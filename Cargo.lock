@@ -81,9 +81,13 @@ name = "daemon"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "daemon-common",
  "daemon-core",
  "daemon-host",
  "daemon-orchestration",
+ "daemon-provision",
+ "daemon-store",
+ "daemon-supervision",
  "daemon-tool-fs",
  "daemon-tool-orchestrate",
  "daemon-tool-shell",
@@ -187,13 +191,16 @@ name = "daemon-host"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "ciborium",
  "daemon-activation",
  "daemon-common",
  "daemon-core",
  "daemon-protocol",
+ "daemon-provision",
  "daemon-store",
  "daemon-supervision",
  "dashmap",
+ "serde",
  "thiserror",
  "tokio",
  "tokio-util",

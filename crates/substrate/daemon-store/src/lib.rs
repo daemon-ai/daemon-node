@@ -15,11 +15,12 @@
 
 use async_trait::async_trait;
 use daemon_common::{DaemonError, Epoch, FenceToken, JobId, PartitionId, SessionId, SnapshotBlob};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 /// The durable status of a session record (lifecycle §5).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
     /// A live incarnation is (or was) running; recoverable from the last snapshot.
     Active,
@@ -52,7 +53,7 @@ pub struct SessionRecord {
 }
 
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCommand {
     /// Stable job identity (deterministic per `(session, epoch)` so re-enqueues dedupe).
     pub job_id: JobId,
@@ -65,7 +66,7 @@ pub struct JobCommand {
 }
 
 /// A durable background-job completion, applied idempotently per `(session, epoch, job)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCompletion {
     /// The session the completion is for.
     pub session_id: SessionId,
@@ -79,7 +80,7 @@ pub struct JobCompletion {
 
 /// What a session activation loads: snapshot + unapplied completions, under a fencing token
 /// (lifecycle §5).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Activation {
     /// The last persisted snapshot (opaque CBOR).
     pub snapshot: SnapshotBlob,
@@ -92,7 +93,7 @@ pub struct Activation {
 /// A checkpoint write: the new snapshot for a session at a bumped epoch (lifecycle §5).
 ///
 /// The store sees only ids + opaque bytes, never the typed `Snapshot`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// The session being checkpointed.
     pub session_id: SessionId,
@@ -124,9 +125,58 @@ pub enum StoreError {
     Common(#[from] DaemonError),
 }
 
+/// A serializable form of [`StoreError`] for crossing a placement cut (phase 5).
+///
+/// [`StoreError`] is not `Serialize` (it carries a `thiserror` source and the test-only
+/// [`FaultPoint`]). When the parent's store is brokered to an out-of-process child, the store's
+/// verdict — crucially [`StoreError::Fenced`] — must round-trip across the wire so the child sees
+/// the same fencing decision it would in-process. `daemon-host` (de)serializes this on the cut.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoreErrorWire {
+    /// A stale incarnation attempted to commit (lost the lease).
+    Fenced {
+        /// The token the caller presented.
+        have: u64,
+        /// The current (highest) token.
+        current: u64,
+    },
+    /// The session does not exist.
+    NotFound(SessionId),
+    /// A fault boundary fired (test-only crash simulation), rendered as text.
+    Fault(String),
+    /// Any other failure, rendered as text.
+    Other(String),
+}
+
+impl From<&StoreError> for StoreErrorWire {
+    fn from(e: &StoreError) -> Self {
+        match e {
+            StoreError::Fenced { have, current } => StoreErrorWire::Fenced {
+                have: *have,
+                current: *current,
+            },
+            StoreError::NotFound(id) => StoreErrorWire::NotFound(id.clone()),
+            StoreError::Fault(point) => StoreErrorWire::Fault(format!("{point:?}")),
+            StoreError::Common(inner) => StoreErrorWire::Other(inner.to_string()),
+        }
+    }
+}
+
+impl StoreErrorWire {
+    /// Reconstruct a [`StoreError`] from its wire form on the far side of a cut.
+    pub fn into_store_error(self) -> StoreError {
+        match self {
+            StoreErrorWire::Fenced { have, current } => StoreError::Fenced { have, current },
+            StoreErrorWire::NotFound(id) => StoreError::NotFound(id),
+            StoreErrorWire::Fault(msg) => StoreError::Common(DaemonError::Fault(msg)),
+            StoreErrorWire::Other(msg) => StoreError::Common(DaemonError::Other(msg)),
+        }
+    }
+}
+
 /// A point-in-time view of durable queue depths and session count, for the host's Metrics/health
 /// resident service and test assertions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreStats {
     /// Pending background jobs on the durable job outbox.
     pub pending_jobs: usize,

@@ -13,19 +13,25 @@
 //! - [`EngineUnit`] presents a running engine as a `UnitKind::Engine`
 //!   [`ManagedUnit`](daemon_supervision::ManagedUnit), realizing the supervision §4 mapping table.
 //!
-//! Deferred to later phases: credential authority, provisioning, telemetry, and remote transport.
+//! Phase 5 adds the protocol-aware side of a placement *cut* ([`cut`]): [`PlacedUnit`] presents an
+//! out-of-process child as a `ManagedUnit`, brokering the parent's store across the cut so fencing
+//! holds out-of-process, and [`run_placed_child`] is the child-side loop.
+//!
+//! Deferred to later phases: credential authority, telemetry, and remote (cross-node) transport.
 //!
 //! See `docs/specs/daemon-host-spec.md`.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod cut;
 pub mod engine_incarnation;
 pub mod services;
 pub mod supervisor;
 pub mod unit;
 
 pub use config::HostConfig;
+pub use cut::{run_placed_child, CutFrame, PlacedUnit, RemoteStoreClient, StoreCall, StoreReplyBody};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, ProviderBuilder};
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,

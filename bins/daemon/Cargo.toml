@@ -10,8 +10,10 @@ name = "daemon"
 path = "src/main.rs"
 
 [dependencies]
+daemon-common = { workspace = true }
 daemon-core = { workspace = true }
 daemon-host = { workspace = true }
+daemon-provision = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-shell = { workspace = true }
 daemon-tool-fs = { workspace = true }
@@ -20,3 +22,7 @@ daemon-tool-orchestrate = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+daemon-store = { workspace = true }
+daemon-supervision = { workspace = true }

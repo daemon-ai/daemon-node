@@ -5,9 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Phase-3 scope: resident-service supervision plus the §17<->management protocol translation and
-# the real engine. The remaining deferred deps (daemon-provision, daemon-credentials,
-# daemon-telemetry, daemon-transport) land with provisioning / credential authority / cross-node.
+# Phase-5 scope adds `daemon-provision`: the host owns the protocol-aware side of a placement cut
+# (the `PlacedUnit` proxy, the brokered store, and the placed-child loop). The remaining deferred
+# deps (daemon-credentials, daemon-telemetry, daemon-transport) land with credential authority /
+# cross-node distribution.
 [dependencies]
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
@@ -15,9 +16,12 @@ daemon-supervision = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
+daemon-provision = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
