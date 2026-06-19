@@ -130,10 +130,12 @@ version = "0.0.0"
 dependencies = [
  "daemon-activation",
  "daemon-common",
+ "daemon-host",
  "daemon-protocol",
  "daemon-store",
  "daemon-stub-engine",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -180,13 +182,8 @@ dependencies = [
  "async-trait",
  "daemon-activation",
  "daemon-common",
- "daemon-core",
- "daemon-credentials",
- "daemon-protocol",
- "daemon-provision",
  "daemon-store",
- "daemon-supervision",
- "daemon-telemetry",
+ "dashmap",
  "thiserror",
  "tokio",
  "tokio-util",

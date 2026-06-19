@@ -226,6 +226,18 @@ impl ActivationManager {
         Ok(dispatched)
     }
 
+    /// One recovery-scan pass: re-activate every session the store reports as resumable
+    /// (`Ready`/`Active`) whose wake may have been lost (invariant #7). This is the per-tick body
+    /// the host's `RecoveryScanner` resident service runs on an interval.
+    pub async fn scan_once(&self) -> Result<usize, SubErr> {
+        let mut scanned = 0usize;
+        for id in self.inner.store.scan_resumable(self.inner.partition).await? {
+            self.wake(id).await?;
+            scanned += 1;
+        }
+        Ok(scanned)
+    }
+
     /// The recovery scanner: rebuild from the store alone (in-memory directories are gone).
     /// Drains durable work, dispatches pending wakes, then re-activates any session left in a
     /// resumable state whose wake never arrived (lifecycle §3.1; invariants #5, #7). Loops until
@@ -234,11 +246,7 @@ impl ActivationManager {
         loop {
             let jobs = self.run_workers().await?;
             let wakes = self.dispatch_wakes().await?;
-            let mut scanned = 0usize;
-            for id in self.inner.store.scan_resumable(self.inner.partition).await? {
-                self.wake(id).await?;
-                scanned += 1;
-            }
+            let scanned = self.scan_once().await?;
             if jobs == 0 && wakes == 0 && scanned == 0 {
                 break;
             }

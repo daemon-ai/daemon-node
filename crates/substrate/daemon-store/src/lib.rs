@@ -124,6 +124,18 @@ pub enum StoreError {
     Common(#[from] DaemonError),
 }
 
+/// A point-in-time view of durable queue depths and session count, for the host's Metrics/health
+/// resident service and test assertions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    /// Pending background jobs on the durable job outbox.
+    pub pending_jobs: usize,
+    /// Pending wake hints on the durable wake outbox.
+    pub pending_wakes: usize,
+    /// Total durable session records.
+    pub sessions: usize,
+}
+
 /// A crash boundary the in-memory store can be armed to fail at, for acceptance test #2.
 ///
 /// These model the durable boundaries enumerated in `rust-substrate-evaluation.md` §6 test #2.
@@ -194,6 +206,9 @@ pub trait SessionStore: Send + Sync {
 
     /// Read the current durable status of a session (test/observability helper).
     async fn status(&self, id: &SessionId) -> Option<SessionStatus>;
+
+    /// Snapshot durable queue depths + session count (Metrics/health resident service).
+    async fn stats(&self) -> StoreStats;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,5 +429,14 @@ impl SessionStore for InMemoryStore {
             .sessions
             .get(id)
             .map(|r| r.status.clone())
+    }
+
+    async fn stats(&self) -> StoreStats {
+        let inner = self.inner.lock().unwrap();
+        StoreStats {
+            pending_jobs: inner.job_outbox.len(),
+            pending_wakes: inner.wake_outbox.len(),
+            sessions: inner.sessions.len(),
+        }
     }
 }

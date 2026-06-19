@@ -5,18 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# Phase-2 scope: resident-service supervision over the durable substrate. The deferred deps
+# (daemon-protocol, daemon-supervision, daemon-core, daemon-provision, daemon-credentials,
+# daemon-telemetry) return in phase 3 when the §17<->management translation and real engine land.
 [dependencies]
 daemon-common = { workspace = true }
-daemon-protocol = { workspace = true }
-daemon-supervision = { workspace = true }
-daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
-daemon-provision = { workspace = true }
-daemon-credentials = { workspace = true }
-daemon-telemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+dashmap = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
