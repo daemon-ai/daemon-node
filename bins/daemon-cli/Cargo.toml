@@ -1,0 +1,16 @@
+[package]
+name = "daemon-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "daemon-cli"
+path = "src/main.rs"
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-host = { workspace = true }
+daemon-orchestration = { workspace = true }
+anyhow = { workspace = true }

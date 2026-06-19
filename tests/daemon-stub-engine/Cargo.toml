@@ -1,0 +1,12 @@
+[package]
+name = "daemon-stub-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+async-trait = { workspace = true }

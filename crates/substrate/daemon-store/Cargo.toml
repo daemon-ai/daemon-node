@@ -1,0 +1,17 @@
+[package]
+name = "daemon-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+sqlite = []
+
+[dependencies]
+daemon-common = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

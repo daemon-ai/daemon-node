@@ -1,0 +1,11 @@
+[package]
+name = "daemon-tool-orchestrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-orchestration = { workspace = true }
+async-trait = { workspace = true }

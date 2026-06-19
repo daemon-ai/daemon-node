@@ -1,0 +1,315 @@
+# daemon-host — the durable substrate specification
+
+`daemon-host` is the layer that **runs `daemon-core` engine instances durably**. It is the
+translation boundary (§17 downward, the management protocol upward) and the home of the **durable
+activation layer**: the Tokio-based machinery that activates, suspends, persists, and reactivates
+sessions keyed by a stable `SessionId`, with `SessionStore` as the sole authority.
+
+It implements decisions taken in:
+
+- [`rust-substrate-evaluation.md`](rust-substrate-evaluation.md) — Tokio + a durable activation layer; no actor framework owns the lifecycle; the **7 acceptance tests** are this host's conformance criteria.
+- [`daemon-lifecycle-persistence.md`](daemon-lifecycle-persistence.md) — the snapshot contract, the activation architecture, the durability invariants.
+- [`daemon-supervision-spec.md`](daemon-supervision-spec.md) — the management protocol the host speaks upward and translates to §17 downward.
+- [`daemon-core-spec.md`](../../crates/engine/daemon-core/docs/daemon-core-spec.md) — §7 (credentials port), §14 (`SessionStore`), §16 (processes/delegation), §17 (host protocol).
+
+`daemon-host` is a **trait with two implementations**: an **in-process embedder** (L1/L2, tests,
+single-node teams) and a **remote host** speaking §17 over the wire (distributed fleets). An
+orchestrator never sees which (synthesis §3).
+
+---
+
+## 1. Responsibilities
+
+1. **Durable activation layer** — the SessionId → owner → task → checkpoint → exit → wake lifecycle (§2–§4).
+2. **Resident-service supervision** — supervise the small fixed set of infrastructure services, never historical session incarnations (§5).
+3. **Credential authority** — the authority backing the engine's §7 `CredentialProvider` port, plus fleet-wide rate/cost governance (§6).
+4. **Workspace / placement provisioning** — give each engine its isolated workspace and decide where it runs (§7).
+5. **Live-resource ownership** — own OS processes, LSP sessions, sockets, and child tasks so an engine can dehydrate while they persist (§8).
+6. **Protocol translation** — be the one place §17 ↔ management protocol collapses (§9).
+
+The host does **not** decide *what work to do* or *how to classify/route/gate* it — that is the
+orchestrator's job ([`daemon-orchestrator-spec.md`](daemon-orchestrator-spec.md)). The host is
+mechanism; the orchestrator is policy.
+
+---
+
+## 2. The substrate trait (swappable)
+
+The activation substrate sits behind a trait so the default plain-Tokio implementation can be
+swapped for an Elfo-backed local activation shell without touching durability
+([`rust-substrate-evaluation.md`](rust-substrate-evaluation.md) §4).
+
+```rust
+#[async_trait]
+trait ActivationSubstrate: Send + Sync {
+    /// Ensure exactly one live incarnation for `id` in this process, hydrated and ready.
+    async fn activate(&self, id: SessionId, fence: FenceToken) -> Result<ActivationRef, SubErr>;
+    /// Local passivation: drop the in-memory incarnation (durability already committed).
+    async fn passivate(&self, id: &SessionId);
+    /// Deliver a message to the active incarnation (creating none if absent).
+    async fn deliver(&self, id: &SessionId, msg: SessionMsg) -> Result<(), SubErr>;
+}
+```
+
+- **Default (`tokio` impl):** an in-process active-only directory `DashMap<SessionId, ActivationRef>`
+  plus `TaskTracker`-tracked session tasks. `activate` spawns/hydrates; `passivate` removes the
+  directory entry and lets the task exit.
+- **Optional (`elfo` impl):** a `MapRouter` keyed by `SessionId` (`Outcome::Unicast(id)` lazily
+  starts a session actor; `RestartPolicy::never` passivates on normal exit). It replaces the local
+  directory only — ownership, persistence, completion recovery, and fencing stay in the host layers
+  below, and Elfo messages remain wake *hints*, never durable facts.
+
+The trait is intentionally narrow: everything correctness-critical (ownership, leases, store,
+outboxes) lives in the host, not the substrate, so the substrate choice is reversible.
+
+---
+
+## 3. The durable activation architecture
+
+```text
+                         +---------------------------+
+SessionId  ------------->| PartitionLeaseManager     |  durable partition/owner router + fencing
+                         +-------------+-------------+
+                                       |
+                                       v
+                         +---------------------------+
+                         | active-only directory      |  (in-memory; running sessions only)
+                         | SessionId -> ActivationRef  |
+                         +-------------+-------------+
+                                       |
+                                       v
+                         +---------------------------+
+                         | Tokio session task         |  TaskTracker-tracked; frees on exit
+                         | hydrated incarnation        |  drives one daemon-core engine via §17
+                         +-------------+-------------+
+                                       |
+                       checkpoint_and_enqueue (1 txn)
+                                       |
+                                       v
+                            task exits; memory freed
+```
+
+Reverse (completion → wake) path:
+
+```text
+worker completion
+  -> record_completion_and_wake (1 txn): insert completion inbox (UNIQUE(session,epoch,job));
+                                          mark session Ready; enqueue durable Wake(SessionId)
+  -> WakeOutboxDispatcher delivers the wake to the partition owner
+  -> PartitionLeaseManager acquires/increments fence
+  -> SessionActivator activates: load_for_activation (snapshot + unapplied completions) -> task
+```
+
+### 3.1 Session task lifecycle
+
+A session task is the host's driver around one engine incarnation:
+
+1. **Hydrate** — `SessionStore::load_for_activation(id, fence)` → snapshot + unapplied completions;
+   reconstruct the engine from the snapshot's `Conversation` + references; re-attach host-owned live
+   resources by handle (§8); apply unapplied completions idempotently *before* running new work.
+2. **Run** — translate management commands to §17 `AgentCommand`s (§9); stream §17 `AgentEvent`s up
+   as `ManageEvent`s; service `HostRequest`s, escalating up as needed.
+3. **Suspend** — when the engine reaches a phase boundary waiting on background work: bump `epoch`,
+   `checkpoint_and_enqueue(snapshot, job)` in one transaction, then **return from the task**
+   (`TaskTracker` frees the memory). Persist-before-stop is mandatory.
+4. **Complete** — on `TurnFinished`/`Shutdown`, emit `ManageEvent::Finished { outcome }` and exit.
+
+Background work is **never a child of the session task**; it runs in a durable worker keyed by
+`JobId`, so the session can dehydrate while it runs.
+
+---
+
+## 4. The durable store (host-owned schema)
+
+The host owns the durable backbone, built on the §14 `SessionStore` extensions (lifecycle doc §5).
+Default backend: the existing SQLite/WAL/CBOR store; a dedicated durable queue can sit behind the
+same trait.
+
+| table / queue | purpose | key invariant |
+|---|---|---|
+| `session_record` | `{ session_id, epoch, status, snapshot, lease, fence }` | one row per session; snapshot is CBOR (§6) |
+| `completion_inbox` | durable background-job completions | `UNIQUE(session_id, epoch, job_id)` → idempotent apply |
+| `wake_outbox` | durable `Wake(SessionId)` hints | at-least-once delivery; consumer is idempotent |
+| `job_outbox` | durable background-job commands | at-least-once dispatch to workers |
+| `activation_leases` | partition ownership + monotonic fencing token | only the highest fence may commit |
+
+All four cross-cutting transactions (`checkpoint_and_enqueue`, `record_completion_and_wake`,
+`load_for_activation`, lease acquire/renew) are single transactions on this store.
+
+---
+
+## 5. Resident-service supervision (and only this)
+
+The host supervises a **small, fixed set of resident services** — never a per-session child. This
+is the single design rule that keeps memory bounded at fleet scale (acceptance test #1).
+
+```text
+Root supervisor
+├── PartitionLeaseManager   — owns partitions; issues/renews fencing leases; rejects stale owners
+├── SessionActivator        — drives ActivationSubstrate::activate on wake / new work
+├── CompletionConsumer      — applies completion_inbox records idempotently to the right session
+├── WakeOutboxDispatcher    — drains wake_outbox; delivers wake hints to partition owners
+├── JobOutboxDispatcher     — drains job_outbox; hands background jobs to workers
+├── RecoveryScanner         — periodically scan_resumable(); activate any Ready session whose wake was lost
+└── Metrics / health        — exposes Usage/RateLimit aggregation + HealthStatus
+```
+
+- A conventional supervisor (e.g. `ractor-supervisor` or a task-supervision crate) is fine for *this*
+  tree — restart/backoff/meltdown semantics apply to long-lived services, not to sessions.
+- Sessions are **plain `TaskTracker` tasks**, not supervised children: their durability lives in the
+  store, so "restart" for a session means "re-activate from the snapshot," handled by the activation
+  layer, not a supervisor child-spec.
+
+> **Source-audit note (S1): the framework metadata leaks do not apply here.** The
+> [`source-audit.md`](../research/source-audit.md) read of the cloned trees
+> confirms the Kameo child-spec accumulation (`kameo/src/links.rs`, no `children.remove` on a normal
+> `Transient` exit) and the `ractor-supervisor` `child_failure_state` retention
+> (`ractor-supervisor/src/dynamic.rs:314-324`). **Both only bite under unbounded *unique* supervised
+> children** — exactly the shape this rule forbids. Because the supervised set is small and fixed
+> (the seven services above) and sessions are never supervised children, neither leak can grow. So
+> `ractor-supervisor` is an acceptable choice for this tree; the only real caveat is its **stale
+> dependency pin** (it pins `ractor 0.14.3` vs the current 0.15.x), not its memory behavior. A
+> hand-rolled `TaskTracker` + thin restart/backoff wrapper is the equally-valid alternative and
+> avoids the pin. Note also that `panic = "abort"` defeats catch-unwind-based supervision in any of
+> these crates (`ractor/ractor/src/lib.rs:124-125`), so the production profile must use unwinding.
+
+---
+
+## 6. Credential authority
+
+The host is the **authority** backing the engine's §7 `CredentialProvider` port. The engine holds a
+handle; the host's impl owns the secrets and the governance:
+
+- **Acquire/release with scoping** — issues short-lived `CredLease`s scoped to a `ProfileRef` +
+  `CredScope`; revokes on session end or cancel.
+- **Rotation / cooldown / health** — the heavy logic from §7's `credential_pool` lives here at fleet
+  scope (multi-key selection, `mark_exhausted`, `mark_dead`, OAuth refresh).
+- **Attenuation down supervision edges** — a delegated child's `CredScope` is intersected with its
+  parent's (mirrors the §16.2 toolset intersection); least-privilege is enforced by the authority,
+  not trusted to the engine.
+- **Fleet rate/cost governance** — because `Usage`/`RateLimit` aggregate up the management protocol
+  (supervision spec §2.2), the authority can throttle a shared provider quota across many engines and
+  feed cost ceilings back into `Budget` caps.
+
+Standalone (L1) embedding uses the engine's default embedded `credential_pool` impl; under a host,
+the authority-backed impl is injected at construction.
+
+---
+
+## 7. Workspace / placement provisioning
+
+The host gives each engine its **isolated workspace root** (§13/§17.3 construction parameter) and
+decides **where** it runs:
+
+- **Workspace** — per-session working directory / sandbox; the orchestrator's verifier routing
+  (read-only exec env, [`daemon-orchestrator-spec.md`](daemon-orchestrator-spec.md)) is realized
+  here by provisioning a read-only or copy-on-write workspace variant. Workspace state is a
+  **tool-owned external resource** (lifecycle doc §1.2), not part of the snapshot.
+- **Placement** — in-process (default; same address space) or remote (a remote host driving the
+  engine over §17). Placement is a host concern invisible to the orchestrator, which only routes by
+  `UnitId`.
+
+> **Source-audit note (S2): isolation is a *placement* property, not a framework "distribution"
+> feature.** The intuition that "distribution gives us isolation" does **not** hold for the Rust
+> actor frameworks surveyed in [`source-audit.md`](../research/source-audit.md):
+> Coerce/Kameo/Ractor/Elfo "distribution" is *message transport* between shared-address-space Tokio
+> tasks, where a panic mid-`Arc<Mutex<_>>` can still corrupt shared state and poison the lock —
+> remoting isolates nothing. True per-unit fault isolation in the cloned tree comes from exactly two
+> sources, **both of which this `place` step owns**: (a) **Wasm-per-process** (only Lunatic provides
+> it, at the cost of compiling the workload to Wasm), or (b) **OS process / container / remote node**
+> placement. So isolation is delivered by `Provisioner::place`, not by adopting an actor crate's
+> remoting layer — which reinforces, rather than changes, this design.
+
+```rust
+#[async_trait]
+trait Provisioner: Send + Sync {
+    async fn workspace(&self, id: &SessionId, spec: WorkspaceSpec) -> Result<WorkspaceRoot, ProvErr>;
+    async fn place(&self, id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr>;
+    async fn reclaim(&self, id: &SessionId);
+}
+```
+
+---
+
+## 8. Live-resource ownership
+
+Per the §16.1 amendment, the host owns the **live** runtime resources so an engine can dehydrate
+while they persist:
+
+- OS processes (dev servers, watchers, builds), LSP sessions, sockets, and any background child
+  tasks are **host-owned**; the engine's snapshot carries only `ProcHandle`/reference views.
+- On rehydration the host re-binds the engine to its handles; `ProcEvent`s/`completion` that arrived
+  while the engine was dehydrated are waiting durably and surface as a `BackgroundCompletion`
+  trigger (§17.1 item 5).
+- On session end/reclaim the host tears these down (the `Provisioner::reclaim` + registry teardown).
+
+---
+
+## 9. Protocol translation (the host's defining job)
+
+The host is the **only** node that translates: management protocol upward, §17 downward. The host is
+itself **not a managed unit** — it is the adapter/substrate. It **presents each engine it drives as a
+`UnitKind::Engine` `ManagedUnit`** (supervision spec §2.4) to the supervisor above it, adapting that
+engine's §17 surface to satisfy the supervision-spec §4 mapping table:
+
+- `ManageCommand::Assign { work }` → resolve `WorkRef` to a `UserMsg` → `AgentCommand::StartTurn`.
+- `Cancel`/`Snapshot`/`Shutdown` → `Interrupt`/`Snapshot`/`Shutdown`.
+- `Pause`/`Resume`/`Scale` → `Ack::Unsupported` (no-op at a single conversation).
+- §17 `AgentEvent`s → `ManageEvent`s (`TurnStarted`→`Started`, deltas→`Progress`, `Usage`/`RateLimit`
+  pass through identically, `TurnFinished`→`Finished { outcome }`).
+- §17 `HostRequest`s → `ManageRequest`s; if the host cannot answer locally (no human/policy), it
+  re-raises `Escalate` up its own supervisor through the management protocol.
+
+The adapter is total upward (every §17 message maps to a `ManageEvent`/`ManageRequest`) and partial
+downward (commands an engine cannot honor are `Ack::Unsupported`). §17 is **not** re-exported as the
+generic types (supervision spec §4 decision); the engine crate stays free of `daemon-supervision`.
+
+> **Framing: the host is a *tiling* over the logical tree, not a level in it
+> ([`daemon-orchestration-synthesis.md`](../research/daemon-orchestration-synthesis.md) §3.2).** Because the host
+> is not a managed unit, it does not sit "above" or "below" a unit — it is the runtime that holds a
+> connected region of the `ManagedUnit` tree in one address space. **Placement/isolation (§7) is a
+> *cut*** in that tree: a host boundary where this translation runs over the wire instead of
+> in-process. Two consequences for this section: (a) the host presents *whatever sits behind it* —
+> one engine, or (via an orchestrator) a whole sub-fleet — through the **same** upward face, which is
+> what makes the cut placeable anywhere; (b) the translation above is **single-faced for a leaf**
+> (management upward, §17 down to one engine), but for an **orchestrator node the host is two-faced on
+> the management protocol** — server upward *and* client downward to its children's hosts — since the
+> orchestrator engine emits only §16 delegation over §17 and the host realizes the downward
+> management-protocol client + child placement. That downward-client role is the host responsibility
+> that opens a cut to children; it is the precise hinge between the logical and physical structures.
+
+---
+
+## 10. Conformance criteria — the 7 acceptance tests
+
+A `daemon-host` implementation (any substrate) is correct iff it passes the seven fleet-scale tests
+from [`rust-substrate-evaluation.md`](rust-substrate-evaluation.md) §6:
+
+1. **Churn / memory baseline** — activate+passivate ≥ 1,000,000 unique `SessionId`s; active
+   directory + supervisor metadata return to baseline (no per-incarnation leak).
+2. **Crash-after-every-boundary** — crash before snapshot, after snapshot, after job outbox, before
+   task exit, after completion insert, before wake publication; recover correctly each time.
+3. **Wake/completion idempotency** — deliver every wake/completion repeatedly; `UNIQUE(session,
+   epoch, job)` makes apply idempotent.
+4. **Dual-node fencing** — activate the same `SessionId` on two nodes; only the highest fence commits.
+5. **Empty-mailbox process kill** — kill the process with all mailboxes empty; recover solely from
+   `SessionStore` + durable queues.
+6. **Ownership-transfer stale-write rejection** — pause an old owner, transfer ownership, resume it;
+   its writes are rejected by the fence.
+7. **Lost-wake recovery** — drop a wake entirely; `RecoveryScanner` eventually activates every
+   `Ready` session.
+
+These are the host's CI gates before any fleet deployment.
+
+---
+
+## 11. Open decisions (flagged, not blocking)
+
+- **Store backend** — the existing SQLite/CBOR store (§14) vs a dedicated durable queue for
+  inbox/outbox; kept behind the store trait.
+- **Substrate** — plain-Tokio default vs Elfo local activation shell (adopt only if keyed-routing /
+  observability ergonomics justify an alpha dependency).
+- **Remote transport + cross-node ownership/fencing** — in-process first; the wire form of the
+  management protocol and the cross-node lease protocol are deferred detail.
+- **Distribution mechanism** for fleets-of-fleets (Elfo/Kameo libp2p vs message bus vs gRPC) —
+  explicitly deferred until cross-node is needed.

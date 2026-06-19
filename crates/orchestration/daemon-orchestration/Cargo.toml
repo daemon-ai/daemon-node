@@ -1,0 +1,15 @@
+[package]
+name = "daemon-orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-common = { workspace = true }
+daemon-supervision = { workspace = true }
+daemon-host = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

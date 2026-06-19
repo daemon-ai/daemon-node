@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/*/*", "tools/*", "bins/*", "tests/*", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/daemon"
+
+[workspace.dependencies]
+# shared third-party deps (single source of truth)
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+
+# internal crates (path deps; referenced by member crates via `workspace = true`)
+daemon-common = { path = "crates/contracts/daemon-common" }
+daemon-protocol = { path = "crates/contracts/daemon-protocol" }
+daemon-supervision = { path = "crates/contracts/daemon-supervision" }
+daemon-core = { path = "crates/engine/daemon-core" }
+daemon-store = { path = "crates/substrate/daemon-store" }
+daemon-activation = { path = "crates/substrate/daemon-activation" }
+daemon-provision = { path = "crates/substrate/daemon-provision" }
+daemon-credentials = { path = "crates/substrate/daemon-credentials" }
+daemon-telemetry = { path = "crates/substrate/daemon-telemetry" }
+daemon-host = { path = "crates/substrate/daemon-host" }
+daemon-transport = { path = "crates/substrate/daemon-transport" }
+daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
+daemon-tool-shell = { path = "tools/daemon-tool-shell" }
+daemon-tool-fs = { path = "tools/daemon-tool-fs" }
+daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
+daemon-tool-orchestrate = { path = "tools/daemon-tool-orchestrate" }
+daemon-stub-engine = { path = "tests/daemon-stub-engine" }
+
+[profile.release]
+panic = "unwind"   # catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)
+
+[profile.dev]
+panic = "unwind"

@@ -1,0 +1,22 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "daemon"
+path = "src/main.rs"
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-host = { workspace = true }
+daemon-orchestration = { workspace = true }
+daemon-tool-shell = { workspace = true }
+daemon-tool-fs = { workspace = true }
+daemon-tool-tkx = { workspace = true }
+daemon-tool-orchestrate = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

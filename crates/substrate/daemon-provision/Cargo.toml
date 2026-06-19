@@ -1,0 +1,18 @@
+[package]
+name = "daemon-provision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["process"]
+process = []
+container = []
+
+[dependencies]
+daemon-common = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "daemon-activation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+elfo = []
+
+[dependencies]
+daemon-common = { workspace = true }
+daemon-store = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
