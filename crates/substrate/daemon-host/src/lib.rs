@@ -20,13 +20,17 @@
 //! Phase 6 threads a `TraceId` across the cut (stamped on send, restored on receive) and folds a
 //! placed unit's `Usage` into a resident [`Metrics`](daemon_telemetry::Metrics) dump.
 //!
-//! Deferred to later phases: credential authority and remote (cross-node) transport.
+//! Phase 7 adds the credential broker ([`credentials`]): [`OwnerBroker`]/[`RelayBroker`] realize
+//! recursive serve-or-forward of `daemon-credentials` capability leases, [`RemoteCredentialClient`]
+//! is the descendant-side client over a credential cut, and [`BrokeredCredentialProvider`] bridges
+//! a broker to the engine's §7 port.
 //!
 //! See `docs/specs/daemon-host-spec.md`.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod credentials;
 pub mod cut;
 pub mod engine_incarnation;
 pub mod journal;
@@ -35,7 +39,13 @@ pub mod supervisor;
 pub mod unit;
 
 pub use config::HostConfig;
-pub use cut::{run_placed_child, CutFrame, PlacedUnit, RemoteStoreClient, StoreCall, StoreReplyBody};
+pub use credentials::{
+    BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,
+};
+pub use cut::{
+    run_placed_child, serve_credentials, CredCall, CredReplyBody, CutFrame, PlacedUnit,
+    RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
+};
 pub use journal::{journal_stream, JournalSink};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, ProviderBuilder};
 pub use supervisor::{

@@ -531,9 +531,11 @@ dependencies = [
  "daemon-activation",
  "daemon-common",
  "daemon-core",
+ "daemon-credentials",
  "daemon-host",
  "daemon-orchestration",
  "daemon-protocol",
+ "daemon-provision",
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
@@ -569,8 +571,11 @@ name = "daemon-credentials"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bc-components",
+ "bc-envelope",
  "daemon-common",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -591,6 +596,7 @@ dependencies = [
  "daemon-activation",
  "daemon-common",
  "daemon-core",
+ "daemon-credentials",
  "daemon-protocol",
  "daemon-provision",
  "daemon-store",

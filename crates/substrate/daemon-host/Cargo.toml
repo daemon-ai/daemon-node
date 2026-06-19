@@ -18,6 +18,7 @@ daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
 daemon-provision = { workspace = true }
+daemon-credentials = { workspace = true }
 daemon-telemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

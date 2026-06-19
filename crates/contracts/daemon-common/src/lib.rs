@@ -352,6 +352,199 @@ hash32! {
     MerkleRoot
 }
 
+// ---------------------------------------------------------------------------
+// Credential primitives (phase 7)
+// ---------------------------------------------------------------------------
+//
+// The credential authority brokers short-lived, scoped *capability leases* down the supervision
+// tree (host-spec §6; supervision-spec rules #6, #142). These are the serializable primitives that
+// ride a cut: the authority (an ancestor host that owns secret material) mints a signed
+// `CapabilityLease`; descendants several cuts down acquire it by re-brokering upward, with the
+// `CredScope` intersected at each hop. The crypto (ed25519 signing of the capability) lives in
+// `daemon-credentials` — this layer stays codec/crypto-free (layout §3), holding only opaque
+// signature bytes alongside the public fields.
+
+string_id! {
+    /// Stable identity of one credential / capability lease minted by the authority.
+    CredId
+}
+string_id! {
+    /// A reference to a provider profile (which provider/key family a credential serves).
+    ProfileRef
+}
+
+/// How a `CapabilityLease` resolves at the point of use — three modes trading isolation for cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CredMode {
+    /// The owner mints a genuinely short-lived provider token (OAuth/STS); the holder calls the
+    /// provider directly with the embedded `LeaseSecret`. The provider enforces the TTL.
+    Native,
+    /// The owner hands over a usable (often non-expiring) key in the lease; the holder calls the
+    /// provider directly. Honest that the holder effectively keeps it for the key's lifetime, so
+    /// the compensating control is the mandatory audit record, not the TTL. A fresh per-grant key
+    /// (where the source can mint one) is genuinely revocable; otherwise the grant is audit-only.
+    Bearer,
+    /// The owner holds a non-expiring key; the lease is a handle only, and the actual provider call
+    /// is proxied to the owner (who attaches the real key). The holder never sees secret material.
+    Proxied,
+}
+
+/// A short-lived secret token embedded in a `CredMode::Native` lease. Its `Debug` is redacted so a
+/// token never leaks into logs or the verifiable trace.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseSecret(pub String);
+
+impl LeaseSecret {
+    /// Wrap a token string.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    /// Borrow the raw token (use only at the provider boundary).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for LeaseSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LeaseSecret(***)")
+    }
+}
+
+/// An attenuable capability scope (macaroon-style): the set of profiles and actions a holder may
+/// use, plus an optional cost ceiling. Attenuation is set intersection + the tighter ceiling, so a
+/// child's scope can only ever *narrow* its parent's (least privilege enforced by the authority).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredScope {
+    /// The profiles this scope may serve.
+    pub profiles: std::collections::BTreeSet<String>,
+    /// The named operations permitted (e.g. `"chat"`, `"embed"`).
+    pub actions: std::collections::BTreeSet<String>,
+    /// Optional token ceiling this scope authorizes (`None` = unbounded).
+    pub max_tokens: Option<u64>,
+}
+
+impl CredScope {
+    /// The empty scope (grants nothing) — the identity for "deny".
+    pub fn nothing() -> Self {
+        Self {
+            profiles: Default::default(),
+            actions: Default::default(),
+            max_tokens: Some(0),
+        }
+    }
+
+    /// A scope over the given profile and actions with an optional ceiling.
+    pub fn new<P, A>(profiles: P, actions: A, max_tokens: Option<u64>) -> Self
+    where
+        P: IntoIterator,
+        P::Item: Into<String>,
+        A: IntoIterator,
+        A::Item: Into<String>,
+    {
+        Self {
+            profiles: profiles.into_iter().map(Into::into).collect(),
+            actions: actions.into_iter().map(Into::into).collect(),
+            max_tokens,
+        }
+    }
+
+    /// Attenuate: the intersection of two scopes (profiles ∩, actions ∩, tighter ceiling). The
+    /// result authorizes only what *both* allow — the per-hop narrowing the broker applies.
+    pub fn intersect(&self, other: &CredScope) -> CredScope {
+        let tighter = match (self.max_tokens, other.max_tokens) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        CredScope {
+            profiles: self.profiles.intersection(&other.profiles).cloned().collect(),
+            actions: self.actions.intersection(&other.actions).cloned().collect(),
+            max_tokens: tighter,
+        }
+    }
+
+    /// Whether this scope authorizes `action` on `profile`.
+    pub fn allows(&self, profile: &ProfileRef, action: &str) -> bool {
+        self.profiles.contains(profile.as_str()) && self.actions.contains(action)
+    }
+
+    /// Whether this scope is a superset of `other` (so `other` is a valid attenuation of it). Used
+    /// by the broker to reject a request for *more* than the hop's own grant.
+    pub fn contains(&self, other: &CredScope) -> bool {
+        other.profiles.is_subset(&self.profiles)
+            && other.actions.is_subset(&self.actions)
+            && match (self.max_tokens, other.max_tokens) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => b <= a,
+            }
+    }
+
+    /// Whether this scope grants nothing.
+    pub fn is_empty(&self) -> bool {
+        self.profiles.is_empty() || self.actions.is_empty() || self.max_tokens == Some(0)
+    }
+}
+
+/// A minted, signed, short-lived capability the authority hands a holder. It is **not** the raw
+/// provider key: `Native` embeds a genuinely-expiring token; `Proxied` carries only a handle and the
+/// real call is proxied to the owner. The `signature` is an opaque ed25519 detached signature over
+/// the capability's canonical form (produced/verified by `daemon-credentials`); this layer treats it
+/// as bytes so the DAG root stays crypto-free.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityLease {
+    /// The capability's stable id (audit correlation).
+    pub cap_id: CredId,
+    /// The profile this capability serves.
+    pub profile: ProfileRef,
+    /// The (attenuated) scope this capability authorizes.
+    pub scope: CredScope,
+    /// How the capability resolves at use.
+    pub mode: CredMode,
+    /// Wall-clock expiry, in milliseconds since the Unix epoch.
+    pub expires_at_ms: u64,
+    /// The short-lived token, present only in `Native` mode.
+    pub secret: Option<LeaseSecret>,
+    /// The authority's detached signature over the canonical capability bytes.
+    pub signature: Vec<u8>,
+}
+
+impl CapabilityLease {
+    /// Whether this capability has expired relative to `now_ms`.
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+}
+
+/// Why a credential acquire / use / verify failed. Crosses a cut (the brokered `CredReply`), so it
+/// is serializable; the authority's verdict (notably `Fenced`/`Expired`) round-trips faithfully.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum CredError {
+    /// No usable credential is available for the profile (pool exhausted/dead).
+    #[error("no credential available for profile {0}")]
+    Unavailable(String),
+    /// The requested scope exceeds what this hop (or the authority) may grant.
+    #[error("scope denied: requested capability exceeds the grant")]
+    ScopeDenied,
+    /// The capability has expired.
+    #[error("capability expired")]
+    Expired,
+    /// The capability signature did not verify (tampered or wrong authority).
+    #[error("capability signature invalid")]
+    BadSignature,
+    /// A stale incarnation attempted to acquire/use under a superseded fence.
+    #[error("fenced: a stale incarnation cannot acquire credentials")]
+    Fenced,
+    /// This host is not the authority and has no upstream broker to forward to.
+    #[error("no credential authority reachable")]
+    NoAuthority,
+    /// Any other failure.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// The shared base error reused/wrapped by layer-specific errors (`StoreError`, `SubErr`).
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {

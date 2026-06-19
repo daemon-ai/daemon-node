@@ -9,3 +9,11 @@ license.workspace = true
 daemon-common = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+# Capability minting/verification: the same Blockchain Commons ed25519 + Gordian Envelope stack the
+# verifiable trace journal uses (phase 6), so a capability's signature is a digest over a
+# deterministic envelope of its fields.
+bc-components = { workspace = true }
+bc-envelope = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

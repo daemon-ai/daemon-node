@@ -17,6 +17,7 @@
 
 pub mod actor;
 pub mod conversation;
+pub mod credentials;
 pub mod engine;
 pub mod events;
 pub mod provider;
@@ -29,6 +30,7 @@ pub use actor::{spawn_agent_session, AgentHandle};
 pub use conversation::{
     AssistantMsg, Conversation, SystemPrompt, ToolCall, ToolResult, ToolTurn, Turn,
 };
+pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use engine::{Completion, Engine, Suspension, TurnOutcome};
 pub use events::EventSink;
 pub use provider::{

@@ -78,12 +78,23 @@ pub enum Failure {
     /// The provider itself failed.
     #[error("provider: {0}")]
     Provider(String),
+    /// A rotatable provider failure (quota/rate-limit/auth, e.g. HTTP 429/402/401): the engine
+    /// should mark the credential and retry on a rotated one (`credential_pool.py` `should_rotate`).
+    #[error("rotatable: {0}")]
+    Rotatable(String),
     /// The turn was cancelled cooperatively.
     #[error("cancelled")]
     Cancelled,
     /// Any other engine failure.
     #[error("{0}")]
     Other(String),
+}
+
+impl Failure {
+    /// Whether this failure should trigger a credential rotation + retry.
+    pub fn is_rotatable(&self) -> bool {
+        matches!(self, Failure::Rotatable(_))
+    }
 }
 
 /// The model provider port (§7).

@@ -7,6 +7,7 @@
 //! deterministic phase boundary (lifecycle §3.1).
 
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
+use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
 use crate::events::EventSink;
 use crate::provider::{build_context, ModelOutput, Provider};
 use crate::snapshot::Snapshot;
@@ -14,7 +15,7 @@ use crate::tool_pipeline::run_tool;
 use crate::tools::ToolRegistry;
 use crate::turn::{Effect, TurnCx};
 use crate::Failure;
-use daemon_common::{Budget, Epoch, JobId, SessionId};
+use daemon_common::{Budget, CredScope, Epoch, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
     AgentEvent, CompletionSource, EndReason, HostRequestHandler, ToolCallView, ToolResultView,
     TurnSummary, TurnTrigger, UserMsg,
@@ -57,6 +58,8 @@ pub struct Engine {
     registry: Arc<ToolRegistry>,
     pending: Vec<Completion>,
     budget: Budget,
+    credentials: Arc<dyn CredentialProvider>,
+    profile: ProfileRef,
 }
 
 impl Engine {
@@ -72,6 +75,10 @@ impl Engine {
             registry,
             pending: Vec::new(),
             budget: Budget::unlimited(),
+            // L1 default: the in-tree embedded pool. Under a host an authority-backed provider is
+            // injected via `with_credentials` (host-spec §6).
+            credentials: Arc::new(EmbeddedCredentialPool::single_key()),
+            profile: ProfileRef::new("default"),
         }
     }
 
@@ -90,6 +97,18 @@ impl Engine {
     /// Set the budget governing this engine's turns.
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Inject the credential provider + profile this engine acquires capabilities from (the host
+    /// injects an authority-backed or brokered impl; the default is the embedded L1 pool).
+    pub fn with_credentials(
+        mut self,
+        credentials: Arc<dyn CredentialProvider>,
+        profile: ProfileRef,
+    ) -> Self {
+        self.credentials = credentials;
+        self.profile = profile;
         self
     }
 
@@ -118,10 +137,33 @@ impl Engine {
         self.registry.names()
     }
 
-    /// `call_model` phase: flatten context, ask the provider, stream usage + reasoning.
+    /// `call_model` phase: acquire a scoped credential capability, flatten context, ask the
+    /// provider under that capability, stream usage + reasoning. On a rotatable failure
+    /// (quota/auth) the credential is rotated and the call retried once (§7 `should_rotate`).
     async fn call_model(&self, events: &EventSink) -> Result<ModelOutput, Failure> {
         let req = build_context(&self.snapshot.conversation, &self.tool_names());
-        let out = self.provider.chat(req).await?;
+        // The scope a turn needs: the `chat` action on this engine's profile.
+        let want = CredScope::new([self.profile.as_str()], ["chat"], self.budget.tokens);
+        let mut attempt = 0u8;
+        let out = loop {
+            let lease = self
+                .credentials
+                .acquire(&self.profile, &want)
+                .await
+                .map_err(|e| Failure::Provider(format!("credential acquire: {e}")))?;
+            let result = self.provider.chat(req.clone()).await;
+            self.credentials.release(&lease).await;
+            match result {
+                Ok(out) => break out,
+                Err(f) if f.is_rotatable() && attempt == 0 => {
+                    // Mark the credential out and retry on a rotated one.
+                    self.credentials.rotate(&self.profile, &lease.cap_id).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(f) => return Err(f),
+            }
+        };
         let usage = out.usage;
         events.emit(|seq| AgentEvent::Usage { seq, delta: usage });
         if let Some(reasoning) = &out.reasoning {
@@ -297,5 +339,92 @@ impl Engine {
             epoch: self.snapshot.epoch,
             payload: b"delegated-work".to_vec(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Capabilities, ModelOutput, Request, ToolCallFormat};
+    use daemon_common::{CredScope, UsageDelta};
+    use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A provider that fails the first call with a rotatable error, then completes.
+    struct FlakyProvider {
+        calls: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+
+        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                Err(Failure::Rotatable("quota exceeded (429)".into()))
+            } else {
+                Ok(ModelOutput {
+                    text: "done after rotation".into(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: UsageDelta::default(),
+                })
+            }
+        }
+    }
+
+    struct NoopHost;
+
+    #[async_trait::async_trait]
+    impl HostRequestHandler for NoopHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved(true),
+            }
+        }
+    }
+
+    /// A rotatable provider failure rotates the credential and retries on a second key — the turn
+    /// completes, the provider was called twice, and one key is now cooling down.
+    #[tokio::test]
+    async fn rotatable_failure_rotates_credential_and_retries() {
+        let provider = Arc::new(FlakyProvider {
+            calls: AtomicU64::new(0),
+        });
+        let pool = Arc::new(EmbeddedCredentialPool::new(
+            "openai",
+            CredScope::new(["openai"], ["chat"], None),
+            [
+                ("key-a".to_string(), "secret-a".to_string()),
+                ("key-b".to_string(), "secret-b".to_string()),
+            ],
+            60_000,
+            30_000,
+        ));
+        let mut engine = Engine::fresh(
+            SessionId::new("rotate"),
+            SystemPrompt::new("test"),
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_credentials(pool.clone(), ProfileRef::new("openai"));
+        engine.push_user(UserMsg::new("hello"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), CancellationToken::new())
+            .await
+            .expect("turn completes after a single rotation");
+        assert!(matches!(outcome, TurnOutcome::Completed(_)));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "retried once");
+        assert_eq!(pool.live_count(), 1, "the rotated key is cooling down");
     }
 }

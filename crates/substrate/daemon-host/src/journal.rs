@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use daemon_common::{Epoch, FenceToken, MerkleRoot, SessionId, TraceId};
+use daemon_credentials::CredentialAuditEvent;
 use daemon_store::SessionStore;
 use daemon_supervision::ManageEvent;
 use daemon_telemetry::{
@@ -101,6 +102,40 @@ impl JournalSink {
             kind: kind.to_string(),
             detail,
             timestamp_ms: now_ms,
+        };
+        let (bytes, content_hash) = encode_entry(&record);
+        self.store
+            .append_trace(
+                &self.session,
+                self.epoch,
+                daemon_store::TraceEntry {
+                    seq,
+                    bytes,
+                    content_hash,
+                },
+            )
+            .await
+    }
+
+    /// Append a **credential audit** event to the same durable segment (host-spec §6). The
+    /// credential lifecycle thus rides the identical verifiable trace as the unit's `ManageEvent`s:
+    /// after [`JournalSink::seal`] the sealed, signed root is the tamper-evident answer to "who
+    /// requested which credential when," and it verifies end-to-end by the audit's own `trace_id`.
+    pub async fn record_credential(
+        &self,
+        event: &CredentialAuditEvent,
+    ) -> Result<(), daemon_store::StoreError> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let record = TraceRecord {
+            session: self.session.clone(),
+            epoch: self.epoch,
+            seq,
+            // Prefer the event's own correlation trace (captured at the requesting hop), falling
+            // back to this task's restored trace.
+            trace: trace_or(event.trace, current_trace()),
+            kind: event.kind.label().to_string(),
+            detail: event.summary(),
+            timestamp_ms: event.timestamp_ms,
         };
         let (bytes, content_hash) = encode_entry(&record);
         self.store

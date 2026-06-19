@@ -17,11 +17,14 @@
 //! - [`run_placed_child`] — the child loop: build a [`RemoteStoreClient`], drive the engine through
 //!   the ordinary [`ActivationManager`] under the parent-granted fence, and stream events back.
 
+use crate::credentials::CredentialBroker;
 use async_trait::async_trait;
 use daemon_activation::{ActivationManager, ActivationSubstrate, EngineFactory, SubErr};
 use daemon_common::{
-    DaemonError, FenceToken, PartitionId, SessionId, SnapshotBlob, TraceId, UnitId, UsageDelta,
+    CapabilityLease, CredError, CredId, CredScope, DaemonError, FenceToken, LeaseSecret,
+    PartitionId, ProfileRef, SessionId, SnapshotBlob, TraceId, UnitId, UsageDelta,
 };
+use daemon_core::CredentialProvider;
 use daemon_provision::{ChildGuard, CutChannel, CutWriter, Placement};
 use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics};
 use daemon_store::{
@@ -75,6 +78,13 @@ pub enum CutFrame {
         /// The reply body.
         body: ManageResponseBody,
     },
+    /// Parent -> child: the reply to a brokered [`CredCall`].
+    CredReply {
+        /// Correlates with the originating [`CredCall`].
+        id: u64,
+        /// The reply body.
+        body: CredReplyBody,
+    },
     /// Child -> parent: a management event from the placed unit.
     Event(ManageEvent),
     /// Child -> parent: a brokered durable-store call (served against the parent's authority).
@@ -91,6 +101,45 @@ pub enum CutFrame {
         /// The request payload.
         req: ManageRequest,
     },
+    /// Child -> parent: a brokered credential call (served-or-forwarded up to the owner authority).
+    CredCall {
+        /// Correlation id for the reply.
+        id: u64,
+        /// The credential operation.
+        call: CredCall,
+    },
+}
+
+/// A brokered credential operation crossing a cut. Mirrors the [`CredentialBroker`] surface: an
+/// `Acquire` re-broker (narrowed at each hop) and a `Proxied` `Use` round-trip to the owner.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CredCall {
+    /// Acquire a capability for `profile`, attenuated to `scope`, on behalf of `requester`.
+    Acquire {
+        /// The unit the descendant is acting for (audit subject).
+        requester: Option<UnitId>,
+        /// The profile a credential is wanted for.
+        profile: ProfileRef,
+        /// The (already per-hop-narrowed) scope requested.
+        scope: CredScope,
+    },
+    /// Resolve a capability to its usable secret at the owner (the `Proxied` use path).
+    Use {
+        /// The acting unit (audit subject).
+        requester: Option<UnitId>,
+        /// The capability to resolve.
+        lease: CapabilityLease,
+    },
+}
+
+/// The reply to a [`CredCall`]. The owner's verdict (notably `ScopeDenied`/`Expired`/`Fenced`)
+/// round-trips faithfully via the serializable [`CredError`].
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CredReplyBody {
+    /// An `Acquire` reply: the minted capability or the denial.
+    Lease(Result<CapabilityLease, CredError>),
+    /// A `Use` reply: the resolved secret or the failure.
+    Secret(Result<LeaseSecret, CredError>),
 }
 
 /// A brokered [`SessionStore`] operation, mirroring the trait one-to-one (phase-5 cut).
@@ -452,6 +501,152 @@ impl SessionStore for RemoteStoreClient {
             _ => StoreStats::default(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Credential brokering across the cut
+// ---------------------------------------------------------------------------
+
+/// The parent side of a credential cut: read brokered [`CredCall`]s and serve each against `broker`
+/// (serve-or-forward), framing the [`CredReplyBody`] back. Each call is served on its own task so a
+/// relay's *upward* forward (which awaits an even-higher hop) never blocks this reader. Runs until
+/// the cut closes.
+///
+/// In the `Proxied` chain the raw key never crosses this loop on the way down — only on a `Use`
+/// reply from the owner, and only as far as the immediate caller.
+pub async fn serve_credentials(channel: CutChannel, broker: Arc<dyn CredentialBroker>) {
+    let (writer, mut reader) = channel.split();
+    while let Some(bytes) = reader.recv().await {
+        let Some(Wire { trace, frame }) = decode(&bytes) else {
+            continue;
+        };
+        set_trace(trace);
+        if let CutFrame::CredCall { id, call } = frame {
+            let writer = writer.clone();
+            let broker = broker.clone();
+            // Serve under the restored trace so the audit at this hop (and every hop up) correlates.
+            tokio::spawn(with_trace(trace, async move {
+                let body = match call {
+                    CredCall::Acquire {
+                        requester,
+                        profile,
+                        scope,
+                    } => CredReplyBody::Lease(broker.acquire(requester, &profile, &scope).await),
+                    CredCall::Use { requester, lease } => {
+                        CredReplyBody::Secret(broker.use_capability(requester, &lease).await)
+                    }
+                };
+                let _ = writer.send(&encode(&CutFrame::CredReply { id, body })).await;
+            }));
+        }
+    }
+}
+
+/// The descendant-side credential client: a [`CredentialBroker`] (and the engine's
+/// [`CredentialProvider`]) whose every call is a request/reply round-trip over the cut, served by
+/// the parent's broker. Owns its reader so it completes its own pending calls — credential cuts are
+/// dedicated channels, distinct from the multiplexed store/management cut.
+pub struct RemoteCredentialClient {
+    writer: CutWriter,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<CredReplyBody>>>>,
+    next_id: AtomicU64,
+}
+
+impl RemoteCredentialClient {
+    /// Connect over `channel`, spawning the reader that routes [`CredReplyBody`]s to pending calls.
+    pub fn connect(channel: CutChannel) -> Arc<Self> {
+        let (writer, mut reader) = channel.split();
+        let client = Arc::new(Self {
+            writer,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(0),
+        });
+        let c = client.clone();
+        tokio::spawn(with_trace(TraceId::NONE, async move {
+            while let Some(bytes) = reader.recv().await {
+                let Some(Wire { trace, frame }) = decode(&bytes) else {
+                    continue;
+                };
+                set_trace(trace);
+                if let CutFrame::CredReply { id, body } = frame {
+                    if let Some(tx) = c.pending.lock().unwrap().remove(&id) {
+                        let _ = tx.send(body);
+                    }
+                }
+            }
+        }));
+        client
+    }
+
+    async fn call(&self, call: CredCall) -> Result<CredReplyBody, CredError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        if self
+            .writer
+            .send(&encode(&CutFrame::CredCall { id, call }))
+            .await
+            .is_err()
+        {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(CredError::NoAuthority);
+        }
+        rx.await.map_err(|_| CredError::NoAuthority)
+    }
+}
+
+#[async_trait]
+impl CredentialBroker for RemoteCredentialClient {
+    async fn acquire(
+        &self,
+        requester: Option<UnitId>,
+        profile: &ProfileRef,
+        scope: &CredScope,
+    ) -> Result<CapabilityLease, CredError> {
+        match self
+            .call(CredCall::Acquire {
+                requester,
+                profile: profile.clone(),
+                scope: scope.clone(),
+            })
+            .await?
+        {
+            CredReplyBody::Lease(r) => r,
+            CredReplyBody::Secret(_) => Err(CredError::Other("unexpected credential reply".into())),
+        }
+    }
+
+    async fn use_capability(
+        &self,
+        requester: Option<UnitId>,
+        lease: &CapabilityLease,
+    ) -> Result<LeaseSecret, CredError> {
+        match self
+            .call(CredCall::Use {
+                requester,
+                lease: lease.clone(),
+            })
+            .await?
+        {
+            CredReplyBody::Secret(r) => r,
+            CredReplyBody::Lease(_) => Err(CredError::Other("unexpected credential reply".into())),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for RemoteCredentialClient {
+    async fn acquire(
+        &self,
+        profile: &ProfileRef,
+        scope: &CredScope,
+    ) -> Result<CapabilityLease, CredError> {
+        CredentialBroker::acquire(self, None, profile, scope).await
+    }
+
+    async fn release(&self, _lease: &CapabilityLease) {}
+
+    async fn rotate(&self, _profile: &ProfileRef, _cap_id: &CredId) {}
 }
 
 // ---------------------------------------------------------------------------
