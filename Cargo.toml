@@ -39,7 +39,6 @@ daemon-tool-shell = { path = "tools/daemon-tool-shell" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }
 daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
 daemon-tool-orchestrate = { path = "tools/daemon-tool-orchestrate" }
-daemon-stub-engine = { path = "tests/daemon-stub-engine" }
 
 [profile.release]
 panic = "unwind"   # catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)

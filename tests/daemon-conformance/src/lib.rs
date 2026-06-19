@@ -1,17 +1,21 @@
-//! `daemon-conformance` — the substrate conformance harness.
+//! `daemon-conformance` — the substrate + translation conformance harness.
 //!
-//! The executable acceptance gate for the build-first milestone: the seven acceptance tests from
-//! [`rust-substrate-evaluation.md`](../../../docs/specs/rust-substrate-evaluation.md) §6, run against
-//! the in-memory [`daemon_store::InMemoryStore`] driven through [`daemon_activation`] with the
-//! [`daemon_stub_engine`] standing in for the real `daemon-core`. No dependency on `daemon-host`.
+//! The executable acceptance gate for the build-first milestones: the seven substrate acceptance
+//! tests from [`rust-substrate-evaluation.md`](../../../docs/specs/rust-substrate-evaluation.md) §6,
+//! run against the in-memory [`daemon_store::InMemoryStore`] driven through [`daemon_activation`].
+//! From phase 3 the engine under test is the *real* `daemon-core`, driven via the host's
+//! [`CoreEngineFactory`](daemon_host::CoreEngineFactory) (the stub engine is retired): the substrate
+//! invariants are now proven against the real engine's deterministic delegate→suspend→resume cycle.
 //!
 //! Coverage map (acceptance test -> lifecycle §4 invariant):
 //! 1 churn/baseline (#8), 2 crash-after-every-boundary (#2/#3/#7), 3 idempotency (#2/#3),
 //! 4 dual-node fencing (#5/#6), 5 empty-mailbox kill (#1/#7), 6 ownership-transfer (#5/#6),
 //! 7 lost-wake recovery (#1/#7).
 //!
-//! Phase 2 adds `mod supervision`: the resident-service supervisor (restart/backoff/meltdown) and
-//! the running `daemon_host::Host` driving sessions to completion under churn and service crashes.
+//! `mod supervision` (phase 2): the resident-service supervisor (restart/backoff/meltdown) and the
+//! running `daemon_host::Host` driving sessions to completion under churn and service crashes.
+//! `mod translation` (phase 3 gate): the §17 ⇄ management protocol round-trip — the host presents
+//! the real engine as a `ManagedUnit` and the supervision §4 mapping table is exercised end to end.
 
 #![forbid(unsafe_code)]
 
@@ -19,9 +23,9 @@
 mod harness {
     use daemon_activation::ActivationManager;
     use daemon_common::{PartitionId, SessionId};
-    use daemon_protocol::Snapshot;
+    use daemon_core::Snapshot;
+    use daemon_host::CoreEngineFactory;
     use daemon_store::{InMemoryStore, JobCompletion, SessionStatus, SessionStore};
-    use daemon_stub_engine::StubEngineFactory;
     use std::sync::Arc;
 
     pub const PARTITION: PartitionId = PartitionId::DEFAULT;
@@ -33,9 +37,9 @@ mod harness {
         (store, mgr)
     }
 
-    /// An activation manager over an existing (possibly shared) store.
+    /// An activation manager over an existing (possibly shared) store, driving the real engine.
     pub fn manager(store: Arc<InMemoryStore>) -> ActivationManager {
-        ActivationManager::new(store, Arc::new(StubEngineFactory::new()), PARTITION)
+        ActivationManager::new(store, Arc::new(CoreEngineFactory::delegating()), PARTITION)
     }
 
     /// Create a fresh `Ready` session with an encoded empty snapshot.
@@ -332,8 +336,8 @@ mod supervision {
         Backoff, ChildSpec, HealthStatus, Host, HostConfig, MeltdownPolicy, RestartPolicy,
         ServiceError, Supervisor,
     };
+    use daemon_host::CoreEngineFactory;
     use daemon_store::{InMemoryStore, SessionStatus, SessionStore};
-    use daemon_stub_engine::StubEngineFactory;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -559,7 +563,7 @@ mod supervision {
         let store = Arc::new(InMemoryStore::new());
         let host = Host::new(
             store.clone(),
-            Arc::new(StubEngineFactory::new()),
+            Arc::new(CoreEngineFactory::delegating()),
             HostConfig::default(),
         );
 
@@ -584,7 +588,7 @@ mod supervision {
         let store = Arc::new(InMemoryStore::new());
         let manager = ActivationManager::new(
             store.clone(),
-            Arc::new(StubEngineFactory::new()),
+            Arc::new(CoreEngineFactory::delegating()),
             PartitionId::DEFAULT,
         );
 
@@ -648,5 +652,138 @@ mod supervision {
 
         // ensure status() import is exercised (sanity on one session)
         assert_eq!(status(&store, &ids[0]).await, Some(SessionStatus::Completed));
+    }
+}
+
+#[cfg(test)]
+mod translation {
+    //! THE PHASE-3 GATE: §17 ⇄ management protocol round-trips (`daemon-workspace-layout.md` §7
+    //! phase-3 gate). The host presents a real `daemon-core` engine as a `UnitKind::Engine`
+    //! [`ManagedUnit`]; driving it with `ManageCommand`s and observing `ManageEvent`s / a
+    //! `ManageRequest` exercises the supervision §4 mapping table end to end (host-spec §9,
+    //! supervision invariant #7).
+
+    use async_trait::async_trait;
+    use daemon_common::{Budget, ReqId, SessionId, UnitId};
+    use daemon_core::{DelegateTool, Engine, MockProvider, Provider, SystemPrompt, ToolRegistry};
+    use daemon_host::EngineUnit;
+    use daemon_supervision::{
+        Ack, Concurrency, EndReason, ManageCommand, ManageEvent, ManageRequest,
+        ManageRequestHandler, ManageRequestKind, ManageResponse, ManageResponseBody, ManagedUnit,
+        ProgressDelta, StartTrigger, UnitKind, WorkRef,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Build a managed unit over a real engine driven by `provider`.
+    fn engine_unit(provider: Arc<dyn Provider>) -> EngineUnit {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DelegateTool::new("background-work")));
+        let engine = Engine::fresh(
+            SessionId::new("u1"),
+            SystemPrompt::new("translation gate engine"),
+            provider,
+            Arc::new(registry),
+        );
+        EngineUnit::spawn(UnitId::new("u1"), engine)
+    }
+
+    /// `Assign` drives a turn whose §17 events surface as `Started → Progress → Finished` upward.
+    #[tokio::test]
+    async fn assign_round_trips_to_finished() {
+        let unit = engine_unit(Arc::new(MockProvider::completing("all done")));
+        assert_eq!(unit.kind(), UnitKind::Engine);
+        assert_eq!(unit.id(), UnitId::new("u1"));
+
+        let mut events = unit.events();
+        let ack = unit
+            .command(ManageCommand::Assign {
+                request_id: ReqId(1),
+                work: WorkRef::inline("w1", "do the thing"),
+                budget: Budget::unlimited(),
+            })
+            .await;
+        assert_eq!(ack, Ack::Accepted);
+
+        let mut saw_started = false;
+        let mut saw_progress = false;
+        let outcome = loop {
+            match tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+                Ok(Ok(ManageEvent::Started {
+                    trigger: StartTrigger::Assigned(_),
+                    ..
+                })) => saw_started = true,
+                Ok(Ok(ManageEvent::Progress {
+                    delta: ProgressDelta::Text(_),
+                    ..
+                })) => saw_progress = true,
+                Ok(Ok(ManageEvent::Finished { outcome, .. })) => break outcome,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => panic!("event stream closed before Finished"),
+                Err(_) => panic!("timed out waiting for ManageEvent::Finished"),
+            }
+        };
+
+        assert!(saw_started, "no Started{{Assigned}} mapped from TurnStarted");
+        assert!(saw_progress, "no Progress{{Text}} mapped from TextDelta");
+        assert_eq!(outcome.end_reason, EndReason::Completed);
+    }
+
+    /// `Pause`/`Resume`/`Scale` are no-ops at an engine leaf — the partial-downward `Ack::Unsupported`.
+    #[tokio::test]
+    async fn pause_resume_scale_are_unsupported() {
+        let unit = engine_unit(Arc::new(MockProvider::completing("done")));
+        assert_eq!(unit.command(ManageCommand::Pause).await, Ack::Unsupported);
+        assert_eq!(unit.command(ManageCommand::Resume).await, Ack::Unsupported);
+        assert_eq!(
+            unit.command(ManageCommand::Scale {
+                target: Concurrency(4)
+            })
+            .await,
+            Ack::Unsupported
+        );
+    }
+
+    /// A blocking §17 `HostRequest` raised inside a turn surfaces upward as a correlated
+    /// `ManageRequest` through the installed handler (supervision §2.3 / §4).
+    #[tokio::test]
+    async fn host_request_maps_to_manage_request() {
+        struct Recorder {
+            tx: tokio::sync::mpsc::UnboundedSender<ManageRequest>,
+        }
+
+        #[async_trait]
+        impl ManageRequestHandler for Recorder {
+            async fn request(&self, req: ManageRequest) -> ManageResponse {
+                let request_id = req.request_id;
+                let _ = self.tx.send(req);
+                ManageResponse {
+                    request_id,
+                    body: ManageResponseBody::Delegated(vec![UnitId::new("child-1")]),
+                }
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let unit = engine_unit(Arc::new(MockProvider::delegating("delegate", "done")));
+        unit.install_request_handler(Arc::new(Recorder { tx }));
+
+        let ack = unit
+            .command(ManageCommand::Assign {
+                request_id: ReqId(7),
+                work: WorkRef::inline("w1", "needs background work"),
+                budget: Budget::unlimited(),
+            })
+            .await;
+        assert_eq!(ack, Ack::Accepted);
+
+        let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for the escalated ManageRequest")
+            .expect("a ManageRequest");
+        assert!(
+            matches!(got.kind, ManageRequestKind::Delegate(_)),
+            "the §17 HostRequest::Delegate did not map to ManageRequestKind::Delegate"
+        );
     }
 }

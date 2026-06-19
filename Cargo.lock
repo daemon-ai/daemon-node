@@ -128,12 +128,14 @@ dependencies = [
 name = "daemon-conformance"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "daemon-activation",
  "daemon-common",
+ "daemon-core",
  "daemon-host",
  "daemon-protocol",
  "daemon-store",
- "daemon-stub-engine",
+ "daemon-supervision",
  "tokio",
  "tokio-util",
 ]
@@ -143,10 +145,13 @@ name = "daemon-core"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "ciborium",
  "daemon-common",
  "daemon-protocol",
  "serde",
  "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -182,7 +187,10 @@ dependencies = [
  "async-trait",
  "daemon-activation",
  "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
  "daemon-store",
+ "daemon-supervision",
  "dashmap",
  "thiserror",
  "tokio",
@@ -208,7 +216,6 @@ name = "daemon-protocol"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "ciborium",
  "daemon-common",
  "serde",
 ]
@@ -236,22 +243,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "daemon-stub-engine"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "daemon-activation",
- "daemon-common",
- "daemon-protocol",
- "daemon-store",
-]
-
-[[package]]
 name = "daemon-supervision"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "daemon-common",
  "serde",
+ "tokio",
 ]
 
 [[package]]

@@ -9,9 +9,11 @@ publish = false
 [dependencies]
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
+daemon-supervision = { workspace = true }
+daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
 daemon-host = { workspace = true }
-daemon-stub-engine = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+async-trait = { workspace = true }

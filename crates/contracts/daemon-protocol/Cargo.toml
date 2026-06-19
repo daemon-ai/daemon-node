@@ -8,5 +8,4 @@ license.workspace = true
 [dependencies]
 daemon-common = { workspace = true }
 serde = { workspace = true }
-ciborium = { workspace = true }
 async-trait = { workspace = true }

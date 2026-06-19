@@ -141,6 +141,50 @@ impl Budget {
     }
 }
 
+/// Correlation id for a request/response pair on the live protocols.
+///
+/// Shared by the §17 host protocol (`daemon-protocol`) and the generic management protocol
+/// (`daemon-supervision`) so a `request_id` means the same thing at every level of the tree
+/// (supervision spec §2.3; §17.1 item 2). Mandatory on every correlated command/request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReqId(pub u64);
+
+/// An incremental usage measurement, identical at every level of the supervision tree.
+///
+/// `Usage` is first-class on both the §17 and management event streams precisely because it
+/// aggregates up the tree by construction: an orchestrator's usage is the fold of its children's
+/// (supervision spec §2.2 / §4, "identical at every level"). Deltas are additive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageDelta {
+    /// Prompt/input tokens consumed by this step.
+    pub input_tokens: u64,
+    /// Completion/output tokens produced by this step.
+    pub output_tokens: u64,
+    /// Provider API calls made by this step.
+    pub api_calls: u32,
+}
+
+impl UsageDelta {
+    /// Fold another delta into this one (the tree aggregation, supervision invariant #4).
+    pub fn add(&mut self, other: &UsageDelta) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.api_calls += other.api_calls;
+    }
+}
+
+/// A point-in-time view of a provider rate-limit window, identical at every level (supervision
+/// spec §2.2). Fields are `None` when the provider does not surface them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitSnapshot {
+    /// Requests/tokens remaining in the current window.
+    pub remaining: Option<u64>,
+    /// The window ceiling.
+    pub limit: Option<u64>,
+    /// Milliseconds until the window resets.
+    pub reset_ms: Option<u64>,
+}
+
 /// Version of the live host wire protocol (§17 envelopes / CDDL contract).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WireVersion(pub u16);
@@ -166,9 +210,9 @@ impl Default for WireVersion {
     }
 }
 
-/// The opaque, persisted form of an engine [`Snapshot`](crate). Typed snapshots live in
-/// `daemon-protocol`; the durable layer (`daemon-store` / `daemon-activation`) handles them only as
-/// CBOR bytes, keeping those crates free of a protocol dependency (lifecycle §2; layout §3 DAG).
+/// The opaque, persisted form of an engine snapshot. The typed `Snapshot` lives in `daemon-core`
+/// (§5); the durable layer (`daemon-store` / `daemon-activation`) handles them only as CBOR bytes,
+/// keeping those crates free of an engine/protocol dependency (lifecycle §2; layout §3 DAG).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBlob(pub Vec<u8>);
 

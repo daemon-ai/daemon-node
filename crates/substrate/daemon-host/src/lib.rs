@@ -1,28 +1,37 @@
-//! `daemon-host` — the durable substrate that runs a unit.
+//! `daemon-host` — the durable substrate that runs a unit, and the protocol translator.
 //!
-//! Phase 2 scope: the **resident-service supervision** layer. It composes the phase-1 durable
-//! substrate (`daemon-store` + `daemon-activation`) into a continuously-running host whose fixed
-//! resident-service tree ([`daemon-host-spec.md`](../../../docs/specs/daemon-host-spec.md) §5) runs
-//! under a one-for-one restart/backoff/meltdown [`Supervisor`]. The host is engine-agnostic: it
-//! drives whatever [`EngineFactory`](daemon_activation::EngineFactory) is injected (the stub in
-//! tests), keeping it free of `daemon-core` until phase 3.
+//! Composes the phase-1 durable substrate (`daemon-store` + `daemon-activation`) into a
+//! continuously-running host whose fixed resident-service tree
+//! ([`daemon-host-spec.md`](../../../docs/specs/daemon-host-spec.md) §5) runs under a one-for-one
+//! restart/backoff/meltdown [`Supervisor`] (phase 2), and adds the host's defining job: the §17 ⇄
+//! management protocol translation (§9, phase 3).
 //!
-//! Deferred to phase 3 (and beyond): the §17 ⇄ management protocol translation, the real engine,
-//! credentials, provisioning, telemetry, and remote transport.
+//! Two adapters bridge the engine to the substrate and to the supervisor above:
+//! - [`CoreIncarnation`] / [`CoreEngineFactory`] drive a real `daemon-core` engine through the
+//!   protocol-agnostic activation seam (host-spec §3.1), keeping `daemon-core` free of the durable
+//!   substrate.
+//! - [`EngineUnit`] presents a running engine as a `UnitKind::Engine`
+//!   [`ManagedUnit`](daemon_supervision::ManagedUnit), realizing the supervision §4 mapping table.
+//!
+//! Deferred to later phases: credential authority, provisioning, telemetry, and remote transport.
 //!
 //! See `docs/specs/daemon-host-spec.md`.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod engine_incarnation;
 pub mod services;
 pub mod supervisor;
+pub mod unit;
 
 pub use config::HostConfig;
+pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, ProviderBuilder};
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle,
 };
+pub use unit::EngineUnit;
 
 use daemon_activation::{ActivationManager, EngineFactory};
 use daemon_store::SessionStore;

@@ -1,23 +1,21 @@
-//! `daemon-protocol` — the §17 host wire protocol and the typed engine snapshot.
+//! `daemon-protocol` — the §17 host wire protocol (the engine's upward face).
 //!
-//! Phase 1 carries a *minimal* slice of the §17 surface — enough for `daemon-stub-engine` to speak
-//! it and for the durable activation core to be proven — plus the typed [`Snapshot`] the engine
-//! produces. The persisted form is CBOR via `ciborium`, emitted as a [`SnapshotBlob`]; the durable
-//! layer never sees these typed structs. Depends only on `daemon-common`.
+//! The typed control/event/request surface the engine (`daemon-core`) speaks to its host: commands
+//! down (`AgentCommand`), a lossless-primary event stream up (`AgentEvent`, each carrying a
+//! monotonic `seq`), and blocking correlated host requests (`HostRequest` / `HostRequestHandler`).
+//! Pure wire types only; no runtime logic. Depends only on `daemon-common`.
 //!
-//! The full §17 surface (streaming deltas, tool views, usage/rate-limit telemetry) and the real
-//! `daemon-core` §5 `Conversation` arrive in phase 3.
+//! The typed engine snapshot (§5 `Conversation`, references) lives in `daemon-core`, not here — the
+//! durable substrate handles only the opaque [`SnapshotBlob`](daemon_common::SnapshotBlob). The host
+//! adapts this §17 surface to the generic management protocol (`daemon-supervision` §4); the engine
+//! crate stays free of that protocol.
 
 #![forbid(unsafe_code)]
 
-use daemon_common::{Budget, Epoch, JobId, SessionId, SnapshotBlob};
+use daemon_common::{Budget, JobId, RateLimitSnapshot, ReqId, UsageDelta};
 use serde::{Deserialize, Serialize};
 
-/// Correlation id for a request/response pair on the §17 surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ReqId(pub u64);
-
-/// A user-authored turn input (placeholder for the richer §5 message type).
+/// A user-authored turn input (the `StartTurn` payload; the §5 message type proper lives in core).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMsg {
     /// The textual body of the message.
@@ -37,6 +35,7 @@ impl UserMsg {
 
 /// Commands the host sends down to an engine (§17, host -> core).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AgentCommand {
     /// Begin a turn from a (user or resumed) trigger.
     StartTurn {
@@ -91,8 +90,9 @@ pub enum CompletionSource {
     Delegation(JobId),
 }
 
-/// How a turn ended (carried in [`TurnSummary`]).
+/// How a turn ended (carried in [`TurnSummary`]; the §17.3 leaf form of the management `EndReason`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum EndReason {
     /// The turn completed normally.
     Completed,
@@ -100,6 +100,10 @@ pub enum EndReason {
     Suspended,
     /// The turn was interrupted.
     Interrupted,
+    /// The turn ran out of its assigned budget.
+    BudgetExhausted,
+    /// The turn failed.
+    Failed,
 }
 
 /// Terminal turn outcome (§17).
@@ -107,9 +111,48 @@ pub enum EndReason {
 pub struct TurnSummary {
     /// Why the turn ended.
     pub end_reason: EndReason,
+    /// Optional final assistant text.
+    pub final_text: Option<String>,
+    /// Usage accrued over the turn.
+    pub usage: UsageDelta,
 }
 
-/// Events the engine streams up to the host (§17, core -> host). Each carries a monotonic `seq`.
+impl TurnSummary {
+    /// A summary that only records why the turn ended.
+    pub fn ended(end_reason: EndReason) -> Self {
+        Self {
+            end_reason,
+            final_text: None,
+            usage: UsageDelta::default(),
+        }
+    }
+}
+
+/// A compact view of a tool invocation, streamed on the event surface (the durable record lives in
+/// the engine's `Conversation`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallView {
+    /// Correlates the start with its result.
+    pub call_id: String,
+    /// The tool's stable name.
+    pub name: String,
+    /// A human-readable summary of the arguments (never the raw secret-bearing payload).
+    pub args_summary: String,
+}
+
+/// A compact view of a tool result, streamed on the event surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultView {
+    /// Correlates back to the originating [`ToolCallView`].
+    pub call_id: String,
+    /// Whether the tool succeeded.
+    pub ok: bool,
+    /// A human-readable summary of the outcome.
+    pub summary: String,
+}
+
+/// Events the engine streams up to the host (§17, core -> host). Each carries a monotonic `seq`;
+/// the stream is lossless-primary, so a lossy live consumer resyncs from the last acked `seq`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AgentEvent {
@@ -127,6 +170,42 @@ pub enum AgentEvent {
         /// The text fragment.
         text: String,
     },
+    /// A chunk of assistant reasoning. A deliberately separate channel from [`AgentEvent::TextDelta`]
+    /// so a host never accidentally renders reasoning as output (§17.2 scrubbing).
+    ReasoningDelta {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The reasoning fragment.
+        text: String,
+    },
+    /// A tool invocation began.
+    ToolStarted {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The invocation view.
+        call: ToolCallView,
+    },
+    /// A tool invocation finished.
+    ToolFinished {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The result view.
+        result: ToolResultView,
+    },
+    /// Incremental usage; aggregates up the tree by construction (identical at every level).
+    Usage {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The usage increment.
+        delta: UsageDelta,
+    },
+    /// A provider rate-limit window update.
+    RateLimit {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The current window snapshot.
+        snapshot: RateLimitSnapshot,
+    },
     /// The turn finished.
     TurnFinished {
         /// Monotonic event sequence number.
@@ -143,6 +222,23 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    /// The monotonic sequence number this event carries.
+    pub fn seq(&self) -> u64 {
+        match self {
+            AgentEvent::TurnStarted { seq, .. }
+            | AgentEvent::TextDelta { seq, .. }
+            | AgentEvent::ReasoningDelta { seq, .. }
+            | AgentEvent::ToolStarted { seq, .. }
+            | AgentEvent::ToolFinished { seq, .. }
+            | AgentEvent::Usage { seq, .. }
+            | AgentEvent::RateLimit { seq, .. }
+            | AgentEvent::TurnFinished { seq, .. }
+            | AgentEvent::Error { seq, .. } => *seq,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // §17 blocking host requests (human-in-the-loop / delegation)
 // ---------------------------------------------------------------------------
@@ -156,8 +252,11 @@ pub struct HostRequest {
     pub kind: HostRequestKind,
 }
 
-/// The kinds of blocking host request the engine can raise (minimal phase-1 subset).
+/// The kinds of blocking host request the engine can raise (§17 = `{Approval, Input, Choice,
+/// Delegate}`; the management protocol's `ManageRequestKind` is the superset that adds
+/// `Escalate`/`Resource`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum HostRequestKind {
     /// Ask the host to approve an action.
     Approval {
@@ -168,6 +267,13 @@ pub enum HostRequestKind {
     Input {
         /// The input prompt.
         prompt: String,
+    },
+    /// Ask the host to pick one of N options.
+    Choice {
+        /// The choice prompt.
+        prompt: String,
+        /// The available options.
+        options: Vec<String>,
     },
     /// Ask the host to delegate background work, yielding a [`JobId`].
     Delegate {
@@ -189,128 +295,21 @@ pub struct HostResponse {
 
 /// The body of a [`HostResponse`], typed per request kind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum HostResponseBody {
     /// Approval decision.
     Approved(bool),
     /// Free-form input result.
     Input(String),
+    /// The index of the chosen option.
+    Chosen(usize),
     /// The id assigned to delegated work.
     Delegated(JobId),
 }
 
-/// The trait the host implements so an engine can raise blocking requests (§17). Thin in phase 1.
+/// The trait the host implements so an engine can raise blocking requests (§17).
 #[async_trait::async_trait]
 pub trait HostRequestHandler: Send + Sync {
     /// Answer a blocking host request.
     async fn request(&self, req: HostRequest) -> HostResponse;
-}
-
-// ---------------------------------------------------------------------------
-// The typed engine snapshot (lifecycle §2)
-// ---------------------------------------------------------------------------
-
-/// A single conversational turn (minimal placeholder for the §5 `Conversation` body).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Turn {
-    /// Role label (e.g. `user`, `assistant`, `system`).
-    pub role: String,
-    /// The turn text.
-    pub text: String,
-}
-
-/// The typed conversation body. Phase-1 placeholder; replaced by the `daemon-core` §5 type later.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Conversation {
-    /// Ordered turns.
-    pub turns: Vec<Turn>,
-}
-
-impl Conversation {
-    /// Append a turn.
-    pub fn push(&mut self, role: impl Into<String>, text: impl Into<String>) {
-        self.turns.push(Turn {
-            role: role.into(),
-            text: text.into(),
-        });
-    }
-
-    /// Number of turns recorded so far.
-    pub fn len(&self) -> usize {
-        self.turns.len()
-    }
-
-    /// Whether the conversation is empty.
-    pub fn is_empty(&self) -> bool {
-        self.turns.is_empty()
-    }
-}
-
-/// A host-owned OS process handle, re-attached by the host on rehydration (lifecycle §2).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProcHandle {
-    /// Opaque host-assigned process key.
-    pub key: String,
-}
-
-/// A tool identity plus the key the tool uses to reload its own external state (lifecycle §1.2).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolBinding {
-    /// The tool's stable name.
-    pub name: String,
-    /// The key the tool reloads its own state from.
-    pub state_key: String,
-}
-
-/// Handles to re-establish on rehydration — never live resources (lifecycle §2).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct References {
-    /// Delegated child engines, by id (recursive composition).
-    pub children: Vec<SessionId>,
-    /// Host-owned OS processes, re-attached by the host.
-    pub processes: Vec<ProcHandle>,
-    /// Tool identities + the keys tools use to reload their own state.
-    pub tools: Vec<ToolBinding>,
-}
-
-/// The complete, serializable state of one engine incarnation. Nothing else is durable
-/// (lifecycle §2). Tool working state and live resources are never included.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Snapshot {
-    /// Stable logical identity (not a live task handle).
-    pub session_id: SessionId,
-    /// Monotonic epoch; bumped on every suspension; fences stale incarnations.
-    pub epoch: Epoch,
-    /// The typed conversation body (source of truth).
-    pub conversation: Conversation,
-    /// Handles to re-establish on rehydration.
-    pub references: References,
-    /// Outstanding background work this incarnation suspended for.
-    pub waiting_for: Vec<JobId>,
-}
-
-impl Snapshot {
-    /// A fresh snapshot for a newly created session at epoch 0.
-    pub fn fresh(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            epoch: Epoch::ZERO,
-            conversation: Conversation::default(),
-            references: References::default(),
-            waiting_for: Vec::new(),
-        }
-    }
-
-    /// Encode to the opaque persisted CBOR form.
-    pub fn encode(&self) -> Result<SnapshotBlob, daemon_common::DaemonError> {
-        let mut bytes = Vec::new();
-        ciborium::into_writer(self, &mut bytes)
-            .map_err(|e| daemon_common::DaemonError::Codec(e.to_string()))?;
-        Ok(SnapshotBlob::new(bytes))
-    }
-
-    /// Decode from the opaque persisted CBOR form.
-    pub fn decode(blob: &SnapshotBlob) -> Result<Self, daemon_common::DaemonError> {
-        ciborium::from_reader(blob.as_bytes())
-            .map_err(|e| daemon_common::DaemonError::Codec(e.to_string()))
-    }
 }
