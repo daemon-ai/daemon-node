@@ -1,0 +1,6 @@
+language = "C"
+pragma_once = true
+include_guard = "DAEMON_H"
+usize_is_size_t = true
+sys_includes = ["stddef.h", "stdint.h"]
+documentation = true

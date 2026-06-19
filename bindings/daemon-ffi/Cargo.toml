@@ -1,0 +1,15 @@
+[package]
+name = "daemon-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+daemon-host = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-supervision = { workspace = true }

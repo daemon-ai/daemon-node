@@ -141,6 +141,7 @@ deployment shapes:
 | **In-process actor** | TUI, local desktop, ACP, tests | links `daemon-core`, sends `AgentCommand`, subscribes to `AgentEvent` | typed channels (lossless-primary), no serialization |
 | **In-process + server** | dashboard / self-hosting | same binary also runs axum exposing the protocol | WS/SSE for remote clients |
 | **Out-of-process** | remote desktop, browser, CI, SDK | connects to a remote `daemon-server` | serialized `daemon-protocol` |
+| **C ABI (cross-language)** | C/C++/Swift/Go/Node/JVM embedders | links `daemon-core-ffi` (brain) or `daemon-ffi` (durable system); same `AgentCommand`/`AgentEvent` | CBOR over opaque handles — see [`daemon-ffi-spec.md`](../../../../docs/specs/daemon-ffi-spec.md) |
 
 Python had to *fake* this spectrum with subprocess spawning, port handshakes, and token adoption.
 In Rust it is one trait boundary with three call sites. **This is the property that makes "embed

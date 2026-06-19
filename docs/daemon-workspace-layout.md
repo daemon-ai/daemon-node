@@ -32,6 +32,10 @@ crate runs).
 - **Orchestration is a capability, not a node type** (§4). There is no orchestrator *engine* — the
   brain is always `daemon-core` — but there **is** a `daemon-orchestration` *fleet-runtime* crate
   beneath a thin tool veneer.
+- **Embedding is a thin shell at a protocol seam, not a new API.** The C ABI / FFI crates
+  (`bindings/`) pump CBOR-encoded `daemon-protocol` / `daemon-supervision` messages over opaque
+  handles — one more row in the embedding spectrum, riding the existing `wire_version` + CDDL contract
+  ([`docs/specs/daemon-ffi-spec.md`](specs/daemon-ffi-spec.md)).
 - **Reference material is outside the workspace** (`research/`), so the cloned trees never build or lint.
 
 ---
@@ -40,7 +44,7 @@ crate runs).
 
 ```text
 daemon/                              # cargo workspace root
-├── Cargo.toml                       # [workspace] members = crates/*/*, tools/*, bins/*, tests/*, xtask
+├── Cargo.toml                       # [workspace] members = crates/*/*, tools/*, bindings/*, bins/*, tests/*, xtask
 ├── Cargo.lock
 ├── rust-toolchain.toml              # pinned toolchain
 ├── rustfmt.toml · clippy.toml · deny.toml
@@ -101,6 +105,10 @@ daemon/                              # cargo workspace root
 │   ├── daemon-tool-fs/
 │   ├── daemon-tool-tkx/             #   work source = agent-managed tooling (NOT a core crate)
 │   └── daemon-tool-orchestrate/     #   thin agent veneer over daemon-orchestration (→ orchestration, core Tool trait)
+│
+├── bindings/                        # C ABI / embedding shells — thin cdylibs over the protocol seams (docs/specs/daemon-ffi-spec.md)
+│   ├── daemon-core-ffi/             #   cdylib+staticlib over §17 — embed the engine (→ core, protocol)
+│   └── daemon-ffi/                  #   cdylib+staticlib over host/mgmt surface — embed the durable system (→ host)
 │
 ├── bins/
 │   ├── daemon/                      # the node binary — runs as embedder | host | (orchestrating) engine by config

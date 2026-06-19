@@ -146,12 +146,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-core-ffi"
+version = "0.0.0"
+dependencies = [
+ "daemon-core",
+ "daemon-protocol",
+]
+
+[[package]]
 name = "daemon-credentials"
 version = "0.0.0"
 dependencies = [
  "async-trait",
  "daemon-common",
  "thiserror",
+]
+
+[[package]]
+name = "daemon-ffi"
+version = "0.0.0"
+dependencies = [
+ "daemon-host",
+ "daemon-protocol",
+ "daemon-supervision",
 ]
 
 [[package]]

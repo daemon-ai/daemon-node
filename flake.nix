@@ -93,6 +93,7 @@
             [
               rustToolchain
               fenix.packages.${system}.rust-analyzer
+              pkgs.rust-cbindgen
             ]
             ++ lib.optionals (lib.hasAttr "cargo-deny" pkgs) [
               pkgs.cargo-deny
