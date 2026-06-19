@@ -15,3 +15,6 @@ serde = { workspace = true }
 ciborium = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -149,6 +149,55 @@ impl Budget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReqId(pub u64);
 
+/// A logical correlation id that rides every message boundary ("trace context").
+///
+/// Modelled on elfo's `TraceId`: a process generates one at an ingress point, stamps it onto
+/// every outbound frame, and the receiver *restores* it into its task-local scope so logs,
+/// spans, and the verifiable journal on both sides of a cut correlate. This is a correlation
+/// handle only — **not** an integrity primitive (the signed Merkle journal provides that).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TraceId(pub u64);
+
+impl TraceId {
+    /// The absence of a trace context.
+    pub const NONE: Self = Self(0);
+
+    /// Generate a fresh, process-locally-unique, nonzero trace id.
+    ///
+    /// Combines a monotonic counter with a nanosecond time seed and a mixing constant so ids do
+    /// not collide within a run. No crypto dependency: this keeps `daemon-common` at the root of
+    /// the DAG (layout §3).
+    pub fn generate() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mixed = seed.rotate_left(17) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        Self(if mixed == 0 { 1 } else { mixed })
+    }
+
+    /// Whether this is the absent trace.
+    pub fn is_none(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Default for TraceId {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl fmt::Display for TraceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
 /// An incremental usage measurement, identical at every level of the supervision tree.
 ///
 /// `Usage` is first-class on both the §17 and management event streams precisely because it
@@ -237,6 +286,70 @@ impl From<Vec<u8>> for SnapshotBlob {
     fn from(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
+}
+
+/// Macro for a 32-byte opaque digest newtype (SHA-256 sized).
+macro_rules! hash32 {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct $name(pub [u8; 32]);
+
+        impl $name {
+            /// Wrap raw 32 bytes.
+            pub const fn new(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
+            /// Borrow the raw bytes.
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            /// Lowercase hex rendering.
+            pub fn to_hex(&self) -> String {
+                let mut s = String::with_capacity(64);
+                for b in &self.0 {
+                    s.push_str(&format!("{b:02x}"));
+                }
+                s
+            }
+        }
+
+        impl From<[u8; 32]> for $name {
+            fn from(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), self.to_hex())
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.to_hex())
+            }
+        }
+    };
+}
+
+hash32! {
+    /// A 32-byte content hash of a deterministically-encoded value.
+    ///
+    /// Opaque at this layer: `daemon-store` persists it without depending on the crypto stack,
+    /// while `daemon-telemetry` computes it (the Gordian Envelope / dCBOR digest).
+    ContentHash
+}
+
+hash32! {
+    /// A 32-byte Merkle root over a trace segment's digest tree (one per `(session, epoch)`).
+    ///
+    /// Folds every journal entry's digest plus the prior epoch's root (a rolling hash chain),
+    /// bound into the durable incarnation under the same fence the checkpoint commits under.
+    MerkleRoot
 }
 
 /// The shared base error reused/wrapped by layer-specific errors (`StoreError`, `SubErr`).

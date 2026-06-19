@@ -5,9 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Phase-5 scope adds `daemon-provision`: the host owns the protocol-aware side of a placement cut
-# (the `PlacedUnit` proxy, the brokered store, and the placed-child loop). The remaining deferred
-# deps (daemon-credentials, daemon-telemetry, daemon-transport) land with credential authority /
+# Phase-5 scope adds `daemon-provision`: the host owns the protocol-aware side of a placement cut.
+# Phase-6 adds `daemon-telemetry`: the host threads a `TraceId` across the cut (restore-on-receive),
+# folds unit `Usage` into a resident `Metrics`, and (6b) drives the verifiable trace journal. The
+# remaining deferred deps (daemon-credentials, daemon-transport) land with credential authority /
 # cross-node distribution.
 [dependencies]
 daemon-common = { workspace = true }
@@ -17,6 +18,7 @@ daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
 daemon-provision = { workspace = true }
+daemon-telemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 dashmap = { workspace = true }

@@ -19,8 +19,11 @@
 
 use async_trait::async_trait;
 use daemon_activation::{ActivationManager, ActivationSubstrate, EngineFactory, SubErr};
-use daemon_common::{DaemonError, FenceToken, PartitionId, SessionId, SnapshotBlob, UnitId};
+use daemon_common::{
+    DaemonError, FenceToken, PartitionId, SessionId, SnapshotBlob, TraceId, UnitId, UsageDelta,
+};
 use daemon_provision::{ChildGuard, CutChannel, CutWriter, Placement};
+use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics};
 use daemon_store::{
     Activation, Checkpoint, JobCommand, JobCompletion, SessionStatus, SessionStore, StoreError,
     StoreErrorWire, StoreStats,
@@ -175,14 +178,34 @@ pub enum StoreReplyBody {
     Stats(StoreStats),
 }
 
+/// The on-wire envelope: every cut frame rides with the sender's task-local [`TraceId`] so the
+/// receiver can *restore* it (elfo "context rides every message"). Serialized borrowing the frame.
+#[derive(Serialize)]
+struct WireRef<'a> {
+    trace: TraceId,
+    frame: &'a CutFrame,
+}
+
+/// The owned form decoded on receipt.
+#[derive(Deserialize)]
+struct Wire {
+    trace: TraceId,
+    frame: CutFrame,
+}
+
 fn encode(frame: &CutFrame) -> Vec<u8> {
+    let wire = WireRef {
+        // Stamp the current trace context onto the outbound frame.
+        trace: current_trace(),
+        frame,
+    };
     let mut buf = Vec::new();
     // Our frame types are always serializable; a failure here is a programming error.
-    ciborium::into_writer(frame, &mut buf).expect("encode CutFrame");
+    ciborium::into_writer(&wire, &mut buf).expect("encode CutFrame");
     buf
 }
 
-fn decode(bytes: &[u8]) -> Option<CutFrame> {
+fn decode(bytes: &[u8]) -> Option<Wire> {
     ciborium::from_reader(bytes).ok()
 }
 
@@ -450,16 +473,40 @@ pub struct PlacedUnit {
     events: broadcast::Sender<ManageEvent>,
     handler: HandlerSlot,
     child: Arc<AsyncMutex<ChildGuard>>,
+    /// The last (nonzero) trace id observed on a frame *originated by the child* — the proof that
+    /// the parent-set trace was restored on the far side of the cut and stamped back out.
+    child_trace: Arc<AtomicU64>,
 }
 
 impl PlacedUnit {
     /// Wrap a live [`Placement`] as a managed unit identified by `id`, serving the child's brokered
     /// store traffic against `store`.
     pub fn new(id: UnitId, placement: Placement, store: Arc<dyn SessionStore>) -> Self {
+        Self::build(id, placement, store, None)
+    }
+
+    /// As [`PlacedUnit::new`], but fold the child's `Usage` events into `metrics` (the placed
+    /// unit's usage aggregates into the host's resident metrics, supervision invariant #4).
+    pub fn with_metrics(
+        id: UnitId,
+        placement: Placement,
+        store: Arc<dyn SessionStore>,
+        metrics: Metrics,
+    ) -> Self {
+        Self::build(id, placement, store, Some(metrics))
+    }
+
+    fn build(
+        id: UnitId,
+        placement: Placement,
+        store: Arc<dyn SessionStore>,
+        metrics: Option<Metrics>,
+    ) -> Self {
         let Placement { channel, child } = placement;
         let (writer, mut reader) = channel.split();
         let (events, _) = broadcast::channel::<ManageEvent>(256);
         let handler: HandlerSlot = Arc::new(Mutex::new(None));
+        let child_trace = Arc::new(AtomicU64::new(0));
 
         // The parent-side cut reader: relay the child's events up, and serve its brokered store and
         // escalated-request traffic against the parent's authority.
@@ -467,13 +514,27 @@ impl PlacedUnit {
         let store_for_reader = store.clone();
         let writer_for_reader = writer.clone();
         let handler_for_reader = handler.clone();
-        tokio::spawn(async move {
+        let child_trace_for_reader = child_trace.clone();
+        // Establish a trace scope so `set_trace` (restore-on-receive) governs the replies this loop
+        // sends back to the child (a served `StoreReply` correlates with the brokered `StoreCall`).
+        tokio::spawn(with_trace(TraceId::NONE, async move {
             while let Some(bytes) = reader.recv().await {
-                let Some(frame) = decode(&bytes) else {
+                let Some(Wire { trace, frame }) = decode(&bytes) else {
                     continue;
                 };
+                // Restore the child's trace context, and record it as proof of round-trip.
+                set_trace(trace);
+                if !trace.is_none() {
+                    child_trace_for_reader.store(trace.0, Ordering::Relaxed);
+                }
                 match frame {
                     CutFrame::Event(ev) => {
+                        if let (Some(m), ManageEvent::Usage { delta, .. }) = (&metrics, &ev) {
+                            m.fold_usage(delta);
+                        }
+                        if let Some(m) = &metrics {
+                            m.record_event();
+                        }
                         let _ = out.send(ev);
                     }
                     CutFrame::StoreCall { id, call } => {
@@ -495,7 +556,7 @@ impl PlacedUnit {
                     _ => {}
                 }
             }
-        });
+        }));
 
         Self {
             id,
@@ -504,7 +565,14 @@ impl PlacedUnit {
             events,
             handler,
             child: Arc::new(AsyncMutex::new(child)),
+            child_trace,
         }
+    }
+
+    /// The last nonzero [`TraceId`] observed on a child-originated frame. After driving the child
+    /// under a known trace, this equals that trace — proof it rode the cut and was restored.
+    pub fn observed_child_trace(&self) -> TraceId {
+        TraceId(self.child_trace.load(Ordering::Relaxed))
     }
 
     /// Drive the placed child to run `session` under an explicit `fence`. The parent is the fence
@@ -599,7 +667,7 @@ pub async fn run_placed_child(
     let manager = ActivationManager::new(client.clone() as Arc<dyn SessionStore>, factory, partition);
 
     while let Some(bytes) = reader.recv().await {
-        let Some(frame) = decode(&bytes) else {
+        let Some(Wire { trace, frame }) = decode(&bytes) else {
             continue;
         };
         match frame {
@@ -609,7 +677,9 @@ pub async fn run_placed_child(
                 let writer = writer.clone();
                 // The activation drives store calls back over the cut whose replies arrive on THIS
                 // reader loop, so it must run concurrently — awaiting it inline would deadlock.
-                tokio::spawn(async move {
+                // Run it inside the *restored* trace scope so every brokered store call and emitted
+                // event the child sends back is stamped with the parent's trace (round-trip proof).
+                tokio::spawn(with_trace(trace, async move {
                     emit(
                         &writer,
                         ManageEvent::Started {
@@ -618,25 +688,39 @@ pub async fn run_placed_child(
                         },
                     )
                     .await;
+                    // A turn makes (at least) one provider call; report it as first-class usage so
+                    // it aggregates up the tree (the mock provider does not surface token counts).
+                    emit(
+                        &writer,
+                        ManageEvent::Usage {
+                            seq: 1,
+                            delta: UsageDelta {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                api_calls: 1,
+                            },
+                        },
+                    )
+                    .await;
                     let event = match manager.activate(session, fence).await {
                         Ok(()) => ManageEvent::Finished {
-                            seq: 1,
+                            seq: 2,
                             outcome: Outcome::ended(EndReason::Completed),
                         },
                         Err(SubErr::Store(StoreError::Fenced { .. })) => ManageEvent::Error {
-                            seq: 1,
+                            seq: 2,
                             failure: FailureView::new(
                                 FailureClass::Cancelled,
                                 "fenced across the cut",
                             ),
                         },
                         Err(e) => ManageEvent::Error {
-                            seq: 1,
+                            seq: 2,
                             failure: FailureView::new(FailureClass::Internal, e.to_string()),
                         },
                     };
                     emit(&writer, event).await;
-                });
+                }));
             }
             CutFrame::Cancel { .. } | CutFrame::Shutdown => break,
             _ => {}

@@ -7,4 +7,15 @@ license.workspace = true
 
 [dependencies]
 daemon-common = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# verifiable-trace stack: deterministic CBOR + Gordian Envelope digest tree + ed25519 keys.
+dcbor = { workspace = true }
+bc-envelope = { workspace = true }
+bc-components = { workspace = true }
+
+[dev-dependencies]
+bc-rand = { workspace = true }

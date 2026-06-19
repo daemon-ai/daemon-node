@@ -21,6 +21,13 @@ async-trait = "0.1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# verifiable-trace stack (Blockchain Commons): dcbor for deterministic CBOR,
+# bc-envelope for the Gordian Envelope digest tree + signing, bc-components for keys.
+dcbor = "0.25"
+bc-envelope = { version = "0.43", features = ["signature"] }
+bc-components = "0.31"
+bc-rand = "0.5"
 
 # internal crates (path deps; referenced by member crates via `workspace = true`)
 daemon-common = { path = "crates/contracts/daemon-common" }

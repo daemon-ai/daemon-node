@@ -14,6 +14,8 @@
 use crate::supervisor::{Backoff, ChildSpec, RestartPolicy, ServiceError, ServiceFuture};
 use daemon_activation::ActivationManager;
 use daemon_store::SessionStore;
+use daemon_telemetry::metrics::QueueDepths;
+use daemon_telemetry::{current_trace, Metrics};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -111,19 +113,44 @@ pub fn scan_tick(manager: ActivationManager) -> TickFn {
     })
 }
 
-/// `Metrics/health` tick: sample durable queue depths + active sessions (observability only).
-pub fn metrics_tick(store: Arc<dyn SessionStore>, active: ActivationManager) -> TickFn {
+/// `Metrics/health` tick: sample durable queue depths + active sessions and render a [`Dump`]
+/// (durable depths joined with the folded `Usage` aggregated from units, plus the health bit). The
+/// dump is stamped with the current trace context so it correlates with the work it summarizes.
+///
+/// [`Dump`]: daemon_telemetry::Dump
+pub fn metrics_tick(
+    store: Arc<dyn SessionStore>,
+    active: ActivationManager,
+    metrics: Metrics,
+) -> TickFn {
     Arc::new(move || {
         let store = store.clone();
         let active = active.clone();
+        let metrics = metrics.clone();
         Box::pin(async move {
             let stats = store.stats().await;
+            let depths = QueueDepths {
+                pending_jobs: stats.pending_jobs,
+                pending_wakes: stats.pending_wakes,
+                sessions: stats.sessions,
+                active: active.active_count(),
+            };
+            // Resident host is healthy as long as this loop runs (the supervisor restarts it
+            // otherwise); richer health derives from folded unit health in later phases.
+            metrics.set_healthy(true);
+            let dump = metrics.dump(depths);
             tracing::debug!(
-                pending_jobs = stats.pending_jobs,
-                pending_wakes = stats.pending_wakes,
-                sessions = stats.sessions,
-                active = active.active_count(),
-                "resident metrics"
+                trace_id = %current_trace(),
+                pending_jobs = dump.depths.pending_jobs,
+                pending_wakes = dump.depths.pending_wakes,
+                sessions = dump.depths.sessions,
+                active = dump.depths.active,
+                usage_input = dump.usage.input_tokens,
+                usage_output = dump.usage.output_tokens,
+                usage_api_calls = dump.usage.api_calls,
+                events = dump.events,
+                healthy = dump.healthy,
+                "resident metrics dump"
             );
             Ok(())
         })

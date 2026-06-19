@@ -14,7 +14,10 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use daemon_common::{DaemonError, Epoch, FenceToken, JobId, PartitionId, SessionId, SnapshotBlob};
+use daemon_common::{
+    ContentHash, DaemonError, Epoch, FenceToken, JobId, MerkleRoot, PartitionId, SessionId,
+    SnapshotBlob,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -186,6 +189,45 @@ pub struct StoreStats {
     pub sessions: usize,
 }
 
+/// One durable, append-only trace-journal entry, keyed `(session, epoch, seq)`.
+///
+/// The store sees only opaque bytes — a deterministically-encoded (dCBOR) Gordian Envelope built by
+/// `daemon-telemetry` — plus its [`ContentHash`]. This keeps `daemon-store` free of the crypto
+/// stack (layout §3 DAG) while still making the journal *authoritative durable session state*: the
+/// per-epoch Merkle root is committed under the same fence as the checkpoint (lifecycle §4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEntry {
+    /// Monotonic per-`(session, epoch)` sequence number.
+    pub seq: u64,
+    /// Opaque deterministic-CBOR bytes of the entry's Gordian Envelope.
+    pub bytes: Vec<u8>,
+    /// The content hash of `bytes` (the envelope's digest).
+    pub content_hash: ContentHash,
+}
+
+/// The committed root of a trace segment: the per-`(session, epoch)` Merkle root and its signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedRoot {
+    /// The digest-tree root folding every entry plus the prior epoch's root (rolling chain).
+    pub root: MerkleRoot,
+    /// An opaque detached signature over the root (ed25519, produced by `daemon-telemetry`).
+    pub signature: Vec<u8>,
+}
+
+/// A loaded trace segment: its append-only entries plus the committed root, if the segment has been
+/// sealed at its epoch boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSegment {
+    /// The session this segment belongs to.
+    pub session_id: SessionId,
+    /// The epoch (incarnation) this segment covers.
+    pub epoch: Epoch,
+    /// The append-only entries, in `seq` order.
+    pub entries: Vec<TraceEntry>,
+    /// The committed root + signature, once sealed; `None` while the segment is still open.
+    pub committed: Option<CommittedRoot>,
+}
+
 /// A crash boundary the in-memory store can be armed to fail at, for acceptance test #2.
 ///
 /// These model the durable boundaries enumerated in `rust-substrate-evaluation.md` §6 test #2.
@@ -259,6 +301,47 @@ pub trait SessionStore: Send + Sync {
 
     /// Snapshot durable queue depths + session count (Metrics/health resident service).
     async fn stats(&self) -> StoreStats;
+
+    // -- verifiable trace journal (phase 6b) --------------------------------------------------
+    //
+    // The journal is authoritative durable session state: an append-only log of opaque envelope
+    // bytes keyed `(session, epoch, seq)`, whose per-epoch Merkle root is sealed under the same
+    // fence as the checkpoint. Default impls report "unsupported" so a non-authoritative store
+    // (the brokered child proxy, which never journals) need not implement them; an authoritative
+    // backend (`InMemoryStore`, later SQLite) overrides all three.
+
+    /// Append one entry to the open `(session, epoch)` trace segment. Idempotent per `seq`.
+    async fn append_trace(
+        &self,
+        _session: &SessionId,
+        _epoch: Epoch,
+        _entry: TraceEntry,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "trace journal not supported by this store".into(),
+        )))
+    }
+
+    /// Seal the `(session, epoch)` segment with its signed Merkle root. Fenced exactly like a
+    /// checkpoint: only the highest token for the session may commit (binds the root to the
+    /// durable incarnation).
+    async fn commit_trace_segment(
+        &self,
+        _session: &SessionId,
+        _epoch: Epoch,
+        _root: MerkleRoot,
+        _signature: Vec<u8>,
+        _fence: FenceToken,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "trace journal not supported by this store".into(),
+        )))
+    }
+
+    /// Load the `(session, epoch)` trace segment (entries + committed root, if sealed).
+    async fn load_trace_segment(&self, _session: &SessionId, _epoch: Epoch) -> Option<TraceSegment> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +360,10 @@ struct Inner {
     enqueued_jobs: HashSet<JobId>,
     wake_outbox: VecDeque<SessionId>,
     fault: Option<FaultPoint>,
+    /// Append-only trace entries per `(session, epoch)`, kept in `seq` order.
+    trace_entries: HashMap<(SessionId, Epoch), Vec<TraceEntry>>,
+    /// Sealed segment roots per `(session, epoch)`.
+    trace_roots: HashMap<(SessionId, Epoch), CommittedRoot>,
 }
 
 /// In-memory [`SessionStore`] backend. The default backend for phase 1 and the conformance harness.
@@ -488,5 +575,150 @@ impl SessionStore for InMemoryStore {
             pending_wakes: inner.wake_outbox.len(),
             sessions: inner.sessions.len(),
         }
+    }
+
+    async fn append_trace(
+        &self,
+        session: &SessionId,
+        epoch: Epoch,
+        entry: TraceEntry,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.sessions.contains_key(session) {
+            return Err(StoreError::NotFound(session.clone()));
+        }
+        let log = inner
+            .trace_entries
+            .entry((session.clone(), epoch))
+            .or_default();
+        // Append-only + idempotent: a redelivered `seq` is a no-op; otherwise insert in order.
+        if log.iter().any(|e| e.seq == entry.seq) {
+            return Ok(());
+        }
+        let pos = log.partition_point(|e| e.seq < entry.seq);
+        log.insert(pos, entry);
+        Ok(())
+    }
+
+    async fn commit_trace_segment(
+        &self,
+        session: &SessionId,
+        epoch: Epoch,
+        root: MerkleRoot,
+        signature: Vec<u8>,
+        fence: FenceToken,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let rec = inner
+            .sessions
+            .get(session)
+            .ok_or_else(|| StoreError::NotFound(session.clone()))?;
+        // Fenced exactly like a checkpoint: a stale incarnation cannot seal a segment root.
+        Self::check_fence(rec, fence)?;
+        inner
+            .trace_roots
+            .insert((session.clone(), epoch), CommittedRoot { root, signature });
+        Ok(())
+    }
+
+    async fn load_trace_segment(&self, session: &SessionId, epoch: Epoch) -> Option<TraceSegment> {
+        let inner = self.inner.lock().unwrap();
+        let key = (session.clone(), epoch);
+        let entries = inner.trace_entries.get(&key).cloned().unwrap_or_default();
+        let committed = inner.trace_roots.get(&key).cloned();
+        if entries.is_empty() && committed.is_none() {
+            return None;
+        }
+        Some(TraceSegment {
+            session_id: session.clone(),
+            epoch,
+            entries,
+            committed,
+        })
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    //! Trace-journal conformance against the in-memory backend: append-only ordering + idempotency,
+    //! the committed-root round-trip, and the fence guarding a segment seal (phase 6b store layer).
+
+    use super::*;
+
+    fn entry(seq: u64, byte: u8) -> TraceEntry {
+        TraceEntry {
+            seq,
+            bytes: vec![byte; 4],
+            content_hash: ContentHash::new([byte; 32]),
+        }
+    }
+
+    async fn seeded() -> (InMemoryStore, SessionId, FenceToken) {
+        let store = InMemoryStore::new();
+        let id = SessionId::new("journaled");
+        store
+            .create_session(id.clone(), PartitionId::DEFAULT, SnapshotBlob::default())
+            .await
+            .unwrap();
+        let fence = store.acquire_activation_lease(&id).await.unwrap();
+        (store, id, fence)
+    }
+
+    #[tokio::test]
+    async fn append_is_ordered_and_idempotent() {
+        let (store, id, _f) = seeded().await;
+        // Append out of order; load returns them sorted by seq.
+        store.append_trace(&id, Epoch::ZERO, entry(2, 0x22)).await.unwrap();
+        store.append_trace(&id, Epoch::ZERO, entry(0, 0x00)).await.unwrap();
+        store.append_trace(&id, Epoch::ZERO, entry(1, 0x11)).await.unwrap();
+        // Redelivered seq is a no-op (append-only, idempotent).
+        store.append_trace(&id, Epoch::ZERO, entry(1, 0xFF)).await.unwrap();
+
+        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        assert_eq!(seg.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        // The first writer of seq=1 wins; the duplicate did not overwrite.
+        assert_eq!(seg.entries[1].bytes, vec![0x11; 4]);
+        assert!(seg.committed.is_none(), "segment is still open");
+    }
+
+    #[tokio::test]
+    async fn append_unknown_session_is_not_found() {
+        let store = InMemoryStore::new();
+        let r = store
+            .append_trace(&SessionId::new("ghost"), Epoch::ZERO, entry(0, 1))
+            .await;
+        assert!(matches!(r, Err(StoreError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn commit_root_round_trips() {
+        let (store, id, fence) = seeded().await;
+        store.append_trace(&id, Epoch::ZERO, entry(0, 7)).await.unwrap();
+        let root = MerkleRoot::new([9u8; 32]);
+        store
+            .commit_trace_segment(&id, Epoch::ZERO, root, vec![1, 2, 3], fence)
+            .await
+            .unwrap();
+
+        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        let committed = seg.committed.expect("segment sealed");
+        assert_eq!(committed.root, root);
+        assert_eq!(committed.signature, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn stale_fence_cannot_seal_a_segment() {
+        let (store, id, stale) = seeded().await;
+        // A newer owner supersedes the fence we hold.
+        let _current = store.acquire_activation_lease(&id).await.unwrap();
+        let r = store
+            .commit_trace_segment(&id, Epoch::ZERO, MerkleRoot::new([0; 32]), vec![], stale)
+            .await;
+        assert!(
+            matches!(r, Err(StoreError::Fenced { .. })),
+            "a stale incarnation must not seal a segment root, got {r:?}"
+        );
+        // And nothing was committed.
+        assert!(store.load_trace_segment(&id, Epoch::ZERO).await.is_none());
     }
 }

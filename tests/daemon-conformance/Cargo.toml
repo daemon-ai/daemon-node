@@ -14,6 +14,7 @@ daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
 daemon-host = { workspace = true }
+daemon-telemetry = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
 tokio = { workspace = true }

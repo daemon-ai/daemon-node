@@ -6,11 +6,21 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["remote"]
 remote = []
 
 [dependencies]
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
+daemon-supervision = { workspace = true }
+daemon-store = { workspace = true }
+daemon-telemetry = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+daemon-core = { workspace = true }
+daemon-host = { workspace = true }

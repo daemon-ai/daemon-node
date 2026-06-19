@@ -17,7 +17,10 @@
 //! out-of-process child as a `ManagedUnit`, brokering the parent's store across the cut so fencing
 //! holds out-of-process, and [`run_placed_child`] is the child-side loop.
 //!
-//! Deferred to later phases: credential authority, telemetry, and remote (cross-node) transport.
+//! Phase 6 threads a `TraceId` across the cut (stamped on send, restored on receive) and folds a
+//! placed unit's `Usage` into a resident [`Metrics`](daemon_telemetry::Metrics) dump.
+//!
+//! Deferred to later phases: credential authority and remote (cross-node) transport.
 //!
 //! See `docs/specs/daemon-host-spec.md`.
 
@@ -26,12 +29,14 @@
 pub mod config;
 pub mod cut;
 pub mod engine_incarnation;
+pub mod journal;
 pub mod services;
 pub mod supervisor;
 pub mod unit;
 
 pub use config::HostConfig;
 pub use cut::{run_placed_child, CutFrame, PlacedUnit, RemoteStoreClient, StoreCall, StoreReplyBody};
+pub use journal::{journal_stream, JournalSink};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, ProviderBuilder};
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
@@ -41,6 +46,7 @@ pub use unit::EngineUnit;
 
 use daemon_activation::{ActivationManager, EngineFactory};
 use daemon_store::SessionStore;
+use daemon_telemetry::Metrics;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -50,6 +56,7 @@ pub struct Host {
     store: Arc<dyn SessionStore>,
     manager: ActivationManager,
     config: HostConfig,
+    metrics: Metrics,
 }
 
 impl Host {
@@ -64,7 +71,13 @@ impl Host {
             store,
             manager,
             config,
+            metrics: Metrics::new(),
         }
+    }
+
+    /// The host's resident usage/health aggregator (folded across units reporting to it).
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// The underlying activation manager (e.g. to inspect `active_count`).
@@ -117,7 +130,11 @@ impl Host {
                 cfg.scan_interval,
                 RestartPolicy::Permanent,
                 cfg.backoff,
-                services::metrics_tick(self.store.clone(), self.manager.clone()),
+                services::metrics_tick(
+                    self.store.clone(),
+                    self.manager.clone(),
+                    self.metrics.clone(),
+                ),
             ))
             .start(cancel)
     }
