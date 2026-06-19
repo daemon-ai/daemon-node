@@ -1,9 +1,131 @@
-//! `daemon-tool-orchestrate` — the agent veneer over the fleet runtime.
+//! `daemon-tool-orchestrate` — the agent veneer over the fleet runtime (layout §4: tool surface).
 //!
-//! Exposes orchestration as a `daemon_core::Tool` so the engine can spawn/steer children by policy;
-//! the actual fleet mechanism lives in `daemon-orchestration`. This is the explicit DOWN edge of the
-//! orchestration flow.
+//! Exposes orchestration to the engine as a single `daemon_core::Tool` so the brain can grow/steer a
+//! fleet by policy. This is the explicit DOWN edge of the orchestration flow: the agent *calls* the
+//! tool, the tool records the delegation intent through the §17 host port (yielding the durable
+//! `JobId` the engine suspends on), and the fleet runtime — not the tool — spawns and drives the
+//! child when the resulting job is processed. The `status`/`cancel` verbs read/poke live fleet state.
+//!
+//! The fleet machinery itself lives in `daemon-orchestration`; this crate is a thin handle onto it.
 
 #![forbid(unsafe_code)]
 
-// TODO: Tool surface that drives daemon-orchestration.
+use async_trait::async_trait;
+use daemon_common::{JobId, ReqId, UnitId};
+use daemon_core::{Effect, Tool, ToolCall, ToolOutcome, ToolResult, TurnCx};
+use daemon_orchestration::FleetRuntime;
+use daemon_protocol::{HostRequest, HostRequestKind, HostResponseBody};
+
+/// The verbs the agent can invoke through the orchestrate tool.
+enum Verb {
+    /// Grow the fleet: delegate background work to a new child (the default).
+    Delegate,
+    /// Observe live fleet state.
+    Status,
+    /// Cancel a registered child by id.
+    Cancel(String),
+}
+
+/// Parse a verb from the tool-call args. Minimal by design (no JSON dep): a bare verb word, with
+/// `cancel:<unit-id>` carrying its target. Anything unrecognized (including the empty `{}` the mock
+/// provider emits) is a `delegate`.
+fn parse_verb(args: &str) -> Verb {
+    let trimmed = args.trim();
+    if let Some(rest) = trimmed.strip_prefix("cancel:") {
+        Verb::Cancel(rest.trim().to_owned())
+    } else if trimmed == "status" {
+        Verb::Status
+    } else {
+        Verb::Delegate
+    }
+}
+
+/// The agent's handle onto a node's [`FleetRuntime`].
+pub struct OrchestrateTool {
+    fleet: FleetRuntime,
+    label: String,
+}
+
+impl OrchestrateTool {
+    /// A tool over `fleet`, labelling delegated work with a default label.
+    pub fn new(fleet: FleetRuntime) -> Self {
+        Self {
+            fleet,
+            label: "orchestrated-work".into(),
+        }
+    }
+
+    /// A tool that labels its delegated work with `label`.
+    pub fn with_label(fleet: FleetRuntime, label: impl Into<String>) -> Self {
+        Self {
+            fleet,
+            label: label.into(),
+        }
+    }
+
+    fn ok(call: &ToolCall, content: String, effects: Vec<Effect>) -> ToolOutcome {
+        ToolOutcome {
+            result: ToolResult {
+                call_id: call.call_id.clone(),
+                ok: true,
+                content,
+            },
+            effects,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for OrchestrateTool {
+    fn name(&self) -> &str {
+        "orchestrate"
+    }
+
+    fn schema(&self) -> &str {
+        r#"{"type":"object","properties":{"verb":{"type":"string","enum":["delegate","status","cancel"]}}}"#
+    }
+
+    async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
+        match parse_verb(&call.args) {
+            // DOWN edge: record the delegation through the host port; the fleet worker spawns the
+            // child when the resulting durable job is processed. Emitting Effect::Delegate suspends
+            // the parent until the child's completion wakes it (lifecycle §3.1).
+            Verb::Delegate => {
+                let req = HostRequest {
+                    request_id: ReqId(0),
+                    kind: HostRequestKind::Delegate {
+                        label: self.label.clone(),
+                        budget: cx.budget,
+                    },
+                };
+                let resp = cx.host.request(req).await;
+                let job_id = match resp.body {
+                    HostResponseBody::Delegated(job) => job,
+                    _ => JobId::new(format!("{}:unresolved", cx.session_id)),
+                };
+                Self::ok(
+                    call,
+                    format!("delegated:{job_id}"),
+                    vec![Effect::Delegate(job_id)],
+                )
+            }
+            Verb::Status => {
+                let children = self.fleet.children();
+                let usage = self.fleet.fleet_usage();
+                Self::ok(
+                    call,
+                    format!(
+                        "fleet: {} children, {} api_calls",
+                        children.len(),
+                        usage.api_calls
+                    ),
+                    Vec::new(),
+                )
+            }
+            Verb::Cancel(id) => {
+                let cancelled = self.fleet.cancel_child(&UnitId::new(id.clone())).await;
+                Self::ok(call, format!("cancel:{id}:{cancelled}"), Vec::new())
+            }
+        }
+    }
+}

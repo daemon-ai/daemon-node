@@ -133,9 +133,11 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-host",
+ "daemon-orchestration",
  "daemon-protocol",
  "daemon-store",
  "daemon-supervision",
+ "daemon-tool-orchestrate",
  "tokio",
  "tokio-util",
 ]
@@ -204,8 +206,9 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "daemon-common",
- "daemon-host",
+ "daemon-store",
  "daemon-supervision",
+ "dashmap",
  "thiserror",
  "tokio",
  "tracing",
@@ -273,8 +276,10 @@ name = "daemon-tool-orchestrate"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "daemon-common",
  "daemon-core",
  "daemon-orchestration",
+ "daemon-protocol",
 ]
 
 [[package]]

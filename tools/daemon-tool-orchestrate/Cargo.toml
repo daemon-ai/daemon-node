@@ -8,4 +8,6 @@ license.workspace = true
 [dependencies]
 daemon-core = { workspace = true }
 daemon-orchestration = { workspace = true }
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
 async-trait = { workspace = true }

@@ -8,8 +8,9 @@ license.workspace = true
 [dependencies]
 daemon-common = { workspace = true }
 daemon-supervision = { workspace = true }
-daemon-host = { workspace = true }
+daemon-store = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+dashmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
