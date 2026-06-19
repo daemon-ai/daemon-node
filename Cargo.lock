@@ -129,7 +129,9 @@ name = "daemon-conformance"
 version = "0.0.0"
 dependencies = [
  "daemon-activation",
- "daemon-host",
+ "daemon-common",
+ "daemon-protocol",
+ "daemon-store",
  "daemon-stub-engine",
  "tokio",
 ]
@@ -208,6 +210,7 @@ dependencies = [
 name = "daemon-protocol"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "ciborium",
  "daemon-common",
  "serde",
@@ -240,8 +243,10 @@ name = "daemon-stub-engine"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "daemon-activation",
  "daemon-common",
  "daemon-protocol",
+ "daemon-store",
 ]
 
 [[package]]

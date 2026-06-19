@@ -9,4 +9,6 @@ publish = false
 [dependencies]
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
+daemon-store = { workspace = true }
+daemon-activation = { workspace = true }
 async-trait = { workspace = true }

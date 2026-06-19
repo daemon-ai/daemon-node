@@ -7,7 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
-daemon-host = { workspace = true }
 daemon-stub-engine = { workspace = true }
 tokio = { workspace = true }
