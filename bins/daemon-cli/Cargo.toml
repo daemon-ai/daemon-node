@@ -10,7 +10,10 @@ name = "daemon-cli"
 path = "src/main.rs"
 
 [dependencies]
-daemon-core = { workspace = true }
+daemon-common = { workspace = true }
+daemon-api = { workspace = true }
 daemon-host = { workspace = true }
-daemon-orchestration = { workspace = true }
+daemon-protocol = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
 anyhow = { workspace = true }

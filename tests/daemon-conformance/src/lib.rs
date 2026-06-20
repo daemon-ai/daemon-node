@@ -1510,3 +1510,276 @@ mod credentials {
         assert_eq!(auth.spent_tokens(), 120);
     }
 }
+
+#[cfg(test)]
+mod node_interface {
+    //! THE PHASE-8 CONTROL-SURFACE GATE (`daemon-workspace-layout.md` §7 phase-8 gate). The node is
+    //! assembled exactly as `bins/daemon` does (durable substrate + fleet-as-job-worker + the live
+    //! session surface) and driven through the one [`daemon_api`] surface over two transports: the
+    //! in-process trait call and the Unix socket. The gate proves the surface is transport-agnostic:
+    //! a session assigned over the socket is driven to `Completed` by the real `FleetRuntime` job
+    //! worker, the fleet usage folds in, and the in-process and socket reads agree.
+    //!
+    //! The session sub-surface's cross-language twin (the C FFI driving `StartTurn -> TurnFinished`)
+    //! is proven by the `bindings/daemon-core-ffi` C harness, not here.
+
+    use async_trait::async_trait;
+    use daemon_api::{
+        ApiRequest, ApiResponse, ControlApi, FleetReport, SessionState,
+    };
+    use daemon_common::{PartitionId, SessionId, UnitId};
+    use daemon_core::{Engine, MockProvider, Provider, SystemPrompt, ToolRegistry};
+    use daemon_host::{
+        serve_api_unix, ApiClient, CoreEngineFactory, EngineUnit, FleetView, Host, HostConfig,
+        JobWorker, NodeApiImpl, ServiceError, SessionEngineBuilder,
+    };
+    use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
+    use daemon_store::{InMemoryStore, SessionStore};
+    use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
+    use daemon_tool_orchestrate::OrchestrateTool;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::net::UnixListener;
+
+    const PARTITION: PartitionId = PartitionId::DEFAULT;
+
+    /// A completing-child placement seam (same as `bins/daemon`).
+    struct EngineChildSpawner;
+
+    #[async_trait]
+    impl ChildSpawner for EngineChildSpawner {
+        async fn spawn(&self, id: UnitId, _spec: &DelegationSpec) -> Arc<dyn ManagedUnit> {
+            let engine = Engine::fresh(
+                SessionId::new(id.as_str()),
+                SystemPrompt::new("fleet child"),
+                Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>,
+                Arc::new(ToolRegistry::new()),
+            );
+            Arc::new(EngineUnit::spawn(id, engine))
+        }
+    }
+
+    /// The fleet driven as the node's real job worker.
+    struct FleetJobWorker(FleetRuntime);
+
+    #[async_trait]
+    impl JobWorker for FleetJobWorker {
+        async fn process_jobs_once(&self) -> Result<(), ServiceError> {
+            self.0
+                .process_jobs_once()
+                .await
+                .map(|_| ())
+                .map_err(ServiceError::new)
+        }
+    }
+
+    /// The fleet projected for the control surface.
+    struct FleetViewImpl(FleetRuntime);
+
+    #[async_trait]
+    impl FleetView for FleetViewImpl {
+        async fn report(&self) -> FleetReport {
+            FleetReport {
+                children: self.0.children(),
+                usage: self.0.fleet_usage(),
+            }
+        }
+        async fn cancel(&self, child: &UnitId) -> bool {
+            self.0.cancel_child(child).await
+        }
+    }
+
+    /// Assemble a node like `bins/daemon`'s host role: store + fleet-as-job-worker + the live
+    /// session surface, returning the in-process surface, a started handle, and the durable store.
+    fn assemble() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
+        let store = Arc::new(InMemoryStore::new());
+        let fleet = FleetRuntime::new(
+            store.clone(),
+            PARTITION,
+            Arc::new(EngineChildSpawner),
+            Arc::new(DefaultAnswerPolicy),
+            None::<Arc<dyn ManageRequestHandler>>,
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(OrchestrateTool::new(fleet.clone())));
+        let factory = CoreEngineFactory::with_provider(
+            Arc::new(|| {
+                Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
+            }),
+            Arc::new(registry),
+            SystemPrompt::new("gate host node"),
+        );
+        let host = Host::new(store.clone(), Arc::new(factory), HostConfig::default())
+            .with_job_worker(Arc::new(FleetJobWorker(fleet.clone())));
+        let handle = host.start();
+
+        let session_builder: SessionEngineBuilder = Arc::new(|id: SessionId| {
+            Engine::fresh(
+                id,
+                SystemPrompt::new("interactive session"),
+                Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>,
+                Arc::new(ToolRegistry::new()),
+            )
+        });
+
+        let node = Arc::new(NodeApiImpl::new(
+            handle.observer(),
+            store as Arc<dyn SessionStore>,
+            host.manager().clone(),
+            PARTITION,
+            session_builder,
+            Some(Arc::new(FleetViewImpl(fleet)) as Arc<dyn FleetView>),
+        ));
+        (node, handle)
+    }
+
+    fn temp_socket() -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("daemon-api-gate-{}-{}.sock", std::process::id(), n))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_surface_is_transport_agnostic_and_drives_a_session_to_completion() {
+        let (node, handle) = assemble();
+
+        // Serve the same surface over a Unix socket.
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+
+        // Health over the socket: the four resident services are present.
+        let health = match client.call(ApiRequest::Health).await.unwrap() {
+            ApiResponse::Health(h) => h,
+            other => panic!("expected Health, got {other:?}"),
+        };
+        assert!(
+            health.services.len() >= 4,
+            "expected the resident-service tree, got {:?}",
+            health.services
+        );
+
+        // Assign a durable session over the socket and drive it to Completed via the real fleet
+        // job worker (the resident JobOutboxDispatcher), polling the control surface.
+        let session = SessionId::new("op-session");
+        assert!(matches!(
+            client
+                .call(ApiRequest::Assign {
+                    session: session.clone()
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let resp = client.call(ApiRequest::Sessions).await.unwrap();
+            if let ApiResponse::Sessions(list) = resp {
+                if list
+                    .iter()
+                    .any(|i| i.session == session && i.state == SessionState::Completed)
+                {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the assigned session never reached Completed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A delegation child ran: fleet usage folded in (the §7 fan-in).
+        let fleet = match client.call(ApiRequest::Fleet).await.unwrap() {
+            ApiResponse::Fleet(f) => f,
+            other => panic!("expected Fleet, got {other:?}"),
+        };
+        assert!(
+            fleet.usage.api_calls > 0 && !fleet.children.is_empty(),
+            "expected a delegation child to have run and folded usage, got {fleet:?}"
+        );
+
+        // Transport parity: the in-process trait call and the socket round-trip agree.
+        let inproc_health = node.health().await;
+        let socket_health = match client.call(ApiRequest::Health).await.unwrap() {
+            ApiResponse::Health(h) => h,
+            other => panic!("expected Health, got {other:?}"),
+        };
+        assert_eq!(
+            inproc_health.all_ok, socket_health.all_ok,
+            "health all_ok must agree across transports"
+        );
+        assert_eq!(
+            sorted_names(&inproc_health),
+            sorted_names(&socket_health),
+            "the service set must agree across transports"
+        );
+
+        let inproc_sessions = node.sessions().await;
+        let socket_sessions = match client.call(ApiRequest::Sessions).await.unwrap() {
+            ApiResponse::Sessions(list) => list,
+            other => panic!("expected Sessions, got {other:?}"),
+        };
+        assert!(
+            inproc_sessions
+                .iter()
+                .any(|i| i.session == session && i.state == SessionState::Completed)
+                && socket_sessions
+                    .iter()
+                    .any(|i| i.session == session && i.state == SessionState::Completed),
+            "both transports must observe the completed session"
+        );
+
+        server.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn sorted_names(h: &daemon_api::HealthReport) -> Vec<String> {
+        let mut names: Vec<String> = h.services.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_surface_runs_an_interactive_turn_to_finished() {
+        use daemon_api::{Outbound, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_protocol::{AgentCommand, AgentEvent, UserMsg};
+
+        let (node, handle) = assemble();
+        let session = SessionId::new("live-1");
+
+        // Open + run a turn on the live session sub-surface (the same surface the FFI wraps).
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hello"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit StartTurn");
+
+        // Drain events until TurnFinished arrives.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut finished = false;
+        while Instant::now() < deadline {
+            let drained = node.poll(session.clone(), 0).await.expect("poll");
+            if drained.iter().any(|o| {
+                matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. }))
+            }) {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(finished, "the interactive turn never reached TurnFinished");
+
+        handle.shutdown().await;
+    }
+}

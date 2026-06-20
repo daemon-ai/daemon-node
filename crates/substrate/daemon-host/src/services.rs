@@ -99,6 +99,17 @@ pub fn job_tick(manager: ActivationManager) -> TickFn {
     })
 }
 
+/// `JobOutboxDispatcher` tick over an injected [`JobWorker`] — the seam the binary uses to drive
+/// the job outbox with the real orchestration `FleetRuntime` (spawn + run a child per delegation
+/// job) instead of the substrate's placeholder echo worker. Keeps `daemon-host` free of any
+/// dependency on `daemon-orchestration`.
+pub fn job_worker_tick(worker: Arc<dyn crate::JobWorker>) -> TickFn {
+    Arc::new(move || {
+        let worker = worker.clone();
+        Box::pin(async move { worker.process_jobs_once().await })
+    })
+}
+
 /// `RecoveryScanner` tick: re-activate any resumable session whose wake was lost.
 pub fn scan_tick(manager: ActivationManager) -> TickFn {
     Arc::new(move || {

@@ -1,0 +1,106 @@
+; daemon-api.cddl — the node interface mirror (one surface, many transports).
+;
+; This is the wire contract every non-in-process transport marshals: the Unix socket, a future
+; TCP/JSON-RPC endpoint, and the C FFI buffer pump all carry these CBOR shapes. The in-process
+; transport calls the Rust trait directly and skips this encoding. Encoding is deterministic CBOR
+; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
+; governs evolution; bump it on any breaking change to a shape below.
+
+wire_version = uint                 ; daemon-common WireVersion (current = 1)
+
+; ----- identifiers (daemon-common newtypes; encoded as text) -----
+session-id = tstr
+unit-id    = tstr
+req-id     = uint
+job-id     = tstr
+
+; ----- usage (daemon-common UsageDelta) -----
+usage-delta = {
+  input_tokens: uint,
+  output_tokens: uint,
+  api_calls: uint,
+}
+
+; ----- §17 protocol shapes (daemon-protocol; summarized) -----
+user-msg = { text: tstr }
+
+agent-command = { "StartTurn": { input: user-msg, request_id: req-id } }
+              / { "Steer": { text: tstr } }
+              / { "Interrupt": { reason: (tstr / null) } }
+              / { "Snapshot": { request_id: req-id } }
+              / "Shutdown"
+
+agent-event = { "TurnStarted": { seq: uint, trigger: any } }
+            / { "TextDelta": { seq: uint, text: tstr } }
+            / { "ReasoningDelta": { seq: uint, text: tstr } }
+            / { "ToolStarted": { seq: uint, call: any } }
+            / { "ToolFinished": { seq: uint, result: any } }
+            / { "Usage": { seq: uint, delta: usage-delta } }
+            / { "RateLimit": { seq: uint, snapshot: any } }
+            / { "TurnFinished": { seq: uint, summary: any } }
+            / { "Error": { seq: uint, failure: tstr } }
+
+host-request  = { request_id: req-id, kind: any }
+host-response = { request_id: req-id, body: any }
+
+outbound = { "Event": agent-event }
+         / { "Request": host-request }
+
+; ----- report DTOs -----
+service-health = {
+  name: tstr,
+  ok: bool,
+  restarts: uint,
+  detail: (tstr / null),
+}
+
+health-report = {
+  all_ok: bool,
+  services: [* service-health],
+}
+
+stats-report = {
+  pending_jobs: uint,
+  pending_wakes: uint,
+  sessions: uint,
+  active: uint,
+}
+
+session-state = "Active"
+              / { "Suspended": { job_id: job-id } }
+              / "Ready"
+              / "Completed"
+              / "Unknown"
+
+session-info = {
+  session: session-id,
+  state: session-state,
+}
+
+fleet-report = {
+  children: [* unit-id],
+  usage: usage-delta,
+}
+
+api-error = { "UnknownSession": tstr }
+          / { "Unsupported": tstr }
+          / { "Other": tstr }
+
+; ----- the request/response mirror (1:1 with the interface methods) -----
+api-request = { "Submit": { session: session-id, command: agent-command } }
+            / { "Poll": { session: session-id, max: uint } }
+            / { "Respond": { session: session-id, response: host-response } }
+            / "Health"
+            / "Stats"
+            / "Sessions"
+            / { "Assign": { session: session-id } }
+            / { "Cancel": { session: session-id } }
+            / "Fleet"
+
+api-response = "Ok"
+             / { "Drained": [* outbound] }
+             / { "Health": health-report }
+             / { "Stats": stats-report }
+             / { "Sessions": [* session-info] }
+             / { "Fleet": fleet-report }
+             / { "Error": api-error }

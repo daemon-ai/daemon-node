@@ -299,6 +299,13 @@ pub trait SessionStore: Send + Sync {
     /// Read the current durable status of a session (test/observability helper).
     async fn status(&self, id: &SessionId) -> Option<SessionStatus>;
 
+    /// List every durable session id with its current status (the node control surface's
+    /// `sessions` projection). Defaults to empty so a non-authoritative store (the brokered child
+    /// proxy) need not implement it; an authoritative backend overrides it.
+    async fn list_sessions(&self) -> Vec<(SessionId, SessionStatus)> {
+        Vec::new()
+    }
+
     /// Snapshot durable queue depths + session count (Metrics/health resident service).
     async fn stats(&self) -> StoreStats;
 
@@ -566,6 +573,16 @@ impl SessionStore for InMemoryStore {
             .sessions
             .get(id)
             .map(|r| r.status.clone())
+    }
+
+    async fn list_sessions(&self) -> Vec<(SessionId, SessionStatus)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .map(|r| (r.session_id.clone(), r.status.clone()))
+            .collect()
     }
 
     async fn stats(&self) -> StoreStats {

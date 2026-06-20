@@ -183,12 +183,57 @@ impl SupervisorHandle {
             .all(|e| e.value().health == HealthStatus::Ok)
     }
 
+    /// A cloneable, read-only observer of this supervisor's child health — the projection the node
+    /// control surface (`ControlApi::health`) reads without taking ownership of (and the right to
+    /// shut down) the handle.
+    pub fn observer(&self) -> SupervisorObserver {
+        SupervisorObserver {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// Trip the cancellation token and wait for every supervising task to drain.
     pub async fn shutdown(self) {
         self.cancel.cancel();
         for task in self.tasks {
             let _ = task.await;
         }
+    }
+}
+
+/// A read-only view of a [`SupervisorHandle`]'s child health, cheap to clone and safe to hold
+/// alongside the owning handle (the handle alone may `shutdown`).
+#[derive(Clone)]
+pub struct SupervisorObserver {
+    shared: Arc<Shared>,
+}
+
+impl SupervisorObserver {
+    /// The names of every supervised child.
+    pub fn service_names(&self) -> Vec<String> {
+        self.shared
+            .children
+            .iter()
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// The health of a named child, if it exists.
+    pub fn health(&self, name: &str) -> Option<HealthStatus> {
+        self.shared.children.get(name).map(|s| s.health.clone())
+    }
+
+    /// The number of times a named child has been restarted.
+    pub fn restarts(&self, name: &str) -> Option<u32> {
+        self.shared.children.get(name).map(|s| s.restarts)
+    }
+
+    /// Whether every child is currently `Ok`.
+    pub fn all_ok(&self) -> bool {
+        self.shared
+            .children
+            .iter()
+            .all(|e| e.value().health == HealthStatus::Ok)
     }
 }
 

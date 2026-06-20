@@ -11,8 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 daemon-common = { workspace = true }
+daemon-api = { workspace = true }
 daemon-core = { workspace = true }
 daemon-host = { workspace = true }
+daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-store = { workspace = true }
 daemon-supervision = { workspace = true }
@@ -24,5 +26,6 @@ daemon-tool-fs = { workspace = true }
 daemon-tool-tkx = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

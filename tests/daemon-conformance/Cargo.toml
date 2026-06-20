@@ -10,6 +10,7 @@ publish = false
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
+daemon-api = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }

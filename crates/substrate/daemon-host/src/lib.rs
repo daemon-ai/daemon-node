@@ -34,7 +34,9 @@ pub mod credentials;
 pub mod cut;
 pub mod engine_incarnation;
 pub mod journal;
+pub mod node_api;
 pub mod services;
+pub mod socket;
 pub mod supervisor;
 pub mod unit;
 
@@ -48,17 +50,43 @@ pub use cut::{
 };
 pub use journal::{journal_stream, JournalSink};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, ProviderBuilder};
+pub use node_api::{NodeApiImpl, SessionEngineBuilder};
+pub use socket::{serve_api_unix, ApiClient};
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
-    SupervisorHandle,
+    SupervisorHandle, SupervisorObserver,
 };
 pub use unit::EngineUnit;
 
+use async_trait::async_trait;
 use daemon_activation::{ActivationManager, EngineFactory};
+use daemon_api::FleetReport;
+use daemon_common::UnitId;
 use daemon_store::SessionStore;
 use daemon_telemetry::Metrics;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// The `JobOutboxDispatcher`'s per-tick work: drain the durable job outbox once. The default host
+/// uses `ActivationManager::run_workers` (the substrate echo worker); the binary injects the real
+/// orchestration `FleetRuntime` through this seam (`Host::with_job_worker`) so the node spawns and
+/// drives a child per delegation job — *without* `daemon-host` depending on `daemon-orchestration`.
+#[async_trait]
+pub trait JobWorker: Send + Sync {
+    /// Process every currently-pending durable job, returning when the outbox is drained.
+    async fn process_jobs_once(&self) -> Result<(), ServiceError>;
+}
+
+/// A read-only projection of the running orchestration fleet for the node control surface
+/// (`ControlApi::fleet`/`cancel`). Implemented by the binary over its `FleetRuntime`, keeping
+/// `daemon-host` free of the orchestration crate.
+#[async_trait]
+pub trait FleetView: Send + Sync {
+    /// The fleet roster + folded usage.
+    async fn report(&self) -> FleetReport;
+    /// Cancel a registered child by id; returns whether a child was found and cancelled.
+    async fn cancel(&self, child: &UnitId) -> bool;
+}
 
 /// An in-process host: the durable activation substrate plus its supervised resident-service tree.
 #[derive(Clone)]
@@ -67,6 +95,7 @@ pub struct Host {
     manager: ActivationManager,
     config: HostConfig,
     metrics: Metrics,
+    job_worker: Option<Arc<dyn JobWorker>>,
 }
 
 impl Host {
@@ -82,7 +111,15 @@ impl Host {
             manager,
             config,
             metrics: Metrics::new(),
+            job_worker: None,
         }
+    }
+
+    /// Drive the `JobOutboxDispatcher` with an injected [`JobWorker`] (e.g. the orchestration
+    /// `FleetRuntime`) instead of the substrate's placeholder echo worker.
+    pub fn with_job_worker(mut self, worker: Arc<dyn JobWorker>) -> Self {
+        self.job_worker = Some(worker);
+        self
     }
 
     /// The host's resident usage/health aggregator (folded across units reporting to it).
@@ -113,6 +150,12 @@ impl Host {
     /// Start the resident tree under a caller-supplied cancellation token.
     pub fn start_with_cancel(&self, cancel: CancellationToken) -> SupervisorHandle {
         let cfg = self.config;
+        // The job-outbox dispatcher runs the injected fleet worker if present, else the substrate's
+        // built-in echo worker.
+        let job_tick = match &self.job_worker {
+            Some(worker) => services::job_worker_tick(worker.clone()),
+            None => services::job_tick(self.manager.clone()),
+        };
         Supervisor::new(cfg.meltdown)
             .child(services::interval_child(
                 "WakeOutboxDispatcher",
@@ -126,7 +169,7 @@ impl Host {
                 cfg.dispatch_interval,
                 RestartPolicy::Permanent,
                 cfg.backoff,
-                services::job_tick(self.manager.clone()),
+                job_tick,
             ))
             .child(services::interval_child(
                 "RecoveryScanner",
