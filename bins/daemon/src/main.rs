@@ -11,14 +11,16 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+mod config;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use daemon_api::FleetReport;
 use daemon_common::{CredMode, CredScope, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
-    CredentialProvider, Engine, MockProvider, Provider, SystemPrompt, ToolRegistry,
+    CredentialBuilder, CredentialProvider, Engine, EngineProfile, MockProvider, Provider,
+    ProviderRegistry, SystemPrompt, ToolRegistry,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
@@ -32,12 +34,12 @@ use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
 use daemon_transport::RemoteHost;
 
+use config::{NodeConfig, StoreBackend};
+
 /// The environment variable that selects the placed-child role.
 const PLACED_CHILD_ENV: &str = "DAEMON_PLACED_CHILD";
 /// The environment variable that selects the transport-server role (its value is the bind address).
 const TRANSPORT_SERVER_ENV: &str = "DAEMON_TRANSPORT_SERVER";
-/// The environment variable overriding the host role's api socket path.
-const API_SOCKET_ENV: &str = "DAEMON_API_SOCKET";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,28 +56,17 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    run_as_host(NodeConfig::from_env()).await
+    run_as_host(NodeConfig::load()?).await
 }
 
-/// The host role's env-first configuration.
-struct NodeConfig {
-    /// The partition this node owns.
-    partition: PartitionId,
-    /// The Unix socket the node serves its [`daemon_api`] surface on.
-    socket_path: PathBuf,
-}
-
-impl NodeConfig {
-    fn from_env() -> Self {
-        let socket_path = std::env::var_os(API_SOCKET_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let dir = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
-                PathBuf::from(dir).join("daemon-api.sock")
-            });
-        Self {
-            partition: PartitionId::DEFAULT,
-            socket_path,
+/// Build the durable store backend the config selected.
+fn build_store(backend: &StoreBackend) -> anyhow::Result<Arc<dyn SessionStore>> {
+    match backend {
+        StoreBackend::Memory => Ok(Arc::new(InMemoryStore::new())),
+        StoreBackend::Sqlite { path } => {
+            let store = daemon_store::SqliteStore::open(path)
+                .map_err(|e| anyhow::anyhow!("opening sqlite store at {}: {e}", path.display()))?;
+            Ok(Arc::new(store))
         }
     }
 }
@@ -83,42 +74,75 @@ impl NodeConfig {
 /// Assemble and run the default host node, serving the unified surface over a Unix socket until
 /// `ctrl_c` trips a graceful shutdown.
 async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
-    let store = Arc::new(InMemoryStore::new());
+    let store = build_store(&cfg.store)?;
 
-    // Orchestration fleet: a completing-child spawner, driven as the node's real job worker.
+    // Credentials: an owner authority brokered into *every* engine, uniformly across the durable,
+    // interactive, and fleet-child construction paths (host-spec §6).
+    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key);
+    let cred_profile = ProfileRef::new(cfg.profile.clone());
+    let credentials: CredentialBuilder = {
+        let owner = owner.clone();
+        Arc::new(move || {
+            Arc::new(BrokeredCredentialProvider::new(owner.clone(), None))
+                as Arc<dyn CredentialProvider>
+        })
+    };
+
+    // Provider selection seam: Mock is the default; a real networked provider drops in via a single
+    // `register(...)` / `set_default(...)` without touching the engine or the construction sites.
+    let mut providers = ProviderRegistry::new();
+    providers.set_default(Arc::new(|| {
+        Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
+    }));
+    providers.register(
+        "orchestrator",
+        Arc::new(|| Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>),
+    );
+    providers.register(
+        "child",
+        Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
+    );
+
+    // Orchestration fleet: children built from one shared child profile, driven as the real job
+    // worker (so every child gets the same provider + brokered credentials).
+    let child_profile = EngineProfile::new(
+        providers
+            .builder_for(&ProfileRef::new("child"))
+            .expect("child provider registered"),
+        Arc::new(ToolRegistry::new()),
+        SystemPrompt::new("fleet child"),
+    )
+    .with_credentials(credentials.clone(), cred_profile.clone());
     let fleet = FleetRuntime::new(
         store.clone(),
         cfg.partition,
-        Arc::new(EngineChildSpawner),
+        Arc::new(EngineChildSpawner {
+            profile: child_profile,
+        }),
         Arc::new(DefaultAnswerPolicy),
         None::<Arc<dyn ManageRequestHandler>>,
     );
 
-    // Credentials: an owner authority brokered into every engine the factory builds (host-spec §6).
-    let owner = build_owner_broker();
-    let credential_owner = owner.clone();
-    let credentials: daemon_host::engine_incarnation::CredentialBuilder = Arc::new(move || {
-        Arc::new(BrokeredCredentialProvider::new(credential_owner.clone(), None))
-            as Arc<dyn CredentialProvider>
-    });
-
-    // The parent factory: an engine that delegates once through the orchestrate tool, then
-    // completes — the durable delegate -> suspend -> resume -> complete cycle.
+    // The parent orchestrator profile: an engine that delegates once through the orchestrate tool,
+    // then completes — the durable delegate -> suspend -> resume -> complete cycle.
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(daemon_tool_orchestrate::OrchestrateTool::new(
         fleet.clone(),
     )));
-    let factory = CoreEngineFactory::with_provider(
-        Arc::new(|| {
-            Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
-        }),
+    let parent_profile = EngineProfile::new(
+        providers
+            .builder_for(&ProfileRef::new("orchestrator"))
+            .expect("orchestrator provider registered"),
         Arc::new(registry),
         SystemPrompt::new("daemon host node"),
     )
-    .with_credentials(credentials, ProfileRef::new("openai"));
+    .with_credentials(credentials.clone(), cred_profile.clone());
+    let factory = CoreEngineFactory::from_profile(parent_profile);
 
     let config = HostConfig {
         partition: cfg.partition,
+        dispatch_interval: cfg.dispatch_interval,
+        scan_interval: cfg.scan_interval,
         ..HostConfig::default()
     };
     let host = Host::new(store.clone(), Arc::new(factory), config)
@@ -127,19 +151,24 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let handle = host.start();
     tracing::info!("daemon host node started");
 
-    // The interactive (session sub-surface) engines complete in one turn.
-    let session_builder: SessionEngineBuilder = Arc::new(|id: SessionId| {
-        Engine::fresh(
-            id,
-            SystemPrompt::new("interactive session"),
-            Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>,
-            Arc::new(ToolRegistry::new()),
-        )
-    });
+    // The interactive (session sub-surface) engines: built from the same seam (default provider +
+    // brokered credentials), so the live path is no longer credential-asymmetric with the durable one.
+    let session_profile = EngineProfile::new(
+        providers
+            .builder_for(&cred_profile)
+            .expect("default session provider"),
+        Arc::new(ToolRegistry::new()),
+        SystemPrompt::new("interactive session"),
+    )
+    .with_credentials(credentials.clone(), cred_profile.clone());
+    let session_builder: SessionEngineBuilder = {
+        let profile = session_profile;
+        Arc::new(move |id: SessionId| profile.fresh(id))
+    };
 
     let node = Arc::new(NodeApiImpl::new(
         handle.observer(),
-        store.clone() as Arc<dyn SessionStore>,
+        store.clone(),
         host.manager().clone(),
         cfg.partition,
         session_builder,
@@ -160,11 +189,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the owner end of the credential brokering chain over a stub source (host-spec §7).
-fn build_owner_broker() -> Arc<dyn CredentialBroker> {
+/// Build the owner end of the credential brokering chain over a stub source (host-spec §7), minting
+/// the configured key for the configured profile.
+fn build_owner_broker(profile: &str, key: &str) -> Arc<dyn CredentialBroker> {
     let signer = Arc::new(CapabilitySigner::generate());
-    let source = Arc::new(StubCredentialSource::minting("openai", "sk-configured"));
-    let scope = CredScope::new(["openai"], ["chat"], Some(1_000));
+    let source = Arc::new(StubCredentialSource::minting(profile, key));
+    let scope = CredScope::new([profile], ["chat"], Some(1_000));
     let authority = Arc::new(CredentialAuthority::new(
         scope,
         CredMode::Native,
@@ -175,19 +205,16 @@ fn build_owner_broker() -> Arc<dyn CredentialBroker> {
     Arc::new(OwnerBroker::new(authority))
 }
 
-/// The injected placement seam: materialize a child as an engine-backed `ManagedUnit`. A completing
-/// provider finishes the child in one turn (no further delegation).
-struct EngineChildSpawner;
+/// The injected placement seam: materialize a child as an engine-backed `ManagedUnit`, built from
+/// the shared child [`EngineProfile`] (a completing provider finishes the child in one turn).
+struct EngineChildSpawner {
+    profile: EngineProfile,
+}
 
 #[async_trait]
 impl ChildSpawner for EngineChildSpawner {
     async fn spawn(&self, id: UnitId, _spec: &DelegationSpec) -> Arc<dyn ManagedUnit> {
-        let engine = Engine::fresh(
-            SessionId::new(id.as_str()),
-            SystemPrompt::new("fleet child"),
-            Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>,
-            Arc::new(ToolRegistry::new()),
-        );
+        let engine = self.profile.fresh(SessionId::new(id.as_str()));
         Arc::new(EngineUnit::spawn(id, engine))
     }
 }

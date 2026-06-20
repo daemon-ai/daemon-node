@@ -281,12 +281,18 @@ impl LiveSessions {
                 }
                 Ok(())
             }
-            AgentCommand::Steer { .. } => Err(ApiError::Unsupported(
-                "Steer is not yet wired through the session actor".into(),
-            )),
-            AgentCommand::Snapshot { .. } => Err(ApiError::Unsupported(
-                "Snapshot is not yet wired through the session actor".into(),
-            )),
+            AgentCommand::Steer { text, request_id } => {
+                // Steer-when-idle opens a fresh turn; mid-turn it is drained at a phase boundary.
+                // Either way the ack + any turn events flow to the drain queue via the pump.
+                let handle = self.ensure(&session);
+                handle.steer(request_id, text).await;
+                Ok(())
+            }
+            AgentCommand::Snapshot { request_id } => {
+                let handle = self.existing(&session)?;
+                handle.snapshot(request_id).await;
+                Ok(())
+            }
             _ => Err(ApiError::Unsupported("unknown agent command".into())),
         }
     }

@@ -25,10 +25,23 @@ usage-delta = {
 user-msg = { text: tstr }
 
 agent-command = { "StartTurn": { input: user-msg, request_id: req-id } }
-              / { "Steer": { text: tstr } }
+              / { "Steer": { text: tstr, request_id: req-id } }
               / { "Interrupt": { reason: (tstr / null) } }
               / { "Snapshot": { request_id: req-id } }
               / "Shutdown"
+
+; ----- read-only conversation projection (Snapshot event body) -----
+conv-turn-view = {
+  role: tstr,                       ; "user" / "assistant" / "tool"
+  text: tstr,
+  tools: [* tstr],
+}
+
+conv-view = {
+  epoch: uint,
+  turns: [* conv-turn-view],
+  waiting_for: [* tstr],
+}
 
 agent-event = { "TurnStarted": { seq: uint, trigger: any } }
             / { "TextDelta": { seq: uint, text: tstr } }
@@ -39,6 +52,8 @@ agent-event = { "TurnStarted": { seq: uint, trigger: any } }
             / { "RateLimit": { seq: uint, snapshot: any } }
             / { "TurnFinished": { seq: uint, summary: any } }
             / { "Error": { seq: uint, failure: tstr } }
+            / { "Steered": { seq: uint, request_id: req-id, accepted: bool } }
+            / { "Snapshot": { seq: uint, request_id: req-id, view: conv-view } }
 
 host-request  = { request_id: req-id, kind: any }
 host-response = { request_id: req-id, body: any }

@@ -44,10 +44,13 @@ pub enum AgentCommand {
         /// Correlation id for this turn request.
         request_id: ReqId,
     },
-    /// Inject mid-turn steering text.
+    /// Inject mid-turn steering text (drained at the next phase boundary; opens a steer turn when
+    /// the engine is idle).
     Steer {
         /// The steering text.
         text: String,
+        /// Correlation id for this steer request (echoed on [`AgentEvent::Steered`]).
+        request_id: ReqId,
     },
     /// Interrupt the current turn.
     Interrupt {
@@ -126,6 +129,30 @@ impl TurnSummary {
             usage: UsageDelta::default(),
         }
     }
+}
+
+/// A read-only projection of one conversation turn, carried in a [`ConvView`] (§17 snapshot reply).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvTurnView {
+    /// The turn's role: `user`, `assistant`, or `tool`.
+    pub role: String,
+    /// The message / assistant text for the turn.
+    pub text: String,
+    /// The names of any tools invoked in this turn (empty for non-tool turns).
+    pub tools: Vec<String>,
+}
+
+/// A read-only projection of the engine's conversation at a consistent phase boundary — the body of
+/// an [`AgentEvent::Snapshot`] reply. Built by the engine from its durable `Snapshot`; never live
+/// state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvView {
+    /// The incarnation epoch the view was taken at.
+    pub epoch: u64,
+    /// The conversation turns, oldest first.
+    pub turns: Vec<ConvTurnView>,
+    /// Rendered ids of the background work the engine is currently waiting on.
+    pub waiting_for: Vec<String>,
 }
 
 /// A compact view of a tool invocation, streamed on the event surface (the durable record lives in
@@ -220,6 +247,24 @@ pub enum AgentEvent {
         /// Human-readable failure description.
         failure: String,
     },
+    /// A steer command was acknowledged (drained at a phase boundary or opened a steer turn).
+    Steered {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// Correlation id echoed from [`AgentCommand::Steer`].
+        request_id: ReqId,
+        /// Whether the steer was accepted into the conversation.
+        accepted: bool,
+    },
+    /// A read-only snapshot reply (the §17 snapshot ride on the event stream).
+    Snapshot {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// Correlation id echoed from [`AgentCommand::Snapshot`].
+        request_id: ReqId,
+        /// The consistent conversation projection.
+        view: ConvView,
+    },
 }
 
 impl AgentEvent {
@@ -234,7 +279,9 @@ impl AgentEvent {
             | AgentEvent::Usage { seq, .. }
             | AgentEvent::RateLimit { seq, .. }
             | AgentEvent::TurnFinished { seq, .. }
-            | AgentEvent::Error { seq, .. } => *seq,
+            | AgentEvent::Error { seq, .. }
+            | AgentEvent::Steered { seq, .. }
+            | AgentEvent::Snapshot { seq, .. } => *seq,
         }
     }
 }

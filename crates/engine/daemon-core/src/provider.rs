@@ -5,7 +5,9 @@
 //! clients (and streaming) arrive later.
 
 use crate::conversation::{Conversation, ToolCall, Turn};
-use daemon_common::UsageDelta;
+use crate::profile::ProviderBuilder;
+use daemon_common::{ProfileRef, UsageDelta};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How a model expects tool calls to be encoded.
@@ -104,6 +106,44 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     /// Run a (non-streaming) chat completion.
     async fn chat(&self, req: Request) -> Result<ModelOutput, Failure>;
+}
+
+/// A name -> [`ProviderBuilder`] map with a fallback default — the provider *selection* seam.
+///
+/// Provider implementations are a `daemon-core` port; *which* provider a profile resolves to is a
+/// host/binary policy. The registry makes that policy a one-line registration: a real networked
+/// provider drops in by `register("openai", ...)` (or `set_default`) without touching the engine or
+/// the construction sites. Phase 9 ships [`MockProvider`] as the default; no networked provider yet.
+#[derive(Clone, Default)]
+pub struct ProviderRegistry {
+    builders: HashMap<String, ProviderBuilder>,
+    default: Option<ProviderBuilder>,
+}
+
+impl ProviderRegistry {
+    /// An empty registry (no default; [`ProviderRegistry::builder_for`] returns `None` until one is
+    /// registered or set as default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register the provider builder a given profile name resolves to.
+    pub fn register(&mut self, profile: impl Into<String>, builder: ProviderBuilder) {
+        self.builders.insert(profile.into(), builder);
+    }
+
+    /// Set the fallback builder used when a profile has no explicit registration.
+    pub fn set_default(&mut self, builder: ProviderBuilder) {
+        self.default = Some(builder);
+    }
+
+    /// Resolve the builder for `profile`: its explicit registration, else the default, else `None`.
+    pub fn builder_for(&self, profile: &ProfileRef) -> Option<ProviderBuilder> {
+        self.builders
+            .get(profile.as_str())
+            .cloned()
+            .or_else(|| self.default.clone())
+    }
 }
 
 /// Flatten a conversation into a [`Request`] (the `build_context` phase, minimal form).

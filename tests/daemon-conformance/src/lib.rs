@@ -1782,4 +1782,407 @@ mod node_interface {
 
         handle.shutdown().await;
     }
+
+    /// Steer / Snapshot / Interrupt drive over the Unix socket, and the snapshot projection agrees
+    /// with the in-process transport (the phase-9 control-surface parity gate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steer_snapshot_interrupt_drive_over_socket_with_parity() {
+        use daemon_api::{Outbound, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_protocol::{AgentCommand, AgentEvent, ConvView, UserMsg};
+
+        let (node, handle) = assemble();
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+
+        // Drain the socket until `pred` matches one of the outbound items; returns all drained.
+        async fn drain_socket_until(
+            client: &ApiClient,
+            session: &SessionId,
+            pred: impl Fn(&Outbound) -> bool,
+        ) -> Vec<Outbound> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            loop {
+                match client
+                    .call(ApiRequest::Poll {
+                        session: session.clone(),
+                        max: 0,
+                    })
+                    .await
+                    .unwrap()
+                {
+                    ApiResponse::Drained(v) => {
+                        let hit = v.iter().any(&pred);
+                        seen.extend(v);
+                        if hit {
+                            return seen;
+                        }
+                    }
+                    other => panic!("expected Drained, got {other:?}"),
+                }
+                assert!(Instant::now() < deadline, "socket drain never matched");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn find_snapshot(items: &[Outbound], request_id: ReqId) -> Option<ConvView> {
+            items.iter().find_map(|o| match o {
+                Outbound::Event(AgentEvent::Snapshot {
+                    request_id: id,
+                    view,
+                    ..
+                }) if *id == request_id => Some(view.clone()),
+                _ => None,
+            })
+        }
+
+        // --- socket transport: StartTurn -> Snapshot -> Steer -> Interrupt ---
+        let socket_session = SessionId::new("socket-live");
+        assert!(matches!(
+            client
+                .call(ApiRequest::Submit {
+                    session: socket_session.clone(),
+                    command: AgentCommand::StartTurn {
+                        input: UserMsg::new("hello there"),
+                        request_id: ReqId(1),
+                    },
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+        drain_socket_until(&client, &socket_session, |o| {
+            matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. }))
+        })
+        .await;
+
+        // Snapshot over the socket.
+        client
+            .call(ApiRequest::Submit {
+                session: socket_session.clone(),
+                command: AgentCommand::Snapshot {
+                    request_id: ReqId(2),
+                },
+            })
+            .await
+            .unwrap();
+        let socket_items = drain_socket_until(&client, &socket_session, |o| {
+            matches!(o, Outbound::Event(AgentEvent::Snapshot { request_id, .. }) if *request_id == ReqId(2))
+        })
+        .await;
+        let socket_view = find_snapshot(&socket_items, ReqId(2)).expect("a snapshot view");
+        assert!(socket_view
+            .turns
+            .iter()
+            .any(|t| t.role == "user" && t.text == "hello there"));
+
+        // Steer over the socket: acked via a Steered event.
+        client
+            .call(ApiRequest::Submit {
+                session: socket_session.clone(),
+                command: AgentCommand::Steer {
+                    text: "stay focused".into(),
+                    request_id: ReqId(3),
+                },
+            })
+            .await
+            .unwrap();
+        drain_socket_until(&client, &socket_session, |o| {
+            matches!(o, Outbound::Event(AgentEvent::Steered { request_id, accepted, .. }) if *request_id == ReqId(3) && *accepted)
+        })
+        .await;
+
+        // Interrupt over the socket flows through and is accepted.
+        assert!(matches!(
+            client
+                .call(ApiRequest::Submit {
+                    session: socket_session.clone(),
+                    command: AgentCommand::Interrupt {
+                        reason: Some("stop".into()),
+                    },
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+
+        // --- in-process parity: the same StartTurn + Snapshot yields the same view shape ---
+        let inproc_session = SessionId::new("inproc-live");
+        node.submit(
+            inproc_session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hello there"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .unwrap();
+        let inproc_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let drained = node.poll(inproc_session.clone(), 0).await.unwrap();
+            if drained
+                .iter()
+                .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))
+            {
+                break;
+            }
+            assert!(Instant::now() < inproc_deadline, "in-proc turn never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        node.submit(
+            inproc_session.clone(),
+            AgentCommand::Snapshot {
+                request_id: ReqId(2),
+            },
+        )
+        .await
+        .unwrap();
+        let mut inproc_items = Vec::new();
+        let snap_deadline = Instant::now() + Duration::from_secs(10);
+        let inproc_view = loop {
+            inproc_items.extend(node.poll(inproc_session.clone(), 0).await.unwrap());
+            if let Some(view) = find_snapshot(&inproc_items, ReqId(2)) {
+                break view;
+            }
+            assert!(Instant::now() < snap_deadline, "in-proc snapshot never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(
+            socket_view.turns, inproc_view.turns,
+            "the snapshot projection must agree across transports"
+        );
+
+        server.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod store_backends {
+    //! Cross-backend store conformance (phase 9): the substrate acceptance invariants run
+    //! *identically* against both the in-memory backend and the durable SQLite backend, proving
+    //! `SqliteStore` is a faithful drop-in. This is the impl-agnostic acceptance harness,
+    //! parameterized by the store backend + a small fault-injection seam.
+
+    use daemon_activation::{ActivationManager, ActivationSubstrate, SubErr};
+    use daemon_common::{PartitionId, SessionId};
+    use daemon_core::Snapshot;
+    use daemon_host::CoreEngineFactory;
+    use daemon_store::{
+        FaultPoint, InMemoryStore, JobCompletion, SessionStatus, SessionStore, SqliteStore,
+        StoreError,
+    };
+    use std::sync::Arc;
+
+    const PARTITION: PartitionId = PartitionId::DEFAULT;
+
+    /// A store backend that can also arm a one-shot crash boundary (acceptance test #2).
+    trait FaultStore: SessionStore {
+        fn arm(&self, fault: Option<FaultPoint>);
+    }
+    impl FaultStore for InMemoryStore {
+        fn arm(&self, fault: Option<FaultPoint>) {
+            self.set_fault(fault);
+        }
+    }
+    impl FaultStore for SqliteStore {
+        fn arm(&self, fault: Option<FaultPoint>) {
+            self.set_fault(fault);
+        }
+    }
+
+    fn manager<S: FaultStore + 'static>(store: Arc<S>) -> ActivationManager {
+        ActivationManager::new(store, Arc::new(CoreEngineFactory::delegating()), PARTITION)
+    }
+
+    async fn seed<S: SessionStore>(store: &S, id: &SessionId) {
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode snapshot");
+        store
+            .create_session(id.clone(), PARTITION, blob)
+            .await
+            .expect("create session");
+    }
+
+    async fn assert_completed<S: SessionStore>(store: &S, id: &SessionId) {
+        assert_eq!(
+            store.status(id).await,
+            Some(SessionStatus::Completed),
+            "session {id} should be Completed"
+        );
+    }
+
+    /// Run the substrate acceptance invariants against a freshly built backend.
+    async fn run_suite<S: FaultStore + 'static>(make: impl Fn() -> Arc<S>) {
+        // #1 churn / baseline: the active directory returns to baseline after each session.
+        {
+            let store = make();
+            let mgr = manager(store.clone());
+            for i in 0..200 {
+                let id = SessionId::new(format!("churn-{i}"));
+                seed(&*store, &id).await;
+                mgr.wake(id).await.expect("wake");
+                assert_eq!(mgr.active_count(), 0, "directory leaked after session {i}");
+            }
+        }
+
+        // #2 crash-after-every-boundary.
+        {
+            let store = make();
+            let mgr = manager(store.clone());
+            let id = SessionId::new("crash-before-snapshot");
+            seed(&*store, &id).await;
+            let f = store.acquire_activation_lease(&id).await.unwrap();
+            store.arm(Some(FaultPoint::BeforeSnapshot));
+            let r = mgr.activate(id.clone(), f).await;
+            assert!(matches!(r, Err(SubErr::Store(StoreError::Fault(_)))));
+            mgr.recover().await.unwrap();
+            assert_completed(&*store, &id).await;
+        }
+        for fault in [FaultPoint::AfterSnapshot, FaultPoint::AfterJobOutbox] {
+            let store = make();
+            let mgr = manager(store.clone());
+            let id = SessionId::new(format!("crash-{fault:?}"));
+            seed(&*store, &id).await;
+            let f = store.acquire_activation_lease(&id).await.unwrap();
+            store.arm(Some(fault));
+            let r = mgr.activate(id.clone(), f).await;
+            assert!(matches!(r, Err(SubErr::Store(StoreError::Fault(_)))));
+            assert!(matches!(
+                store.status(&id).await,
+                Some(SessionStatus::Suspended { .. })
+            ));
+            mgr.recover().await.unwrap();
+            assert_completed(&*store, &id).await;
+        }
+        {
+            // (f) completion durable + Ready, but the wake was lost; the scan must rescue it.
+            let store = make();
+            let mgr = manager(store.clone());
+            let id = SessionId::new("crash-before-wake-publish");
+            seed(&*store, &id).await;
+            mgr.wake(id.clone()).await.unwrap();
+            store.arm(Some(FaultPoint::BeforeWakePublish));
+            let r = mgr.run_workers().await;
+            assert!(matches!(r, Err(SubErr::Store(StoreError::Fault(_)))));
+            assert_eq!(store.status(&id).await, Some(SessionStatus::Ready));
+            assert!(store.dequeue_wake().await.is_none(), "wake should be lost");
+            mgr.recover().await.unwrap();
+            assert_completed(&*store, &id).await;
+        }
+
+        // #3 wake/completion idempotency.
+        {
+            let store = make();
+            let mgr = manager(store.clone());
+            let id = SessionId::new("idempotent");
+            seed(&*store, &id).await;
+            mgr.wake(id.clone()).await.unwrap();
+            let job = store.dequeue_job().await.expect("a job on the outbox");
+            let completion = JobCompletion {
+                session_id: job.session_id,
+                epoch: job.epoch,
+                job_id: job.job_id,
+                payload: job.payload,
+            };
+            for _ in 0..5 {
+                store.record_completion_and_wake(&completion).await.unwrap();
+            }
+            assert_eq!(store.dequeue_wake().await.as_ref(), Some(&id));
+            assert!(
+                store.dequeue_wake().await.is_none(),
+                "duplicate completions must not enqueue extra wakes"
+            );
+            mgr.wake(id.clone()).await.unwrap();
+            assert_completed(&*store, &id).await;
+        }
+
+        // #4 dual-node fencing: only the highest-token holder commits.
+        {
+            let store = make();
+            let mgr_a = manager(store.clone());
+            let mgr_b = manager(store.clone());
+            let id = SessionId::new("dual-node");
+            seed(&*store, &id).await;
+            let fa = store.acquire_activation_lease(&id).await.unwrap();
+            let fb = store.acquire_activation_lease(&id).await.unwrap();
+            assert!(fb > fa);
+            let ra = mgr_a.activate(id.clone(), fa).await;
+            assert!(matches!(ra, Err(SubErr::Store(StoreError::Fenced { .. }))));
+            let rb = mgr_b.activate(id.clone(), fb).await;
+            assert!(rb.is_ok(), "current node should commit: {rb:?}");
+        }
+
+        // #5 empty-mailbox process kill: recover solely from durable state.
+        {
+            let store = make();
+            {
+                let mgr1 = manager(store.clone());
+                let id = SessionId::new("process-kill");
+                seed(&*store, &id).await;
+                mgr1.wake(id.clone()).await.unwrap();
+            }
+            let mgr2 = manager(store.clone());
+            mgr2.recover().await.unwrap();
+            assert_completed(&*store, &SessionId::new("process-kill")).await;
+            assert_eq!(mgr2.active_count(), 0);
+        }
+
+        // #7 lost-wake recovery.
+        {
+            let store = make();
+            let mgr = manager(store.clone());
+            let id = SessionId::new("lost-wake");
+            seed(&*store, &id).await;
+            mgr.wake(id.clone()).await.unwrap();
+            mgr.run_workers().await.unwrap();
+            assert_eq!(store.dequeue_wake().await.as_ref(), Some(&id));
+            assert!(store.dequeue_wake().await.is_none());
+            mgr.recover().await.unwrap();
+            assert_completed(&*store, &id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_backend_acceptance() {
+        run_suite(|| Arc::new(InMemoryStore::new())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_backend_acceptance() {
+        run_suite(|| Arc::new(SqliteStore::open_in_memory().expect("open sqlite"))).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_file_backend_round_trips() {
+        // A temp DB *file* (WAL on disk): the on-disk path drives a session to completion and the
+        // durable trace journal round-trips.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "daemon-conformance-{}-{}.sqlite",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let store = Arc::new(SqliteStore::open(&path).expect("open sqlite file"));
+        let mgr = manager(store.clone());
+        let id = SessionId::new("file-backed");
+        seed(&*store, &id).await;
+        mgr.wake(id.clone()).await.unwrap();
+        mgr.recover().await.unwrap();
+        assert_completed(&*store, &id).await;
+        drop(mgr);
+        drop(store);
+
+        for ext in ["sqlite", "sqlite-wal", "sqlite-shm"] {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
+    }
 }

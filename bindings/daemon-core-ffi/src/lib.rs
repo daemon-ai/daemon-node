@@ -464,9 +464,20 @@ impl SessionApi for CoreSessionApi {
                 }
                 Ok(())
             }
-            AgentCommand::Steer { .. } | AgentCommand::Snapshot { .. } => Err(ApiError::Unsupported(
-                "command not wired through the session actor".into(),
-            )),
+            AgentCommand::Steer { text, request_id } => {
+                let handle = self.ensure(&session);
+                handle.steer(request_id, text).await;
+                Ok(())
+            }
+            AgentCommand::Snapshot { request_id } => {
+                let handle = self
+                    .sessions
+                    .get(&session)
+                    .map(|s| s.handle.clone())
+                    .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+                handle.snapshot(request_id).await;
+                Ok(())
+            }
             _ => Err(ApiError::Unsupported("unknown agent command".into())),
         }
     }
@@ -556,6 +567,53 @@ mod fixture_tests {
         assert_eq!(
             to_cbor(&cmd),
             START_TURN_HI,
+            "the C harness fixture is stale; regenerate harness/harness.c"
+        );
+    }
+
+    /// CBOR for `AgentCommand::Snapshot { request_id: 2 }`
+    /// (externally-tagged: `{"Snapshot": {"request_id": 2}}`).
+    const SNAPSHOT_2: &[u8] = &[
+        0xA1, // map(1)
+        0x68, b'S', b'n', b'a', b'p', b's', b'h', b'o', b't', // "Snapshot"
+        0xA1, // map(1)
+        0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd', // "request_id"
+        0x02, // 2
+    ];
+
+    #[test]
+    fn snapshot_fixture_matches_canonical_cbor() {
+        let cmd = AgentCommand::Snapshot {
+            request_id: ReqId(2),
+        };
+        assert_eq!(
+            to_cbor(&cmd),
+            SNAPSHOT_2,
+            "the C harness fixture is stale; regenerate harness/harness.c"
+        );
+    }
+
+    /// CBOR for `AgentCommand::Steer { text: "go", request_id: 3 }`
+    /// (externally-tagged: `{"Steer": {"text": "go", "request_id": 3}}`).
+    const STEER_GO: &[u8] = &[
+        0xA1, // map(1)
+        0x65, b'S', b't', b'e', b'e', b'r', // "Steer"
+        0xA2, // map(2)
+        0x64, b't', b'e', b'x', b't', // "text"
+        0x62, b'g', b'o', // "go"
+        0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd', // "request_id"
+        0x03, // 3
+    ];
+
+    #[test]
+    fn steer_fixture_matches_canonical_cbor() {
+        let cmd = AgentCommand::Steer {
+            text: "go".into(),
+            request_id: ReqId(3),
+        };
+        assert_eq!(
+            to_cbor(&cmd),
+            STEER_GO,
             "the C harness fixture is stale; regenerate harness/harness.c"
         );
     }

@@ -3,8 +3,10 @@
  *
  * Proves the C ABI is the *same* §17 session surface: create a runtime + session, submit a
  * CBOR-encoded AgentCommand::StartTurn, then poll the drain queue until a drained item carries the
- * "TurnFinished" event. The CBOR bytes are pinned by the Rust test
- * `fixture_tests::start_turn_fixture_matches_canonical_cbor` so they cannot silently drift.
+ * "TurnFinished" event. It then drives the phase-9 control surface over the same ABI: a Snapshot
+ * command (expecting a "Snapshot" event) and a Steer command (expecting a "Steered" event). The
+ * CBOR bytes are pinned by the Rust `fixture_tests::*_fixture_matches_canonical_cbor` tests so they
+ * cannot silently drift.
  *
  * Build + run via `harness/run.sh` (links the staticlib). Exit 0 on success, non-zero otherwise.
  */
@@ -30,6 +32,26 @@ static const uint8_t START_TURN_HI[] = {
     0x01,
 };
 
+/* CBOR for AgentCommand::Snapshot { request_id: 2 }. */
+static const uint8_t SNAPSHOT_2[] = {
+    0xA1,
+    0x68, 'S','n','a','p','s','h','o','t',
+    0xA1,
+    0x6A, 'r','e','q','u','e','s','t','_','i','d',
+    0x02,
+};
+
+/* CBOR for AgentCommand::Steer { text: "go", request_id: 3 }. */
+static const uint8_t STEER_GO[] = {
+    0xA1,
+    0x65, 'S','t','e','e','r',
+    0xA2,
+    0x64, 't','e','x','t',
+    0x62, 'g','o',
+    0x6A, 'r','e','q','u','e','s','t','_','i','d',
+    0x03,
+};
+
 /* Naive byte-substring search (the CBOR carries the variant name as a text string). */
 static int contains(const uint8_t *hay, size_t hay_len, const char *needle) {
     size_t n = strlen(needle);
@@ -48,6 +70,36 @@ static void print_last_error(const char *ctx) {
     fprintf(stderr, "%s: %.*s\n", ctx, (int)len, (char *)buf);
 }
 
+/*
+ * Submit a CBOR command, then poll the drain queue until an item carries `needle`.
+ * Returns 1 on success, 0 otherwise.
+ */
+static int submit_and_await(daemon_session_t *s, const uint8_t *cmd, size_t cmd_len,
+                            const char *what, const char *needle) {
+    int rc = daemon_session_submit(s, cmd, cmd_len);
+    if (rc != DAEMON_OK) { print_last_error(what); return 0; }
+
+    uint8_t buf[4096];
+    struct timespec nap = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 }; /* 10ms */
+    for (int i = 0; i < 500; i++) {
+        size_t out_len = 0;
+        int pr = daemon_session_poll(s, buf, sizeof(buf), &out_len);
+        if (pr == DAEMON_OK) {
+            if (contains(buf, out_len, needle)) return 1;
+        } else if (pr == DAEMON_EMPTY) {
+            nanosleep(&nap, NULL);
+        } else if (pr == DAEMON_BUFFER_TOO_SMALL) {
+            fprintf(stderr, "%s poll: item needs %zu bytes\n", what, out_len);
+            return 0;
+        } else {
+            print_last_error(what);
+            return 0;
+        }
+    }
+    fprintf(stderr, "FAIL: %s never observed %s\n", what, needle);
+    return 0;
+}
+
 int main(void) {
     printf("daemon-core-ffi harness: abi_version=%u\n", daemon_abi_version());
 
@@ -58,38 +110,26 @@ int main(void) {
     daemon_session_t *s = daemon_session_open(rt, (const uint8_t *)name, strlen(name));
     if (!s) { print_last_error("session_open"); daemon_runtime_free(rt); return 1; }
 
-    int rc = daemon_session_submit(s, START_TURN_HI, sizeof(START_TURN_HI));
-    if (rc != DAEMON_OK) { print_last_error("submit"); daemon_session_free(s); daemon_runtime_free(rt); return 1; }
+    int ok = 1;
+    if (ok && submit_and_await(s, START_TURN_HI, sizeof(START_TURN_HI), "start_turn", "TurnFinished")) {
+        printf("OK: drained TurnFinished over the C ABI\n");
+    } else { ok = 0; }
 
-    int finished = 0;
-    uint8_t buf[4096];
-    struct timespec nap = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 }; /* 10ms */
-    for (int i = 0; i < 500 && !finished; i++) {
-        size_t out_len = 0;
-        int pr = daemon_session_poll(s, buf, sizeof(buf), &out_len);
-        if (pr == DAEMON_OK) {
-            if (contains(buf, out_len, "TurnFinished")) {
-                finished = 1;
-                break;
-            }
-        } else if (pr == DAEMON_EMPTY) {
-            nanosleep(&nap, NULL);
-        } else if (pr == DAEMON_BUFFER_TOO_SMALL) {
-            fprintf(stderr, "poll: item needs %zu bytes\n", out_len);
-            break;
-        } else {
-            print_last_error("poll");
-            break;
-        }
-    }
+    /* The phase-9 control surface, over the same ABI. */
+    if (ok && submit_and_await(s, SNAPSHOT_2, sizeof(SNAPSHOT_2), "snapshot", "Snapshot")) {
+        printf("OK: drained Snapshot over the C ABI\n");
+    } else { ok = 0; }
+
+    if (ok && submit_and_await(s, STEER_GO, sizeof(STEER_GO), "steer", "Steered")) {
+        printf("OK: drained Steered over the C ABI\n");
+    } else { ok = 0; }
 
     daemon_session_free(s);
     daemon_runtime_free(rt);
 
-    if (finished) {
-        printf("OK: drained TurnFinished over the C ABI\n");
+    if (ok) {
+        printf("OK: C ABI exercised StartTurn + Snapshot + Steer\n");
         return 0;
     }
-    fprintf(stderr, "FAIL: never observed TurnFinished\n");
     return 1;
 }

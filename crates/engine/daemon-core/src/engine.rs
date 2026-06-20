@@ -6,6 +6,8 @@
 //! applies them — appending turns and recording delegations — which is what makes suspension a
 //! deterministic phase boundary (lifecycle §3.1).
 
+use crate::config::Config;
+use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
 use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
 use crate::events::EventSink;
@@ -17,11 +19,10 @@ use crate::turn::{Effect, TurnCx};
 use crate::Failure;
 use daemon_common::{Budget, CredScope, Epoch, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
-    AgentEvent, CompletionSource, EndReason, HostRequestHandler, ToolCallView, ToolResultView,
-    TurnSummary, TurnTrigger, UserMsg,
+    AgentEvent, CompletionSource, ConvTurnView, ConvView, EndReason, HostRequestHandler,
+    ToolCallView, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 /// A background-job completion handed back to the engine on rehydration (the core-local form of the
 /// durable `JobCompletion`; the host adapter converts between them).
@@ -60,6 +61,10 @@ pub struct Engine {
     budget: Budget,
     credentials: Arc<dyn CredentialProvider>,
     profile: ProfileRef,
+    config: Config,
+    /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
+    /// consumed at the start of `run_turn`.
+    next_trigger: Option<TurnTrigger>,
 }
 
 impl Engine {
@@ -79,6 +84,8 @@ impl Engine {
             // injected via `with_credentials` (host-spec §6).
             credentials: Arc::new(EmbeddedCredentialPool::single_key()),
             profile: ProfileRef::new("default"),
+            config: Config::default(),
+            next_trigger: None,
         }
     }
 
@@ -97,6 +104,12 @@ impl Engine {
     /// Set the budget governing this engine's turns.
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Inject the engine tunables (§20) the host loaded from its config.
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
         self
     }
 
@@ -122,9 +135,120 @@ impl Engine {
         self.snapshot.conversation.push_user(input);
     }
 
+    /// Append an out-of-band steer marker into the conversation (hermes-style) and arm the next
+    /// turn's trigger as [`TurnTrigger::Steer`]. The steer text becomes part of the model context.
+    pub fn push_steer_marker(&mut self, steer: &SteerReq) {
+        self.snapshot
+            .conversation
+            .push_user(UserMsg::new(format!("[steer] {}", steer.text)));
+        self.next_trigger = Some(TurnTrigger::Steer);
+    }
+
     /// The current snapshot (the only durable state).
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// Build a read-only [`ConvView`] projection of the current conversation (the §17 snapshot
+    /// reply body). Never exposes live resources — only the durable conversation + epoch.
+    pub fn conv_view(&self) -> ConvView {
+        let turns = self
+            .snapshot
+            .conversation
+            .turns
+            .iter()
+            .map(|turn| match turn {
+                Turn::User(u) => ConvTurnView {
+                    role: "user".into(),
+                    text: u.text.clone(),
+                    tools: Vec::new(),
+                },
+                Turn::Assistant(a) => ConvTurnView {
+                    role: "assistant".into(),
+                    text: a.text.clone(),
+                    tools: Vec::new(),
+                },
+                Turn::Tool(t) => ConvTurnView {
+                    role: "tool".into(),
+                    text: t.assistant.text.clone(),
+                    tools: t.calls.iter().map(|(call, _)| call.name.clone()).collect(),
+                },
+            })
+            .collect();
+        ConvView {
+            epoch: self.snapshot.epoch.0,
+            turns,
+            waiting_for: self
+                .snapshot
+                .waiting_for
+                .iter()
+                .map(|j| j.to_string())
+                .collect(),
+        }
+    }
+
+    /// Serve any pending snapshot requests at a consistent phase boundary by emitting a
+    /// [`AgentEvent::Snapshot`] carrying the current [`ConvView`].
+    fn serve_snapshots(&self, control: &TurnControl, events: &EventSink) {
+        for request_id in control.drain_snapshot() {
+            let view = self.conv_view();
+            events.emit(|seq| AgentEvent::Snapshot {
+                seq,
+                request_id,
+                view,
+            });
+        }
+    }
+
+    /// A full phase boundary: serve snapshots, drain steer (appending markers + acking each), then
+    /// report whether cancellation has been requested.
+    fn boundary(&mut self, control: &TurnControl, events: &EventSink) -> bool {
+        self.serve_snapshots(control, events);
+        for steer in control.drain_steer() {
+            self.push_steer_marker(&steer);
+            let request_id = steer.request_id;
+            events.emit(|seq| AgentEvent::Steered {
+                seq,
+                request_id,
+                accepted: true,
+            });
+        }
+        control.is_cancelled()
+    }
+
+    /// A read-only phase boundary (inside the tool loop): serve snapshots and report cancellation,
+    /// without mutating the conversation mid-tool-turn.
+    fn boundary_readonly(&self, control: &TurnControl, events: &EventSink) -> bool {
+        self.serve_snapshots(control, events);
+        control.is_cancelled()
+    }
+
+    /// Finalize an interrupted turn: emit `TurnFinished{Interrupted}` and report it as a (terminal)
+    /// completed outcome.
+    fn finish_interrupted(&self, events: &EventSink) -> TurnOutcome {
+        let summary = TurnSummary::ended(EndReason::Interrupted);
+        let emitted = summary.clone();
+        events.emit(|seq| AgentEvent::TurnFinished {
+            seq,
+            summary: emitted,
+        });
+        TurnOutcome::Completed(summary)
+    }
+
+    /// Finalize a failed turn: emit `Error` + `TurnFinished{Failed}` and report it as terminal.
+    fn finish_failed(&self, failure: Failure, events: &EventSink) -> TurnOutcome {
+        if matches!(failure, Failure::Cancelled) {
+            return self.finish_interrupted(events);
+        }
+        let text = failure.to_string();
+        events.emit(|seq| AgentEvent::Error { seq, failure: text });
+        let summary = TurnSummary::ended(EndReason::Failed);
+        let emitted = summary.clone();
+        events.emit(|seq| AgentEvent::TurnFinished {
+            seq,
+            summary: emitted,
+        });
+        TurnOutcome::Completed(summary)
     }
 
     /// The current incarnation epoch.
@@ -155,8 +279,8 @@ impl Engine {
             self.credentials.release(&lease).await;
             match result {
                 Ok(out) => break out,
-                Err(f) if f.is_rotatable() && attempt == 0 => {
-                    // Mark the credential out and retry on a rotated one.
+                Err(f) if f.is_rotatable() && attempt < self.config.model_retry_attempts => {
+                    // Mark the credential out and retry on a rotated one (up to the configured count).
                     self.credentials.rotate(&self.profile, &lease.cap_id).await;
                     attempt += 1;
                     continue;
@@ -208,21 +332,32 @@ impl Engine {
     }
 
     /// Run one turn to a phase boundary: terminal completion or durable suspension (§4.2 / §3.1).
+    ///
+    /// The turn observes the shared [`TurnControl`] at phase boundaries: a requested interrupt
+    /// finalizes the turn as [`EndReason::Interrupted`], queued steers are drained into the
+    /// conversation (acked via [`AgentEvent::Steered`]), and pending snapshot requests are served
+    /// with a consistent [`AgentEvent::Snapshot`]. A provider failure ends the turn as
+    /// [`EndReason::Failed`] (after an [`AgentEvent::Error`]).
     pub async fn run_turn(
         &mut self,
         host: &dyn HostRequestHandler,
         events: &EventSink,
-        cancel: CancellationToken,
+        control: &TurnControl,
     ) -> Result<TurnOutcome, Failure> {
         let resuming = !self.pending.is_empty();
-        let trigger = if resuming {
+        let trigger = self.next_trigger.take().unwrap_or(if resuming {
             TurnTrigger::BackgroundCompletion {
                 source: CompletionSource::Delegation(self.pending[0].job_id.clone()),
             }
         } else {
             TurnTrigger::User
-        };
+        });
         events.emit(|seq| AgentEvent::TurnStarted { seq, trigger });
+
+        // Boundary: an interrupt that arrived before the turn does any work ends it immediately.
+        if self.boundary(control, events) {
+            return Ok(self.finish_interrupted(events));
+        }
 
         // Resume path: a background completion arrived — apply it idempotently, bump the epoch, and
         // let the model finalize.
@@ -230,7 +365,10 @@ impl Engine {
             self.resolve_pending();
             self.snapshot.waiting_for.clear();
             self.snapshot.epoch = self.snapshot.epoch.next();
-            let out = self.call_model(events).await?;
+            let out = match self.call_model(events).await {
+                Ok(out) => out,
+                Err(f) => return Ok(self.finish_failed(f, events)),
+            };
             self.finalize_text(&out, events);
             return Ok(self.complete(out, events));
         }
@@ -243,14 +381,23 @@ impl Engine {
 
         // Fresh activation: ask the model. A completing provider finishes here; a delegating one
         // returns a tool call that drives suspension.
-        let out = self.call_model(events).await?;
+        let out = match self.call_model(events).await {
+            Ok(out) => out,
+            Err(f) => return Ok(self.finish_failed(f, events)),
+        };
+
+        // Boundary after the model call: serve snapshots/steer, honor a mid-call interrupt.
+        if self.boundary(control, events) {
+            return Ok(self.finish_interrupted(events));
+        }
+
         if out.tool_calls.is_empty() {
             self.finalize_text(&out, events);
             return Ok(self.complete(out, events));
         }
 
         let cx = TurnCx {
-            cancel,
+            cancel: control.cancel_token(),
             events,
             host,
             session_id: self.snapshot.session_id.clone(),
@@ -261,6 +408,7 @@ impl Engine {
         // execute_tools: run each call through the §12 pipeline, collecting result slots + effects.
         let mut calls = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
+        let mut interrupted = false;
         for call in &out.tool_calls {
             let view = ToolCallView {
                 call_id: call.call_id.clone(),
@@ -280,6 +428,11 @@ impl Engine {
             });
             calls.push((call.clone(), outcome.result));
             effects.extend(outcome.effects);
+            // Boundary after each tool: an interrupt stops further tool execution.
+            if self.boundary_readonly(control, events) {
+                interrupted = true;
+                break;
+            }
         }
 
         // The single-owner applier: the assembled tool turn is the leading Persist effect, then any
@@ -300,6 +453,11 @@ impl Engine {
                 Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
                 Effect::Delegate(job_id) => delegated = Some(job_id),
             }
+        }
+
+        // An interrupt at a tool boundary finalizes the turn before it would suspend/complete.
+        if interrupted {
+            return Ok(self.finish_interrupted(events));
         }
 
         match delegated {
@@ -346,7 +504,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::provider::{Capabilities, ModelOutput, Request, ToolCallFormat};
-    use daemon_common::{CredScope, UsageDelta};
+    use daemon_common::{CredScope, ReqId, UsageDelta};
     use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -420,11 +578,148 @@ mod tests {
         engine.push_user(UserMsg::new("hello"));
 
         let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), CancellationToken::new())
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
             .await
             .expect("turn completes after a single rotation");
         assert!(matches!(outcome, TurnOutcome::Completed(_)));
         assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "retried once");
         assert_eq!(pool.live_count(), 1, "the rotated key is cooling down");
+    }
+
+    /// A provider that always fails with a non-rotatable error.
+    struct FailingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FailingProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+
+        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+            Err(Failure::Provider("model exploded".into()))
+        }
+    }
+
+    /// An event sink that records every emitted event for assertions.
+    fn collecting() -> (EventSink, Arc<std::sync::Mutex<Vec<AgentEvent>>>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let l = log.clone();
+        (EventSink::new(move |ev| l.lock().unwrap().push(ev)), log)
+    }
+
+    fn completing_engine(id: &str) -> Engine {
+        Engine::fresh(
+            SessionId::new(id),
+            SystemPrompt::new("test"),
+            Arc::new(crate::provider::MockProvider::completing("hi")),
+            Arc::new(ToolRegistry::new()),
+        )
+    }
+
+    /// An interrupt observed at the opening phase boundary finalizes the turn as `Interrupted`.
+    #[tokio::test]
+    async fn interrupt_at_boundary_finalizes_interrupted() {
+        let mut engine = completing_engine("int");
+        engine.push_user(UserMsg::new("hello"));
+        let control = TurnControl::new();
+        control.cancel();
+        let (sink, log) = collecting();
+
+        let outcome = engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
+            _ => panic!("expected a completed-but-interrupted outcome"),
+        }
+        assert!(log.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnFinished { summary, .. } if summary.end_reason == EndReason::Interrupted
+        )));
+    }
+
+    /// A provider failure ends the turn as `Failed`, after an `Error` event.
+    #[tokio::test]
+    async fn provider_failure_emits_error_and_failed() {
+        let mut engine = Engine::fresh(
+            SessionId::new("fail"),
+            SystemPrompt::new("test"),
+            Arc::new(FailingProvider),
+            Arc::new(ToolRegistry::new()),
+        );
+        engine.push_user(UserMsg::new("hello"));
+        let (sink, log) = collecting();
+
+        let outcome = engine
+            .run_turn(&NoopHost, &sink, &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
+            _ => panic!("expected a failed outcome"),
+        }
+        let log = log.lock().unwrap();
+        assert!(log.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+        assert!(log.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnFinished { summary, .. } if summary.end_reason == EndReason::Failed
+        )));
+    }
+
+    /// A pending snapshot request is served at a phase boundary with a `ConvView` reflecting the
+    /// conversation.
+    #[tokio::test]
+    async fn snapshot_request_served_with_conv_view() {
+        let mut engine = completing_engine("snap");
+        engine.push_user(UserMsg::new("question"));
+        let control = TurnControl::new();
+        control.push_snapshot(ReqId(7));
+        let (sink, log) = collecting();
+
+        engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
+        let log = log.lock().unwrap();
+        let (request_id, view) = log
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Snapshot {
+                    request_id, view, ..
+                } => Some((*request_id, view.clone())),
+                _ => None,
+            })
+            .expect("a snapshot event");
+        assert_eq!(request_id, ReqId(7));
+        assert!(view
+            .turns
+            .iter()
+            .any(|t| t.role == "user" && t.text == "question"));
+    }
+
+    /// A queued steer is drained at a boundary: the marker lands in the conversation and a
+    /// `Steered` ack is emitted.
+    #[tokio::test]
+    async fn steer_drained_appends_marker_and_acks() {
+        let mut engine = completing_engine("steer");
+        engine.push_user(UserMsg::new("hi"));
+        let control = TurnControl::new();
+        control.push_steer(SteerReq {
+            request_id: ReqId(3),
+            text: "focus".into(),
+        });
+        let (sink, log) = collecting();
+
+        engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
+        assert!(log.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AgentEvent::Steered { request_id, accepted, .. } if *request_id == ReqId(3) && *accepted
+        )));
+        assert!(engine
+            .snapshot()
+            .conversation
+            .turns
+            .iter()
+            .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer] focus"))));
     }
 }

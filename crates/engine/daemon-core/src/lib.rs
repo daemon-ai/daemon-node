@@ -16,10 +16,13 @@
 #![forbid(unsafe_code)]
 
 pub mod actor;
+pub mod config;
+pub mod control;
 pub mod conversation;
 pub mod credentials;
 pub mod engine;
 pub mod events;
+pub mod profile;
 pub mod provider;
 pub mod snapshot;
 pub mod tool_pipeline;
@@ -27,15 +30,18 @@ pub mod tools;
 pub mod turn;
 
 pub use actor::{spawn_agent_session, AgentHandle};
+pub use config::Config;
+pub use control::{SteerReq, TurnControl};
 pub use conversation::{
     AssistantMsg, Conversation, SystemPrompt, ToolCall, ToolResult, ToolTurn, Turn,
 };
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use engine::{Completion, Engine, Suspension, TurnOutcome};
 pub use events::EventSink;
+pub use profile::{CredentialBuilder, EngineProfile, ProviderBuilder};
 pub use provider::{
-    build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, Request, RequestMsg,
-    ToolCallFormat,
+    build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
+    Request, RequestMsg, ToolCallFormat,
 };
 pub use snapshot::{ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;

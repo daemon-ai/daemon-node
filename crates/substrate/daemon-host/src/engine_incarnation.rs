@@ -15,32 +15,24 @@ use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
 use daemon_common::{Epoch, JobId, ProfileRef, SessionId};
 use daemon_core::{
-    Completion, CredentialProvider, DelegateTool, Engine, EventSink, Failure, MockProvider,
-    Provider, Snapshot, SystemPrompt, ToolRegistry, TurnOutcome,
+    Completion, DelegateTool, Engine, EngineProfile, EventSink, Failure, MockProvider, Provider,
+    Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
 };
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody,
 };
 use daemon_store::{JobCommand, JobCompletion};
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
-/// A builder for the model [`Provider`] each incarnation drives (a fresh provider per activation).
-pub type ProviderBuilder = Arc<dyn Fn() -> Arc<dyn Provider> + Send + Sync>;
+// The provider/credential builder type aliases now live with the [`EngineProfile`] in `daemon-core`
+// (the one composition seam); re-exported here for callers that still reference them by this path.
+pub use daemon_core::{CredentialBuilder, ProviderBuilder};
 
-/// A builder for the [`CredentialProvider`] each incarnation acquires capabilities from. A fresh
-/// handle per activation lets a brokered client be re-bound to the live cut (host-spec §6).
-pub type CredentialBuilder = Arc<dyn Fn() -> Arc<dyn CredentialProvider> + Send + Sync>;
-
-/// Builds core-backed [`Incarnation`]s — the phase-3 replacement for the retired stub engine.
+/// Builds core-backed [`Incarnation`]s from a shared [`EngineProfile`] — the durable activation
+/// path's view of the one engine-construction seam.
 #[derive(Clone)]
 pub struct CoreEngineFactory {
-    provider: ProviderBuilder,
-    registry: Arc<ToolRegistry>,
-    system: SystemPrompt,
-    /// The credential provider + profile injected into each engine; `None` keeps the engine's
-    /// embedded L1 default.
-    credentials: Option<(CredentialBuilder, ProfileRef)>,
+    profile: EngineProfile,
 }
 
 impl CoreEngineFactory {
@@ -49,14 +41,14 @@ impl CoreEngineFactory {
     pub fn delegating() -> Self {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(DelegateTool::new("background-work")));
-        Self {
-            provider: Arc::new(|| {
+        let profile = EngineProfile::new(
+            Arc::new(|| {
                 Arc::new(MockProvider::delegating("delegate", "work complete")) as Arc<dyn Provider>
             }),
-            registry: Arc::new(registry),
-            system: SystemPrompt::new("daemon-core conformance engine"),
-            credentials: None,
-        }
+            Arc::new(registry),
+            SystemPrompt::new("daemon-core conformance engine"),
+        );
+        Self { profile }
     }
 
     /// A factory over a custom provider builder, tool registry, and system prompt.
@@ -66,17 +58,19 @@ impl CoreEngineFactory {
         system: SystemPrompt,
     ) -> Self {
         Self {
-            provider,
-            registry,
-            system,
-            credentials: None,
+            profile: EngineProfile::new(provider, registry, system),
         }
+    }
+
+    /// A factory over an already-assembled [`EngineProfile`] (the binary's composition root).
+    pub fn from_profile(profile: EngineProfile) -> Self {
+        Self { profile }
     }
 
     /// Inject an authority-backed (or brokered) credential provider + profile into every engine
     /// this factory builds — the host bridge for the §7 port (host-spec §6).
     pub fn with_credentials(mut self, credentials: CredentialBuilder, profile: ProfileRef) -> Self {
-        self.credentials = Some((credentials, profile));
+        self.profile = self.profile.with_credentials(credentials, profile);
         self
     }
 }
@@ -84,10 +78,7 @@ impl CoreEngineFactory {
 impl EngineFactory for CoreEngineFactory {
     fn create(&self) -> Box<dyn Incarnation> {
         Box::new(CoreIncarnation {
-            provider: self.provider.clone(),
-            registry: self.registry.clone(),
-            system: self.system.clone(),
-            credentials: self.credentials.clone(),
+            profile: self.profile.clone(),
             engine: None,
         })
     }
@@ -95,11 +86,7 @@ impl EngineFactory for CoreEngineFactory {
 
 /// One core-backed engine incarnation driven through the activation seam.
 pub struct CoreIncarnation {
-    provider: ProviderBuilder,
-    registry: Arc<ToolRegistry>,
-    #[allow(dead_code)]
-    system: SystemPrompt,
-    credentials: Option<(CredentialBuilder, ProfileRef)>,
+    profile: EngineProfile,
     engine: Option<Engine>,
 }
 
@@ -120,11 +107,7 @@ impl Incarnation for CoreIncarnation {
             ));
         }
         let snap = Snapshot::decode(&snapshot)?;
-        let provider = (self.provider)();
-        let mut engine = Engine::from_snapshot(snap, provider, self.registry.clone());
-        if let Some((build, profile)) = &self.credentials {
-            engine = engine.with_credentials(build(), profile.clone());
-        }
+        let mut engine = self.profile.from_snapshot(snap);
         let completions = unapplied
             .into_iter()
             .map(|c| Completion {
@@ -148,9 +131,9 @@ impl Incarnation for CoreIncarnation {
             epoch: engine.epoch(),
         };
         let sink = EventSink::discarding();
-        let cancel = CancellationToken::new();
+        let control = TurnControl::new();
         match engine
-            .run_turn(&host, &sink, cancel)
+            .run_turn(&host, &sink, &control)
             .await
             .map_err(map_failure)?
         {
