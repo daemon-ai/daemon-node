@@ -1,86 +1,24 @@
 //! [`ProcessAgentUnit`] — a **foreign** agent process presented as an `Engine`-leaf managed unit.
 //!
 //! Where [`crate::unit::EngineUnit`] backs a unit with an in-process `daemon-core` engine, this backs
-//! it with a child process that speaks §17 over a [`daemon_provision`] cut: `AgentCommand`/
-//! `HostResponse` framed (CBOR) down its stdin, `AgentEvent`/`HostRequest` framed up its stdout. Both
-//! flow through the same [`crate::section17`] adapter, so a foreign brain is indistinguishable from
-//! `daemon-core` to its supervisor (`UnitKind::Engine`) — the whole point of the §17 leaf being a
-//! universal agent-runner contract.
+//! it with a child process that speaks §17 over a [`daemon_provision`] cut. It is a thin factory over
+//! the generic [`CodecSection17`](crate::foreign::CodecSection17) driver wired with the
+//! [`NativeCutCodec`](crate::foreign::NativeCutCodec): `AgentCommand`/`HostResponse` framed (CBOR)
+//! down its stdin, `AgentEvent`/`HostRequest` framed up its stdout. The session flows through the
+//! same [`crate::section17`] adapter, so a foreign brain is indistinguishable from `daemon-core` to
+//! its supervisor (`UnitKind::Engine`) — the whole point of the §17 leaf being a universal
+//! agent-runner contract. Other foreign protocols are just other codecs on the same driver.
 //!
 //! Unlike the durable placement cut ([`crate::cut`]), there is **no** store/credential brokering: a
 //! foreign brain owns its own state, so its lifecycle is adapter-owned (the child is killed on drop,
 //! relaunched from its launch profile) rather than hydrated/dehydrated from a `daemon-core` snapshot.
 
+use crate::foreign::{CodecSection17, NativeCutCodec};
 use crate::section17::{AgentUnit, Section17Session};
-use async_trait::async_trait;
 use daemon_common::UnitId;
-use daemon_protocol::{
-    AgentCommand, AgentEvent, HostRequestHandler, Inbound, Outbound,
-};
-use daemon_provision::{ChildGuard, CutChannel, CutWriter, Placement};
+use daemon_protocol::HostRequestHandler;
+use daemon_provision::Placement;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-
-/// A [`Section17Session`] over a foreign agent process driven across a cut.
-struct ProcessSection17 {
-    writer: CutWriter,
-    events: broadcast::Sender<AgentEvent>,
-    /// Owns the child process (when placed over a real cut); killed on drop so a unit never leaks an
-    /// OS process. `None` when driven over an in-memory channel (tests).
-    _child: Option<ChildGuard>,
-}
-
-impl ProcessSection17 {
-    /// Start pumping a foreign agent over `channel`: spawn the reader task (events up, blocking
-    /// requests answered via `host` and framed back down) and retain the writer for `submit`.
-    fn from_channel(
-        channel: CutChannel,
-        child: Option<ChildGuard>,
-        host: Arc<dyn HostRequestHandler>,
-    ) -> Self {
-        let (writer, mut reader) = channel.split();
-        let (events, _) = broadcast::channel::<AgentEvent>(256);
-
-        let events_relay = events.clone();
-        let reply_writer = writer.clone();
-        tokio::spawn(async move {
-            while let Some(bytes) = reader.recv().await {
-                match decode_up(&bytes) {
-                    Some(Outbound::Event(ev)) => {
-                        let _ = events_relay.send(ev);
-                    }
-                    Some(Outbound::Request(req)) => {
-                        let resp = host.request(req).await;
-                        let _ = reply_writer
-                            .send(&encode_down(&Inbound::Response(resp)))
-                            .await;
-                    }
-                    Some(_) | None => continue,
-                }
-            }
-        });
-
-        Self {
-            writer,
-            events,
-            _child: child,
-        }
-    }
-}
-
-#[async_trait]
-impl Section17Session for ProcessSection17 {
-    async fn submit(&self, cmd: AgentCommand) {
-        let _ = self
-            .writer
-            .send(&encode_down(&Inbound::Command(cmd)))
-            .await;
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
-        self.events.subscribe()
-    }
-}
 
 /// A foreign agent process presented to its supervisor as a `UnitKind::Engine` managed unit.
 pub struct ProcessAgentUnit;
@@ -100,40 +38,39 @@ impl ProcessAgentUnit {
     ) -> AgentUnit {
         let Placement { channel, child } = placement;
         AgentUnit::start_journaled(id, journal, move |host: Arc<dyn HostRequestHandler>| {
-            Arc::new(ProcessSection17::from_channel(channel, Some(child), host))
-                as Arc<dyn Section17Session>
+            Arc::new(CodecSection17::from_channel(
+                channel,
+                Some(child),
+                host,
+                NativeCutCodec,
+            )) as Arc<dyn Section17Session>
         })
     }
 
     /// Wrap a foreign agent reachable over an in-memory `channel` (no OS child) as a managed unit.
     /// Used by tests to exercise the cut framing without spawning a process.
     #[cfg(test)]
-    pub fn from_channel(id: UnitId, channel: CutChannel) -> AgentUnit {
+    pub fn from_channel(id: UnitId, channel: daemon_provision::CutChannel) -> AgentUnit {
         AgentUnit::start_journaled(id, None, move |host: Arc<dyn HostRequestHandler>| {
-            Arc::new(ProcessSection17::from_channel(channel, None, host))
-                as Arc<dyn Section17Session>
+            Arc::new(CodecSection17::from_channel(
+                channel,
+                None,
+                host,
+                NativeCutCodec,
+            )) as Arc<dyn Section17Session>
         })
     }
-}
-
-/// Encode a down-frame (CBOR). Frame types are always serializable; a failure is a programming error.
-fn encode_down(frame: &Inbound) -> Vec<u8> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(frame, &mut buf).expect("encode Inbound");
-    buf
-}
-
-/// Decode an up-frame; `None` on a malformed frame.
-fn decode_up(bytes: &[u8]) -> Option<Outbound> {
-    ciborium::from_reader(bytes).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use daemon_common::{Budget, ReqId};
+    use daemon_provision::CutChannel;
     use daemon_protocol::{
-        EndReason, HostRequest, HostRequestKind, HostResponseBody, TurnSummary, TurnTrigger,
+        AgentCommand, AgentEvent, EndReason, HostRequest, HostRequestKind, HostResponseBody, Inbound,
+        Outbound, TurnSummary, TurnTrigger,
     };
     use daemon_supervision::{
         Ack, ManageCommand, ManageEvent, ManageRequest, ManageRequestHandler, ManageResponse,

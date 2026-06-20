@@ -30,6 +30,9 @@ dcbor = "0.25"
 bc-envelope = { version = "0.43", features = ["signature"] }
 bc-components = "0.31"
 bc-rand = "0.5"
+# Agent Client Protocol (ACP): JSON-RPC 2.0 over stdio for foreign agents. Pinned; isolated to the
+# `daemon-acp` adapter crate so its runtime model never leaks into `daemon-host`.
+agent-client-protocol = "=0.15.0"
 
 # internal crates (path deps; referenced by member crates via `workspace = true`)
 daemon-common = { path = "crates/contracts/daemon-common" }
@@ -43,6 +46,7 @@ daemon-provision = { path = "crates/substrate/daemon-provision" }
 daemon-credentials = { path = "crates/substrate/daemon-credentials" }
 daemon-telemetry = { path = "crates/substrate/daemon-telemetry" }
 daemon-host = { path = "crates/substrate/daemon-host" }
+daemon-acp = { path = "crates/adapters/daemon-acp" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }

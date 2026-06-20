@@ -33,12 +33,14 @@ pub mod config;
 pub mod credentials;
 pub mod cut;
 pub mod engine_incarnation;
+pub mod foreign;
 pub mod journal;
 pub mod node_api;
 pub mod process_agent;
 pub mod section17;
 pub mod services;
 pub mod socket;
+pub mod streamjson;
 pub mod supervisor;
 pub mod transcript;
 pub mod unit;
@@ -54,6 +56,9 @@ pub use cut::{
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
+pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSection17, NativeCutCodec};
+pub use section17::Section17Session;
+pub use streamjson::StreamJsonCodec;
 pub use node_api::{NodeApiImpl, SessionEngineBuilder};
 pub use socket::{serve_api_unix, ApiClient};
 pub use supervisor::{

@@ -263,11 +263,12 @@ decides **where** it runs:
   engine over §17). Placement is a host concern invisible to the orchestrator, which only routes by
   `UnitId`.
 - **Brain** — in-process `daemon-core` (the reference engine, presented as an `EngineUnit`) or a
-  **foreign agent** process driven over a §17 process cut (presented as a `ProcessAgentUnit`). Both
-  are `Engine`-leaf `ManagedUnit`s; which brain backs a unit is a host concern, selected at spawn time
-  from a **launch profile** (`program`/`args`/`env`, mirroring `PlacementSpec`) by a profile-driven
-  `ChildSpawner`. A foreign brain's adapter owns its lifecycle: the durable activation/snapshot path
-  (§4) is `daemon-core`-only, so a foreign unit is relaunched from its profile rather than rehydrated.
+  **foreign agent** process driven through a foreign adapter (§9.1). Both are `Engine`-leaf
+  `ManagedUnit`s; which brain backs a unit is a host concern, selected at spawn time from a **launch
+  profile** (`program`/`args`/`env` + a `ForeignProtocol` wire selector, mirroring `PlacementSpec`) by
+  a profile-driven `ChildSpawner`. A foreign brain's adapter owns its lifecycle: the durable
+  activation/snapshot path (§4) is `daemon-core`-only, so a foreign unit is relaunched from its
+  profile rather than rehydrated.
 
 > **Agent adapter vs FFI — opposite directions.** Driving a *foreign* brain (above) is **us → them**:
 > a host-side adapter frames §17 to a child process. The FFI crates (`bindings/`) are **them → us**: a
@@ -381,6 +382,55 @@ generic types (supervision spec §4 decision); the engine crate stays free of `d
 > orchestrator engine emits only §16 delegation over §17 and the host realizes the downward
 > management-protocol client + child placement. That downward-client role is the host responsibility
 > that opens a cut to children; it is the precise hinge between the logical and physical structures.
+
+### 9.1 Foreign adapters — one seam, many wire dialects
+
+The translation above (§17 ⇄ management) is the same for **every** engine leaf. What differs per
+foreign brain is only the **bytes on the cut** — real CLI agents do not speak our CBOR §17 frames;
+they speak newline-delimited JSON over stdio, in one of two incompatible dialects. So the foreign
+path is factored into a single reusable driver over two orthogonal seams:
+
+- **Transport (framing)** — how the next message is delimited. `daemon-provision`'s `CutChannel`
+  carries a `Framing`: `Length` (`u32`-LE length-prefixed, our native cut) or `Lines`
+  (newline-delimited, for NDJSON). `Provisioner::place_lines` returns a line-framed channel; the
+  spawn logic is otherwise identical to `place`.
+- **Codec** — how bytes become §17 frames: `Codec::decode(&[u8]) -> Vec<Outbound>` and
+  `Codec::encode(Inbound) -> Vec<Vec<u8>>`. The generic `CodecSection17<C: Codec>` owns the single
+  reader task (recv → `decode` → events to the broadcast / blocking host requests through the
+  `HostRequestHandler`) and the writer for `submit`. It is an ordinary `Section17Session`, so it
+  reaches the supervisor through the **same** `AgentUnit::start_journaled` factory as `daemon-core`.
+
+This removes the previously hardcoded CBOR `decode_up`/`encode_down`: that path is now just the first
+codec, `NativeCutCodec` (renamed `decode_outbound`/`encode_inbound`), over the length transport.
+
+**Protocol matrix.** `LaunchProfile.protocol: ForeignProtocol` selects how `ProfileChildSpawner`
+materializes a child; all three present up the tree as a `UnitKind::Engine` `ManagedUnit` and journal
+identically (sealed per turn, keyed by `UnitId`) — only the dialect differs:
+
+| `ForeignProtocol` | Transport | Codec / adapter | Shape | Reach |
+|---|---|---|---|---|
+| `NativeCut` | `Length` (CBOR) | `NativeCutCodec` (in `daemon-host`) | our placed `daemon-core` children | the native dialect |
+| `StreamJson` | `Lines` (NDJSON) | `StreamJsonCodec` (in `daemon-host`) | **one-way** event envelope | Claude Code; also Amp, Cursor |
+| `Acp` | `Lines` (JSON-RPC 2.0) | `AcpSession` (in `daemon-acp`, on `agent-client-protocol`) | **symmetric** (agent calls back) | ~30 ACP-registry agents, incl. the in-tree Hermes Agent |
+
+**One-way vs symmetric is the load-bearing distinction.** `stream-json` is a pure event stream: the
+agent emits `system`/`assistant`/`user`/`result` envelopes carrying Anthropic content blocks, and the
+only "callback" is a permission prompt the codec turns into a §17 `HostRequest::Approval`. **ACP is
+symmetric**: the agent issues JSON-RPC requests *back* into the client (`session/request_permission`,
+and — when advertised — `fs/*` and terminal access), which the adapter answers through the same
+`HostRequestHandler`. Because the `agent-client-protocol` crate is a scoped builder/connection runtime
+with its own subprocess + stdio ownership, ACP does **not** use the `CutChannel` transport at all; its
+runtime is isolated in the `daemon-acp` crate behind a `Section17Session`, driven on a dedicated task
+fed by an mpsc command queue so the session outlives a single prompt. The adapter ships
+**permission-first** (advertises no `fs`/terminal client capabilities); fs/terminal callbacks are a
+follow-up on the unchanged seam.
+
+Codecs are **forward-compatible**: unknown message `type`s and unknown fields are ignored, per the
+vendors' documented contract, so a newer agent build never breaks the adapter. All foreign codecs are
+proven by mock-agent conformance tests ([`tests/daemon-conformance`](../../tests/daemon-conformance))
+that spawn a real subprocess through `ProfileChildSpawner` and assert the agent (a) maps `Assign` →
+`Finished{Completed}` exactly like an engine, (b) round-trips a blocking permission request through an
+answer-authority, and (c) seals a journal segment that verifies under the node signing key.
 
 ---
 

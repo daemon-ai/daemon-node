@@ -1,0 +1,25 @@
+[package]
+name = "daemon-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The ACP adapter: bridges a foreign agent that speaks the Agent Client Protocol (JSON-RPC 2.0 over
+# stdio, symmetric) to the daemon's §17 session seam. The heavy `agent-client-protocol` dependency
+# is isolated here so its runtime model (scoped connection, possibly `!Send` types) never reaches
+# `daemon-host`.
+[dependencies]
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-host = { workspace = true }
+agent-client-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+daemon-supervision = { workspace = true }

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use daemon_common::SessionId;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -81,8 +81,18 @@ pub trait Provisioner: Send + Sync {
         spec: WorkspaceSpec,
     ) -> Result<WorkspaceRoot, ProvErr>;
 
-    /// Open a placement cut for `id`, returning the live [`Placement`].
+    /// Open a length-framed placement cut for `id` (the native `daemon` cut dialect), returning the
+    /// live [`Placement`].
     async fn place(&self, id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr>;
+
+    /// Open a newline-framed placement cut for `id` (NDJSON stdio), returning the live [`Placement`]
+    /// whose [`CutChannel`] is [`Framing::Lines`]. Used to host foreign CLI agents (Claude-Code
+    /// `stream-json`, etc.); the default backend declares it unavailable.
+    async fn place_lines(&self, _id: &SessionId, _spec: PlacementSpec) -> Result<Placement, ProvErr> {
+        Err(ProvErr::Unavailable(
+            "newline-framed placement not supported by this backend".into(),
+        ))
+    }
 
     /// Tear down any host-owned resources for `id` (workspaces, sockets). The child process itself
     /// is owned by the returned [`Placement`]/[`ChildGuard`].
@@ -90,34 +100,63 @@ pub trait Provisioner: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// The cut channel — a length-framed byte duplex
+// The cut channel — a byte-frame duplex (length- or newline-framed)
 // ---------------------------------------------------------------------------
 
-/// A length-prefixed (`u32` little-endian) byte-frame duplex over a child's stdio.
+/// How messages are delimited on a [`CutChannel`].
 ///
-/// Protocol-agnostic: it carries opaque frames. `daemon-host` serializes its `CutFrame` onto it.
-/// Split into a shareable [`CutWriter`] and an owned [`CutReader`] so a single reader task can
-/// demultiplex inbound frames while multiple producers send concurrently.
+/// The two framings carry opaque byte messages identically; only the on-wire delimiter differs.
+/// The same generic codec session driver in `daemon-host` runs over either, so the choice is purely
+/// "what does the peer on the other end of the pipe expect".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// A `u32` little-endian length prefix per message — the native `daemon` cut dialect (CBOR
+    /// `CutFrame`s, brokered store calls, our own placed `daemon-core` children).
+    Length,
+    /// One message per line, `\n`-delimited (a trailing `\r` is tolerated) — the dialect every real
+    /// foreign CLI agent speaks (NDJSON: Claude-Code `stream-json`, ACP JSON-RPC, etc.).
+    Lines,
+}
+
+/// A byte-frame duplex over a child's stdio, [`Framing`]-tagged (length- or newline-delimited).
+///
+/// Protocol-agnostic: it carries opaque frames. `daemon-host` serializes its `CutFrame` (length) or
+/// an NDJSON line (lines) onto it. Split into a shareable [`CutWriter`] and an owned [`CutReader`]
+/// so a single reader task can demultiplex inbound frames while multiple producers send concurrently.
 pub struct CutChannel {
     reader: CutReader,
     writer: CutWriter,
 }
 
 impl CutChannel {
-    /// Build a channel from an async reader + writer pair.
+    /// Build a length-framed channel from an async reader + writer pair (the native cut dialect).
     pub fn from_parts(
         reader: Box<dyn AsyncRead + Send + Unpin>,
         writer: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> Self {
+        Self::from_parts_framed(reader, writer, Framing::Length)
+    }
+
+    /// Build a channel from an async reader + writer pair with an explicit [`Framing`].
+    pub fn from_parts_framed(
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        writer: Box<dyn AsyncWrite + Send + Unpin>,
+        framing: Framing,
+    ) -> Self {
         Self {
-            reader: CutReader { inner: reader },
+            reader: CutReader {
+                inner: BufReader::new(reader),
+                framing,
+            },
             writer: CutWriter {
                 inner: Arc::new(Mutex::new(writer)),
+                framing,
             },
         }
     }
 
-    /// The child end of a cut: frames are read from this process's stdin and written to its stdout.
+    /// The child end of a length-framed cut: frames read from this process's stdin, written to its
+    /// stdout.
     pub fn from_stdio() -> Self {
         Self::from_parts(Box::new(tokio::io::stdin()), Box::new(tokio::io::stdout()))
     }
@@ -130,18 +169,37 @@ impl CutChannel {
 
 /// The read half of a [`CutChannel`].
 pub struct CutReader {
-    inner: Box<dyn AsyncRead + Send + Unpin>,
+    inner: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
+    framing: Framing,
 }
 
 impl CutReader {
-    /// Read the next length-framed message, or `None` on EOF / a broken channel.
+    /// Read the next framed message, or `None` on EOF / a broken channel.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        self.inner.read_exact(&mut len_buf).await.ok()?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        self.inner.read_exact(&mut buf).await.ok()?;
-        Some(buf)
+        match self.framing {
+            Framing::Length => {
+                let mut len_buf = [0u8; 4];
+                self.inner.read_exact(&mut len_buf).await.ok()?;
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                self.inner.read_exact(&mut buf).await.ok()?;
+                Some(buf)
+            }
+            Framing::Lines => {
+                let mut line = Vec::new();
+                // `read_until` returns 0 only at EOF; otherwise the line includes the `\n`.
+                if self.inner.read_until(b'\n', &mut line).await.ok()? == 0 {
+                    return None;
+                }
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                Some(line)
+            }
+        }
     }
 }
 
@@ -149,16 +207,25 @@ impl CutReader {
 #[derive(Clone)]
 pub struct CutWriter {
     inner: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
+    framing: Framing,
 }
 
 impl CutWriter {
-    /// Send one length-framed message. Each frame's length prefix + body + flush are written under
-    /// a single lock, so concurrent senders never interleave a frame.
+    /// Send one framed message. The delimiter + body + flush are written under a single lock, so
+    /// concurrent senders never interleave a frame.
     pub async fn send(&self, frame: &[u8]) -> std::io::Result<()> {
-        let len = (frame.len() as u32).to_le_bytes();
         let mut guard = self.inner.lock().await;
-        guard.write_all(&len).await?;
-        guard.write_all(frame).await?;
+        match self.framing {
+            Framing::Length => {
+                let len = (frame.len() as u32).to_le_bytes();
+                guard.write_all(&len).await?;
+                guard.write_all(frame).await?;
+            }
+            Framing::Lines => {
+                guard.write_all(frame).await?;
+                guard.write_all(b"\n").await?;
+            }
+        }
         guard.flush().await
     }
 }
@@ -205,24 +272,11 @@ impl ProcessProvisioner {
     pub fn new() -> Self {
         Self
     }
-}
 
-#[cfg(feature = "process")]
-#[async_trait]
-impl Provisioner for ProcessProvisioner {
-    async fn workspace(
-        &self,
-        id: &SessionId,
-        spec: WorkspaceSpec,
-    ) -> Result<WorkspaceRoot, ProvErr> {
-        let root = spec.root.join(id.as_str());
-        tokio::fs::create_dir_all(&root)
-            .await
-            .map_err(|e| ProvErr::Workspace(e.to_string()))?;
-        Ok(WorkspaceRoot(root))
-    }
-
-    async fn place(&self, _id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr> {
+    /// Spawn the child and wire its stdio into a [`CutChannel`] with the requested [`Framing`].
+    /// Shared by the length-framed [`Provisioner::place`] and the newline-framed
+    /// [`Provisioner::place_lines`].
+    async fn spawn_framed(spec: PlacementSpec, framing: Framing) -> Result<Placement, ProvErr> {
         use std::process::Stdio;
 
         let mut command = tokio::process::Command::new(&spec.program);
@@ -247,11 +301,35 @@ impl Provisioner for ProcessProvisioner {
             .ok_or_else(|| ProvErr::Spawn("child stdout not piped".into()))?;
 
         // Parent reads the child's stdout and writes the child's stdin.
-        let channel = CutChannel::from_parts(Box::new(stdout), Box::new(stdin));
+        let channel = CutChannel::from_parts_framed(Box::new(stdout), Box::new(stdin), framing);
         Ok(Placement {
             channel,
             child: ChildGuard(Some(child)),
         })
+    }
+}
+
+#[cfg(feature = "process")]
+#[async_trait]
+impl Provisioner for ProcessProvisioner {
+    async fn workspace(
+        &self,
+        id: &SessionId,
+        spec: WorkspaceSpec,
+    ) -> Result<WorkspaceRoot, ProvErr> {
+        let root = spec.root.join(id.as_str());
+        tokio::fs::create_dir_all(&root)
+            .await
+            .map_err(|e| ProvErr::Workspace(e.to_string()))?;
+        Ok(WorkspaceRoot(root))
+    }
+
+    async fn place(&self, _id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr> {
+        Self::spawn_framed(spec, Framing::Length).await
+    }
+
+    async fn place_lines(&self, _id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr> {
+        Self::spawn_framed(spec, Framing::Lines).await
     }
 
     async fn reclaim(&self, _id: &SessionId) {

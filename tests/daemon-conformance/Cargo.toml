@@ -21,7 +21,10 @@ daemon-telemetry = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
 daemon-node = { workspace = true }
+daemon-acp = { workspace = true }
+agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 ciborium = { workspace = true }
+serde_json = { workspace = true }

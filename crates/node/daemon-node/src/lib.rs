@@ -24,10 +24,11 @@ use daemon_core::{
     Config, CredentialBuilder, EngineProfile, ProviderRegistry, SystemPrompt, ToolRegistry,
 };
 use daemon_host::{
-    CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig, JobWorker, JournalConfig,
-    JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit, ServiceError, SessionEngineBuilder,
-    SupervisorHandle,
+    AgentUnit, CodecSection17, CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig,
+    JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit,
+    Section17Session, ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
 };
+use daemon_protocol::HostRequestHandler;
 use daemon_telemetry::TraceSigner;
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
@@ -200,6 +201,23 @@ pub struct LaunchProfile {
     pub args: Vec<String>,
     /// Environment overrides applied to the child.
     pub env: Vec<(String, String)>,
+    /// Which foreign wire protocol the agent speaks (selects the transport + codec / adapter).
+    pub protocol: ForeignProtocol,
+}
+
+/// The wire protocol a foreign agent speaks — the selector that decides which transport + codec (or
+/// out-of-tree adapter) materializes the child. All three present up the tree as a
+/// `UnitKind::Engine` `ManagedUnit` and journal identically; only the bytes on the cut differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForeignProtocol {
+    /// The native `daemon` cut: CBOR §17 frames over the length-framed transport (our own placed
+    /// `daemon-core` children, or any brain that speaks the native dialect).
+    #[default]
+    NativeCut,
+    /// Claude-Code `stream-json`: NDJSON event envelope over the line transport (also Amp, Cursor).
+    StreamJson,
+    /// Agent Client Protocol: symmetric JSON-RPC 2.0 over stdio, via the `daemon-acp` adapter.
+    Acp,
 }
 
 /// How to construct a child brain. `Core` is the in-process reference engine; `Foreign` launches an
@@ -270,19 +288,50 @@ impl ChildSpawner for ProfileChildSpawner {
                 Arc::new(EngineUnit::spawn_journaled(id, engine, feeder))
             }
             AgentBackend::Foreign(launch) => {
-                let placement = self
-                    .provisioner
-                    .place(
-                        &SessionId::new(id.as_str()),
-                        PlacementSpec {
-                            program: launch.program.clone(),
-                            args: launch.args.clone(),
-                            env: launch.env.clone(),
-                        },
-                    )
-                    .await
-                    .expect("place foreign agent");
-                Arc::new(ProcessAgentUnit::start_journaled(id, placement, feeder))
+                let session = SessionId::new(id.as_str());
+                let spec = PlacementSpec {
+                    program: launch.program.clone(),
+                    args: launch.args.clone(),
+                    env: launch.env.clone(),
+                };
+                match launch.protocol {
+                    ForeignProtocol::NativeCut => {
+                        let placement = self
+                            .provisioner
+                            .place(&session, spec)
+                            .await
+                            .expect("place native-cut foreign agent");
+                        Arc::new(ProcessAgentUnit::start_journaled(id, placement, feeder))
+                    }
+                    ForeignProtocol::StreamJson => {
+                        // NDJSON over the line transport, driven by the generic codec session driver.
+                        let placement = self
+                            .provisioner
+                            .place_lines(&session, spec)
+                            .await
+                            .expect("place stream-json foreign agent");
+                        let daemon_provision::Placement { channel, child } = placement;
+                        Arc::new(AgentUnit::start_journaled(
+                            id,
+                            feeder,
+                            move |host: Arc<dyn HostRequestHandler>| {
+                                Arc::new(CodecSection17::from_channel(
+                                    channel,
+                                    Some(child),
+                                    host,
+                                    StreamJsonCodec::new(),
+                                )) as Arc<dyn Section17Session>
+                            },
+                        ))
+                    }
+                    ForeignProtocol::Acp => {
+                        // The ACP adapter owns its own subprocess + stdio (it does not use the cut).
+                        let acp = daemon_acp::AcpLaunch::new(launch.program.clone())
+                            .args(launch.args.clone())
+                            .env(launch.env.clone());
+                        Arc::new(daemon_acp::acp_unit(id, acp, feeder))
+                    }
+                }
             }
         }
     }

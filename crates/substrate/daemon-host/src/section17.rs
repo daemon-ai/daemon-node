@@ -56,8 +56,11 @@ fn push_outbound(drain: &OutboundDrain, item: Outbound) {
 /// A running §17 session, transport-agnostic. Commands go in; `AgentEvent`s come out on the
 /// broadcast. Blocking host requests are answered by the [`HostRequestHandler`] the session was
 /// built with, so they never surface on this trait.
+///
+/// Public so an out-of-tree adapter crate (e.g. `daemon-acp`) can implement its own session over a
+/// foreign protocol and wrap it with [`AgentUnit::start_journaled`].
 #[async_trait]
-pub(crate) trait Section17Session: Send + Sync {
+pub trait Section17Session: Send + Sync {
     /// Submit a §17 command. Must return promptly: a `StartTurn` runs the turn in the background so
     /// progress streams out as events.
     async fn submit(&self, cmd: AgentCommand);
@@ -85,7 +88,10 @@ impl AgentUnit {
     /// When `journal` is `Some`, the full §17 `Outbound` stream (events + raised requests) is fed
     /// into it so the unit's finished transcript blocks + lifecycle are durably sealed per turn (the
     /// fleet/foreign production journaling path); `None` disables journaling.
-    pub(crate) fn start_journaled(
+    ///
+    /// Public so an adapter crate can present its own [`Section17Session`] as a managed engine unit
+    /// with the same drain + verifiable-journal wiring as the in-tree backends.
+    pub fn start_journaled(
         id: UnitId,
         journal: Option<Arc<JournalFeeder>>,
         build: impl FnOnce(Arc<dyn HostRequestHandler>) -> Arc<dyn Section17Session>,
