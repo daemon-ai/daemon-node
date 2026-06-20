@@ -24,9 +24,9 @@ use daemon_core::{
     Config, CredentialBuilder, EngineProfile, ProviderRegistry, SystemPrompt, ToolRegistry,
 };
 use daemon_host::{
-    AgentUnit, CodecSection17, CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig,
-    JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit,
-    Section17Session, ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
+    AgentSession, AgentUnit, CodecSession, CoreEngineFactory, EngineUnit, FleetControl, Host,
+    HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit,
+    ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
 };
 use daemon_protocol::HostRequestHandler;
 use daemon_telemetry::TraceSigner;
@@ -349,12 +349,12 @@ impl ChildSpawner for ProfileChildSpawner {
                             id,
                             feeder,
                             move |host: Arc<dyn HostRequestHandler>| {
-                                Arc::new(CodecSection17::from_channel(
+                                Arc::new(CodecSession::from_channel(
                                     channel,
                                     Some(child),
                                     host,
                                     StreamJsonCodec::new(),
-                                )) as Arc<dyn Section17Session>
+                                )) as Arc<dyn AgentSession>
                             },
                         ))
                     }

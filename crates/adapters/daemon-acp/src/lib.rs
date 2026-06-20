@@ -3,7 +3,7 @@
 //! ACP is JSON-RPC 2.0 over newline-delimited stdio, and unlike Claude-Code `stream-json` it is
 //! **symmetric**: the agent calls *back* into the client for services (permission prompts, and —
 //! when advertised — filesystem / terminal access). This crate bridges an ACP agent to the daemon's
-//! §17 session seam ([`daemon_host::Section17Session`]) so it presents to the orchestrator as an
+//! §17 session seam ([`daemon_host::AgentSession`]) so it presents to the orchestrator as an
 //! ordinary `UnitKind::Engine` managed unit, with its finished transcript blocks flowing into the
 //! verifiable journal exactly like any other engine.
 //!
@@ -29,7 +29,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use async_trait::async_trait;
 use daemon_common::{ReqId, UnitId};
-use daemon_host::{AgentUnit, JournalFeeder, Section17Session};
+use daemon_host::{AgentSession, AgentUnit, JournalFeeder};
 use daemon_protocol::{
     AgentCommand, AgentEvent, EndReason, HostRequest, HostRequestHandler, HostRequestKind,
     HostResponseBody, ToolCallView, ToolDetail, ToolResultView, TurnSummary, TurnTrigger,
@@ -117,7 +117,7 @@ pub fn acp_unit(id: UnitId, launch: AcpLaunch, journal: Option<Arc<JournalFeeder
 impl AcpSession {
     /// Spawn the ACP connection driver and return the live session. `host` answers the symmetric
     /// permission callbacks the agent raises.
-    pub fn connect(launch: AcpLaunch, host: Arc<dyn HostRequestHandler>) -> Arc<dyn Section17Session> {
+    pub fn connect(launch: AcpLaunch, host: Arc<dyn HostRequestHandler>) -> Arc<dyn AgentSession> {
         let (commands, command_rx) = mpsc::unbounded_channel::<AgentCommand>();
         let (events, _) = broadcast::channel::<AgentEvent>(256);
         let seq = Arc::new(AtomicU64::new(0));
@@ -129,7 +129,7 @@ impl AcpSession {
 }
 
 #[async_trait]
-impl Section17Session for AcpSession {
+impl AgentSession for AcpSession {
     async fn submit(&self, cmd: AgentCommand) {
         let _ = self.commands.send(cmd);
     }

@@ -5,11 +5,11 @@
 //! process driven over a cut ([`crate::process_agent::ProcessAgentUnit`]). This module factors the
 //! part that is identical for both:
 //!
-//! - [`Section17Session`] — a running §17 session as a transport: submit a command, subscribe to the
+//! - [`AgentSession`] — a running §17 session as a transport: submit a command, subscribe to the
 //!   event stream. Blocking host requests are answered by the [`HostRequestHandler`] the session was
 //!   constructed with (the [`ManageToHost`] adapter), so the request direction never appears in this
 //!   trait.
-//! - [`AgentUnit`] — the shared `UnitKind::Engine` [`ManagedUnit`] over any `Section17Session`. It
+//! - [`AgentUnit`] — the shared `UnitKind::Engine` [`ManagedUnit`] over any `AgentSession`. It
 //!   realizes the supervision §4 mapping table (total upward, partial downward) so a host presents an
 //!   engine — ours or foreign — identically to its supervisor.
 
@@ -60,7 +60,7 @@ fn push_outbound(drain: &OutboundDrain, item: Outbound) {
 /// Public so an out-of-tree adapter crate (e.g. `daemon-acp`) can implement its own session over a
 /// foreign protocol and wrap it with [`AgentUnit::start_journaled`].
 #[async_trait]
-pub trait Section17Session: Send + Sync {
+pub trait AgentSession: Send + Sync {
     /// Submit a §17 command. Must return promptly: a `StartTurn` runs the turn in the background so
     /// progress streams out as events.
     async fn submit(&self, cmd: AgentCommand);
@@ -70,10 +70,10 @@ pub trait Section17Session: Send + Sync {
 }
 
 /// An engine (in-process or foreign) presented to its supervisor as a `UnitKind::Engine`
-/// [`ManagedUnit`] over a [`Section17Session`] (host-spec §9).
+/// [`ManagedUnit`] over a [`AgentSession`] (host-spec §9).
 pub struct AgentUnit {
     id: UnitId,
-    session: Arc<dyn Section17Session>,
+    session: Arc<dyn AgentSession>,
     handler: HandlerSlot,
     events: broadcast::Sender<ManageEvent>,
     last_work: Arc<Mutex<Option<WorkId>>>,
@@ -89,12 +89,12 @@ impl AgentUnit {
     /// into it so the unit's finished transcript blocks + lifecycle are durably sealed per turn (the
     /// fleet/foreign production journaling path); `None` disables journaling.
     ///
-    /// Public so an adapter crate can present its own [`Section17Session`] as a managed engine unit
+    /// Public so an adapter crate can present its own [`AgentSession`] as a managed engine unit
     /// with the same drain + verifiable-journal wiring as the in-tree backends.
     pub fn start_journaled(
         id: UnitId,
         journal: Option<Arc<JournalFeeder>>,
-        build: impl FnOnce(Arc<dyn HostRequestHandler>) -> Arc<dyn Section17Session>,
+        build: impl FnOnce(Arc<dyn HostRequestHandler>) -> Arc<dyn AgentSession>,
     ) -> Self {
         let handler: HandlerSlot = Arc::new(Mutex::new(None));
         let outbound: OutboundDrain = Arc::new(Mutex::new(VecDeque::new()));

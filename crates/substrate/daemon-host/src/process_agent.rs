@@ -2,10 +2,10 @@
 //!
 //! Where [`crate::unit::EngineUnit`] backs a unit with an in-process `daemon-core` engine, this backs
 //! it with a child process that speaks §17 over a [`daemon_provision`] cut. It is a thin factory over
-//! the generic [`CodecSection17`](crate::foreign::CodecSection17) driver wired with the
+//! the generic [`CodecSession`](crate::foreign::CodecSession) driver wired with the
 //! [`NativeCutCodec`](crate::foreign::NativeCutCodec): `AgentCommand`/`HostResponse` framed (CBOR)
 //! down its stdin, `AgentEvent`/`HostRequest` framed up its stdout. The session flows through the
-//! same [`crate::section17`] adapter, so a foreign brain is indistinguishable from `daemon-core` to
+//! same [`crate::agent_session`] adapter, so a foreign brain is indistinguishable from `daemon-core` to
 //! its supervisor (`UnitKind::Engine`) — the whole point of the §17 leaf being a universal
 //! agent-runner contract. Other foreign protocols are just other codecs on the same driver.
 //!
@@ -13,8 +13,8 @@
 //! foreign brain owns its own state, so its lifecycle is adapter-owned (the child is killed on drop,
 //! relaunched from its launch profile) rather than hydrated/dehydrated from a `daemon-core` snapshot.
 
-use crate::foreign::{CodecSection17, NativeCutCodec};
-use crate::section17::{AgentUnit, Section17Session};
+use crate::foreign::{CodecSession, NativeCutCodec};
+use crate::agent_session::{AgentUnit, AgentSession};
 use daemon_common::UnitId;
 use daemon_protocol::HostRequestHandler;
 use daemon_provision::Placement;
@@ -38,12 +38,12 @@ impl ProcessAgentUnit {
     ) -> AgentUnit {
         let Placement { channel, child } = placement;
         AgentUnit::start_journaled(id, journal, move |host: Arc<dyn HostRequestHandler>| {
-            Arc::new(CodecSection17::from_channel(
+            Arc::new(CodecSession::from_channel(
                 channel,
                 Some(child),
                 host,
                 NativeCutCodec,
-            )) as Arc<dyn Section17Session>
+            )) as Arc<dyn AgentSession>
         })
     }
 
@@ -52,12 +52,12 @@ impl ProcessAgentUnit {
     #[cfg(test)]
     pub fn from_channel(id: UnitId, channel: daemon_provision::CutChannel) -> AgentUnit {
         AgentUnit::start_journaled(id, None, move |host: Arc<dyn HostRequestHandler>| {
-            Arc::new(CodecSection17::from_channel(
+            Arc::new(CodecSession::from_channel(
                 channel,
                 None,
                 host,
                 NativeCutCodec,
-            )) as Arc<dyn Section17Session>
+            )) as Arc<dyn AgentSession>
         })
     }
 }

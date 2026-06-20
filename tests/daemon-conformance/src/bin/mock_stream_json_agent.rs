@@ -1,6 +1,6 @@
 //! A minimal **Claude-Code `stream-json`** foreign agent (newline-delimited JSON over stdio).
 //!
-//! It has no `daemon-core` (or `daemon-host`) dependency, yet a `daemon-host` `CodecSection17`
+//! It has no `daemon-core` (or `daemon-host`) dependency, yet a `daemon-host` `CodecSession`
 //! driving the [`StreamJsonCodec`](daemon_host::StreamJsonCodec) over a line-framed cut presents it
 //! up the tree as an ordinary `Engine` leaf. On a user turn it raises one permission
 //! (`control_request`) and, once the host approves it (`control_response`), emits a canned assistant

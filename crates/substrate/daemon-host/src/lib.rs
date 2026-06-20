@@ -37,7 +37,7 @@ pub mod foreign;
 pub mod journal;
 pub mod node_api;
 pub mod process_agent;
-pub mod section17;
+pub mod agent_session;
 pub mod services;
 pub mod socket;
 pub mod streamjson;
@@ -56,8 +56,8 @@ pub use cut::{
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
-pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSection17, NativeCutCodec};
-pub use section17::Section17Session;
+pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
+pub use agent_session::AgentSession;
 pub use streamjson::StreamJsonCodec;
 pub use node_api::{NodeApiImpl, SessionEngineBuilder};
 pub use socket::{serve_api_unix, ApiClient};
@@ -66,7 +66,7 @@ pub use supervisor::{
     SupervisorHandle, SupervisorObserver,
 };
 pub use process_agent::ProcessAgentUnit;
-pub use section17::AgentUnit;
+pub use agent_session::AgentUnit;
 pub use unit::EngineUnit;
 
 use async_trait::async_trait;

@@ -6,7 +6,7 @@
 //! (events up, blocking requests up); §17 [`Inbound`] frames (commands down, request replies down)
 //! must be translated back into bytes on the agent's stdin. That translation is the **only** thing
 //! that varies per protocol — so it is captured in one trait, [`Codec`], and driven by one reusable
-//! [`CodecSection17`].
+//! [`CodecSession`].
 //!
 //! The framing (length-prefixed vs newline-delimited) is a runtime property of the
 //! [`CutChannel`](daemon_provision::CutChannel) ([`daemon_provision::Framing`]), so the driver is
@@ -14,7 +14,7 @@
 //! our own placed `daemon-core` children speak is just the first codec ([`NativeCutCodec`]); the
 //! Claude-Code stream-json codec ([`crate::streamjson::StreamJsonCodec`]) is the second.
 
-use crate::section17::Section17Session;
+use crate::agent_session::AgentSession;
 use async_trait::async_trait;
 use daemon_protocol::{AgentCommand, AgentEvent, HostRequestHandler, Inbound, Outbound};
 use daemon_provision::{ChildGuard, CutChannel, CutWriter};
@@ -38,13 +38,13 @@ pub trait Codec: Send + 'static {
     fn encode(&mut self, inbound: Inbound) -> Vec<Vec<u8>>;
 }
 
-/// A [`Section17Session`] over a foreign agent process, generic over its wire [`Codec`].
+/// A [`AgentSession`] over a foreign agent process, generic over its wire [`Codec`].
 ///
 /// Owns the single reader task (recv → `decode` → events to the broadcast / blocking requests
 /// through the [`HostRequestHandler`], whose replies are `encode`d back down) and retains the writer
-/// for [`Section17Session::submit`]. The codec is shared (a `std::sync::Mutex`) between the reader
+/// for [`AgentSession::submit`]. The codec is shared (a `std::sync::Mutex`) between the reader
 /// task and `submit`; its critical sections are pure CPU (no `.await` held across the lock).
-pub struct CodecSection17<C: Codec> {
+pub struct CodecSession<C: Codec> {
     writer: CutWriter,
     codec: Arc<Mutex<C>>,
     events: broadcast::Sender<AgentEvent>,
@@ -53,7 +53,7 @@ pub struct CodecSection17<C: Codec> {
     _child: Option<ChildGuard>,
 }
 
-impl<C: Codec> CodecSection17<C> {
+impl<C: Codec> CodecSession<C> {
     /// Start pumping a foreign agent over `channel` with `codec`: spawn the reader task and retain
     /// the writer for `submit`. `child`, when present, is the owned OS process (killed on drop).
     pub fn from_channel(
@@ -103,7 +103,7 @@ impl<C: Codec> CodecSection17<C> {
 }
 
 #[async_trait]
-impl<C: Codec> Section17Session for CodecSection17<C> {
+impl<C: Codec> AgentSession for CodecSession<C> {
     async fn submit(&self, cmd: AgentCommand) {
         let frames = self.codec.lock().unwrap().encode(Inbound::Command(cmd));
         for frame in frames {
