@@ -22,7 +22,8 @@
 
 use async_trait::async_trait;
 use daemon_common::{SessionId, UnitId, UsageDelta, WireVersion};
-use daemon_protocol::{AgentCommand, AgentEvent, HostRequest, HostResponse};
+use daemon_protocol::{AgentCommand, HostResponse};
+pub use daemon_protocol::Outbound;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,18 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// Drain up to `max` recent §17 [`Outbound`] items (streamed events + raised host requests) for
+    /// one unit — the rich, transcript-fidelity drill-down a GUI reads to render a full transcript
+    /// for *any* unit in the tree (not just a top-level interactive session). The coarse
+    /// [`Self::unit_events`] is the fleet-dashboard view; this is the drill-down-to-transcript view,
+    /// carrying the full §17 vocabulary (text, reasoning, tool I/O with opaque structured `detail`,
+    /// opaque `ContentDelta`, usage, errors) plus blocking host requests, untouched. A destructive
+    /// drain like [`Self::poll`] (each call consumes what it returns; `max == 0` drains all).
+    /// Default: empty (a transport with no fleet projection).
+    async fn unit_outbound(&self, _id: UnitId, _max: u32) -> Vec<Outbound> {
+        Vec::new()
+    }
+
     /// Pause a unit (lifecycle `ManageCommand`). Default: unsupported.
     async fn pause(&self, _id: UnitId) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("pause".into()))
@@ -107,16 +120,10 @@ impl<T: SessionApi + ControlApi> NodeApi for T {}
 // ---------------------------------------------------------------------------
 // Outbound drain item (§17 events + raised host requests share one queue)
 // ---------------------------------------------------------------------------
-
-/// One item drained from a session by [`SessionApi::poll`]. Events and blocking host requests ride
-/// the **same** drain queue (daemon-ffi-spec §3.3), so a poll-based embedder sees both in order.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Outbound {
-    /// A streamed §17 event.
-    Event(AgentEvent),
-    /// A blocking host request awaiting [`SessionApi::respond`].
-    Request(HostRequest),
-}
+//
+// The drain item is the canonical `daemon_protocol::Outbound` union, re-exported above. Events and
+// blocking host requests ride the **same** drain queue (daemon-ffi-spec §3.3), so a poll-based
+// embedder (see [`SessionApi::poll`]) sees both in order.
 
 // ---------------------------------------------------------------------------
 // Report DTOs (decoupled from the substrate's concrete types)
@@ -351,6 +358,13 @@ pub enum ApiRequest {
         /// Maximum events to drain.
         max: u32,
     },
+    /// [`ControlApi::unit_outbound`].
+    UnitOutbound {
+        /// The unit to drain §17 outbound items for.
+        unit: UnitId,
+        /// Maximum items to drain.
+        max: u32,
+    },
     /// [`ControlApi::pause`].
     Pause {
         /// The unit to pause.
@@ -451,6 +465,10 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::UnitEvents { unit, max } => {
             ApiResponse::UnitEvents(api.unit_events(unit, max).await)
         }
+        ApiRequest::UnitOutbound { unit, max } => {
+            // Reuses the `Drained(Vec<Outbound>)` response — the same rich §17 drain shape as `poll`.
+            ApiResponse::Drained(api.unit_outbound(unit, max).await)
+        }
         ApiRequest::Pause { unit } => unit_or_err(api.pause(unit).await),
         ApiRequest::Resume { unit } => unit_or_err(api.resume(unit).await),
         ApiRequest::Scale { unit, n } => unit_or_err(api.scale(unit, n).await),
@@ -494,7 +512,7 @@ pub fn from_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
 mod tests {
     use super::*;
     use daemon_common::ReqId;
-    use daemon_protocol::{EndReason, TurnSummary, UserMsg};
+    use daemon_protocol::{AgentEvent, EndReason, TurnSummary, UserMsg};
 
     #[test]
     fn request_cbor_round_trips() {

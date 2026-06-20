@@ -191,6 +191,13 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
+    async fn unit_outbound(&self, id: UnitId, max: u32) -> Vec<Outbound> {
+        match &self.fleet {
+            Some(fleet) => fleet.unit_outbound(&id, max).await,
+            None => Vec::new(),
+        }
+    }
+
     async fn pause(&self, id: UnitId) -> Result<(), ApiError> {
         match &self.fleet {
             Some(fleet) if fleet.pause(&id).await => Ok(()),

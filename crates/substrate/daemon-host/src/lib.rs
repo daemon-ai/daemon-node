@@ -108,6 +108,13 @@ pub trait FleetControl: Send + Sync {
         Vec::new()
     }
 
+    /// Drain up to `max` recent §17 [`Outbound`](daemon_api::Outbound) items for one unit — the rich,
+    /// transcript-fidelity drill-down (the node side of `ControlApi::unit_outbound`). A destructive
+    /// drain (each call consumes what it returns); empty if the unit is unknown or retains no stream.
+    async fn unit_outbound(&self, _id: &UnitId, _max: u32) -> Vec<daemon_api::Outbound> {
+        Vec::new()
+    }
+
     /// Pause a unit's scheduling; `false` if unknown or unsupported (e.g. an engine leaf).
     async fn pause(&self, _id: &UnitId) -> bool {
         false

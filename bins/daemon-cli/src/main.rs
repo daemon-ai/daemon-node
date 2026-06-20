@@ -62,6 +62,14 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         max: u32,
     },
+    /// Drain the rich §17 outbound stream for a unit (transcript-fidelity drill-down).
+    UnitOutbound {
+        /// The unit id.
+        id: String,
+        /// Maximum items to drain (0 = all buffered).
+        #[arg(long, default_value_t = 0)]
+        max: u32,
+    },
     /// Pause a unit's scheduling (orchestrator sub-fleets).
     Pause {
         /// The unit id.
@@ -139,6 +147,14 @@ async fn main() -> anyhow::Result<()> {
             client
                 .call(ApiRequest::Unit {
                     unit: UnitId::new(id),
+                })
+                .await?,
+        ),
+        Command::UnitOutbound { id, max } => render(
+            client
+                .call(ApiRequest::UnitOutbound {
+                    unit: UnitId::new(id),
+                    max,
                 })
                 .await?,
         ),

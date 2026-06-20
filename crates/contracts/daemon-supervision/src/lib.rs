@@ -602,4 +602,20 @@ pub trait ManagedUnit: Send + Sync {
     fn events(&self) -> EventStream<ManageEvent>;
     /// Install the handler the unit's upward requests flow through (set at attach time).
     fn install_request_handler(&self, handler: Arc<dyn ManageRequestHandler>);
+
+    /// Drain up to `max` recent §17 [`Outbound`](daemon_protocol::Outbound) items (streamed events +
+    /// raised host requests) retained for this unit — the rich, transcript-fidelity drill-down a
+    /// consumer reads to render a full transcript for *this* unit (the node surface's
+    /// `unit_outbound`). It is the opposite end from [`Self::events`]: that is the coarse,
+    /// payload-agnostic management view a supervisor folds; this preserves the full §17 vocabulary
+    /// (text, reasoning, tool I/O with opaque structured `detail`, opaque `ContentDelta`, usage,
+    /// errors) plus blocking host requests, untouched. A destructive drain (like a poll): each call
+    /// consumes what it returns; `max == 0` drains all buffered items.
+    ///
+    /// The default is empty: only a unit that retains a §17 leaf stream (a host's engine unit, ours
+    /// or a foreign agent) overrides it; an orchestrator has no single §17 stream and returns
+    /// nothing (its children are drained individually by id).
+    fn drain_outbound(&self, _max: u32) -> Vec<daemon_protocol::Outbound> {
+        Vec::new()
+    }
 }

@@ -155,6 +155,36 @@ pub struct ConvView {
     pub waiting_for: Vec<String>,
 }
 
+/// An opaque, structured payload a brain (or a foreign-agent adapter) attaches to a tool view or a
+/// [`AgentEvent::ContentDelta`] so a rich consumer (a transcript GUI) can render it — a tool's
+/// arguments object, a unified diff, a web-search result list, an image-generation output, a
+/// terminal/PTY byte stream, etc.
+///
+/// The carrier is deliberately **opaque to the daemon**: the brain and the consuming GUI agree on
+/// the schema; the host, orchestrator, and node surface pass it through untouched and never match on
+/// it (so a foreign agent can ship payload shapes the daemon has never seen). `kind` is a stable
+/// discriminator the GUI routes a renderer by (a tool name for tool I/O, or a reserved kind such as
+/// `"ansi-stream"` / `"pty"` for terminal output); `body` is the encoded payload (CBOR by
+/// convention) the GUI decodes per `kind`. Kept as raw bytes so the §17 wire types stay `Eq` and the
+/// contract crate gains no codec dependency.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDetail {
+    /// The stable renderer discriminator (e.g. a tool name, or `"ansi-stream"`/`"pty"`).
+    pub kind: String,
+    /// The opaque encoded payload (CBOR by convention), decoded by the consumer per `kind`.
+    pub body: Vec<u8>,
+}
+
+impl ToolDetail {
+    /// Construct a detail from a kind and its encoded body.
+    pub fn new(kind: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: kind.into(),
+            body: body.into(),
+        }
+    }
+}
+
 /// A compact view of a tool invocation, streamed on the event surface (the durable record lives in
 /// the engine's `Conversation`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +195,10 @@ pub struct ToolCallView {
     pub name: String,
     /// A human-readable summary of the arguments (never the raw secret-bearing payload).
     pub args_summary: String,
+    /// An optional opaque structured payload (e.g. the arguments object) for a rich consumer.
+    /// Passed through the daemon untouched; absent when the brain has nothing structured to attach.
+    #[serde(default)]
+    pub detail: Option<ToolDetail>,
 }
 
 /// A compact view of a tool result, streamed on the event surface.
@@ -176,6 +210,10 @@ pub struct ToolResultView {
     pub ok: bool,
     /// A human-readable summary of the outcome.
     pub summary: String,
+    /// An optional opaque structured payload (e.g. a diff, search results, an image) for a rich
+    /// consumer. Passed through the daemon untouched; absent when there is nothing structured.
+    #[serde(default)]
+    pub detail: Option<ToolDetail>,
 }
 
 /// Events the engine streams up to the host (§17, core -> host). Each carries a monotonic `seq`;
@@ -204,6 +242,20 @@ pub enum AgentEvent {
         seq: u64,
         /// The reasoning fragment.
         text: String,
+    },
+    /// A chunk of opaque structured stream content **not tied to a tool call** — a whole-agent
+    /// terminal/PTY stream, a foreign agent's raw rendered output, or a future structured content
+    /// type. Like [`ToolCallView::detail`] the payload is opaque to the daemon: the host,
+    /// orchestrator, and node surface pass it through untouched; a rich consumer routes by `kind`
+    /// (e.g. `"ansi-stream"` / `"pty"`) and decodes `body`. Reasoning and plain assistant text keep
+    /// their dedicated typed channels ([`AgentEvent::ReasoningDelta`] / [`AgentEvent::TextDelta`]).
+    ContentDelta {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The stable renderer discriminator (e.g. `"ansi-stream"` / `"pty"`).
+        kind: String,
+        /// The opaque encoded payload (CBOR by convention), decoded by the consumer per `kind`.
+        body: Vec<u8>,
     },
     /// A tool invocation began.
     ToolStarted {
@@ -274,6 +326,7 @@ impl AgentEvent {
             AgentEvent::TurnStarted { seq, .. }
             | AgentEvent::TextDelta { seq, .. }
             | AgentEvent::ReasoningDelta { seq, .. }
+            | AgentEvent::ContentDelta { seq, .. }
             | AgentEvent::ToolStarted { seq, .. }
             | AgentEvent::ToolFinished { seq, .. }
             | AgentEvent::Usage { seq, .. }
@@ -362,29 +415,32 @@ pub trait HostRequestHandler: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// §17 process-cut framing (foreign agents)
+// §17 frame unions (engine-relative): `Outbound` (engine -> host) is the canonical
+// up-union, also used as the node drain item; `Inbound` (host -> engine) is its partner.
+// Both serialize as the CBOR-framed dialect spoken over a foreign-agent process cut.
 // ---------------------------------------------------------------------------
 
-/// A §17 frame sent **down** to a foreign agent process (host -> agent) over a process cut. A
-/// foreign brain that speaks §17 is driven by these frames on its stdin; the host wraps the cut as
-/// an `Engine`-leaf managed unit. The reference in-process brain (`daemon-core`) uses typed channels
-/// instead, but the dialect is the same §17.
+/// A §17 frame delivered **to** an engine (host -> engine). Over a foreign-agent process cut these
+/// arrive on the agent's stdin; a foreign brain that speaks §17 is driven by them, and the host
+/// wraps the cut as an `Engine`-leaf managed unit. The reference in-process brain (`daemon-core`)
+/// uses typed channels instead, but the dialect is the same §17.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum Section17Down {
-    /// A §17 command for the agent to act on.
+pub enum Inbound {
+    /// A §17 command for the engine to act on.
     Command(AgentCommand),
-    /// The host's reply to a [`HostRequest`] the agent raised.
+    /// The host's reply to a [`HostRequest`] the engine raised.
     Response(HostResponse),
 }
 
-/// A §17 frame sent **up** from a foreign agent process (agent -> host) over a process cut, written
-/// to its stdout.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A §17 frame emitted **from** an engine (engine -> host). This is the canonical "item coming up
+/// from an engine" union: it doubles as the node drain item (`daemon-api` re-exports it as
+/// `Outbound`) and as the up-frame over a foreign-agent process cut, written to the agent's stdout.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum Section17Up {
+pub enum Outbound {
     /// A streamed §17 event.
     Event(AgentEvent),
-    /// A blocking §17 host request awaiting a [`Section17Down::Response`].
+    /// A blocking §17 host request awaiting an [`Inbound::Response`].
     Request(HostRequest),
 }

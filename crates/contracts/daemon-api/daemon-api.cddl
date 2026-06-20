@@ -43,11 +43,20 @@ conv-view = {
   waiting_for: [* tstr],
 }
 
+; An opaque structured payload a brain (or foreign-agent adapter) attaches for a rich consumer (a
+; transcript GUI). Opaque to the daemon: `kind` is a renderer discriminator (a tool name, or a
+; reserved kind such as "ansi-stream" / "pty"); `body` is the encoded payload (CBOR by convention).
+tool-detail = { kind: tstr, body: bstr }
+
+tool-call-view   = { call_id: tstr, name: tstr, args_summary: tstr, ? detail: (tool-detail / null) }
+tool-result-view = { call_id: tstr, ok: bool, summary: tstr, ? detail: (tool-detail / null) }
+
 agent-event = { "TurnStarted": { seq: uint, trigger: any } }
             / { "TextDelta": { seq: uint, text: tstr } }
             / { "ReasoningDelta": { seq: uint, text: tstr } }
-            / { "ToolStarted": { seq: uint, call: any } }
-            / { "ToolFinished": { seq: uint, result: any } }
+            / { "ContentDelta": { seq: uint, kind: tstr, body: bstr } }
+            / { "ToolStarted": { seq: uint, call: tool-call-view } }
+            / { "ToolFinished": { seq: uint, result: tool-result-view } }
             / { "Usage": { seq: uint, delta: usage-delta } }
             / { "RateLimit": { seq: uint, snapshot: any } }
             / { "TurnFinished": { seq: uint, summary: any } }
@@ -141,6 +150,7 @@ api-request = { "Submit": { session: session-id, command: agent-command } }
             / "Tree"
             / { "Unit": { unit: unit-id } }
             / { "UnitEvents": { unit: unit-id, max: uint } }
+            / { "UnitOutbound": { unit: unit-id, max: uint } }   ; rich §17 drain -> Drained
             / { "Pause": { unit: unit-id } }
             / { "Resume": { unit: unit-id } }
             / { "Scale": { unit: unit-id, n: uint } }

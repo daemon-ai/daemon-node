@@ -226,6 +226,21 @@ by `UnitId`). A single agent is a tree of one; teams and fleets-of-fleets are de
 through the same surface. The management protocol (`ManagedUnit`) is the internal recursion; the
 `daemon-api` projection is its read/drive face for consumers.
 
+**Two per-unit views: coarse dashboard vs. transcript-fidelity drill-down.** `unit_events()` is the
+coarse fleet-dashboard view — a bounded buffer of `ManageEventView`s (started / progress-line /
+usage / finished / error), payload-agnostic and non-destructive, what a supervisor folds. For a
+chat-transcript consumer that needs to render *any* unit's full operation stream, `unit_outbound(id,
+max)` is the drill-down: a destructive drain (like the per-session `poll`) of the unit's rich §17
+`Outbound` stream — the full vocabulary (text, reasoning, tool I/O with the opaque structured
+`detail` envelope, `ContentDelta`, usage, errors) plus blocking host requests, carried untouched.
+Every engine leaf (a `daemon-core` `AgentUnit` or a foreign agent over a cut) retains this stream in
+a bounded per-unit buffer; the host routes `unit_outbound` to it by `UnitId`. This is how a single
+agent *or* a delegate deep in a fleet is rendered at transcript fidelity — the rich stream is
+addressable by `UnitId`, not only for a top-level interactive session. The §17 ⇄ management
+projection (§4) drops the opaque envelope by design, so the dashboard stays agnostic while the
+drill-down stays lossless. (Durable/queryable transcript history — reconnect, scroll-back — is out of
+scope for this drain, which is live-only and best-effort.)
+
 > **Source-audit note (S2): isolation is a *placement* property, not a framework "distribution"
 > feature.** The intuition that "distribution gives us isolation" does **not** hold for the Rust
 > actor frameworks surveyed in [`source-audit.md`](../research/source-audit.md):

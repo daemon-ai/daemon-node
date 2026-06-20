@@ -15,7 +15,7 @@ use crate::section17::{AgentUnit, Section17Session};
 use async_trait::async_trait;
 use daemon_common::UnitId;
 use daemon_protocol::{
-    AgentCommand, AgentEvent, HostRequestHandler, Section17Down, Section17Up,
+    AgentCommand, AgentEvent, HostRequestHandler, Inbound, Outbound,
 };
 use daemon_provision::{ChildGuard, CutChannel, CutWriter, Placement};
 use std::sync::Arc;
@@ -46,13 +46,13 @@ impl ProcessSection17 {
         tokio::spawn(async move {
             while let Some(bytes) = reader.recv().await {
                 match decode_up(&bytes) {
-                    Some(Section17Up::Event(ev)) => {
+                    Some(Outbound::Event(ev)) => {
                         let _ = events_relay.send(ev);
                     }
-                    Some(Section17Up::Request(req)) => {
+                    Some(Outbound::Request(req)) => {
                         let resp = host.request(req).await;
                         let _ = reply_writer
-                            .send(&encode_down(&Section17Down::Response(resp)))
+                            .send(&encode_down(&Inbound::Response(resp)))
                             .await;
                     }
                     Some(_) | None => continue,
@@ -73,7 +73,7 @@ impl Section17Session for ProcessSection17 {
     async fn submit(&self, cmd: AgentCommand) {
         let _ = self
             .writer
-            .send(&encode_down(&Section17Down::Command(cmd)))
+            .send(&encode_down(&Inbound::Command(cmd)))
             .await;
     }
 
@@ -107,14 +107,14 @@ impl ProcessAgentUnit {
 }
 
 /// Encode a down-frame (CBOR). Frame types are always serializable; a failure is a programming error.
-fn encode_down(frame: &Section17Down) -> Vec<u8> {
+fn encode_down(frame: &Inbound) -> Vec<u8> {
     let mut buf = Vec::new();
-    ciborium::into_writer(frame, &mut buf).expect("encode Section17Down");
+    ciborium::into_writer(frame, &mut buf).expect("encode Inbound");
     buf
 }
 
 /// Decode an up-frame; `None` on a malformed frame.
-fn decode_up(bytes: &[u8]) -> Option<Section17Up> {
+fn decode_up(bytes: &[u8]) -> Option<Outbound> {
     ciborium::from_reader(bytes).ok()
 }
 
@@ -144,13 +144,13 @@ mod tests {
         }
     }
 
-    fn encode_up(frame: &Section17Up) -> Vec<u8> {
+    fn encode_up(frame: &Outbound) -> Vec<u8> {
         let mut buf = Vec::new();
-        ciborium::into_writer(frame, &mut buf).expect("encode Section17Up");
+        ciborium::into_writer(frame, &mut buf).expect("encode Outbound");
         buf
     }
 
-    fn decode_down(bytes: &[u8]) -> Option<Section17Down> {
+    fn decode_down(bytes: &[u8]) -> Option<Inbound> {
         ciborium::from_reader(bytes).ok()
     }
 
@@ -170,8 +170,8 @@ mod tests {
         tokio::spawn(async move {
             while let Some(bytes) = cr.recv().await {
                 match decode_down(&bytes) {
-                    Some(Section17Down::Command(AgentCommand::StartTurn { .. })) => {
-                        let req = Section17Up::Request(HostRequest {
+                    Some(Inbound::Command(AgentCommand::StartTurn { .. })) => {
+                        let req = Outbound::Request(HostRequest {
                             request_id: ReqId(1),
                             kind: HostRequestKind::Approval {
                                 prompt: "may I?".into(),
@@ -179,13 +179,13 @@ mod tests {
                         });
                         let _ = cw.send(&encode_up(&req)).await;
                     }
-                    Some(Section17Down::Response(resp)) => {
+                    Some(Inbound::Response(resp)) => {
                         assert!(matches!(resp.body, HostResponseBody::Approved(true)));
-                        let started = Section17Up::Event(AgentEvent::TurnStarted {
+                        let started = Outbound::Event(AgentEvent::TurnStarted {
                             seq: 0,
                             trigger: TurnTrigger::User,
                         });
-                        let finished = Section17Up::Event(AgentEvent::TurnFinished {
+                        let finished = Outbound::Event(AgentEvent::TurnFinished {
                             seq: 1,
                             summary: TurnSummary::ended(EndReason::Completed),
                         });

@@ -14,6 +14,7 @@
 //!   engine — ours or foreign — identically to its supervisor.
 
 use async_trait::async_trait;
+use daemon_api::Outbound;
 use daemon_common::{JobId, UnitId};
 use daemon_protocol::{
     AgentCommand, AgentEvent, CompletionSource as P17CompletionSource, EndReason as P17EndReason,
@@ -26,11 +27,30 @@ use daemon_supervision::{
     ManageRequestHandler, ManageRequestKind, ManageResponseBody, ManagedUnit, Outcome, ProcId,
     ProgressDelta, StartTrigger, ToolRef, ToolResultRef, UnitKind, WorkId, WorkRef,
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// The slot the parent's upward request handler is installed into at attach time.
 pub(crate) type HandlerSlot = Arc<Mutex<Option<Arc<dyn ManageRequestHandler>>>>;
+
+/// A bounded ring buffer of §17 [`Outbound`] items (streamed events + raised host requests) retained
+/// per unit for the rich, transcript-fidelity per-`UnitId` drain ([`AgentUnit::drain_outbound`], the
+/// host side of `ControlApi::unit_outbound`). Live-only and best-effort: when full the oldest item
+/// is dropped. Durable/queryable history (reconnect, scroll-back) is out of scope for this layer.
+pub(crate) type OutboundDrain = Arc<Mutex<VecDeque<Outbound>>>;
+
+/// How many recent §17 `Outbound` items a unit retains for its rich drain.
+const OUTBOUND_DRAIN_CAP: usize = 1024;
+
+/// Push one item onto a unit's bounded outbound drain, dropping the oldest when at capacity.
+fn push_outbound(drain: &OutboundDrain, item: Outbound) {
+    let mut q = drain.lock().unwrap();
+    if q.len() >= OUTBOUND_DRAIN_CAP {
+        q.pop_front();
+    }
+    q.push_back(item);
+}
 
 /// A running §17 session, transport-agnostic. Commands go in; `AgentEvent`s come out on the
 /// broadcast. Blocking host requests are answered by the [`HostRequestHandler`] the session was
@@ -53,6 +73,7 @@ pub struct AgentUnit {
     handler: HandlerSlot,
     events: broadcast::Sender<ManageEvent>,
     last_work: Arc<Mutex<Option<WorkId>>>,
+    outbound: OutboundDrain,
 }
 
 impl AgentUnit {
@@ -64,23 +85,29 @@ impl AgentUnit {
         build: impl FnOnce(Arc<dyn HostRequestHandler>) -> Arc<dyn Section17Session>,
     ) -> Self {
         let handler: HandlerSlot = Arc::new(Mutex::new(None));
+        let outbound: OutboundDrain = Arc::new(Mutex::new(VecDeque::new()));
         let host = Arc::new(ManageToHost {
             handler: handler.clone(),
+            outbound: outbound.clone(),
         });
         let session = build(host);
 
         let (events, _) = broadcast::channel::<ManageEvent>(256);
         let last_work = Arc::new(Mutex::new(None));
 
-        // Relay: subscribe to the §17 stream and map each event up to a ManageEvent. Subscribing
-        // here (before any turn) keeps the translation lossless for live consumers (§4 / §2.2).
+        // Relay: subscribe to the §17 stream and (a) retain each event verbatim on the rich outbound
+        // drain (transcript fidelity — structured `detail` / `ContentDelta` survive untouched), then
+        // (b) map it up to a ManageEvent for the coarse management broadcast. Subscribing here
+        // (before any turn) keeps both translations lossless for live consumers (§4 / §2.2).
         let mut agent_rx = session.subscribe();
         let out = events.clone();
         let last_work_relay = last_work.clone();
+        let drain_relay = outbound.clone();
         tokio::spawn(async move {
             loop {
                 match agent_rx.recv().await {
                     Ok(ev) => {
+                        push_outbound(&drain_relay, Outbound::Event(ev.clone()));
                         if let Some(mapped) = map_event(ev, &last_work_relay) {
                             let _ = out.send(mapped);
                         }
@@ -97,6 +124,7 @@ impl AgentUnit {
             handler,
             events,
             last_work,
+            outbound,
         }
     }
 }
@@ -162,6 +190,13 @@ fn map_event(ev: AgentEvent, last_work: &Arc<Mutex<Option<WorkId>>>) -> Option<M
             seq,
             failure: FailureView::new(FailureClass::Internal, failure),
         },
+        // Opaque structured stream content has no coarse management projection: the supervisor /
+        // fleet dashboard stays payload-agnostic by design (it never interprets `kind`/`body`). A
+        // rich consumer reads it verbatim off the §17 `Outbound` drain (`unit_outbound`), not here.
+        // The opaque `detail` on `ToolStarted`/`ToolFinished` is likewise dropped above: the coarse
+        // `ProgressDelta::ToolStarted`/`ToolFinished` keep only `call_id`/`name`/`ok`.
+        AgentEvent::ContentDelta { .. } => return None,
+        // Steered / Snapshot are control-correlated replies, not management progress.
         _ => return None,
     };
     Some(mapped)
@@ -249,6 +284,20 @@ impl ManagedUnit for AgentUnit {
     fn install_request_handler(&self, handler: Arc<dyn ManageRequestHandler>) {
         *self.handler.lock().unwrap() = Some(handler);
     }
+
+    /// The rich, transcript-fidelity per-unit drill-down: the full §17 `Outbound` stream this engine
+    /// retained, in order (the drill-down counterpart to the coarse [`Self::events`] management
+    /// stream). Preserves structured tool `detail` / `ContentDelta` and blocking host requests
+    /// untouched, so a transcript consumer can render any unit in the tree.
+    fn drain_outbound(&self, max: u32) -> Vec<Outbound> {
+        let mut q = self.outbound.lock().unwrap();
+        let take = if max == 0 {
+            q.len()
+        } else {
+            (max as usize).min(q.len())
+        };
+        q.drain(..take).collect()
+    }
 }
 
 /// The §17 `HostRequestHandler` the session sees: forwards each blocking §17 request up to the
@@ -256,11 +305,18 @@ impl ManagedUnit for AgentUnit {
 /// down (host-spec §9: §17 `HostRequest`s → `ManageRequest`s).
 pub(crate) struct ManageToHost {
     handler: HandlerSlot,
+    /// The unit's rich outbound drain: a raised request is retained here (in causal order with the
+    /// event stream) so the transcript consumer sees the pending interactive prompt.
+    outbound: OutboundDrain,
 }
 
 #[async_trait]
 impl HostRequestHandler for ManageToHost {
     async fn request(&self, req: HostRequest) -> HostResponse {
+        // Retain the blocking request on the rich drain before escalating, so a transcript consumer
+        // can render the pending prompt (approval / input / choice / delegate).
+        push_outbound(&self.outbound, Outbound::Request(req.clone()));
+
         let installed = self.handler.lock().unwrap().clone();
         let request_id = req.request_id;
         let is_delegate = matches!(req.kind, HostRequestKind::Delegate { .. });

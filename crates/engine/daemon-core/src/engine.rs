@@ -414,6 +414,9 @@ impl Engine {
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
                 args_summary: call.args.clone(),
+                // The reference MockProvider has no structured payload to attach yet; a real
+                // provider/tool populates this with the arguments object for a rich consumer.
+                detail: None,
             };
             events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
             let outcome = run_tool(call, &registry, &cx).await;
@@ -421,6 +424,8 @@ impl Engine {
                 call_id: outcome.result.call_id.clone(),
                 ok: outcome.result.ok,
                 summary: outcome.result.content.clone(),
+                // Likewise filled by a real tool with structured output (diff, search, image, ...).
+                detail: None,
             };
             events.emit(|seq| AgentEvent::ToolFinished {
                 seq,

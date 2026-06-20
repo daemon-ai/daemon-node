@@ -273,6 +273,16 @@ pub enum AgentEvent {
 This removes sentinel values. A segment break is not `None`; it is
 `MessageSegmentEnded`.
 
+> **Note (structured operation payloads).** The canonical §17 surface (`daemon-protocol`, see
+> [`daemon-core-spec.md`](daemon-core-spec.md) §17) carries an **opaque structured envelope** for
+> transcript-grade rendering: `ToolDetail { kind, body }` on `ToolStarted`/`ToolFinished` (a tool's
+> arguments object, a diff, a search-result list, an image), plus a tool-independent
+> `ContentDelta { kind, body }` event for stream content not tied to a tool (a terminal/PTY stream
+> under a reserved kind such as `"ansi-stream"` / `"pty"`, or a foreign agent's raw rendered output).
+> The daemon never interprets the envelope — the brain (or a foreign-agent adapter) and the consuming
+> GUI agree on the schema; the host/orchestrator/node surface pass it through untouched. A consumer
+> reads the full stream verbatim through the node's per-unit rich drain (`unit_outbound`).
+
 ## 3. Host Requests And Responses
 
 Some operations require the runtime to ask the host for input and wait.

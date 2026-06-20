@@ -22,7 +22,7 @@ use crate::registry::{ChildRecord, ChildStatus};
 use crate::spawner::ChildSpawner;
 use async_trait::async_trait;
 use daemon_api::{
-    ManageEventView, TreeReport, UnitKind as ApiUnitKind, UnitNode, UnitState,
+    ManageEventView, Outbound, TreeReport, UnitKind as ApiUnitKind, UnitNode, UnitState,
 };
 use daemon_common::{
     Budget, Epoch, PartitionId, ReqId, SessionId, SnapshotBlob, UnitId, UsageDelta,
@@ -318,6 +318,19 @@ impl FleetRuntime {
                 };
                 r.events.iter().skip(len - take).cloned().collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Drain up to `max` recent §17 [`Outbound`] items (events + raised host requests) for one unit
+    /// — the rich, transcript-fidelity drill-down (the host side of `ControlApi::unit_outbound`).
+    /// Routed by id to the registered unit's own retained drain; empty if the unit is unknown or
+    /// (e.g. an orchestrator) retains no §17 stream. A destructive drain: each call consumes what it
+    /// returns (`max == 0` drains all buffered items), mirroring the per-session poll model.
+    pub fn unit_outbound(&self, id: &UnitId, max: u32) -> Vec<Outbound> {
+        self.inner
+            .children
+            .get(id)
+            .map(|r| r.unit.drain_outbound(max))
             .unwrap_or_default()
     }
 

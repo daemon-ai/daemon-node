@@ -1278,6 +1278,22 @@ durable activation/snapshot machinery (§2.x, lifecycle-persistence) is a `daemo
 foreign brain owns its own opaque state, so its host-side adapter owns its (coarser) lifecycle —
 relaunch with the right launch profile, or treat as ephemeral.
 
+**Structured operation payloads — an opaque envelope the daemon passes through.** A transcript-grade
+consumer (a GUI) needs more than scrubbed summaries: a tool's arguments object, a unified diff, a
+web-search result list, an image-generation output, or a whole-agent terminal stream. §17 carries
+these through an **opaque envelope** the daemon never interprets — `ToolDetail { kind, body }` where
+`kind` is a renderer discriminator and `body` is the encoded payload (CBOR by convention). It rides
+two places: `ToolCallView::detail` / `ToolResultView::detail` (structured tool I/O, correlated by
+`call_id`), and `AgentEvent::ContentDelta { kind, body }` for stream content **not** tied to a tool
+(a terminal/PTY stream under a reserved kind such as `"ansi-stream"` / `"pty"`, a foreign agent's raw
+rendered output, or a future content type). Plain assistant text and reasoning keep their dedicated
+typed channels (`TextDelta` / `ReasoningDelta`). The brain (or a foreign-agent adapter, e.g. one
+translating a CLI agent's structured stream) owns the schema; the host, orchestrator, and node
+surface pass the envelope through untouched and never match on `kind`/`body`, so a foreign agent can
+ship payload shapes the daemon has never seen. The management projection (§4, the supervisor's coarse
+view) deliberately drops the envelope — it stays payload-agnostic; a consumer reads the full §17
+stream verbatim through the node's per-unit rich drain (`unit_outbound`, host-spec §9).
+
 **`hermes-agent` behavior.** Hosts integrate through ad-hoc callbacks and direct attribute access on
 the `AIAgent` god object ([`hermes-god-object-architecture.md`](../../../../docs/research/hermes/hermes-god-object-architecture.md),
 [`hermes-agent-host-interface.md`](../../../../docs/research/hermes/hermes-agent-host-interface.md)): UI rendering, approval prompts,
@@ -1302,6 +1318,7 @@ enum AgentEvent {                   // core -> host (carries a monotonic seq)
     TurnStarted { seq: u64, trigger: TurnTrigger },
     TextDelta { seq: u64, text: String },
     ReasoningDelta { seq: u64, text: String },     // separate channel; never mixed into text
+    ContentDelta { seq: u64, kind: String, body: Vec<u8> }, // opaque structured stream content (§17.2)
     ToolStarted { seq: u64, call: ToolCallView },
     ToolFinished { seq: u64, result: ToolResultView },
     Usage { seq: u64, delta: UsageDelta },          // token usage telemetry (orchestratability)
@@ -1309,6 +1326,9 @@ enum AgentEvent {                   // core -> host (carries a monotonic seq)
     TurnFinished { seq: u64, summary: TurnSummary }, // summary carries end_reason: EndReason
     Error { seq: u64, failure: FailureView },
 }
+
+// ToolCallView/ToolResultView additionally carry `detail: Option<ToolDetail>` (below).
+struct ToolDetail { kind: String, body: Vec<u8> }   // opaque structured payload for a rich consumer
 
 // completion of a background activity initiates a new idle turn (§17.1 item 5):
 enum TurnTrigger { User, Steer, BackgroundCompletion { source: CompletionSource } }

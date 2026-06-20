@@ -1597,6 +1597,9 @@ mod node_interface {
         async fn unit_events(&self, id: &UnitId, max: u32) -> Vec<daemon_api::ManageEventView> {
             self.0.unit_events(id, max)
         }
+        async fn unit_outbound(&self, id: &UnitId, max: u32) -> Vec<daemon_api::Outbound> {
+            self.0.unit_outbound(id, max)
+        }
         async fn pause(&self, id: &UnitId) -> bool {
             self.0.pause(id).await
         }
