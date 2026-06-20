@@ -4,6 +4,24 @@
 > re-implementation of the **`hermes-agent`** embeddable agent core plus its core-adjacent
 > runtime services, with in-process Python (PyO3) extensions.
 
+> **Implementation status (the brain — P4 landed).** The engine is no longer a single-pass mock.
+> `run_turn` is now a real **in-turn ReAct loop** (§4.2): `build_context → call_model →
+> execute_tools → observe → call_model …` repeating until the model returns final text, guarded by
+> the §20 **iteration budget** (`Config::max_iterations`, default 90) — on exhaustion it makes one
+> toolless summary call and ends `EndReason::BudgetExhausted`. The loop runs fully in-process within
+> one durable turn; only `Effect::Delegate` crosses the suspension boundary, so dehydration
+> semantics are unchanged. The §12 `run_tool` pipeline executes every tool through a §13
+> **`ExecutionEnvironment`** (in-core `LocalEnvironment`, per-session workspace-rooted, containment +
+> child-env scrub; the trait stays host-routable), applies the sanitize+result-byte-budget stage,
+> and surfaces structured `ToolDetail` into the `ToolCall`/`ToolResult` transcript views. Real
+> **fs** (read/write/list/edit) and **shell** (exec, with hardline-deny + approval gate) tools ship
+> in `tools/daemon-tool-fs` + `tools/daemon-tool-shell` and are registered on every node engine, so a
+> leaf/session/orchestrator does real local work in its workspace. **Still deferred** (provider stays
+> deterministic this phase): the real networked provider (P3 — a `ScriptedProvider`/`MockProvider`
+> drives the loop+tools end-to-end without network/keys), context/memory depth (P2), mutating-op
+> checkpoints, untrusted-output wrapping, parallel tool batching, and remote (docker/ssh) exec
+> backends.
+
 ## Source-of-truth discipline (read first)
 
 This document has one authoritative reference and several supporting ones. Keeping them straight
@@ -1620,6 +1638,17 @@ regression-proof, exploiting the effects-as-values design.
 
 Mapped to the parity-map tiers ([`hermes-agent-parity-map.md`](../../../../docs/research/hermes/hermes-agent-parity-map.md)) with
 acceptance criteria. Each phase is shippable.
+
+> **Landed so far.** P0's actor + typed phases + effects applier (§4), the **in-turn ReAct loop**
+> with the §20 iteration budget (§4.2), path safety + hardline approval + cancellation + result-byte
+> budget (§12), and the `Config` skeleton + `MockProvider`/`ScriptedProvider` + recovery/golden tests
+> (§20–21) are implemented. From P1, the §13 **`LocalEnvironment`** (per-session workspace,
+> containment, child-env scrub) and the real **fs/shell** tools are implemented and registered on
+> every node engine, and async sub-agent delegation (`Effect::Delegate → BackgroundCompletion`, §16.2)
+> plus the host protocol + in-process `AgentHandle` (§17) are in place. **Provider stays
+> deterministic** (the real networked transport is P1/P2); context summarization/memory (§10–11),
+> checkpoint/rewind + parallel tool batching (§12), and remote exec backends (§13, P3) remain
+> deferred.
 
 ### P0 — Production survival
 - Typed `Conversation`/`Turn`/`ToolTurn` (§5) + wire conversion + serialization skeleton (§6).

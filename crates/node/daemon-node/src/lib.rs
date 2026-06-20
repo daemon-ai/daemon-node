@@ -97,6 +97,16 @@ fn provider_for(providers: &ProviderRegistry, name: &str) -> daemon_core::Provid
         .unwrap_or_else(|| panic!("no provider registered for {name:?} and no default set"))
 }
 
+/// A registry seeded with the core local toolset (fs + shell) every daemon-core engine carries, so a
+/// leaf or session can do real work in its contained workspace (§12/§13). Callers add role tools
+/// (e.g. orchestrate) on top.
+fn core_tool_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(daemon_tool_fs::FsTool::new()));
+    registry.register(Arc::new(daemon_tool_shell::ShellTool::new()));
+    registry
+}
+
 /// Assemble and start the default host node: durable substrate + resident services, the
 /// orchestration fleet as the real job worker, the credential seam, and the live session surface,
 /// all built from one shared [`EngineProfile`] per role so the durable, live, and fleet-child paths
@@ -119,7 +129,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let child_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, CHILD_PROFILE),
-            Arc::new(ToolRegistry::new()),
+            Arc::new(core_tool_registry()),
             SystemPrompt::new("fleet child"),
         ),
         &a,
@@ -143,7 +153,9 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // can delegate (the recursive durable graph). The orchestrate tool's depth guard (cap =
     // `nesting_depth + 1`) terminates the chain: `nesting_depth = 0` is a single delegation level
     // (top -> leaf child), `n` allows `n + 1` levels of nested delegation.
-    let mut registry = ToolRegistry::new();
+    // The orchestrator-capable engine carries the core local toolset (fs + shell) *plus* orchestrate,
+    // so a node can both do real local work and delegate.
+    let mut registry = core_tool_registry();
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
             .with_max_depth(a.nesting_depth + 1),
@@ -177,7 +189,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let session_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, a.profile.as_str()),
-            Arc::new(ToolRegistry::new()),
+            Arc::new(core_tool_registry()),
             SystemPrompt::new("interactive session"),
         ),
         &a,

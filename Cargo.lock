@@ -961,7 +961,9 @@ dependencies = [
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
+ "daemon-tool-fs",
  "daemon-tool-orchestrate",
+ "daemon-tool-shell",
 ]
 
 [[package]]
@@ -1045,7 +1047,13 @@ name = "daemon-tool-fs"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "daemon-common",
  "daemon-core",
+ "daemon-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1064,7 +1072,13 @@ name = "daemon-tool-shell"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "daemon-common",
  "daemon-core",
+ "daemon-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

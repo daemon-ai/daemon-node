@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::conversation::SystemPrompt;
 use crate::credentials::CredentialProvider;
 use crate::engine::Engine;
+use crate::exec::ExecutionEnvironment;
 use crate::provider::Provider;
 use crate::snapshot::Snapshot;
 use crate::tools::ToolRegistry;
@@ -31,6 +32,11 @@ pub type ProviderBuilder = Arc<dyn Fn() -> Arc<dyn Provider> + Send + Sync>;
 /// client re-bind to the live cut (host-spec §6).
 pub type CredentialBuilder = Arc<dyn Fn() -> Arc<dyn CredentialProvider> + Send + Sync>;
 
+/// Builds the [`ExecutionEnvironment`] (§13) for one engine, keyed by its [`SessionId`] — the seam
+/// the host uses to root each session's tools in its provisioned workspace (or, later, to route
+/// fs/exec to a host-owned/remote env). The default builds a per-session [`LocalEnvironment`] sandbox.
+pub type ExecEnvBuilder = Arc<dyn Fn(&SessionId) -> Arc<dyn ExecutionEnvironment> + Send + Sync>;
+
 /// The engine's construction environment, shared by every construction site (durable factory, live
 /// session builder, fleet child spawner).
 #[derive(Clone)]
@@ -41,6 +47,7 @@ pub struct EngineProfile {
     credentials: Option<(CredentialBuilder, ProfileRef)>,
     budget: Budget,
     config: Config,
+    exec: Option<ExecEnvBuilder>,
 }
 
 impl EngineProfile {
@@ -55,6 +62,7 @@ impl EngineProfile {
             credentials: None,
             budget: Budget::unlimited(),
             config: Config::default(),
+            exec: None,
         }
     }
 
@@ -78,6 +86,14 @@ impl EngineProfile {
         self
     }
 
+    /// Inject the execution-environment builder (§13) every engine this profile builds runs its tools
+    /// in — the host roots each session in its provisioned workspace (or a host-routed env). Without
+    /// it, engines fall back to the per-session [`LocalEnvironment`] sandbox.
+    pub fn with_exec(mut self, exec: ExecEnvBuilder) -> Self {
+        self.exec = Some(exec);
+        self
+    }
+
     /// The tool registry shared by engines this profile builds.
     pub fn registry(&self) -> Arc<ToolRegistry> {
         self.registry.clone()
@@ -88,10 +104,15 @@ impl EngineProfile {
         &self.system
     }
 
-    /// Apply the profile's credentials, budget, and tunables to a freshly constructed engine.
+    /// Apply the profile's credentials, budget, tunables, and execution environment to a freshly
+    /// constructed engine.
     fn dress(&self, mut engine: Engine) -> Engine {
         if let Some((build, profile)) = &self.credentials {
             engine = engine.with_credentials(build(), profile.clone());
+        }
+        if let Some(build) = &self.exec {
+            let exec = build(&engine.snapshot().session_id);
+            engine = engine.with_exec(exec);
         }
         engine.with_budget(self.budget).with_config(self.config)
     }

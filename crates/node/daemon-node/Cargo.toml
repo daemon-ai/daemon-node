@@ -19,6 +19,8 @@ daemon-protocol = { workspace = true }
 daemon-acp = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
+daemon-tool-fs = { workspace = true }
+daemon-tool-shell = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }

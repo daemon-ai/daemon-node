@@ -27,6 +27,10 @@ const CREDENTIAL_KEY_ENV: &str = "DAEMON_CREDENTIAL_KEY";
 const MODEL_RETRY_ATTEMPTS_ENV: &str = "DAEMON_MODEL_RETRY_ATTEMPTS";
 /// Overrides the engine's `context_budget_tokens` tunable.
 const CONTEXT_BUDGET_TOKENS_ENV: &str = "DAEMON_CONTEXT_BUDGET_TOKENS";
+/// Overrides the engine's `max_iterations` (per-turn ReAct round cap) tunable.
+const MAX_ITERATIONS_ENV: &str = "DAEMON_MAX_ITERATIONS";
+/// Overrides the engine's `tool_result_budget` (per-tool result-byte cap) tunable.
+const TOOL_RESULT_BUDGET_ENV: &str = "DAEMON_TOOL_RESULT_BUDGET";
 /// The 32-byte verifiable-journal signer seed, hex-encoded (64 hex chars).
 const JOURNAL_SEED_ENV: &str = "DAEMON_JOURNAL_SEED";
 /// How many orchestrator levels the top fleet materializes before its leaves (fleets-of-fleets).
@@ -85,6 +89,8 @@ struct FileConfig {
     credential_key: Option<String>,
     model_retry_attempts: Option<u8>,
     context_budget_tokens: Option<u32>,
+    max_iterations: Option<u32>,
+    tool_result_budget: Option<usize>,
     journal_seed: Option<String>,
     nesting_depth: Option<usize>,
 }
@@ -196,6 +202,20 @@ impl NodeConfig {
                 s.parse()
                     .context("DAEMON_CONTEXT_BUDGET_TOKENS must be a u32")?,
             );
+        }
+        if let Some(n) = file.max_iterations {
+            engine.max_iterations = n;
+        }
+        if let Some(s) = env_string(MAX_ITERATIONS_ENV) {
+            engine.max_iterations = s.parse().context("DAEMON_MAX_ITERATIONS must be a u32")?;
+        }
+        if let Some(n) = file.tool_result_budget {
+            engine.tool_result_budget = n;
+        }
+        if let Some(s) = env_string(TOOL_RESULT_BUDGET_ENV) {
+            engine.tool_result_budget = s
+                .parse()
+                .context("DAEMON_TOOL_RESULT_BUDGET must be a usize")?;
         }
         Ok(engine)
     }

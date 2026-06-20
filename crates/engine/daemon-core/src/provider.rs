@@ -270,3 +270,123 @@ impl Provider for MockProvider {
         }
     }
 }
+
+/// One scripted model round for a [`ScriptedProvider`].
+#[derive(Clone, Debug)]
+pub enum ScriptStep {
+    /// Emit a single tool call with the given name and (canonical) argument payload.
+    Call {
+        /// The tool name to invoke.
+        name: String,
+        /// The argument payload (e.g. a JSON object for the fs/shell tools).
+        args: String,
+    },
+    /// Emit several tool calls in one round (a parallel batch the engine runs in order).
+    Calls(Vec<(String, String)>),
+    /// Emit final assistant text and no tool calls (completes the turn).
+    Final(String),
+}
+
+/// A deterministic provider that replays a fixed sequence of tool-call/final rounds — the seam-only
+/// stand-in for a real model that drives the multi-round ReAct loop in tests (no network/keys).
+///
+/// Each `chat` returns the next [`ScriptStep`]. Once the script is exhausted it returns `final_text`
+/// (completing the turn), unless constructed with [`ScriptedProvider::looping`], which repeats one
+/// step forever — useful for exercising the iteration-budget hard stop.
+pub struct ScriptedProvider {
+    steps: Vec<ScriptStep>,
+    repeat: Option<ScriptStep>,
+    final_text: String,
+    calls: AtomicU64,
+}
+
+impl ScriptedProvider {
+    /// A provider that replays `steps` in order, then completes with `final_text`.
+    pub fn new(steps: Vec<ScriptStep>, final_text: impl Into<String>) -> Self {
+        Self {
+            steps,
+            repeat: None,
+            final_text: final_text.into(),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    /// A provider that emits `step` on *every* round forever — never completes on its own, so the
+    /// engine's iteration budget is what ends the turn (`BudgetExhausted`).
+    pub fn looping(step: ScriptStep) -> Self {
+        Self {
+            steps: Vec::new(),
+            repeat: Some(step),
+            final_text: String::new(),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    /// How many model rounds this provider has served (test observability).
+    pub fn call_count(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    fn output(&self, step: &ScriptStep, n: u64, usage: UsageDelta) -> ModelOutput {
+        match step {
+            ScriptStep::Call { name, args } => ModelOutput {
+                text: String::new(),
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    call_id: format!("call-{n}"),
+                    name: name.clone(),
+                    args: args.clone(),
+                }],
+                usage,
+            },
+            ScriptStep::Calls(list) => ModelOutput {
+                text: String::new(),
+                reasoning: None,
+                tool_calls: list
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, args))| ToolCall {
+                        call_id: format!("call-{n}-{i}"),
+                        name: name.clone(),
+                        args: args.clone(),
+                    })
+                    .collect(),
+                usage,
+            },
+            ScriptStep::Final(text) => ModelOutput {
+                text: text.clone(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ScriptedProvider {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_native_tools: true,
+            supports_streaming: false,
+            tool_call_format: ToolCallFormat::Native,
+            max_context: Some(8192),
+        }
+    }
+
+    async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+        let n = self.calls.fetch_add(1, Ordering::Relaxed);
+        let usage = UsageDelta {
+            input_tokens: 8,
+            output_tokens: 4,
+            api_calls: 1,
+        };
+        let step = self
+            .steps
+            .get(n as usize)
+            .or(self.repeat.as_ref())
+            .cloned()
+            .unwrap_or_else(|| ScriptStep::Final(self.final_text.clone()));
+        Ok(self.output(&step, n, usage))
+    }
+}

@@ -2306,6 +2306,181 @@ mod node_interface {
         handle.shutdown().await;
     }
 
+    /// A provider registry whose session default is a deterministic [`ScriptedProvider`] that drives
+    /// the real ReAct loop: write a file, read it back, run a command, then finish. Orchestrator /
+    /// child slots are completing mocks (unused by this leaf-work scenario, but the composition root
+    /// resolves them).
+    fn core_tools_providers() -> ProviderRegistry {
+        use daemon_core::{ScriptStep, ScriptedProvider};
+        let mut providers = ProviderRegistry::new();
+        providers.set_default(Arc::new(|| {
+            Arc::new(ScriptedProvider::new(
+                vec![
+                    ScriptStep::Call {
+                        name: "fs".into(),
+                        args: r#"{"op":"write","path":"note.txt","content":"hello from daemon-core"}"#.into(),
+                    },
+                    ScriptStep::Call {
+                        name: "fs".into(),
+                        args: r#"{"op":"read","path":"note.txt"}"#.into(),
+                    },
+                    ScriptStep::Call {
+                        name: "shell".into(),
+                        args: r#"{"command":"printf","args":["ran-%s","ok"]}"#.into(),
+                    },
+                ],
+                "work complete",
+            )) as Arc<dyn Provider>
+        }));
+        providers.register(
+            "orchestrator",
+            Arc::new(|| Arc::new(MockProvider::completing("orchestrator done")) as Arc<dyn Provider>),
+        );
+        providers.register(
+            "child",
+            Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
+        );
+        providers
+    }
+
+    fn assemble_core_tools(store: Arc<dyn SessionStore>) -> AssembledNode {
+        assemble_node(NodeAssembly {
+            store,
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: core_tools_providers(),
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x33; 32]),
+            nesting_depth: 0,
+        })
+    }
+
+    /// THE BRAIN GATE: a `daemon-core` session does *real local work* in one turn through the node
+    /// surface — the in-turn ReAct loop (§4.2) runs the §13 fs + shell tools (write -> read -> exec)
+    /// against its contained workspace, and the tool I/O lands in the durable, verified
+    /// `session_history`. Asserted against both store backends.
+    async fn core_tools_session_does_real_work(store: Arc<dyn SessionStore>) {
+        use daemon_api::{JournalRecordPayload, Outbound, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_protocol::{AgentCommand, AgentEvent, TranscriptBlock, UserMsg};
+
+        let AssembledNode { node, handle, .. } = assemble_core_tools(store);
+        let session = SessionId::new("core-tools-1");
+
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("do file work"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit StartTurn");
+
+        // Drain the live session until the turn finishes, collecting every outbound event.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        let mut finished = false;
+        while Instant::now() < deadline {
+            let drained = node.poll(session.clone(), 0).await.expect("poll");
+            for o in drained {
+                if matches!(&o, Outbound::Event(AgentEvent::TurnFinished { .. })) {
+                    finished = true;
+                }
+                events.push(o);
+            }
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(finished, "the core-tools turn never reached TurnFinished");
+
+        // The loop ran the real tools: the read returned the bytes the write produced, and the shell
+        // command executed in the contained workspace.
+        let tool_results: Vec<_> = events
+            .iter()
+            .filter_map(|o| match o {
+                Outbound::Event(AgentEvent::ToolFinished { result, .. }) => Some(result.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_results
+                .iter()
+                .any(|r| r.ok && r.summary.contains("hello from daemon-core")),
+            "the fs read should return the written content: {tool_results:?}"
+        );
+        assert!(
+            tool_results.iter().any(|r| r.ok && r.summary.contains("ran-ok")),
+            "the shell command should run in the workspace: {tool_results:?}"
+        );
+
+        // The tool I/O is durable + verified: scroll back through session_history until the turn's
+        // sealed tool blocks appear *and* the whole segment is committed (the seal lands just after
+        // TurnFinished drains, and signature commit can lag the block append under load).
+        let has_tool_result = |p: &daemon_api::JournalPageView| {
+            p.entries.iter().any(|e| {
+                matches!(
+                    &e.payload,
+                    JournalRecordPayload::Block {
+                        block: TranscriptBlock::ToolResult { .. }
+                    }
+                )
+            })
+        };
+        let mut page = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let p = node.session_history(session.clone(), 0, 0).await;
+            if has_tool_result(&p) && p.entries.iter().all(|e| e.verified) {
+                page = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let page = page.expect("durable history should carry the sealed, verified tool blocks");
+        assert!(
+            page.entries.iter().all(|e| e.verified),
+            "every sealed entry must verify under the node key: {page:?}"
+        );
+        let call_names: Vec<_> = page
+            .entries
+            .iter()
+            .filter_map(|e| match &e.payload {
+                JournalRecordPayload::Block {
+                    block: TranscriptBlock::ToolCall { name, .. },
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            call_names.iter().any(|n| n == "fs"),
+            "the fs tool calls should be journaled: {call_names:?}"
+        );
+        assert!(
+            call_names.iter().any(|n| n == "shell"),
+            "the shell tool call should be journaled: {call_names:?}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn core_tools_session_does_real_work_in_memory() {
+        core_tools_session_does_real_work(Arc::new(InMemoryStore::new())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn core_tools_session_does_real_work_sqlite() {
+        core_tools_session_does_real_work(
+            Arc::new(SqliteStore::open_in_memory().expect("open sqlite store")),
+        )
+        .await;
+    }
+
     /// Steer / Snapshot / Interrupt drive over the Unix socket, and the snapshot projection agrees
     /// with the in-process transport (the phase-9 control-surface parity gate).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

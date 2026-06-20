@@ -259,6 +259,15 @@ decides **where** it runs:
   (read-only exec env, [`daemon-orchestrator-spec.md`](daemon-orchestrator-spec.md)) is realized
   here by provisioning a read-only or copy-on-write workspace variant. Workspace state is a
   **tool-owned external resource** (lifecycle doc §1.2), not part of the snapshot.
+  > **Leaf sessions now do real local work in-turn.** With the engine's in-turn ReAct loop landed
+  > (daemon-core-spec §4.2), a `daemon-core` leaf/session runs the real **fs** and **shell** tools
+  > (daemon-core-spec §12/§13) against a §13 `ExecutionEnvironment` *within a single turn* —
+  > model→tools→model until final text — rather than a single mock pass. The host roots that env at
+  > the engine's workspace via the `EngineProfile`'s exec-env builder (an in-core `LocalEnvironment`
+  > enforcing workspace containment + child-env scrub; the seam stays routable to a future host-owned
+  > env). The loop is fully in-process; only `Effect::Delegate` still crosses the durable suspension
+  > boundary, so activation/snapshot semantics are unchanged. The provider remains deterministic this
+  > phase (real networked model I/O is deferred).
 - **Placement** — in-process (default; same address space) or remote (a remote host driving the
   engine over §17). Placement is a host concern invisible to the orchestrator, which only routes by
   `UnitId`.

@@ -208,7 +208,7 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{SystemPrompt, ToolCall, ToolResult};
+    use crate::conversation::{SystemPrompt, ToolCall};
     use crate::provider::MockProvider;
     use crate::tools::{Tool, ToolOutcome, ToolRegistry};
     use crate::turn::TurnCx;
@@ -241,14 +241,7 @@ mod tests {
         }
         async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
             cx.cancel.cancelled().await;
-            ToolOutcome {
-                result: ToolResult {
-                    call_id: call.call_id.clone(),
-                    ok: true,
-                    content: "interrupted".into(),
-                },
-                effects: Vec::new(),
-            }
+            ToolOutcome::text(call.call_id.clone(), true, "interrupted")
         }
     }
 

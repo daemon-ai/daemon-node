@@ -7,4 +7,12 @@ license.workspace = true
 
 [dependencies]
 daemon-core = { workspace = true }
+daemon-protocol = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+daemon-common = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

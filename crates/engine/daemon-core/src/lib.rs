@@ -8,8 +8,11 @@
 //!
 //! It speaks the §17 host protocol (`daemon-protocol`) and is intentionally unaware of
 //! `daemon-supervision` and the durable substrate — the host adapts the management protocol and
-//! bridges the activation seam on its behalf. Phase 3 ships a deterministic [`MockProvider`] and a
-//! single [`DelegateTool`]; real model I/O, compaction, memory, and LSP arrive later.
+//! bridges the activation seam on its behalf. The turn now drives a real **in-turn ReAct loop**
+//! (model → tools → model until final text) guarded by the §20 iteration budget, executing tools
+//! through a §13 [`ExecutionEnvironment`] (the in-core [`LocalEnvironment`]); the provider stays
+//! deterministic ([`MockProvider`] / [`ScriptedProvider`]) this phase, with real model I/O,
+//! compaction, memory, and LSP arriving later.
 //!
 //! See `crates/engine/daemon-core/docs/` for the engine spec family.
 
@@ -22,6 +25,7 @@ pub mod conversation;
 pub mod credentials;
 pub mod engine;
 pub mod events;
+pub mod exec;
 pub mod profile;
 pub mod provider;
 pub mod snapshot;
@@ -38,10 +42,11 @@ pub use conversation::{
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use engine::{Completion, Engine, Suspension, TurnOutcome};
 pub use events::EventSink;
-pub use profile::{CredentialBuilder, EngineProfile, ProviderBuilder};
+pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+pub use profile::{CredentialBuilder, EngineProfile, ExecEnvBuilder, ProviderBuilder};
 pub use provider::{
     build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
-    Request, RequestMsg, ToolCallFormat,
+    Request, RequestMsg, ScriptStep, ScriptedProvider, ToolCallFormat,
 };
 pub use snapshot::{ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;

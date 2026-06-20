@@ -9,7 +9,7 @@
 use crate::conversation::{ToolCall, ToolResult};
 use crate::turn::{Effect, TurnCx};
 use daemon_common::{JobId, ReqId};
-use daemon_protocol::{HostRequest, HostRequestKind, HostResponseBody};
+use daemon_protocol::{HostRequest, HostRequestKind, HostResponseBody, ToolDetail};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,6 +19,31 @@ pub struct ToolOutcome {
     pub result: ToolResult,
     /// The effects the tool produced, applied by the single-owner applier.
     pub effects: Vec<Effect>,
+    /// An optional structured payload for a rich consumer (the §17 `ToolResultView::detail`
+    /// envelope): the tool's typed output (a diff, a command's exit/stdout, a file listing, ...),
+    /// opaque to the daemon and rendered by the GUI per `kind`. `None` for plain-text tools.
+    pub detail: Option<ToolDetail>,
+}
+
+impl ToolOutcome {
+    /// A plain text-only outcome with no effects or structured detail.
+    pub fn text(call_id: impl Into<String>, ok: bool, content: impl Into<String>) -> Self {
+        Self {
+            result: ToolResult {
+                call_id: call_id.into(),
+                ok,
+                content: content.into(),
+            },
+            effects: Vec::new(),
+            detail: None,
+        }
+    }
+
+    /// Attach a structured detail envelope to this outcome.
+    pub fn with_detail(mut self, detail: ToolDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
 }
 
 /// A registry entry's static description (schemars-generated schema in the real engine).
@@ -136,6 +161,7 @@ impl Tool for DelegateTool {
                 content: format!("delegated:{job_id}"),
             },
             effects: vec![Effect::Delegate(job_id)],
+            detail: None,
         }
     }
 }

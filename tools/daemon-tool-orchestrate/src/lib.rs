@@ -94,6 +94,7 @@ impl OrchestrateTool {
                 content,
             },
             effects,
+            detail: None,
         }
     }
 }

@@ -7,6 +7,7 @@
 
 use crate::conversation::Turn;
 use crate::events::EventSink;
+use crate::exec::ExecutionEnvironment;
 use daemon_common::{Budget, JobId, SessionId};
 use daemon_protocol::HostRequestHandler;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,11 @@ pub struct TurnCx<'a> {
     pub session_id: SessionId,
     /// The budget governing this turn's work.
     pub budget: Budget,
+    /// The contained execution environment (§13) a tool reads/writes files and runs commands in.
+    pub exec: &'a dyn ExecutionEnvironment,
+    /// The per-tool result-byte budget: a tool result longer than this is truncated by the pipeline
+    /// (the §12 sanitize+budget stage) so one tool cannot blow the model context.
+    pub tool_result_budget: usize,
 }
 
 /// An effect a turn phase or tool produces; the single-owner applier orders and applies them

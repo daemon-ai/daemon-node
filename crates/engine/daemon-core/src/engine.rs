@@ -11,6 +11,7 @@ use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
 use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
 use crate::events::EventSink;
+use crate::exec::{ExecutionEnvironment, LocalEnvironment};
 use crate::provider::{build_context, ModelOutput, Provider};
 use crate::snapshot::Snapshot;
 use crate::tool_pipeline::run_tool;
@@ -20,7 +21,7 @@ use crate::Failure;
 use daemon_common::{Budget, CredScope, Epoch, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
     AgentEvent, CompletionSource, ConvTurnView, ConvView, EndReason, HostRequestHandler,
-    ToolCallView, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
+    ToolCallView, ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
 
@@ -62,6 +63,9 @@ pub struct Engine {
     credentials: Arc<dyn CredentialProvider>,
     profile: ProfileRef,
     config: Config,
+    /// The contained execution environment (§13) tools run in; the host injects a per-session
+    /// workspace-rooted one via [`crate::EngineProfile`], else the default sandbox.
+    exec: Arc<dyn ExecutionEnvironment>,
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
     next_trigger: Option<TurnTrigger>,
@@ -74,6 +78,9 @@ impl Engine {
         provider: Arc<dyn Provider>,
         registry: Arc<ToolRegistry>,
     ) -> Self {
+        // Default sandbox keyed by session id; a host injects a workspace-rooted env via the profile.
+        let exec: Arc<dyn ExecutionEnvironment> =
+            Arc::new(LocalEnvironment::sandbox(snapshot.session_id.as_str()));
         Self {
             snapshot,
             provider,
@@ -85,6 +92,7 @@ impl Engine {
             credentials: Arc::new(EmbeddedCredentialPool::single_key()),
             profile: ProfileRef::new("default"),
             config: Config::default(),
+            exec,
             next_trigger: None,
         }
     }
@@ -110,6 +118,13 @@ impl Engine {
     /// Inject the engine tunables (§20) the host loaded from its config.
     pub fn with_config(mut self, config: Config) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Inject the execution environment (§13) this engine's tools run in (a per-session
+    /// workspace-rooted [`LocalEnvironment`], or a host-routed env).
+    pub fn with_exec(mut self, exec: Arc<dyn ExecutionEnvironment>) -> Self {
+        self.exec = exec;
         self
     }
 
@@ -264,8 +279,16 @@ impl Engine {
     /// `call_model` phase: acquire a scoped credential capability, flatten context, ask the
     /// provider under that capability, stream usage + reasoning. On a rotatable failure
     /// (quota/auth) the credential is rotated and the call retried once (§7 `should_rotate`).
-    async fn call_model(&self, events: &EventSink) -> Result<ModelOutput, Failure> {
-        let req = build_context(&self.snapshot.conversation, &self.tool_names());
+    ///
+    /// `offer_tools` is `false` for the final budget-exhausted summary call (no tools offered, so the
+    /// model must produce prose), `true` for every normal ReAct round.
+    async fn call_model(&self, events: &EventSink, offer_tools: bool) -> Result<ModelOutput, Failure> {
+        let tools = if offer_tools {
+            self.tool_names()
+        } else {
+            Vec::new()
+        };
+        let req = build_context(&self.snapshot.conversation, &tools);
         // The scope a turn needs: the `chat` action on this engine's profile.
         let want = CredScope::new([self.profile.as_str()], ["chat"], self.budget.tokens);
         let mut attempt = 0u8;
@@ -359,119 +382,151 @@ impl Engine {
             return Ok(self.finish_interrupted(events));
         }
 
-        // Resume path: a background completion arrived — apply it idempotently, bump the epoch, and
-        // let the model finalize.
         if resuming {
+            // Resume path: a background completion arrived — apply it idempotently and bump the epoch,
+            // then fall into the ReAct loop so the model sees the resolved tool result(s) and can
+            // either finalize or take further tool steps.
             self.resolve_pending();
             self.snapshot.waiting_for.clear();
             self.snapshot.epoch = self.snapshot.epoch.next();
-            let out = match self.call_model(events).await {
-                Ok(out) => out,
-                Err(f) => return Ok(self.finish_failed(f, events)),
-            };
-            self.finalize_text(&out, events);
-            return Ok(self.complete(out, events));
-        }
-
-        // Re-activated while still suspended (e.g. recovery before the worker ran): re-suspend the
-        // same job deterministically; the durable outbox dedupes the re-enqueue.
-        if let Some(job_id) = self.snapshot.waiting_for.first().cloned() {
+        } else if let Some(job_id) = self.snapshot.waiting_for.first().cloned() {
+            // Re-activated while still suspended (e.g. recovery before the worker ran): re-suspend the
+            // same job deterministically; the durable outbox dedupes the re-enqueue.
             return Ok(self.suspend(job_id, events, false));
         }
 
-        // Fresh activation: ask the model. A completing provider finishes here; a delegating one
-        // returns a tool call that drives suspension.
-        let out = match self.call_model(events).await {
-            Ok(out) => out,
-            Err(f) => return Ok(self.finish_failed(f, events)),
-        };
-
-        // Boundary after the model call: serve snapshots/steer, honor a mid-call interrupt.
-        if self.boundary(control, events) {
-            return Ok(self.finish_interrupted(events));
-        }
-
-        if out.tool_calls.is_empty() {
-            self.finalize_text(&out, events);
-            return Ok(self.complete(out, events));
-        }
-
-        let cx = TurnCx {
-            cancel: control.cancel_token(),
-            events,
-            host,
-            session_id: self.snapshot.session_id.clone(),
-            budget: self.budget,
-        };
+        // The in-turn ReAct loop (§4.2): build_context -> call_model -> execute_tools -> observe ->
+        // call_model again, until the model returns final text (completion) or a tool delegates
+        // (durable suspension). The iteration budget is the hard stop. The loop runs fully
+        // in-process within one durable turn; only `Effect::Delegate` crosses the suspension boundary.
+        let exec = self.exec.clone();
         let registry = self.registry.clone();
+        let tool_result_budget = self.config.tool_result_budget;
+        let mut rounds_left = self.config.max_iterations;
 
-        // execute_tools: run each call through the §12 pipeline, collecting result slots + effects.
-        let mut calls = Vec::new();
-        let mut effects: Vec<Effect> = Vec::new();
-        let mut interrupted = false;
-        for call in &out.tool_calls {
-            let view = ToolCallView {
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-                args_summary: call.args.clone(),
-                // The reference MockProvider has no structured payload to attach yet; a real
-                // provider/tool populates this with the arguments object for a rich consumer.
-                detail: None,
-            };
-            events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-            let outcome = run_tool(call, &registry, &cx).await;
-            let result_view = ToolResultView {
-                call_id: outcome.result.call_id.clone(),
-                ok: outcome.result.ok,
-                summary: outcome.result.content.clone(),
-                // Likewise filled by a real tool with structured output (diff, search, image, ...).
-                detail: None,
-            };
-            events.emit(|seq| AgentEvent::ToolFinished {
-                seq,
-                result: result_view,
-            });
-            calls.push((call.clone(), outcome.result));
-            effects.extend(outcome.effects);
-            // Boundary after each tool: an interrupt stops further tool execution.
-            if self.boundary_readonly(control, events) {
-                interrupted = true;
-                break;
+        loop {
+            if rounds_left == 0 {
+                // Budget exhausted: one final toolless call asks the model to summarize what it has,
+                // then the turn ends `BudgetExhausted` (the model cannot keep calling tools forever).
+                return Ok(self.finish_budget_exhausted(events).await);
             }
-        }
+            rounds_left -= 1;
 
-        // The single-owner applier: the assembled tool turn is the leading Persist effect, then any
-        // Delegate effects, applied in order.
-        effects.insert(
-            0,
-            Effect::Persist(Turn::Tool(ToolTurn {
+            let out = match self.call_model(events, true).await {
+                Ok(out) => out,
+                Err(f) => return Ok(self.finish_failed(f, events)),
+            };
+
+            // Boundary after the model call: serve snapshots/steer, honor a mid-call interrupt.
+            if self.boundary(control, events) {
+                return Ok(self.finish_interrupted(events));
+            }
+
+            if out.tool_calls.is_empty() {
+                self.finalize_text(&out, events);
+                return Ok(self.complete(out, events));
+            }
+
+            let cx = TurnCx {
+                cancel: control.cancel_token(),
+                events,
+                host,
+                session_id: self.snapshot.session_id.clone(),
+                budget: self.budget,
+                exec: &*exec,
+                tool_result_budget,
+            };
+
+            // execute_tools: run each call through the §12 pipeline, collecting result slots,
+            // effects, and structured detail for the rich §17 transcript views.
+            let mut calls = Vec::new();
+            let mut effects: Vec<Effect> = Vec::new();
+            let mut interrupted = false;
+            for call in &out.tool_calls {
+                let view = ToolCallView {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    args_summary: call.args.clone(),
+                    // A generic structured echo of the call arguments, opaque to the daemon; a tool
+                    // with a richer call schema can refine this once providers carry structured args.
+                    detail: Some(ToolDetail {
+                        kind: call.name.clone(),
+                        body: call.args.clone().into_bytes(),
+                    }),
+                };
+                events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                let outcome = run_tool(call, &registry, &cx).await;
+                let result_view = ToolResultView {
+                    call_id: outcome.result.call_id.clone(),
+                    ok: outcome.result.ok,
+                    summary: outcome.result.content.clone(),
+                    // The tool's typed output (fs listing, command exit/stdout, ...) for a rich
+                    // consumer; `None` for plain-text tools.
+                    detail: outcome.detail.clone(),
+                };
+                events.emit(|seq| AgentEvent::ToolFinished {
+                    seq,
+                    result: result_view,
+                });
+                calls.push((call.clone(), outcome.result));
+                effects.extend(outcome.effects);
+                // Boundary after each tool: an interrupt stops further tool execution.
+                if self.boundary_readonly(control, events) {
+                    interrupted = true;
+                    break;
+                }
+            }
+
+            // The single-owner applier: record the assembled tool turn, then apply any extra effects.
+            self.snapshot.conversation.turns.push(Turn::Tool(ToolTurn {
                 assistant: AssistantMsg {
                     text: out.text.clone(),
                     reasoning: out.reasoning.clone(),
                 },
                 calls,
-            })),
-        );
-        let mut delegated: Option<JobId> = None;
-        for effect in effects {
-            match effect {
-                Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
-                Effect::Delegate(job_id) => delegated = Some(job_id),
+            }));
+            let mut delegated: Option<JobId> = None;
+            for effect in effects {
+                match effect {
+                    Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
+                    Effect::Delegate(job_id) => delegated = Some(job_id),
+                }
             }
-        }
 
-        // An interrupt at a tool boundary finalizes the turn before it would suspend/complete.
-        if interrupted {
-            return Ok(self.finish_interrupted(events));
-        }
+            // An interrupt at a tool boundary finalizes the turn before it would suspend/loop.
+            if interrupted {
+                return Ok(self.finish_interrupted(events));
+            }
 
-        match delegated {
-            Some(job_id) => {
+            if let Some(job_id) = delegated {
+                // A delegation crosses the durable boundary: suspend the turn and wait for the wake.
                 self.snapshot.waiting_for.push(job_id.clone());
-                Ok(self.suspend(job_id, events, true))
+                return Ok(self.suspend(job_id, events, true));
             }
-            None => Ok(self.complete(out, events)),
+            // No delegation: loop — the next `call_model` sees the tool results in context.
         }
+    }
+
+    /// Finalize a turn that hit its iteration budget: one final toolless model call to summarize,
+    /// then `TurnFinished { BudgetExhausted }`. Any tool calls the model attempts on this pass are
+    /// ignored — the turn is ending.
+    async fn finish_budget_exhausted(&mut self, events: &EventSink) -> TurnOutcome {
+        let out = match self.call_model(events, false).await {
+            Ok(out) => out,
+            Err(f) => return self.finish_failed(f, events),
+        };
+        self.finalize_text(&out, events);
+        let summary = TurnSummary {
+            end_reason: EndReason::BudgetExhausted,
+            final_text: Some(out.text),
+            usage: out.usage,
+        };
+        let emitted = summary.clone();
+        events.emit(|seq| AgentEvent::TurnFinished {
+            seq,
+            summary: emitted,
+        });
+        TurnOutcome::Completed(summary)
     }
 
     /// Emit the terminal `TurnFinished` and build the completed outcome.
@@ -726,5 +781,145 @@ mod tests {
             .turns
             .iter()
             .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer] focus"))));
+    }
+
+    // --- ReAct loop (§4.2) ---
+
+    use crate::conversation::ToolCall;
+    use crate::provider::{ScriptStep, ScriptedProvider};
+    use crate::tools::Tool;
+    use crate::turn::TurnCx;
+
+    /// A trivial in-turn tool that records how many times it ran (shared counter) and returns a
+    /// fixed result — enough to exercise the model->tools->model loop without a real tool crate.
+    struct CounterTool {
+        runs: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CounterTool {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn schema(&self) -> &str {
+            "{}"
+        }
+        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> crate::tools::ToolOutcome {
+            let n = self.runs.fetch_add(1, Ordering::Relaxed);
+            crate::tools::ToolOutcome::text(call.call_id.clone(), true, format!("counter:{n}"))
+        }
+    }
+
+    fn looping_engine(provider: Arc<dyn Provider>, runs: Arc<AtomicU64>, max_iterations: u32) -> Engine {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CounterTool { runs }));
+        let config = Config {
+            max_iterations,
+            ..Config::default()
+        };
+        Engine::fresh(
+            SessionId::new("react"),
+            SystemPrompt::new("test"),
+            provider,
+            Arc::new(registry),
+        )
+        .with_config(config)
+    }
+
+    /// The model calls a tool twice across two rounds, then returns final text — one activation runs
+    /// the whole multi-round loop and completes (no suspension).
+    #[tokio::test]
+    async fn multi_round_loop_runs_tools_then_completes() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![
+                ScriptStep::Call {
+                    name: "counter".into(),
+                    args: "{}".into(),
+                },
+                ScriptStep::Call {
+                    name: "counter".into(),
+                    args: "{}".into(),
+                },
+            ],
+            "all done",
+        ));
+        let mut engine = looping_engine(provider.clone(), runs.clone(), 90);
+        engine.push_user(UserMsg::new("do work"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => {
+                assert_eq!(s.end_reason, EndReason::Completed);
+                assert_eq!(s.final_text.as_deref(), Some("all done"));
+            }
+            _ => panic!("expected completion after the loop"),
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "the tool ran on both rounds");
+        // 3 model rounds: two tool rounds + the final-text round.
+        assert_eq!(provider.call_count(), 3);
+        // Two tool turns are recorded in the durable conversation.
+        let tool_turns = engine
+            .snapshot()
+            .conversation
+            .turns
+            .iter()
+            .filter(|t| matches!(t, Turn::Tool(_)))
+            .count();
+        assert_eq!(tool_turns, 2);
+    }
+
+    /// A provider that never stops calling a (non-delegating) tool exhausts the iteration budget; the
+    /// turn ends `BudgetExhausted` after one final toolless summary call.
+    #[tokio::test]
+    async fn iteration_budget_exhaustion_ends_with_summary() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
+            name: "counter".into(),
+            args: "{}".into(),
+        }));
+        let mut engine = looping_engine(provider.clone(), runs.clone(), 4);
+        engine.push_user(UserMsg::new("loop forever"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::BudgetExhausted),
+            _ => panic!("expected budget exhaustion"),
+        }
+        // The tool ran exactly `max_iterations` times; the budget is the hard stop.
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
+        // 4 loop rounds + 1 toolless summary round.
+        assert_eq!(provider.call_count(), 5);
+    }
+
+    /// Cancellation observed mid-loop (after a tool runs) finalizes the turn as `Interrupted` rather
+    /// than looping back to the model.
+    #[tokio::test]
+    async fn cancel_mid_loop_finalizes_interrupted() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
+            name: "counter".into(),
+            args: "{}".into(),
+        }));
+        let mut engine = looping_engine(provider, runs, 90);
+        engine.push_user(UserMsg::new("go"));
+        let control = TurnControl::new();
+        // Cancel before the first boundary: the turn finalizes interrupted immediately.
+        control.cancel();
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &control)
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
+            _ => panic!("expected interruption"),
+        }
     }
 }
