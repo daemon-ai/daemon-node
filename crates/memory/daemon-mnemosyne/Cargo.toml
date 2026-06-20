@@ -1,0 +1,46 @@
+[package]
+name = "daemon-mnemosyne"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Rust port of the Mnemosyne BEAM memory engine as a daemon-core MemoryProvider."
+
+[features]
+default = []
+# Local ONNX embeddings (BAAI/bge-small-en-v1.5, 384-dim) via fastembed. Off by default keeps the
+# crate free of the ONNX runtime; recall falls back to keyword-only mode (MNEMOSYNE_NO_EMBEDDINGS).
+embeddings = ["dep:fastembed"]
+# sqlite-vec vec0 virtual tables (float32/int8/bit + native distance fns). Off by default uses an
+# in-Rust cosine fallback over f32 BLOBs (mirrors Mnemosyne's numpy fallback).
+vec-ext = ["dep:sqlite-vec", "dep:zerocopy"]
+# Event-log replication + streaming (sync.py / streaming.py).
+sync = ["dep:reqwest", "dep:chacha20poly1305", "dep:argon2"]
+# Exact token counts via tiktoken (else len/4).
+tiktoken = ["dep:tiktoken-rs"]
+
+[dependencies]
+daemon-core = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = "1"
+sha2 = "0.10"
+unicode-normalization = "0.1"
+chrono = { version = "0.4", features = ["clock"], default-features = false }
+
+# optional / feature-gated
+fastembed = { version = "5", optional = true }
+sqlite-vec = { version = "0.1.6", optional = true }
+zerocopy = { version = "0.7", optional = true }
+reqwest = { workspace = true, optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }
+tiktoken-rs = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
