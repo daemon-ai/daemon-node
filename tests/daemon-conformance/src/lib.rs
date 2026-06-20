@@ -1537,7 +1537,7 @@ mod node_interface {
     use daemon_core::{MockProvider, Provider, ProviderRegistry};
     use daemon_host::{serve_api_unix, ApiClient, HostConfig, NodeApiImpl};
     use daemon_node::{assemble as assemble_node, AssembledNode, NodeAssembly};
-    use daemon_store::InMemoryStore;
+    use daemon_store::{InMemoryStore, SessionStore, SqliteStore};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1549,7 +1549,10 @@ mod node_interface {
     /// `bins/daemon`'s host role does — with the gate's mock providers (an orchestrator that
     /// delegates once, completing children, and a completing session default). Returns the in-process
     /// surface and the started resident-service handle.
-    fn assemble() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
+    /// The gate's mock provider registry: an orchestrator that delegates once per turn (driving the
+    /// recursive durable delegation chain, bounded by the orchestrate-tool depth guard), a completing
+    /// session default, and a legacy `child` provider for the synchronous foreign fallback.
+    fn gate_providers() -> ProviderRegistry {
         let mut providers = ProviderRegistry::new();
         providers.set_default(Arc::new(|| {
             Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
@@ -1564,57 +1567,59 @@ mod node_interface {
             "child",
             Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
         );
+        providers
+    }
 
-        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
-            store: Arc::new(InMemoryStore::new()),
+    /// Assemble a node over a caller-supplied durable `store` (so two nodes can share one store to
+    /// simulate a crash/restart), with `host_config` cadence and a delegation depth cap of
+    /// `nesting_depth + 1` (see [`daemon_node::assemble`]).
+    fn assemble_over(
+        store: Arc<dyn SessionStore>,
+        nesting_depth: usize,
+        journal_seed: [u8; 32],
+        host_config: HostConfig,
+    ) -> AssembledNode {
+        assemble_node(NodeAssembly {
+            store,
             partition: PARTITION,
-            host_config: HostConfig {
-                partition: PARTITION,
-                ..HostConfig::default()
-            },
-            providers,
+            host_config,
+            providers: gate_providers(),
             credentials: None,
             profile: ProfileRef::new("openai"),
             engine_config: daemon_core::Config::default(),
-            journal_seed: Some([0x11; 32]),
-            nesting_depth: 0,
-        });
+            journal_seed: Some(journal_seed),
+            nesting_depth,
+        })
+    }
+
+    /// The default resident-service cadence for the gate (fast ticks).
+    fn fast_host_config() -> HostConfig {
+        HostConfig {
+            partition: PARTITION,
+            ..HostConfig::default()
+        }
+    }
+
+    fn assemble() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
+        let AssembledNode { node, handle, .. } = assemble_over(
+            Arc::new(InMemoryStore::new()),
+            0,
+            [0x11; 32],
+            fast_host_config(),
+        );
         (node, handle)
     }
 
-    /// Assemble a node whose top fleet nests `depth` orchestrator level(s) before its engine leaves
-    /// (fleets-of-fleets), so the management tree the GUI projects is genuinely recursive. Same mock
-    /// providers as [`assemble`]: the durable orchestrator delegates once, every child completes.
+    /// Assemble a node whose orchestrate-tool depth cap allows `depth + 1` levels of nested durable
+    /// delegation, so the management tree the GUI projects is genuinely recursive (top -> child ->
+    /// ... -> leaf). The durable orchestrator delegates once per level; the deepest level completes.
     fn assemble_nested(depth: usize) -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
-        let mut providers = ProviderRegistry::new();
-        providers.set_default(Arc::new(|| {
-            Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
-        }));
-        providers.register(
-            "orchestrator",
-            Arc::new(|| {
-                Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
-            }),
+        let AssembledNode { node, handle, .. } = assemble_over(
+            Arc::new(InMemoryStore::new()),
+            depth,
+            [0x22; 32],
+            fast_host_config(),
         );
-        providers.register(
-            "child",
-            Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
-        );
-
-        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
-            store: Arc::new(InMemoryStore::new()),
-            partition: PARTITION,
-            host_config: HostConfig {
-                partition: PARTITION,
-                ..HostConfig::default()
-            },
-            providers,
-            credentials: None,
-            profile: ProfileRef::new("openai"),
-            engine_config: daemon_core::Config::default(),
-            journal_seed: Some([0x22; 32]),
-            nesting_depth: depth,
-        });
         (node, handle)
     }
 
@@ -1877,10 +1882,12 @@ mod node_interface {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The recursive fleets-of-fleets projection: a node nested one orchestrator level deep projects
-    /// a genuine multi-level tree, every node — including a *grandchild* — is addressable by `UnitId`
-    /// at any depth, pause/resume/scale route into the orchestrator's sub-fleet (no longer
-    /// `Unsupported`), and the whole projection is byte-identical in-process and over the socket.
+    /// The recursive durable delegation tree (the GUI's real surface), re-sourced from the durable
+    /// session graph: one delegation chain two levels deep — top -> orchestrator child -> leaf
+    /// grandchild — projects a genuine multi-level tree where every node, including the *grandchild*,
+    /// is addressable by `UnitId` at its true depth. A node is an orchestrator iff it actually
+    /// delegated (has durable children). The whole projection (and the grandchild's verifiable
+    /// history) is byte-identical in-process and over the socket.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_tree_projection_is_recursive_and_transport_agnostic() {
         let (node, handle) = assemble_nested(1);
@@ -2002,8 +2009,10 @@ mod node_interface {
             "expected buffered drill-down events for the grandchild"
         );
 
-        // unit_outbound routes by id to the grandchild's own retained §17 drain at depth (a *live*,
-        // destructive drain — so a single read proves routing rather than two-transport equality).
+        // A durable session retains no *live* §17 outbound stream (it is driven one turn at a time
+        // through activation, not a persistent actor): the rich, byte-faithful transcript is the
+        // durable verifiable journal, read by id below via `unit_history`. So the live drain is empty
+        // — identically on both transports.
         let socket_outbound = match client
             .call(ApiRequest::UnitOutbound {
                 unit: grandchild.id.clone(),
@@ -2016,8 +2025,8 @@ mod node_interface {
             other => panic!("expected Drained, got {other:?}"),
         };
         assert!(
-            !socket_outbound.is_empty(),
-            "the grandchild's §17 outbound stream resolves by id at depth"
+            socket_outbound.is_empty(),
+            "a durable grandchild has no live §17 drain; its transcript is the journal"
         );
 
         // The grandchild's durable, verifiable history routes by its id (it journaled its turn).
@@ -2050,7 +2059,10 @@ mod node_interface {
             "grandchild history must agree across transports"
         );
 
-        // (c) pause/resume/scale route into the orchestrator's sub-fleet — Accepted, not Unsupported.
+        // (c) pause/resume/scale are vestigial on the durable path: a durable session has no live
+        // scheduling to pause/resume/scale (it is suspended/resumed by the activation lifecycle), so
+        // these report Unsupported — identically on both transports — for an orchestrator session too.
+        use daemon_api::ApiError;
         for (req, label) in [
             (
                 ApiRequest::Pause {
@@ -2074,18 +2086,103 @@ mod node_interface {
         ] {
             let socket = client.call(req).await.unwrap();
             assert!(
-                matches!(socket, ApiResponse::Ok),
-                "{label} should route into the orchestrator sub-fleet, got {socket:?}"
+                matches!(socket, ApiResponse::Error(ApiError::Unsupported(_))),
+                "{label} is vestigial on the durable path, got {socket:?}"
             );
         }
-        // The same lifecycle ops succeed in-process too (transport parity for commands).
-        assert!(node.pause(orchestrator.id.clone()).await.is_ok());
-        assert!(node.resume(orchestrator.id.clone()).await.is_ok());
-        assert!(node.scale(orchestrator.id.clone(), 2).await.is_ok());
+        assert!(node.pause(orchestrator.id.clone()).await.is_err());
+        assert!(node.resume(orchestrator.id.clone()).await.is_err());
+        assert!(node.scale(orchestrator.id.clone(), 2).await.is_err());
 
         server.abort();
         handle.shutdown().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE UNIFIED-DELEGATION RECOVERY GATE: a node crashes *mid* a nested durable delegation, and a
+    /// fresh node rebuilt from the same durable store alone — no in-memory state carried over —
+    /// recovers and unwinds the whole chain to completion. This is the new value the unified durable
+    /// orchestrator model unlocks: a nested delegation is as crash-recoverable as a top-level one,
+    /// because every level is a parent-bound durable session driven by the one shared outbox +
+    /// recovery scanner. Asserted against both store backends (`InMemoryStore`, `SqliteStore`).
+    async fn nested_delegation_recovers_after_restart(store: Arc<dyn SessionStore>) {
+        let session = SessionId::new("rec-op");
+
+        // Node A: a stalled cadence so its resident services never advance the delegation after the
+        // synchronous `assign`. `assign` runs the top's first turn to a suspension with a delegation
+        // job pending on the durable outbox and *no child created yet* — genuinely mid-delegation.
+        let stalled = HostConfig {
+            partition: PARTITION,
+            dispatch_interval: Duration::from_secs(3600),
+            scan_interval: Duration::from_secs(3600),
+            ..HostConfig::default()
+        };
+        let AssembledNode {
+            node: node_a,
+            handle: handle_a,
+            ..
+        } = assemble_over(store.clone(), 1, [0x33; 32], stalled);
+        node_a.assign(session.clone()).await.expect("assign");
+        // The top is now mid-delegation in the durable store (suspended on / running toward a
+        // delegation job), and node A's stalled cadence will not advance it any further.
+        let after_assign = store.status(&session).await;
+        assert!(
+            !matches!(after_assign, Some(daemon_store::SessionStatus::Completed) | None),
+            "the top should be mid-flight (not completed) after assign, got {after_assign:?}"
+        );
+        // Crash: stop node A. The durable store retains the mid-flight top (+ any pending job).
+        handle_a.shutdown().await;
+        drop(node_a);
+
+        // Node B: a fresh process over the *same* durable store. Its recovery scanner + dispatchers
+        // drain the pending job, create+drive the child (which itself delegates to a leaf
+        // grandchild), and resume the chain bottom-up to completion — all from durable state alone.
+        let AssembledNode {
+            node: node_b,
+            handle: handle_b,
+            ..
+        } = assemble_over(store.clone(), 1, [0x33; 32], fast_host_config());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if node_b
+                .sessions()
+                .await
+                .iter()
+                .any(|i| i.session == session && i.state == SessionState::Completed)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the nested delegation never recovered to completion"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The recovered tree shows the full depth: a depth-2 grandchild (two `/` path segments) is
+        // present and addressable, proving the *nested* delegation — not just the top — recovered.
+        let tree = node_b.tree().await;
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|n| n.id.as_str().matches('/').count() == 2),
+            "a depth-2 grandchild is present after recovery, got {:?}",
+            tree.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+        );
+        handle_b.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_delegation_recovers_after_restart_in_memory() {
+        nested_delegation_recovers_after_restart(Arc::new(InMemoryStore::new())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_delegation_recovers_after_restart_sqlite() {
+        nested_delegation_recovers_after_restart(
+            Arc::new(SqliteStore::open_in_memory().expect("open sqlite store")),
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

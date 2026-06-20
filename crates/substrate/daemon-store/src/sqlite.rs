@@ -18,7 +18,7 @@ use crate::{
 use async_trait::async_trait;
 use daemon_common::{
     ContentHash, DaemonError, Epoch, FenceToken, JobId, JournalStreamId, MerkleRoot, PartitionId,
-    SessionId, SnapshotBlob,
+    SessionId, SnapshotBlob, UsageDelta,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -65,6 +65,22 @@ CREATE TABLE IF NOT EXISTS enqueued_jobs (
 CREATE TABLE IF NOT EXISTS wake_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delegations (
+    rowseq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    child          TEXT NOT NULL UNIQUE,
+    parent_session TEXT NOT NULL,
+    parent_epoch   INTEGER NOT NULL,
+    job_id         TEXT NOT NULL,
+    payload        BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_usage (
+    session_id    TEXT PRIMARY KEY,
+    input_tokens  INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    api_calls     INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS journal_entries (
@@ -322,15 +338,16 @@ impl SessionStore for SqliteStore {
         checkpoint: Checkpoint,
         fence: FenceToken,
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let current = Self::fence_of(&conn, &checkpoint.session_id)?;
+        let mut guard = self.conn.lock().unwrap();
+        let current = Self::fence_of(&guard, &checkpoint.session_id)?;
         if fence < current {
             return Err(StoreError::Fenced {
                 have: fence.0,
                 current: current.0,
             });
         }
-        conn.execute(
+        let tx = guard.transaction().map_err(sql_err)?;
+        tx.execute(
             "UPDATE session_record \
              SET snapshot = ?2, epoch = ?3, status_kind = 'completed', status_job = NULL \
              WHERE session_id = ?1",
@@ -341,7 +358,131 @@ impl SessionStore for SqliteStore {
             ],
         )
         .map_err(sql_err)?;
+        // If this session was delegated by a parent, fulfill that parent's job and wake it in the
+        // same transaction — the binding is durable, so a crash cannot orphan the parent at any depth.
+        let parent: Option<(String, i64, String)> = tx
+            .query_row(
+                "SELECT parent_session, parent_epoch, job_id FROM delegations WHERE child = ?1",
+                params![checkpoint.session_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if let Some((parent_session, parent_epoch, job_id)) = parent {
+            let payload = format!("child:{}", checkpoint.session_id).into_bytes();
+            let fresh = tx
+                .execute(
+                    "INSERT OR IGNORE INTO completion_inbox (session_id, epoch, job_id, payload) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![parent_session, parent_epoch, job_id, payload],
+                )
+                .map_err(sql_err)?;
+            if fresh > 0 {
+                tx.execute(
+                    "UPDATE session_record SET status_kind = 'ready' WHERE session_id = ?1",
+                    params![parent_session],
+                )
+                .map_err(sql_err)?;
+                tx.execute(
+                    "INSERT INTO wake_outbox (session_id) VALUES (?1)",
+                    params![parent_session],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        tx.commit().map_err(sql_err)?;
         Ok(())
+    }
+
+    async fn bind_delegation(&self, child: SessionId, job: JobCommand) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO delegations \
+             (child, parent_session, parent_epoch, job_id, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                child.as_str(),
+                job.session_id.as_str(),
+                job.epoch.0 as i64,
+                job.job_id.as_str(),
+                job.payload,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn children_of(&self, parent: &SessionId) -> Vec<SessionId> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT child FROM delegations WHERE parent_session = ?1 ORDER BY rowseq")
+        {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt
+            .query_map(params![parent.as_str()], |row| {
+                Ok(SessionId::new(row.get::<_, String>(0)?))
+            })
+            .and_then(|r| r.collect::<Result<Vec<_>, _>>());
+        rows.unwrap_or_default()
+    }
+
+    async fn enqueue_wake(&self, id: SessionId) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO wake_outbox (session_id) VALUES (?1)",
+            params![id.as_str()],
+        );
+    }
+
+    async fn delegation_work(&self, child: &SessionId) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM delegations WHERE child = ?1",
+            params![child.as_str()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn record_usage(&self, id: &SessionId, delta: UsageDelta) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO session_usage (session_id, input_tokens, output_tokens, api_calls) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+               input_tokens = input_tokens + excluded.input_tokens, \
+               output_tokens = output_tokens + excluded.output_tokens, \
+               api_calls = api_calls + excluded.api_calls",
+            params![
+                id.as_str(),
+                delta.input_tokens as i64,
+                delta.output_tokens as i64,
+                delta.api_calls as i64,
+            ],
+        );
+    }
+
+    async fn usage_of(&self, id: &SessionId) -> UsageDelta {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT input_tokens, output_tokens, api_calls FROM session_usage WHERE session_id = ?1",
+            params![id.as_str()],
+            |row| {
+                Ok(UsageDelta {
+                    input_tokens: row.get::<_, i64>(0)? as u64,
+                    output_tokens: row.get::<_, i64>(1)? as u64,
+                    api_calls: row.get::<_, i64>(2)? as u32,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
     }
 
     async fn record_completion_and_wake(&self, c: &JobCompletion) -> Result<(), StoreError> {

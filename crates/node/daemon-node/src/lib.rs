@@ -30,16 +30,14 @@ use daemon_host::{
 };
 use daemon_protocol::HostRequestHandler;
 use daemon_telemetry::TraceSigner;
-use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime, OrchestratorSpawner};
+use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
 
 /// The provider-registry profile name the orchestrator (parent) engine resolves to.
 const ORCHESTRATOR_PROFILE: &str = "orchestrator";
-/// The provider-registry profile name the fleet-child engine resolves to.
+/// The provider-registry profile name the (legacy synchronous) fleet-child engine resolves to.
 const CHILD_PROFILE: &str = "child";
-/// The id of the node's synthetic tree root (the top fleet as the GUI's root node).
-const NODE_ROOT: &str = "node";
 
 /// The policy inputs for [`assemble`]: everything that varies between a production node and a test
 /// node. The standard plumbing (role profiles, fleet, factory, host, session surface) is derived.
@@ -126,38 +124,31 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         ),
         &a,
     );
-    // The leaf placement seam (in-process engine children). When `nesting_depth > 0` the top fleet
-    // spawns orchestrator children instead, each owning a sub-fleet that bottoms out in these leaves
-    // — a real, addressable fleets-of-fleets tree.
-    let leaf_spawner: Arc<dyn ChildSpawner> =
+    // The legacy synchronous placement seam (in-process live engine children + foreign agents). The
+    // durable Core delegation path no longer uses this — it materializes children as durable
+    // sessions through the shared activation manager (see `FleetJobWorker`) — so this spawner is
+    // retained only for the foreign/ephemeral coarse lifecycle and the live management escalation.
+    let spawner: Arc<dyn ChildSpawner> =
         Arc::new(ProfileChildSpawner::core(child_profile).with_journal(journal.clone()));
-    let spawner: Arc<dyn ChildSpawner> = if a.nesting_depth == 0 {
-        leaf_spawner
-    } else {
-        Arc::new(OrchestratorSpawner::new(
-            a.store.clone(),
-            a.partition,
-            Arc::new(DefaultAnswerPolicy),
-            leaf_spawner,
-            a.nesting_depth,
-        ))
-    };
     let fleet = FleetRuntime::new(
         a.store.clone(),
         a.partition,
         spawner,
         Arc::new(DefaultAnswerPolicy),
         None::<Arc<dyn ManageRequestHandler>>,
-    )
-    // The top fleet projects a rooted tree (the GUI's tree root is the node itself).
-    .with_root_id(UnitId::new(NODE_ROOT));
+    );
 
-    // The parent orchestrator: an engine that delegates through the orchestrate tool, then completes.
+    // The one orchestrator-capable engine shape, used at *every* durable level: the top session and
+    // every delegated child are built from this profile, so a child is itself an orchestrator that
+    // can delegate (the recursive durable graph). The orchestrate tool's depth guard (cap =
+    // `nesting_depth + 1`) terminates the chain: `nesting_depth = 0` is a single delegation level
+    // (top -> leaf child), `n` allows `n + 1` levels of nested delegation.
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(daemon_tool_orchestrate::OrchestrateTool::new(
-        fleet.clone(),
-    )));
-    let parent_profile = dress(
+    registry.register(Arc::new(
+        daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
+            .with_max_depth(a.nesting_depth + 1),
+    ));
+    let orchestrator_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, ORCHESTRATOR_PROFILE),
             Arc::new(registry),
@@ -167,11 +158,18 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     );
     // The durable path journals too: replace the discarding sink with one sealing per turn into the
     // shared store, keyed by the durable `SessionId`.
-    let factory =
-        CoreEngineFactory::from_profile(parent_profile).with_journal(a.store.clone(), signer.clone());
+    let factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
+        .with_journal(a.store.clone(), signer.clone());
 
-    let host = Host::new(a.store.clone(), Arc::new(factory), a.host_config)
-        .with_job_worker(Arc::new(FleetJobWorker(fleet.clone())));
+    // One durable job worker for the whole node: every delegation (top or nested) materializes a
+    // parent-bound durable child session seeded from the same orchestrator profile.
+    let host = Host::new(a.store.clone(), Arc::new(factory), a.host_config).with_job_worker(
+        Arc::new(FleetJobWorker::new(
+            a.store.clone(),
+            a.partition,
+            orchestrator_profile,
+        )),
+    );
     let handle = host.start();
 
     // The interactive (session sub-surface) engines: built from the same seam (resolved provider +
@@ -196,7 +194,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             host.manager().clone(),
             a.partition,
             session_builder,
-            Some(Arc::new(FleetViewImpl(fleet.clone())) as Arc<dyn FleetControl>),
+            Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>),
         )
         // Live interactive sessions journal per turn; also records the signer so history reads verify.
         .with_journal(a.store.clone(), signer.clone()),
@@ -361,61 +359,215 @@ impl ChildSpawner for ProfileChildSpawner {
     }
 }
 
-/// Drives the durable job outbox with the real fleet (spawn + run a child per delegation job).
-pub struct FleetJobWorker(pub FleetRuntime);
+/// Drives the durable job outbox by materializing each delegation as a *durable child session*:
+/// seed a fresh orchestrator-capable engine snapshot with the delegated work, create the child row,
+/// bind it to the parent's job (so its terminal completion wakes the parent — store-parent-link),
+/// and enqueue a wake. The one shared [`daemon_activation::ActivationManager`] then drives the child
+/// through the same `CoreIncarnation` path as the top session; if the child itself delegates it
+/// suspends and enqueues its own job (parent = child), so nesting is recursive and crash-recoverable
+/// at every depth. The legacy synchronous `FleetRuntime::spawn_and_run` is retained only for the
+/// foreign/ephemeral coarse lifecycle, not this path.
+pub struct FleetJobWorker {
+    store: Arc<dyn daemon_store::SessionStore>,
+    partition: PartitionId,
+    /// The orchestrator-capable profile every durable session (top and child) is built from — one
+    /// engine shape at every level. Used here to seed a fresh child's first turn.
+    profile: EngineProfile,
+}
+
+impl FleetJobWorker {
+    /// A durable job worker that seeds children from `profile` into `store` under `partition`.
+    pub fn new(
+        store: Arc<dyn daemon_store::SessionStore>,
+        partition: PartitionId,
+        profile: EngineProfile,
+    ) -> Self {
+        Self {
+            store,
+            partition,
+            profile,
+        }
+    }
+
+    /// The deterministic id of the child session a delegation job materializes: the parent's id plus
+    /// a `/c{epoch}` path segment. Deterministic so a re-enqueued/recovered job dedupes onto the same
+    /// child, and the `/`-delimited path encodes the tree depth the orchestrate-tool guard reads.
+    fn child_id(job: &daemon_store::JobCommand) -> SessionId {
+        SessionId::new(format!("{}/c{}", job.session_id, job.epoch.0))
+    }
+}
 
 #[async_trait]
 impl JobWorker for FleetJobWorker {
     async fn process_jobs_once(&self) -> Result<(), ServiceError> {
-        self.0
-            .process_jobs_once()
-            .await
-            .map(|_| ())
-            .map_err(ServiceError::new)
+        while let Some(job) = self.store.dequeue_job().await {
+            let child = Self::child_id(&job);
+            // Create-if-absent: a fresh durable child session seeded with the delegated work as its
+            // first turn (recovery-idempotent — a re-processed job finds the child already present).
+            if self.store.status(&child).await.is_none() {
+                let work = String::from_utf8_lossy(&job.payload).into_owned();
+                let mut engine = self.profile.fresh(child.clone());
+                engine.push_user(daemon_protocol::UserMsg::new(work));
+                let blob = engine
+                    .snapshot()
+                    .encode()
+                    .map_err(ServiceError::new)?;
+                self.store
+                    .create_session(child.clone(), self.partition, blob)
+                    .await
+                    .map_err(ServiceError::new)?;
+            }
+            // Durable tree edge: the child's terminal completion fulfills this job and wakes the
+            // parent (in the store's mark_completed transaction). Idempotent.
+            self.store
+                .bind_delegation(child.clone(), job.clone())
+                .await
+                .map_err(ServiceError::new)?;
+            // Kick the child into its first turn via the shared wake dispatcher.
+            self.store.enqueue_wake(child).await;
+        }
+        Ok(())
     }
 }
 
-/// Projects the fleet for the node control surface: the flat roster + the tree the GUI/TUI drives.
-pub struct FleetViewImpl(pub FleetRuntime);
+/// Projects the management tree for the node control surface directly from the **durable session
+/// graph** (the GUI/TUI's real surface). Structure (parent->children), state, per-node work label,
+/// and folded usage are all re-sourced from the store — so the tree is recovery-survivable and
+/// shows every durable session (top, child, grandchild, ...) at its true depth, addressable by id.
+/// The legacy in-memory `FleetRuntime` projection is retained only for the synchronous foreign path;
+/// `cancel` still routes through it.
+pub struct FleetViewImpl {
+    store: Arc<dyn daemon_store::SessionStore>,
+    fleet: FleetRuntime,
+}
+
+impl FleetViewImpl {
+    /// A control-surface projection over the durable `store`, with `fleet` for cancel routing.
+    pub fn new(store: Arc<dyn daemon_store::SessionStore>, fleet: FleetRuntime) -> Self {
+        Self { store, fleet }
+    }
+
+    /// Build the tree node for one durable session from its status + durable child edge.
+    async fn node_for(
+        &self,
+        session: &SessionId,
+        status: &daemon_store::SessionStatus,
+        children: &[SessionId],
+    ) -> daemon_api::UnitNode {
+        use daemon_store::SessionStatus;
+        // A node is an orchestrator iff it actually delegated (has durable children), else a leaf.
+        let kind = if children.is_empty() {
+            daemon_api::UnitKind::Engine
+        } else {
+            daemon_api::UnitKind::Orchestrator
+        };
+        let state = match status {
+            SessionStatus::Completed => daemon_api::UnitState::Finished {
+                end_reason: "Completed".to_string(),
+            },
+            _ => daemon_api::UnitState::Running,
+        };
+        daemon_api::UnitNode {
+            id: UnitId::new(session.as_str()),
+            kind,
+            state,
+            work: self.store.delegation_work(session).await,
+            usage: self.store.usage_of(session).await,
+            children: children
+                .iter()
+                .map(|c| UnitId::new(c.as_str()))
+                .collect(),
+        }
+    }
+}
 
 #[async_trait]
 impl FleetControl for FleetViewImpl {
     async fn report(&self) -> FleetReport {
-        FleetReport {
-            children: self.0.children(),
-            usage: self.0.fleet_usage(),
+        let mut usage = daemon_common::UsageDelta::default();
+        let mut children = Vec::new();
+        for (session, _) in self.store.list_sessions().await {
+            usage.add(&self.store.usage_of(&session).await);
+            children.push(UnitId::new(session.as_str()));
         }
+        FleetReport { children, usage }
     }
 
     async fn cancel(&self, child: &UnitId) -> bool {
-        self.0.cancel_child(child).await
+        self.fleet.cancel_child(child).await
     }
 
     async fn tree(&self) -> daemon_api::TreeReport {
-        self.0.tree()
+        let sessions = self.store.list_sessions().await;
+        let mut nodes = Vec::with_capacity(sessions.len());
+        let mut is_child = std::collections::HashSet::new();
+        for (session, status) in &sessions {
+            let children = self.store.children_of(session).await;
+            for c in &children {
+                is_child.insert(c.clone());
+            }
+            nodes.push(self.node_for(session, status, &children).await);
+        }
+        // The root is the single top (parentless) session, if there is exactly one; otherwise the
+        // node holds a forest and `root` is left unset (the nodes still carry the full structure).
+        let roots: Vec<&SessionId> = sessions
+            .iter()
+            .map(|(s, _)| s)
+            .filter(|s| !is_child.contains(*s))
+            .collect();
+        let root = match roots.as_slice() {
+            [only] => Some(UnitId::new(only.as_str())),
+            _ => None,
+        };
+        daemon_api::TreeReport { root, nodes }
     }
 
     async fn unit(&self, id: &UnitId) -> Option<daemon_api::UnitNode> {
-        self.0.unit(id)
+        let session = SessionId::new(id.as_str());
+        let status = self.store.status(&session).await?;
+        let children = self.store.children_of(&session).await;
+        Some(self.node_for(&session, &status, &children).await)
     }
 
     async fn unit_events(&self, id: &UnitId, max: u32) -> Vec<daemon_api::ManageEventView> {
-        self.0.unit_events(id, max)
+        use daemon_store::SessionStatus;
+        let session = SessionId::new(id.as_str());
+        // Coarse lifecycle views synthesized from the durable status (the rich, byte-faithful
+        // transcript is the verifiable journal, read via `unit_history`). A durable session has at
+        // least Started; a terminal one also has Finished.
+        let Some(status) = self.store.status(&session).await else {
+            return Vec::new();
+        };
+        let mut views = vec![daemon_api::ManageEventView::Started { seq: 0 }];
+        if matches!(status, SessionStatus::Completed) {
+            views.push(daemon_api::ManageEventView::Finished {
+                seq: 1,
+                end_reason: "Completed".to_string(),
+                summary: None,
+            });
+        }
+        if max != 0 && (max as usize) < views.len() {
+            let skip = views.len() - max as usize;
+            views.drain(0..skip);
+        }
+        views
     }
 
-    async fn unit_outbound(&self, id: &UnitId, max: u32) -> Vec<daemon_api::Outbound> {
-        self.0.unit_outbound(id, max)
+    async fn unit_outbound(&self, _id: &UnitId, _max: u32) -> Vec<daemon_api::Outbound> {
+        // Durable sessions retain no live §17 stream; their transcript is the durable journal.
+        Vec::new()
     }
 
-    async fn pause(&self, id: &UnitId) -> bool {
-        self.0.pause(id).await
+    async fn pause(&self, _id: &UnitId) -> bool {
+        // Vestigial on the durable path: a durable session has no live scheduling to pause.
+        false
     }
 
-    async fn resume(&self, id: &UnitId) -> bool {
-        self.0.resume(id).await
+    async fn resume(&self, _id: &UnitId) -> bool {
+        false
     }
 
-    async fn scale(&self, id: &UnitId, n: u32) -> bool {
-        self.0.scale(id, n).await
+    async fn scale(&self, _id: &UnitId, _n: u32) -> bool {
+        false
     }
 }

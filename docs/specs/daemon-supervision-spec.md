@@ -207,6 +207,18 @@ by the fleet that holds its record (the **authority split** below), so the metho
   management contract carries the projection seam without an edge to the consumer-surface crate while
   the wire mirror (`daemon-api.cddl`) stays unchanged — the same resolution used for `Outbound`.
 
+> **In-process realization — the durable session graph is the tree.** With unified durable
+> delegation (every orchestrator, top or nested, is a parent-linked durable engine session that
+> delegates through the node's single shared job outbox), the in-process node re-sources the whole
+> projection — `tree()`/`unit()`/`unit_events()`/`state`/`work`/`usage` — directly from the
+> `SessionStore`'s parent→children graph: `root` is the real top session (no synthetic root), a node's
+> `kind` is `Orchestrator` iff it has children (else `Engine`), `state` folds from `SessionStatus`,
+> `children` come from `children_of`, `work` from the delegation binding label, and `usage` from the
+> store's per-session fold. The `project_subtree`/`locate_*` recursion methods above therefore become
+> **vestigial on the durable in-process path** (the graph already spans every depth uniformly) and are
+> retained only for the **deferred cross-node remote-host proxy**, which will implement the same
+> methods over the wire.
+
 > **No `Host` unit kind (in-process scope).** A host is the **translator/substrate**, not a managed
 > unit: it *presents* the engine(s) it drives as `Engine` units to the supervisor above it (§4,
 > [`daemon-host-spec.md`](daemon-host-spec.md) §9). A remote-host **aggregate** kind — where a whole

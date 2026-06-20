@@ -40,10 +40,24 @@ fn parse_verb(args: &str) -> Verb {
     }
 }
 
+/// The default ceiling on nested delegation depth before the tool stops delegating (and the engine
+/// completes instead). The durable delegation graph is recursive — a child is itself an
+/// orchestrator-capable engine that can delegate — so without a guard a model that always delegates
+/// would spawn an unbounded chain of sessions. The depth is read from the session id (the durable
+/// child minter encodes the tree path with `/`), so it needs no extra protocol field.
+const DEFAULT_MAX_DEPTH: usize = 8;
+
 /// The agent's handle onto a node's [`FleetRuntime`].
 pub struct OrchestrateTool {
     fleet: FleetRuntime,
     label: String,
+    max_depth: usize,
+}
+
+/// The nesting depth a durable session sits at, derived from its id: the top session is depth 0 and
+/// each delegated child appends a `/c{epoch}` path segment, so the depth is the segment count.
+fn session_depth(session_id: &str) -> usize {
+    session_id.matches('/').count()
 }
 
 impl OrchestrateTool {
@@ -52,6 +66,7 @@ impl OrchestrateTool {
         Self {
             fleet,
             label: "orchestrated-work".into(),
+            max_depth: DEFAULT_MAX_DEPTH,
         }
     }
 
@@ -60,7 +75,15 @@ impl OrchestrateTool {
         Self {
             fleet,
             label: label.into(),
+            max_depth: DEFAULT_MAX_DEPTH,
         }
+    }
+
+    /// Cap nested delegation at `max_depth` levels: a session already at or below the cap completes
+    /// instead of delegating, so the recursive durable delegation chain terminates.
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
     }
 
     fn ok(call: &ToolCall, content: String, effects: Vec<Effect>) -> ToolOutcome {
@@ -87,6 +110,14 @@ impl Tool for OrchestrateTool {
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         match parse_verb(&call.args) {
+            // Depth guard: at the cap, stop delegating and let the turn complete — this is what
+            // terminates the recursive durable delegation chain (every child is itself
+            // orchestrator-capable, so an always-delegating model would otherwise nest forever).
+            Verb::Delegate if session_depth(cx.session_id.as_str()) >= self.max_depth => Self::ok(
+                call,
+                format!("depth-limit:{}", self.max_depth),
+                Vec::new(),
+            ),
             // DOWN edge: record the delegation through the host port; the fleet worker spawns the
             // child when the resulting durable job is processed. Emitting Effect::Delegate suspends
             // the parent until the child's completion wakes it (lifecycle §3.1).

@@ -110,6 +110,26 @@ SessionId  ------------->| durable partition/owner   |
 | **Crash of an active task** | re-activate from the last snapshot + unapplied completions (idempotent); the live incarnation left no authoritative state behind |
 | **Process/node restart** | the **recovery scanner** finds every `Ready`/resumable session and re-activates it; in-memory directories are rebuilt from the store |
 
+### 3.1a Recursive durable delegation (one orchestrator shape at every depth)
+
+Delegation is *the same mechanism as background work*, applied recursively. A `daemon-core` engine —
+top or nested — delegates by emitting `Effect::Delegate` at a phase boundary, which suspends it and
+`checkpoint + enqueue(job)`s onto the node's **single shared job outbox**. The one
+`JobOutboxDispatcher` materializes the job as a **fresh parent-linked durable child session** (seeded
+with the delegated work as its first turn, a deterministic `{parent}/c{epoch}` id, and the same
+orchestrator-capable engine profile) and enqueues a wake — it does **not** run the child inline. The
+child is then just another durable session: if *it* delegates, it suspends and enqueues onto the same
+outbox (parent = the child), so nesting is recursive by construction and every depth is driven by the
+same dispatcher set.
+
+On a child's **terminal** `mark_completed`, the store consults its delegation binding and — in the
+same transaction — `record_completion_and_wake`s the *parent's* job (payload = the child's summary),
+marking the parent `Ready` and waking it; the parent resumes via the normal completion-application
+path. Because the binding is durable, this holds across a crash: a child that completes after a
+restart still fulfills its delegator. A depth/fan-out guard (carried by the `OrchestrateTool`, keyed
+off the `{parent}/cN` id depth) terminates the recursion. This **supersedes** the earlier synchronous
+brainless orchestrator unit, the sub-fleet recursion, and the synthetic tree root.
+
 ### 3.2 Why suspension is clean only at phase boundaries
 
 The engine's single-owner actor (§4.1) checks steering/cancellation at phase boundaries; suspension
@@ -144,6 +164,11 @@ substrate survey, and they are what the host's acceptance tests verify
 8. **Bounded memory.** The active directory holds only running sessions; `TaskTracker` releases a
    task's memory on completion; no per-incarnation metadata accumulates (the failure mode that
    disqualified the in-memory-supervisor designs).
+9. **Durable parent-linkage.** A delegation binding (`child → parent JobCommand`) is persisted before
+   the child runs and outlives a crash; a child's terminal completion fulfills its delegator's job in
+   the **same transaction** as marking the child complete. So a nested delegation recovers exactly
+   like a top-level one — the recovery scanner re-drives the chain at any depth and the parent is
+   woken whether the child finished before or after the restart.
 
 ---
 
@@ -168,6 +193,19 @@ trait SessionStore: Send + Sync {
     async fn acquire_activation_lease(&self, id: &SessionId) -> Result<FenceToken, StoreError>;
     /// Scan for sessions in `Ready` (or otherwise resumable) state for the recovery scanner.
     async fn scan_resumable(&self, partition: PartitionId) -> Result<Vec<SessionId>, StoreError>;
+
+    // --- durable parent-linkage (recursive delegation) ---
+    /// Bind a child session to the parent `JobCommand` that delegated it (parent session + epoch +
+    /// job id + work label). The binding outlives a crash, so on the child's terminal completion it
+    /// can fulfill its delegator even after a restart.
+    async fn bind_delegation(&self, child: SessionId, job: JobCommand) -> Result<(), StoreError>;
+    /// The reverse parent→children index — the spine of the durable tree projection.
+    async fn children_of(&self, parent: &SessionId) -> Vec<SessionId>;
+    /// The work label a child was delegated with (its parent job's payload), for the tree node's `work`.
+    async fn delegation_work(&self, child: &SessionId) -> Option<String>;
+    /// Fold per-turn usage into a session's durable total — the per-node `usage` the tree reads.
+    async fn record_usage(&self, id: &SessionId, delta: UsageDelta);
+    async fn usage_of(&self, id: &SessionId) -> UsageDelta;
 }
 
 struct Activation { snapshot: Snapshot, unapplied: Vec<JobCompletion>, fence: FenceToken }

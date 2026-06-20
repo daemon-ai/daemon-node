@@ -279,8 +279,8 @@ impl FleetRuntime {
 
     /// Spawn + run a child per `spec` synchronously (the same management-level delegation the
     /// orchestrate tool's `Delegate` request takes through [`FleetRequestHandler`]), returning the
-    /// spawned child ids. This is the nested orchestrator's drive path: an [`crate::OrchestratorUnit`]
-    /// drives its own sub-fleet through here, so a deeper level needs no second durable job worker.
+    /// spawned child ids. Legacy synchronous drive path retained for the foreign/ephemeral coarse
+    /// lifecycle; the durable Core delegation path materializes children as durable sessions instead.
     pub async fn delegate(&self, specs: &[DelegationSpec]) -> Vec<UnitId> {
         let mut ids = Vec::with_capacity(specs.len());
         for spec in specs {

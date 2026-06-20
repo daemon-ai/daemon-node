@@ -281,19 +281,24 @@ by `UnitId`). A single agent is a tree of one; teams and fleets-of-fleets are de
 through the same surface. The management protocol (`ManagedUnit`) is the internal recursion; the
 `daemon-api` projection is its read/drive face for consumers.
 
-**The projection is genuinely recursive (fleets-of-fleets).** An orchestrator node owns its own
-`FleetRuntime`: when delegated work it spawns children into *its* sub-fleet (synchronously, through
-the management-level `Delegate` answer-authority — a nested level needs no second
-`JobOutboxDispatcher`), and its `project_subtree` / `locate_*` overrides
-([`daemon-supervision-spec.md`](daemon-supervision-spec.md) §2.1) forward the projection/routing seam
-one level down, where the sub-fleet repeats it. So `tree()` returns a real multi-level tree with each
-node's `children` ids filled and a populated `root` (the node itself), and `unit()` / `unit_events()`
-/ `unit_outbound()` / `unit_history()` / `pause` / `resume` / `scale` all resolve a *grandchild* (and
-deeper) by `UnitId` at any depth — identically in-process and over the socket/FFI. Sub-fleet ids are
-namespaced under their owning orchestrator (`{orchestrator}/child-N`) so every node is uniquely
-addressable. The projection DTO (`TreeReport`/`UnitNode`/`UnitState`/`ManageEventView`) lives in
-`daemon-protocol` and is re-exported by `daemon-api`, so the management contract can carry the seam
-without depending on the consumer surface and the cddl wire mirror is unchanged.
+**The projection is genuinely recursive (fleets-of-fleets) — sourced from the durable session graph.**
+Every orchestrator, top or nested, is a parent-linked durable engine session that delegates through
+the node's **single shared job outbox** (§3.1a of [`daemon-lifecycle-persistence.md`](daemon-lifecycle-persistence.md)):
+a delegation suspends the parent and enqueues a job; the one `JobOutboxDispatcher` materializes a
+fresh durable child session and binds it to its parent. The node therefore re-sources `tree()` /
+`unit()` / `unit_events()` directly from the `SessionStore`'s parent→children graph — `root` is the
+real top session (no synthetic root), `children` come from `children_of`, `state` folds from
+`SessionStatus`, `work` from the delegation binding label, and `usage` from the store's per-session
+fold — so a *grandchild* (and deeper) is addressable by `UnitId` at any depth, identically in-process
+and over the socket/FFI. Child ids are namespaced under their parent (`{parent}/cN`) so every node is
+uniquely addressable and its depth is recoverable from the id. The `ManagedUnit::project_subtree` /
+`locate_*` recursion seam is now **vestigial on the durable in-process path** (the graph already spans
+every depth) and is retained only for the deferred cross-node remote-host proxy; correspondingly,
+lifecycle commands that only made sense for the live in-memory fleet (`pause` / `resume` / `scale`)
+are reported `Unsupported` for durable sessions. The projection DTO
+(`TreeReport`/`UnitNode`/`UnitState`/`ManageEventView`) lives in `daemon-protocol` and is re-exported
+by `daemon-api`, so the management contract can carry the seam without depending on the consumer
+surface and the cddl wire mirror is unchanged.
 
 **Two per-unit views: coarse dashboard vs. transcript-fidelity drill-down.** `unit_events()` is the
 coarse fleet-dashboard view — a bounded buffer of `ManageEventView`s (started / progress-line /
@@ -312,10 +317,12 @@ scope for this drain, which is live-only and best-effort.)
 
 **One node, one composition root.** The host node is assembled in exactly one place — the
 `daemon-node` crate's `assemble()` — which the `daemon` binary and the conformance harness both call.
-It wires the durable substrate (store + resident services), the orchestration fleet as the real job
-worker, the credential broker, and the live session surface from one `EngineProfile` per role
-(orchestrator / child / session), so the durable, live, and fleet-child construction paths share
-provider selection, brokered credentials, and engine tunables (`daemon_core::Config`) uniformly.
+It wires the durable substrate (store + resident services), the shared job outbox worker that seeds
+parent-linked durable child sessions, the credential broker, and the live session surface from a
+**single orchestrator-capable `EngineProfile`** used at every depth (a node is an orchestrator iff it
+actually delegated — has children — else a leaf; an `OrchestrateTool` depth guard terminates the
+recursion). So the durable top, the durable nested children, and the live session paths all share one
+engine shape, provider selection, brokered credentials, and engine tunables (`daemon_core::Config`).
 `daemon-node` sits *above* `daemon-host` because the fleet + orchestrate-tool glue is composition
 policy; `daemon-host` itself stays free of `daemon-orchestration`.
 

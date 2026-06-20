@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use daemon_common::{
     ContentHash, DaemonError, Epoch, FenceToken, JobId, JournalStreamId, MerkleRoot, PartitionId,
-    SessionId, SnapshotBlob,
+    SessionId, SnapshotBlob, UsageDelta,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -322,6 +322,42 @@ pub trait SessionStore: Send + Sync {
     /// `(session, epoch, job)` (lifecycle §5; invariants #2, #3).
     async fn record_completion_and_wake(&self, c: &JobCompletion) -> Result<(), StoreError>;
 
+    /// Bind a delegated child session to the parent `job` whose completion it fulfills: when the
+    /// child reaches a terminal state ([`Self::mark_completed`]), the store records a completion for
+    /// `job` and wakes the parent — in the *same* durable transaction, so a crash between the two
+    /// cannot orphan the parent. This is the durable tree edge that makes nested delegation
+    /// recursive and recovery-safe at any depth. Default: a no-op (a non-authoritative proxy store).
+    async fn bind_delegation(&self, _child: SessionId, _job: JobCommand) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The child sessions `parent` delegated, in delegation order — the durable parent->child edge
+    /// the management-tree projection walks. Default: empty (a non-authoritative proxy store).
+    async fn children_of(&self, _parent: &SessionId) -> Vec<SessionId> {
+        Vec::new()
+    }
+
+    /// Enqueue a bare wake hint for `id` (no completion) so the wake-outbox dispatcher activates it.
+    /// Used to kick a freshly-created durable child session into its first turn. Default: no-op (a
+    /// non-authoritative proxy store relies on its authoritative peer's dispatcher).
+    async fn enqueue_wake(&self, _id: SessionId) {}
+
+    /// The work label `child` was delegated with (the parent job's payload as text), for the tree
+    /// projection's per-node `work`. `None` for a top (parentless) session. Default: `None`.
+    async fn delegation_work(&self, _child: &SessionId) -> Option<String> {
+        None
+    }
+
+    /// Fold `delta` into a session's durable usage total — the per-session usage surface the tree
+    /// projection reads (replacing the in-memory fleet fan-in for durable sessions). Recorded by the
+    /// activation path as each turn runs. Default: no-op.
+    async fn record_usage(&self, _id: &SessionId, _delta: UsageDelta) {}
+
+    /// A session's folded durable usage total. Default: zero.
+    async fn usage_of(&self, _id: &SessionId) -> UsageDelta {
+        UsageDelta::default()
+    }
+
     /// Scan for sessions in a resumable (`Ready`/`Active`) state for the recovery scanner
     /// (lifecycle §5; invariant #7).
     async fn scan_resumable(&self, partition: PartitionId) -> Result<Vec<SessionId>, StoreError>;
@@ -419,6 +455,12 @@ struct Inner {
     /// Job ids already enqueued, to dedupe re-enqueues from idempotent re-activation.
     enqueued_jobs: HashSet<JobId>,
     wake_outbox: VecDeque<SessionId>,
+    /// child session -> the parent job its terminal completion fulfills (the durable tree edge).
+    delegations: HashMap<SessionId, JobCommand>,
+    /// parent session -> its delegated children in order (reverse index for the tree projection).
+    child_index: HashMap<SessionId, Vec<SessionId>>,
+    /// Per-session folded usage total (the durable usage surface the tree projection reads).
+    usage: HashMap<SessionId, UsageDelta>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
     journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
@@ -467,6 +509,26 @@ impl InMemoryStore {
             });
         }
         Ok(())
+    }
+
+    /// Apply a completion under the held lock: idempotent per `(session, epoch, job)`, push it onto
+    /// the parent's unapplied queue and mark the parent `Ready`. Returns `true` if it was fresh (the
+    /// caller then publishes the wake). The parent must exist. Shared by the explicit
+    /// `record_completion_and_wake` and the delegation fulfillment inside `mark_completed`.
+    fn apply_completion_locked(inner: &mut Inner, c: &JobCompletion) -> bool {
+        let key = (c.session_id.clone(), c.epoch, c.job_id.clone());
+        if !inner.inbox_keys.insert(key) {
+            return false;
+        }
+        inner
+            .unapplied
+            .entry(c.session_id.clone())
+            .or_default()
+            .push(c.clone());
+        if let Some(rec) = inner.sessions.get_mut(&c.session_id) {
+            rec.status = SessionStatus::Ready;
+        }
+        true
     }
 }
 
@@ -572,6 +634,22 @@ impl SessionStore for InMemoryStore {
         rec.snapshot = checkpoint.snapshot;
         rec.epoch = checkpoint.epoch;
         rec.status = SessionStatus::Completed;
+        // If this session was delegated by a parent, fulfill that parent's job and wake it in the
+        // *same* transaction (under the held lock). The binding is durable, so this is recovery-safe:
+        // a child marked terminal always wakes its delegator, at any nesting depth.
+        if let Some(job) = inner.delegations.get(&checkpoint.session_id).cloned() {
+            let completion = JobCompletion {
+                session_id: job.session_id.clone(),
+                epoch: job.epoch,
+                job_id: job.job_id.clone(),
+                payload: format!("child:{}", checkpoint.session_id).into_bytes(),
+            };
+            if inner.sessions.contains_key(&completion.session_id)
+                && Self::apply_completion_locked(&mut inner, &completion)
+            {
+                inner.wake_outbox.push_back(completion.session_id);
+            }
+        }
         Ok(())
     }
 
@@ -580,24 +658,69 @@ impl SessionStore for InMemoryStore {
         if !inner.sessions.contains_key(&c.session_id) {
             return Err(StoreError::NotFound(c.session_id.clone()));
         }
-        let key = (c.session_id.clone(), c.epoch, c.job_id.clone());
         // Idempotent: a redelivered completion is a no-op (invariant #2/#3).
-        if !inner.inbox_keys.insert(key) {
+        if !Self::apply_completion_locked(&mut inner, c) {
             return Ok(());
-        }
-        inner
-            .unapplied
-            .entry(c.session_id.clone())
-            .or_default()
-            .push(c.clone());
-        if let Some(rec) = inner.sessions.get_mut(&c.session_id) {
-            rec.status = SessionStatus::Ready;
         }
         // Boundary: completion durable + session Ready; crash before publishing the wake.
         // Recovery scan must still re-activate the Ready session (invariant #7).
         Self::take_fault(&mut inner, FaultPoint::BeforeWakePublish)?;
         inner.wake_outbox.push_back(c.session_id.clone());
         Ok(())
+    }
+
+    async fn bind_delegation(&self, child: SessionId, job: JobCommand) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .child_index
+            .entry(job.session_id.clone())
+            .or_default()
+            .push(child.clone());
+        inner.delegations.insert(child, job);
+        Ok(())
+    }
+
+    async fn children_of(&self, parent: &SessionId) -> Vec<SessionId> {
+        self.inner
+            .lock()
+            .unwrap()
+            .child_index
+            .get(parent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn enqueue_wake(&self, id: SessionId) {
+        self.inner.lock().unwrap().wake_outbox.push_back(id);
+    }
+
+    async fn delegation_work(&self, child: &SessionId) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .delegations
+            .get(child)
+            .map(|job| String::from_utf8_lossy(&job.payload).into_owned())
+    }
+
+    async fn record_usage(&self, id: &SessionId, delta: UsageDelta) {
+        self.inner
+            .lock()
+            .unwrap()
+            .usage
+            .entry(id.clone())
+            .or_default()
+            .add(&delta);
+    }
+
+    async fn usage_of(&self, id: &SessionId) -> UsageDelta {
+        self.inner
+            .lock()
+            .unwrap()
+            .usage
+            .get(id)
+            .copied()
+            .unwrap_or_default()
     }
 
     async fn scan_resumable(&self, partition: PartitionId) -> Result<Vec<SessionId>, StoreError> {

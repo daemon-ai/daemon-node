@@ -161,7 +161,8 @@ impl Incarnation for CoreIncarnation {
             epoch: engine.epoch(),
         };
         // When journaling, capture the engine's events so they can be coalesced into finished blocks
-        // and sealed after the turn; otherwise discard (the substrate replays from durable state).
+        // and sealed after the turn, and so the turn's token usage can be folded into the durable
+        // per-session usage surface (the tree projection's usage source); otherwise discard.
         let captured: Arc<Mutex<Vec<daemon_protocol::AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = if self.journal.is_some() {
             let cap = captured.clone();
@@ -174,6 +175,21 @@ impl Incarnation for CoreIncarnation {
             .run_turn(&host, &sink, &control)
             .await
             .map_err(map_failure)?;
+
+        // Fold this turn's token usage into the durable per-session usage surface so the management
+        // tree projects real, recovery-survivable usage at every node (replacing the in-memory fleet
+        // fan-in for durable sessions).
+        if let Some(cfg) = &self.journal {
+            let mut delta = daemon_common::UsageDelta::default();
+            for ev in captured.lock().unwrap().iter() {
+                if let daemon_protocol::AgentEvent::Usage { delta: d, .. } = ev {
+                    delta.add(d);
+                }
+            }
+            if delta != daemon_common::UsageDelta::default() {
+                cfg.store.record_usage(&session_id, delta).await;
+            }
+        }
 
         // Seal this incarnation's turn into the unified verifiable journal (unfenced on the durable
         // path: the snapshot chain fences durable state, the ed25519 signature seals the transcript).
