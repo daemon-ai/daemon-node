@@ -30,7 +30,7 @@ use daemon_host::{
 };
 use daemon_protocol::HostRequestHandler;
 use daemon_telemetry::TraceSigner;
-use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
+use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime, OrchestratorSpawner};
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
 
@@ -38,6 +38,8 @@ use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
 const ORCHESTRATOR_PROFILE: &str = "orchestrator";
 /// The provider-registry profile name the fleet-child engine resolves to.
 const CHILD_PROFILE: &str = "child";
+/// The id of the node's synthetic tree root (the top fleet as the GUI's root node).
+const NODE_ROOT: &str = "node";
 
 /// The policy inputs for [`assemble`]: everything that varies between a production node and a test
 /// node. The standard plumbing (role profiles, fleet, factory, host, session surface) is derived.
@@ -62,6 +64,10 @@ pub struct NodeAssembly {
     /// across restarts (auditors keep verifying old segments). `None` generates an ephemeral key
     /// (fine for tests; a fresh key each boot otherwise).
     pub journal_seed: Option<[u8; 32]>,
+    /// How many orchestrator levels the top fleet materializes before its leaves. `0` (default) is a
+    /// flat fleet of engine leaves; `1` makes every top child an orchestrator owning a sub-fleet of
+    /// leaves (fleets-of-fleets), `n` nests `n` deep — the tree the GUI projects and addresses.
+    pub nesting_depth: usize,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -120,13 +126,31 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         ),
         &a,
     );
+    // The leaf placement seam (in-process engine children). When `nesting_depth > 0` the top fleet
+    // spawns orchestrator children instead, each owning a sub-fleet that bottoms out in these leaves
+    // — a real, addressable fleets-of-fleets tree.
+    let leaf_spawner: Arc<dyn ChildSpawner> =
+        Arc::new(ProfileChildSpawner::core(child_profile).with_journal(journal.clone()));
+    let spawner: Arc<dyn ChildSpawner> = if a.nesting_depth == 0 {
+        leaf_spawner
+    } else {
+        Arc::new(OrchestratorSpawner::new(
+            a.store.clone(),
+            a.partition,
+            Arc::new(DefaultAnswerPolicy),
+            leaf_spawner,
+            a.nesting_depth,
+        ))
+    };
     let fleet = FleetRuntime::new(
         a.store.clone(),
         a.partition,
-        Arc::new(ProfileChildSpawner::core(child_profile).with_journal(journal.clone())),
+        spawner,
         Arc::new(DefaultAnswerPolicy),
         None::<Arc<dyn ManageRequestHandler>>,
-    );
+    )
+    // The top fleet projects a rooted tree (the GUI's tree root is the node itself).
+    .with_root_id(UnitId::new(NODE_ROOT));
 
     // The parent orchestrator: an engine that delegates through the orchestrate tool, then completes.
     let mut registry = ToolRegistry::new();

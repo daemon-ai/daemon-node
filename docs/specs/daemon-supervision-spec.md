@@ -167,6 +167,14 @@ trait ManagedUnit: Send + Sync {
     fn events(&self) -> EventStream<ManageEvent>;    // lossless-primary; seq-resyncable
     // upward requests flow through a ManageRequestHandler the parent installs at attach time:
     fn install_request_handler(&self, handler: Arc<dyn ManageRequestHandler>);
+
+    // The drill-down + recursive-projection seam (default: a leaf answers only for its own id):
+    fn drain_outbound(&self, max: u32) -> Vec<Outbound>;          // this unit's §17 stream
+    fn project_subtree(&self) -> Vec<UnitNode>;                   // descendants, flat, children-filled
+    fn locate_node(&self, id: &UnitId) -> Option<UnitNode>;       // a descendant's node
+    fn locate_events(&self, id: &UnitId, max: u32) -> Vec<ManageEventView>;
+    fn locate_outbound(&self, id: &UnitId, max: u32) -> Vec<Outbound>;
+    async fn locate_command(&self, id: &UnitId, cmd: ManageCommand) -> Option<Ack>;
 }
 
 enum UnitKind { Engine, Orchestrator }
@@ -175,6 +183,29 @@ enum Ack { Accepted, Queued, Busy, Unsupported, Rejected { reason: String } }
 
 `UnitId` is the durable routing key (it generalizes the §17.3 `SessionId` activation key, §3 of the
 lifecycle doc) — supervisors route by `UnitId`, never by a retained handle.
+
+### 2.1 The recursive projection / routing seam
+
+The GUI/TUI manages the whole orchestration through one surface ([`daemon-api`](daemon-host-spec.md)
+`ControlApi`) as a **nested tree** — a single agent, a team, fleets-of-fleets — every node
+addressable by `UnitId` at any depth. The projection/routing methods above are the recursion vehicle
+that makes this work *through orchestrator opacity*: an `Orchestrator` overrides them to forward into
+the [`FleetRuntime`](daemon-orchestration-synthesis.md) it owns, so projection and id-routing recurse
+uniformly across any nesting (and, at the deferred cross-node cut, a remote-host proxy implements the
+same methods over the wire). A leaf keeps the trait defaults (empty / `None`): its own node is built
+by the fleet that holds its record (the **authority split** below), so the methods carry only the
+*descent*.
+
+- **Authority split.** The fleet that holds a unit's `ChildRecord` is the source of truth for *that*
+  unit's status / work / usage (folded from its `ManageEvent` stream). So `project_subtree`/`locate_*`
+  never re-derive a node's own record-backed fields; an orchestrator returns its **descendants'**
+  nodes and routes id-addressed reads/commands one level down, where the sub-fleet repeats the split.
+- **Unique ids.** Each sub-fleet namespaces its minted child ids under its owning orchestrator's id
+  (`{orchestrator}/child-N`), so every node in the whole tree is addressable by a *unique* `UnitId`.
+- **Projection DTO.** `UnitNode` / `TreeReport` / `UnitState` / `ManageEventView` live in
+  `daemon-protocol` (next to the §17 `Outbound`) and are re-exported by `daemon-api`, so this
+  management contract carries the projection seam without an edge to the consumer-surface crate while
+  the wire mirror (`daemon-api.cddl`) stays unchanged — the same resolution used for `Outbound`.
 
 > **No `Host` unit kind (in-process scope).** A host is the **translator/substrate**, not a managed
 > unit: it *presents* the engine(s) it drives as `Engine` units to the supervisor above it (§4,

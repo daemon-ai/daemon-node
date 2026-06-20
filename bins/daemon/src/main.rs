@@ -120,6 +120,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         profile: cred_profile,
         engine_config: cfg.engine,
         journal_seed: cfg.journal_seed,
+        nesting_depth: cfg.nesting_depth,
     });
     tracing::info!("daemon host node started");
 

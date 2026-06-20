@@ -29,6 +29,8 @@ const MODEL_RETRY_ATTEMPTS_ENV: &str = "DAEMON_MODEL_RETRY_ATTEMPTS";
 const CONTEXT_BUDGET_TOKENS_ENV: &str = "DAEMON_CONTEXT_BUDGET_TOKENS";
 /// The 32-byte verifiable-journal signer seed, hex-encoded (64 hex chars).
 const JOURNAL_SEED_ENV: &str = "DAEMON_JOURNAL_SEED";
+/// How many orchestrator levels the top fleet materializes before its leaves (fleets-of-fleets).
+const NESTING_DEPTH_ENV: &str = "DAEMON_NESTING_DEPTH";
 
 /// The durable store backend selected by config.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +66,9 @@ pub struct NodeConfig {
     /// The 32-byte seed for the node's verifiable-journal signer (a stable verifying key across
     /// restarts). `None` => an ephemeral key generated each boot.
     pub journal_seed: Option<[u8; 32]>,
+    /// How many orchestrator levels the top fleet materializes before its engine leaves. `0` (the
+    /// default) is a flat fleet; `n` nests the management tree `n` deep (fleets-of-fleets).
+    pub nesting_depth: usize,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -81,6 +86,7 @@ struct FileConfig {
     model_retry_attempts: Option<u8>,
     context_budget_tokens: Option<u32>,
     journal_seed: Option<String>,
+    nesting_depth: Option<usize>,
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -151,6 +157,11 @@ impl NodeConfig {
             None => None,
         };
 
+        let nesting_depth = match env_string(NESTING_DEPTH_ENV) {
+            Some(s) => s.parse().context("DAEMON_NESTING_DEPTH must be a usize")?,
+            None => file.nesting_depth.unwrap_or(0),
+        };
+
         Ok(Self {
             partition,
             socket_path,
@@ -161,6 +172,7 @@ impl NodeConfig {
             credential_key,
             engine,
             journal_seed,
+            nesting_depth,
         })
     }
 

@@ -19,11 +19,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod orchestrator;
 pub mod policy;
 pub mod registry;
 pub mod runtime;
 pub mod spawner;
 
+pub use orchestrator::{OrchestratorSpawner, OrchestratorUnit};
 pub use policy::{AnswerPolicy, Decision, DefaultAnswerPolicy};
 pub use registry::{ChildRecord, ChildStatus};
 pub use runtime::{FleetRuntime, OrchestrationError};

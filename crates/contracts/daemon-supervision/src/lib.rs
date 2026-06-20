@@ -618,4 +618,51 @@ pub trait ManagedUnit: Send + Sync {
     fn drain_outbound(&self, _max: u32) -> Vec<daemon_protocol::Outbound> {
         Vec::new()
     }
+
+    // -----------------------------------------------------------------------
+    // Recursive tree projection / routing (the GUI's nested management surface)
+    // -----------------------------------------------------------------------
+    //
+    // These let a supervisor project and address an *entire* subtree by `UnitId`, through the same
+    // opacity that hides whether a unit is a leaf or a whole sub-fleet: an `Orchestrator` overrides
+    // them to forward into its own runtime, so projection/routing recurse uniformly across any
+    // nesting — and, eventually, across a placement cut (a remote proxy implements them over the
+    // wire). The projection DTOs live in `daemon-protocol` (re-exported by `daemon-api`).
+    //
+    // Authority split: the fleet that holds a unit's record is the source of truth for *that* unit's
+    // state/work/usage. So these methods carry only the recursion: a leaf returns empty/`None` (its
+    // own node is built by its holding fleet from the record); an orchestrator returns its
+    // descendants' nodes / routes id-addressed reads & commands into its sub-fleet.
+
+    /// The **descendant** nodes of this unit's subtree, flat, with each node's `children` ids filled
+    /// (the unit's *own* node is supplied by the fleet that holds its record). Empty for a leaf;
+    /// an orchestrator overrides this to project its sub-fleet (which recurses further).
+    fn project_subtree(&self) -> Vec<daemon_protocol::UnitNode> {
+        Vec::new()
+    }
+
+    /// Resolve one node by `id` strictly *within* this unit's subtree (its descendants); `None` if
+    /// `id` is not a descendant here. Default: `None` (a leaf has no descendants).
+    fn locate_node(&self, _id: &UnitId) -> Option<daemon_protocol::UnitNode> {
+        None
+    }
+
+    /// A bounded snapshot of recent management-event views for the descendant unit `id`; empty if
+    /// `id` is not a descendant here. Default: empty.
+    fn locate_events(&self, _id: &UnitId, _max: u32) -> Vec<daemon_protocol::ManageEventView> {
+        Vec::new()
+    }
+
+    /// Drain up to `max` recent §17 outbound items for the descendant unit `id`; empty if `id` is
+    /// not a descendant here. Default: empty.
+    fn locate_outbound(&self, _id: &UnitId, _max: u32) -> Vec<daemon_protocol::Outbound> {
+        Vec::new()
+    }
+
+    /// Route a lifecycle [`ManageCommand`] to the descendant unit `id`; `None` if `id` is not a
+    /// descendant here (so a caller can distinguish "not found in this subtree" from a returned
+    /// [`Ack`]). Default: `None`.
+    async fn locate_command(&self, _id: &UnitId, _cmd: ManageCommand) -> Option<Ack> {
+        None
+    }
 }

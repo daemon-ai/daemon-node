@@ -281,6 +281,20 @@ by `UnitId`). A single agent is a tree of one; teams and fleets-of-fleets are de
 through the same surface. The management protocol (`ManagedUnit`) is the internal recursion; the
 `daemon-api` projection is its read/drive face for consumers.
 
+**The projection is genuinely recursive (fleets-of-fleets).** An orchestrator node owns its own
+`FleetRuntime`: when delegated work it spawns children into *its* sub-fleet (synchronously, through
+the management-level `Delegate` answer-authority — a nested level needs no second
+`JobOutboxDispatcher`), and its `project_subtree` / `locate_*` overrides
+([`daemon-supervision-spec.md`](daemon-supervision-spec.md) §2.1) forward the projection/routing seam
+one level down, where the sub-fleet repeats it. So `tree()` returns a real multi-level tree with each
+node's `children` ids filled and a populated `root` (the node itself), and `unit()` / `unit_events()`
+/ `unit_outbound()` / `unit_history()` / `pause` / `resume` / `scale` all resolve a *grandchild* (and
+deeper) by `UnitId` at any depth — identically in-process and over the socket/FFI. Sub-fleet ids are
+namespaced under their owning orchestrator (`{orchestrator}/child-N`) so every node is uniquely
+addressable. The projection DTO (`TreeReport`/`UnitNode`/`UnitState`/`ManageEventView`) lives in
+`daemon-protocol` and is re-exported by `daemon-api`, so the management contract can carry the seam
+without depending on the consumer surface and the cddl wire mirror is unchanged.
+
 **Two per-unit views: coarse dashboard vs. transcript-fidelity drill-down.** `unit_events()` is the
 coarse fleet-dashboard view — a bounded buffer of `ManageEventView`s (started / progress-line /
 usage / finished / error), payload-agnostic and non-destructive, what a supervisor folds. For a

@@ -29,10 +29,11 @@ use daemon_common::{
 };
 use daemon_store::{Checkpoint, JobCompletion, SessionStore, StoreError};
 use daemon_supervision::{
-    Concurrency, DelegationSpec, EndReason, FailureClass, ManageCommand, ManageEvent,
+    Ack, Concurrency, DelegationSpec, EndReason, FailureClass, ManageCommand, ManageEvent,
     ManageRequest, ManageRequestHandler, ManageRequestKind, ManageResponse, ManageResponseBody,
-    Outcome, ProgressDelta, StreamLagged, UnitKind, WorkRef,
+    ManagedUnit, Outcome, ProgressDelta, StreamLagged, UnitKind, WorkRef,
 };
+use std::collections::HashSet;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -60,13 +61,25 @@ struct FleetInner {
     request_log: Mutex<Vec<ManageRequest>>,
     next_child: AtomicU64,
     max_children: usize,
+    /// A fleet-unique prefix for minted child ids, so a sub-fleet's children never collide with a
+    /// sibling fleet's (every node in the tree is addressable by a *unique* `UnitId`). Empty at the
+    /// top fleet (`child-0`, ...); a sub-fleet uses its owning orchestrator's id (`{orch}/child-0`).
+    id_prefix: String,
+    /// The id of the unit that *owns* this fleet, when the fleet should project a rooted tree (the
+    /// top node fleet). `None` for a sub-fleet — its owning orchestrator's node is built one level
+    /// up from that orchestrator's record, so the sub-fleet projects only its members.
+    root_id: Option<UnitId>,
 }
 
 impl FleetInner {
     /// Spawn, register, drive, and fold one child to a terminal outcome.
     async fn spawn_and_run(self: &Arc<Self>, spec: &DelegationSpec) -> (UnitId, Outcome) {
         let n = self.next_child.fetch_add(1, Ordering::SeqCst);
-        let child_id = UnitId::new(format!("child-{n}"));
+        let child_id = if self.id_prefix.is_empty() {
+            UnitId::new(format!("child-{n}"))
+        } else {
+            UnitId::new(format!("{}/child-{n}", self.id_prefix))
+        };
 
         let unit = self.spawner.spawn(child_id.clone(), spec).await;
         self.children
@@ -191,6 +204,8 @@ impl FleetRuntime {
                 request_log: Mutex::new(Vec::new()),
                 next_child: AtomicU64::new(0),
                 max_children: DEFAULT_MAX_CHILDREN,
+                id_prefix: String::new(),
+                root_id: None,
             }),
         }
     }
@@ -201,6 +216,24 @@ impl FleetRuntime {
         Arc::get_mut(&mut self.inner)
             .expect("with_max_children before sharing")
             .max_children = max;
+        self
+    }
+
+    /// Set the fleet-unique prefix minted child ids carry (a sub-fleet uses its owning
+    /// orchestrator's id), so every node in the whole tree is addressable by a unique `UnitId`.
+    pub fn with_id_prefix(mut self, prefix: impl Into<String>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_id_prefix before sharing")
+            .id_prefix = prefix.into();
+        self
+    }
+
+    /// Mark this fleet as the rooted node tree, projecting a synthetic root node (id `root`) whose
+    /// children are the fleet's direct members — so the GUI gets a populated [`TreeReport::root`].
+    pub fn with_root_id(mut self, root: UnitId) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_root_id before sharing")
+            .root_id = Some(root);
         self
     }
 
@@ -244,6 +277,19 @@ impl FleetRuntime {
         Ok(processed)
     }
 
+    /// Spawn + run a child per `spec` synchronously (the same management-level delegation the
+    /// orchestrate tool's `Delegate` request takes through [`FleetRequestHandler`]), returning the
+    /// spawned child ids. This is the nested orchestrator's drive path: an [`crate::OrchestratorUnit`]
+    /// drives its own sub-fleet through here, so a deeper level needs no second durable job worker.
+    pub async fn delegate(&self, specs: &[DelegationSpec]) -> Vec<UnitId> {
+        let mut ids = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let (id, _) = self.inner.spawn_and_run(spec).await;
+            ids.push(id);
+        }
+        ids
+    }
+
     /// Cancel a registered child by id (the orchestrate tool's `cancel` verb).
     pub async fn cancel_child(&self, id: &UnitId) -> bool {
         let unit = self.inner.children.get(id).map(|r| r.unit.clone());
@@ -284,40 +330,79 @@ impl FleetRuntime {
         self.inner.request_log.lock().unwrap().clone()
     }
 
-    /// Project the fleet as the GUI/TUI tree (a flat node list; one-level for now — children that are
-    /// orchestrators nest as the runtime gains sub-fleets). `root` is `None`: the node's own id lives
-    /// above the runtime, so the host fills it in if it wants a rooted view.
+    /// Project the fleet as the GUI/TUI tree: a flat node list with each node's `children` ids
+    /// filled, recursing through orchestrator children's opaque sub-fleets (genuine
+    /// fleets-of-fleets). When the fleet is rooted ([`Self::with_root_id`]) a synthetic root node is
+    /// prepended and [`TreeReport::root`] is populated; a sub-fleet projects only its members (its
+    /// owning orchestrator's node is built one level up from that orchestrator's record).
     pub fn tree(&self) -> TreeReport {
-        let nodes = self
-            .inner
-            .children
-            .iter()
-            .map(|e| project_unit(e.key(), e.value()))
-            .collect();
-        TreeReport { root: None, nodes }
+        let mut direct = Vec::new();
+        let mut nodes = Vec::new();
+        for e in self.inner.children.iter() {
+            let id = e.key();
+            let (node, subtree) = project_child(e.value(), id);
+            direct.push(id.clone());
+            nodes.push(node);
+            nodes.extend(subtree);
+        }
+        match &self.inner.root_id {
+            Some(root) => {
+                let mut all = Vec::with_capacity(nodes.len() + 1);
+                all.push(self.root_node(root, direct));
+                all.extend(nodes);
+                TreeReport {
+                    root: Some(root.clone()),
+                    nodes: all,
+                }
+            }
+            None => TreeReport { root: None, nodes },
+        }
     }
 
-    /// One unit's node view, if registered.
+    /// The synthetic node-root node (the fleet itself as the GUI's tree root).
+    fn root_node(&self, root: &UnitId, children: Vec<UnitId>) -> UnitNode {
+        UnitNode {
+            id: root.clone(),
+            kind: ApiUnitKind::Orchestrator,
+            state: UnitState::Running,
+            work: None,
+            usage: self.fleet_usage(),
+            children,
+        }
+    }
+
+    /// One unit's node view by id at any depth: the synthetic root, a direct child (with its
+    /// sub-fleet roots filled), or — recursing through an orchestrator child — a grandchild.
     pub fn unit(&self, id: &UnitId) -> Option<UnitNode> {
-        self.inner.children.get(id).map(|r| project_unit(id, &r))
+        if self.inner.root_id.as_ref() == Some(id) {
+            return Some(self.root_node(id, self.children()));
+        }
+        if let Some(r) = self.inner.children.get(id) {
+            return Some(project_child(r.value(), id).0);
+        }
+        self.orchestrator_units()
+            .iter()
+            .find_map(|u| u.locate_node(id))
     }
 
     /// A bounded snapshot of a unit's most recent management-event views (GUI drill-down). Returns up
     /// to `max` (most recent; `0` = all buffered). Non-destructive so repeated reads — including the
     /// same call over different transports — observe the same window.
     pub fn unit_events(&self, id: &UnitId, max: u32) -> Vec<ManageEventView> {
-        self.inner
-            .children
-            .get(id)
-            .map(|r| {
-                let len = r.events.len();
-                let take = if max == 0 {
-                    len
-                } else {
-                    (max as usize).min(len)
-                };
-                r.events.iter().skip(len - take).cloned().collect()
-            })
+        if let Some(r) = self.inner.children.get(id) {
+            let len = r.events.len();
+            let take = if max == 0 {
+                len
+            } else {
+                (max as usize).min(len)
+            };
+            return r.events.iter().skip(len - take).cloned().collect();
+        }
+        // Recurse: an orchestrator child holds its descendants' event buffers in its sub-fleet.
+        self.orchestrator_units()
+            .iter()
+            .map(|u| u.locate_events(id, max))
+            .find(|v| !v.is_empty())
             .unwrap_or_default()
     }
 
@@ -327,25 +412,52 @@ impl FleetRuntime {
     /// (e.g. an orchestrator) retains no §17 stream. A destructive drain: each call consumes what it
     /// returns (`max == 0` drains all buffered items), mirroring the per-session poll model.
     pub fn unit_outbound(&self, id: &UnitId, max: u32) -> Vec<Outbound> {
+        if let Some(r) = self.inner.children.get(id) {
+            return r.unit.drain_outbound(max);
+        }
+        // Recurse into orchestrator children; only the subtree holding `id` drains (ids are unique).
+        self.orchestrator_units()
+            .iter()
+            .map(|u| u.locate_outbound(id, max))
+            .find(|v| !v.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// The handles of this fleet's orchestrator children — the only members whose opacity hides a
+    /// sub-fleet, so the recursion descends through exactly these. Collected up front so no `DashMap`
+    /// guard is ever held across an `.await` (the routing recursion is async).
+    fn orchestrator_units(&self) -> Vec<Arc<dyn ManagedUnit>> {
         self.inner
             .children
-            .get(id)
-            .map(|r| r.unit.drain_outbound(max))
-            .unwrap_or_default()
+            .iter()
+            .filter(|e| matches!(e.value().unit.kind(), UnitKind::Orchestrator))
+            .map(|e| e.value().unit.clone())
+            .collect()
+    }
+
+    /// Route a lifecycle [`ManageCommand`] to the unit `id` at any depth, returning its [`Ack`] (or
+    /// `None` if `id` is in no subtree here). A direct child is driven in-process; a deeper unit is
+    /// reached through its orchestrator ancestor's `locate_command`.
+    pub async fn command_unit(&self, id: &UnitId, cmd: ManageCommand) -> Option<Ack> {
+        if let Some(unit) = self.inner.children.get(id).map(|r| r.unit.clone()) {
+            return Some(unit.command(cmd).await);
+        }
+        for unit in self.orchestrator_units() {
+            if let Some(ack) = unit.locate_command(id, cmd.clone()).await {
+                return Some(ack);
+            }
+        }
+        None
     }
 
     /// Route a lifecycle command to a unit, returning whether it was accepted. Pause/Resume/Scale are
     /// `Unsupported` at an engine leaf (single conversation), so these return `false` there — the
     /// surface is meaningful for orchestrator sub-fleets.
     async fn route_lifecycle(&self, id: &UnitId, cmd: ManageCommand) -> bool {
-        let unit = self.inner.children.get(id).map(|r| r.unit.clone());
-        match unit {
-            Some(unit) => matches!(
-                unit.command(cmd).await,
-                daemon_supervision::Ack::Accepted | daemon_supervision::Ack::Queued
-            ),
-            None => false,
-        }
+        matches!(
+            self.command_unit(id, cmd).await,
+            Some(Ack::Accepted | Ack::Queued)
+        )
     }
 
     /// Pause a unit's scheduling (orchestrator sub-fleets); `false` if unknown or unsupported.
@@ -365,6 +477,27 @@ impl FleetRuntime {
         })
         .await
     }
+}
+
+/// Project a direct child into its node — filling `children` with the roots of any sub-fleet it
+/// owns — and return its descendant nodes (empty for a leaf) for the flat tree. An orchestrator's
+/// descendants come from its opaque [`ManagedUnit::project_subtree`]; its *direct* children are the
+/// roots of that subtree forest (ids no other subtree node lists as a child).
+fn project_child(record: &ChildRecord, id: &UnitId) -> (UnitNode, Vec<UnitNode>) {
+    let mut node = project_unit(id, record);
+    let subtree = record.unit.project_subtree();
+    if !subtree.is_empty() {
+        let referenced: HashSet<UnitId> = subtree
+            .iter()
+            .flat_map(|n| n.children.iter().cloned())
+            .collect();
+        node.children = subtree
+            .iter()
+            .map(|n| n.id.clone())
+            .filter(|cid| !referenced.contains(cid))
+            .collect();
+    }
+    (node, subtree)
 }
 
 /// Project a child record into the GUI tree-node DTO.

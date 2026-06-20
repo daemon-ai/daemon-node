@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-use daemon_common::{Budget, JobId, RateLimitSnapshot, ReqId, UsageDelta};
+use daemon_common::{Budget, JobId, RateLimitSnapshot, ReqId, UnitId, UsageDelta};
 use serde::{Deserialize, Serialize};
 
 /// A user-authored turn input (the `StartTurn` payload; the §5 message type proper lives in core).
@@ -526,4 +526,111 @@ impl TranscriptBlock {
             TranscriptBlock::Content { .. } => "block.content",
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Management-tree projection DTOs (the GUI/TUI surface)
+// ---------------------------------------------------------------------------
+//
+// These transport-stable mirrors of the orchestration tree live here (next to `Outbound`) rather
+// than in `daemon-api` so the management contract (`daemon-supervision`'s `ManagedUnit`) can carry
+// the recursive projection/routing seam without an edge to the consumer-surface crate. `daemon-api`
+// re-exports them, so the wire mirror (`daemon-api.cddl`) and every existing call site are
+// unchanged — the same resolution already used for `Outbound`.
+
+/// What kind of unit a tree node is (a transport-stable mirror of the supervision `UnitKind`). A
+/// foreign agent and a `daemon-core` engine are both `Engine` — the GUI cannot, and need not, tell
+/// them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitKind {
+    /// A leaf brain (a `daemon-core` engine or a foreign agent over a §17 cut).
+    Engine,
+    /// A host running a unit.
+    Host,
+    /// An orchestrator running a sub-fleet.
+    Orchestrator,
+}
+
+/// A tree node's lifecycle state (decoupled from the orchestration runtime's `ChildStatus`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitState {
+    /// Attached, no terminal outcome yet (working or idle).
+    Running,
+    /// Reached a terminal outcome (`end_reason` is the supervision end reason, rendered).
+    Finished {
+        /// The terminal end reason (e.g. `Completed`, `Interrupted`, `Failed`).
+        end_reason: String,
+    },
+    /// State could not be resolved.
+    Unknown,
+}
+
+/// One node in the orchestration tree projection (the GUI's per-unit view). The tree is a flat node
+/// list plus per-node `children` ids, so deeper / cross-node nesting can fill in later without a DTO
+/// change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitNode {
+    /// The unit id.
+    pub id: UnitId,
+    /// What kind of unit this is.
+    pub kind: UnitKind,
+    /// Its lifecycle state.
+    pub state: UnitState,
+    /// A short description of the unit's current work, when known.
+    pub work: Option<String>,
+    /// The unit's folded usage.
+    pub usage: UsageDelta,
+    /// The ids of this unit's direct children.
+    pub children: Vec<UnitId>,
+}
+
+/// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeReport {
+    /// The root unit id (the node itself), when there is one.
+    pub root: Option<UnitId>,
+    /// Every node in the tree.
+    pub nodes: Vec<UnitNode>,
+}
+
+/// A transport-stable projection of a unit's management event, for GUI drill-down (decoupled from
+/// the supervision `ManageEvent`). Mirrors the per-session poll model: a bounded drain of recent
+/// events for one unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManageEventView {
+    /// The unit started a unit of work.
+    Started {
+        /// Monotonic per-unit sequence.
+        seq: u64,
+    },
+    /// Streamed progress (text/reasoning/tool activity rendered to a line).
+    Progress {
+        /// Monotonic per-unit sequence.
+        seq: u64,
+        /// A rendered progress line, when textual.
+        text: Option<String>,
+    },
+    /// A usage delta the unit reported.
+    Usage {
+        /// Monotonic per-unit sequence.
+        seq: u64,
+        /// The reported delta.
+        delta: UsageDelta,
+    },
+    /// The unit reached a terminal outcome.
+    Finished {
+        /// Monotonic per-unit sequence.
+        seq: u64,
+        /// The terminal end reason, rendered.
+        end_reason: String,
+        /// A final summary, when present.
+        summary: Option<String>,
+    },
+    /// The unit raised an error.
+    Error {
+        /// Monotonic per-unit sequence.
+        seq: u64,
+        /// A rendered error message.
+        message: String,
+    },
 }

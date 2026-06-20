@@ -1577,6 +1577,43 @@ mod node_interface {
             profile: ProfileRef::new("openai"),
             engine_config: daemon_core::Config::default(),
             journal_seed: Some([0x11; 32]),
+            nesting_depth: 0,
+        });
+        (node, handle)
+    }
+
+    /// Assemble a node whose top fleet nests `depth` orchestrator level(s) before its engine leaves
+    /// (fleets-of-fleets), so the management tree the GUI projects is genuinely recursive. Same mock
+    /// providers as [`assemble`]: the durable orchestrator delegates once, every child completes.
+    fn assemble_nested(depth: usize) -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
+        let mut providers = ProviderRegistry::new();
+        providers.set_default(Arc::new(|| {
+            Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
+        }));
+        providers.register(
+            "orchestrator",
+            Arc::new(|| {
+                Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
+            }),
+        );
+        providers.register(
+            "child",
+            Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
+        );
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: HostConfig {
+                partition: PARTITION,
+                ..HostConfig::default()
+            },
+            providers,
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x22; 32]),
+            nesting_depth: depth,
         });
         (node, handle)
     }
@@ -1741,11 +1778,28 @@ mod node_interface {
             !socket_tree.nodes.is_empty(),
             "expected at least one unit in the tree"
         );
-        let child = socket_tree.nodes[0].clone();
+        // The tree is rooted at the node's synthetic root, whose children are the fleet members.
+        let root = socket_tree.root.clone().expect("the node tree is rooted");
+        let root_node = socket_tree
+            .nodes
+            .iter()
+            .find(|n| n.id == root)
+            .expect("the root node is present");
         assert_eq!(
-            child.kind,
-            daemon_api::UnitKind::Engine,
-            "a fleet child is an Engine leaf"
+            root_node.kind,
+            daemon_api::UnitKind::Orchestrator,
+            "the node root projects as an orchestrator"
+        );
+        // The fleet child presents as an Engine leaf (a flat node, depth 0).
+        let child = socket_tree
+            .nodes
+            .iter()
+            .find(|n| n.kind == daemon_api::UnitKind::Engine)
+            .expect("a fleet child Engine leaf is present")
+            .clone();
+        assert!(
+            root_node.children.contains(&child.id),
+            "the engine leaf is a direct child of the node root"
         );
 
         // unit() parity.
@@ -1817,6 +1871,217 @@ mod node_interface {
         assert!(node.pause(child.id.clone()).await.is_err());
         assert!(node.resume(child.id.clone()).await.is_err());
         assert!(node.scale(child.id.clone(), 2).await.is_err());
+
+        server.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The recursive fleets-of-fleets projection: a node nested one orchestrator level deep projects
+    /// a genuine multi-level tree, every node — including a *grandchild* — is addressable by `UnitId`
+    /// at any depth, pause/resume/scale route into the orchestrator's sub-fleet (no longer
+    /// `Unsupported`), and the whole projection is byte-identical in-process and over the socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_tree_projection_is_recursive_and_transport_agnostic() {
+        let (node, handle) = assemble_nested(1);
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+
+        // One durable delegation: the top fleet spawns an orchestrator child, which delegates to a
+        // leaf grandchild in its own sub-fleet — two levels below the node root.
+        let session = SessionId::new("nest-op");
+        assert!(matches!(
+            client
+                .call(ApiRequest::Assign {
+                    session: session.clone()
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let ApiResponse::Sessions(list) = client.call(ApiRequest::Sessions).await.unwrap() {
+                if list
+                    .iter()
+                    .any(|i| i.session == session && i.state == SessionState::Completed)
+                {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "the assigned session never completed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // (a) tree() projects root + 2+ levels with correct per-node children ids, identically on
+        // both transports.
+        let inproc_tree = node.tree().await;
+        let socket_tree = match client.call(ApiRequest::Tree).await.unwrap() {
+            ApiResponse::Tree(t) => t,
+            other => panic!("expected Tree, got {other:?}"),
+        };
+        assert_eq!(inproc_tree, socket_tree, "tree must agree across transports");
+
+        let root = socket_tree.root.clone().expect("the node tree is rooted");
+        let orchestrator = socket_tree
+            .nodes
+            .iter()
+            .find(|n| n.kind == daemon_api::UnitKind::Orchestrator && n.id != root)
+            .expect("an orchestrator child is present")
+            .clone();
+        let grandchild = socket_tree
+            .nodes
+            .iter()
+            .find(|n| n.kind == daemon_api::UnitKind::Engine)
+            .expect("a leaf grandchild is present")
+            .clone();
+        // The root owns the orchestrator; the orchestrator owns the grandchild (real nesting).
+        assert!(
+            socket_tree
+                .nodes
+                .iter()
+                .find(|n| n.id == root)
+                .unwrap()
+                .children
+                .contains(&orchestrator.id),
+            "the node root's children include the orchestrator"
+        );
+        assert!(
+            orchestrator.children.contains(&grandchild.id),
+            "the orchestrator's children include the grandchild ({:?} not in {:?})",
+            grandchild.id,
+            orchestrator.children
+        );
+        assert!(
+            grandchild.id.as_str().contains('/'),
+            "the grandchild id is namespaced under its sub-fleet, got {:?}",
+            grandchild.id
+        );
+
+        // (b) unit / unit_events / unit_outbound / unit_history resolve the *grandchild* by id at
+        // depth, identically on both transports.
+        let inproc_unit = node.unit(grandchild.id.clone()).await;
+        let socket_unit = match client
+            .call(ApiRequest::Unit {
+                unit: grandchild.id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::Unit(u) => u,
+            other => panic!("expected Unit, got {other:?}"),
+        };
+        assert_eq!(inproc_unit, socket_unit, "grandchild unit view must agree");
+        assert_eq!(
+            socket_unit.expect("grandchild resolves by id").id,
+            grandchild.id,
+            "the resolved node is the grandchild"
+        );
+
+        let socket_events = match client
+            .call(ApiRequest::UnitEvents {
+                unit: grandchild.id.clone(),
+                max: 0,
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::UnitEvents(e) => e,
+            other => panic!("expected UnitEvents, got {other:?}"),
+        };
+        assert_eq!(
+            node.unit_events(grandchild.id.clone(), 0).await,
+            socket_events,
+            "grandchild events must agree across transports"
+        );
+        assert!(
+            !socket_events.is_empty(),
+            "expected buffered drill-down events for the grandchild"
+        );
+
+        // unit_outbound routes by id to the grandchild's own retained §17 drain at depth (a *live*,
+        // destructive drain — so a single read proves routing rather than two-transport equality).
+        let socket_outbound = match client
+            .call(ApiRequest::UnitOutbound {
+                unit: grandchild.id.clone(),
+                max: 0,
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::Drained(o) => o,
+            other => panic!("expected Drained, got {other:?}"),
+        };
+        assert!(
+            !socket_outbound.is_empty(),
+            "the grandchild's §17 outbound stream resolves by id at depth"
+        );
+
+        // The grandchild's durable, verifiable history routes by its id (it journaled its turn).
+        let history_deadline = Instant::now() + Duration::from_secs(10);
+        let socket_history = loop {
+            let page = match client
+                .call(ApiRequest::UnitHistory {
+                    unit: grandchild.id.clone(),
+                    after_cursor: 0,
+                    max: 0,
+                })
+                .await
+                .unwrap()
+            {
+                ApiResponse::Journal(p) => p,
+                other => panic!("expected Journal, got {other:?}"),
+            };
+            if !page.entries.is_empty() || Instant::now() >= history_deadline {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            !socket_history.entries.is_empty(),
+            "expected durable history entries for the grandchild"
+        );
+        assert_eq!(
+            node.unit_history(grandchild.id.clone(), 0, 0).await,
+            socket_history,
+            "grandchild history must agree across transports"
+        );
+
+        // (c) pause/resume/scale route into the orchestrator's sub-fleet — Accepted, not Unsupported.
+        for (req, label) in [
+            (
+                ApiRequest::Pause {
+                    unit: orchestrator.id.clone(),
+                },
+                "pause",
+            ),
+            (
+                ApiRequest::Resume {
+                    unit: orchestrator.id.clone(),
+                },
+                "resume",
+            ),
+            (
+                ApiRequest::Scale {
+                    unit: orchestrator.id.clone(),
+                    n: 2,
+                },
+                "scale",
+            ),
+        ] {
+            let socket = client.call(req).await.unwrap();
+            assert!(
+                matches!(socket, ApiResponse::Ok),
+                "{label} should route into the orchestrator sub-fleet, got {socket:?}"
+            );
+        }
+        // The same lifecycle ops succeed in-process too (transport parity for commands).
+        assert!(node.pause(orchestrator.id.clone()).await.is_ok());
+        assert!(node.resume(orchestrator.id.clone()).await.is_ok());
+        assert!(node.scale(orchestrator.id.clone(), 2).await.is_ok());
 
         server.abort();
         handle.shutdown().await;

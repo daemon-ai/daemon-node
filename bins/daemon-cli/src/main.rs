@@ -296,12 +296,10 @@ fn render(resp: ApiResponse) {
         ApiResponse::Tree(t) => {
             println!(
                 "tree: root={} nodes={}",
-                t.root.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
+                t.root.as_ref().map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
                 t.nodes.len()
             );
-            for n in t.nodes {
-                render_unit_node(&n);
-            }
+            render_tree(&t);
         }
         ApiResponse::Unit(unit) => match unit {
             Some(n) => render_unit_node(&n),
@@ -342,10 +340,56 @@ fn render(resp: ApiResponse) {
     }
 }
 
-/// Render one tree node line (id, kind, state, work, usage).
+/// Render the orchestration tree with depth: a DFS from `root`, indenting each level, so the
+/// GUI/TUI's nested fleets-of-fleets read as a tree rather than a flat roster. Any node not
+/// reachable from the root (there should be none) is printed flat afterwards, so nothing is hidden.
+fn render_tree(t: &daemon_api::TreeReport) {
+    use std::collections::{HashMap, HashSet};
+    let index: HashMap<&UnitId, &daemon_api::UnitNode> =
+        t.nodes.iter().map(|n| (&n.id, n)).collect();
+    let mut seen: HashSet<UnitId> = HashSet::new();
+    if let Some(root) = &t.root {
+        render_tree_node(root, &index, 0, &mut seen);
+    }
+    for n in &t.nodes {
+        if !seen.contains(&n.id) {
+            render_unit_node_at(n, 0);
+            seen.insert(n.id.clone());
+        }
+    }
+}
+
+/// Render `id`'s node indented at `depth`, then recurse into its children (cycle-guarded).
+fn render_tree_node(
+    id: &UnitId,
+    index: &std::collections::HashMap<&UnitId, &daemon_api::UnitNode>,
+    depth: usize,
+    seen: &mut std::collections::HashSet<UnitId>,
+) {
+    if !seen.insert(id.clone()) {
+        return;
+    }
+    match index.get(id) {
+        Some(n) => {
+            render_unit_node_at(n, depth);
+            for child in &n.children {
+                render_tree_node(child, index, depth + 1, seen);
+            }
+        }
+        None => println!("{}- {} (not projected)", "  ".repeat(depth + 1), id),
+    }
+}
+
+/// Render one tree node line (id, kind, state, work, usage), indented by tree `depth`.
 fn render_unit_node(n: &daemon_api::UnitNode) {
+    render_unit_node_at(n, 0);
+}
+
+/// Render one tree node line indented by `depth` levels.
+fn render_unit_node_at(n: &daemon_api::UnitNode, depth: usize) {
     println!(
-        "  - {} kind={:?} state={:?} work={} usage(in={} out={} api_calls={}) children={}",
+        "{}- {} kind={:?} state={:?} work={} usage(in={} out={} api_calls={}) children={}",
+        "  ".repeat(depth + 1),
         n.id,
         n.kind,
         n.state,

@@ -230,102 +230,14 @@ pub struct FleetReport {
     pub usage: UsageDelta,
 }
 
-/// What kind of unit a tree node is (a transport-stable mirror of the supervision `UnitKind`). A
-/// foreign agent and a `daemon-core` engine are both `Engine` — the GUI cannot, and need not, tell
-/// them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UnitKind {
-    /// A leaf brain (a `daemon-core` engine or a foreign agent over a §17 cut).
-    Engine,
-    /// A host running a unit.
-    Host,
-    /// An orchestrator running a sub-fleet.
-    Orchestrator,
-}
+// `UnitKind`, `UnitState`, `UnitNode`, and `TreeReport` are defined in `daemon-protocol` (next to
+// `Outbound`) so the management contract can carry the projection seam without depending on this
+// surface crate; they are re-exported here so every transport and the cddl mirror are unchanged.
+pub use daemon_protocol::{TreeReport, UnitKind, UnitNode, UnitState};
 
-/// A tree node's lifecycle state (decoupled from the orchestration runtime's `ChildStatus`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UnitState {
-    /// Attached, no terminal outcome yet (working or idle).
-    Running,
-    /// Reached a terminal outcome (`end_reason` is the supervision end reason, rendered).
-    Finished {
-        /// The terminal end reason (e.g. `Completed`, `Interrupted`, `Failed`).
-        end_reason: String,
-    },
-    /// State could not be resolved.
-    Unknown,
-}
-
-/// One node in the orchestration tree projection (the GUI's per-unit view). The tree is a flat node
-/// list plus per-node `children` ids, so deeper / cross-node nesting can fill in later without a DTO
-/// change.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnitNode {
-    /// The unit id.
-    pub id: UnitId,
-    /// What kind of unit this is.
-    pub kind: UnitKind,
-    /// Its lifecycle state.
-    pub state: UnitState,
-    /// A short description of the unit's current work, when known.
-    pub work: Option<String>,
-    /// The unit's folded usage.
-    pub usage: UsageDelta,
-    /// The ids of this unit's direct children.
-    pub children: Vec<UnitId>,
-}
-
-/// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeReport {
-    /// The root unit id (the node itself), when there is one.
-    pub root: Option<UnitId>,
-    /// Every node in the tree.
-    pub nodes: Vec<UnitNode>,
-}
-
-/// A transport-stable projection of a unit's management event, for GUI drill-down (decoupled from
-/// the supervision `ManageEvent`). Mirrors the per-session poll model: a bounded drain of recent
-/// events for one unit.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ManageEventView {
-    /// The unit started a unit of work.
-    Started {
-        /// Monotonic per-unit sequence.
-        seq: u64,
-    },
-    /// Streamed progress (text/reasoning/tool activity rendered to a line).
-    Progress {
-        /// Monotonic per-unit sequence.
-        seq: u64,
-        /// A rendered progress line, when textual.
-        text: Option<String>,
-    },
-    /// A usage delta the unit reported.
-    Usage {
-        /// Monotonic per-unit sequence.
-        seq: u64,
-        /// The reported delta.
-        delta: UsageDelta,
-    },
-    /// The unit reached a terminal outcome.
-    Finished {
-        /// Monotonic per-unit sequence.
-        seq: u64,
-        /// The terminal end reason, rendered.
-        end_reason: String,
-        /// A final summary, when present.
-        summary: Option<String>,
-    },
-    /// The unit raised an error.
-    Error {
-        /// Monotonic per-unit sequence.
-        seq: u64,
-        /// A rendered error message.
-        message: String,
-    },
-}
+// `ManageEventView` is defined in `daemon-protocol` (so the `ManagedUnit` projection seam can carry
+// it without a surface-crate edge) and re-exported here unchanged.
+pub use daemon_protocol::ManageEventView;
 
 // ---------------------------------------------------------------------------
 // Verifiable journal read DTOs (the non-destructive reconnect / scroll-back surface)
