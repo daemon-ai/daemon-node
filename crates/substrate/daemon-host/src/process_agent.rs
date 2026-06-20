@@ -88,8 +88,18 @@ pub struct ProcessAgentUnit;
 impl ProcessAgentUnit {
     /// Wrap a live [`Placement`] (a spawned foreign agent + its cut) as a managed unit `id`.
     pub fn start(id: UnitId, placement: Placement) -> AgentUnit {
+        Self::start_journaled(id, placement, None)
+    }
+
+    /// As [`Self::start`], but durably journals the foreign agent's transcript (finished blocks +
+    /// lifecycle, sealed per turn) into `journal` when provided.
+    pub fn start_journaled(
+        id: UnitId,
+        placement: Placement,
+        journal: Option<Arc<crate::journal::JournalFeeder>>,
+    ) -> AgentUnit {
         let Placement { channel, child } = placement;
-        AgentUnit::start(id, move |host: Arc<dyn HostRequestHandler>| {
+        AgentUnit::start_journaled(id, journal, move |host: Arc<dyn HostRequestHandler>| {
             Arc::new(ProcessSection17::from_channel(channel, Some(child), host))
                 as Arc<dyn Section17Session>
         })
@@ -99,7 +109,7 @@ impl ProcessAgentUnit {
     /// Used by tests to exercise the cut framing without spawning a process.
     #[cfg(test)]
     pub fn from_channel(id: UnitId, channel: CutChannel) -> AgentUnit {
-        AgentUnit::start(id, move |host: Arc<dyn HostRequestHandler>| {
+        AgentUnit::start_journaled(id, None, move |host: Arc<dyn HostRequestHandler>| {
             Arc::new(ProcessSection17::from_channel(channel, None, host))
                 as Arc<dyn Section17Session>
         })

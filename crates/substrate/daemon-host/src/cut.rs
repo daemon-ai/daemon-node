@@ -21,15 +21,17 @@ use crate::credentials::CredentialBroker;
 use async_trait::async_trait;
 use daemon_activation::{ActivationManager, ActivationSubstrate, EngineFactory, SubErr};
 use daemon_common::{
-    CapabilityLease, CredError, CredId, CredScope, DaemonError, FenceToken, LeaseSecret,
-    PartitionId, ProfileRef, SessionId, SnapshotBlob, TraceId, UnitId, UsageDelta,
+    CapabilityLease, CredError, CredId, CredScope, DaemonError, FenceToken, JournalStreamId,
+    LeaseSecret, MerkleRoot, PartitionId, ProfileRef, SessionId, SnapshotBlob, TraceId, UnitId,
+    UsageDelta,
 };
 use daemon_core::CredentialProvider;
-use daemon_provision::{ChildGuard, CutChannel, CutWriter, Placement};
-use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics};
+use crate::engine_incarnation::CoreEngineFactory;
+use daemon_provision::{ChildGuard, CutChannel, CutReader, CutWriter, Placement};
+use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics, TraceSigner};
 use daemon_store::{
-    Activation, Checkpoint, JobCommand, JobCompletion, SessionStatus, SessionStore, StoreError,
-    StoreErrorWire, StoreStats,
+    Activation, Checkpoint, JobCommand, JobCompletion, JournalPage, SessionStatus, SessionStore,
+    StoreError, StoreErrorWire, StoreStats, TraceEntry, TraceSegment,
 };
 use daemon_supervision::{
     Ack, EndReason, EventStream, FailureClass, FailureView, ManageCommand, ManageEvent,
@@ -203,6 +205,45 @@ pub enum StoreCall {
     },
     /// [`SessionStore::stats`].
     Stats,
+    /// [`SessionStore::append_trace`] — a placed child appends a journal entry to the parent's
+    /// authoritative store.
+    AppendTrace {
+        /// The journal stream.
+        stream: JournalStreamId,
+        /// The segment (turn / incarnation).
+        segment: u64,
+        /// The opaque entry.
+        entry: TraceEntry,
+    },
+    /// [`SessionStore::commit_trace_segment`] — seal a segment with its signed root.
+    CommitTraceSegment {
+        /// The journal stream.
+        stream: JournalStreamId,
+        /// The segment to seal.
+        segment: u64,
+        /// The Merkle root.
+        root: MerkleRoot,
+        /// The detached signature over the root.
+        signature: Vec<u8>,
+        /// The committing fence (`None` for an unfenced/non-durable seal).
+        fence: Option<FenceToken>,
+    },
+    /// [`SessionStore::load_trace_segment`] — load one segment (the seal-recompute path).
+    LoadTraceSegment {
+        /// The journal stream.
+        stream: JournalStreamId,
+        /// The segment.
+        segment: u64,
+    },
+    /// [`SessionStore::load_journal`] — cursor-paged read of a stream's journal.
+    LoadJournal {
+        /// The journal stream.
+        stream: JournalStreamId,
+        /// The exclusive lower-bound cursor.
+        after_cursor: u64,
+        /// The page size (0 = all).
+        max: u32,
+    },
 }
 
 /// The reply to a [`StoreCall`], typed per the trait's return shape. Fallible calls carry a
@@ -225,6 +266,10 @@ pub enum StoreReplyBody {
     MaybeStatus(Option<SessionStatus>),
     /// A `stats` reply.
     Stats(StoreStats),
+    /// A `load_trace_segment` reply.
+    MaybeSegment(Option<TraceSegment>),
+    /// A `load_journal` reply.
+    Journal(JournalPage),
 }
 
 /// The on-wire envelope: every cut frame rides with the sender's task-local [`TraceId`] so the
@@ -316,6 +361,36 @@ async fn serve_store_call(store: &dyn SessionStore, call: StoreCall) -> StoreRep
         StoreCall::DequeueWake => StoreReplyBody::MaybeWake(store.dequeue_wake().await),
         StoreCall::Status { id } => StoreReplyBody::MaybeStatus(store.status(&id).await),
         StoreCall::Stats => StoreReplyBody::Stats(store.stats().await),
+        StoreCall::AppendTrace {
+            stream,
+            segment,
+            entry,
+        } => StoreReplyBody::Unit(
+            store
+                .append_trace(&stream, segment, entry)
+                .await
+                .map_err(|e| StoreErrorWire::from(&e)),
+        ),
+        StoreCall::CommitTraceSegment {
+            stream,
+            segment,
+            root,
+            signature,
+            fence,
+        } => StoreReplyBody::Unit(
+            store
+                .commit_trace_segment(&stream, segment, root, signature, fence)
+                .await
+                .map_err(|e| StoreErrorWire::from(&e)),
+        ),
+        StoreCall::LoadTraceSegment { stream, segment } => {
+            StoreReplyBody::MaybeSegment(store.load_trace_segment(&stream, segment).await)
+        }
+        StoreCall::LoadJournal {
+            stream,
+            after_cursor,
+            max,
+        } => StoreReplyBody::Journal(store.load_journal(&stream, after_cursor, max).await),
     }
 }
 
@@ -499,6 +574,84 @@ impl SessionStore for RemoteStoreClient {
         match self.call(StoreCall::Stats).await {
             StoreReplyBody::Stats(s) => s,
             _ => StoreStats::default(),
+        }
+    }
+
+    async fn append_trace(
+        &self,
+        stream: &JournalStreamId,
+        segment: u64,
+        entry: TraceEntry,
+    ) -> Result<(), StoreError> {
+        match self
+            .call(StoreCall::AppendTrace {
+                stream: stream.clone(),
+                segment,
+                entry,
+            })
+            .await
+        {
+            StoreReplyBody::Unit(r) => r.map_err(StoreErrorWire::into_store_error),
+            _ => unexpected_reply(),
+        }
+    }
+
+    async fn commit_trace_segment(
+        &self,
+        stream: &JournalStreamId,
+        segment: u64,
+        root: MerkleRoot,
+        signature: Vec<u8>,
+        fence: Option<FenceToken>,
+    ) -> Result<(), StoreError> {
+        match self
+            .call(StoreCall::CommitTraceSegment {
+                stream: stream.clone(),
+                segment,
+                root,
+                signature,
+                fence,
+            })
+            .await
+        {
+            StoreReplyBody::Unit(r) => r.map_err(StoreErrorWire::into_store_error),
+            _ => unexpected_reply(),
+        }
+    }
+
+    async fn load_trace_segment(
+        &self,
+        stream: &JournalStreamId,
+        segment: u64,
+    ) -> Option<TraceSegment> {
+        match self
+            .call(StoreCall::LoadTraceSegment {
+                stream: stream.clone(),
+                segment,
+            })
+            .await
+        {
+            StoreReplyBody::MaybeSegment(s) => s,
+            _ => None,
+        }
+    }
+
+    async fn load_journal(
+        &self,
+        stream: &JournalStreamId,
+        after_cursor: u64,
+        max: u32,
+    ) -> JournalPage {
+        match self
+            .call(StoreCall::LoadJournal {
+                stream: stream.clone(),
+                after_cursor,
+                max,
+            })
+            .await
+        {
+            StoreReplyBody::Journal(p) => p,
+            _ => JournalPage::default(),
         }
     }
 }
@@ -857,8 +1010,39 @@ pub async fn run_placed_child(
     factory: Arc<dyn EngineFactory>,
     partition: PartitionId,
 ) {
-    let (writer, mut reader) = channel.split();
+    let (writer, reader) = channel.split();
     let client = Arc::new(RemoteStoreClient::new(writer.clone()));
+    drive_placed_child(writer, reader, client, factory, partition).await;
+}
+
+/// Like [`run_placed_child`], but the child journals its durable history **through the parent's
+/// authoritative store** (the brokered [`RemoteStoreClient`]) and seals each segment with a
+/// config-seeded node [`TraceSigner`]. The parent stores the entry bytes and sealed roots; the
+/// child holds only the seed (shared with the node), so the chain verifies under the node's
+/// published verifying key without the child ever owning the parent's store.
+pub async fn run_placed_child_journaled(
+    channel: CutChannel,
+    factory: CoreEngineFactory,
+    partition: PartitionId,
+    signer: Arc<TraceSigner>,
+) {
+    let (writer, reader) = channel.split();
+    let client = Arc::new(RemoteStoreClient::new(writer.clone()));
+    let factory = Arc::new(
+        factory.with_journal(client.clone() as Arc<dyn SessionStore>, signer),
+    ) as Arc<dyn EngineFactory>;
+    drive_placed_child(writer, reader, client, factory, partition).await;
+}
+
+/// The shared placed-child drive loop, parameterised over an already-built brokered store client and
+/// engine factory so both the plain and journaled entry points reuse one verbatim cycle.
+async fn drive_placed_child(
+    writer: CutWriter,
+    mut reader: CutReader,
+    client: Arc<RemoteStoreClient>,
+    factory: Arc<dyn EngineFactory>,
+    partition: PartitionId,
+) {
     let manager = ActivationManager::new(client.clone() as Arc<dyn SessionStore>, factory, partition);
 
     while let Some(bytes) = reader.recv().await {

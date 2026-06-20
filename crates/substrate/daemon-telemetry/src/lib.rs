@@ -22,8 +22,8 @@ pub mod metrics;
 pub mod trace;
 
 pub use journal::{
-    encode_entry, segment_root, verify_segment, SegmentInput, TraceRecord, TraceSigner,
-    VerifyError, VerifyingKey, GENESIS_ROOT,
+    decode_entry, encode_entry, segment_root, verify_segment, JournalEntryView, JournalPayload,
+    SegmentInput, TraceSigner, VerifyError, VerifyingKey, GENESIS_ROOT,
 };
 pub use metrics::{Dump, Metrics};
 pub use trace::{current_trace, set_trace, with_trace};

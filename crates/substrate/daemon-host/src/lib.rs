@@ -40,6 +40,7 @@ pub mod section17;
 pub mod services;
 pub mod socket;
 pub mod supervisor;
+pub mod transcript;
 pub mod unit;
 
 pub use config::HostConfig;
@@ -50,8 +51,9 @@ pub use cut::{
     run_placed_child, serve_credentials, CredCall, CredReplyBody, CutFrame, PlacedUnit,
     RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
 };
-pub use journal::{journal_stream, JournalSink};
-pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, ProviderBuilder};
+pub use journal::{journal_stream, JournalFeeder, JournalSink};
+pub use transcript::{BlockCoalescer, JournalAction};
+pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
 pub use node_api::{NodeApiImpl, SessionEngineBuilder};
 pub use socket::{serve_api_unix, ApiClient};
 pub use supervisor::{

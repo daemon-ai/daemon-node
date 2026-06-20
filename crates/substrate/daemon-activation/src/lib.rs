@@ -191,7 +191,10 @@ impl ActivationManager {
         }
         let fence = self.inner.store.acquire_activation_lease(&id).await?;
         match self.activate(id, fence).await {
-            Err(SubErr::Busy(_)) => Ok(()),
+            // A concurrent incarnation is already driving this session, so wake's contract ("ensure
+            // it is progressing") is satisfied: an in-process `Busy` guard, or a superseding lease
+            // that fenced our incarnation (e.g. the resident recovery scanner won the lease race).
+            Err(SubErr::Busy(_)) | Err(SubErr::Store(StoreError::Fenced { .. })) => Ok(()),
             other => other,
         }
     }

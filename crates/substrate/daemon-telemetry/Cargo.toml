@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 daemon-common = { workspace = true }
 serde = { workspace = true }
+ciborium = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

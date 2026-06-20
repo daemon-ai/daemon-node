@@ -163,6 +163,15 @@ re-entrancy and lock-ordering hazards of Rust calling back into arbitrary C on a
 composes with any host event loop. An optional readiness fd avoids busy-waiting. (A callback-register
 variant MAY be added later for languages that prefer it, but the drain queue is the contract.)
 
+The drain is **destructive and live-only**: each item is delivered once, to a connected client, at
+full §17 fidelity (streaming deltas included). It is *not* the transcript of record. Durable,
+non-destructive **reconnect / scroll-back** is a distinct read — `session_history` /`unit_history` on
+the node surface (`ApiResponse::Journal`) — over the unified verifiable journal (host-spec §5.1):
+cursor-paged, returning *decoded, finished* blocks (not deltas) each stamped with its sealed
+segment's `verified` flag. A reconnecting GUI rebuilds scroll-back from the history read, then
+follows the live drain for new deltas. (The session-only FFI exposes the drain today; a history read
+over the C ABI is an optional later addition — `dispatch_session` already accepts the request.)
+
 ### 3.3 `HostRequest` — the one genuinely blocking sub-seam
 
 Blocking human-in-the-loop / delegation requests (`HostRequestKind::Approval/Input/Choice/Delegate`,

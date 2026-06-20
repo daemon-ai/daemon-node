@@ -132,6 +132,8 @@ same trait.
 | `wake_outbox` | durable `Wake(SessionId)` hints | at-least-once delivery; consumer is idempotent |
 | `job_outbox` | durable background-job commands | at-least-once dispatch to workers |
 | `activation_leases` | partition ownership + monotonic fencing token | only the highest fence may commit |
+| `journal_entries` | the verifiable journal's append-only entries (opaque CBOR + content hash) | `UNIQUE(stream, segment, seq)`; a monotonic `cursor` keys the non-destructive read (§5.1) |
+| `journal_roots` | per-segment sealed Merkle root + signature | one row per `(stream, segment)`; the rolling hash chain |
 
 All four cross-cutting transactions (`checkpoint_and_enqueue`, `record_completion_and_wake`,
 `load_for_activation`, lease acquire/renew) are single transactions on this store.
@@ -172,6 +174,47 @@ Root supervisor
 > hand-rolled `TaskTracker` + thin restart/backoff wrapper is the equally-valid alternative and
 > avoids the pin. Note also that `panic = "abort"` defeats catch-unwind-based supervision in any of
 > these crates (`ractor/ractor/src/lib.rs:124-125`), so the production profile must use unwinding.
+
+---
+
+## 5.1 The unified verifiable journal (durable transcript history)
+
+The host keeps **one** hash-linked, per-segment-signed chain per *stream* that carries **both**
+coarse management/lifecycle records **and** the coalesced finished **chat blocks** of a transcript.
+There is no separate "audit log" and "transcript store": an auditor (or a reconnecting GUI) follows
+a single ordered chain to see *who managed what* and *what was said*, end to end.
+
+- **Keyed `(stream, segment, seq)`.** A `stream` ([`JournalStreamId`]) is any addressable agent in
+  the tree — a durable session, a live interactive session, or a fleet/foreign unit — so the journal
+  is decoupled from the durable `(session, epoch)` identity and **every** unit journals the same way.
+  A `segment` is one **turn** (streaming paths) or one **incarnation** (the durable path).
+- **What is journaled (and what is not).** The host folds the fine-grained §17 stream through a
+  *block coalescer*: streaming text/reasoning deltas, usage, and rate-limit snapshots are **not**
+  individually journaled. Only **finished blocks** graduate into history — an assembled assistant
+  message, a tool call/result (opaque structured `detail` rides through untouched), a raised host
+  request, or a coalesced opaque content block (e.g. a foreign agent's terminal stream). This is the
+  signing/verification unit: we seal the *finished* record, not in-progress reasoning.
+- **Sealed per turn, chained.** At each turn boundary the open segment is folded into a Gordian
+  Envelope whose digest is the segment **Merkle root**, signed with the node's ed25519 key, and the
+  next segment chains onto that root (a rolling chain). Any mutation to an entry, the set of entries,
+  or the chain is detected by re-derivation. The durable path seals **fenced** (only the incarnation
+  holding the highest lease may commit, exactly like a checkpoint); non-durable streams seal
+  **unfenced** (the signature is the integrity primitive — there is no competing incarnation).
+- **Two reads, two purposes.** The **live drain** (`ControlApi::unit_outbound` / `SessionApi::poll`)
+  is a *destructive*, best-effort, full-fidelity delta stream for a *connected* client. The
+  **history read** (`ControlApi::unit_history` / `SessionApi::session_history`) is the
+  *non-destructive*, cursor-paged, **decoded + verified** durable read for *reconnect / scroll-back*
+  and audit: repeated reads from the same cursor return the same page, each entry decoded to its
+  typed block and stamped with its sealed segment's `verified` flag.
+- **Offline verification.** The node publishes its **verifying key** (`ControlApi::verifying_key`,
+  `daemon-cli verifying-key`) so an auditor can verify the sealed chain without trusting the node.
+  Seeding the signer from config (`DAEMON_JOURNAL_SEED`) keeps the verifying key stable across
+  restarts. Across a placement cut, a placed child journals **through the parent's authoritative
+  store** (the brokered store client) and seals with the config-seeded node key, so the chain
+  verifies under the node's one published key without the child ever owning the parent's store.
+
+The crypto lives in `daemon-telemetry`; the store persists only the opaque entry bytes, content
+hashes, and 32-byte roots (it never learns the protocol or the key), keeping the DAG layering clean.
 
 ---
 

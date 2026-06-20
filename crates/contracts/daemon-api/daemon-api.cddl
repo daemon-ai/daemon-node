@@ -133,6 +133,37 @@ manage-event-view = { "Started": { seq: uint } }
                   / { "Finished": { seq: uint, end_reason: tstr, summary: (tstr / null) } }
                   / { "Error": { seq: uint, message: tstr } }
 
+; ----- verifiable journal read DTOs (non-destructive reconnect / scroll-back history) -----
+; A finished, coalesced chat block (daemon-protocol TranscriptBlock), already decoded for the
+; consumer. Opaque tool `detail` / content `body` ride through as in the live shapes above.
+transcript-role  = "Assistant" / "User" / "System"
+transcript-block = { "Message": { role: transcript-role, text: tstr } }
+                 / { "ToolCall": { call_id: tstr, name: tstr, args_summary: tstr, ? detail: (tool-detail / null) } }
+                 / { "ToolResult": { call_id: tstr, ok: bool, summary: tstr, ? detail: (tool-detail / null) } }
+                 / { "Request": { request_id: req-id, kind: any } }
+                 / { "Content": { kind: tstr, body: bstr } }
+
+journal-record-payload = { "Management": { detail: tstr } }
+                       / { "Block": { block: transcript-block } }
+
+journal-record = {
+  cursor: uint,
+  segment: uint,
+  seq: uint,
+  epoch: uint,
+  trace: uint,
+  kind: tstr,
+  timestamp_ms: uint,
+  verified: bool,
+  payload: journal-record-payload,
+}
+
+journal-page-view = {
+  entries: [* journal-record],
+  next_cursor: uint,
+  head_cursor: uint,
+}
+
 api-error = { "UnknownSession": tstr }
           / { "Unsupported": tstr }
           / { "Conflict": tstr }
@@ -152,9 +183,12 @@ api-request = { "Submit": { session: session-id, command: agent-command } }
             / { "Unit": { unit: unit-id } }
             / { "UnitEvents": { unit: unit-id, max: uint } }
             / { "UnitOutbound": { unit: unit-id, max: uint } }   ; rich §17 drain -> Drained
+            / { "SessionHistory": { session: session-id, after_cursor: uint, max: uint } }
+            / { "UnitHistory": { unit: unit-id, after_cursor: uint, max: uint } }
             / { "Pause": { unit: unit-id } }
             / { "Resume": { unit: unit-id } }
             / { "Scale": { unit: unit-id, n: uint } }
+            / "VerifyingKey"
 
 api-response = "Ok"
              / { "Drained": [* outbound] }
@@ -165,4 +199,6 @@ api-response = "Ok"
              / { "Tree": tree-report }
              / { "Unit": (unit-node / null) }
              / { "UnitEvents": [* manage-event-view] }
+             / { "Journal": journal-page-view }
+             / { "VerifyingKey": (tstr / null) }
              / { "Error": api-error }

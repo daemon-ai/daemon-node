@@ -12,13 +12,13 @@
 //! transaction / before any post-commit fault fires, so a crash boundary leaves consistent state.
 
 use crate::{
-    Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, SessionStatus,
-    SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
+    Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
+    JournalPage, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
-    ContentHash, DaemonError, Epoch, FenceToken, JobId, MerkleRoot, PartitionId, SessionId,
-    SnapshotBlob,
+    ContentHash, DaemonError, Epoch, FenceToken, JobId, JournalStreamId, MerkleRoot, PartitionId,
+    SessionId, SnapshotBlob,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -67,21 +67,22 @@ CREATE TABLE IF NOT EXISTS wake_outbox (
     session_id TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS trace_entries (
-    session_id   TEXT NOT NULL,
-    epoch        INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS journal_entries (
+    cursor       INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream       TEXT NOT NULL,
+    segment      INTEGER NOT NULL,
     seq          INTEGER NOT NULL,
     bytes        BLOB NOT NULL,
     content_hash BLOB NOT NULL,
-    PRIMARY KEY (session_id, epoch, seq)
+    UNIQUE (stream, segment, seq)
 );
 
-CREATE TABLE IF NOT EXISTS trace_roots (
-    session_id TEXT NOT NULL,
-    epoch      INTEGER NOT NULL,
-    root       BLOB NOT NULL,
-    signature  BLOB NOT NULL,
-    PRIMARY KEY (session_id, epoch)
+CREATE TABLE IF NOT EXISTS journal_roots (
+    stream    TEXT NOT NULL,
+    segment   INTEGER NOT NULL,
+    root      BLOB NOT NULL,
+    signature BLOB NOT NULL,
+    PRIMARY KEY (stream, segment)
 );
 "#;
 
@@ -141,6 +142,26 @@ impl SqliteStore {
             return Err(StoreError::Fault(point));
         }
         Ok(())
+    }
+
+    /// Read the committed (sealed) root of a `(stream, segment)`, if any.
+    fn committed_root(conn: &Connection, stream: &JournalStreamId, segment: u64) -> Option<CommittedRoot> {
+        conn.query_row(
+            "SELECT root, signature FROM journal_roots WHERE stream = ?1 AND segment = ?2",
+            params![stream.as_str(), segment as i64],
+            |row| {
+                let root_bytes: Vec<u8> = row.get(0)?;
+                let mut root = [0u8; 32];
+                root.copy_from_slice(&root_bytes);
+                Ok(CommittedRoot {
+                    root: MerkleRoot::new(root),
+                    signature: row.get::<_, Vec<u8>>(1)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     /// Read a session's current fence, or `NotFound`.
@@ -486,30 +507,20 @@ impl SessionStore for SqliteStore {
 
     async fn append_trace(
         &self,
-        session: &SessionId,
-        epoch: Epoch,
+        stream: &JournalStreamId,
+        segment: u64,
         entry: TraceEntry,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM session_record WHERE session_id = ?1",
-                params![session.as_str()],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(sql_err)?
-            .is_some();
-        if !exists {
-            return Err(StoreError::NotFound(session.clone()));
-        }
-        // Append-only + idempotent: a redelivered `seq` is a no-op.
+        // Append-only + idempotent per `(stream, segment, seq)`; keyed by stream, not by session, so
+        // a non-durable unit journals without a session record. The autoincrement `cursor` is the
+        // stream-monotonic pagination key.
         conn.execute(
-            "INSERT OR IGNORE INTO trace_entries (session_id, epoch, seq, bytes, content_hash) \
+            "INSERT OR IGNORE INTO journal_entries (stream, segment, seq, bytes, content_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                session.as_str(),
-                epoch.0 as i64,
+                stream.as_str(),
+                segment as i64,
                 entry.seq as i64,
                 entry.bytes,
                 entry.content_hash.as_bytes().as_slice(),
@@ -521,27 +532,30 @@ impl SessionStore for SqliteStore {
 
     async fn commit_trace_segment(
         &self,
-        session: &SessionId,
-        epoch: Epoch,
+        stream: &JournalStreamId,
+        segment: u64,
         root: MerkleRoot,
         signature: Vec<u8>,
-        fence: FenceToken,
+        fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let current = Self::fence_of(&conn, session)?;
-        // Fenced exactly like a checkpoint: a stale incarnation cannot seal a segment root.
-        if fence < current {
-            return Err(StoreError::Fenced {
-                have: fence.0,
-                current: current.0,
-            });
+        // Durable path: fenced exactly like a checkpoint. Non-durable streams pass `None`.
+        if let Some(fence) = fence {
+            let id = SessionId::new(stream.as_str());
+            let current = Self::fence_of(&conn, &id)?;
+            if fence < current {
+                return Err(StoreError::Fenced {
+                    have: fence.0,
+                    current: current.0,
+                });
+            }
         }
         conn.execute(
-            "INSERT OR REPLACE INTO trace_roots (session_id, epoch, root, signature) \
+            "INSERT OR REPLACE INTO journal_roots (stream, segment, root, signature) \
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                session.as_str(),
-                epoch.0 as i64,
+                stream.as_str(),
+                segment as i64,
                 root.as_bytes().as_slice(),
                 signature,
             ],
@@ -550,16 +564,20 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
-    async fn load_trace_segment(&self, session: &SessionId, epoch: Epoch) -> Option<TraceSegment> {
+    async fn load_trace_segment(
+        &self,
+        stream: &JournalStreamId,
+        segment: u64,
+    ) -> Option<TraceSegment> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT seq, bytes, content_hash FROM trace_entries \
-                 WHERE session_id = ?1 AND epoch = ?2 ORDER BY seq",
+                "SELECT seq, bytes, content_hash FROM journal_entries \
+                 WHERE stream = ?1 AND segment = ?2 ORDER BY seq",
             )
             .ok()?;
         let entries: Vec<TraceEntry> = stmt
-            .query_map(params![session.as_str(), epoch.0 as i64], |row| {
+            .query_map(params![stream.as_str(), segment as i64], |row| {
                 let hash_bytes: Vec<u8> = row.get(2)?;
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&hash_bytes);
@@ -573,32 +591,76 @@ impl SessionStore for SqliteStore {
             .filter_map(Result::ok)
             .collect();
 
-        let committed = conn
-            .query_row(
-                "SELECT root, signature FROM trace_roots WHERE session_id = ?1 AND epoch = ?2",
-                params![session.as_str(), epoch.0 as i64],
-                |row| {
-                    let root_bytes: Vec<u8> = row.get(0)?;
-                    let mut root = [0u8; 32];
-                    root.copy_from_slice(&root_bytes);
-                    Ok(CommittedRoot {
-                        root: MerkleRoot::new(root),
-                        signature: row.get::<_, Vec<u8>>(1)?,
-                    })
-                },
-            )
-            .optional()
-            .ok()
-            .flatten();
+        let committed = Self::committed_root(&conn, stream, segment);
 
         if entries.is_empty() && committed.is_none() {
             return None;
         }
         Some(TraceSegment {
-            session_id: session.clone(),
-            epoch,
+            stream: stream.clone(),
+            segment,
             entries,
             committed,
         })
+    }
+
+    async fn load_journal(
+        &self,
+        stream: &JournalStreamId,
+        after_cursor: u64,
+        max: u32,
+    ) -> JournalPage {
+        let conn = self.conn.lock().unwrap();
+        let head_cursor: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(cursor), 0) FROM journal_entries WHERE stream = ?1",
+                params![stream.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c as u64)
+            .unwrap_or(0);
+        let limit: i64 = if max == 0 { -1 } else { max as i64 };
+        let mut stmt = match conn.prepare(
+            "SELECT cursor, segment, seq, bytes, content_hash FROM journal_entries \
+             WHERE stream = ?1 AND cursor > ?2 ORDER BY cursor LIMIT ?3",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return JournalPage::default(),
+        };
+        let rows = stmt.query_map(
+            params![stream.as_str(), after_cursor as i64, limit],
+            |row| {
+                let hash_bytes: Vec<u8> = row.get(4)?;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hash_bytes);
+                Ok(JournalEntry {
+                    cursor: row.get::<_, i64>(0)? as u64,
+                    segment: row.get::<_, i64>(1)? as u64,
+                    entry: TraceEntry {
+                        seq: row.get::<_, i64>(2)? as u64,
+                        bytes: row.get::<_, Vec<u8>>(3)?,
+                        content_hash: ContentHash::new(hash),
+                    },
+                })
+            },
+        );
+        let entries: Vec<JournalEntry> = match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => return JournalPage::default(),
+        };
+        let next_cursor = entries.last().map(|e| e.cursor).unwrap_or(after_cursor);
+        let mut segments: Vec<u64> = entries.iter().map(|e| e.segment).collect();
+        segments.sort_unstable();
+        segments.dedup();
+        let segment_roots = segments
+            .into_iter()
+            .filter_map(|seg| Self::committed_root(&conn, stream, seg).map(|root| (seg, root)))
+            .collect();
+        JournalPage {
+            entries,
+            segment_roots,
+            next_cursor,
+            head_cursor,
+        }
     }
 }

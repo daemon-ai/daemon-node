@@ -22,7 +22,7 @@
 
 use async_trait::async_trait;
 use daemon_common::{SessionId, UnitId, UsageDelta, WireVersion};
-use daemon_protocol::{AgentCommand, HostResponse};
+use daemon_protocol::{AgentCommand, HostResponse, TranscriptBlock};
 pub use daemon_protocol::Outbound;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,20 @@ pub trait SessionApi: Send + Sync {
 
     /// Answer a host request the session raised (matched by `response.request_id`).
     async fn respond(&self, session: SessionId, response: HostResponse) -> Result<(), ApiError>;
+
+    /// Non-destructive, cursor-paged read of a session's **durable** verifiable history (decoded
+    /// finished chat blocks + lifecycle records, with a per-entry `verified` flag) for reconnect /
+    /// scroll-back. Complements [`Self::poll`] (which destructively drains the *live* delta stream):
+    /// repeated reads from the same `after_cursor` return the same page. Default: an empty page (a
+    /// transport with no durable journal, e.g. an ephemeral session-only FFI).
+    async fn session_history(
+        &self,
+        _session: SessionId,
+        _after_cursor: u64,
+        _max: u32,
+    ) -> JournalPageView {
+        JournalPageView::default()
+    }
 }
 
 /// The node/operator control surface: inspect and steer the running node.
@@ -97,6 +111,15 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// Non-destructive, cursor-paged read of *any* unit's **durable** verifiable history (decoded
+    /// finished chat blocks + management lifecycle records, each carrying the `verified` flag of its
+    /// sealed segment) — the reconnect / scroll-back read for a GUI rendering a transcript for any
+    /// node in the tree, and the auditor's one-chain verify pass. Complements (does not replace) the
+    /// destructive live [`Self::unit_outbound`] drain. Default: an empty page.
+    async fn unit_history(&self, _id: UnitId, _after_cursor: u64, _max: u32) -> JournalPageView {
+        JournalPageView::default()
+    }
+
     /// Pause a unit (lifecycle `ManageCommand`). Default: unsupported.
     async fn pause(&self, _id: UnitId) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("pause".into()))
@@ -110,6 +133,13 @@ pub trait ControlApi: Send + Sync {
     /// Scale a unit (an orchestrator sub-fleet) to `n` members. Default: unsupported.
     async fn scale(&self, _id: UnitId, _n: u32) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("scale".into()))
+    }
+
+    /// The node's journal **verifying** key (hex-encoded dCBOR), so an auditor can independently
+    /// verify the sealed segments returned by the history reads. `None` when the node exposes no
+    /// journal signer. Default: `None`.
+    async fn verifying_key(&self) -> Option<String> {
+        None
     }
 }
 
@@ -298,6 +328,66 @@ pub enum ManageEventView {
 }
 
 // ---------------------------------------------------------------------------
+// Verifiable journal read DTOs (the non-destructive reconnect / scroll-back surface)
+// ---------------------------------------------------------------------------
+
+/// The decoded payload of one journal entry: a coarse management lifecycle record or a coalesced
+/// finished chat block (a `daemon-protocol` [`TranscriptBlock`], already decoded for the consumer —
+/// the GUI renders it directly, an auditor reads one timeline). Streaming deltas never appear here;
+/// they stay on the ephemeral live drains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalRecordPayload {
+    /// A management lifecycle / credential-audit record (its human/structured detail).
+    Management {
+        /// The record detail.
+        detail: String,
+    },
+    /// A finished chat block, decoded from the entry's opaque body.
+    Block {
+        /// The decoded transcript block.
+        block: TranscriptBlock,
+    },
+}
+
+/// One decoded + verified journal entry, as returned by a history read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalRecord {
+    /// The stream-monotonic pagination cursor (pass as the next `after_cursor`).
+    pub cursor: u64,
+    /// The segment (turn / incarnation) this entry belongs to.
+    pub segment: u64,
+    /// Monotonic per-`(stream, segment)` sequence number.
+    pub seq: u64,
+    /// The incarnation epoch active when recorded (0 for non-durable / first turn).
+    pub epoch: u64,
+    /// The correlation trace context active when recorded.
+    pub trace: u64,
+    /// The entry's kind label (e.g. `"mgmt.started"`, `"block.message"`).
+    pub kind: String,
+    /// Milliseconds since the Unix epoch when the entry was recorded.
+    pub timestamp_ms: u64,
+    /// Whether the sealed segment carrying this entry verified end-to-end (root recomputed +
+    /// signature checked + chain linked). `false` for an as-yet-unsealed (open) segment or when the
+    /// node exposes no verifying key.
+    pub verified: bool,
+    /// The decoded entry payload.
+    pub payload: JournalRecordPayload,
+}
+
+/// A page of a unit/session's verifiable journal: decoded entries past a cursor plus the pagination
+/// cursors. Non-destructive — repeated reads from the same `after_cursor` return the same page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalPageView {
+    /// The decoded entries in cursor order.
+    pub entries: Vec<JournalRecord>,
+    /// The cursor to pass as `after_cursor` on the next read (the last entry's cursor, or the input
+    /// `after_cursor` when the page is empty).
+    pub next_cursor: u64,
+    /// The highest cursor currently stored for the stream (how far a reader can scroll).
+    pub head_cursor: u64,
+}
+
+// ---------------------------------------------------------------------------
 // The serializable mirror (1:1 with the interface methods)
 // ---------------------------------------------------------------------------
 
@@ -365,6 +455,24 @@ pub enum ApiRequest {
         /// Maximum items to drain.
         max: u32,
     },
+    /// [`SessionApi::session_history`].
+    SessionHistory {
+        /// The session whose durable history to read.
+        session: SessionId,
+        /// The exclusive lower-bound cursor (0 from the start).
+        after_cursor: u64,
+        /// Maximum entries to return (0 = all available).
+        max: u32,
+    },
+    /// [`ControlApi::unit_history`].
+    UnitHistory {
+        /// The unit whose durable history to read.
+        unit: UnitId,
+        /// The exclusive lower-bound cursor (0 from the start).
+        after_cursor: u64,
+        /// Maximum entries to return (0 = all available).
+        max: u32,
+    },
     /// [`ControlApi::pause`].
     Pause {
         /// The unit to pause.
@@ -382,6 +490,8 @@ pub enum ApiRequest {
         /// The target member count.
         n: u32,
     },
+    /// [`ControlApi::verifying_key`].
+    VerifyingKey,
 }
 
 /// The serializable reflection of an interface result.
@@ -405,6 +515,10 @@ pub enum ApiResponse {
     Unit(Option<UnitNode>),
     /// Drained per-unit management events.
     UnitEvents(Vec<ManageEventView>),
+    /// A page of decoded + verified journal history (session/unit history).
+    Journal(JournalPageView),
+    /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
+    VerifyingKey(Option<String>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -447,6 +561,11 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             Err(e) => ApiResponse::Error(e),
         },
         ApiRequest::Respond { session, response } => unit_or_err(api.respond(session, response).await),
+        ApiRequest::SessionHistory {
+            session,
+            after_cursor,
+            max,
+        } => ApiResponse::Journal(api.session_history(session, after_cursor, max).await),
         _ => return None,
     })
 }
@@ -473,11 +592,20 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             // Reuses the `Drained(Vec<Outbound>)` response — the same rich §17 drain shape as `poll`.
             ApiResponse::Drained(api.unit_outbound(unit, max).await)
         }
+        ApiRequest::UnitHistory {
+            unit,
+            after_cursor,
+            max,
+        } => ApiResponse::Journal(api.unit_history(unit, after_cursor, max).await),
         ApiRequest::Pause { unit } => unit_or_err(api.pause(unit).await),
         ApiRequest::Resume { unit } => unit_or_err(api.resume(unit).await),
         ApiRequest::Scale { unit, n } => unit_or_err(api.scale(unit, n).await),
+        ApiRequest::VerifyingKey => ApiResponse::VerifyingKey(api.verifying_key().await),
         // Session variants were handled by `serve_session`.
-        ApiRequest::Submit { .. } | ApiRequest::Poll { .. } | ApiRequest::Respond { .. } => {
+        ApiRequest::Submit { .. }
+        | ApiRequest::Poll { .. }
+        | ApiRequest::Respond { .. }
+        | ApiRequest::SessionHistory { .. } => {
             unreachable!("session variants handled above")
         }
     }

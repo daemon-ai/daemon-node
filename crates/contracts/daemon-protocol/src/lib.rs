@@ -444,3 +444,86 @@ pub enum Outbound {
     /// A blocking §17 host request awaiting an [`Inbound::Response`].
     Request(HostRequest),
 }
+
+// ---------------------------------------------------------------------------
+// Durable transcript blocks (the verifiable journal's chat-entry payload)
+// ---------------------------------------------------------------------------
+
+/// Who authored a transcript message block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TranscriptRole {
+    /// The agent/assistant.
+    Assistant,
+    /// The user / driver (e.g. an injected steer).
+    User,
+    /// The system / harness.
+    System,
+}
+
+/// One *finished* block of an agent transcript — the coalesced unit that graduates into durable,
+/// signed history. The host's coalescer folds the fine-grained §17 stream (streaming text/reasoning
+/// deltas, which are *not* individually journaled) into these at turn/tool boundaries; the verifiable
+/// journal stores each as one entry, and a consuming GUI replays them for scroll-back. Opaque tool
+/// `detail` / content `body` ride through untouched (the daemon never matches on them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TranscriptBlock {
+    /// A finished message (assistant text assembled from its deltas, or an injected user/system msg).
+    Message {
+        /// The author of the message.
+        role: TranscriptRole,
+        /// The assembled message text.
+        text: String,
+    },
+    /// A tool invocation that was issued (the call as it entered history).
+    ToolCall {
+        /// Correlates the call with its result.
+        call_id: String,
+        /// The tool's stable name.
+        name: String,
+        /// A human-readable summary of the arguments (never the raw secret-bearing payload).
+        args_summary: String,
+        /// An optional opaque structured payload (e.g. the arguments object) for a rich consumer.
+        detail: Option<ToolDetail>,
+    },
+    /// A tool result that was produced.
+    ToolResult {
+        /// Correlates back to the originating [`TranscriptBlock::ToolCall`].
+        call_id: String,
+        /// Whether the tool succeeded.
+        ok: bool,
+        /// A human-readable summary of the outcome.
+        summary: String,
+        /// An optional opaque structured payload (e.g. a diff, search results) for a rich consumer.
+        detail: Option<ToolDetail>,
+    },
+    /// A blocking host request that was raised (the prompt as it entered history).
+    Request {
+        /// Correlation id of the originating [`HostRequest`].
+        request_id: ReqId,
+        /// The request payload.
+        kind: HostRequestKind,
+    },
+    /// A finished chunk of opaque structured content not tied to a tool call (e.g. a coalesced
+    /// terminal/PTY block from a foreign agent). Routed by `kind`, decoded by the consumer.
+    Content {
+        /// The stable renderer discriminator (e.g. `"ansi-stream"` / `"pty"`).
+        kind: String,
+        /// The opaque encoded payload (CBOR by convention).
+        body: Vec<u8>,
+    },
+}
+
+impl TranscriptBlock {
+    /// A stable kind label for the journal entry envelope subject (`block.*`).
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            TranscriptBlock::Message { .. } => "block.message",
+            TranscriptBlock::ToolCall { .. } => "block.tool_call",
+            TranscriptBlock::ToolResult { .. } => "block.tool_result",
+            TranscriptBlock::Request { .. } => "block.request",
+            TranscriptBlock::Content { .. } => "block.content",
+        }
+    }
+}

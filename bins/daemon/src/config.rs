@@ -27,6 +27,8 @@ const CREDENTIAL_KEY_ENV: &str = "DAEMON_CREDENTIAL_KEY";
 const MODEL_RETRY_ATTEMPTS_ENV: &str = "DAEMON_MODEL_RETRY_ATTEMPTS";
 /// Overrides the engine's `context_budget_tokens` tunable.
 const CONTEXT_BUDGET_TOKENS_ENV: &str = "DAEMON_CONTEXT_BUDGET_TOKENS";
+/// The 32-byte verifiable-journal signer seed, hex-encoded (64 hex chars).
+const JOURNAL_SEED_ENV: &str = "DAEMON_JOURNAL_SEED";
 
 /// The durable store backend selected by config.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +61,9 @@ pub struct NodeConfig {
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
     pub engine: daemon_core::Config,
+    /// The 32-byte seed for the node's verifiable-journal signer (a stable verifying key across
+    /// restarts). `None` => an ephemeral key generated each boot.
+    pub journal_seed: Option<[u8; 32]>,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -75,10 +80,27 @@ struct FileConfig {
     credential_key: Option<String>,
     model_retry_attempts: Option<u8>,
     context_budget_tokens: Option<u32>,
+    journal_seed: Option<String>,
 }
 
 fn env_string(key: &str) -> Option<String> {
     std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Parse a 64-char hex string into a 32-byte journal signer seed.
+fn parse_seed(hex: &str) -> anyhow::Result<[u8; 32]> {
+    let hex = hex.trim();
+    anyhow::ensure!(
+        hex.len() == 64,
+        "DAEMON_JOURNAL_SEED must be 64 hex chars (32 bytes), got {}",
+        hex.len()
+    );
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .context("DAEMON_JOURNAL_SEED must be valid hex")?;
+    }
+    Ok(seed)
 }
 
 fn default_socket() -> PathBuf {
@@ -124,6 +146,11 @@ impl NodeConfig {
             .or(file.credential_key)
             .unwrap_or_else(|| "sk-configured".to_string());
 
+        let journal_seed = match env_string(JOURNAL_SEED_ENV).or(file.journal_seed) {
+            Some(hex) => Some(parse_seed(&hex)?),
+            None => None,
+        };
+
         Ok(Self {
             partition,
             socket_path,
@@ -133,6 +160,7 @@ impl NodeConfig {
             profile,
             credential_key,
             engine,
+            journal_seed,
         })
     }
 

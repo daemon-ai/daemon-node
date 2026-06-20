@@ -13,20 +13,27 @@
 //!   by the actor's event broadcast and a parked-request table so a poll-based embedder (the FFI)
 //!   sees events *and* blocking host requests on one queue and answers them with `respond`.
 
+use crate::engine_incarnation::JournalConfig;
+use crate::journal::{JournalFeeder, JournalSink};
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
-    ApiError, ControlApi, FleetReport, HealthReport, ManageEventView, Outbound, ServiceHealth,
-    SessionApi, SessionInfo, SessionState, StatsReport, TreeReport, UnitNode,
+    ApiError, ControlApi, FleetReport, HealthReport, JournalPageView, JournalRecord,
+    JournalRecordPayload, ManageEventView, Outbound, ServiceHealth, SessionApi, SessionInfo,
+    SessionState, StatsReport, TreeReport, UnitNode,
 };
-use daemon_common::{PartitionId, ReqId, SessionId, UnitId};
+use daemon_common::{ContentHash, JournalStreamId, PartitionId, ReqId, SessionId, UnitId};
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
 use daemon_protocol::{
-    AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody,
+    AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody, TranscriptBlock,
 };
 use daemon_store::{SessionStatus, SessionStore};
+use daemon_telemetry::{
+    decode_entry, verify_segment, JournalPayload, SegmentInput, TraceSigner, VerifyingKey,
+    GENESIS_ROOT,
+};
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -60,6 +67,9 @@ pub struct NodeApiImpl {
     live: Arc<LiveSessions>,
     /// One-lifecycle-owner guard-rail: which lifecycle (if any) has claimed each session id.
     owners: Arc<DashMap<SessionId, Lifecycle>>,
+    /// The node's journal signer, when journaling is enabled. Held here so a history read can verify
+    /// each sealed segment (recompute root + check signature) before reporting it as `verified`.
+    verifier: Option<Arc<TraceSigner>>,
 }
 
 impl NodeApiImpl {
@@ -84,7 +94,119 @@ impl NodeApiImpl {
             partition,
             live: Arc::new(LiveSessions::new(engine_builder)),
             owners: Arc::new(DashMap::new()),
+            verifier: None,
         }
+    }
+
+    /// Durably journal live interactive sessions: each session's transcript (finished blocks +
+    /// lifecycle) is sealed per turn into the unified verifiable journal keyed by its `SessionId`.
+    /// Also records the node's `signer` so history reads verify sealed segments. Call during
+    /// assembly, before any session is opened.
+    pub fn with_journal(mut self, store: Arc<dyn SessionStore>, signer: Arc<TraceSigner>) -> Self {
+        self.verifier = Some(signer.clone());
+        self.live.set_journal(JournalConfig { store, signer });
+        self
+    }
+
+    /// Read a stream's durable verifiable history: cursor-page the store, decode each entry to its
+    /// typed view, decode block bodies into `TranscriptBlock`s, and stamp each entry with the
+    /// verification result of its sealed segment. Non-destructive (the live drains are separate).
+    async fn read_history(
+        &self,
+        stream: JournalStreamId,
+        after_cursor: u64,
+        max: u32,
+    ) -> JournalPageView {
+        let page = self.store.load_journal(&stream, after_cursor, max).await;
+        let key = self.verifier.as_ref().map(|s| s.verifying_key());
+
+        // Verify each distinct sealed segment the page touches exactly once.
+        let mut seg_verified: HashMap<u64, bool> = HashMap::new();
+        for je in &page.entries {
+            if let std::collections::hash_map::Entry::Vacant(slot) = seg_verified.entry(je.segment) {
+                let ok = match &key {
+                    Some(k) => self.verify_segment_in_store(&stream, je.segment, k).await,
+                    None => false,
+                };
+                slot.insert(ok);
+            }
+        }
+
+        let entries = page
+            .entries
+            .into_iter()
+            .filter_map(|je| {
+                let view = decode_entry(&je.entry.bytes).ok()?;
+                let payload = match view.payload {
+                    JournalPayload::Management { detail } => {
+                        JournalRecordPayload::Management { detail }
+                    }
+                    JournalPayload::Block { body } => {
+                        let block: TranscriptBlock = ciborium::from_reader(&body[..]).ok()?;
+                        JournalRecordPayload::Block { block }
+                    }
+                };
+                Some(JournalRecord {
+                    cursor: je.cursor,
+                    segment: je.segment,
+                    seq: view.seq,
+                    epoch: view.epoch,
+                    trace: view.trace,
+                    kind: view.kind,
+                    timestamp_ms: view.timestamp_ms,
+                    verified: seg_verified.get(&je.segment).copied().unwrap_or(false),
+                    payload,
+                })
+            })
+            .collect();
+
+        JournalPageView {
+            entries,
+            next_cursor: page.next_cursor,
+            head_cursor: page.head_cursor,
+        }
+    }
+
+    /// Verify one sealed `(stream, segment)` against the node's verifying key: load the full
+    /// segment, fold its entries onto the prior segment's sealed root, and check the signature. An
+    /// open (unsealed) segment — or a broken prior link — reports `false`.
+    async fn verify_segment_in_store(
+        &self,
+        stream: &JournalStreamId,
+        segment: u64,
+        key: &VerifyingKey,
+    ) -> bool {
+        let Some(seg) = self.store.load_trace_segment(stream, segment).await else {
+            return false;
+        };
+        let Some(committed) = seg.committed else {
+            return false;
+        };
+        let prior = if segment == 0 {
+            GENESIS_ROOT
+        } else {
+            match self
+                .store
+                .load_trace_segment(stream, segment - 1)
+                .await
+                .and_then(|s| s.committed)
+            {
+                Some(c) => c.root,
+                None => return false,
+            }
+        };
+        let entries: Vec<(u64, Vec<u8>, ContentHash)> = seg
+            .entries
+            .into_iter()
+            .map(|e| (e.seq, e.bytes, e.content_hash))
+            .collect();
+        let input = SegmentInput {
+            stream,
+            segment,
+            prior,
+            entries: &entries,
+        };
+        verify_segment(&input, &committed.root, &committed.signature, key).is_ok()
     }
 
     /// Claim `session` for `want`, enforcing the one-lifecycle-owner invariant: the first surface to
@@ -237,6 +359,11 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
+    async fn unit_history(&self, id: UnitId, after_cursor: u64, max: u32) -> JournalPageView {
+        self.read_history(JournalStreamId::unit(&id), after_cursor, max)
+            .await
+    }
+
     async fn pause(&self, id: UnitId) -> Result<(), ApiError> {
         match &self.fleet {
             Some(fleet) if fleet.pause(&id).await => Ok(()),
@@ -257,6 +384,10 @@ impl ControlApi for NodeApiImpl {
             _ => Err(ApiError::Unsupported(format!("scale {id}"))),
         }
     }
+
+    async fn verifying_key(&self) -> Option<String> {
+        self.verifier.as_ref().map(|s| s.verifying_key().to_hex())
+    }
 }
 
 #[async_trait]
@@ -273,6 +404,16 @@ impl SessionApi for NodeApiImpl {
 
     async fn respond(&self, session: SessionId, response: HostResponse) -> Result<(), ApiError> {
         self.live.respond(&session, response)
+    }
+
+    async fn session_history(
+        &self,
+        session: SessionId,
+        after_cursor: u64,
+        max: u32,
+    ) -> JournalPageView {
+        self.read_history(JournalStreamId::session(&session), after_cursor, max)
+            .await
     }
 }
 
@@ -300,6 +441,8 @@ impl Drop for LiveSession {
 struct LiveSessions {
     sessions: DashMap<SessionId, LiveSession>,
     builder: SessionEngineBuilder,
+    /// The verifiable-journal store + signer, when journaling is enabled for live sessions.
+    journal: Mutex<Option<JournalConfig>>,
 }
 
 impl LiveSessions {
@@ -307,7 +450,12 @@ impl LiveSessions {
         Self {
             sessions: DashMap::new(),
             builder,
+            journal: Mutex::new(None),
         }
+    }
+
+    fn set_journal(&self, cfg: JournalConfig) {
+        *self.journal.lock().unwrap() = Some(cfg);
     }
 
     /// Spawn (or reuse) the actor for `session`, returning its handle.
@@ -318,19 +466,38 @@ impl LiveSessions {
         let engine = (self.builder)(session.clone());
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        // A per-session journal feeder (keyed by SessionId), shared by the event pump and the
+        // request handler so the live transcript is sealed per turn into the unified journal.
+        let feeder: Option<Arc<JournalFeeder>> = self.journal.lock().unwrap().as_ref().map(|cfg| {
+            let sink = JournalSink::new(
+                cfg.store.clone(),
+                cfg.signer.clone(),
+                JournalStreamId::session(session),
+            );
+            Arc::new(JournalFeeder::new(Arc::new(sink)))
+        });
         let host = Arc::new(ParkingHandler {
             drain: drain.clone(),
             pending: pending.clone(),
+            journal: feeder.clone(),
         });
         let handle = spawn_agent_session(engine, host);
 
-        // Pump §17 events from the actor broadcast into the drain queue (lossless until polled).
+        // Pump §17 events from the actor broadcast into the drain queue (lossless until polled), and
+        // feed the verifiable journal (coalesced finished blocks, sealed per turn) when enabled.
         let mut rx = handle.subscribe();
         let pump_drain = drain.clone();
+        let pump_journal = feeder.clone();
         let pump = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(ev) => pump_drain.lock().unwrap().push_back(Outbound::Event(ev)),
+                    Ok(ev) => {
+                        let frame = Outbound::Event(ev);
+                        pump_drain.lock().unwrap().push_back(frame.clone());
+                        if let Some(feeder) = &pump_journal {
+                            feeder.feed(&frame).await;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -439,6 +606,8 @@ impl LiveSessions {
 struct ParkingHandler {
     drain: Drain,
     pending: Pending,
+    /// The per-session journal feeder, so a raised request graduates into a durable request block.
+    journal: Option<Arc<JournalFeeder>>,
 }
 
 #[async_trait]
@@ -447,10 +616,11 @@ impl HostRequestHandler for ParkingHandler {
         let (tx, rx) = oneshot::channel();
         let request_id = req.request_id;
         self.pending.lock().unwrap().insert(request_id, tx);
-        self.drain
-            .lock()
-            .unwrap()
-            .push_back(Outbound::Request(req));
+        let frame = Outbound::Request(req);
+        if let Some(feeder) = &self.journal {
+            feeder.feed(&frame).await;
+        }
+        self.drain.lock().unwrap().push_back(frame);
         match rx.await {
             Ok(resp) => resp,
             // The session was dropped before an answer arrived: decline safely.

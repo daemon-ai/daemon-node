@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use daemon_api::{ApiRequest, ApiResponse};
+use daemon_api::{ApiRequest, ApiResponse, JournalRecordPayload};
 use daemon_common::{ReqId, SessionId, UnitId};
 use daemon_host::ApiClient;
 use daemon_protocol::{AgentCommand, UserMsg};
@@ -103,6 +103,30 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         max: u32,
     },
+    /// Read a session's durable verifiable history (non-destructive scroll-back).
+    History {
+        /// The session id.
+        id: String,
+        /// Return entries with cursor strictly greater than this (0 from the start).
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Maximum entries to return (0 = all available).
+        #[arg(long, default_value_t = 0)]
+        max: u32,
+    },
+    /// Read any unit's durable verifiable history (non-destructive scroll-back).
+    UnitHistory {
+        /// The unit id.
+        id: String,
+        /// Return entries with cursor strictly greater than this (0 from the start).
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Maximum entries to return (0 = all available).
+        #[arg(long, default_value_t = 0)]
+        max: u32,
+    },
+    /// Print the node's journal verifying key (hex dCBOR) for offline audit.
+    VerifyingKey,
 }
 
 fn default_socket() -> PathBuf {
@@ -207,6 +231,25 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?,
         ),
+        Command::History { id, after, max } => render(
+            client
+                .call(ApiRequest::SessionHistory {
+                    session: SessionId::new(id),
+                    after_cursor: after,
+                    max,
+                })
+                .await?,
+        ),
+        Command::UnitHistory { id, after, max } => render(
+            client
+                .call(ApiRequest::UnitHistory {
+                    unit: UnitId::new(id),
+                    after_cursor: after,
+                    max,
+                })
+                .await?,
+        ),
+        Command::VerifyingKey => render(client.call(ApiRequest::VerifyingKey).await?),
     }
     Ok(())
 }
@@ -270,6 +313,31 @@ fn render(resp: ApiResponse) {
                 println!("  - {e:?}");
             }
         }
+        ApiResponse::Journal(page) => {
+            println!(
+                "history: {} entr(ies) next_cursor={} head_cursor={}",
+                page.entries.len(),
+                page.next_cursor,
+                page.head_cursor
+            );
+            for r in page.entries {
+                let mark = if r.verified { "verified" } else { "unsealed" };
+                match r.payload {
+                    JournalRecordPayload::Management { detail } => println!(
+                        "  - [{}] cur={} seg={} seq={} {} mgmt: {}",
+                        mark, r.cursor, r.segment, r.seq, r.kind, detail
+                    ),
+                    JournalRecordPayload::Block { block } => println!(
+                        "  - [{}] cur={} seg={} seq={} {} block: {:?}",
+                        mark, r.cursor, r.segment, r.seq, r.kind, block
+                    ),
+                }
+            }
+        }
+        ApiResponse::VerifyingKey(key) => match key {
+            Some(hex) => println!("verifying_key: {hex}"),
+            None => println!("verifying_key: none (node exposes no journal signer)"),
+        },
         ApiResponse::Error(e) => println!("error: {e}"),
     }
 }

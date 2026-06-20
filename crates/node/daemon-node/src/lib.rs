@@ -19,14 +19,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use daemon_api::FleetReport;
-use daemon_common::{PartitionId, ProfileRef, SessionId, UnitId};
+use daemon_common::{JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     Config, CredentialBuilder, EngineProfile, ProviderRegistry, SystemPrompt, ToolRegistry,
 };
 use daemon_host::{
-    CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig, JobWorker, NodeApiImpl,
-    ProcessAgentUnit, ServiceError, SessionEngineBuilder, SupervisorHandle,
+    CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig, JobWorker, JournalConfig,
+    JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit, ServiceError, SessionEngineBuilder,
+    SupervisorHandle,
 };
+use daemon_telemetry::TraceSigner;
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
@@ -55,6 +57,10 @@ pub struct NodeAssembly {
     pub profile: ProfileRef,
     /// The engine tunables (§20) every engine this node builds runs under.
     pub engine_config: Config,
+    /// The 32-byte seed for the node's verifiable-journal signer, so its verifying key is stable
+    /// across restarts (auditors keep verifying old segments). `None` generates an ephemeral key
+    /// (fine for tests; a fresh key each boot otherwise).
+    pub journal_seed: Option<[u8; 32]>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -65,6 +71,9 @@ pub struct AssembledNode {
     pub handle: SupervisorHandle,
     /// The orchestration fleet handle (e.g. for inspection in tests).
     pub fleet: FleetRuntime,
+    /// The node's verifiable-journal signer — its verifying key is published so auditors can verify
+    /// sealed history (`ControlApi::verifying_key`).
+    pub signer: Arc<TraceSigner>,
 }
 
 /// Apply the optional brokered credentials to a role profile.
@@ -88,8 +97,20 @@ fn provider_for(providers: &ProviderRegistry, name: &str) -> daemon_core::Provid
 /// all built from one shared [`EngineProfile`] per role so the durable, live, and fleet-child paths
 /// share provider/credential/tunable policy.
 pub fn assemble(a: NodeAssembly) -> AssembledNode {
+    // The node's one verifiable-journal signer: every engine path (durable, live, fleet child) seals
+    // its per-stream chain with this key, and the control surface publishes the verifying half.
+    let signer = Arc::new(
+        a.journal_seed
+            .map(|seed| TraceSigner::from_seed(&seed))
+            .unwrap_or_else(TraceSigner::generate),
+    );
+    let journal = JournalConfig {
+        store: a.store.clone(),
+        signer: signer.clone(),
+    };
+
     // The fleet child: one shared profile, driven as the real job worker so every child gets the same
-    // provider + brokered credentials.
+    // provider + brokered credentials. Each child journals into the shared store keyed by its UnitId.
     let child_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, CHILD_PROFILE),
@@ -101,7 +122,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let fleet = FleetRuntime::new(
         a.store.clone(),
         a.partition,
-        Arc::new(ProfileChildSpawner::core(child_profile)),
+        Arc::new(ProfileChildSpawner::core(child_profile).with_journal(journal.clone())),
         Arc::new(DefaultAnswerPolicy),
         None::<Arc<dyn ManageRequestHandler>>,
     );
@@ -119,7 +140,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         ),
         &a,
     );
-    let factory = CoreEngineFactory::from_profile(parent_profile);
+    // The durable path journals too: replace the discarding sink with one sealing per turn into the
+    // shared store, keyed by the durable `SessionId`.
+    let factory =
+        CoreEngineFactory::from_profile(parent_profile).with_journal(a.store.clone(), signer.clone());
 
     let host = Host::new(a.store.clone(), Arc::new(factory), a.host_config)
         .with_job_worker(Arc::new(FleetJobWorker(fleet.clone())));
@@ -140,16 +164,25 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         Arc::new(move |id: SessionId| profile.fresh(id))
     };
 
-    let node = Arc::new(NodeApiImpl::new(
-        handle.observer(),
-        a.store.clone(),
-        host.manager().clone(),
-        a.partition,
-        session_builder,
-        Some(Arc::new(FleetViewImpl(fleet.clone())) as Arc<dyn FleetControl>),
-    ));
+    let node = Arc::new(
+        NodeApiImpl::new(
+            handle.observer(),
+            a.store.clone(),
+            host.manager().clone(),
+            a.partition,
+            session_builder,
+            Some(Arc::new(FleetViewImpl(fleet.clone())) as Arc<dyn FleetControl>),
+        )
+        // Live interactive sessions journal per turn; also records the signer so history reads verify.
+        .with_journal(a.store.clone(), signer.clone()),
+    );
 
-    AssembledNode { node, handle, fleet }
+    AssembledNode {
+        node,
+        handle,
+        fleet,
+        signer,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +217,9 @@ pub enum AgentBackend {
 pub struct ProfileChildSpawner {
     backend: AgentBackend,
     provisioner: Arc<dyn Provisioner>,
+    /// The verifiable-journal store + signer; when set, each spawned child journals its transcript
+    /// (finished blocks + lifecycle) sealed per turn into the shared store, keyed by its `UnitId`.
+    journal: Option<JournalConfig>,
 }
 
 impl ProfileChildSpawner {
@@ -192,6 +228,7 @@ impl ProfileChildSpawner {
         Self {
             backend: AgentBackend::Core(profile),
             provisioner: Arc::new(ProcessProvisioner::new()),
+            journal: None,
         }
     }
 
@@ -200,17 +237,37 @@ impl ProfileChildSpawner {
         Self {
             backend: AgentBackend::Foreign(launch),
             provisioner: Arc::new(ProcessProvisioner::new()),
+            journal: None,
         }
+    }
+
+    /// Journal every spawned child into the unified verifiable journal (keyed by `UnitId`).
+    pub fn with_journal(mut self, journal: JournalConfig) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    /// Build a per-child journal feeder keyed by `id`, when journaling is configured.
+    fn feeder(&self, id: &UnitId) -> Option<Arc<JournalFeeder>> {
+        self.journal.as_ref().map(|cfg| {
+            let sink = JournalSink::new(
+                cfg.store.clone(),
+                cfg.signer.clone(),
+                JournalStreamId::unit(id),
+            );
+            Arc::new(JournalFeeder::new(Arc::new(sink)))
+        })
     }
 }
 
 #[async_trait]
 impl ChildSpawner for ProfileChildSpawner {
     async fn spawn(&self, id: UnitId, _spec: &DelegationSpec) -> Arc<dyn ManagedUnit> {
+        let feeder = self.feeder(&id);
         match &self.backend {
             AgentBackend::Core(profile) => {
                 let engine = profile.fresh(SessionId::new(id.as_str()));
-                Arc::new(EngineUnit::spawn(id, engine))
+                Arc::new(EngineUnit::spawn_journaled(id, engine, feeder))
             }
             AgentBackend::Foreign(launch) => {
                 let placement = self
@@ -225,7 +282,7 @@ impl ChildSpawner for ProfileChildSpawner {
                     )
                     .await
                     .expect("place foreign agent");
-                Arc::new(ProcessAgentUnit::start(id, placement))
+                Arc::new(ProcessAgentUnit::start_journaled(id, placement, feeder))
             }
         }
     }

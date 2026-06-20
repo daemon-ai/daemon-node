@@ -17,8 +17,8 @@
 
 use async_trait::async_trait;
 use daemon_common::{
-    ContentHash, DaemonError, Epoch, FenceToken, JobId, MerkleRoot, PartitionId, SessionId,
-    SnapshotBlob,
+    ContentHash, DaemonError, Epoch, FenceToken, JobId, JournalStreamId, MerkleRoot, PartitionId,
+    SessionId, SnapshotBlob,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -196,15 +196,15 @@ pub struct StoreStats {
     pub sessions: usize,
 }
 
-/// One durable, append-only trace-journal entry, keyed `(session, epoch, seq)`.
+/// One durable, append-only journal entry, keyed `(stream, segment, seq)`.
 ///
 /// The store sees only opaque bytes — a deterministically-encoded (dCBOR) Gordian Envelope built by
 /// `daemon-telemetry` — plus its [`ContentHash`]. This keeps `daemon-store` free of the crypto
-/// stack (layout §3 DAG) while still making the journal *authoritative durable session state*: the
-/// per-epoch Merkle root is committed under the same fence as the checkpoint (lifecycle §4).
+/// stack (layout §3 DAG). The entry's payload is either a coarse management record or a coalesced
+/// finished chat block; the store never distinguishes them (the envelope `kind` does).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceEntry {
-    /// Monotonic per-`(session, epoch)` sequence number.
+    /// Monotonic per-`(stream, segment)` sequence number.
     pub seq: u64,
     /// Opaque deterministic-CBOR bytes of the entry's Gordian Envelope.
     pub bytes: Vec<u8>,
@@ -212,27 +212,56 @@ pub struct TraceEntry {
     pub content_hash: ContentHash,
 }
 
-/// The committed root of a trace segment: the per-`(session, epoch)` Merkle root and its signature.
+/// The committed root of a journal segment: the per-`(stream, segment)` Merkle root and signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedRoot {
-    /// The digest-tree root folding every entry plus the prior epoch's root (rolling chain).
+    /// The digest-tree root folding every entry plus the prior segment's root (rolling chain).
     pub root: MerkleRoot,
     /// An opaque detached signature over the root (ed25519, produced by `daemon-telemetry`).
     pub signature: Vec<u8>,
 }
 
-/// A loaded trace segment: its append-only entries plus the committed root, if the segment has been
-/// sealed at its epoch boundary.
+/// A loaded journal segment: its append-only entries plus the committed root, if the segment has
+/// been sealed at its turn/incarnation boundary. The seal-recompute path loads exactly one segment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceSegment {
-    /// The session this segment belongs to.
-    pub session_id: SessionId,
-    /// The epoch (incarnation) this segment covers.
-    pub epoch: Epoch,
+    /// The stream this segment belongs to.
+    pub stream: JournalStreamId,
+    /// The monotonic segment index this covers (a turn for streaming units, an incarnation for the
+    /// durable path).
+    pub segment: u64,
     /// The append-only entries, in `seq` order.
     pub entries: Vec<TraceEntry>,
     /// The committed root + signature, once sealed; `None` while the segment is still open.
     pub committed: Option<CommittedRoot>,
+}
+
+/// One entry as returned by the cursor-paged journal read: the stream-monotonic `cursor` (the
+/// pagination key), the `segment` it belongs to, and the opaque entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEntry {
+    /// The stream-monotonic cursor; `load_journal` returns entries with `cursor > after_cursor`.
+    pub cursor: u64,
+    /// The segment this entry belongs to.
+    pub segment: u64,
+    /// The opaque journal entry.
+    pub entry: TraceEntry,
+}
+
+/// A page of the verifiable journal for one stream: entries past a cursor, the sealed roots of the
+/// segments they cover (for verification), and the pagination cursors. Non-destructive — repeated
+/// reads from the same `after_cursor` return the same page (unlike the live drain `poll`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalPage {
+    /// The entries in cursor order.
+    pub entries: Vec<JournalEntry>,
+    /// The committed roots of the segments covered by `entries`, as `(segment, root)`.
+    pub segment_roots: Vec<(u64, CommittedRoot)>,
+    /// The cursor to pass as `after_cursor` on the next read (the last entry's cursor, or the
+    /// input `after_cursor` when the page is empty).
+    pub next_cursor: u64,
+    /// The highest cursor currently stored for the stream (so a reader knows how far it can scroll).
+    pub head_cursor: u64,
 }
 
 /// A crash boundary the in-memory store can be armed to fail at, for acceptance test #2.
@@ -316,45 +345,62 @@ pub trait SessionStore: Send + Sync {
     /// Snapshot durable queue depths + session count (Metrics/health resident service).
     async fn stats(&self) -> StoreStats;
 
-    // -- verifiable trace journal (phase 6b) --------------------------------------------------
+    // -- verifiable journal (phase 6b; unified management + transcript) -----------------------
     //
-    // The journal is authoritative durable session state: an append-only log of opaque envelope
-    // bytes keyed `(session, epoch, seq)`, whose per-epoch Merkle root is sealed under the same
-    // fence as the checkpoint. Default impls report "unsupported" so a non-authoritative store
-    // (the brokered child proxy, which never journals) need not implement them; an authoritative
-    // backend (`InMemoryStore`, later SQLite) overrides all three.
+    // One hash-linked, per-segment-signed chain per stream carries typed entries: coarse management
+    // records and coalesced finished chat blocks. Keyed `(stream, segment, seq)` — decoupled from
+    // the durable `(session, epoch)` identity so non-durable units (live/fleet/foreign) journal too.
+    // Default impls report "unsupported" / empty so a non-authoritative store (the brokered child
+    // proxy) need not implement them; an authoritative backend overrides them.
 
-    /// Append one entry to the open `(session, epoch)` trace segment. Idempotent per `seq`.
+    /// Append one entry to the open `(stream, segment)` segment. Idempotent per `seq`.
     async fn append_trace(
         &self,
-        _session: &SessionId,
-        _epoch: Epoch,
+        _stream: &JournalStreamId,
+        _segment: u64,
         _entry: TraceEntry,
     ) -> Result<(), StoreError> {
         Err(StoreError::Common(DaemonError::Other(
-            "trace journal not supported by this store".into(),
+            "verifiable journal not supported by this store".into(),
         )))
     }
 
-    /// Seal the `(session, epoch)` segment with its signed Merkle root. Fenced exactly like a
-    /// checkpoint: only the highest token for the session may commit (binds the root to the
-    /// durable incarnation).
+    /// Seal the `(stream, segment)` segment with its signed Merkle root. `fence` is `Some` on the
+    /// durable path (only the highest token for the session may commit, binding the root to the
+    /// durable incarnation) and `None` for non-durable streams (the ed25519 signature is the
+    /// integrity primitive; there is no competing incarnation to fence).
     async fn commit_trace_segment(
         &self,
-        _session: &SessionId,
-        _epoch: Epoch,
+        _stream: &JournalStreamId,
+        _segment: u64,
         _root: MerkleRoot,
         _signature: Vec<u8>,
-        _fence: FenceToken,
+        _fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         Err(StoreError::Common(DaemonError::Other(
-            "trace journal not supported by this store".into(),
+            "verifiable journal not supported by this store".into(),
         )))
     }
 
-    /// Load the `(session, epoch)` trace segment (entries + committed root, if sealed).
-    async fn load_trace_segment(&self, _session: &SessionId, _epoch: Epoch) -> Option<TraceSegment> {
+    /// Load one `(stream, segment)` segment (entries + committed root, if sealed) — the
+    /// seal-recompute path.
+    async fn load_trace_segment(
+        &self,
+        _stream: &JournalStreamId,
+        _segment: u64,
+    ) -> Option<TraceSegment> {
         None
+    }
+
+    /// Cursor-paged read of a stream's journal for reconnect/scroll-back: up to `max` entries with
+    /// `cursor > after_cursor`, plus the sealed roots of the segments they cover. Non-destructive.
+    async fn load_journal(
+        &self,
+        _stream: &JournalStreamId,
+        _after_cursor: u64,
+        _max: u32,
+    ) -> JournalPage {
+        JournalPage::default()
     }
 }
 
@@ -374,10 +420,12 @@ struct Inner {
     enqueued_jobs: HashSet<JobId>,
     wake_outbox: VecDeque<SessionId>,
     fault: Option<FaultPoint>,
-    /// Append-only trace entries per `(session, epoch)`, kept in `seq` order.
-    trace_entries: HashMap<(SessionId, Epoch), Vec<TraceEntry>>,
-    /// Sealed segment roots per `(session, epoch)`.
-    trace_roots: HashMap<(SessionId, Epoch), CommittedRoot>,
+    /// Append-only journal entries per stream, in append (cursor) order across all segments.
+    journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
+    /// Sealed segment roots per `(stream, segment)`.
+    journal_roots: HashMap<(JournalStreamId, u64), CommittedRoot>,
+    /// Stream-monotonic cursor allocator (the pagination key for `load_journal`).
+    journal_cursor: u64,
 }
 
 /// In-memory [`SessionStore`] backend. The default backend for phase 1 and the conformance harness.
@@ -603,62 +651,128 @@ impl SessionStore for InMemoryStore {
 
     async fn append_trace(
         &self,
-        session: &SessionId,
-        epoch: Epoch,
+        stream: &JournalStreamId,
+        segment: u64,
         entry: TraceEntry,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.sessions.contains_key(session) {
-            return Err(StoreError::NotFound(session.clone()));
-        }
-        let log = inner
-            .trace_entries
-            .entry((session.clone(), epoch))
-            .or_default();
-        // Append-only + idempotent: a redelivered `seq` is a no-op; otherwise insert in order.
-        if log.iter().any(|e| e.seq == entry.seq) {
+        // Append-only + idempotent per `(segment, seq)`: a redelivered entry is a no-op.
+        let log = inner.journal_entries.entry(stream.clone()).or_default();
+        if log
+            .iter()
+            .any(|e| e.segment == segment && e.entry.seq == entry.seq)
+        {
             return Ok(());
         }
-        let pos = log.partition_point(|e| e.seq < entry.seq);
-        log.insert(pos, entry);
+        // 1-based, matching the SQLite backend's `AUTOINCREMENT` cursor: `after_cursor = 0` (strict
+        // `>`) yields the first entry, so the two backends paginate identically.
+        inner.journal_cursor += 1;
+        let cursor = inner.journal_cursor;
+        inner
+            .journal_entries
+            .get_mut(stream)
+            .unwrap()
+            .push(JournalEntry {
+                cursor,
+                segment,
+                entry,
+            });
         Ok(())
     }
 
     async fn commit_trace_segment(
         &self,
-        session: &SessionId,
-        epoch: Epoch,
+        stream: &JournalStreamId,
+        segment: u64,
         root: MerkleRoot,
         signature: Vec<u8>,
-        fence: FenceToken,
+        fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let rec = inner
-            .sessions
-            .get(session)
-            .ok_or_else(|| StoreError::NotFound(session.clone()))?;
-        // Fenced exactly like a checkpoint: a stale incarnation cannot seal a segment root.
-        Self::check_fence(rec, fence)?;
+        // Durable path: fenced exactly like a checkpoint — a stale incarnation cannot seal a root.
+        // Non-durable streams pass `None`: no competing incarnation, the signature is the integrity
+        // primitive.
+        if let Some(fence) = fence {
+            let id = SessionId::new(stream.as_str());
+            let rec = inner
+                .sessions
+                .get(&id)
+                .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+            Self::check_fence(rec, fence)?;
+        }
         inner
-            .trace_roots
-            .insert((session.clone(), epoch), CommittedRoot { root, signature });
+            .journal_roots
+            .insert((stream.clone(), segment), CommittedRoot { root, signature });
         Ok(())
     }
 
-    async fn load_trace_segment(&self, session: &SessionId, epoch: Epoch) -> Option<TraceSegment> {
+    async fn load_trace_segment(
+        &self,
+        stream: &JournalStreamId,
+        segment: u64,
+    ) -> Option<TraceSegment> {
         let inner = self.inner.lock().unwrap();
-        let key = (session.clone(), epoch);
-        let entries = inner.trace_entries.get(&key).cloned().unwrap_or_default();
-        let committed = inner.trace_roots.get(&key).cloned();
+        let mut entries: Vec<TraceEntry> = inner
+            .journal_entries
+            .get(stream)
+            .map(|log| {
+                log.iter()
+                    .filter(|e| e.segment == segment)
+                    .map(|e| e.entry.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by_key(|e| e.seq);
+        let committed = inner.journal_roots.get(&(stream.clone(), segment)).cloned();
         if entries.is_empty() && committed.is_none() {
             return None;
         }
         Some(TraceSegment {
-            session_id: session.clone(),
-            epoch,
+            stream: stream.clone(),
+            segment,
             entries,
             committed,
         })
+    }
+
+    async fn load_journal(
+        &self,
+        stream: &JournalStreamId,
+        after_cursor: u64,
+        max: u32,
+    ) -> JournalPage {
+        let inner = self.inner.lock().unwrap();
+        let Some(log) = inner.journal_entries.get(stream) else {
+            return JournalPage::default();
+        };
+        let head_cursor = log.iter().map(|e| e.cursor).max().unwrap_or(0);
+        let mut entries: Vec<JournalEntry> =
+            log.iter().filter(|e| e.cursor > after_cursor).cloned().collect();
+        entries.sort_by_key(|e| e.cursor);
+        if max > 0 {
+            entries.truncate(max as usize);
+        }
+        let next_cursor = entries.last().map(|e| e.cursor).unwrap_or(after_cursor);
+        // The sealed roots of the segments this page covers, for verification.
+        let mut segments: Vec<u64> = entries.iter().map(|e| e.segment).collect();
+        segments.sort_unstable();
+        segments.dedup();
+        let segment_roots = segments
+            .into_iter()
+            .filter_map(|seg| {
+                inner
+                    .journal_roots
+                    .get(&(stream.clone(), seg))
+                    .cloned()
+                    .map(|root| (seg, root))
+            })
+            .collect();
+        JournalPage {
+            entries,
+            segment_roots,
+            next_cursor,
+            head_cursor,
+        }
     }
 }
 
@@ -691,14 +805,15 @@ mod journal_tests {
     #[tokio::test]
     async fn append_is_ordered_and_idempotent() {
         let (store, id, _f) = seeded().await;
-        // Append out of order; load returns them sorted by seq.
-        store.append_trace(&id, Epoch::ZERO, entry(2, 0x22)).await.unwrap();
-        store.append_trace(&id, Epoch::ZERO, entry(0, 0x00)).await.unwrap();
-        store.append_trace(&id, Epoch::ZERO, entry(1, 0x11)).await.unwrap();
+        let stream = JournalStreamId::session(&id);
+        // Append out of order; load_trace_segment returns them sorted by seq.
+        store.append_trace(&stream, 0, entry(2, 0x22)).await.unwrap();
+        store.append_trace(&stream, 0, entry(0, 0x00)).await.unwrap();
+        store.append_trace(&stream, 0, entry(1, 0x11)).await.unwrap();
         // Redelivered seq is a no-op (append-only, idempotent).
-        store.append_trace(&id, Epoch::ZERO, entry(1, 0xFF)).await.unwrap();
+        store.append_trace(&stream, 0, entry(1, 0xFF)).await.unwrap();
 
-        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
         assert_eq!(seg.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2]);
         // The first writer of seq=1 wins; the duplicate did not overwrite.
         assert_eq!(seg.entries[1].bytes, vec![0x11; 4]);
@@ -706,25 +821,54 @@ mod journal_tests {
     }
 
     #[tokio::test]
-    async fn append_unknown_session_is_not_found() {
+    async fn non_durable_stream_journals_without_a_session() {
+        // A unit stream has no session record; the journal accepts it (keyed by stream, not session).
         let store = InMemoryStore::new();
-        let r = store
-            .append_trace(&SessionId::new("ghost"), Epoch::ZERO, entry(0, 1))
-            .await;
-        assert!(matches!(r, Err(StoreError::NotFound(_))));
+        let stream = JournalStreamId::unit(&daemon_common::UnitId::new("fleet-child"));
+        store.append_trace(&stream, 0, entry(0, 1)).await.unwrap();
+        store.append_trace(&stream, 0, entry(1, 2)).await.unwrap();
+        // Unfenced seal (None) succeeds for a non-durable stream.
+        store
+            .commit_trace_segment(&stream, 0, MerkleRoot::new([5; 32]), vec![9], None)
+            .await
+            .unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
+        assert_eq!(seg.entries.len(), 2);
+        assert_eq!(seg.committed.unwrap().root, MerkleRoot::new([5; 32]));
+    }
+
+    #[tokio::test]
+    async fn cursor_paging_walks_segments_in_order() {
+        let (store, id, _f) = seeded().await;
+        let stream = JournalStreamId::session(&id);
+        // Segment 0 then segment 1, each with two entries.
+        store.append_trace(&stream, 0, entry(0, 0xA0)).await.unwrap();
+        store.append_trace(&stream, 0, entry(1, 0xA1)).await.unwrap();
+        store.append_trace(&stream, 1, entry(0, 0xB0)).await.unwrap();
+        store.append_trace(&stream, 1, entry(1, 0xB1)).await.unwrap();
+
+        let page = store.load_journal(&stream, 0, 3).await;
+        assert_eq!(page.entries.len(), 3, "max caps the page");
+        assert_eq!(page.entries[0].segment, 0, "from the start (after_cursor 0 is inclusive)");
+        assert_eq!(page.head_cursor, 4, "four entries -> 1-based cursors 1..=4");
+        // Walk the rest from the returned cursor.
+        let rest = store.load_journal(&stream, page.next_cursor, 0).await;
+        assert_eq!(rest.entries.len(), 1);
+        assert_eq!(rest.entries[0].segment, 1);
     }
 
     #[tokio::test]
     async fn commit_root_round_trips() {
         let (store, id, fence) = seeded().await;
-        store.append_trace(&id, Epoch::ZERO, entry(0, 7)).await.unwrap();
+        let stream = JournalStreamId::session(&id);
+        store.append_trace(&stream, 0, entry(0, 7)).await.unwrap();
         let root = MerkleRoot::new([9u8; 32]);
         store
-            .commit_trace_segment(&id, Epoch::ZERO, root, vec![1, 2, 3], fence)
+            .commit_trace_segment(&stream, 0, root, vec![1, 2, 3], Some(fence))
             .await
             .unwrap();
 
-        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
         let committed = seg.committed.expect("segment sealed");
         assert_eq!(committed.root, root);
         assert_eq!(committed.signature, vec![1, 2, 3]);
@@ -733,16 +877,17 @@ mod journal_tests {
     #[tokio::test]
     async fn stale_fence_cannot_seal_a_segment() {
         let (store, id, stale) = seeded().await;
+        let stream = JournalStreamId::session(&id);
         // A newer owner supersedes the fence we hold.
         let _current = store.acquire_activation_lease(&id).await.unwrap();
         let r = store
-            .commit_trace_segment(&id, Epoch::ZERO, MerkleRoot::new([0; 32]), vec![], stale)
+            .commit_trace_segment(&stream, 0, MerkleRoot::new([0; 32]), vec![], Some(stale))
             .await;
         assert!(
             matches!(r, Err(StoreError::Fenced { .. })),
             "a stale incarnation must not seal a segment root, got {r:?}"
         );
         // And nothing was committed.
-        assert!(store.load_trace_segment(&id, Epoch::ZERO).await.is_none());
+        assert!(store.load_trace_segment(&stream, 0).await.is_none());
     }
 }

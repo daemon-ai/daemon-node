@@ -800,7 +800,7 @@ mod journal {
     //! the durable bytes — detecting tampering, proving the cross-epoch chain, and rejecting a stale
     //! incarnation's seal.
 
-    use daemon_common::{ContentHash, Epoch, MerkleRoot, SessionId};
+    use daemon_common::{ContentHash, JournalStreamId, MerkleRoot, SessionId};
     use daemon_common::{PartitionId, SnapshotBlob, UsageDelta};
     use daemon_host::JournalSink;
     use daemon_store::{InMemoryStore, SessionStore, StoreError, TraceSegment};
@@ -839,14 +839,14 @@ mod journal {
     }
 
     fn input_from<'a>(
-        id: &'a SessionId,
-        epoch: Epoch,
+        stream: &'a JournalStreamId,
+        segment: u64,
         prior: MerkleRoot,
         entries: &'a [(u64, Vec<u8>, ContentHash)],
     ) -> SegmentInput<'a> {
         SegmentInput {
-            session: id,
-            epoch,
+            stream,
+            segment,
             prior,
             entries,
         }
@@ -869,13 +869,15 @@ mod journal {
         let fence = store.acquire_activation_lease(&id).await.unwrap();
 
         let signer = Arc::new(TraceSigner::generate());
-        let sink = JournalSink::new(
+        let stream = JournalStreamId::session(&id);
+        let sink = JournalSink::for_incarnation(
             store.clone() as Arc<dyn SessionStore>,
             signer.clone(),
-            id.clone(),
-            Epoch::ZERO,
+            stream.clone(),
             fence,
-        );
+            0,
+        )
+        .await;
 
         for ev in turn_events() {
             sink.record(&ev).await.unwrap();
@@ -883,12 +885,12 @@ mod journal {
         let root = sink.seal().await.unwrap();
 
         // Load the sealed segment from the store and verify it end to end.
-        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
         let committed = seg.committed.clone().expect("segment sealed");
         assert_eq!(committed.root, root);
         let entries = loaded_entries(&seg);
         verify_segment(
-            &input_from(&id, Epoch::ZERO, GENESIS_ROOT, &entries),
+            &input_from(&stream, 0, GENESIS_ROOT, &entries),
             &committed.root,
             &committed.signature,
             &signer.verifying_key(),
@@ -899,7 +901,7 @@ mod journal {
         let mut tampered = entries.clone();
         tampered[1].1[0] ^= 0xFF;
         let err = verify_segment(
-            &input_from(&id, Epoch::ZERO, GENESIS_ROOT, &tampered),
+            &input_from(&stream, 0, GENESIS_ROOT, &tampered),
             &committed.root,
             &committed.signature,
             &signer.verifying_key(),
@@ -927,40 +929,43 @@ mod journal {
         // Epoch 0.
         let f0 = store.acquire_activation_lease(&id).await.unwrap();
         let signer = Arc::new(TraceSigner::generate());
-        let sink0 = JournalSink::new(
+        let stream = JournalStreamId::session(&id);
+        let sink0 = JournalSink::for_incarnation(
             store.clone() as Arc<dyn SessionStore>,
             signer.clone(),
-            id.clone(),
-            Epoch::ZERO,
+            stream.clone(),
             f0,
-        );
+            0,
+        )
+        .await;
         for ev in turn_events() {
             sink0.record(&ev).await.unwrap();
         }
         let root0 = sink0.seal().await.unwrap();
 
-        // Epoch 1 chains onto epoch 0's sealed root, under a fresh (superseding) fence.
+        // Epoch 1 chains onto epoch 0's sealed root (loaded from the store), under a fresh
+        // (superseding) fence.
         let f1 = store.acquire_activation_lease(&id).await.unwrap();
-        let sink1 = JournalSink::chained(
+        let sink1 = JournalSink::for_incarnation(
             store.clone() as Arc<dyn SessionStore>,
             signer.clone(),
-            id.clone(),
-            Epoch(1),
+            stream.clone(),
             f1,
-            root0,
-        );
+            1,
+        )
+        .await;
         for ev in turn_events() {
             sink1.record(&ev).await.unwrap();
         }
         let root1 = sink1.seal().await.unwrap();
 
-        let seg1 = store.load_trace_segment(&id, Epoch(1)).await.unwrap();
+        let seg1 = store.load_trace_segment(&stream, 1).await.unwrap();
         let committed1 = seg1.committed.clone().unwrap();
         let entries1 = loaded_entries(&seg1);
 
         // Verifies with the true prior (root0)...
         verify_segment(
-            &input_from(&id, Epoch(1), root0, &entries1),
+            &input_from(&stream, 1, root0, &entries1),
             &committed1.root,
             &committed1.signature,
             &signer.verifying_key(),
@@ -971,7 +976,7 @@ mod journal {
         // ...and a broken link (wrong prior) is rejected.
         assert_eq!(
             verify_segment(
-                &input_from(&id, Epoch(1), GENESIS_ROOT, &entries1),
+                &input_from(&stream, 1, GENESIS_ROOT, &entries1),
                 &committed1.root,
                 &committed1.signature,
                 &signer.verifying_key(),
@@ -994,13 +999,15 @@ mod journal {
         let _current = store.acquire_activation_lease(&id).await.unwrap();
 
         let signer = Arc::new(TraceSigner::generate());
-        let sink = JournalSink::new(
+        let stream = JournalStreamId::session(&id);
+        let sink = JournalSink::for_incarnation(
             store.clone() as Arc<dyn SessionStore>,
             signer,
-            id.clone(),
-            Epoch::ZERO,
+            stream.clone(),
             stale,
-        );
+            0,
+        )
+        .await;
         for ev in turn_events() {
             // Appends are not fenced (the open log), but the seal is.
             sink.record(&ev).await.unwrap();
@@ -1011,7 +1018,7 @@ mod journal {
             "a stale incarnation must not seal a segment root, got {r:?}"
         );
         // No root was committed.
-        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
         assert!(seg.committed.is_none());
     }
 }
@@ -1228,8 +1235,8 @@ mod credentials {
     //! and a cost ceiling feeds back into `Budget`.
 
     use daemon_common::{
-        ContentHash, CredError, CredMode, CredScope, Epoch, FenceToken, PartitionId, ProfileRef,
-        SessionId, SnapshotBlob, UnitId,
+        ContentHash, CredError, CredMode, CredScope, FenceToken, JournalStreamId, PartitionId,
+        ProfileRef, SessionId, SnapshotBlob, UnitId,
     };
     use daemon_credentials::{
         CapabilitySigner, CredAuditKind, CredentialAuthority, StubCredentialSource,
@@ -1449,13 +1456,15 @@ mod credentials {
             .unwrap();
         let fence = store.acquire_activation_lease(&id).await.unwrap();
         let tsigner = Arc::new(TraceSigner::generate());
-        let sink = JournalSink::new(
+        let stream = JournalStreamId::session(&id);
+        let sink = JournalSink::for_incarnation(
             store.clone() as Arc<dyn SessionStore>,
             tsigner.clone(),
-            id.clone(),
-            Epoch::ZERO,
+            stream.clone(),
             fence,
-        );
+            0,
+        )
+        .await;
 
         let events = auth.audit_log();
         assert!(events.iter().any(|e| e.kind == CredAuditKind::Request));
@@ -1465,14 +1474,14 @@ mod credentials {
         }
         let root = sink.seal().await.unwrap();
 
-        let seg = store.load_trace_segment(&id, Epoch::ZERO).await.unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
         let committed = seg.committed.clone().expect("segment sealed");
         assert_eq!(committed.root, root);
         let entries = loaded_entries(&seg);
         verify_segment(
             &SegmentInput {
-                session: &id,
-                epoch: Epoch::ZERO,
+                stream: &stream,
+                segment: 0,
                 prior: GENESIS_ROOT,
                 entries: &entries,
             },
@@ -1567,6 +1576,7 @@ mod node_interface {
             credentials: None,
             profile: ProfileRef::new("openai"),
             engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x11; 32]),
         });
         (node, handle)
     }
@@ -1847,6 +1857,89 @@ mod node_interface {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(finished, "the interactive turn never reached TurnFinished");
+
+        handle.shutdown().await;
+    }
+
+    /// THE THREAD-C GATE: reconnect + scroll-back through durable, verified history. After an
+    /// interactive turn seals into the unified verifiable journal, the session's history is read
+    /// back through the (non-destructive) `session_history` surface — independent of the live drain,
+    /// exactly as a reconnecting client sees it. The coalesced assistant message is present, the
+    /// whole sealed chain verifies under the node's published verifying key, and the read is
+    /// non-destructive (a second read returns the same page).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_reads_back_verified_session_history() {
+        use daemon_api::{ControlApi, JournalRecordPayload, Outbound, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_protocol::{AgentCommand, AgentEvent, TranscriptBlock, UserMsg};
+
+        let (node, handle) = assemble();
+        let session = SessionId::new("history-1");
+
+        // Drive an interactive turn to TurnFinished (the live path journals + seals per turn).
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hello"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit StartTurn");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut finished = false;
+        while Instant::now() < deadline {
+            let drained = node.poll(session.clone(), 0).await.expect("poll");
+            if drained
+                .iter()
+                .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))
+            {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(finished, "the interactive turn never reached TurnFinished");
+
+        // Scroll back through durable history — non-destructive and independent of the live drain
+        // (the seal may land just after TurnFinished drains, so retry until the page appears).
+        let mut page = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let p = node.session_history(session.clone(), 0, 0).await;
+            if !p.entries.is_empty() {
+                page = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let page = page.expect("durable history should appear after the turn seals");
+
+        // The whole sealed chain verifies, and the coalesced assistant message is present.
+        assert!(
+            page.entries.iter().all(|e| e.verified),
+            "every sealed entry must verify under the node key: {page:?}"
+        );
+        assert!(
+            page.entries.iter().any(|e| matches!(
+                &e.payload,
+                JournalRecordPayload::Block {
+                    block: TranscriptBlock::Message { .. }
+                }
+            )),
+            "expected a coalesced assistant message block, got {page:?}"
+        );
+
+        // Non-destructive: a repeat read from the same cursor returns the same entries.
+        let again = node.session_history(session.clone(), 0, 0).await;
+        assert_eq!(again.entries, page.entries, "history read must be non-destructive");
+
+        // The node publishes its verifying key so an auditor can verify the chain offline.
+        let key = node.verifying_key().await;
+        assert!(
+            key.map(|k| !k.is_empty()).unwrap_or(false),
+            "the node must publish a journal verifying key"
+        );
 
         handle.shutdown().await;
     }

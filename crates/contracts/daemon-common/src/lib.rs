@@ -62,6 +62,24 @@ string_id! {
     /// Stable identity of a unit of background work delegated by a session.
     JobId
 }
+string_id! {
+    /// The stream a verifiable journal is keyed by: any addressable agent in the tree (a durable
+    /// session, a live interactive session, a fleet/foreign unit). Decouples the journal from the
+    /// durable activation identity (`SessionId`/`Epoch`) so non-durable units journal too.
+    JournalStreamId
+}
+
+impl JournalStreamId {
+    /// The journal stream for a durable/live session.
+    pub fn session(id: &SessionId) -> Self {
+        Self(id.0.clone())
+    }
+
+    /// The journal stream for a managed unit (fleet/foreign).
+    pub fn unit(id: &UnitId) -> Self {
+        Self(id.0.clone())
+    }
+}
 
 /// Partition / ownership domain. The activation lease is scoped per partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

@@ -20,4 +20,5 @@ daemon-tool-orchestrate = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }
+daemon-telemetry = { workspace = true }
 async-trait = { workspace = true }

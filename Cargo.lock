@@ -754,6 +754,7 @@ dependencies = [
  "daemon-provision",
  "daemon-store",
  "daemon-supervision",
+ "daemon-telemetry",
  "daemon-tool-orchestrate",
 ]
 
@@ -823,6 +824,7 @@ dependencies = [
  "bc-components",
  "bc-envelope",
  "bc-rand",
+ "ciborium",
  "daemon-common",
  "dcbor",
  "serde",

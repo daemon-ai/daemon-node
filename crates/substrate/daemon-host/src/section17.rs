@@ -13,6 +13,7 @@
 //!   realizes the supervision §4 mapping table (total upward, partial downward) so a host presents an
 //!   engine — ours or foreign — identically to its supervisor.
 
+use crate::journal::JournalFeeder;
 use async_trait::async_trait;
 use daemon_api::Outbound;
 use daemon_common::{JobId, UnitId};
@@ -80,8 +81,13 @@ impl AgentUnit {
     /// Start a unit identified by `id` over a session built by `build`. `build` is handed the
     /// [`HostRequestHandler`] the session must route its blocking §17 requests through (the
     /// [`ManageToHost`] adapter that escalates to the installed [`ManageRequestHandler`]).
-    pub(crate) fn start(
+    ///
+    /// When `journal` is `Some`, the full §17 `Outbound` stream (events + raised requests) is fed
+    /// into it so the unit's finished transcript blocks + lifecycle are durably sealed per turn (the
+    /// fleet/foreign production journaling path); `None` disables journaling.
+    pub(crate) fn start_journaled(
         id: UnitId,
+        journal: Option<Arc<JournalFeeder>>,
         build: impl FnOnce(Arc<dyn HostRequestHandler>) -> Arc<dyn Section17Session>,
     ) -> Self {
         let handler: HandlerSlot = Arc::new(Mutex::new(None));
@@ -89,6 +95,7 @@ impl AgentUnit {
         let host = Arc::new(ManageToHost {
             handler: handler.clone(),
             outbound: outbound.clone(),
+            journal: journal.clone(),
         });
         let session = build(host);
 
@@ -97,17 +104,23 @@ impl AgentUnit {
 
         // Relay: subscribe to the §17 stream and (a) retain each event verbatim on the rich outbound
         // drain (transcript fidelity — structured `detail` / `ContentDelta` survive untouched), then
-        // (b) map it up to a ManageEvent for the coarse management broadcast. Subscribing here
+        // (b) feed the verifiable journal (coalesced into finished blocks, sealed per turn), then
+        // (c) map it up to a ManageEvent for the coarse management broadcast. Subscribing here
         // (before any turn) keeps both translations lossless for live consumers (§4 / §2.2).
         let mut agent_rx = session.subscribe();
         let out = events.clone();
         let last_work_relay = last_work.clone();
         let drain_relay = outbound.clone();
+        let journal_relay = journal.clone();
         tokio::spawn(async move {
             loop {
                 match agent_rx.recv().await {
                     Ok(ev) => {
-                        push_outbound(&drain_relay, Outbound::Event(ev.clone()));
+                        let frame = Outbound::Event(ev.clone());
+                        push_outbound(&drain_relay, frame.clone());
+                        if let Some(feeder) = &journal_relay {
+                            feeder.feed(&frame).await;
+                        }
                         if let Some(mapped) = map_event(ev, &last_work_relay) {
                             let _ = out.send(mapped);
                         }
@@ -308,6 +321,8 @@ pub(crate) struct ManageToHost {
     /// The unit's rich outbound drain: a raised request is retained here (in causal order with the
     /// event stream) so the transcript consumer sees the pending interactive prompt.
     outbound: OutboundDrain,
+    /// The verifiable-journal feeder, so a raised request graduates into a durable request block.
+    journal: Option<Arc<JournalFeeder>>,
 }
 
 #[async_trait]
@@ -316,6 +331,9 @@ impl HostRequestHandler for ManageToHost {
         // Retain the blocking request on the rich drain before escalating, so a transcript consumer
         // can render the pending prompt (approval / input / choice / delegate).
         push_outbound(&self.outbound, Outbound::Request(req.clone()));
+        if let Some(feeder) = &self.journal {
+            feeder.feed(&Outbound::Request(req.clone())).await;
+        }
 
         let installed = self.handler.lock().unwrap().clone();
         let request_id = req.request_id;

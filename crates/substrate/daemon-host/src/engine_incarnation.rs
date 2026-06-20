@@ -11,18 +11,30 @@
 //! — the live management-protocol escalation path is the actor-backed `EngineUnit` (see
 //! [`crate::unit`]).
 
+use crate::journal::{JournalFeeder, JournalSink};
 use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
-use daemon_common::{Epoch, JobId, ProfileRef, SessionId};
+use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, SessionId};
 use daemon_core::{
     Completion, DelegateTool, Engine, EngineProfile, EventSink, Failure, MockProvider, Provider,
     Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
 };
 use daemon_protocol::{
-    HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody,
+    HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, Outbound,
 };
-use daemon_store::{JobCommand, JobCompletion};
-use std::sync::Arc;
+use daemon_store::{JobCommand, JobCompletion, SessionStore};
+use daemon_telemetry::{TraceSigner, GENESIS_ROOT};
+use std::sync::{Arc, Mutex};
+
+/// The store + signer a durable incarnation journals into. Injected by the composition root; when
+/// absent the durable path runs without journaling (e.g. the substrate conformance suite).
+#[derive(Clone)]
+pub struct JournalConfig {
+    /// The authoritative store the journal is appended to + sealed in.
+    pub store: Arc<dyn SessionStore>,
+    /// The node's segment-root signer.
+    pub signer: Arc<TraceSigner>,
+}
 
 // The provider/credential builder type aliases now live with the [`EngineProfile`] in `daemon-core`
 // (the one composition seam); re-exported here for callers that still reference them by this path.
@@ -33,6 +45,7 @@ pub use daemon_core::{CredentialBuilder, ProviderBuilder};
 #[derive(Clone)]
 pub struct CoreEngineFactory {
     profile: EngineProfile,
+    journal: Option<JournalConfig>,
 }
 
 impl CoreEngineFactory {
@@ -48,7 +61,10 @@ impl CoreEngineFactory {
             Arc::new(registry),
             SystemPrompt::new("daemon-core conformance engine"),
         );
-        Self { profile }
+        Self {
+            profile,
+            journal: None,
+        }
     }
 
     /// A factory over a custom provider builder, tool registry, and system prompt.
@@ -59,12 +75,23 @@ impl CoreEngineFactory {
     ) -> Self {
         Self {
             profile: EngineProfile::new(provider, registry, system),
+            journal: None,
         }
     }
 
     /// A factory over an already-assembled [`EngineProfile`] (the binary's composition root).
     pub fn from_profile(profile: EngineProfile) -> Self {
-        Self { profile }
+        Self {
+            profile,
+            journal: None,
+        }
+    }
+
+    /// Inject the verifiable-journal store + signer so every durable incarnation this factory builds
+    /// seals its turn into the unified journal (the durable production journaling path).
+    pub fn with_journal(mut self, store: Arc<dyn SessionStore>, signer: Arc<TraceSigner>) -> Self {
+        self.journal = Some(JournalConfig { store, signer });
+        self
     }
 
     /// Inject an authority-backed (or brokered) credential provider + profile into every engine
@@ -80,6 +107,7 @@ impl EngineFactory for CoreEngineFactory {
         Box::new(CoreIncarnation {
             profile: self.profile.clone(),
             engine: None,
+            journal: self.journal.clone(),
         })
     }
 }
@@ -88,6 +116,7 @@ impl EngineFactory for CoreEngineFactory {
 pub struct CoreIncarnation {
     profile: EngineProfile,
     engine: Option<Engine>,
+    journal: Option<JournalConfig>,
 }
 
 fn map_failure(failure: Failure) -> EngineError {
@@ -126,17 +155,55 @@ impl Incarnation for CoreIncarnation {
             .as_mut()
             .ok_or_else(|| EngineError::Other("run before hydrate".into()))?;
         let session_id = engine.snapshot().session_id.clone();
+        let segment = engine.epoch().0;
         let host = DelegateResolver {
             session_id: session_id.clone(),
             epoch: engine.epoch(),
         };
-        let sink = EventSink::discarding();
+        // When journaling, capture the engine's events so they can be coalesced into finished blocks
+        // and sealed after the turn; otherwise discard (the substrate replays from durable state).
+        let captured: Arc<Mutex<Vec<daemon_protocol::AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = if self.journal.is_some() {
+            let cap = captured.clone();
+            EventSink::new(move |ev| cap.lock().unwrap().push(ev))
+        } else {
+            EventSink::discarding()
+        };
         let control = TurnControl::new();
-        match engine
+        let outcome = engine
             .run_turn(&host, &sink, &control)
             .await
-            .map_err(map_failure)?
-        {
+            .map_err(map_failure)?;
+
+        // Seal this incarnation's turn into the unified verifiable journal (unfenced on the durable
+        // path: the snapshot chain fences durable state, the ed25519 signature seals the transcript).
+        if let Some(cfg) = &self.journal {
+            let stream = JournalStreamId::session(&session_id);
+            let prior = if segment == 0 {
+                GENESIS_ROOT
+            } else {
+                cfg.store
+                    .load_trace_segment(&stream, segment - 1)
+                    .await
+                    .and_then(|s| s.committed.map(|c| c.root))
+                    .unwrap_or(GENESIS_ROOT)
+            };
+            let jsink = Arc::new(JournalSink::with_segment(
+                cfg.store.clone(),
+                cfg.signer.clone(),
+                stream,
+                None,
+                segment,
+                prior,
+            ));
+            let feeder = JournalFeeder::new(jsink);
+            let events = std::mem::take(&mut *captured.lock().unwrap());
+            for ev in events {
+                feeder.feed(&Outbound::Event(ev)).await;
+            }
+        }
+
+        match outcome {
             TurnOutcome::Completed(_) => Ok(Step::Completed),
             TurnOutcome::Suspended(suspension) => Ok(Step::Suspended {
                 job: JobCommand {
