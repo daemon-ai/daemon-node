@@ -679,7 +679,7 @@ mod translation {
     use std::time::Duration;
 
     /// Build a managed unit over a real engine driven by `provider`.
-    fn engine_unit(provider: Arc<dyn Provider>) -> EngineUnit {
+    fn engine_unit(provider: Arc<dyn Provider>) -> daemon_host::AgentUnit {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(DelegateTool::new("background-work")));
         let engine = Engine::fresh(
@@ -1530,7 +1530,7 @@ mod node_interface {
     use daemon_common::{PartitionId, SessionId, UnitId};
     use daemon_core::{Engine, MockProvider, Provider, SystemPrompt, ToolRegistry};
     use daemon_host::{
-        serve_api_unix, ApiClient, CoreEngineFactory, EngineUnit, FleetView, Host, HostConfig,
+        serve_api_unix, ApiClient, CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig,
         JobWorker, NodeApiImpl, ServiceError, SessionEngineBuilder,
     };
     use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
@@ -1574,11 +1574,11 @@ mod node_interface {
         }
     }
 
-    /// The fleet projected for the control surface.
+    /// The fleet projected for the control surface (roster + the tree the GUI/TUI drives).
     struct FleetViewImpl(FleetRuntime);
 
     #[async_trait]
-    impl FleetView for FleetViewImpl {
+    impl FleetControl for FleetViewImpl {
         async fn report(&self) -> FleetReport {
             FleetReport {
                 children: self.0.children(),
@@ -1587,6 +1587,24 @@ mod node_interface {
         }
         async fn cancel(&self, child: &UnitId) -> bool {
             self.0.cancel_child(child).await
+        }
+        async fn tree(&self) -> daemon_api::TreeReport {
+            self.0.tree()
+        }
+        async fn unit(&self, id: &UnitId) -> Option<daemon_api::UnitNode> {
+            self.0.unit(id)
+        }
+        async fn unit_events(&self, id: &UnitId, max: u32) -> Vec<daemon_api::ManageEventView> {
+            self.0.unit_events(id, max)
+        }
+        async fn pause(&self, id: &UnitId) -> bool {
+            self.0.pause(id).await
+        }
+        async fn resume(&self, id: &UnitId) -> bool {
+            self.0.resume(id).await
+        }
+        async fn scale(&self, id: &UnitId, n: u32) -> bool {
+            self.0.scale(id, n).await
         }
     }
 
@@ -1629,7 +1647,7 @@ mod node_interface {
             host.manager().clone(),
             PARTITION,
             session_builder,
-            Some(Arc::new(FleetViewImpl(fleet)) as Arc<dyn FleetView>),
+            Some(Arc::new(FleetViewImpl(fleet)) as Arc<dyn FleetControl>),
         ));
         (node, handle)
     }
@@ -1743,6 +1761,137 @@ mod node_interface {
         let mut names: Vec<String> = h.services.iter().map(|s| s.name.clone()).collect();
         names.sort();
         names
+    }
+
+    /// The tree-aware control surface (the GUI's real surface) is transport-agnostic: `tree`/`unit`/
+    /// `unit_events` and the lifecycle ops agree in-process and over the socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tree_surface_is_transport_agnostic() {
+        use daemon_api::ApiError;
+
+        let (node, handle) = assemble();
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+
+        // Drive a delegation child to completion so the tree has a unit to project.
+        let session = SessionId::new("tree-op");
+        assert!(matches!(
+            client
+                .call(ApiRequest::Assign {
+                    session: session.clone()
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let ApiResponse::Sessions(list) = client.call(ApiRequest::Sessions).await.unwrap() {
+                if list
+                    .iter()
+                    .any(|i| i.session == session && i.state == SessionState::Completed)
+                {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "the assigned session never completed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // tree() parity + the fleet child presents as an Engine leaf.
+        let inproc_tree = node.tree().await;
+        let socket_tree = match client.call(ApiRequest::Tree).await.unwrap() {
+            ApiResponse::Tree(t) => t,
+            other => panic!("expected Tree, got {other:?}"),
+        };
+        assert_eq!(inproc_tree, socket_tree, "tree must agree across transports");
+        assert!(
+            !socket_tree.nodes.is_empty(),
+            "expected at least one unit in the tree"
+        );
+        let child = socket_tree.nodes[0].clone();
+        assert_eq!(
+            child.kind,
+            daemon_api::UnitKind::Engine,
+            "a fleet child is an Engine leaf"
+        );
+
+        // unit() parity.
+        let inproc_unit = node.unit(child.id.clone()).await;
+        let socket_unit = match client
+            .call(ApiRequest::Unit {
+                unit: child.id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::Unit(u) => u,
+            other => panic!("expected Unit, got {other:?}"),
+        };
+        assert_eq!(inproc_unit, socket_unit, "unit view must agree across transports");
+        assert!(socket_unit.is_some(), "the child unit should resolve");
+
+        // unit_events() parity: the child emitted at least Started + Finished views.
+        let inproc_events = node.unit_events(child.id.clone(), 0).await;
+        let socket_events = match client
+            .call(ApiRequest::UnitEvents {
+                unit: child.id.clone(),
+                max: 0,
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::UnitEvents(e) => e,
+            other => panic!("expected UnitEvents, got {other:?}"),
+        };
+        assert_eq!(
+            inproc_events, socket_events,
+            "unit events must agree across transports"
+        );
+        assert!(
+            !socket_events.is_empty(),
+            "expected buffered drill-down events for the child"
+        );
+
+        // Lifecycle parity: an engine leaf does not support pause/resume/scale — identically on both
+        // transports (the surface is meaningful for orchestrator sub-fleets).
+        for (req, label) in [
+            (
+                ApiRequest::Pause {
+                    unit: child.id.clone(),
+                },
+                "pause",
+            ),
+            (
+                ApiRequest::Resume {
+                    unit: child.id.clone(),
+                },
+                "resume",
+            ),
+            (
+                ApiRequest::Scale {
+                    unit: child.id.clone(),
+                    n: 2,
+                },
+                "scale",
+            ),
+        ] {
+            let socket = client.call(req).await.unwrap();
+            assert!(
+                matches!(socket, ApiResponse::Error(ApiError::Unsupported(_))),
+                "{label} should be Unsupported over the socket, got {socket:?}"
+            );
+        }
+        assert!(node.pause(child.id.clone()).await.is_err());
+        assert!(node.resume(child.id.clone()).await.is_err());
+        assert!(node.scale(child.id.clone(), 2).await.is_err());
+
+        server.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

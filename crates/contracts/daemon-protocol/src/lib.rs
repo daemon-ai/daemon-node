@@ -360,3 +360,31 @@ pub trait HostRequestHandler: Send + Sync {
     /// Answer a blocking host request.
     async fn request(&self, req: HostRequest) -> HostResponse;
 }
+
+// ---------------------------------------------------------------------------
+// §17 process-cut framing (foreign agents)
+// ---------------------------------------------------------------------------
+
+/// A §17 frame sent **down** to a foreign agent process (host -> agent) over a process cut. A
+/// foreign brain that speaks §17 is driven by these frames on its stdin; the host wraps the cut as
+/// an `Engine`-leaf managed unit. The reference in-process brain (`daemon-core`) uses typed channels
+/// instead, but the dialect is the same §17.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Section17Down {
+    /// A §17 command for the agent to act on.
+    Command(AgentCommand),
+    /// The host's reply to a [`HostRequest`] the agent raised.
+    Response(HostResponse),
+}
+
+/// A §17 frame sent **up** from a foreign agent process (agent -> host) over a process cut, written
+/// to its stdout.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Section17Up {
+    /// A streamed §17 event.
+    Event(AgentEvent),
+    /// A blocking §17 host request awaiting a [`Section17Down::Response`].
+    Request(HostRequest),
+}

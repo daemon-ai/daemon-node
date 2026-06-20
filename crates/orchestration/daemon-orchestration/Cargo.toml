@@ -9,6 +9,7 @@ license.workspace = true
 daemon-common = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-store = { workspace = true }
+daemon-api = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }

@@ -5,8 +5,14 @@
 //! incremental [`daemon_common::UsageDelta`] events fold into one fleet total (supervision
 //! invariant #4 — usage aggregates up the tree by construction).
 
+use daemon_api::ManageEventView;
+use daemon_common::UsageDelta;
 use daemon_supervision::{ManagedUnit, Outcome, WorkRef};
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+/// The per-child cap on buffered [`ManageEventView`]s for the GUI drill-down (`unit_events`).
+pub(crate) const CHILD_EVENT_BUFFER: usize = 256;
 
 /// Where a child sits in its lifecycle, as folded from its `ManageEvent` stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +38,10 @@ pub struct ChildRecord {
     pub status: ChildStatus,
     /// The terminal outcome, once `Finished`/`Failed`.
     pub outcome: Option<Outcome>,
+    /// The child's folded usage (its own `Usage` events summed; supervision invariant #4).
+    pub usage: UsageDelta,
+    /// A bounded buffer of recent management-event views for GUI drill-down (`unit_events`).
+    pub events: VecDeque<ManageEventView>,
 }
 
 impl ChildRecord {
@@ -42,6 +52,16 @@ impl ChildRecord {
             work,
             status: ChildStatus::Spawned,
             outcome: None,
+            usage: UsageDelta::default(),
+            events: VecDeque::new(),
         }
+    }
+
+    /// Append an event view, evicting the oldest beyond the buffer cap.
+    pub fn push_event(&mut self, view: ManageEventView) {
+        if self.events.len() == CHILD_EVENT_BUFFER {
+            self.events.pop_front();
+        }
+        self.events.push_back(view);
     }
 }

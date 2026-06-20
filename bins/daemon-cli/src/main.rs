@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use daemon_api::{ApiRequest, ApiResponse};
-use daemon_common::{ReqId, SessionId};
+use daemon_common::{ReqId, SessionId, UnitId};
 use daemon_host::ApiClient;
 use daemon_protocol::{AgentCommand, UserMsg};
 
@@ -47,6 +47,38 @@ enum Command {
     },
     /// The orchestration fleet roster + folded usage.
     Fleet,
+    /// The orchestration tree the GUI/TUI drives (unit structure, state, work, usage).
+    Tree,
+    /// One unit's node view.
+    Unit {
+        /// The unit id.
+        id: String,
+    },
+    /// Drain recent management events for a unit (drill-down).
+    UnitEvents {
+        /// The unit id.
+        id: String,
+        /// Maximum events to drain (0 = all buffered).
+        #[arg(long, default_value_t = 0)]
+        max: u32,
+    },
+    /// Pause a unit's scheduling (orchestrator sub-fleets).
+    Pause {
+        /// The unit id.
+        id: String,
+    },
+    /// Resume a unit's scheduling.
+    Resume {
+        /// The unit id.
+        id: String,
+    },
+    /// Scale a unit (sub-fleet) to N members.
+    Scale {
+        /// The unit id.
+        id: String,
+        /// The target member count.
+        n: u32,
+    },
     /// Open/continue an interactive session by starting a turn.
     Submit {
         /// The session id.
@@ -102,6 +134,44 @@ async fn main() -> anyhow::Result<()> {
                 .await?,
         ),
         Command::Fleet => render(client.call(ApiRequest::Fleet).await?),
+        Command::Tree => render(client.call(ApiRequest::Tree).await?),
+        Command::Unit { id } => render(
+            client
+                .call(ApiRequest::Unit {
+                    unit: UnitId::new(id),
+                })
+                .await?,
+        ),
+        Command::UnitEvents { id, max } => render(
+            client
+                .call(ApiRequest::UnitEvents {
+                    unit: UnitId::new(id),
+                    max,
+                })
+                .await?,
+        ),
+        Command::Pause { id } => render(
+            client
+                .call(ApiRequest::Pause {
+                    unit: UnitId::new(id),
+                })
+                .await?,
+        ),
+        Command::Resume { id } => render(
+            client
+                .call(ApiRequest::Resume {
+                    unit: UnitId::new(id),
+                })
+                .await?,
+        ),
+        Command::Scale { id, n } => render(
+            client
+                .call(ApiRequest::Scale {
+                    unit: UnitId::new(id),
+                    n,
+                })
+                .await?,
+        ),
         Command::Submit { id, text } => render(
             client
                 .call(ApiRequest::Submit {
@@ -164,6 +234,41 @@ fn render(resp: ApiResponse) {
                 println!("  - {item:?}");
             }
         }
+        ApiResponse::Tree(t) => {
+            println!(
+                "tree: root={} nodes={}",
+                t.root.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
+                t.nodes.len()
+            );
+            for n in t.nodes {
+                render_unit_node(&n);
+            }
+        }
+        ApiResponse::Unit(unit) => match unit {
+            Some(n) => render_unit_node(&n),
+            None => println!("unit: not found"),
+        },
+        ApiResponse::UnitEvents(events) => {
+            println!("unit events: {}", events.len());
+            for e in events {
+                println!("  - {e:?}");
+            }
+        }
         ApiResponse::Error(e) => println!("error: {e}"),
     }
+}
+
+/// Render one tree node line (id, kind, state, work, usage).
+fn render_unit_node(n: &daemon_api::UnitNode) {
+    println!(
+        "  - {} kind={:?} state={:?} work={} usage(in={} out={} api_calls={}) children={}",
+        n.id,
+        n.kind,
+        n.state,
+        n.work.as_deref().unwrap_or("-"),
+        n.usage.input_tokens,
+        n.usage.output_tokens,
+        n.usage.api_calls,
+        n.children.len()
+    );
 }

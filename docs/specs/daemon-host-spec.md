@@ -208,6 +208,23 @@ decides **where** it runs:
 - **Placement** — in-process (default; same address space) or remote (a remote host driving the
   engine over §17). Placement is a host concern invisible to the orchestrator, which only routes by
   `UnitId`.
+- **Brain** — in-process `daemon-core` (the reference engine, presented as an `EngineUnit`) or a
+  **foreign agent** process driven over a §17 process cut (presented as a `ProcessAgentUnit`). Both
+  are `Engine`-leaf `ManagedUnit`s; which brain backs a unit is a host concern, selected at spawn time
+  from a **launch profile** (`program`/`args`/`env`, mirroring `PlacementSpec`) by a profile-driven
+  `ChildSpawner`. A foreign brain's adapter owns its lifecycle: the durable activation/snapshot path
+  (§4) is `daemon-core`-only, so a foreign unit is relaunched from its profile rather than rehydrated.
+
+> **Agent adapter vs FFI — opposite directions.** Driving a *foreign* brain (above) is **us → them**:
+> a host-side adapter frames §17 to a child process. The FFI crates (`bindings/`) are **them → us**: a
+> non-Rust host embedding *our* engine/node. Don't conflate them.
+
+**The consuming surface is the tree, not §17.** A GUI/TUI/`daemon-cli` never speaks §17 to individual
+agents; it drives the node's `daemon-api` `ControlApi`, which projects the orchestration tree
+(`tree()`/`unit()`/`unit_events()` + lifecycle `pause`/`resume`/`scale`/`cancel`/`assign`, all routed
+by `UnitId`). A single agent is a tree of one; teams and fleets-of-fleets are deeper trees presented
+through the same surface. The management protocol (`ManagedUnit`) is the internal recursion; the
+`daemon-api` projection is its read/drive face for consumers.
 
 > **Source-audit note (S2): isolation is a *placement* property, not a framework "distribution"
 > feature.** The intuition that "distribution gives us isolation" does **not** hold for the Rust

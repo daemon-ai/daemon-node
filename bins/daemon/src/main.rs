@@ -25,11 +25,12 @@ use daemon_core::{
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
     run_placed_child, serve_api_unix, BrokeredCredentialProvider, CoreEngineFactory,
-    CredentialBroker, EngineUnit, FleetView, Host, HostConfig, JobWorker, NodeApiImpl, OwnerBroker,
-    ServiceError, SessionEngineBuilder,
+    CredentialBroker, EngineUnit, FleetControl, Host, HostConfig, JobWorker, NodeApiImpl,
+    OwnerBroker, ProcessAgentUnit, ServiceError, SessionEngineBuilder,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
-use daemon_provision::CutChannel;
+use daemon_provision::{CutChannel, PlacementSpec, ProcessProvisioner, Provisioner};
+use std::path::PathBuf;
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
 use daemon_transport::RemoteHost;
@@ -116,9 +117,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let fleet = FleetRuntime::new(
         store.clone(),
         cfg.partition,
-        Arc::new(EngineChildSpawner {
-            profile: child_profile,
-        }),
+        Arc::new(ProfileChildSpawner::core(child_profile)),
         Arc::new(DefaultAnswerPolicy),
         None::<Arc<dyn ManageRequestHandler>>,
     );
@@ -172,7 +171,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         host.manager().clone(),
         cfg.partition,
         session_builder,
-        Some(Arc::new(FleetViewImpl(fleet)) as Arc<dyn FleetView>),
+        Some(Arc::new(FleetViewImpl(fleet)) as Arc<dyn FleetControl>),
     ));
 
     // Bind the api socket (fresh) and serve the unified surface over it.
@@ -205,17 +204,67 @@ fn build_owner_broker(profile: &str, key: &str) -> Arc<dyn CredentialBroker> {
     Arc::new(OwnerBroker::new(authority))
 }
 
-/// The injected placement seam: materialize a child as an engine-backed `ManagedUnit`, built from
-/// the shared child [`EngineProfile`] (a completing provider finishes the child in one turn).
-struct EngineChildSpawner {
-    profile: EngineProfile,
+/// A foreign agent launch profile: how to start a non-`daemon-core` brain that speaks §17 over a
+/// process cut (mirrors [`daemon_provision::PlacementSpec`]). The reference brain needs none of this;
+/// it is the home for "manage the foreign process's environment" the way `EngineProfile` is for ours.
+#[allow(dead_code)]
+struct LaunchProfile {
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// How to construct a child brain. `Core` is the in-process reference engine; `Foreign` launches an
+/// external agent process. Both are presented up the tree as a `UnitKind::Engine` `ManagedUnit`, so
+/// the fleet/orchestrator (and the GUI above it) cannot tell them apart. The default host wires
+/// `Core`; the foreign path is exercised by the conformance gate.
+#[allow(dead_code)]
+enum AgentBackend {
+    Core(EngineProfile),
+    Foreign(LaunchProfile),
+}
+
+/// The profile-driven placement seam: materialize each child as the configured [`AgentBackend`],
+/// uniformly presented as a `ManagedUnit`.
+struct ProfileChildSpawner {
+    backend: AgentBackend,
+    provisioner: Arc<dyn Provisioner>,
+}
+
+impl ProfileChildSpawner {
+    /// A spawner that materializes children from the in-process reference engine profile.
+    fn core(profile: EngineProfile) -> Self {
+        Self {
+            backend: AgentBackend::Core(profile),
+            provisioner: Arc::new(ProcessProvisioner::new()),
+        }
+    }
 }
 
 #[async_trait]
-impl ChildSpawner for EngineChildSpawner {
+impl ChildSpawner for ProfileChildSpawner {
     async fn spawn(&self, id: UnitId, _spec: &DelegationSpec) -> Arc<dyn ManagedUnit> {
-        let engine = self.profile.fresh(SessionId::new(id.as_str()));
-        Arc::new(EngineUnit::spawn(id, engine))
+        match &self.backend {
+            AgentBackend::Core(profile) => {
+                let engine = profile.fresh(SessionId::new(id.as_str()));
+                Arc::new(EngineUnit::spawn(id, engine))
+            }
+            AgentBackend::Foreign(launch) => {
+                let placement = self
+                    .provisioner
+                    .place(
+                        &SessionId::new(id.as_str()),
+                        PlacementSpec {
+                            program: launch.program.clone(),
+                            args: launch.args.clone(),
+                            env: launch.env.clone(),
+                        },
+                    )
+                    .await
+                    .expect("place foreign agent");
+                Arc::new(ProcessAgentUnit::start(id, placement))
+            }
+        }
     }
 }
 
@@ -233,11 +282,11 @@ impl JobWorker for FleetJobWorker {
     }
 }
 
-/// Projects the fleet for the node control surface (`ControlApi::fleet`/`cancel`).
+/// Projects the fleet for the node control surface: the flat roster + the tree the GUI/TUI drives.
 struct FleetViewImpl(FleetRuntime);
 
 #[async_trait]
-impl FleetView for FleetViewImpl {
+impl FleetControl for FleetViewImpl {
     async fn report(&self) -> FleetReport {
         FleetReport {
             children: self.0.children(),
@@ -247,6 +296,30 @@ impl FleetView for FleetViewImpl {
 
     async fn cancel(&self, child: &UnitId) -> bool {
         self.0.cancel_child(child).await
+    }
+
+    async fn tree(&self) -> daemon_api::TreeReport {
+        self.0.tree()
+    }
+
+    async fn unit(&self, id: &UnitId) -> Option<daemon_api::UnitNode> {
+        self.0.unit(id)
+    }
+
+    async fn unit_events(&self, id: &UnitId, max: u32) -> Vec<daemon_api::ManageEventView> {
+        self.0.unit_events(id, max)
+    }
+
+    async fn pause(&self, id: &UnitId) -> bool {
+        self.0.pause(id).await
+    }
+
+    async fn resume(&self, id: &UnitId) -> bool {
+        self.0.resume(id).await
+    }
+
+    async fn scale(&self, id: &UnitId, n: u32) -> bool {
+        self.0.scale(id, n).await
     }
 }
 

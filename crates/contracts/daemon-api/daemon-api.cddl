@@ -97,6 +97,33 @@ fleet-report = {
   usage: usage-delta,
 }
 
+; ----- tree projection DTOs (the GUI/TUI surface over the management tree) -----
+unit-kind = "Engine" / "Host" / "Orchestrator"
+
+unit-state = "Running"
+           / { "Finished": { end_reason: tstr } }
+           / "Unknown"
+
+unit-node = {
+  id: unit-id,
+  kind: unit-kind,
+  state: unit-state,
+  work: (tstr / null),
+  usage: usage-delta,
+  children: [* unit-id],
+}
+
+tree-report = {
+  root: (unit-id / null),
+  nodes: [* unit-node],
+}
+
+manage-event-view = { "Started": { seq: uint } }
+                  / { "Progress": { seq: uint, text: (tstr / null) } }
+                  / { "Usage": { seq: uint, delta: usage-delta } }
+                  / { "Finished": { seq: uint, end_reason: tstr, summary: (tstr / null) } }
+                  / { "Error": { seq: uint, message: tstr } }
+
 api-error = { "UnknownSession": tstr }
           / { "Unsupported": tstr }
           / { "Other": tstr }
@@ -111,6 +138,12 @@ api-request = { "Submit": { session: session-id, command: agent-command } }
             / { "Assign": { session: session-id } }
             / { "Cancel": { session: session-id } }
             / "Fleet"
+            / "Tree"
+            / { "Unit": { unit: unit-id } }
+            / { "UnitEvents": { unit: unit-id, max: uint } }
+            / { "Pause": { unit: unit-id } }
+            / { "Resume": { unit: unit-id } }
+            / { "Scale": { unit: unit-id, n: uint } }
 
 api-response = "Ok"
              / { "Drained": [* outbound] }
@@ -118,4 +151,7 @@ api-response = "Ok"
              / { "Stats": stats-report }
              / { "Sessions": [* session-info] }
              / { "Fleet": fleet-report }
+             / { "Tree": tree-report }
+             / { "Unit": (unit-node / null) }
+             / { "UnitEvents": [* manage-event-view] }
              / { "Error": api-error }

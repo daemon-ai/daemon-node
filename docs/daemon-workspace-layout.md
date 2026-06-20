@@ -30,8 +30,16 @@ crate runs).
   unimplemented (remote transport, process/container placement) is a real seam behind a feature flag,
   so the shape is defined before the work.
 - **Orchestration is a capability, not a node type** (§4). There is no orchestrator *engine* — the
-  brain is always `daemon-core` — but there **is** a `daemon-orchestration` *fleet-runtime* crate
-  beneath a thin tool veneer.
+  brain is `daemon-core` — but there **is** a `daemon-orchestration` *fleet-runtime* crate beneath a
+  thin tool veneer.
+- **`daemon-core` is the *reference* brain, not the only possible one.** §17 (`AgentCommand` /
+  `AgentEvent` / `HostRequest`) is the **universal agent-runner leaf**: any brain that speaks it is an
+  `Engine`-leaf `ManagedUnit`, indistinguishable to its supervisor from a `daemon-core` engine.
+  Foreign agents (e.g. a CLI agent in another language) attach as a `ManagedUnit` over a §17 **process
+  cut** via an adapter + a launch profile (`program`/`args`/`env`); they own their own state, so the
+  durable hydrate/dehydrate machinery (§2) is a `daemon-core` property, and foreign units get a
+  coarser, adapter-owned lifecycle. The FFI direction is the opposite concern — *others embedding our
+  brain/node* (see the embedding bullet below) — not us driving a foreign agent.
 - **Embedding is a thin shell at a protocol seam, not a new API.** The C ABI / FFI crates
   (`bindings/`) pump CBOR-encoded `daemon-protocol` / `daemon-supervision` messages over opaque
   handles — one more row in the embedding spectrum, riding the existing `wire_version` + CDDL contract
@@ -181,14 +189,17 @@ and the engine entirely.
 
 ## 4. Orchestration is a capability, not a node type
 
-A node is **always** the same thing: a `daemon-core` engine running on a host. "Being an orchestrator"
-is not a different kind of node — it is an engine whose toolset includes the orchestration tool. But
-orchestration is not just "a tool"; there is real fleet machinery between the brain and the wire.
-It splits into **four** distinct things, in four homes:
+A node is the same thing: a brain (a `daemon-core` engine by default) running on a host. "Being an
+orchestrator" is not a different kind of node — it is an engine whose toolset includes the
+orchestration tool. The brain it supervises need not be `daemon-core`: a child unit may be a foreign
+agent process speaking §17 over a cut, presented up the tree as an ordinary `Engine`-leaf
+`ManagedUnit` (the supervisor cannot tell which sits behind the interface). But orchestration is not
+just "a tool"; there is real fleet machinery between the brain and the wire. It splits into **four**
+distinct things, in four homes:
 
 | Layer | Holds | Home |
 |---|---|---|
-| **Brain** — *what / when* to delegate (reasoning) | the conversation/turn loop deciding fleet actions | `daemon-core` (the **only** engine) |
+| **Brain** — *what / when* to delegate (reasoning) | the conversation/turn loop deciding fleet actions | `daemon-core` (the **reference** engine; foreign §17 brains attach as `Engine`-leaf units) |
 | **Fleet runtime** — the machinery | child registry (`UnitId → status/work/lease`), `Usage`/`RateLimit`/`Health` fan-in, the child-request **answer/escalation policy chain**, optional deterministic scheduler (WIP/retry/reconcile), fleet-level child-supervision policy | **`daemon-orchestration`** (a runtime/state library — **not an engine**) |
 | **Per-child mechanism** — drive/place/cancel one child, speak the management protocol downward | the downward management-protocol **client** + placement | `daemon-host` (synthesis §3.2: a host is two-faced for an orchestrator node) |
 | **Tool surface** — the agent's handle | `delegate`/`assign`/`cancel`/`status` verbs; rendering fleet state back as observations | `tools/daemon-tool-orchestrate` (thin veneer) |

@@ -656,6 +656,7 @@ name = "daemon-conformance"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "ciborium",
  "daemon-activation",
  "daemon-api",
  "daemon-common",
@@ -750,6 +751,7 @@ name = "daemon-orchestration"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "daemon-api",
  "daemon-common",
  "daemon-store",
  "daemon-supervision",

@@ -14,12 +14,12 @@
 //!   sees events *and* blocking host requests on one queue and answers them with `respond`.
 
 use crate::supervisor::{HealthStatus, SupervisorObserver};
-use crate::FleetView;
+use crate::FleetControl;
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
-    ApiError, ControlApi, FleetReport, HealthReport, Outbound, ServiceHealth, SessionApi,
-    SessionInfo, SessionState, StatsReport,
+    ApiError, ControlApi, FleetReport, HealthReport, ManageEventView, Outbound, ServiceHealth,
+    SessionApi, SessionInfo, SessionState, StatsReport, TreeReport, UnitNode,
 };
 use daemon_common::{PartitionId, ReqId, SessionId, UnitId};
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
@@ -43,7 +43,7 @@ pub struct NodeApiImpl {
     supervisor: SupervisorObserver,
     store: Arc<dyn SessionStore>,
     manager: ActivationManager,
-    fleet: Option<Arc<dyn FleetView>>,
+    fleet: Option<Arc<dyn FleetControl>>,
     partition: PartitionId,
     live: Arc<LiveSessions>,
 }
@@ -60,7 +60,7 @@ impl NodeApiImpl {
         manager: ActivationManager,
         partition: PartitionId,
         engine_builder: SessionEngineBuilder,
-        fleet: Option<Arc<dyn FleetView>>,
+        fleet: Option<Arc<dyn FleetControl>>,
     ) -> Self {
         Self {
             supervisor,
@@ -167,6 +167,48 @@ impl ControlApi for NodeApiImpl {
         match &self.fleet {
             Some(fleet) => fleet.report().await,
             None => FleetReport::default(),
+        }
+    }
+
+    async fn tree(&self) -> TreeReport {
+        match &self.fleet {
+            Some(fleet) => fleet.tree().await,
+            None => TreeReport::default(),
+        }
+    }
+
+    async fn unit(&self, id: UnitId) -> Option<UnitNode> {
+        match &self.fleet {
+            Some(fleet) => fleet.unit(&id).await,
+            None => None,
+        }
+    }
+
+    async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
+        match &self.fleet {
+            Some(fleet) => fleet.unit_events(&id, max).await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn pause(&self, id: UnitId) -> Result<(), ApiError> {
+        match &self.fleet {
+            Some(fleet) if fleet.pause(&id).await => Ok(()),
+            _ => Err(ApiError::Unsupported(format!("pause {id}"))),
+        }
+    }
+
+    async fn resume(&self, id: UnitId) -> Result<(), ApiError> {
+        match &self.fleet {
+            Some(fleet) if fleet.resume(&id).await => Ok(()),
+            _ => Err(ApiError::Unsupported(format!("resume {id}"))),
+        }
+    }
+
+    async fn scale(&self, id: UnitId, n: u32) -> Result<(), ApiError> {
+        match &self.fleet {
+            Some(fleet) if fleet.scale(&id, n).await => Ok(()),
+            _ => Err(ApiError::Unsupported(format!("scale {id}"))),
         }
     }
 }

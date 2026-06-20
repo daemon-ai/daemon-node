@@ -35,6 +35,8 @@ pub mod cut;
 pub mod engine_incarnation;
 pub mod journal;
 pub mod node_api;
+pub mod process_agent;
+pub mod section17;
 pub mod services;
 pub mod socket;
 pub mod supervisor;
@@ -56,6 +58,8 @@ pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle, SupervisorObserver,
 };
+pub use process_agent::ProcessAgentUnit;
+pub use section17::AgentUnit;
 pub use unit::EngineUnit;
 
 use async_trait::async_trait;
@@ -77,15 +81,47 @@ pub trait JobWorker: Send + Sync {
     async fn process_jobs_once(&self) -> Result<(), ServiceError>;
 }
 
-/// A read-only projection of the running orchestration fleet for the node control surface
-/// (`ControlApi::fleet`/`cancel`). Implemented by the binary over its `FleetRuntime`, keeping
-/// `daemon-host` free of the orchestration crate.
+/// The control-surface projection of the running orchestration fleet — the seam the GUI/TUI drives
+/// the tree through (`ControlApi::fleet`/`cancel`/`tree`/`unit`/`unit_events`/`pause`/`resume`/
+/// `scale`). Implemented by the binary over its `FleetRuntime`, keeping `daemon-host` free of the
+/// orchestration crate. The tree-projection methods default to empty/unsupported so a fleetless node
+/// (or a session-only transport) needs only `report`/`cancel`.
 #[async_trait]
-pub trait FleetView: Send + Sync {
+pub trait FleetControl: Send + Sync {
     /// The fleet roster + folded usage.
     async fn report(&self) -> FleetReport;
     /// Cancel a registered child by id; returns whether a child was found and cancelled.
     async fn cancel(&self, child: &UnitId) -> bool;
+
+    /// The orchestration tree projection (parent/child structure, per-unit state/work/usage).
+    async fn tree(&self) -> daemon_api::TreeReport {
+        daemon_api::TreeReport::default()
+    }
+
+    /// One unit's node view (`None` if unknown).
+    async fn unit(&self, _id: &UnitId) -> Option<daemon_api::UnitNode> {
+        None
+    }
+
+    /// A bounded snapshot of one unit's recent management events (GUI drill-down).
+    async fn unit_events(&self, _id: &UnitId, _max: u32) -> Vec<daemon_api::ManageEventView> {
+        Vec::new()
+    }
+
+    /// Pause a unit's scheduling; `false` if unknown or unsupported (e.g. an engine leaf).
+    async fn pause(&self, _id: &UnitId) -> bool {
+        false
+    }
+
+    /// Resume a unit's scheduling; `false` if unknown or unsupported.
+    async fn resume(&self, _id: &UnitId) -> bool {
+        false
+    }
+
+    /// Scale a unit (sub-fleet) to `n` members; `false` if unknown or unsupported.
+    async fn scale(&self, _id: &UnitId, _n: u32) -> bool {
+        false
+    }
 }
 
 /// An in-process host: the durable activation substrate plus its supervised resident-service tree.

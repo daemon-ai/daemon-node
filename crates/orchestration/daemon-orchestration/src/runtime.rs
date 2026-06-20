@@ -21,14 +21,17 @@ use crate::policy::{AnswerPolicy, Decision};
 use crate::registry::{ChildRecord, ChildStatus};
 use crate::spawner::ChildSpawner;
 use async_trait::async_trait;
+use daemon_api::{
+    ManageEventView, TreeReport, UnitKind as ApiUnitKind, UnitNode, UnitState,
+};
 use daemon_common::{
     Budget, Epoch, PartitionId, ReqId, SessionId, SnapshotBlob, UnitId, UsageDelta,
 };
 use daemon_store::{Checkpoint, JobCompletion, SessionStore, StoreError};
 use daemon_supervision::{
-    DelegationSpec, EndReason, FailureClass, ManageCommand, ManageEvent, ManageRequest,
-    ManageRequestHandler, ManageRequestKind, ManageResponse, ManageResponseBody, Outcome,
-    StreamLagged, WorkRef,
+    Concurrency, DelegationSpec, EndReason, FailureClass, ManageCommand, ManageEvent,
+    ManageRequest, ManageRequestHandler, ManageRequestKind, ManageResponse, ManageResponseBody,
+    Outcome, ProgressDelta, StreamLagged, UnitKind, WorkRef,
 };
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,25 +87,30 @@ impl FleetInner {
         .await;
 
         let outcome = loop {
-            match events.recv().await {
-                Ok(ManageEvent::Started { .. }) => self.set_status(&child_id, ChildStatus::Running),
-                Ok(ManageEvent::Usage { delta, .. }) => self.usage.lock().unwrap().add(&delta),
-                Ok(ManageEvent::Finished { outcome, .. }) => {
-                    self.record_terminal(&child_id, ChildStatus::Finished, &outcome);
-                    break outcome;
-                }
-                Ok(ManageEvent::Error { failure, .. }) => {
-                    let outcome = Outcome::ended(EndReason::Failed(failure.class));
-                    self.record_terminal(&child_id, ChildStatus::Failed, &outcome);
-                    break outcome;
-                }
-                Ok(_) => {}
-                Err(StreamLagged::Lagged { .. }) => {}
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(StreamLagged::Lagged { .. }) => continue,
                 Err(StreamLagged::Closed) => {
                     let outcome = Outcome::ended(EndReason::Failed(FailureClass::Internal));
                     self.record_terminal(&child_id, ChildStatus::Failed, &outcome);
                     break outcome;
                 }
+            };
+            // Buffer the event for GUI drill-down + fold per-child usage before handling it.
+            self.record_event(&child_id, &event);
+            match event {
+                ManageEvent::Started { .. } => self.set_status(&child_id, ChildStatus::Running),
+                ManageEvent::Usage { delta, .. } => self.usage.lock().unwrap().add(&delta),
+                ManageEvent::Finished { outcome, .. } => {
+                    self.record_terminal(&child_id, ChildStatus::Finished, &outcome);
+                    break outcome;
+                }
+                ManageEvent::Error { failure, .. } => {
+                    let outcome = Outcome::ended(EndReason::Failed(failure.class));
+                    self.record_terminal(&child_id, ChildStatus::Failed, &outcome);
+                    break outcome;
+                }
+                _ => {}
             }
         };
         (child_id, outcome)
@@ -111,6 +119,18 @@ impl FleetInner {
     fn set_status(&self, id: &UnitId, status: ChildStatus) {
         if let Some(mut r) = self.children.get_mut(id) {
             r.status = status;
+        }
+    }
+
+    /// Fold a child's event into its record: per-child usage + a bounded view buffer (`unit_events`).
+    fn record_event(&self, id: &UnitId, ev: &ManageEvent) {
+        if let Some(mut r) = self.children.get_mut(id) {
+            if let ManageEvent::Usage { delta, .. } = ev {
+                r.usage.add(delta);
+            }
+            if let Some(view) = project_event(ev) {
+                r.push_event(view);
+            }
         }
     }
 
@@ -262,6 +282,154 @@ impl FleetRuntime {
     /// The requests children have raised so far (observability / the gate's answer-authority proof).
     pub fn request_log(&self) -> Vec<ManageRequest> {
         self.inner.request_log.lock().unwrap().clone()
+    }
+
+    /// Project the fleet as the GUI/TUI tree (a flat node list; one-level for now — children that are
+    /// orchestrators nest as the runtime gains sub-fleets). `root` is `None`: the node's own id lives
+    /// above the runtime, so the host fills it in if it wants a rooted view.
+    pub fn tree(&self) -> TreeReport {
+        let nodes = self
+            .inner
+            .children
+            .iter()
+            .map(|e| project_unit(e.key(), e.value()))
+            .collect();
+        TreeReport { root: None, nodes }
+    }
+
+    /// One unit's node view, if registered.
+    pub fn unit(&self, id: &UnitId) -> Option<UnitNode> {
+        self.inner.children.get(id).map(|r| project_unit(id, &r))
+    }
+
+    /// A bounded snapshot of a unit's most recent management-event views (GUI drill-down). Returns up
+    /// to `max` (most recent; `0` = all buffered). Non-destructive so repeated reads — including the
+    /// same call over different transports — observe the same window.
+    pub fn unit_events(&self, id: &UnitId, max: u32) -> Vec<ManageEventView> {
+        self.inner
+            .children
+            .get(id)
+            .map(|r| {
+                let len = r.events.len();
+                let take = if max == 0 {
+                    len
+                } else {
+                    (max as usize).min(len)
+                };
+                r.events.iter().skip(len - take).cloned().collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Route a lifecycle command to a unit, returning whether it was accepted. Pause/Resume/Scale are
+    /// `Unsupported` at an engine leaf (single conversation), so these return `false` there — the
+    /// surface is meaningful for orchestrator sub-fleets.
+    async fn route_lifecycle(&self, id: &UnitId, cmd: ManageCommand) -> bool {
+        let unit = self.inner.children.get(id).map(|r| r.unit.clone());
+        match unit {
+            Some(unit) => matches!(
+                unit.command(cmd).await,
+                daemon_supervision::Ack::Accepted | daemon_supervision::Ack::Queued
+            ),
+            None => false,
+        }
+    }
+
+    /// Pause a unit's scheduling (orchestrator sub-fleets); `false` if unknown or unsupported.
+    pub async fn pause(&self, id: &UnitId) -> bool {
+        self.route_lifecycle(id, ManageCommand::Pause).await
+    }
+
+    /// Resume a unit's scheduling; `false` if unknown or unsupported.
+    pub async fn resume(&self, id: &UnitId) -> bool {
+        self.route_lifecycle(id, ManageCommand::Resume).await
+    }
+
+    /// Scale a unit (sub-fleet) to `n` members; `false` if unknown or unsupported.
+    pub async fn scale(&self, id: &UnitId, n: u32) -> bool {
+        self.route_lifecycle(id, ManageCommand::Scale {
+            target: Concurrency(n),
+        })
+        .await
+    }
+}
+
+/// Project a child record into the GUI tree-node DTO.
+fn project_unit(id: &UnitId, record: &ChildRecord) -> UnitNode {
+    let state = match record.status {
+        ChildStatus::Finished | ChildStatus::Failed => UnitState::Finished {
+            end_reason: record
+                .outcome
+                .as_ref()
+                .map(|o| render_end_reason(&o.end_reason))
+                .unwrap_or_else(|| "Unknown".to_string()),
+        },
+        _ => UnitState::Running,
+    };
+    UnitNode {
+        id: id.clone(),
+        kind: map_kind(record.unit.kind()),
+        state,
+        work: Some(render_work(&record.work)),
+        usage: record.usage,
+        children: Vec::new(),
+    }
+}
+
+fn map_kind(kind: UnitKind) -> ApiUnitKind {
+    match kind {
+        UnitKind::Engine => ApiUnitKind::Engine,
+        UnitKind::Orchestrator => ApiUnitKind::Orchestrator,
+    }
+}
+
+fn render_end_reason(end_reason: &EndReason) -> String {
+    format!("{end_reason:?}")
+}
+
+fn render_work(work: &WorkRef) -> String {
+    if let Some(payload) = &work.payload {
+        payload.text.clone()
+    } else {
+        work.id.as_str().to_string()
+    }
+}
+
+/// Project a management event into its transport-stable GUI view (`None` for events with no view).
+fn project_event(ev: &ManageEvent) -> Option<ManageEventView> {
+    Some(match ev {
+        ManageEvent::Started { seq, .. } => ManageEventView::Started { seq: *seq },
+        ManageEvent::Progress { seq, delta } => ManageEventView::Progress {
+            seq: *seq,
+            text: render_progress(delta),
+        },
+        ManageEvent::Usage { seq, delta } => ManageEventView::Usage {
+            seq: *seq,
+            delta: *delta,
+        },
+        ManageEvent::Finished { seq, outcome } => ManageEventView::Finished {
+            seq: *seq,
+            end_reason: render_end_reason(&outcome.end_reason),
+            summary: outcome.summary.clone(),
+        },
+        ManageEvent::Error { seq, failure } => ManageEventView::Error {
+            seq: *seq,
+            message: failure.message.clone(),
+        },
+        _ => return None,
+    })
+}
+
+fn render_progress(delta: &ProgressDelta) -> Option<String> {
+    match delta {
+        ProgressDelta::Text(t) | ProgressDelta::Reasoning(t) => Some(t.clone()),
+        ProgressDelta::ToolStarted(tool) => Some(format!("tool {} started", tool.name)),
+        ProgressDelta::ToolFinished(tool) => Some(format!(
+            "tool {} {}",
+            tool.call_id,
+            if tool.ok { "ok" } else { "err" }
+        )),
+        _ => None,
     }
 }
 

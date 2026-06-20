@@ -23,3 +23,4 @@ daemon-tool-orchestrate = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+ciborium = { workspace = true }

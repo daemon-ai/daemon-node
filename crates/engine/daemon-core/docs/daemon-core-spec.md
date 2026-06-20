@@ -1268,6 +1268,16 @@ orchestrator that fulfils these requests is a separate specification.
 or out-of-process surface): commands in, events out, and blocking host requests for
 human-in-the-loop. This is what replaces `hermes-agent`'s callback sprawl.
 
+**Universal agent-runner leaf.** §17 is not specific to `daemon-core`; it is the *leaf dialect every
+brain speaks*. A foreign agent (a CLI agent in another language) attaches to a host by speaking §17
+over a **process cut** — `AgentCommand`/`HostResponse` framed down its stdin, `AgentEvent`/`HostRequest`
+framed up its stdout (CBOR). The host wraps that cut as an ordinary `Engine`-leaf `ManagedUnit`
+(supervision §4), so the fleet/orchestrator cannot tell a foreign brain from a `daemon-core` one.
+`daemon-core` is therefore the *reference* implementation of this leaf, not the only one. Note the
+durable activation/snapshot machinery (§2.x, lifecycle-persistence) is a `daemon-core` property: a
+foreign brain owns its own opaque state, so its host-side adapter owns its (coarser) lifecycle —
+relaunch with the right launch profile, or treat as ephemeral.
+
 **`hermes-agent` behavior.** Hosts integrate through ad-hoc callbacks and direct attribute access on
 the `AIAgent` god object ([`hermes-god-object-architecture.md`](../../../../docs/research/hermes/hermes-god-object-architecture.md),
 [`hermes-agent-host-interface.md`](../../../../docs/research/hermes/hermes-agent-host-interface.md)): UI rendering, approval prompts,
