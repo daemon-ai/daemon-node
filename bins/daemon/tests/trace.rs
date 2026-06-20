@@ -25,7 +25,15 @@ fn placement_spec() -> PlacementSpec {
     PlacementSpec {
         program: env!("CARGO_BIN_EXE_daemon").into(),
         args: Vec::new(),
-        env: vec![("DAEMON_PLACED_CHILD".into(), "1".into())],
+        // Journal the child too, so its brokered journal appends/seals are also trace-stamped — the
+        // trace must ride *every* child-originated frame, including the journaling store calls.
+        env: vec![
+            ("DAEMON_PLACED_CHILD".into(), "1".into()),
+            (
+                "DAEMON_JOURNAL_SEED".into(),
+                "1111111111111111111111111111111111111111111111111111111111111111".into(),
+            ),
+        ],
     }
 }
 

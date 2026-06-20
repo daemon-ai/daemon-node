@@ -29,8 +29,8 @@ use daemon_api::{
 };
 use daemon_common::{ReqId, SessionId};
 use daemon_core::{
-    spawn_agent_session, AgentHandle, Engine, EngineProfile, MockProvider, Provider, SystemPrompt,
-    ToolRegistry,
+    spawn_agent_session, AgentHandle, Config, Engine, EngineProfile, MockProvider, Provider,
+    SystemPrompt, ToolRegistry,
 };
 use daemon_protocol::{
     AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody,
@@ -396,14 +396,20 @@ impl CoreSessionApi {
     }
 
     fn build_engine(id: SessionId) -> Engine {
-        // Construct through an `EngineProfile` so the FFI's engine matches the rest of the system's
-        // construction seam (provider selection / future tunables), even though this path stays
-        // self-contained and free of `daemon-host`.
+        // Construct through a `with_config`-dressed `EngineProfile` so the FFI's engine matches the
+        // rest of the system's construction seam (explicit tunables rather than a silent default).
+        //
+        // This embed path is deliberately self-contained (it cannot depend on `daemon-host`/
+        // `daemon-node`). Injecting a real provider, brokered credentials, or a verifiable-journal
+        // sink would need new C-ABI surface to pass those in; that is deferred to the embedding /
+        // ACP phase. Until then it uses the Mock provider, the engine's embedded L1 credential pool,
+        // and no journal.
         EngineProfile::new(
             Arc::new(|| Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>),
             Arc::new(ToolRegistry::new()),
             SystemPrompt::new("daemon-core-ffi session"),
         )
+        .with_config(Config::default())
         .fresh(id)
     }
 

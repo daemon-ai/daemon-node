@@ -15,15 +15,16 @@ mod config;
 
 use std::sync::Arc;
 
-use daemon_common::{CredMode, CredScope, PartitionId, ProfileRef, SessionId, UnitId};
+use daemon_common::{CredMode, CredScope, JournalStreamId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     CredentialBuilder, CredentialProvider, EngineProfile, MockProvider, Provider, ProviderRegistry,
     SystemPrompt, ToolRegistry,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
-    run_placed_child, serve_api_unix, BrokeredCredentialProvider, CoreEngineFactory,
-    CredentialBroker, EngineUnit, HostConfig, OwnerBroker,
+    run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
+    CoreEngineFactory, CredentialBroker, EngineUnit, HostConfig, JournalFeeder, JournalSink,
+    OwnerBroker,
 };
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
 use daemon_provision::CutChannel;
@@ -154,17 +155,46 @@ fn build_owner_broker(profile: &str, key: &str) -> Arc<dyn CredentialBroker> {
 
 /// Run as a transport server: host a completing engine unit + an authoritative store, reachable as
 /// a `ManagedUnit` over a socket (with the cross-node lease/fence handshake). The engine is built
-/// through an [`EngineProfile`] so its construction matches the host path.
+/// through a *dressed* [`EngineProfile`] (engine tunables + a local owner-broker credential seam,
+/// since a transport node is its own authority over its own store) and journals its transcript per
+/// turn under a seed-derived signer, so its construction matches the host path.
 async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
+    let cfg = NodeConfig::load()?;
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+
+    // A transport node owns its store, so it mints its own credentials (the host path's owner
+    // broker) rather than brokering from a parent — the engine is therefore not credential-less.
+    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key);
+    let credentials: CredentialBuilder = {
+        let owner = owner.clone();
+        Arc::new(move || {
+            Arc::new(BrokeredCredentialProvider::new(owner.clone(), None))
+                as Arc<dyn CredentialProvider>
+        })
+    };
     let profile = EngineProfile::new(
         Arc::new(|| Arc::new(MockProvider::completing("transport done")) as Arc<dyn Provider>),
         Arc::new(ToolRegistry::new()),
         SystemPrompt::new("transport-hosted unit"),
+    )
+    .with_config(cfg.engine)
+    .with_credentials(credentials, ProfileRef::new(cfg.profile.clone()));
+
+    // The unit journals per turn into the local store, keyed by its UnitId, sealed under the
+    // config-seeded signer (or an ephemeral key when no seed is configured).
+    let unit_id = UnitId::new("u1");
+    let signer = Arc::new(
+        cfg.journal_seed
+            .map(|seed| daemon_telemetry::TraceSigner::from_seed(&seed))
+            .unwrap_or_else(daemon_telemetry::TraceSigner::generate),
     );
-    let unit: Arc<dyn ManagedUnit> = Arc::new(EngineUnit::spawn(
-        UnitId::new("u1"),
-        profile.fresh(SessionId::new("u1")),
+    let sink = JournalSink::new(store.clone(), signer, JournalStreamId::unit(&unit_id));
+    let feeder = Arc::new(JournalFeeder::new(Arc::new(sink)));
+
+    let unit: Arc<dyn ManagedUnit> = Arc::new(EngineUnit::spawn_journaled(
+        unit_id.clone(),
+        profile.fresh(SessionId::new(unit_id.as_str())),
+        Some(feeder),
     ));
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "transport server listening");
@@ -173,19 +203,35 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
 }
 
 /// Run as the far side of a placement cut: a completing engine driven over the brokered store. The
-/// engine is built from an [`EngineProfile`] (via [`CoreEngineFactory::from_profile`]) so it shares
-/// the host's construction seam rather than a bespoke provider literal.
+/// engine is built from a *dressed* [`EngineProfile`] (engine tunables applied, via
+/// [`CoreEngineFactory::from_profile`]) so it shares the host's construction seam rather than a
+/// bespoke literal. When the node's journal seed is configured (passed down via `DAEMON_JOURNAL_SEED`
+/// by the spawning parent), the child journals its durable transcript **through the parent's brokered
+/// store**, sealed under the node's seed-derived signer so the chain verifies under the node's
+/// published verifying key. Credentials stay on the embedded L1 pool — brokering them over the cut
+/// is a separate channel, deferred.
 async fn run_as_placed_child() {
+    let cfg = match NodeConfig::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(error = %e, "placed child failed to load config");
+            return;
+        }
+    };
     let profile = EngineProfile::new(
         Arc::new(|| Arc::new(MockProvider::completing("placed child done")) as Arc<dyn Provider>),
         Arc::new(ToolRegistry::new()),
         SystemPrompt::new("placed child"),
-    );
-    let factory = CoreEngineFactory::from_profile(profile);
-    run_placed_child(
-        CutChannel::from_stdio(),
-        Arc::new(factory),
-        PartitionId::DEFAULT,
     )
-    .await;
+    .with_config(cfg.engine);
+    let factory = CoreEngineFactory::from_profile(profile);
+    let channel = CutChannel::from_stdio();
+
+    match cfg.journal_seed {
+        Some(seed) => {
+            let signer = Arc::new(daemon_telemetry::TraceSigner::from_seed(&seed));
+            run_placed_child_journaled(channel, factory, cfg.partition, signer).await;
+        }
+        None => run_placed_child(channel, Arc::new(factory), cfg.partition).await,
+    }
 }

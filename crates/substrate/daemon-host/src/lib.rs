@@ -48,8 +48,8 @@ pub use credentials::{
     BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,
 };
 pub use cut::{
-    run_placed_child, serve_credentials, CredCall, CredReplyBody, CutFrame, PlacedUnit,
-    RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
+    run_placed_child, run_placed_child_journaled, serve_credentials, CredCall, CredReplyBody,
+    CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
 };
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use transcript::{BlockCoalescer, JournalAction};

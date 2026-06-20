@@ -213,6 +213,17 @@ a single ordered chain to see *who managed what* and *what was said*, end to end
   store** (the brokered store client) and seals with the config-seeded node key, so the chain
   verifies under the node's one published key without the child ever owning the parent's store.
 
+**Role parity.** Every engine the node binary constructs is built through the same `EngineProfile`
+seam (engine tunables applied) and journals per turn under the node signer — none is a bespoke,
+unjournaled loop. This holds across the in-process host engines, the fleet children, the far side of
+a placement cut (`DAEMON_PLACED_CHILD`), and a transport-hosted unit (`DAEMON_TRANSPORT_SERVER`). A
+placed child seals through the parent's brokered store under the config-seeded key (above); a
+transport node, owning its own store, seals locally and mints its own credentials via the host's
+owner broker. **One deferral:** a placed child does not yet consume the parent's *credentials* over
+the cut (it keeps its embedded L1 pool). The brokering primitives already exist
+(`serve_credentials` / `RemoteCredentialClient`), but wiring them needs a credential channel
+alongside the store cut — sequenced for when a placed child must call a real (credentialed) provider.
+
 The crypto lives in `daemon-telemetry`; the store persists only the opaque entry bytes, content
 hashes, and 32-byte roots (it never learns the protocol or the key), keeping the DAG layering clean.
 

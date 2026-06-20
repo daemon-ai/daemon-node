@@ -10,24 +10,42 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_common::{Budget, PartitionId, ReqId, SessionId, UnitId};
+use daemon_common::{Budget, ContentHash, JournalStreamId, PartitionId, ReqId, SessionId, UnitId};
 use daemon_core::Snapshot;
 use daemon_host::PlacedUnit;
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
-use daemon_store::{InMemoryStore, SessionStatus, SessionStore};
+use daemon_store::{InMemoryStore, SessionStatus, SessionStore, TraceSegment};
 use daemon_supervision::{
     Ack, EndReason, EventStream, ManageCommand, ManageEvent, ManagedUnit, WorkRef,
 };
+use daemon_telemetry::{verify_segment, SegmentInput, TraceSigner, GENESIS_ROOT};
 
 const PARTITION: PartitionId = PartitionId::DEFAULT;
 
-/// Spawn the `daemon` binary in its placed-child role as the far side of the cut.
+/// The node journal signer seed the spawning parent passes down to the placed child (hex of
+/// `[0x11; 32]`), so the child's sealed chain verifies under the matching verifying key.
+const JOURNAL_SEED_HEX: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Spawn the `daemon` binary in its placed-child role as the far side of the cut, passing the node's
+/// journal seed so the child journals its durable transcript through the parent's brokered store.
 fn placement_spec() -> PlacementSpec {
     PlacementSpec {
         program: env!("CARGO_BIN_EXE_daemon").into(),
         args: Vec::new(),
-        env: vec![("DAEMON_PLACED_CHILD".into(), "1".into())],
+        env: vec![
+            ("DAEMON_PLACED_CHILD".into(), "1".into()),
+            ("DAEMON_JOURNAL_SEED".into(), JOURNAL_SEED_HEX.into()),
+        ],
     }
+}
+
+/// The loaded segment's entries shaped for `verify_segment`.
+fn loaded_entries(seg: &TraceSegment) -> Vec<(u64, Vec<u8>, ContentHash)> {
+    seg.entries
+        .iter()
+        .map(|e| (e.seq, e.bytes.clone(), e.content_hash))
+        .collect()
 }
 
 /// Seed a fresh durable session the placed child will be told to activate.
@@ -138,6 +156,76 @@ async fn fencing_holds_across_the_cut() {
         Some(SessionStatus::Completed),
         "a fenced child must not have committed across the cut"
     );
+
+    unit.command(ManageCommand::Shutdown { drain: false }).await;
+}
+
+/// Seat-polish parity: a placed child journals its durable transcript through the parent's brokered
+/// store, sealed under the node's seed-derived signer. The parent (sole store authority) ends up
+/// holding a sealed segment that verifies under the node's published verifying key — proving the
+/// out-of-process child shares the host's journaling seam, not a bespoke unjournaled loop.
+#[tokio::test]
+async fn placed_child_journals_verifiable_history_via_brokered_store() {
+    let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+    let session = SessionId::new("placed-journaled");
+    seed(store.as_ref(), &session).await;
+
+    let provisioner = ProcessProvisioner::new();
+    let placement = provisioner
+        .place(&session, placement_spec())
+        .await
+        .expect("place child process");
+    let unit = PlacedUnit::new(UnitId::new(session.as_str()), placement, store.clone());
+    let mut events = unit.events();
+
+    let ack = unit
+        .command(ManageCommand::Assign {
+            request_id: ReqId(1),
+            work: WorkRef::inline("w1", "do the work"),
+            budget: Budget::unlimited(),
+        })
+        .await;
+    assert_eq!(ack, Ack::Accepted, "the placed unit should accept the work");
+
+    let terminal = await_terminal(&mut events).await;
+    assert!(
+        matches!(
+            terminal,
+            ManageEvent::Finished { ref outcome, .. } if outcome.end_reason == EndReason::Completed
+        ),
+        "the child should complete across the cut, got {terminal:?}"
+    );
+
+    // The durable path keys the journal by the session and seals segment 0 (the first incarnation).
+    let stream = JournalStreamId::session(&session);
+    let seg = store
+        .load_trace_segment(&stream, 0)
+        .await
+        .expect("the placed child should have journaled a sealed segment into the parent store");
+    let committed = seg
+        .committed
+        .clone()
+        .expect("the segment should be sealed (committed root present) after the turn");
+
+    // The chain verifies under the verifying half of the node's seed-derived signer.
+    let mut seed_bytes = [0u8; 32];
+    for (i, b) in seed_bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&JOURNAL_SEED_HEX[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    let verifying = TraceSigner::from_seed(&seed_bytes).verifying_key();
+    let entries = loaded_entries(&seg);
+    verify_segment(
+        &SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &entries,
+        },
+        &committed.root,
+        &committed.signature,
+        &verifying,
+    )
+    .expect("the placed child's sealed segment must verify under the node verifying key");
 
     unit.command(ManageCommand::Shutdown { drain: false }).await;
 }
