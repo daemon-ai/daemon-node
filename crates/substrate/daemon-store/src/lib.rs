@@ -3,8 +3,10 @@
 //! The [`SessionStore`] trait is the *sole authority* for durable session state (lifecycle §4
 //! invariant #1): snapshots, the completion inbox (idempotent via `UNIQUE(session_id, epoch,
 //! job_id)`), the wake/job outboxes, and the monotonic activation lease that fences stale
-//! incarnations. Phase 1 ships the in-memory backend ([`InMemoryStore`]); the `sqlite` feature is a
-//! deferred stub. Depends only on `daemon-common`.
+//! incarnations. Two backends implement it with identical semantics (proven by the same conformance
+//! acceptance suite run against both): the default in-memory [`InMemoryStore`] and, behind the
+//! `sqlite` feature, the durable [`SqliteStore`] (WAL-mode `rusqlite`, including the trace journal).
+//! Depends only on `daemon-common`.
 //!
 //! Snapshots are handled here only as opaque CBOR [`SnapshotBlob`]s — the typed `Snapshot` lives in
 //! `daemon-protocol`, keeping this crate protocol-free (lifecycle §2; layout §3 DAG).

@@ -419,6 +419,10 @@ pub enum ApiError {
     /// unsupported §17 command).
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The session is already owned by the *other* lifecycle: a `SessionId` is durable-managed
+    /// (control surface, `assign`) **or** live-interactive (session surface, `submit`), never both.
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// Any other failure.
     #[error("{0}")]
     Other(String),

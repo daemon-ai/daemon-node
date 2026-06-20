@@ -37,6 +37,18 @@ use tokio::task::JoinHandle;
 /// seam — the binary supplies the provider/tools/system).
 pub type SessionEngineBuilder = Arc<dyn Fn(SessionId) -> Engine + Send + Sync>;
 
+/// Which lifecycle owns a `SessionId`. The durable and live lifecycles are intentionally distinct
+/// (one runs an engine dormant-between-turns through the activation seam, the other keeps it
+/// resident in an actor), and a single id must not exist as two divergent engine instances. This is
+/// the guard-rail's ownership tag: a session is claimed by the first surface that touches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    /// Durable, control-surface managed (`assign` -> `ActivationManager`).
+    Durable,
+    /// Live, interactive session-surface managed (`submit` -> the §17 actor).
+    Live,
+}
+
 /// The node interface implemented over a running [`crate::Host`].
 #[derive(Clone)]
 pub struct NodeApiImpl {
@@ -46,6 +58,8 @@ pub struct NodeApiImpl {
     fleet: Option<Arc<dyn FleetControl>>,
     partition: PartitionId,
     live: Arc<LiveSessions>,
+    /// One-lifecycle-owner guard-rail: which lifecycle (if any) has claimed each session id.
+    owners: Arc<DashMap<SessionId, Lifecycle>>,
 }
 
 impl NodeApiImpl {
@@ -69,6 +83,26 @@ impl NodeApiImpl {
             fleet,
             partition,
             live: Arc::new(LiveSessions::new(engine_builder)),
+            owners: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Claim `session` for `want`, enforcing the one-lifecycle-owner invariant: the first surface to
+    /// touch a session id owns it; the other surface is rejected with [`ApiError::Conflict`] until
+    /// the session is released (via `cancel`). Re-claiming the same lifecycle is idempotent.
+    fn claim(&self, session: &SessionId, want: Lifecycle) -> Result<(), ApiError> {
+        use dashmap::mapref::entry::Entry;
+        match self.owners.entry(session.clone()) {
+            Entry::Occupied(e) if *e.get() != want => Err(ApiError::Conflict(format!(
+                "session {session} is owned by the {:?} lifecycle; cannot use it as {:?}",
+                e.get(),
+                want
+            ))),
+            Entry::Occupied(_) => Ok(()),
+            Entry::Vacant(v) => {
+                v.insert(want);
+                Ok(())
+            }
         }
     }
 }
@@ -136,6 +170,9 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn assign(&self, session: SessionId) -> Result<(), ApiError> {
+        // Guard-rail: a session driven through the durable control surface must not also be a live
+        // interactive session (two divergent engine instances for one id).
+        self.claim(&session, Lifecycle::Durable)?;
         // Create-if-absent: a fresh durable session row with the engine's initial snapshot.
         if self.store.status(&session).await.is_none() {
             let blob = Snapshot::fresh(session.clone())
@@ -160,6 +197,8 @@ impl ControlApi for NodeApiImpl {
             fleet.cancel(&UnitId::new(session.as_str())).await;
         }
         self.live.interrupt(&session).await;
+        // Release the lifecycle claim so the id can be reused by either surface.
+        self.owners.remove(&session);
         Ok(())
     }
 
@@ -223,6 +262,8 @@ impl ControlApi for NodeApiImpl {
 #[async_trait]
 impl SessionApi for NodeApiImpl {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
+        // Guard-rail: claim the session for the live lifecycle (rejects an id already durable-managed).
+        self.claim(&session, Lifecycle::Live)?;
         self.live.submit(session, command).await
     }
 

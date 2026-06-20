@@ -241,6 +241,24 @@ projection (§4) drops the opaque envelope by design, so the dashboard stays agn
 drill-down stays lossless. (Durable/queryable transcript history — reconnect, scroll-back — is out of
 scope for this drain, which is live-only and best-effort.)
 
+**One node, one composition root.** The host node is assembled in exactly one place — the
+`daemon-node` crate's `assemble()` — which the `daemon` binary and the conformance harness both call.
+It wires the durable substrate (store + resident services), the orchestration fleet as the real job
+worker, the credential broker, and the live session surface from one `EngineProfile` per role
+(orchestrator / child / session), so the durable, live, and fleet-child construction paths share
+provider selection, brokered credentials, and engine tunables (`daemon_core::Config`) uniformly.
+`daemon-node` sits *above* `daemon-host` because the fleet + orchestrate-tool glue is composition
+policy; `daemon-host` itself stays free of `daemon-orchestration`.
+
+**One-lifecycle-owner invariant.** The durable and live lifecycles are intentionally distinct: a
+durable session runs its engine dormant-between-turns through the activation seam (control surface,
+`assign`), while a live session keeps it resident in the §17 actor (session surface, `submit`). A
+single `SessionId` must never exist as two divergent engine instances, so the node claims a session
+for the first surface that touches it and rejects the other with `ApiError::Conflict` until the
+session is released (`cancel`). This is a lightweight guard-rail, not a merge of the two lifecycles —
+the split is load-bearing for dehydration (many dormant durable sessions cost nothing) and is kept on
+purpose.
+
 > **Source-audit note (S2): isolation is a *placement* property, not a framework "distribution"
 > feature.** The intuition that "distribution gives us isolation" does **not** hold for the Rust
 > actor frameworks surveyed in [`source-audit.md`](../research/source-audit.md):

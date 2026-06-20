@@ -23,6 +23,10 @@ const PARTITION_ENV: &str = "DAEMON_PARTITION";
 const PROFILE_ENV: &str = "DAEMON_PROFILE";
 /// Overrides the (stub) credential key the owner authority mints.
 const CREDENTIAL_KEY_ENV: &str = "DAEMON_CREDENTIAL_KEY";
+/// Overrides the engine's `model_retry_attempts` tunable.
+const MODEL_RETRY_ATTEMPTS_ENV: &str = "DAEMON_MODEL_RETRY_ATTEMPTS";
+/// Overrides the engine's `context_budget_tokens` tunable.
+const CONTEXT_BUDGET_TOKENS_ENV: &str = "DAEMON_CONTEXT_BUDGET_TOKENS";
 
 /// The durable store backend selected by config.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +57,8 @@ pub struct NodeConfig {
     pub profile: String,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
+    /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
+    pub engine: daemon_core::Config,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -67,6 +73,8 @@ struct FileConfig {
     scan_interval_ms: Option<u64>,
     profile: Option<String>,
     credential_key: Option<String>,
+    model_retry_attempts: Option<u8>,
+    context_budget_tokens: Option<u32>,
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -97,6 +105,8 @@ impl NodeConfig {
         };
 
         let store = Self::resolve_store(&file)?;
+        // Resolve engine tunables before the `String`/`PathBuf` fields below partially move `file`.
+        let engine = Self::resolve_engine(&file)?;
 
         let socket_path = env_string(API_SOCKET_ENV)
             .map(PathBuf::from)
@@ -122,7 +132,32 @@ impl NodeConfig {
             scan_interval,
             profile,
             credential_key,
+            engine,
         })
+    }
+
+    /// Resolve the engine tunables (§20), env overriding TOML overriding [`daemon_core::Config`]
+    /// defaults.
+    fn resolve_engine(file: &FileConfig) -> anyhow::Result<daemon_core::Config> {
+        let mut engine = daemon_core::Config::default();
+        if let Some(n) = file.model_retry_attempts {
+            engine.model_retry_attempts = n;
+        }
+        if let Some(s) = env_string(MODEL_RETRY_ATTEMPTS_ENV) {
+            engine.model_retry_attempts = s
+                .parse()
+                .context("DAEMON_MODEL_RETRY_ATTEMPTS must be a u8")?;
+        }
+        if let Some(n) = file.context_budget_tokens {
+            engine.context_budget_tokens = Some(n);
+        }
+        if let Some(s) = env_string(CONTEXT_BUDGET_TOKENS_ENV) {
+            engine.context_budget_tokens = Some(
+                s.parse()
+                    .context("DAEMON_CONTEXT_BUDGET_TOKENS must be a u32")?,
+            );
+        }
+        Ok(engine)
     }
 
     fn resolve_store(file: &FileConfig) -> anyhow::Result<StoreBackend> {

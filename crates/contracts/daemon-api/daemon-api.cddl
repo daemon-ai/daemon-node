@@ -135,6 +135,7 @@ manage-event-view = { "Started": { seq: uint } }
 
 api-error = { "UnknownSession": tstr }
           / { "Unsupported": tstr }
+          / { "Conflict": tstr }
           / { "Other": tstr }
 
 ; ----- the request/response mirror (1:1 with the interface methods) -----

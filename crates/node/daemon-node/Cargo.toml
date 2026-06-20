@@ -1,0 +1,23 @@
+[package]
+name = "daemon-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The single host-composition root: assembles the durable substrate, the orchestration fleet (as the
+# real job worker), the credential seam, and the live session surface into one running node. Both the
+# `daemon` binary and the conformance harness build their node through this crate, so there is one
+# wiring to keep correct. It sits *above* `daemon-host` because the fleet + orchestrate-tool glue is
+# composition-layer policy (`daemon-host` deliberately does not depend on `daemon-orchestration`).
+[dependencies]
+daemon-common = { workspace = true }
+daemon-core = { workspace = true }
+daemon-store = { workspace = true }
+daemon-host = { workspace = true }
+daemon-orchestration = { workspace = true }
+daemon-tool-orchestrate = { workspace = true }
+daemon-provision = { workspace = true }
+daemon-supervision = { workspace = true }
+daemon-api = { workspace = true }
+async-trait = { workspace = true }

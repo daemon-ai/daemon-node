@@ -103,10 +103,15 @@ daemon/                              # cargo workspace root
 │   │   │                            #     owns the downward management-protocol CLIENT (drive/place ONE child)
 │   │   └── daemon-transport/        #   DEFERRED stub: wire form of mgmt protocol + remote host
 │   │
-│   └── orchestration/
-│       └── daemon-orchestration/    #   fleet RUNTIME (not an engine): child registry, Usage/RateLimit/Health
-│                                    #     fan-in, child-request answer/escalation policy, optional scheduler;
-│                                    #     driven by the tool (agent) or a deterministic policy driver (→ host, supervision)
+│   ├── orchestration/
+│   │   └── daemon-orchestration/    #   fleet RUNTIME (not an engine): child registry, Usage/RateLimit/Health
+│   │                                #     fan-in, child-request answer/escalation policy, optional scheduler;
+│   │                                #     driven by the tool (agent) or a deterministic policy driver (→ host, supervision)
+│   │
+│   └── node/
+│       └── daemon-node/             #   the single host-COMPOSITION root: assemble() wires store + fleet-as-job-worker
+│                                    #     + credentials + live session surface into one node. Shared by bins/daemon AND
+│                                    #     the conformance harness (→ host, orchestration, tool-orchestrate, core)
 │
 ├── tools/                           # the agent toolset, one crate per tool (the engine loads these)
 │   ├── daemon-tool-shell/
@@ -120,6 +125,7 @@ daemon/                              # cargo workspace root
 │
 ├── bins/
 │   ├── daemon/                      # the node binary — runs as embedder | host | (orchestrating) engine by config
+│   │                                #     (THIN: builds policy inputs, then calls daemon-node::assemble)
 │   └── daemon-cli/                  # operator CLI
 │
 ├── tests/
@@ -152,7 +158,8 @@ flowchart TB
   orch["daemon-orchestration (fleet runtime)"]
   torch["daemon-tool-orchestrate"]
   tstd["daemon-tool-shell / fs / tkx"]
-  bin["bins/daemon"]
+  node["daemon-node (composition root)"]
+  bin["bins/daemon (thin)"]
   stub["daemon-stub-engine"]
   conf["daemon-conformance ★"]
 
@@ -168,10 +175,14 @@ flowchart TB
   host --> orch
   orch --> torch
   core --> torch & tstd
+  host --> node
+  orch --> node
+  torch --> node
+  core --> node
+  node --> bin
   core --> bin
   host --> bin
-  torch --> bin
-  tstd --> bin
+  node --> conf
   stub --> conf
   act --> conf
   host --> conf

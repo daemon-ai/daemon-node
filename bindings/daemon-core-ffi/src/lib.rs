@@ -28,7 +28,10 @@ use daemon_api::{
     dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, Outbound, SessionApi,
 };
 use daemon_common::{ReqId, SessionId};
-use daemon_core::{spawn_agent_session, AgentHandle, Engine, MockProvider, Provider, SystemPrompt, ToolRegistry};
+use daemon_core::{
+    spawn_agent_session, AgentHandle, Engine, EngineProfile, MockProvider, Provider, SystemPrompt,
+    ToolRegistry,
+};
 use daemon_protocol::{
     AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody,
 };
@@ -393,12 +396,15 @@ impl CoreSessionApi {
     }
 
     fn build_engine(id: SessionId) -> Engine {
-        Engine::fresh(
-            id,
-            SystemPrompt::new("daemon-core-ffi session"),
-            Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>,
+        // Construct through an `EngineProfile` so the FFI's engine matches the rest of the system's
+        // construction seam (provider selection / future tunables), even though this path stays
+        // self-contained and free of `daemon-host`.
+        EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>),
             Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("daemon-core-ffi session"),
         )
+        .fresh(id)
     }
 
     fn ensure(&self, session: &SessionId) -> AgentHandle {

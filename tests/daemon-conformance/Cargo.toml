@@ -20,6 +20,7 @@ daemon-provision = { workspace = true }
 daemon-telemetry = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
+daemon-node = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

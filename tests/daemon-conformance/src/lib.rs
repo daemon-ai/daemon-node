@@ -1523,20 +1523,12 @@ mod node_interface {
     //! The session sub-surface's cross-language twin (the C FFI driving `StartTurn -> TurnFinished`)
     //! is proven by the `bindings/daemon-core-ffi` C harness, not here.
 
-    use async_trait::async_trait;
-    use daemon_api::{
-        ApiRequest, ApiResponse, ControlApi, FleetReport, SessionState,
-    };
-    use daemon_common::{PartitionId, SessionId, UnitId};
-    use daemon_core::{Engine, MockProvider, Provider, SystemPrompt, ToolRegistry};
-    use daemon_host::{
-        serve_api_unix, ApiClient, CoreEngineFactory, EngineUnit, FleetControl, Host, HostConfig,
-        JobWorker, NodeApiImpl, ServiceError, SessionEngineBuilder,
-    };
-    use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
-    use daemon_store::{InMemoryStore, SessionStore};
-    use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
-    use daemon_tool_orchestrate::OrchestrateTool;
+    use daemon_api::{ApiRequest, ApiResponse, ControlApi, SessionState};
+    use daemon_common::{PartitionId, ProfileRef, SessionId};
+    use daemon_core::{MockProvider, Provider, ProviderRegistry};
+    use daemon_host::{serve_api_unix, ApiClient, HostConfig, NodeApiImpl};
+    use daemon_node::{assemble as assemble_node, AssembledNode, NodeAssembly};
+    use daemon_store::InMemoryStore;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1544,114 +1536,38 @@ mod node_interface {
 
     const PARTITION: PartitionId = PartitionId::DEFAULT;
 
-    /// A completing-child placement seam (same as `bins/daemon`).
-    struct EngineChildSpawner;
-
-    #[async_trait]
-    impl ChildSpawner for EngineChildSpawner {
-        async fn spawn(&self, id: UnitId, _spec: &DelegationSpec) -> Arc<dyn ManagedUnit> {
-            let engine = Engine::fresh(
-                SessionId::new(id.as_str()),
-                SystemPrompt::new("fleet child"),
-                Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>,
-                Arc::new(ToolRegistry::new()),
-            );
-            Arc::new(EngineUnit::spawn(id, engine))
-        }
-    }
-
-    /// The fleet driven as the node's real job worker.
-    struct FleetJobWorker(FleetRuntime);
-
-    #[async_trait]
-    impl JobWorker for FleetJobWorker {
-        async fn process_jobs_once(&self) -> Result<(), ServiceError> {
-            self.0
-                .process_jobs_once()
-                .await
-                .map(|_| ())
-                .map_err(ServiceError::new)
-        }
-    }
-
-    /// The fleet projected for the control surface (roster + the tree the GUI/TUI drives).
-    struct FleetViewImpl(FleetRuntime);
-
-    #[async_trait]
-    impl FleetControl for FleetViewImpl {
-        async fn report(&self) -> FleetReport {
-            FleetReport {
-                children: self.0.children(),
-                usage: self.0.fleet_usage(),
-            }
-        }
-        async fn cancel(&self, child: &UnitId) -> bool {
-            self.0.cancel_child(child).await
-        }
-        async fn tree(&self) -> daemon_api::TreeReport {
-            self.0.tree()
-        }
-        async fn unit(&self, id: &UnitId) -> Option<daemon_api::UnitNode> {
-            self.0.unit(id)
-        }
-        async fn unit_events(&self, id: &UnitId, max: u32) -> Vec<daemon_api::ManageEventView> {
-            self.0.unit_events(id, max)
-        }
-        async fn unit_outbound(&self, id: &UnitId, max: u32) -> Vec<daemon_api::Outbound> {
-            self.0.unit_outbound(id, max)
-        }
-        async fn pause(&self, id: &UnitId) -> bool {
-            self.0.pause(id).await
-        }
-        async fn resume(&self, id: &UnitId) -> bool {
-            self.0.resume(id).await
-        }
-        async fn scale(&self, id: &UnitId, n: u32) -> bool {
-            self.0.scale(id, n).await
-        }
-    }
-
-    /// Assemble a node like `bins/daemon`'s host role: store + fleet-as-job-worker + the live
-    /// session surface, returning the in-process surface, a started handle, and the durable store.
+    /// Assemble a node through the shared composition root ([`daemon_node::assemble`]) — exactly as
+    /// `bins/daemon`'s host role does — with the gate's mock providers (an orchestrator that
+    /// delegates once, completing children, and a completing session default). Returns the in-process
+    /// surface and the started resident-service handle.
     fn assemble() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
-        let store = Arc::new(InMemoryStore::new());
-        let fleet = FleetRuntime::new(
-            store.clone(),
-            PARTITION,
-            Arc::new(EngineChildSpawner),
-            Arc::new(DefaultAnswerPolicy),
-            None::<Arc<dyn ManageRequestHandler>>,
-        );
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(OrchestrateTool::new(fleet.clone())));
-        let factory = CoreEngineFactory::with_provider(
+        let mut providers = ProviderRegistry::new();
+        providers.set_default(Arc::new(|| {
+            Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
+        }));
+        providers.register(
+            "orchestrator",
             Arc::new(|| {
                 Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
             }),
-            Arc::new(registry),
-            SystemPrompt::new("gate host node"),
         );
-        let host = Host::new(store.clone(), Arc::new(factory), HostConfig::default())
-            .with_job_worker(Arc::new(FleetJobWorker(fleet.clone())));
-        let handle = host.start();
+        providers.register(
+            "child",
+            Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
+        );
 
-        let session_builder: SessionEngineBuilder = Arc::new(|id: SessionId| {
-            Engine::fresh(
-                id,
-                SystemPrompt::new("interactive session"),
-                Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>,
-                Arc::new(ToolRegistry::new()),
-            )
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: HostConfig {
+                partition: PARTITION,
+                ..HostConfig::default()
+            },
+            providers,
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
         });
-
-        let node = Arc::new(NodeApiImpl::new(
-            handle.observer(),
-            store as Arc<dyn SessionStore>,
-            host.manager().clone(),
-            PARTITION,
-            session_builder,
-            Some(Arc::new(FleetViewImpl(fleet)) as Arc<dyn FleetControl>),
-        ));
         (node, handle)
     }
 

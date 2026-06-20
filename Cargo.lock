@@ -582,21 +582,15 @@ name = "daemon"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "daemon-api",
  "daemon-common",
  "daemon-core",
  "daemon-credentials",
  "daemon-host",
- "daemon-orchestration",
+ "daemon-node",
  "daemon-provision",
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
- "daemon-tool-fs",
- "daemon-tool-orchestrate",
- "daemon-tool-shell",
- "daemon-tool-tkx",
  "daemon-transport",
  "serde",
  "tokio",
@@ -663,6 +657,7 @@ dependencies = [
  "daemon-core",
  "daemon-credentials",
  "daemon-host",
+ "daemon-node",
  "daemon-orchestration",
  "daemon-protocol",
  "daemon-provision",
@@ -744,6 +739,22 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "daemon-node"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-common",
+ "daemon-core",
+ "daemon-host",
+ "daemon-orchestration",
+ "daemon-provision",
+ "daemon-store",
+ "daemon-supervision",
+ "daemon-tool-orchestrate",
 ]
 
 [[package]]

@@ -45,6 +45,7 @@ daemon-telemetry = { path = "crates/substrate/daemon-telemetry" }
 daemon-host = { path = "crates/substrate/daemon-host" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
+daemon-node = { path = "crates/node/daemon-node" }
 daemon-tool-shell = { path = "tools/daemon-tool-shell" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }
 daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
