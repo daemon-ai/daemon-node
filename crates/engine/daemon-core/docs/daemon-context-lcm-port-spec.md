@@ -207,18 +207,34 @@ host-level override/cap. `compact()`'s `budget: Tokens` argument is the post-com
 
 ### 2.5 Construction & injection
 
-`CORE:.../src/profile.rs` — `EngineProfile` is the single construction seam. The foundation adds
-`with_context_engine(Arc<dyn ContextEngine>)` mirroring `with_exec` (`profile.rs:92`). The binary
-wires LCM as the default:
+`CORE:.../src/profile.rs` — `EngineProfile` is the single construction seam. It exposes **two**
+context seams: `with_context_engine(Arc<dyn ContextEngine>)` for a shared, *stateless* engine, and
+`with_context_engine_builder(ContextEngineBuilder)` — `Arc<dyn Fn(&SessionId) -> Arc<dyn
+ContextEngine>>`, mirroring `ExecEnvBuilder` (`profile.rs:40`) — for a *per-session* engine. LCM is
+stateful (it keeps per-session compaction state: `session_id`, `threshold_tokens`,
+`compaction_count`), and the daemon runs many sessions concurrently (the live actor + durable fleet
+children) off one cloned `EngineProfile`. A single shared instance would corrupt that state across
+sessions, and the `before_turn`/`compact`/`after_response` hooks carry no `SessionId` to
+demultiplex. So LCM **must** be wired through the per-session builder, not the shared slot:
 
 ```rust
-let lcm = Arc::new(LcmContextEngine::open(lcm_config, aux_provider)?);
+let lcm_cfg = /* profile-scoped LcmConfig (one lcm.db under <data_dir>/<profile>/) */;
 let profile = EngineProfile::new(provider_builder, registry, system)
-    .with_context_engine(lcm);   // replaces BudgetedContextEngine default
+    .with_context_engine_builder(Arc::new(move |id: &SessionId| {
+        Arc::new(LcmContextEngine::open_for_session(lcm_cfg.clone(), id).unwrap())
+            as Arc<dyn ContextEngine>
+    }));   // each session gets its own engine; all share one lcm.db keyed by session_id
 ```
 
-The auxiliary summarization provider (§7) is injected here too — it is **not** `Engine.provider`
-(the main model); it lives on the `ContextEngine` so LCM controls its own summarization route.
+`EngineProfile::dress()` invokes the builder with the engine's own session id (`build(&engine.
+snapshot().session_id)`), exactly as it already does for the execution-environment builder. The
+store (`lcm.db`) is **shared** across sessions and per-session-scoped at the row level by the
+`session_id` column; only the *engine instance* (and its runtime state) is per-session. Contrast
+with hermes, where a singleton `LCMEngine` is fine because hermes is single-active-session.
+
+The auxiliary summarization provider (§7) is injected through the same builder closure — it is
+**not** `Engine.provider` (the main model); it lives on the `ContextEngine` so LCM controls its own
+summarization route.
 
 ---
 
@@ -1273,7 +1289,11 @@ unnecessary. **Decision:** compile-once, match-directly; this is a *simplificati
 
 LCM owns `lcm.db`; it is never merged with the `daemon-store` activation DB or Mnemosyne banks
 (`daemon-lifecycle-persistence.md` §6, rule 2). **Decision:** the LCM data root is independent;
-relate to other domains only through the `ContextEngine`/`MemoryProvider` hooks.
+relate to other domains only through the `ContextEngine`/`MemoryProvider` hooks. The data root is
+**profile-scoped** — `<DAEMON_DATA_DIR>/<profile>/lcm.db` (mirroring hermes' per-profile home) — and
+is *shared by all sessions of that profile*, scoped at the row level by `session_id`. Durability
+follows the session store: an in-memory `daemon-store` keeps `lcm.db` in-memory too (the zero-config
+default stays fully ephemeral).
 
 ---
 
@@ -1308,9 +1328,11 @@ Each milestone is independently testable; constants from §6/§7/§8 are carried
 - **M7 — Routing + presets + filters.** `model_routing.rs` shim, `presets.rs` metadata,
   `patterns.rs` (session globs + message regex). Acceptance: ignored/stateless sessions skip
   ingest/writes; preset suggestion by context window; glob colon-semantics. (§12.3–12.6)
-- **M8 — Wire as default + conformance.** `EngineProfile::with_context_engine(lcm)` at the binary;
-  error-driven compaction retry on `ContextOverflow`. Acceptance: the engine/ReAct conformance suites
-  stay green with LCM as the default engine; a context-overflow turn compacts and retries once. (§2.5)
+- **M8 — Wire as default + conformance.** `EngineProfile::with_context_engine_builder(...)` at the
+  binary (per-session LCM instances over one profile-scoped `lcm.db`); error-driven compaction retry
+  on `ContextOverflow`. Acceptance: the engine/ReAct conformance suites stay green with LCM as the
+  default engine; a context-overflow turn compacts and retries once; concurrent sessions attribute
+  summary nodes to the correct `session_id`. (§2.5)
 - **Deferred (post-parity):** the `/lcm` slash-command operator surface (`LCM:command.py`), the
   benchmarking/stress harness, legacy `lcm.db` import (`scripts/import_lossless_claw.py`), and a
   reasoning sidecar column.

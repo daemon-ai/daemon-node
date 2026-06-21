@@ -62,7 +62,18 @@ fn check_cddl() -> anyhow::Result<()> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
     anyhow::ensure!(!text.trim().is_empty(), "{} is empty", path.display());
-    for rule in ["api-request", "api-response", "wire_version"] {
+    for rule in [
+        "api-request",
+        "api-response",
+        "wire_version",
+        // wire v2: the merged live session event log shapes.
+        "session-log-entry",
+        "session-payload",
+        "log-page-view",
+        "direction",
+        "disposition",
+        "origin",
+    ] {
         anyhow::ensure!(
             text.contains(rule),
             "{} is missing the `{rule}` rule",

@@ -338,6 +338,20 @@ fn render(resp: ApiResponse) {
                 }
             }
         }
+        ApiResponse::LogPage(page) => {
+            println!(
+                "log: {} entr(ies) next_seq={} head_seq={}",
+                page.entries.len(),
+                page.next_seq,
+                page.head_seq
+            );
+            for e in page.entries {
+                println!(
+                    "  - seq={} {:?} {} {:?}",
+                    e.seq, e.direction, e.origin.transport.0, e.payload
+                );
+            }
+        }
         ApiResponse::VerifyingKey(key) => match key {
             Some(hex) => println!("verifying_key: {hex}"),
             None => println!("verifying_key: none (node exposes no journal signer)"),

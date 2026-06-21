@@ -15,5 +15,7 @@ daemon-core = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-api = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }

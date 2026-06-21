@@ -13,6 +13,7 @@ repository = "https://github.com/example/daemon"
 # shared third-party deps (single source of truth)
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 dashmap = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,6 +40,11 @@ mistralrs = { version = "0.8", default-features = false }
 wiremock = "0.6"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# optional in-process HTTP/WS surface (the daemon-http adapter): JSON dispatch + SSE/WS over the
+# merged session event log. Isolated to the `daemon-http` adapter crate so axum never leaks into the
+# host/core; toggled on like MCP at launch.
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 # verifiable-trace stack (Blockchain Commons): dcbor for deterministic CBOR,
@@ -70,6 +76,7 @@ daemon-credentials = { path = "crates/substrate/daemon-credentials" }
 daemon-telemetry = { path = "crates/substrate/daemon-telemetry" }
 daemon-host = { path = "crates/substrate/daemon-host" }
 daemon-acp = { path = "crates/adapters/daemon-acp" }
+daemon-http = { path = "crates/adapters/daemon-http" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }

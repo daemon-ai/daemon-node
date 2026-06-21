@@ -39,6 +39,18 @@ pub type CredentialBuilder = Arc<dyn Fn() -> Arc<dyn CredentialProvider> + Send 
 /// fs/exec to a host-owned/remote env). The default builds a per-session [`LocalEnvironment`] sandbox.
 pub type ExecEnvBuilder = Arc<dyn Fn(&SessionId) -> Arc<dyn ExecutionEnvironment> + Send + Sync>;
 
+/// Builds the §10 [`ContextEngine`] for one engine, keyed by its [`SessionId`]. A stateful engine
+/// (e.g. LCM, which tracks per-session compaction state) needs a *fresh instance per session* so
+/// concurrent sessions never share mutable state; this builder is the seam that gives each one its
+/// own, while all instances target the same agent-wide store. Prefer over
+/// [`EngineProfile::with_context_engine`] for any engine that is not stateless.
+pub type ContextEngineBuilder = Arc<dyn Fn(&SessionId) -> Arc<dyn ContextEngine> + Send + Sync>;
+
+/// Builds the §11 [`MemoryProvider`] set for one engine, keyed by its [`SessionId`] — so a backend
+/// scoped by session (e.g. Mnemosyne's `session_id` row column over a shared bank) is constructed
+/// per-session. Prefer over [`EngineProfile::with_memory`] for any session-scoped backend.
+pub type MemoryBuilder = Arc<dyn Fn(&SessionId) -> Vec<Arc<dyn MemoryProvider>> + Send + Sync>;
+
 /// The engine's construction environment, shared by every construction site (durable factory, live
 /// session builder, fleet child spawner).
 #[derive(Clone)]
@@ -51,7 +63,9 @@ pub struct EngineProfile {
     config: Config,
     exec: Option<ExecEnvBuilder>,
     context: Option<Arc<dyn ContextEngine>>,
+    context_builder: Option<ContextEngineBuilder>,
     memory: Vec<Arc<dyn MemoryProvider>>,
+    memory_builder: Option<MemoryBuilder>,
 }
 
 impl EngineProfile {
@@ -72,7 +86,9 @@ impl EngineProfile {
             config: Config::default(),
             exec: None,
             context: None,
+            context_builder: None,
             memory: Vec::new(),
+            memory_builder: None,
         }
     }
 
@@ -111,10 +127,26 @@ impl EngineProfile {
         self
     }
 
+    /// Inject a per-session context-engine builder (§10), keyed by [`SessionId`]. Takes precedence
+    /// over [`EngineProfile::with_context_engine`]: each constructed engine gets its *own* instance
+    /// (the seam for stateful engines like LCM that must not share mutable state across sessions).
+    pub fn with_context_engine_builder(mut self, context: ContextEngineBuilder) -> Self {
+        self.context_builder = Some(context);
+        self
+    }
+
     /// Register the memory providers (§11) every engine this profile builds consults around each
     /// turn (default empty — memory is opt-in).
     pub fn with_memory(mut self, memory: Vec<Arc<dyn MemoryProvider>>) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Inject a per-session memory builder (§11), keyed by [`SessionId`]. Takes precedence over
+    /// [`EngineProfile::with_memory`]: each constructed engine gets its own provider set (the seam
+    /// for session-scoped backends like Mnemosyne).
+    pub fn with_memory_builder(mut self, memory: MemoryBuilder) -> Self {
+        self.memory_builder = Some(memory);
         self
     }
 
@@ -138,10 +170,20 @@ impl EngineProfile {
             let exec = build(&engine.snapshot().session_id);
             engine = engine.with_exec(exec);
         }
-        if let Some(context) = &self.context {
+        // Context/memory: a per-session builder (for stateful/session-scoped backends) takes
+        // precedence over a shared instance; both are keyed on the engine's own session id.
+        if let Some(build) = &self.context_builder {
+            let context = build(&engine.snapshot().session_id);
+            engine = engine.with_context_engine(context);
+        } else if let Some(context) = &self.context {
             engine = engine.with_context_engine(context.clone());
         }
-        if !self.memory.is_empty() {
+        if let Some(build) = &self.memory_builder {
+            let memory = build(&engine.snapshot().session_id);
+            if !memory.is_empty() {
+                engine = engine.with_memory(memory);
+            }
+        } else if !self.memory.is_empty() {
             engine = engine.with_memory(self.memory.clone());
         }
         engine.with_budget(self.budget).with_config(self.config)

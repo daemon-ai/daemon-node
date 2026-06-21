@@ -1,0 +1,27 @@
+[package]
+name = "daemon-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The optional in-process HTTP/WS transport adapter for the `daemon-api` surface. Like the Unix
+# socket and the C FFI, it is a thin shell over the shared `daemon_api::dispatch` plus the merged
+# session event log's `subscribe` cursor — only the byte transport differs. Isolated here so axum /
+# tower-http never leak into `daemon-host` or `daemon-core`.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+reqwest = { workspace = true }

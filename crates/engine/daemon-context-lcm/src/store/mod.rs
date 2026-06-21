@@ -77,7 +77,14 @@ impl Store {
             "INSERT INTO summary_nodes \
              (session_id, depth, summary, token_count, source_token_count, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![session_id, depth, summary, token_count, source_token_count, created_at],
+            rusqlite::params![
+                session_id,
+                depth,
+                summary,
+                token_count,
+                source_token_count,
+                created_at
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }

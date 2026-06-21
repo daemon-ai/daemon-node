@@ -72,6 +72,7 @@ pub enum AgentCommand {
 
 /// Why a turn started (§17). A background completion is the durable rehydration trigger.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum TurnTrigger {
     /// A user message opened the turn.
     User,
@@ -81,6 +82,12 @@ pub enum TurnTrigger {
     BackgroundCompletion {
         /// What produced the completion.
         source: CompletionSource,
+    },
+    /// A scheduled job fired (the daemon-schedule trigger source; an inbound, context-bearing
+    /// event in the merged session log — see the event-io spec §5.5).
+    Scheduled {
+        /// The schedule/job that fired.
+        job: JobId,
     },
 }
 
@@ -446,6 +453,209 @@ pub enum Outbound {
 }
 
 // ---------------------------------------------------------------------------
+// Merged session event log (the event-io edge, wire v2)
+// ---------------------------------------------------------------------------
+//
+// The §17 surface above is direction-asymmetric: `Outbound` is sequenced, observable, and journaled,
+// while `Inbound` is mere engine intake (no `seq`, not broadcast, not recorded). The merged session
+// event log closes that gap: both directions become first-class entries on ONE `seq`-stamped log,
+// stamped by a single per-session sequencer (the generalisation of the outbound-only `EventSink`).
+// Three consumers read the one log through different lenses — the engine (Context entries only),
+// any attached surface (everything), and the verifiable journal (Context inbound + outbound +
+// lifecycle). These types are the wire shapes for that log; the sequencer itself lives in
+// `daemon-core` and the cursored subscribe surface in `daemon-api`.
+
+/// The stable name of a surface/adapter that an item entered or left through ("telegram", "http",
+/// "mcp", "slack", "socket", "ffi", "schedule", …). A plain interned string keeps the contract open:
+/// adding an adapter needs no protocol change and the daemon never matches structurally on it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TransportId(pub String);
+
+impl TransportId {
+    /// Construct a transport id from its stable name.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The transport id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for TransportId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for TransportId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// The conversational scope an inbound item belongs to — the single input (with the transport) to
+/// deterministic session-id derivation, and the per-event attribution carried on the log. This is
+/// the daemon analogue of hermes's `build_session_key` input, but carried explicitly (never via
+/// env/`ContextVars`). Principal/route handles are opaque strings the originating adapter owns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum OriginScope {
+    /// A direct / 1:1 conversation with a single principal.
+    Dm {
+        /// The adapter-opaque principal handle (e.g. a Telegram user id).
+        user: String,
+    },
+    /// A group / channel conversation, optionally threaded.
+    Group {
+        /// The adapter-opaque chat/channel handle.
+        chat: String,
+        /// The thread handle within the chat, when threaded.
+        thread: Option<String>,
+    },
+    /// A programmatic API caller, keyed by credential/principal.
+    Api {
+        /// The adapter-opaque credential/principal handle.
+        key: String,
+    },
+    /// A host-internal origin with no external principal — schedule ticks, background completions,
+    /// and other daemon-raised triggers.
+    Internal,
+}
+
+/// Where an inbound item came from (or an outbound item is attributed to). The single input to
+/// session-id derivation, carried **per event, not just per session creation**, so the log and
+/// journal can record "steered via the GUI by the owner" vs "message from the Telegram user" within
+/// one shared conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// The surface/adapter the item entered or left through.
+    pub transport: TransportId,
+    /// The conversational scope (drives session-id derivation + attribution).
+    pub scope: OriginScope,
+}
+
+impl Origin {
+    /// Construct an origin from a transport and a scope.
+    pub fn new(transport: impl Into<TransportId>, scope: OriginScope) -> Self {
+        Self {
+            transport: transport.into(),
+            scope,
+        }
+    }
+
+    /// A host-internal origin (schedule / background triggers) for the given transport.
+    pub fn internal(transport: impl Into<TransportId>) -> Self {
+        Self {
+            transport: transport.into(),
+            scope: OriginScope::Internal,
+        }
+    }
+}
+
+/// Which way an entry flows on the merged session log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Direction {
+    /// World → session: a surface message, steering, a tool result, a trigger, or a meta event.
+    Inbound,
+    /// Session → world: a streamed [`AgentEvent`] or a blocking [`HostRequest`].
+    Outbound,
+}
+
+/// Whether a log entry enters the conversation/prompt or is observability-only.
+///
+/// Default is [`Disposition::Context`]: anything that arrives at the conversation is part of it
+/// unless deliberately demoted. [`Disposition::Transport`] is the explicit lever for presence /
+/// surface-attach / receipts — entries the engine's prompt never sees, making them **cache-safe by
+/// construction** (the first-class form of hermes's "events describe transport, never context").
+/// `Transport` entries are also never journaled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Disposition {
+    /// Enters the conversation: a turn, a tool message, a rehydration/scheduled trigger.
+    #[default]
+    Context,
+    /// Observability only: presence, surface-attach, receipts — never in the prompt or journal.
+    Transport,
+}
+
+/// The body of a [`SessionLogEntry`]. Unifies the outbound §17 union ([`Outbound`] = event / request)
+/// with the inbound intake ([`Inbound`] = command / response) and adds an inbound transport/meta
+/// channel for observability-only events. Opaque `Meta` bodies ride through the daemon untouched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionPayload {
+    /// An outbound streamed event (engine → world).
+    Event(AgentEvent),
+    /// An outbound blocking host request (engine → world).
+    Request(HostRequest),
+    /// An inbound command (world → engine).
+    Command(AgentCommand),
+    /// An inbound host response to a prior [`HostRequest`] (world → engine).
+    Response(HostResponse),
+    /// An inbound transport/meta event with no engine intake — observability only by default
+    /// (presence, surface-attach, delivery receipts). Routed by `kind`, decoded by the consumer.
+    Meta {
+        /// The stable renderer/router discriminator (e.g. `"presence"` / `"attach"` / `"receipt"`).
+        kind: String,
+        /// The opaque encoded payload (CBOR by convention), decoded by the consumer per `kind`.
+        body: Vec<u8>,
+    },
+}
+
+impl SessionPayload {
+    /// The direction implied by the payload variant (outbound for events/requests, inbound for
+    /// commands/responses/meta). The canonical source for a [`SessionLogEntry::direction`] field.
+    pub fn direction(&self) -> Direction {
+        match self {
+            SessionPayload::Event(_) | SessionPayload::Request(_) => Direction::Outbound,
+            SessionPayload::Command(_)
+            | SessionPayload::Response(_)
+            | SessionPayload::Meta { .. } => Direction::Inbound,
+        }
+    }
+}
+
+/// One entry on the merged, bidirectional session event log. Carries four orthogonal axes plus the
+/// payload: a single monotonic `seq` across **both** directions (global per-session ordering and the
+/// subscribe cursor), the `direction`, the per-event `origin` (attribution), and the `disposition`
+/// (context vs transport-only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLogEntry {
+    /// One monotonic sequence across both directions — global ordering and the subscribe cursor.
+    pub seq: u64,
+    /// Which way this entry flows.
+    pub direction: Direction,
+    /// Which surface / trigger produced it (per-event attribution).
+    pub origin: Origin,
+    /// Whether it enters the conversation (`Context`) or is observability-only (`Transport`).
+    #[serde(default)]
+    pub disposition: Disposition,
+    /// The typed payload.
+    pub payload: SessionPayload,
+}
+
+impl SessionLogEntry {
+    /// Build an entry, deriving `direction` from the payload and defaulting `disposition` to
+    /// [`Disposition::Context`].
+    pub fn new(seq: u64, origin: Origin, payload: SessionPayload) -> Self {
+        Self {
+            seq,
+            direction: payload.direction(),
+            origin,
+            disposition: Disposition::default(),
+            payload,
+        }
+    }
+
+    /// Demote this entry to [`Disposition::Transport`] (observability-only; never prompt/journal).
+    pub fn transport_only(mut self) -> Self {
+        self.disposition = Disposition::Transport;
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Durable transcript blocks (the verifiable journal's chat-entry payload)
 // ---------------------------------------------------------------------------
 
@@ -633,4 +843,124 @@ pub enum ManageEventView {
         /// A rendered error message.
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cbor_round_trip<T>(value: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf).expect("cbor encode");
+        ciborium::from_reader(buf.as_slice()).expect("cbor decode")
+    }
+
+    fn json_round_trip<T>(value: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let s = serde_json::to_string(value).expect("json encode");
+        serde_json::from_str(&s).expect("json decode")
+    }
+
+    #[test]
+    fn scheduled_trigger_round_trips() {
+        let trigger = TurnTrigger::Scheduled {
+            job: JobId::from("nightly-digest"),
+        };
+        assert_eq!(trigger, cbor_round_trip(&trigger));
+        assert_eq!(trigger, json_round_trip(&trigger));
+    }
+
+    #[test]
+    fn disposition_defaults_to_context() {
+        assert_eq!(Disposition::default(), Disposition::Context);
+    }
+
+    #[test]
+    fn payload_direction_matches_variant() {
+        let event = SessionPayload::Event(AgentEvent::TurnStarted {
+            seq: 0,
+            trigger: TurnTrigger::User,
+        });
+        assert_eq!(event.direction(), Direction::Outbound);
+
+        let request = SessionPayload::Request(HostRequest {
+            request_id: ReqId(1),
+            kind: HostRequestKind::Input {
+                prompt: "name?".into(),
+            },
+        });
+        assert_eq!(request.direction(), Direction::Outbound);
+
+        let command = SessionPayload::Command(AgentCommand::Shutdown);
+        assert_eq!(command.direction(), Direction::Inbound);
+
+        let response = SessionPayload::Response(HostResponse {
+            request_id: ReqId(1),
+            body: HostResponseBody::Input("ada".into()),
+        });
+        assert_eq!(response.direction(), Direction::Inbound);
+
+        let meta = SessionPayload::Meta {
+            kind: "presence".into(),
+            body: vec![1, 2, 3],
+        };
+        assert_eq!(meta.direction(), Direction::Inbound);
+    }
+
+    #[test]
+    fn session_log_entry_derives_direction_and_default_disposition() {
+        let origin = Origin::new(
+            "telegram",
+            OriginScope::Group {
+                chat: "c1".into(),
+                thread: Some("t1".into()),
+            },
+        );
+        let entry = SessionLogEntry::new(
+            7,
+            origin,
+            SessionPayload::Command(AgentCommand::StartTurn {
+                input: UserMsg::new("hello"),
+                request_id: ReqId(2),
+            }),
+        );
+        assert_eq!(entry.direction, Direction::Inbound);
+        assert_eq!(entry.disposition, Disposition::Context);
+
+        let round = cbor_round_trip(&entry);
+        assert_eq!(entry, round);
+        assert_eq!(entry, json_round_trip(&entry));
+    }
+
+    #[test]
+    fn transport_only_demotes_disposition() {
+        let entry = SessionLogEntry::new(
+            1,
+            Origin::internal("schedule"),
+            SessionPayload::Meta {
+                kind: "attach".into(),
+                body: Vec::new(),
+            },
+        )
+        .transport_only();
+        assert_eq!(entry.disposition, Disposition::Transport);
+        assert_eq!(entry, cbor_round_trip(&entry));
+    }
+
+    #[test]
+    fn origin_round_trips_across_scopes() {
+        for origin in [
+            Origin::new("http", OriginScope::Api { key: "k1".into() }),
+            Origin::new("telegram", OriginScope::Dm { user: "u1".into() }),
+            Origin::internal("schedule"),
+        ] {
+            assert_eq!(origin, cbor_round_trip(&origin));
+            assert_eq!(origin, json_round_trip(&origin));
+        }
+    }
 }

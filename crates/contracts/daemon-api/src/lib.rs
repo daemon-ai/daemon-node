@@ -22,10 +22,18 @@
 
 use async_trait::async_trait;
 use daemon_common::{SessionId, UnitId, UsageDelta, WireVersion};
-pub use daemon_protocol::Outbound;
 use daemon_protocol::{AgentCommand, HostResponse, TranscriptBlock};
+pub use daemon_protocol::{Outbound, SessionLogEntry};
+use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+/// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
+/// shape a streaming transport (in-process, socket, HTTP/WS) returns from [`SessionApi::subscribe`].
+/// Streaming is a *transport capability*, not a wire-mirror variant: the cursor read
+/// ([`SessionApi::log_after`] / [`ApiRequest::Subscribe`]) is the one-shot/long-poll form every
+/// transport marshals.
+pub type LogStream = BoxStream<'static, SessionLogEntry>;
 
 /// The wire version of the api mirror (rides every framed request/response; governs evolution).
 pub const API_WIRE_VERSION: WireVersion = WireVersion::CURRENT;
@@ -58,6 +66,30 @@ pub trait SessionApi: Send + Sync {
         _max: u32,
     ) -> JournalPageView {
         JournalPageView::default()
+    }
+
+    /// Non-destructive, cursor-paged read of the **merged live session event log** (inbound +
+    /// outbound [`SessionLogEntry`] items past `after_seq`). Unlike [`Self::poll`] (a destructive
+    /// single-consumer drain), this is the multi-surface observability read: the entry `seq` *is* the
+    /// cursor, so N consumers each keep their own position and never steal each other's events.
+    /// Repeated reads from the same `after_seq` return the same page; it is the long-poll/one-shot
+    /// basis a streaming transport pages over. Default: an empty page (a transport with no live log).
+    async fn log_after(
+        &self,
+        _session: SessionId,
+        _after_seq: u64,
+        _max: u32,
+    ) -> Result<LogPageView, ApiError> {
+        Ok(LogPageView::default())
+    }
+
+    /// Subscribe to the merged live session event log as a push stream of entries with `seq >
+    /// after_seq` (`after_seq = 0` backfills from the start, then continues live). This is the
+    /// push delivery a streaming transport (in-process, socket, HTTP/WS) holds open; the one-shot
+    /// transports long-poll [`Self::log_after`] over the same cursor instead. Default: an empty
+    /// stream (a transport that exposes no live log — callers fall back to `log_after`).
+    async fn subscribe(&self, _session: SessionId, _after_seq: u64) -> Result<LogStream, ApiError> {
+        Ok(stream::empty().boxed())
     }
 }
 
@@ -299,6 +331,20 @@ pub struct JournalPageView {
     pub head_cursor: u64,
 }
 
+/// A page of a session's **merged live event log**: the [`SessionLogEntry`] items past a cursor plus
+/// the pagination cursors. Non-destructive — repeated reads from the same `after_seq` return the same
+/// page. This is the live-log analogue of [`JournalPageView`] (which pages the *durable* journal).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogPageView {
+    /// The merged-log entries (inbound + outbound) in `seq` order.
+    pub entries: Vec<SessionLogEntry>,
+    /// The cursor to pass as the next `after_seq` (the last entry's `seq`, or the input `after_seq`
+    /// when the page is empty).
+    pub next_seq: u64,
+    /// The highest `seq` currently retained for the session (how far a reader can advance now).
+    pub head_seq: u64,
+}
+
 // ---------------------------------------------------------------------------
 // The serializable mirror (1:1 with the interface methods)
 // ---------------------------------------------------------------------------
@@ -376,6 +422,16 @@ pub enum ApiRequest {
         /// Maximum entries to return (0 = all available).
         max: u32,
     },
+    /// [`SessionApi::log_after`] — the one-shot / long-poll cursor read of the merged live event log
+    /// (the wire-marshaled form of `subscribe`; true push streaming stays a transport capability).
+    Subscribe {
+        /// The session whose merged live log to read.
+        session: SessionId,
+        /// The exclusive lower-bound `seq` (0 from the start).
+        after_seq: u64,
+        /// Maximum entries to return (0 = all available).
+        max: u32,
+    },
     /// [`ControlApi::unit_history`].
     UnitHistory {
         /// The unit whose durable history to read.
@@ -429,6 +485,8 @@ pub enum ApiResponse {
     UnitEvents(Vec<ManageEventView>),
     /// A page of decoded + verified journal history (session/unit history).
     Journal(JournalPageView),
+    /// A page of the merged live session event log (the cursor read of `subscribe`).
+    LogPage(LogPageView),
     /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
     VerifyingKey(Option<String>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
@@ -480,6 +538,14 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             after_cursor,
             max,
         } => ApiResponse::Journal(api.session_history(session, after_cursor, max).await),
+        ApiRequest::Subscribe {
+            session,
+            after_seq,
+            max,
+        } => match api.log_after(session, after_seq, max).await {
+            Ok(page) => ApiResponse::LogPage(page),
+            Err(e) => ApiResponse::Error(e),
+        },
         _ => return None,
     })
 }
@@ -519,7 +585,8 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::Submit { .. }
         | ApiRequest::Poll { .. }
         | ApiRequest::Respond { .. }
-        | ApiRequest::SessionHistory { .. } => {
+        | ApiRequest::SessionHistory { .. }
+        | ApiRequest::Subscribe { .. } => {
             unreachable!("session variants handled above")
         }
     }
@@ -595,5 +662,59 @@ mod tests {
         let bytes = to_cbor(&resp);
         let back: ApiResponse = from_cbor(&bytes).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn subscribe_request_and_log_page_round_trip() {
+        use daemon_protocol::{Direction, Disposition, Origin, OriginScope, SessionPayload};
+
+        let req = ApiRequest::Subscribe {
+            session: SessionId::new("s1"),
+            after_seq: 12,
+            max: 64,
+        };
+        assert_eq!(req, from_cbor::<ApiRequest>(&to_cbor(&req)).unwrap());
+
+        let page = ApiResponse::LogPage(LogPageView {
+            entries: vec![SessionLogEntry {
+                seq: 13,
+                direction: Direction::Inbound,
+                origin: Origin::new("telegram", OriginScope::Dm { user: "u1".into() }),
+                disposition: Disposition::Context,
+                payload: SessionPayload::Command(AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: ReqId(1),
+                }),
+            }],
+            next_seq: 13,
+            head_seq: 13,
+        });
+        assert_eq!(page, from_cbor::<ApiResponse>(&to_cbor(&page)).unwrap());
+    }
+
+    /// The default `SessionApi` implementations of the live-log reads degrade gracefully: an empty
+    /// page and an empty stream, so a transport with no live log still satisfies the surface.
+    #[tokio::test]
+    async fn default_log_reads_are_empty() {
+        use futures::StreamExt;
+
+        struct Bare;
+        #[async_trait]
+        impl SessionApi for Bare {
+            async fn submit(&self, _: SessionId, _: AgentCommand) -> Result<(), ApiError> {
+                Ok(())
+            }
+            async fn poll(&self, _: SessionId, _: u32) -> Result<Vec<Outbound>, ApiError> {
+                Ok(Vec::new())
+            }
+            async fn respond(&self, _: SessionId, _: HostResponse) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+
+        let page = Bare.log_after(SessionId::new("s"), 0, 16).await.unwrap();
+        assert_eq!(page, LogPageView::default());
+        let mut s = Bare.subscribe(SessionId::new("s"), 0).await.unwrap();
+        assert!(s.next().await.is_none());
     }
 }

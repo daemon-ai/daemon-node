@@ -21,13 +21,15 @@ use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
     ApiError, ControlApi, FleetReport, HealthReport, JournalPageView, JournalRecord,
-    JournalRecordPayload, ManageEventView, Outbound, ServiceHealth, SessionApi, SessionInfo,
-    SessionState, StatsReport, TreeReport, UnitNode,
+    JournalRecordPayload, LogPageView, LogStream, ManageEventView, Outbound, ServiceHealth,
+    SessionApi, SessionInfo, SessionState, StatsReport, TreeReport, UnitNode,
 };
 use daemon_common::{ContentHash, JournalStreamId, PartitionId, ReqId, SessionId, UnitId};
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
 use daemon_protocol::{
-    AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody, TranscriptBlock,
+    AgentCommand, Direction, Disposition, HostRequest, HostRequestHandler, HostResponse,
+    HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, TranscriptBlock,
+    TransportId,
 };
 use daemon_store::{SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -35,10 +37,30 @@ use daemon_telemetry::{
     GENESIS_ROOT,
 };
 use dashmap::DashMap;
+use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::BroadcastStream;
+
+/// The session's own attribution for engine-emitted (outbound) merged-log entries.
+fn engine_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("engine"),
+        scope: OriginScope::Internal,
+    }
+}
+
+/// The attribution stamped on inbound items entering through the node api surface. The api `submit`
+/// op carries no per-event origin yet (the surface-aware transports thread real origins in a later
+/// phase), so node-api inbound is tagged with this generic local-api origin.
+fn api_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("api"),
+        scope: OriginScope::Internal,
+    }
+}
 
 /// Builds a fresh live [`Engine`] for an interactive session id (the session sub-surface's engine
 /// seam — the binary supplies the provider/tools/system).
@@ -416,6 +438,19 @@ impl SessionApi for NodeApiImpl {
         self.read_history(JournalStreamId::session(&session), after_cursor, max)
             .await
     }
+
+    async fn log_after(
+        &self,
+        session: SessionId,
+        after_seq: u64,
+        max: u32,
+    ) -> Result<LogPageView, ApiError> {
+        Ok(self.live.log_after(&session, after_seq, max))
+    }
+
+    async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
+        Ok(self.live.subscribe(&session, after_seq))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,11 +459,96 @@ impl SessionApi for NodeApiImpl {
 
 type Drain = Arc<Mutex<VecDeque<Outbound>>>;
 type Pending = Arc<Mutex<HashMap<ReqId, oneshot::Sender<HostResponse>>>>;
+type Merged = Arc<Mutex<MergedLog>>;
+
+/// The authoritative, **non-destructive** merged session event log for one live session: one
+/// `seq`-stamped timeline across both directions (inbound commands/responses, outbound events +
+/// raised host requests). Unlike the destructive `drain` (single-consumer `poll`), this is the
+/// multi-surface observability surface — N consumers each page from their own cursor (`log_after`)
+/// or hold a live push subscription (`subscribe`), and never steal each other's events.
+struct MergedLog {
+    /// The next `seq` to assign (one counter across both directions).
+    next_seq: u64,
+    /// The full ordered history (retained so a late joiner can backfill from any cursor).
+    entries: Vec<SessionLogEntry>,
+    /// The live fan-out to push subscribers.
+    tx: broadcast::Sender<SessionLogEntry>,
+}
+
+impl MergedLog {
+    fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(256);
+        // Seq starts at 1 so the `after_seq` cursor convention (exclusive lower bound; 0 = "from the
+        // start") can address the very first entry.
+        Self {
+            next_seq: 1,
+            entries: Vec::new(),
+            tx,
+        }
+    }
+
+    /// Stamp the next `seq`, record the entry, and fan it out to live subscribers.
+    fn append(
+        &mut self,
+        direction: Direction,
+        origin: Origin,
+        disposition: Disposition,
+        payload: SessionPayload,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let entry = SessionLogEntry {
+            seq,
+            direction,
+            origin,
+            disposition,
+            payload,
+        };
+        self.entries.push(entry.clone());
+        // A send error only means there are no live subscribers; the history retains the entry.
+        let _ = self.tx.send(entry);
+    }
+
+    /// A non-destructive page of entries with `seq > after_seq` (up to `max`, 0 = all).
+    fn page(&self, after_seq: u64, max: u32) -> LogPageView {
+        let head_seq = self.next_seq.saturating_sub(1);
+        let mut entries = Vec::new();
+        for e in self.entries.iter().filter(|e| e.seq > after_seq) {
+            if max != 0 && entries.len() >= max as usize {
+                break;
+            }
+            entries.push(e.clone());
+        }
+        let next_seq = entries.last().map(|e| e.seq).unwrap_or(after_seq);
+        LogPageView {
+            entries,
+            next_seq,
+            head_seq,
+        }
+    }
+
+    /// A push stream that backfills `seq > after_seq` from history, then continues live. The caller
+    /// holds the log mutex while calling this, so the backlog snapshot and the live subscription are
+    /// taken atomically (no entry can slip between them).
+    fn subscribe(&self, after_seq: u64) -> LogStream {
+        let backlog: Vec<SessionLogEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.seq > after_seq)
+            .cloned()
+            .collect();
+        let rx = self.tx.subscribe();
+        let live = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+        stream::iter(backlog).chain(live).boxed()
+    }
+}
 
 struct LiveSession {
     handle: AgentHandle,
     drain: Drain,
     pending: Pending,
+    /// The non-destructive merged event log (multi-surface observability).
+    log: Merged,
     /// The event pump task; aborted when the session is dropped.
     pump: JoinHandle<()>,
 }
@@ -467,6 +587,7 @@ impl LiveSessions {
         let engine = (self.builder)(session.clone());
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let log: Merged = Arc::new(Mutex::new(MergedLog::new()));
         // A per-session journal feeder (keyed by SessionId), shared by the event pump and the
         // request handler so the live transcript is sealed per turn into the unified journal.
         let feeder: Option<Arc<JournalFeeder>> = self.journal.lock().unwrap().as_ref().map(|cfg| {
@@ -480,19 +601,28 @@ impl LiveSessions {
         let host = Arc::new(ParkingHandler {
             drain: drain.clone(),
             pending: pending.clone(),
+            log: log.clone(),
             journal: feeder.clone(),
         });
         let handle = spawn_agent_session(engine, host);
 
-        // Pump §17 events from the actor broadcast into the drain queue (lossless until polled), and
-        // feed the verifiable journal (coalesced finished blocks, sealed per turn) when enabled.
+        // Pump §17 events from the actor broadcast into the destructive drain queue (lossless until
+        // polled), record them on the non-destructive merged log (outbound / Context), and feed the
+        // verifiable journal (coalesced finished blocks, sealed per turn) when enabled.
         let mut rx = handle.subscribe();
         let pump_drain = drain.clone();
+        let pump_log = log.clone();
         let pump_journal = feeder.clone();
         let pump = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
+                        pump_log.lock().unwrap().append(
+                            Direction::Outbound,
+                            engine_origin(),
+                            Disposition::Context,
+                            SessionPayload::Event(ev.clone()),
+                        );
                         let frame = Outbound::Event(ev);
                         pump_drain.lock().unwrap().push_back(frame.clone());
                         if let Some(feeder) = &pump_journal {
@@ -511,6 +641,7 @@ impl LiveSessions {
                 handle: handle.clone(),
                 drain,
                 pending,
+                log,
                 pump,
             },
         );
@@ -519,10 +650,20 @@ impl LiveSessions {
 
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
         match command {
-            AgentCommand::StartTurn { input, .. } => {
+            AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
                 // (including the terminal `TurnFinished`) flow to the drain queue for `poll`.
                 let handle = self.ensure(&session);
+                // Record the inbound command on the merged log first, so an observer sees what was
+                // submitted ahead of the engine's replies (StartTurn enters the conversation).
+                self.record_inbound(
+                    &session,
+                    Disposition::Context,
+                    SessionPayload::Command(AgentCommand::StartTurn {
+                        input: input.clone(),
+                        request_id,
+                    }),
+                );
                 tokio::spawn(async move {
                     let _ = handle.start_turn(input).await;
                 });
@@ -530,10 +671,22 @@ impl LiveSessions {
             }
             AgentCommand::Interrupt { reason } => {
                 let handle = self.existing(&session)?;
+                self.record_inbound(
+                    &session,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::Interrupt {
+                        reason: reason.clone(),
+                    }),
+                );
                 handle.interrupt(reason).await;
                 Ok(())
             }
             AgentCommand::Shutdown => {
+                self.record_inbound(
+                    &session,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::Shutdown),
+                );
                 if let Some((_, s)) = self.sessions.remove(&session) {
                     s.handle.shutdown().await;
                 }
@@ -543,15 +696,60 @@ impl LiveSessions {
                 // Steer-when-idle opens a fresh turn; mid-turn it is drained at a phase boundary.
                 // Either way the ack + any turn events flow to the drain queue via the pump.
                 let handle = self.ensure(&session);
+                self.record_inbound(
+                    &session,
+                    Disposition::Context,
+                    SessionPayload::Command(AgentCommand::Steer {
+                        text: text.clone(),
+                        request_id,
+                    }),
+                );
                 handle.steer(request_id, text).await;
                 Ok(())
             }
             AgentCommand::Snapshot { request_id } => {
                 let handle = self.existing(&session)?;
+                self.record_inbound(
+                    &session,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::Snapshot { request_id }),
+                );
                 handle.snapshot(request_id).await;
                 Ok(())
             }
             _ => Err(ApiError::Unsupported("unknown agent command".into())),
+        }
+    }
+
+    /// Append an inbound entry to a live session's merged log (no-op if the session is gone). Tagged
+    /// with the generic api origin; surface-aware transports will thread real origins later.
+    fn record_inbound(
+        &self,
+        session: &SessionId,
+        disposition: Disposition,
+        payload: SessionPayload,
+    ) {
+        if let Some(s) = self.sessions.get(session) {
+            s.log
+                .lock()
+                .unwrap()
+                .append(Direction::Inbound, api_origin(), disposition, payload);
+        }
+    }
+
+    /// Non-destructive cursor page of a live session's merged log (empty if the session is gone).
+    fn log_after(&self, session: &SessionId, after_seq: u64, max: u32) -> LogPageView {
+        match self.sessions.get(session) {
+            Some(s) => s.log.lock().unwrap().page(after_seq, max),
+            None => LogPageView::default(),
+        }
+    }
+
+    /// A live push subscription to a session's merged log (empty stream if the session is gone).
+    fn subscribe(&self, session: &SessionId, after_seq: u64) -> LogStream {
+        match self.sessions.get(session) {
+            Some(s) => s.log.lock().unwrap().subscribe(after_seq),
+            None => stream::empty().boxed(),
         }
     }
 
@@ -584,6 +782,13 @@ impl LiveSessions {
         let tx = s.pending.lock().unwrap().remove(&response.request_id);
         match tx {
             Some(tx) => {
+                // The answer to a raised host request enters the conversation (inbound / Context).
+                s.log.lock().unwrap().append(
+                    Direction::Inbound,
+                    api_origin(),
+                    Disposition::Context,
+                    SessionPayload::Response(response.clone()),
+                );
                 let _ = tx.send(response);
                 Ok(())
             }
@@ -611,6 +816,8 @@ impl LiveSessions {
 struct ParkingHandler {
     drain: Drain,
     pending: Pending,
+    /// The session's non-destructive merged log, so a raised request is observable to every surface.
+    log: Merged,
     /// The per-session journal feeder, so a raised request graduates into a durable request block.
     journal: Option<Arc<JournalFeeder>>,
 }
@@ -621,6 +828,14 @@ impl HostRequestHandler for ParkingHandler {
         let (tx, rx) = oneshot::channel();
         let request_id = req.request_id;
         self.pending.lock().unwrap().insert(request_id, tx);
+        // Record the raised request on the merged log (outbound / Context) under the unified seq, so
+        // it shares one ordered timeline with events and the eventual inbound response.
+        self.log.lock().unwrap().append(
+            Direction::Outbound,
+            engine_origin(),
+            Disposition::Context,
+            SessionPayload::Request(req.clone()),
+        );
         let frame = Outbound::Request(req);
         if let Some(feeder) = &self.journal {
             feeder.feed(&frame).await;

@@ -21,6 +21,9 @@ daemon-providers = { workspace = true }
 daemon-infer = { workspace = true }
 daemon-host = { workspace = true }
 daemon-node = { workspace = true }
+daemon-api = { workspace = true }
+# Optional in-process HTTP/WS surface, toggled on at launch by a configured bind address.
+daemon-http = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }

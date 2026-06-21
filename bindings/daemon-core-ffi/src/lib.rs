@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use daemon_api::{
-    dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, Outbound, SessionApi,
+    dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, LogPageView,
+    LogStream, Outbound, SessionApi,
 };
 use daemon_common::{ReqId, SessionId};
 use daemon_core::{
@@ -33,12 +34,31 @@ use daemon_core::{
     SystemPrompt, ToolRegistry,
 };
 use daemon_protocol::{
-    AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody,
+    AgentCommand, Direction, Disposition, HostRequest, HostRequestHandler, HostResponse,
+    HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, TransportId,
 };
 use dashmap::DashMap;
+use futures::stream::{self, StreamExt};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::BroadcastStream;
+
+/// The session's own attribution for engine-emitted (outbound) merged-log entries.
+fn engine_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("engine"),
+        scope: OriginScope::Internal,
+    }
+}
+
+/// The attribution stamped on inbound items entering through the FFI session surface.
+fn ffi_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("ffi"),
+        scope: OriginScope::Internal,
+    }
+}
 
 /// The ABI version of the handle/function shell (semver-disciplined, distinct from the payload
 /// `wire_version`).
@@ -367,11 +387,85 @@ pub unsafe extern "C" fn daemon_buf_free(ptr: *mut u8, len: usize) {
 
 type Drain = Arc<Mutex<VecDeque<Outbound>>>;
 type Pending = Arc<Mutex<HashMap<ReqId, oneshot::Sender<HostResponse>>>>;
+type Merged = Arc<Mutex<MergedLog>>;
+
+/// The non-destructive, `seq`-stamped merged session event log (inbound + outbound) backing the
+/// long-poll cursor read ([`SessionApi::log_after`]) and the live push ([`SessionApi::subscribe`]).
+/// A focused mirror of the durable host's log, kept self-contained so the brain FFI stays free of
+/// `daemon-host`.
+struct MergedLog {
+    next_seq: u64,
+    entries: Vec<SessionLogEntry>,
+    tx: broadcast::Sender<SessionLogEntry>,
+}
+
+impl MergedLog {
+    fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(256);
+        // Seq starts at 1 so the `after_seq` cursor convention (exclusive lower bound; 0 = "from the
+        // start") can address the very first entry.
+        Self {
+            next_seq: 1,
+            entries: Vec::new(),
+            tx,
+        }
+    }
+
+    fn append(
+        &mut self,
+        direction: Direction,
+        origin: Origin,
+        disposition: Disposition,
+        payload: SessionPayload,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let entry = SessionLogEntry {
+            seq,
+            direction,
+            origin,
+            disposition,
+            payload,
+        };
+        self.entries.push(entry.clone());
+        let _ = self.tx.send(entry);
+    }
+
+    fn page(&self, after_seq: u64, max: u32) -> LogPageView {
+        let head_seq = self.next_seq.saturating_sub(1);
+        let mut entries = Vec::new();
+        for e in self.entries.iter().filter(|e| e.seq > after_seq) {
+            if max != 0 && entries.len() >= max as usize {
+                break;
+            }
+            entries.push(e.clone());
+        }
+        let next_seq = entries.last().map(|e| e.seq).unwrap_or(after_seq);
+        LogPageView {
+            entries,
+            next_seq,
+            head_seq,
+        }
+    }
+
+    fn subscribe(&self, after_seq: u64) -> LogStream {
+        let backlog: Vec<SessionLogEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.seq > after_seq)
+            .cloned()
+            .collect();
+        let rx = self.tx.subscribe();
+        let live = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+        stream::iter(backlog).chain(live).boxed()
+    }
+}
 
 struct LiveSession {
     handle: AgentHandle,
     drain: Drain,
     pending: Pending,
+    log: Merged,
     pump: JoinHandle<()>,
 }
 
@@ -421,18 +515,29 @@ impl CoreSessionApi {
         }
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let log: Merged = Arc::new(Mutex::new(MergedLog::new()));
         let host = Arc::new(ParkingHandler {
             drain: drain.clone(),
             pending: pending.clone(),
+            log: log.clone(),
         });
         let handle = spawn_agent_session(Self::build_engine(session.clone()), host);
 
         let mut rx = handle.subscribe();
         let pump_drain = drain.clone();
+        let pump_log = log.clone();
         let pump = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(ev) => pump_drain.lock().unwrap().push_back(Outbound::Event(ev)),
+                    Ok(ev) => {
+                        pump_log.lock().unwrap().append(
+                            Direction::Outbound,
+                            engine_origin(),
+                            Disposition::Context,
+                            SessionPayload::Event(ev.clone()),
+                        );
+                        pump_drain.lock().unwrap().push_back(Outbound::Event(ev));
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -445,10 +550,26 @@ impl CoreSessionApi {
                 handle: handle.clone(),
                 drain,
                 pending,
+                log,
                 pump,
             },
         );
         handle
+    }
+
+    /// Append an inbound entry to a session's merged log (no-op if the session is gone).
+    fn record_inbound(
+        &self,
+        session: &SessionId,
+        disposition: Disposition,
+        payload: SessionPayload,
+    ) {
+        if let Some(s) = self.sessions.get(session) {
+            s.log
+                .lock()
+                .unwrap()
+                .append(Direction::Inbound, ffi_origin(), disposition, payload);
+        }
     }
 }
 
@@ -456,8 +577,16 @@ impl CoreSessionApi {
 impl SessionApi for CoreSessionApi {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
         match command {
-            AgentCommand::StartTurn { input, .. } => {
+            AgentCommand::StartTurn { input, request_id } => {
                 let handle = self.ensure(&session);
+                self.record_inbound(
+                    &session,
+                    Disposition::Context,
+                    SessionPayload::Command(AgentCommand::StartTurn {
+                        input: input.clone(),
+                        request_id,
+                    }),
+                );
                 tokio::spawn(async move {
                     let _ = handle.start_turn(input).await;
                 });
@@ -469,10 +598,22 @@ impl SessionApi for CoreSessionApi {
                     .get(&session)
                     .map(|s| s.handle.clone())
                     .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+                self.record_inbound(
+                    &session,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::Interrupt {
+                        reason: reason.clone(),
+                    }),
+                );
                 handle.interrupt(reason).await;
                 Ok(())
             }
             AgentCommand::Shutdown => {
+                self.record_inbound(
+                    &session,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::Shutdown),
+                );
                 if let Some((_, s)) = self.sessions.remove(&session) {
                     s.handle.shutdown().await;
                 }
@@ -480,6 +621,14 @@ impl SessionApi for CoreSessionApi {
             }
             AgentCommand::Steer { text, request_id } => {
                 let handle = self.ensure(&session);
+                self.record_inbound(
+                    &session,
+                    Disposition::Context,
+                    SessionPayload::Command(AgentCommand::Steer {
+                        text: text.clone(),
+                        request_id,
+                    }),
+                );
                 handle.steer(request_id, text).await;
                 Ok(())
             }
@@ -489,6 +638,11 @@ impl SessionApi for CoreSessionApi {
                     .get(&session)
                     .map(|s| s.handle.clone())
                     .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+                self.record_inbound(
+                    &session,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::Snapshot { request_id }),
+                );
                 handle.snapshot(request_id).await;
                 Ok(())
             }
@@ -518,10 +672,35 @@ impl SessionApi for CoreSessionApi {
         let tx = s.pending.lock().unwrap().remove(&response.request_id);
         match tx {
             Some(tx) => {
+                s.log.lock().unwrap().append(
+                    Direction::Inbound,
+                    ffi_origin(),
+                    Disposition::Context,
+                    SessionPayload::Response(response.clone()),
+                );
                 let _ = tx.send(response);
                 Ok(())
             }
             None => Err(ApiError::Other("no parked request for that id".into())),
+        }
+    }
+
+    async fn log_after(
+        &self,
+        session: SessionId,
+        after_seq: u64,
+        max: u32,
+    ) -> Result<LogPageView, ApiError> {
+        match self.sessions.get(&session) {
+            Some(s) => Ok(s.log.lock().unwrap().page(after_seq, max)),
+            None => Ok(LogPageView::default()),
+        }
+    }
+
+    async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
+        match self.sessions.get(&session) {
+            Some(s) => Ok(s.log.lock().unwrap().subscribe(after_seq)),
+            None => Ok(stream::empty().boxed()),
         }
     }
 }
@@ -531,6 +710,7 @@ impl SessionApi for CoreSessionApi {
 struct ParkingHandler {
     drain: Drain,
     pending: Pending,
+    log: Merged,
 }
 
 #[async_trait]
@@ -539,6 +719,12 @@ impl HostRequestHandler for ParkingHandler {
         let (tx, rx) = oneshot::channel();
         let request_id = req.request_id;
         self.pending.lock().unwrap().insert(request_id, tx);
+        self.log.lock().unwrap().append(
+            Direction::Outbound,
+            engine_origin(),
+            Disposition::Context,
+            SessionPayload::Request(req.clone()),
+        );
         self.drain.lock().unwrap().push_back(Outbound::Request(req));
         match rx.await {
             Ok(resp) => resp,
@@ -630,5 +816,74 @@ mod fixture_tests {
             STEER_GO,
             "the C harness fixture is stale; regenerate harness/harness.c"
         );
+    }
+}
+
+#[cfg(test)]
+mod merged_log_tests {
+    //! The non-destructive merged log over the self-contained FFI [`CoreSessionApi`]: a submitted
+    //! `StartTurn` is recorded as an inbound entry under the unified `seq`, ahead of the engine's
+    //! outbound replies, and `log_after` is a non-destructive cursor (re-reads from the same cursor
+    //! return the same entries — unlike the destructive `poll` drain).
+
+    use super::*;
+    use daemon_protocol::UserMsg;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn log_after_records_inbound_then_outbound_non_destructively() {
+        let api = CoreSessionApi::new();
+        let session = SessionId::new("merged");
+
+        api.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hi"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit");
+
+        // Wait until the background turn has produced its terminal outbound event.
+        let mut page = LogPageView::default();
+        for _ in 0..50 {
+            page = api.log_after(session.clone(), 0, 0).await.unwrap();
+            let done = page.entries.iter().any(|e| {
+                matches!(
+                    &e.payload,
+                    SessionPayload::Event(daemon_protocol::AgentEvent::TurnFinished { .. })
+                )
+            });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let first = &page.entries[0];
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.direction, Direction::Inbound);
+        assert!(matches!(
+            first.payload,
+            SessionPayload::Command(AgentCommand::StartTurn { .. })
+        ));
+        assert!(page
+            .entries
+            .iter()
+            .any(|e| e.direction == Direction::Outbound));
+
+        // Non-destructive: a second read from cursor 0 returns the same head, and a cursor past the
+        // head returns nothing while reporting the same head.
+        let again = api.log_after(session.clone(), 0, 0).await.unwrap();
+        assert_eq!(again.head_seq, page.head_seq);
+        assert_eq!(again.entries.len(), page.entries.len());
+
+        let tail = api
+            .log_after(session.clone(), page.head_seq, 0)
+            .await
+            .unwrap();
+        assert!(tail.entries.is_empty());
+        assert_eq!(tail.head_seq, page.head_seq);
     }
 }
