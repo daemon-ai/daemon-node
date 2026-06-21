@@ -109,6 +109,29 @@ const WEB_TAVILY_KEY_ENV: &str = "DAEMON_WEB_TAVILY_KEY_ID";
 /// The credential-profile id the Firecrawl scraper key is read from (default `firecrawl`).
 const WEB_FIRECRAWL_KEY_ENV: &str = "DAEMON_WEB_FIRECRAWL_KEY_ID";
 
+// --- Python tools (`daemon-pytool`) tuning (DAEMON_PYTHON_*) -----------------------------------
+/// Register Python tools discovered from the `daemon_pytool` worker (`false` by default — opt-in,
+/// like `metta`/`web`).
+const PYTHON_ENABLE_ENV: &str = "DAEMON_PYTHON_ENABLE";
+/// The Python interpreter to spawn the worker with (default `python3`, resolved on `PATH`).
+const PYTHON_INTERPRETER_ENV: &str = "DAEMON_PYTHON_INTERPRETER";
+/// The worker module run as `python -m <module>` (default `daemon_pytool`).
+const PYTHON_WORKER_MODULE_ENV: &str = "DAEMON_PYTHON_WORKER_MODULE";
+/// A standalone worker executable; when set it is spawned directly instead of `interpreter -m module`.
+const PYTHON_WORKER_BIN_ENV: &str = "DAEMON_PYTHON_WORKER_BIN";
+/// A directory of user tool modules (each top-level `*.py` is imported for its `@tool` registrations).
+const PYTHON_TOOLS_DIR_ENV: &str = "DAEMON_PYTHON_TOOLS_DIR";
+/// A path prepended to the worker's `PYTHONPATH` so `-m <module>` resolves the shipped SDK package.
+const PYTHON_PACKAGE_PATH_ENV: &str = "DAEMON_PYTHON_PACKAGE_PATH";
+/// How long to wait for a tool call / discovery reply before declaring a transport fault (ms).
+const PYTHON_OP_TIMEOUT_MS_ENV: &str = "DAEMON_PYTHON_OP_TIMEOUT_MS";
+/// How long to wait for the worker's `Ready` after spawning (ms).
+const PYTHON_SPAWN_TIMEOUT_MS_ENV: &str = "DAEMON_PYTHON_SPAWN_TIMEOUT_MS";
+/// Crash-loop meltdown: max worker restarts within the restart window.
+const PYTHON_MAX_RESTARTS_ENV: &str = "DAEMON_PYTHON_MAX_RESTARTS";
+/// The sliding window (ms) over which restarts are counted for meltdown.
+const PYTHON_RESTART_WINDOW_MS_ENV: &str = "DAEMON_PYTHON_RESTART_WINDOW_MS";
+
 // --- Browser tool (`daemon-tool-browser`, `browser` feature) tuning (DAEMON_BROWSER_*) --------
 /// Register the `browser` tool (`false` by default; also requires the `browser` build feature).
 const BROWSER_ENABLE_ENV: &str = "DAEMON_BROWSER_ENABLE";
@@ -284,6 +307,52 @@ fn default_metta_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("daemon-metta"))
 }
 
+/// Tuning for the Python tools worker (`daemon-pytool`). `enable = false` keeps Python tools
+/// unregistered (the default), exactly like the opt-in `metta`/`web` surfaces. When enabled the host
+/// spawns `interpreter -m worker_module [--tools-dir <dir>]` (or `worker_bin` directly), discovers
+/// its tools, and registers a proxy `Tool` for each; the worker is spawned lazily on first use.
+#[derive(Clone, Debug)]
+pub struct PythonToolsConfig {
+    /// Whether to discover + register Python tools.
+    pub enable: bool,
+    /// The Python interpreter to spawn the worker with (when [`PythonToolsConfig::worker_bin`] is
+    /// unset).
+    pub interpreter: PathBuf,
+    /// The worker module run as `python -m <module>`.
+    pub worker_module: String,
+    /// A standalone worker executable; spawned directly instead of `interpreter -m module` when set.
+    pub worker_bin: Option<PathBuf>,
+    /// A directory of user tool modules (imported for their `@tool` registrations).
+    pub tools_dir: Option<PathBuf>,
+    /// A path prepended to the worker's `PYTHONPATH` so `-m <module>` resolves the shipped package.
+    pub package_path: Option<PathBuf>,
+    /// How long to wait for a tool call / discovery reply (the transport-fault watchdog).
+    pub op_timeout: Duration,
+    /// How long to wait for the worker's `Ready` after spawning.
+    pub spawn_timeout: Duration,
+    /// Crash-loop meltdown: max restarts within [`PythonToolsConfig::restart_window`].
+    pub max_restarts: u32,
+    /// The sliding window over which restarts are counted for meltdown.
+    pub restart_window: Duration,
+}
+
+impl Default for PythonToolsConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            interpreter: PathBuf::from("python3"),
+            worker_module: "daemon_pytool".to_string(),
+            worker_bin: None,
+            tools_dir: None,
+            package_path: None,
+            op_timeout: Duration::from_secs(60),
+            spawn_timeout: Duration::from_secs(30),
+            max_restarts: 3,
+            restart_window: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Tuning for the web tools (`daemon-tool-web`). `enable = false` keeps `web_search`/`web_extract`
 /// unregistered (the default). The Tavily/Firecrawl keys are read live from the `CredentialStore`
 /// under [`WebConfig::tavily_key_id`]/[`WebConfig::firecrawl_key_id`], so a GUI-set key applies
@@ -452,6 +521,8 @@ pub struct NodeConfig {
     pub embed: EmbedConfig,
     /// MeTTa symbolic-coprocessor tuning (`enable = false` by default — the `metta` tool is opt-in).
     pub metta: MettaConfig,
+    /// Python-tools tuning (`enable = false` by default — the `daemon_pytool` worker is opt-in).
+    pub python: PythonToolsConfig,
     /// Web-tool tuning (`enable = false` by default — `web_search`/`web_extract` are opt-in).
     pub web: WebConfig,
     /// Browser-tool tuning (`enable = false` by default — also requires the `browser` build feature).
@@ -498,8 +569,25 @@ struct FileConfig {
     models: Option<FileModelsConfig>,
     embed: Option<FileEmbedConfig>,
     metta: Option<FileMettaConfig>,
+    python: Option<FilePythonConfig>,
     web: Option<FileWebConfig>,
     browser: Option<FileBrowserConfig>,
+}
+
+/// The `[python]` TOML table — Python-tools tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FilePythonConfig {
+    enable: Option<bool>,
+    interpreter: Option<PathBuf>,
+    worker_module: Option<String>,
+    worker_bin: Option<PathBuf>,
+    tools_dir: Option<PathBuf>,
+    package_path: Option<PathBuf>,
+    op_timeout_ms: Option<u64>,
+    spawn_timeout_ms: Option<u64>,
+    max_restarts: Option<u32>,
+    restart_window_ms: Option<u64>,
 }
 
 /// The `[metta]` TOML table — symbolic-coprocessor tuning (every field optional; env wins).
@@ -767,6 +855,7 @@ impl NodeConfig {
         let models = Self::resolve_models(file.models.unwrap_or_default());
         let embed = Self::resolve_embed(file.embed.unwrap_or_default())?;
         let metta = Self::resolve_metta(file.metta.unwrap_or_default())?;
+        let python = Self::resolve_python(file.python.unwrap_or_default())?;
         let web = Self::resolve_web(file.web.unwrap_or_default());
         let browser = Self::resolve_browser(file.browser.unwrap_or_default())?;
 
@@ -789,6 +878,7 @@ impl NodeConfig {
             models,
             embed,
             metta,
+            python,
             web,
             browser,
             credential_key,
@@ -881,6 +971,60 @@ impl NodeConfig {
             METTA_RESTART_WINDOW_MS_ENV,
         )?;
         Ok(metta)
+    }
+
+    /// Resolve Python-tools tuning (env overriding the `[python]` TOML table overriding defaults).
+    fn resolve_python(file: FilePythonConfig) -> anyhow::Result<PythonToolsConfig> {
+        let mut python = PythonToolsConfig::default();
+        if let Some(b) = file.enable {
+            python.enable = b;
+        }
+        if let Some(s) = env_string(PYTHON_ENABLE_ENV) {
+            python.enable = parse_bool(&s);
+        }
+        if let Some(p) = file.interpreter {
+            python.interpreter = p;
+        }
+        if let Some(s) = env_string(PYTHON_INTERPRETER_ENV) {
+            python.interpreter = PathBuf::from(s);
+        }
+        if let Some(m) = file.worker_module {
+            python.worker_module = m;
+        }
+        if let Some(s) = env_string(PYTHON_WORKER_MODULE_ENV) {
+            python.worker_module = s;
+        }
+        python.worker_bin = env_string(PYTHON_WORKER_BIN_ENV)
+            .map(PathBuf::from)
+            .or(file.worker_bin);
+        python.tools_dir = env_string(PYTHON_TOOLS_DIR_ENV)
+            .map(PathBuf::from)
+            .or(file.tools_dir);
+        python.package_path = env_string(PYTHON_PACKAGE_PATH_ENV)
+            .map(PathBuf::from)
+            .or(file.package_path);
+        resolve_duration_ms(
+            &mut python.op_timeout,
+            file.op_timeout_ms,
+            PYTHON_OP_TIMEOUT_MS_ENV,
+        )?;
+        resolve_duration_ms(
+            &mut python.spawn_timeout,
+            file.spawn_timeout_ms,
+            PYTHON_SPAWN_TIMEOUT_MS_ENV,
+        )?;
+        if let Some(n) = file.max_restarts {
+            python.max_restarts = n;
+        }
+        if let Some(s) = env_string(PYTHON_MAX_RESTARTS_ENV) {
+            python.max_restarts = s.parse().context("DAEMON_PYTHON_MAX_RESTARTS must be a u32")?;
+        }
+        resolve_duration_ms(
+            &mut python.restart_window,
+            file.restart_window_ms,
+            PYTHON_RESTART_WINDOW_MS_ENV,
+        )?;
+        Ok(python)
     }
 
     /// Resolve web-tool tuning (env overriding the `[web]` TOML table overriding defaults).

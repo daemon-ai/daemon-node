@@ -116,6 +116,8 @@ daemon-node = { path = "crates/node/daemon-node" }
 # (no-hyperon) build; the worker build opts into the engine via `--features hyperon` on the crate.
 daemon-metta = { path = "crates/coprocessor/daemon-metta", default-features = false }
 daemon-metta-client = { path = "crates/coprocessor/daemon-metta-client" }
+daemon-pytool = { path = "crates/coprocessor/daemon-pytool" }
+daemon-pytool-client = { path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { path = "tools/daemon-tool-metta" }
 daemon-tool-shell = { path = "tools/daemon-tool-shell" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }

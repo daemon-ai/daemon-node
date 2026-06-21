@@ -1773,6 +1773,7 @@ dependencies = [
  "daemon-node",
  "daemon-providers",
  "daemon-provision",
+ "daemon-pytool-client",
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
@@ -2175,6 +2176,38 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "daemon-common",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "daemon-pytool"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
+ "daemon-provision",
+ "daemon-pytool-client",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "daemon-pytool-client"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
+ "daemon-provision",
+ "daemon-pytool",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

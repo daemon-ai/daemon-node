@@ -108,6 +108,27 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// A boxed, thread-safe error from a [`ToolProvider`] (kept opaque so `daemon-core` stays free of
+/// any provider's concrete error/runtime types).
+pub type ToolProviderError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A source of dynamically-discovered [`Tool`]s — an out-of-process worker, an MCP server, a plugin
+/// host, etc. The single discovery seam the host queries at startup (and may re-query) to populate
+/// the [`ToolRegistry`] with tools whose names/schemas are only known at runtime.
+///
+/// This is the shared boundary for every dynamic tool surface: the Python tool worker
+/// (`daemon-pytool-client`) implements it today, and a future MCP client implements the same trait,
+/// so the host wires `Vec<Arc<dyn ToolProvider>>` uniformly rather than special-casing each source.
+/// The provider owns its own process/connection lifecycle (lazy spawn, crash-respawn); `discover`
+/// just reports the tools currently on offer.
+#[async_trait::async_trait]
+pub trait ToolProvider: Send + Sync {
+    /// A short, stable label for diagnostics (e.g. `"python"`, `"mcp:github"`).
+    fn label(&self) -> &str;
+    /// Discover (or re-discover) the tools this provider currently offers.
+    async fn discover(&self) -> Result<Vec<Arc<dyn Tool>>, ToolProviderError>;
+}
+
 /// The tool registry: resolves a call name to its handler (§12 `tools.rs`).
 #[derive(Default)]
 pub struct ToolRegistry {

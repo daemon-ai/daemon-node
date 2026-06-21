@@ -24,7 +24,8 @@ use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
     ContextEngine, ContextEngineBuilder, CredentialBuilder, CredentialProvider, EmbeddingProvider,
     EngineProfile, FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider,
-    ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
+    ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolProvider,
+    ToolRegistry, TurnCx,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
@@ -40,6 +41,7 @@ use daemon_api::{
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_metta::protocol::Bounds as MettaBounds;
 use daemon_metta_client::{MettaConfig as MettaClientConfig, MettaCoprocessor};
+use daemon_pytool_client::{PyToolConfig, PyToolProvider};
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
 use daemon_tool_metta::MettaTool;
 use daemon_tool_clarify::ClarifyTool;
@@ -582,6 +584,60 @@ fn build_web_tools(cfg: &NodeConfig, credentials: Arc<dyn CredentialStore>) -> V
     ]
 }
 
+/// Discover + register Python tools from the `daemon_pytool` worker when enabled. Like the metta
+/// coprocessor the worker runs out-of-process over a length-framed cut; one `PyToolHost` backs a
+/// proxy [`Tool`] per discovered Python tool and respawns the worker lazily after a crash. Discovery
+/// failures degrade gracefully: a warning is logged and no Python tools are registered.
+async fn build_python_tools(cfg: &NodeConfig) -> Vec<Arc<dyn Tool>> {
+    let py = &cfg.python;
+    if !py.enable {
+        return Vec::new();
+    }
+
+    // Either spawn a standalone worker binary, or `interpreter -m <module>`.
+    let (program, mut args) = match &py.worker_bin {
+        Some(bin) => (bin.clone(), Vec::new()),
+        None => (
+            py.interpreter.clone(),
+            vec!["-m".to_string(), py.worker_module.clone()],
+        ),
+    };
+    if let Some(dir) = &py.tools_dir {
+        args.push("--tools-dir".to_string());
+        args.push(dir.display().to_string());
+    }
+
+    let mut client_cfg = PyToolConfig::new(program, args);
+    // Make the shipped SDK package importable for `-m <module>` (set absolute; an operator needing a
+    // richer environment uses `worker_bin` or a venv interpreter).
+    if let Some(pkg) = &py.package_path {
+        client_cfg
+            .env
+            .push(("PYTHONPATH".to_string(), pkg.display().to_string()));
+    }
+    client_cfg.op_timeout = py.op_timeout;
+    client_cfg.spawn_timeout = py.spawn_timeout;
+    client_cfg.max_restarts = py.max_restarts;
+    client_cfg.restart_window = py.restart_window;
+
+    // Discover through the shared `ToolProvider` seam (the same boundary a future MCP provider uses).
+    let provider = PyToolProvider::new(client_cfg);
+    match provider.discover().await {
+        Ok(tools) => {
+            tracing::info!(
+                count = tools.len(),
+                interpreter = %py.interpreter.display(),
+                "python tools discovered and registered"
+            );
+            tools
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "python tool worker failed to start; no python tools registered");
+            Vec::new()
+        }
+    }
+}
+
 /// Build the `browser` tool when enabled and compiled in (the `browser` feature). The supervised
 /// Chromium is launched lazily on first use.
 #[cfg(feature = "browser")]
@@ -1046,6 +1102,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // The optional web tools (`web_search`/`web_extract`, opt-in). Keys are read live from the
     // credential store, so a GUI-set Tavily/Firecrawl key applies without a restart.
     extra_tools.extend(build_web_tools(&cfg, credential_store.clone()));
+
+    // The optional Python tools (opt-in, `daemon_pytool` worker). Discovered up-front so each Python
+    // tool joins the registry by name; the worker process itself is (re)spawned lazily on first call.
+    extra_tools.extend(build_python_tools(&cfg).await);
 
     // The optional `browser` tool — only available when the daemon is built with the `browser`
     // feature (which compiles chromiumoxide); a no-op otherwise.

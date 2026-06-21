@@ -1,0 +1,24 @@
+[package]
+name = "daemon-pytool-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The wire protocol (light: serde types + JSON codec). No Python links into the daemon through here.
+daemon-pytool = { workspace = true }
+# The supervised process boundary (spawn + length-framed cut), shared with the metta/infer clients.
+daemon-provision = { workspace = true }
+daemon-common = { workspace = true }
+# The `Tool` trait the proxy implements + the `ToolDetail` envelope it maps results onto.
+daemon-core = { workspace = true }
+daemon-protocol = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

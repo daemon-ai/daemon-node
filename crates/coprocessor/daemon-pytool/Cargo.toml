@@ -1,0 +1,40 @@
+[package]
+name = "daemon-pytool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# A hermetic, Python-free worker that speaks the protocol, used by the client's integration test
+# (and by `tests/daemon-conformance`) so CI exercises the supervised-client + proxy path without
+# requiring a system Python. The real worker is the `daemon_pytool` Python package.
+[[bin]]
+name = "fake-pytool-worker"
+path = "src/bin/fake-pytool-worker.rs"
+
+[dependencies]
+# The wire protocol is pure: serde + serde_json (JSON body codec — keeps the Python SDK stdlib-only).
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Worker runtime + the framed stdio cut (shared with the metta/inference workers), used by the fake
+# worker bin and re-exported `from_stdio` helper.
+tokio = { workspace = true }
+daemon-provision = { workspace = true }
+
+[dev-dependencies]
+# The supervised-client + end-to-end engine tests live here so they can spawn the
+# `fake-pytool-worker` bin via `CARGO_BIN_EXE_fake-pytool-worker`. The dev-dependency cycle
+# (client -> this crate) is allowed by Cargo because dev-dependencies are excluded from the normal
+# build graph.
+daemon-pytool-client = { workspace = true }
+# `engine_e2e` drives a real engine turn (ScriptedProvider -> py_echo proxy) to prove a Python tool is
+# discovered + invoked through the ordinary ReAct loop.
+daemon-core = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }

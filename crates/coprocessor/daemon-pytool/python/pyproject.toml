@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daemon-pytool"
+version = "0.1.0"
+description = "Daemon-native Python tool SDK + out-of-process worker (speaks daemon_pytool::protocol over length-framed JSON stdio)."
+requires-python = ">=3.9"
+# Intentionally dependency-free: the worker + SDK are stdlib-only (asyncio, json, struct).
+dependencies = []
+
+[project.scripts]
+daemon-pytool = "daemon_pytool.__main__:main"
+
+[tool.setuptools]
+packages = ["daemon_pytool"]

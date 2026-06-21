@@ -73,5 +73,8 @@ pub use repair::{
 pub use safety::{check_url, CheckedUrl, UrlReject};
 pub use snapshot::{ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;
-pub use tools::{DelegateTool, Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolRegistry};
+pub use tools::{
+    DelegateTool, Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError,
+    ToolRegistry,
+};
 pub use turn::{Effect, TurnCx};
