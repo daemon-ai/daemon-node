@@ -7,11 +7,13 @@
 //! drill-down tools. See `crates/engine/daemon-core/docs/daemon-context-lcm-port-spec.md` for the
 //! full architecture spec with the authoritative Python `file:line` references each module ports.
 //!
-//! This is the **skeleton** milestone: the seam is implemented end-to-end (the engine wires
-//! [`LcmContextEngine`] as its `ContextEngine`), the SQLite store + config layers exist, and
-//! compaction is a faithful-but-minimal drop-oldest delegating to the in-core
-//! [`BudgetedContextEngine`](daemon_core::context::BudgetedContextEngine). The deep port (summary
-//! DAG, 3-level escalation, externalization, `lcm_*` tools) grows from here per the spec phases.
+//! Implemented (spec milestones **M1-M4**): the SQLite store (lossless `messages` transcript +
+//! summary DAG with `source_ids` lineage + FTS5 indexes + lifecycle frontier — §4/§5), `tiktoken`
+//! token counting (§6.1), the 3-level escalation summarizer over a host-injected aux
+//! [`Provider`](daemon_core::provider::Provider) (§7), and the compaction engine that summarizes the
+//! region outside a fresh tail into the DAG and reassembles `[system] + [summary] + [fresh tail]`
+//! (§6). Still to come: ingest protection (M5), the seven `lcm_*` drill-down tools + search (M6),
+//! and routing/presets (M7).
 //!
 //! Tools are *not* dispatched through the §10 seam: when the `lcm_*` tools land they register through
 //! the §12 [`ToolRegistry`](daemon_core::tools) holding an `Arc<LcmContextEngine>`; [`ContextEngine::tools`]
@@ -22,10 +24,13 @@
 pub mod compaction;
 pub mod config;
 pub mod error;
+pub mod escalation;
+pub mod ingest;
 pub mod provider;
 pub mod store;
+pub mod tokens;
 
 pub use config::LcmConfig;
 pub use error::{Error, Result};
 pub use provider::LcmContextEngine;
-pub use store::SummaryNode;
+pub use store::{MessageRow, NewMessage, NewNode, SourceType, SummaryNode};

@@ -149,7 +149,10 @@ fn build_providers(
 /// (so its per-session compaction state is never shared across concurrent sessions) over the shared
 /// profile-scoped `lcm.db`; `Budgeted` returns `None`, leaving the engine on the in-core
 /// [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) fallback.
-fn build_context_engine(cfg: &NodeConfig) -> Option<ContextEngineBuilder> {
+fn build_context_engine(
+    cfg: &NodeConfig,
+    aux: Arc<dyn Provider>,
+) -> Option<ContextEngineBuilder> {
     match cfg.context_engine {
         ContextEngineKind::Budgeted => None,
         ContextEngineKind::Lcm => {
@@ -163,7 +166,7 @@ fn build_context_engine(cfg: &NodeConfig) -> Option<ContextEngineBuilder> {
                 LcmConfig::in_memory()
             };
             Some(Arc::new(move |id: &SessionId| {
-                match LcmContextEngine::open_for_session(lcm_cfg.clone(), id) {
+                match LcmContextEngine::open_for_session(lcm_cfg.clone(), id, aux.clone()) {
                     Ok(lcm) => Arc::new(lcm) as Arc<dyn ContextEngine>,
                     Err(e) => {
                         tracing::warn!(error = %e, session = %id,
@@ -630,7 +633,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry. Both
     // are per-session builders (LCM keeps per-session compaction state; Mnemosyne scopes by
     // `session_id`), so concurrent sessions never share mutable provider state.
-    let context_builder = build_context_engine(&cfg);
+    // LCM summarizes through the same default provider the agent uses: resolve the profile's builder
+    // (falling back to a mock) and hand the context engine an aux provider instance.
+    let lcm_aux: Arc<dyn Provider> = providers
+        .builder_for(&cred_profile)
+        .map(|b| b())
+        .unwrap_or_else(|| Arc::new(MockProvider::completing("")) as Arc<dyn Provider>);
+    let context_builder = build_context_engine(&cfg, lcm_aux);
     // The optional embedding backend (Mnemosyne vector recall), reusing the shared `ModelManager`
     // for local-model acquisition. `Off` by default — recall stays keyword-only.
     let embedder = build_embedder(&cfg, &manager).await;
