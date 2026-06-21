@@ -101,17 +101,12 @@ pub async fn repo_param_count(client: &HfClient, repo: &str, revision: &str) -> 
 
 /// Fetch (and follow pagination across) the full recursive tree.
 async fn fetch_tree(client: &HfClient, repo: &str, revision: &str) -> Result<Vec<RawTreeItem>> {
-    let first = format!(
-        "{}/api/models/{repo}/tree/{revision}",
-        client.endpoint()
-    );
+    let first = format!("{}/api/models/{repo}/tree/{revision}", client.endpoint());
     let mut url = first;
     let mut query: Vec<(&str, String)> = vec![("recursive", "true".to_string())];
     let mut all = Vec::new();
     for _ in 0..MAX_TREE_PAGES {
-        let page = client
-            .get_url::<Vec<RawTreeItem>>(&url, &query)
-            .await?;
+        let page = client.get_url::<Vec<RawTreeItem>>(&url, &query).await?;
         all.extend(page.body);
         match page.next {
             // The `next` URL already carries the cursor; don't re-append query params.

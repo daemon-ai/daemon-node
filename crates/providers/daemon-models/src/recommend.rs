@@ -101,11 +101,7 @@ fn aggregate_llama(files: &[ModelFile]) -> Vec<LlamaCandidate> {
 }
 
 /// Recommend a GGUF quant for llama from a repo's file listing and a memory budget.
-pub fn recommend_llama(
-    repo: &str,
-    files: &[ModelFile],
-    budget_bytes: u64,
-) -> QuantRecommendation {
+pub fn recommend_llama(repo: &str, files: &[ModelFile], budget_bytes: u64) -> QuantRecommendation {
     let usable = weight_budget(budget_bytes);
     let mut aggregated = aggregate_llama(files);
     // Best quality first.
@@ -266,8 +262,16 @@ pub fn highest_precision_gguf(files: &[ModelFile]) -> Option<&ModelFile> {
         .filter(|f| !f.is_split || f.is_first_shard)
         .filter(|f| f.quant.is_some() || gguf::quant_label(&f.path).is_some())
         .min_by(|a, b| {
-            let qa = a.quant.clone().or_else(|| gguf::quant_label(&a.path)).unwrap_or_default();
-            let qb = b.quant.clone().or_else(|| gguf::quant_label(&b.path)).unwrap_or_default();
+            let qa = a
+                .quant
+                .clone()
+                .or_else(|| gguf::quant_label(&a.path))
+                .unwrap_or_default();
+            let qb = b
+                .quant
+                .clone()
+                .or_else(|| gguf::quant_label(&b.path))
+                .unwrap_or_default();
             quality_rank(&qa)
                 .cmp(&quality_rank(&qb))
                 .then_with(|| b.size_bytes.cmp(&a.size_bytes))

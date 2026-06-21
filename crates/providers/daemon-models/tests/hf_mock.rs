@@ -66,7 +66,10 @@ async fn files_lists_gguf_with_quant_and_shards() {
         .expect("files");
     // README + directory dropped; three GGUF files kept.
     assert_eq!(files.len(), 3);
-    let q4 = files.iter().find(|f| f.path == "Model-Q4_K_M.gguf").unwrap();
+    let q4 = files
+        .iter()
+        .find(|f| f.path == "Model-Q4_K_M.gguf")
+        .unwrap();
     assert_eq!(q4.quant.as_deref(), Some("Q4_K_M"));
     assert!(!q4.is_split);
     let shard1 = files
@@ -102,7 +105,9 @@ async fn files_for_mistralrs_keeps_repo_siblings() {
     assert!(!paths.contains(&"notes.txt"));
 
     // `list_all` returns every file (the mistral.rs prewarm set).
-    let all = files::list_all(&client, "org/mistral", "main").await.unwrap();
+    let all = files::list_all(&client, "org/mistral", "main")
+        .await
+        .unwrap();
     assert_eq!(all.len(), 4);
 }
 

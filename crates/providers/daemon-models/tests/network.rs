@@ -24,9 +24,10 @@ async fn live_search_returns_gguf_repos() {
 #[ignore = "hits the live Hugging Face Hub"]
 async fn live_files_lists_quantized_ggufs() {
     let client = HfClient::new(None);
-    let files = daemon_models::hf::files::list_files(&client, STABLE_REPO, "main", ModelEngine::Llama)
-        .await
-        .expect("live files");
+    let files =
+        daemon_models::hf::files::list_files(&client, STABLE_REPO, "main", ModelEngine::Llama)
+            .await
+            .expect("live files");
     assert!(files.iter().any(|f| f.path.ends_with(".gguf")));
     assert!(files.iter().any(|f| f.quant.is_some()));
 }
@@ -88,7 +89,12 @@ async fn live_recommend_llama_picks_a_gguf() {
 
     // A generous 64 GiB budget so a 7B repo certainly has a fitting quant.
     let rec = manager
-        .recommend(STABLE_REPO, Some("main"), ModelEngine::Llama, Some(64 << 30))
+        .recommend(
+            STABLE_REPO,
+            Some("main"),
+            ModelEngine::Llama,
+            Some(64 << 30),
+        )
         .await
         .expect("recommend");
     assert!(rec.file.is_some(), "a GGUF file should be recommended");

@@ -45,7 +45,9 @@ struct SafeTensors {
 /// trivially mockable in tests.
 pub async fn search(client: &HfClient, query: &SearchQuery) -> Result<SearchPage> {
     let limit = query.limit.max(1);
-    let effective = (limit as u64 * (query.page as u64 + 1)).min(1000).to_string();
+    let effective = (limit as u64 * (query.page as u64 + 1))
+        .min(1000)
+        .to_string();
     let mut params: Vec<(&str, String)> = vec![
         ("search", query.text.clone()),
         ("sort", query.sort.as_query().to_string()),

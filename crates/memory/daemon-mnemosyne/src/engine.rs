@@ -267,11 +267,20 @@ mod tests {
         assert!(!s1.recall("alpha", 5).unwrap().is_empty());
         assert!(!s2.recall("beta", 5).unwrap().is_empty());
         // ...but not the other session's.
-        assert!(s1.recall("beta", 5).unwrap().is_empty(), "s1 must not see s2's row");
-        assert!(s2.recall("alpha", 5).unwrap().is_empty(), "s2 must not see s1's row");
+        assert!(
+            s1.recall("beta", 5).unwrap().is_empty(),
+            "s1 must not see s2's row"
+        );
+        assert!(
+            s2.recall("alpha", 5).unwrap().is_empty(),
+            "s2 must not see s1's row"
+        );
         // The global row is visible to both.
         assert!(!s1.recall("gamma", 5).unwrap().is_empty());
-        assert!(!s2.recall("gamma", 5).unwrap().is_empty(), "global row visible across sessions");
+        assert!(
+            !s2.recall("gamma", 5).unwrap().is_empty(),
+            "global row visible across sessions"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

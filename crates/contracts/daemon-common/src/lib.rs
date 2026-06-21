@@ -259,7 +259,11 @@ pub struct WireVersion(pub u16);
 
 impl WireVersion {
     /// The version this build speaks.
-    pub const CURRENT: Self = Self(1);
+    ///
+    /// v2 (event-io edge): adds the merged session-event-log surface (`Origin`, `Disposition`,
+    /// `Direction`, `SessionLogEntry`), the `subscribe`/`log_after` api ops, and the
+    /// `TurnTrigger::Scheduled` arm.
+    pub const CURRENT: Self = Self(2);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

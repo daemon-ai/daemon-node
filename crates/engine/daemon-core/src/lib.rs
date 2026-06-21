@@ -49,7 +49,7 @@ pub use conversation::{
 };
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use engine::{Completion, Engine, Suspension, TurnOutcome};
-pub use events::EventSink;
+pub use events::{EventSink, SessionLog};
 pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
 pub use memory::{
     FileMemory, MemoryProvider, PromptBlock, RecallQuery, RecalledBlock, SwitchReason,

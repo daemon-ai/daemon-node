@@ -194,7 +194,10 @@ impl Downloader {
     /// Fold the live byte counters into the stored status.
     async fn read_status(&self, job: &Arc<Job>) -> DownloadStatus {
         let mut status = job.status.lock().await.clone();
-        if matches!(status.state, DownloadState::Downloading | DownloadState::Queued) {
+        if matches!(
+            status.state,
+            DownloadState::Downloading | DownloadState::Queued
+        ) {
             let base = job.counters.base.load(Ordering::Relaxed);
             let current = job.counters.current.load(Ordering::Relaxed);
             status.downloaded_bytes = base + current;
@@ -262,7 +265,9 @@ impl Progress for Sink {
         self.counters.current.store(0, Ordering::Relaxed);
     }
     async fn update(&mut self, size: usize) {
-        self.counters.current.fetch_add(size as u64, Ordering::Relaxed);
+        self.counters
+            .current
+            .fetch_add(size as u64, Ordering::Relaxed);
     }
     async fn finish(&mut self) {}
 }
@@ -329,7 +334,9 @@ async fn run_job(api: Api, _id: DownloadId, job: Arc<Job>) {
             }
         }
 
-        let actual = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(file.size);
+        let actual = std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(file.size);
         total_on_disk += actual;
         job.counters.base.fetch_add(actual, Ordering::Relaxed);
         job.counters.current.store(0, Ordering::Relaxed);

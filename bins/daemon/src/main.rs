@@ -26,8 +26,6 @@ use daemon_core::{
     FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider, ProviderRegistry,
     SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
 };
-use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
-use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
@@ -35,6 +33,8 @@ use daemon_host::{
     OwnerBroker,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
+use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
+use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
 use daemon_providers::{GenAiProvider, SwitchableLocalProvider, WorkerConfig};
 use daemon_provision::CutChannel;
@@ -320,7 +320,9 @@ impl MnemosyneBanks {
 /// Open an in-memory Mnemosyne provider for an ephemeral node.
 fn ephemeral_mnemosyne(cfg: MnemosyneConfig) -> daemon_mnemosyne::Result<MnemosyneProvider> {
     use daemon_mnemosyne::Engine;
-    Ok(MnemosyneProvider::new(Arc::new(Engine::open_in_memory(cfg)?)))
+    Ok(MnemosyneProvider::new(Arc::new(Engine::open_in_memory(
+        cfg,
+    )?)))
 }
 
 /// A §12 [`Tool`] adapter that dispatches a `mnemosyne_*` call to the calling session's bank,
@@ -346,10 +348,8 @@ impl Tool for MemoryProviderTool {
         let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
         let result = match self.banks.get_or_open(&cx.session_id) {
             Some(provider) => provider.call_tool(&self.def.name, args).await,
-            None => {
-                serde_json::json!({"status": "error", "error": "memory bank unavailable"})
-                    .to_string()
-            }
+            None => serde_json::json!({"status": "error", "error": "memory bank unavailable"})
+                .to_string(),
         };
         ToolOutcome::text(call.call_id.clone(), true, result)
     }
@@ -516,11 +516,32 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&cfg.socket_path);
     let listener = tokio::net::UnixListener::bind(&cfg.socket_path)?;
     tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket");
-    let server = tokio::spawn(serve_api_unix(listener, node));
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+
+    // Optionally bind the in-process HTTP/WS surface (the `daemon-http` adapter), toggled on by a
+    // configured bind address (like the MCP surface). It shares the same `Arc<dyn NodeApi>`, so it is
+    // just another transport over the one canonical interface — JSON dispatch plus SSE/WS streaming
+    // over the merged session event log.
+    let http_server = match &cfg.http_addr {
+        Some(addr) => {
+            let http_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(%addr, "serving daemon-api over http (json dispatch + sse/ws subscribe)");
+            let api: Arc<dyn daemon_api::NodeApi> = node;
+            Some(tokio::spawn(async move {
+                if let Err(e) = daemon_http::serve_http(http_listener, api).await {
+                    tracing::warn!(error = %e, "http surface ended");
+                }
+            }))
+        }
+        None => None,
+    };
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("ctrl_c received; shutting down");
     server.abort();
+    if let Some(http_server) = http_server {
+        http_server.abort();
+    }
     handle.shutdown().await;
     let _ = std::fs::remove_file(&cfg.socket_path);
     Ok(())

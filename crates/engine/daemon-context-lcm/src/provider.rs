@@ -59,14 +59,16 @@ impl LcmContextEngine {
     /// `state` is never shared across concurrent sessions. All instances still share `lcm.db`.
     pub fn open_for_session(config: LcmConfig, session: &SessionId) -> Result<Self> {
         let engine = Self::open(config)?;
-        engine.state.lock().expect("lcm state poisoned").session_id =
-            session.as_str().to_string();
+        engine.state.lock().expect("lcm state poisoned").session_id = session.as_str().to_string();
         Ok(engine)
     }
 
     /// The current compaction threshold (the model-derived budget), if known.
     fn threshold(&self) -> Option<usize> {
-        self.state.lock().expect("lcm state poisoned").threshold_tokens
+        self.state
+            .lock()
+            .expect("lcm state poisoned")
+            .threshold_tokens
     }
 
     fn now() -> f64 {
@@ -82,7 +84,10 @@ impl ContextEngine for LcmContextEngine {
     fn on_model(&self, model: &ModelInfo) {
         if let Some(max) = model.max_context {
             let threshold = (max as f64 * self.config.threshold_percent) as usize;
-            self.state.lock().expect("lcm state poisoned").threshold_tokens = Some(threshold);
+            self.state
+                .lock()
+                .expect("lcm state poisoned")
+                .threshold_tokens = Some(threshold);
         }
     }
 
@@ -181,8 +186,8 @@ mod tests {
         };
         let s1 = LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"))
             .expect("open s1");
-        let s2 =
-            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s2")).expect("open s2");
+        let s2 = LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s2"))
+            .expect("open s2");
 
         let c1 = convo(10);
         let c2 = convo(8);
@@ -193,11 +198,23 @@ mod tests {
 
         // Each session's summary node is attributed to *its* session id (and only one each), and a
         // fresh reader over the shared db sees both.
-        let reader =
-            LcmContextEngine::open_for_session(cfg, &SessionId::new("reader")).expect("open reader");
-        assert_eq!(reader.store.summary_count("s1").unwrap(), 1, "s1 attributed once");
-        assert_eq!(reader.store.summary_count("s2").unwrap(), 1, "s2 attributed once");
-        assert_eq!(reader.store.summary_count("reader").unwrap(), 0, "no cross-attribution");
+        let reader = LcmContextEngine::open_for_session(cfg, &SessionId::new("reader"))
+            .expect("open reader");
+        assert_eq!(
+            reader.store.summary_count("s1").unwrap(),
+            1,
+            "s1 attributed once"
+        );
+        assert_eq!(
+            reader.store.summary_count("s2").unwrap(),
+            1,
+            "s2 attributed once"
+        );
+        assert_eq!(
+            reader.store.summary_count("reader").unwrap(),
+            0,
+            "no cross-attribution"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,8 +14,8 @@ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 /// `Q4_K_M` before `Q4_K` before `Q4`).
 const QUANT_LABELS: &[&str] = &[
     "Q2_K_S", "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K", "Q4_K_S", "Q4_K_M", "Q4_K", "Q4_0",
-    "Q4_1", "Q5_K_S", "Q5_K_M", "Q5_K", "Q5_0", "Q5_1", "Q6_K", "Q8_0", "Q8_1", "Q8_K",
-    "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M",
+    "Q4_1", "Q5_K_S", "Q5_K_M", "Q5_K", "Q5_0", "Q5_1", "Q6_K", "Q8_0", "Q8_1", "Q8_K", "IQ1_S",
+    "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M",
     "IQ4_XS", "IQ4_NL", "BF16", "F16", "F32", "FP16",
 ];
 
@@ -47,7 +47,9 @@ pub struct ShardSpec {
 pub fn shard_spec(filename: &str) -> Option<ShardSpec> {
     let stem = filename.strip_suffix(".gguf").or_else(|| {
         let lower = filename.to_ascii_lowercase();
-        lower.ends_with(".gguf").then(|| &filename[..filename.len() - 5])
+        lower
+            .ends_with(".gguf")
+            .then(|| &filename[..filename.len() - 5])
     })?;
     // Find the "-of-" separator and read the 5-digit groups around it.
     let of = stem.rfind("-of-")?;

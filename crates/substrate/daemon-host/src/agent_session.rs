@@ -223,6 +223,8 @@ fn map_event(ev: AgentEvent, last_work: &Arc<Mutex<Option<WorkId>>>) -> Option<M
 
 fn map_trigger(trigger: TurnTrigger, last_work: &Arc<Mutex<Option<WorkId>>>) -> StartTrigger {
     match trigger {
+        // A user, steer, or scheduled trigger all open a fresh assigned turn from the supervisor's
+        // vantage; the scheduled case is just the schedule-owned work label.
         TurnTrigger::User | TurnTrigger::Steer => {
             let work = last_work
                 .lock()
@@ -231,6 +233,7 @@ fn map_trigger(trigger: TurnTrigger, last_work: &Arc<Mutex<Option<WorkId>>>) -> 
                 .unwrap_or_else(|| WorkId::new("assigned"));
             StartTrigger::Assigned(work)
         }
+        TurnTrigger::Scheduled { job } => StartTrigger::Assigned(WorkId::new(job.0)),
         TurnTrigger::BackgroundCompletion { source } => StartTrigger::BackgroundCompletion {
             source: match source {
                 P17CompletionSource::Delegation(job) => {
@@ -239,6 +242,16 @@ fn map_trigger(trigger: TurnTrigger, last_work: &Arc<Mutex<Option<WorkId>>>) -> 
                 P17CompletionSource::Process(job) => CompletionSource::Process(ProcId::new(job.0)),
             },
         },
+        // Forward-compat: `TurnTrigger` is `#[non_exhaustive]`; an unknown future trigger maps to a
+        // generic assigned turn rather than failing to compile.
+        _ => {
+            let work = last_work
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| WorkId::new("assigned"));
+            StartTrigger::Assigned(work)
+        }
     }
 }
 

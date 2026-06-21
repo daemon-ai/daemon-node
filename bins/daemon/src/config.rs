@@ -13,6 +13,9 @@ use std::time::Duration;
 const CONFIG_ENV: &str = "DAEMON_CONFIG";
 /// Overrides the api socket path.
 const API_SOCKET_ENV: &str = "DAEMON_API_SOCKET";
+/// Enables the optional in-process HTTP/WS surface (the `daemon-http` adapter) and sets its bind
+/// address (e.g. `127.0.0.1:8787`). Absent => the HTTP surface is off (toggle-on-launch, like MCP).
+const HTTP_ADDR_ENV: &str = "DAEMON_HTTP_ADDR";
 /// Selects the durable store backend: `memory` (default) or `sqlite`.
 const STORE_ENV: &str = "DAEMON_STORE";
 /// The SQLite database path (when the backend is `sqlite`).
@@ -208,6 +211,10 @@ pub struct NodeConfig {
     pub partition: PartitionId,
     /// The Unix socket the node serves its [`daemon_api`](daemon_api) surface on.
     pub socket_path: PathBuf,
+    /// The optional in-process HTTP/WS surface bind address (the `daemon-http` adapter). `None`
+    /// leaves it off; `Some(addr)` binds an axum server alongside the Unix socket (toggle-on-launch,
+    /// like the MCP surface), sharing the same `Arc<dyn NodeApi>`.
+    pub http_addr: Option<String>,
     /// The durable store backend.
     pub store: StoreBackend,
     /// The host data directory rooting the profile-scoped subsystem databases (§10/§11). The LCM and
@@ -256,6 +263,7 @@ pub struct NodeConfig {
 struct FileConfig {
     partition: Option<u64>,
     socket_path: Option<PathBuf>,
+    http_addr: Option<String>,
     store: Option<String>,
     store_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
@@ -415,6 +423,8 @@ impl NodeConfig {
             .or(file.socket_path)
             .unwrap_or_else(default_socket);
 
+        let http_addr = env_string(HTTP_ADDR_ENV).or(file.http_addr);
+
         let dispatch_interval = Duration::from_millis(file.dispatch_interval_ms.unwrap_or(2));
         let scan_interval = Duration::from_millis(file.scan_interval_ms.unwrap_or(10));
 
@@ -500,6 +510,7 @@ impl NodeConfig {
         Ok(Self {
             partition,
             socket_path,
+            http_addr,
             store,
             data_dir,
             dispatch_interval,

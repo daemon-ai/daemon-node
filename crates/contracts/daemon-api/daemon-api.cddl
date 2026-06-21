@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 1)
+wire_version = uint                 ; daemon-common WireVersion (current = 2)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -164,6 +164,46 @@ journal-page-view = {
   head_cursor: uint,
 }
 
+; ----- merged live session event log (wire v2: the bidirectional, seq-stamped edge) -----
+; One ordered log across BOTH directions: inbound (commands / responses / transport meta) and
+; outbound (events / raised host requests). `seq` is one monotonic counter across both directions and
+; doubles as the non-destructive subscribe cursor. `disposition` is the cache-safety lever: `Context`
+; enters the conversation/prompt; `Transport` is observability-only (never prompt, never journaled).
+transport-id = tstr                 ; adapter name: "telegram" / "http" / "mcp" / "engine" / ...
+
+origin-scope = { "Dm": { user: tstr } }
+             / { "Group": { chat: tstr, thread: (tstr / null) } }
+             / { "Api": { key: tstr } }
+             / "Internal"
+
+origin = {
+  transport: transport-id,
+  scope: origin-scope,
+}
+
+direction   = "Inbound" / "Outbound"
+disposition = "Context" / "Transport"
+
+session-payload = { "Event": agent-event }
+                / { "Request": host-request }
+                / { "Command": agent-command }
+                / { "Response": host-response }
+                / { "Meta": { kind: tstr, body: bstr } }
+
+session-log-entry = {
+  seq: uint,
+  direction: direction,
+  origin: origin,
+  disposition: disposition,
+  payload: session-payload,
+}
+
+log-page-view = {
+  entries: [* session-log-entry],
+  next_seq: uint,
+  head_seq: uint,
+}
+
 api-error = { "UnknownSession": tstr }
           / { "Unsupported": tstr }
           / { "Conflict": tstr }
@@ -297,6 +337,7 @@ api-request = { "Submit": { session: session-id, command: agent-command } }
             / { "UnitEvents": { unit: unit-id, max: uint } }
             / { "UnitOutbound": { unit: unit-id, max: uint } }   ; rich §17 drain -> Drained
             / { "SessionHistory": { session: session-id, after_cursor: uint, max: uint } }
+            / { "Subscribe": { session: session-id, after_seq: uint, max: uint } }  ; merged-log cursor read -> LogPage
             / { "UnitHistory": { unit: unit-id, after_cursor: uint, max: uint } }
             / { "Pause": { unit: unit-id } }
             / { "Resume": { unit: unit-id } }
@@ -328,6 +369,7 @@ api-response = "Ok"
              / { "Unit": (unit-node / null) }
              / { "UnitEvents": [* manage-event-view] }
              / { "Journal": journal-page-view }
+             / { "LogPage": log-page-view }
              / { "VerifyingKey": (tstr / null) }
              / { "ModelSearch": search-page }
              / { "ModelFiles": [* model-file] }

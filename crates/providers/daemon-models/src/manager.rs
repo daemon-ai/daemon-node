@@ -412,9 +412,7 @@ fn display_name(model: &ModelRef) -> String {
 /// The quantization label for a model reference (from a named GGUF file).
 fn model_quant(model: &ModelRef) -> Option<String> {
     match &model.source {
-        ModelSource::Hf {
-            file: Some(f), ..
-        } => gguf::quant_label(f),
+        ModelSource::Hf { file: Some(f), .. } => gguf::quant_label(f),
         ModelSource::Local { path } => path
             .file_name()
             .and_then(|n| gguf::quant_label(&n.to_string_lossy())),

@@ -139,7 +139,8 @@ enum Command {
 
 /// Parse an engine selector, defaulting to llama.
 fn parse_engine(s: &str) -> anyhow::Result<ModelEngine> {
-    ModelEngine::parse(s).ok_or_else(|| anyhow::anyhow!("unknown engine {s:?} (expected llama|mistralrs)"))
+    ModelEngine::parse(s)
+        .ok_or_else(|| anyhow::anyhow!("unknown engine {s:?} (expected llama|mistralrs)"))
 }
 
 #[derive(Subcommand)]
@@ -416,7 +417,10 @@ async fn quickstart_up(
         },
     );
     if matches!(engine, ModelEngine::Llama) && rec.file.is_none() {
-        anyhow::bail!("no downloadable GGUF recommended for {repo}: {}", rec.reason);
+        anyhow::bail!(
+            "no downloadable GGUF recommended for {repo}: {}",
+            rec.reason
+        );
     }
     let job = match client
         .call(ApiRequest::ModelDownload {
@@ -459,7 +463,10 @@ async fn quickstart_up(
                 } else {
                     0
                 };
-                println!("  … {pct}% ({}/{} bytes)", status.downloaded_bytes, status.total_bytes);
+                println!(
+                    "  … {pct}% ({}/{} bytes)",
+                    status.downloaded_bytes, status.total_bytes
+                );
             }
         }
     }
@@ -695,6 +702,20 @@ fn render(resp: ApiResponse) {
                 }
             }
         }
+        ApiResponse::LogPage(page) => {
+            println!(
+                "log: {} entr(ies) next_seq={} head_seq={}",
+                page.entries.len(),
+                page.next_seq,
+                page.head_seq
+            );
+            for e in page.entries {
+                println!(
+                    "  - seq={} {:?} {} {:?}",
+                    e.seq, e.direction, e.origin.transport.0, e.payload
+                );
+            }
+        }
         ApiResponse::VerifyingKey(key) => match key {
             Some(hex) => println!("verifying_key: {hex}"),
             None => println!("verifying_key: none (node exposes no journal signer)"),
@@ -723,10 +744,7 @@ fn render(resp: ApiResponse) {
             for f in files {
                 let quant = f.quant.map(|q| format!(" quant={q}")).unwrap_or_default();
                 let split = if f.is_split { " split" } else { "" };
-                println!(
-                    "  - {} ({} bytes){}{}",
-                    f.path, f.size_bytes, quant, split
-                );
+                println!("  - {} ({} bytes){}{}", f.path, f.size_bytes, quant, split);
             }
         }
         ApiResponse::ModelDownloadStarted(id) => println!("download started: {id}"),
@@ -791,10 +809,7 @@ fn render(resp: ApiResponse) {
                     .map(|s| format!("{s} bytes"))
                     .unwrap_or_else(|| "?".into());
                 let file = c.file.map(|f| format!(" {f}")).unwrap_or_default();
-                println!(
-                    "    - {} ({}) fits={}{}",
-                    c.quant, size, c.fits, file
-                );
+                println!("    - {} ({}) fits={}{}", c.quant, size, c.fits, file);
             }
         }
         ApiResponse::ModelQuantizeStarted(id) => println!("quantize started: {id}"),
@@ -814,20 +829,29 @@ fn render(resp: ApiResponse) {
         }
         ApiResponse::ModelInspect(info) => {
             println!("inspect:");
-            println!("  architecture: {}", info.architecture.as_deref().unwrap_or("-"));
+            println!(
+                "  architecture: {}",
+                info.architecture.as_deref().unwrap_or("-")
+            );
             println!("  name: {}", info.name.as_deref().unwrap_or("-"));
             println!("  file_type: {}", info.file_type.as_deref().unwrap_or("-"));
             println!(
                 "  context_length: {}",
-                info.context_length.map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+                info.context_length
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into())
             );
             println!(
                 "  block_count: {}",
-                info.block_count.map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+                info.block_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into())
             );
             println!(
                 "  parameters: {}",
-                info.parameter_count.map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+                info.parameter_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into())
             );
             println!("  size_bytes: {}", info.size_bytes);
         }

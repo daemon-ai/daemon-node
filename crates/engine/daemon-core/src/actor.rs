@@ -14,78 +14,214 @@
 
 use crate::control::{SteerReq, TurnControl};
 use crate::engine::{Engine, TurnOutcome};
-use crate::events::EventSink;
+use crate::events::SessionLog;
 use crate::Failure;
 use daemon_common::ReqId;
-use daemon_protocol::{AgentEvent, EndReason, HostRequestHandler, TurnSummary, UserMsg};
+use daemon_protocol::{
+    AgentCommand, AgentEvent, Disposition, EndReason, HostRequestHandler, Origin, OriginScope,
+    SessionLogEntry, SessionPayload, TransportId, TurnSummary, UserMsg,
+};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-/// Internal actor mailbox messages (the §17 commands plus their reply channels).
+/// The origin stamped on inbound commands submitted through the untagged convenience methods
+/// ([`AgentHandle::start_turn`] etc.). Surface-aware callers use the `*_from` variants to attribute
+/// the inbound item to the real transport.
+fn local_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("local"),
+        scope: OriginScope::Internal,
+    }
+}
+
+/// Internal actor mailbox messages (the §17 commands plus their reply channels). Each carries the
+/// [`Origin`] of the inbound submission so the actor can record it on the merged session log.
 enum ActorMsg {
     StartTurn {
         input: UserMsg,
+        request_id: ReqId,
+        origin: Origin,
         reply: oneshot::Sender<Result<TurnSummary, Failure>>,
     },
     Steer {
         request_id: ReqId,
         text: String,
+        origin: Origin,
     },
     Snapshot {
         request_id: ReqId,
+        origin: Origin,
     },
     Interrupt {
         #[allow(dead_code)]
         reason: Option<String>,
+        origin: Origin,
     },
-    Shutdown,
+    Shutdown {
+        origin: Origin,
+    },
 }
 
-/// A handle to a running engine session: send §17 commands, subscribe to the §17 event stream.
+impl ActorMsg {
+    fn origin(&self) -> &Origin {
+        match self {
+            ActorMsg::StartTurn { origin, .. }
+            | ActorMsg::Steer { origin, .. }
+            | ActorMsg::Snapshot { origin, .. }
+            | ActorMsg::Interrupt { origin, .. }
+            | ActorMsg::Shutdown { origin } => origin,
+        }
+    }
+
+    /// The merged-log payload + disposition for this inbound command. `StartTurn`/`Steer` enter the
+    /// conversation (`Context`); the read-only/control commands are observability-only (`Transport`).
+    fn as_inbound(&self) -> (SessionPayload, Disposition) {
+        match self {
+            ActorMsg::StartTurn {
+                input, request_id, ..
+            } => (
+                SessionPayload::Command(AgentCommand::StartTurn {
+                    input: input.clone(),
+                    request_id: *request_id,
+                }),
+                Disposition::Context,
+            ),
+            ActorMsg::Steer {
+                request_id, text, ..
+            } => (
+                SessionPayload::Command(AgentCommand::Steer {
+                    text: text.clone(),
+                    request_id: *request_id,
+                }),
+                Disposition::Context,
+            ),
+            ActorMsg::Snapshot { request_id, .. } => (
+                SessionPayload::Command(AgentCommand::Snapshot {
+                    request_id: *request_id,
+                }),
+                Disposition::Transport,
+            ),
+            ActorMsg::Interrupt { reason, .. } => (
+                SessionPayload::Command(AgentCommand::Interrupt {
+                    reason: reason.clone(),
+                }),
+                Disposition::Transport,
+            ),
+            ActorMsg::Shutdown { .. } => (
+                SessionPayload::Command(AgentCommand::Shutdown),
+                Disposition::Transport,
+            ),
+        }
+    }
+}
+
+/// Record an inbound command on the merged session log under the next `seq`.
+fn record_inbound(sink: &SessionLog, msg: &ActorMsg) {
+    let (payload, disposition) = msg.as_inbound();
+    sink.record_inbound(msg.origin().clone(), disposition, payload);
+}
+
+/// A handle to a running engine session: send §17 commands, subscribe to the §17 event stream or to
+/// the merged bidirectional session log.
 #[derive(Clone)]
 pub struct AgentHandle {
     tx: mpsc::Sender<ActorMsg>,
     events: broadcast::Sender<AgentEvent>,
+    log: broadcast::Sender<SessionLogEntry>,
+    req_seq: Arc<AtomicU64>,
 }
 
 impl AgentHandle {
-    /// Begin a turn from a user input, awaiting the terminal [`TurnSummary`].
-    pub async fn start_turn(&self, input: UserMsg) -> Result<TurnSummary, Failure> {
+    fn next_req(&self) -> ReqId {
+        ReqId(self.req_seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Begin a turn from a user input attributed to `origin`, awaiting the terminal [`TurnSummary`].
+    pub async fn start_turn_from(
+        &self,
+        origin: Origin,
+        input: UserMsg,
+    ) -> Result<TurnSummary, Failure> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(ActorMsg::StartTurn { input, reply })
+            .send(ActorMsg::StartTurn {
+                input,
+                request_id: self.next_req(),
+                origin,
+                reply,
+            })
             .await
             .map_err(|_| Failure::Other("engine actor is gone".into()))?;
         rx.await
             .map_err(|_| Failure::Other("engine actor dropped the reply".into()))?
     }
 
+    /// Begin a turn from a user input (untagged local origin), awaiting the terminal [`TurnSummary`].
+    pub async fn start_turn(&self, input: UserMsg) -> Result<TurnSummary, Failure> {
+        self.start_turn_from(local_origin(), input).await
+    }
+
     /// Interrupt the in-flight turn (cooperative cancellation, honored at the next phase boundary).
     pub async fn interrupt(&self, reason: Option<String>) {
-        let _ = self.tx.send(ActorMsg::Interrupt { reason }).await;
+        let _ = self
+            .tx
+            .send(ActorMsg::Interrupt {
+                reason,
+                origin: local_origin(),
+            })
+            .await;
+    }
+
+    /// Inject steering text attributed to `origin`.
+    pub async fn steer_from(&self, origin: Origin, request_id: ReqId, text: String) {
+        let _ = self
+            .tx
+            .send(ActorMsg::Steer {
+                request_id,
+                text,
+                origin,
+            })
+            .await;
     }
 
     /// Inject steering text. While a turn is running it is drained at the next phase boundary; when
     /// idle it opens a fresh steer turn. The ack rides the event stream as [`AgentEvent::Steered`].
     pub async fn steer(&self, request_id: ReqId, text: String) {
-        let _ = self.tx.send(ActorMsg::Steer { request_id, text }).await;
+        self.steer_from(local_origin(), request_id, text).await;
     }
 
     /// Request a read-only snapshot. The reply rides the event stream as [`AgentEvent::Snapshot`]
     /// (served immediately when idle, or at the next phase boundary during a turn).
     pub async fn snapshot(&self, request_id: ReqId) {
-        let _ = self.tx.send(ActorMsg::Snapshot { request_id }).await;
+        let _ = self
+            .tx
+            .send(ActorMsg::Snapshot {
+                request_id,
+                origin: local_origin(),
+            })
+            .await;
     }
 
     /// Drain and shut the engine actor down.
     pub async fn shutdown(&self) {
-        let _ = self.tx.send(ActorMsg::Shutdown).await;
+        let _ = self
+            .tx
+            .send(ActorMsg::Shutdown {
+                origin: local_origin(),
+            })
+            .await;
     }
 
-    /// Subscribe to the lossless-primary §17 event stream.
+    /// Subscribe to the lossless-primary §17 outbound event stream.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
+    }
+
+    /// Subscribe to the merged, bidirectional session event log (inbound + outbound, `seq`-stamped).
+    pub fn subscribe_log(&self) -> broadcast::Receiver<SessionLogEntry> {
+        self.log.subscribe()
     }
 }
 
@@ -103,13 +239,25 @@ fn outcome_summary(outcome: Result<TurnOutcome, Failure>) -> Result<TurnSummary,
 pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>) -> AgentHandle {
     let (tx, mut rx) = mpsc::channel::<ActorMsg>(32);
     let (events_tx, _events_rx) = broadcast::channel::<AgentEvent>(256);
+    let (log_tx, _log_rx) = broadcast::channel::<SessionLogEntry>(256);
     let actor_events = events_tx.clone();
+    let actor_log = log_tx.clone();
 
     tokio::spawn(async move {
         let control = TurnControl::new();
-        let sink = EventSink::new(move |ev| {
-            let _ = actor_events.send(ev);
-        });
+        let self_origin = Origin {
+            transport: TransportId::new("engine"),
+            scope: OriginScope::Internal,
+        };
+        let sink = SessionLog::with_log(
+            self_origin,
+            move |ev| {
+                let _ = actor_events.send(ev);
+            },
+            move |entry| {
+                let _ = actor_log.send(entry);
+            },
+        );
         let mut pending_starts: VecDeque<(UserMsg, oneshot::Sender<Result<TurnSummary, Failure>>)> =
             VecDeque::new();
         let mut shutting_down = false;
@@ -150,17 +298,21 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                     Some(msg) => msg,
                     None => break,
                 };
+                // Record the inbound command on the merged log before acting on it.
+                record_inbound(&sink, &msg);
                 match msg {
-                    ActorMsg::StartTurn { input, reply } => {
+                    ActorMsg::StartTurn { input, reply, .. } => {
                         pending_starts.push_back((input, reply));
                     }
-                    ActorMsg::Steer { request_id, text } => {
+                    ActorMsg::Steer {
+                        request_id, text, ..
+                    } => {
                         control.push_steer(SteerReq { request_id, text });
                     }
-                    ActorMsg::Snapshot { request_id } => control.push_snapshot(request_id),
+                    ActorMsg::Snapshot { request_id, .. } => control.push_snapshot(request_id),
                     // Idle: there is no in-flight turn to interrupt.
                     ActorMsg::Interrupt { .. } => {}
-                    ActorMsg::Shutdown => break,
+                    ActorMsg::Shutdown { .. } => break,
                 }
                 continue;
             }
@@ -172,17 +324,27 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                     tokio::select! {
                         outcome = &mut turn => break outcome_summary(outcome),
                         msg = rx.recv() => match msg {
-                            Some(ActorMsg::Interrupt { .. }) => control.cancel(),
-                            Some(ActorMsg::Steer { request_id, text }) => {
-                                control.push_steer(SteerReq { request_id, text });
+                            Some(msg) => {
+                                // Record the inbound command on the merged log before acting on it.
+                                record_inbound(&sink, &msg);
+                                match msg {
+                                    ActorMsg::Interrupt { .. } => control.cancel(),
+                                    ActorMsg::Steer { request_id, text, .. } => {
+                                        control.push_steer(SteerReq { request_id, text });
+                                    }
+                                    ActorMsg::Snapshot { request_id, .. } => {
+                                        control.push_snapshot(request_id);
+                                    }
+                                    ActorMsg::StartTurn { input, reply, .. } => {
+                                        pending_starts.push_back((input, reply));
+                                    }
+                                    ActorMsg::Shutdown { .. } => {
+                                        control.cancel();
+                                        shutting_down = true;
+                                    }
+                                }
                             }
-                            Some(ActorMsg::Snapshot { request_id }) => {
-                                control.push_snapshot(request_id);
-                            }
-                            Some(ActorMsg::StartTurn { input, reply }) => {
-                                pending_starts.push_back((input, reply));
-                            }
-                            Some(ActorMsg::Shutdown) | None => {
+                            None => {
                                 control.cancel();
                                 shutting_down = true;
                             }
@@ -202,6 +364,8 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
     AgentHandle {
         tx,
         events: events_tx,
+        log: log_tx,
+        req_seq: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -298,6 +462,62 @@ mod tests {
             matches!(e, AgentEvent::TurnStarted { trigger, .. } if *trigger == TurnTrigger::Steer)
         })
         .await;
+        handle.shutdown().await;
+    }
+
+    /// The merged session log records the inbound command (with its origin) and the outbound events
+    /// under one monotonic `seq`, so a second surface can observe what was submitted — not just the
+    /// engine's replies. This is the core asymmetry-closing guarantee of the event-io edge.
+    #[tokio::test]
+    async fn merged_log_records_inbound_and_outbound() {
+        use daemon_protocol::{Direction, SessionPayload};
+
+        let handle = spawn_agent_session(completing_engine("merged"), Arc::new(NoopHost));
+        let mut log = handle.subscribe_log();
+
+        let origin = Origin::new(
+            "telegram",
+            daemon_protocol::OriginScope::Dm { user: "u1".into() },
+        );
+        let driver = handle.clone();
+        let origin_for_turn = origin.clone();
+        tokio::spawn(async move {
+            let _ = driver
+                .start_turn_from(origin_for_turn, UserMsg::new("hi"))
+                .await;
+        });
+
+        // The first inbound entry is the user's StartTurn, attributed to the telegram origin.
+        let inbound = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entry = log.recv().await.expect("log closed");
+                if entry.direction == Direction::Inbound {
+                    return entry;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for inbound entry");
+        assert_eq!(inbound.origin, origin);
+        assert!(matches!(
+            inbound.payload,
+            SessionPayload::Command(AgentCommand::StartTurn { .. })
+        ));
+
+        // An outbound entry follows on the same log, with a strictly greater seq.
+        let outbound = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entry = log.recv().await.expect("log closed");
+                if entry.direction == Direction::Outbound {
+                    return entry;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for outbound entry");
+        assert!(outbound.seq > inbound.seq);
+        assert!(matches!(outbound.payload, SessionPayload::Event(_)));
+
         handle.shutdown().await;
     }
 

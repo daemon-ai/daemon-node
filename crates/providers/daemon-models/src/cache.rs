@@ -103,8 +103,6 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, v)| k == "HF_HUB_CACHE" && v == "/tmp/some-cache"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1"));
+        assert!(env.iter().any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1"));
     }
 }

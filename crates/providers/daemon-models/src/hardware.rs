@@ -48,10 +48,7 @@ fn detect_ram_bytes() -> u64 {
 /// load targets one device, so we budget against the biggest GPU rather than the sum.
 fn detect_vram_bytes() -> Option<u64> {
     let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total",
-            "--format=csv,noheader,nobytes",
-        ])
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nobytes"])
         .output()
         .ok()?;
     if !output.status.success() {

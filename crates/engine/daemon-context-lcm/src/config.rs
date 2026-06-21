@@ -54,7 +54,11 @@ impl LcmConfig {
         if self.data_dir.as_os_str().is_empty() {
             return None;
         }
-        let name = if self.bank.is_empty() { "default" } else { &self.bank };
+        let name = if self.bank.is_empty() {
+            "default"
+        } else {
+            &self.bank
+        };
         Some(self.data_dir.join(format!("{name}.db")))
     }
 }

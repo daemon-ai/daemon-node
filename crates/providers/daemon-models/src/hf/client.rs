@@ -97,7 +97,10 @@ impl HfClient {
             .await
             .map_err(|e| ModelError::Http(e.to_string()))?;
         let decoded = serde_json::from_str::<T>(&body).map_err(|e| {
-            ModelError::Decode(format!("{e} (body: {})", body.chars().take(200).collect::<String>()))
+            ModelError::Decode(format!(
+                "{e} (body: {})",
+                body.chars().take(200).collect::<String>()
+            ))
         })?;
         Ok(Paged {
             body: decoded,

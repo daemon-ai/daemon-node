@@ -78,9 +78,10 @@ pub(crate) fn from_hf(err: hf_hub::api::tokio::ApiError) -> ModelError {
             ModelError::Http(e.to_string())
         }
         E::IoError(e) => ModelError::Download(format!("io: {e}")),
-        E::LockAcquisition(p) => {
-            ModelError::Download(format!("another download holds the lock on {}", p.display()))
-        }
+        E::LockAcquisition(p) => ModelError::Download(format!(
+            "another download holds the lock on {}",
+            p.display()
+        )),
         other => ModelError::Download(other.to_string()),
     }
 }
