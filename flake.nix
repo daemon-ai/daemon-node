@@ -10,6 +10,14 @@
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Pinned to the exact llama.cpp commit vendored by `llama-cpp-sys-4` 0.3.2 (commit `94a220cd6`,
+    # tag `b9496`, per that crate's README), so a from-source build here is ABI-compatible with the
+    # crate's bindgen output. Bump in lockstep whenever the `llama-cpp-4` dependency is upgraded.
+    llama-cpp-src = {
+      url = "github:ggml-org/llama.cpp/94a220cd6745e6e3f8de62870b66fd5b9bc92700";
+      flake = false;
+    };
   };
 
   outputs =
@@ -19,6 +27,7 @@
       flake-utils,
       crane,
       fenix,
+      llama-cpp-src,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -37,6 +46,34 @@
           pkgs.pkg-config
         ];
         libclangPath = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+        # A from-source, CPU, shared-lib build of the exact llama.cpp commit that `llama-cpp-sys-4`
+        # 0.3.2 vendors. cmake runs in the Nix build sandbox (which has `/bin/sh`), so this sidesteps
+        # the missing-`/bin/sh` trap. Pointing `LLAMA_PREBUILT_DIR` at it lets a plain `cargo build
+        # --features llama,dynamic-link` skip cmake entirely in the dev shell (only the `cc`-built
+        # `mtp_shim` compiles locally). `GGML_NATIVE=OFF` keeps the store path portable/reproducible.
+        llamaCpp = pkgs.stdenv.mkDerivation {
+          pname = "llama-cpp-prebuilt";
+          version = "b9496";
+          src = llama-cpp-src;
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config ];
+          # Build only the ggml + libllama shared libraries; everything else (tools, the unified
+          # `app` binary, server, examples, tests, common, web UI) is dropped — we only consume the
+          # `.so`s, and those extra targets pull in deps that fail to link in this trimmed build.
+          cmakeFlags = [
+            "-DBUILD_SHARED_LIBS=ON"
+            "-DGGML_NATIVE=OFF"
+            "-DLLAMA_CURL=OFF"
+            "-DLLAMA_BUILD_TESTS=OFF"
+            "-DLLAMA_BUILD_EXAMPLES=OFF"
+            "-DLLAMA_BUILD_SERVER=OFF"
+            "-DLLAMA_BUILD_TOOLS=OFF"
+            "-DLLAMA_BUILD_APP=OFF"
+            "-DLLAMA_BUILD_COMMON=OFF"
+            "-DLLAMA_BUILD_HTML=OFF"
+            "-DLLAMA_BUILD_UI=OFF"
+          ];
+        };
 
         rustToolchain = fenix.packages.${system}.stable.withComponents [
           "cargo"
@@ -104,6 +141,9 @@
             daemon-infer-llama
             daemon-infer-mistralrs
             ;
+          # Prebuilt llama.cpp (shared, CPU) matching the crate's vendored commit; consumed by the dev
+          # shell via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
+          llama-cpp = llamaCpp;
           default = daemon;
         };
 
@@ -129,14 +169,21 @@
 
         devShells = {
           default = craneLib.devShell {
-            # Worker engine toolchain (cmake/clang/libclang) is present so a dev can build an engine
-            # lane locally (`cargo build -p daemon-infer --features llama`). The default
-            # `cargo test --workspace` still builds only the stub worker — no engine, no cmake step.
+            # Worker engine toolchain (clang/libclang for bindgen, cmake for the GPU lanes) is present
+            # so a dev can build an engine lane locally. The default `cargo test --workspace` still
+            # builds only the stub worker — no engine, no cmake step.
             #
-            # Build-matrix shrinking: llama-cpp-4 exposes a `prebuilt` feature that links a pre-built
-            # llama.cpp from $LLAMA_PREBUILT_DIR instead of compiling it here — point that at a cached
-            # build to drop the per-lane cmake compile in CI.
+            # llama lane in the dev shell: this host has no `/bin/sh`, so compiling llama.cpp from
+            # source (cmake -> make/ninja, both of which exec `/bin/sh`) fails here. Instead we point
+            # `LLAMA_PREBUILT_DIR` at the pinned `packages.llama-cpp` (built from source in the Nix
+            # sandbox), so `cargo build -p daemon-infer --features llama,dynamic-link` links that
+            # prebuilt and skips cmake entirely (only the `cc`-built `mtp_shim` compiles locally).
+            # `LD_LIBRARY_PATH` makes the shared llama/ggml libs + libgomp resolvable when the worker
+            # runs in-shell (e.g. `cargo test`, `cargo run`).
             LIBCLANG_PATH = libclangPath;
+            LLAMA_PREBUILT_DIR = "${llamaCpp}";
+            LLAMA_PREBUILT_SHARED = "1";
+            LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.gcc.cc.lib}/lib";
             packages =
               [
                 rustToolchain

@@ -564,9 +564,10 @@ The GUI becomes a thin NodeApi client; it does **not** talk to Hugging Face dire
 > covered by unit + `wiremock` tests (`daemon-models`, incl. recommender fit logic, ftype mapping, and
 > hardware budget) plus ignored live-network integration tests (`tests/network.rs`, incl. live
 > recommend + a `DAEMON_INFER_WORKER_BIN`-gated live quantize). Both the `mistralrs` and `llama` engine
-> lanes build via `nix build .#daemon-infer-{mistralrs,llama}` (the Nix sandbox supplies the `/bin/sh`
-> that a raw dev-shell `cargo --features llama` lacks — see §8a build note), and `live_quantize_small_gguf`
-> was verified end-to-end against the llama worker. Headless end-to-end verification is available via
+> lanes build two ways: from-source static via `nix build .#daemon-infer-{mistralrs,llama}` (the Nix
+> sandbox supplies `/bin/sh`), and — for the llama lane — in a plain `nix develop` via the pinned
+> `packages.llama-cpp` prebuilt (`cargo build --features llama,dynamic-link`, see §8a build note). The
+> end-to-end `live_quantize_small_gguf` was verified against the dev-shell llama worker. Headless end-to-end verification is available via
 > `daemon-cli model
 > search|files|pull|downloads|ls|rm|activate|recommend|quantize|quantizes|inspect|up`.
 
@@ -635,35 +636,46 @@ wraps the real quantizer, so we never reimplement kernels:
   `SwitchableLocalProvider` feeds a recommended `isq` into the active mistralrs worker config when one
   is not set explicitly.
 
-> Build note: the `llama` engine lane (and therefore the `quantize` backend) is cmake-based. A raw
-> dev-shell `cargo build -p daemon-infer --features llama` fails on hosts without `/bin/sh` (e.g.
-> NixOS) because llama-cpp-sys → cmake → GNU make hardcodes `/bin/sh`. The supported way to compile
-> and verify it is the Nix sandbox build the flake already defines, which supplies `/bin/sh` + a full
-> stdenv:
+> Build note: the `llama` engine lane (and therefore the `quantize` backend) is cmake-based, and on
+> hosts without `/bin/sh` (e.g. NixOS with `environment.binsh` off) a from-source compile fails because
+> `llama-cpp-sys-4` → cmake → GNU make/ninja exec a hardcoded `/bin/sh`. Two supported build paths:
+>
+> 1. **Plain dev shell (fast iteration).** The flake builds a pinned, shared-library llama.cpp from
+>    source *in the Nix sandbox* (`packages.llama-cpp`, pin = `llama-cpp-sys-4 0.3.2`'s exact vendored
+>    commit `94a220cd6` / tag `b9496`), and the default `craneLib.devShell` exports `LLAMA_PREBUILT_DIR`
+>    + `LLAMA_PREBUILT_SHARED=1` + an `LD_LIBRARY_PATH` covering the llama/ggml `.so`s and `libgomp`.
+>    `llama-cpp-sys-4`'s build.rs then takes its prebuilt branch — it **skips cmake entirely** and only
+>    `cc`-compiles `mtp_shim.cpp` — so the previously failing command now works with no `/bin/sh`:
+>
+>    ```bash
+>    nix develop -c cargo build -p daemon-infer --features llama,dynamic-link   # links packages.llama-cpp
+>    ```
+>
+>    The `dynamic-link` feature (`daemon-infer` → `llama-cpp-4/dynamic-link`) selects `dylib` linking
+>    against the prebuilt; the shared libs resolve at runtime via the shell's `LD_LIBRARY_PATH`. The pin
+>    must be bumped **in lockstep** with any `llama-cpp-4`/`llama-cpp-sys-4` upgrade — a mismatch surfaces
+>    as undefined/version-skewed llama/ggml symbols at link or load (see `flake.nix` `llama-cpp-src`).
+>
+> 2. **Sandbox build (distribution / from-source static).** The flake's crane derivation compiles
+>    llama.cpp statically inside the sandbox (which supplies `/bin/sh` + a full stdenv):
+>
+>    ```bash
+>    nix build .#daemon-infer-llama            # -> result/bin/daemon-infer (llama-enabled worker)
+>    ```
+>
+> Both paths compile the `#[cfg(feature = "llama")]` quantize code (`backends/quantize.rs` + the
+> `quantize` subcommand) against the real `llama_cpp_4::quantize` API. The end-to-end
+> `live_quantize_small_gguf` test passes against either worker (download `tinyllamas/stories15M.gguf`
+> → quantize to `Q4_K_M` → GGUF-magic verify → catalog), e.g. in the plain dev shell:
 >
 > ```bash
-> nix build .#daemon-infer-llama            # -> result/bin/daemon-infer (llama-enabled worker)
+> nix develop -c bash -c '
+>   export DAEMON_INFER_WORKER_BIN="$CARGO_TARGET_DIR/debug/daemon-infer"   # built with --features llama,dynamic-link
+>   cargo test -p daemon-models --test network -- --ignored live_quantize_small_gguf'
 > ```
 >
-> This was run and the `#[cfg(feature = "llama")]` quantize code (`backends/quantize.rs` + the
-> `quantize` subcommand) compiles against the real `llama_cpp_4::quantize` API. The end-to-end
-> `live_quantize_small_gguf` test then passed against that worker (download `tinyllamas/stories15M.gguf`
-> → quantize to `Q4_K_M` → GGUF-magic verify → catalog), e.g.:
->
-> ```bash
-> DAEMON_INFER_WORKER_BIN="$(readlink -f result)/bin/daemon-infer" \
->   LD_LIBRARY_PATH="$(nix eval --raw nixpkgs#gcc.cc.lib)/lib" \
->   nix develop -c cargo test -p daemon-models --test network -- --ignored live_quantize_small_gguf
-> ```
->
-> (`LD_LIBRARY_PATH` supplies `libgomp.so.1` to the spawned worker outside the Nix store.) The default
-> workspace lane still builds only the stub worker and exercises the non-llama error path.
->
-> Optional dev speedup: to skip the per-lane cmake compile, point `llama-cpp-4`'s prebuilt path at an
-> existing llama.cpp build via `LLAMA_PREBUILT_DIR` (searches root/`lib`/`lib64`/`bin`) — e.g.
-> `nix build nixpkgs#llama-cpp` or a local `~/experiments/*/build/bin` — with `--features llama,dynamic-link`.
-> This is ABI/version-sensitive: the prebuilt libs must match `llama-cpp-sys-4 0.3.2`'s vendored
-> headers, so the version-consistent `nix build .#daemon-infer-llama` above is the reference path.
+> The default workspace lane still builds only the stub worker (no engine, no cmake step) and exercises
+> the non-llama error path.
 
 ---
 

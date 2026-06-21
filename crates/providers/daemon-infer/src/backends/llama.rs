@@ -127,7 +127,7 @@ impl InferenceBackend for LlamaCppBackend {
 fn worker_thread(
     model_path: String,
     params: ModelParams,
-    jobs_rx: std_mpsc::Receiver<Job>,
+    jobs_rx: std_mpsc::Receiver<Task>,
     ready_tx: std_mpsc::Sender<Result<Capabilities, BackendError>>,
 ) {
     let backend = match LlamaBackend::init() {

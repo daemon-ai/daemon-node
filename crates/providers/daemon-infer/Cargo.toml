@@ -17,6 +17,9 @@ path = "src/bin/daemon-infer.rs"
 default = []
 # Engine selectors (the worker compiles a backend in when one of these is on).
 llama = ["dep:llama-cpp-4", "dep:encoding_rs"]
+# Link a prebuilt *shared* llama.cpp (via `LLAMA_PREBUILT_DIR`) instead of static-compiling it from
+# source. Used in the Nix dev shell to skip cmake on hosts without `/bin/sh`.
+dynamic-link = ["llama-cpp-4/dynamic-link"]
 # llama.cpp hardware backends (each implies `llama` and forwards to the llama-cpp-4 feature). ROCm
 # is `hip` (llama-cpp-4 naming).
 cuda = ["llama", "llama-cpp-4/cuda"]

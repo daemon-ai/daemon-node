@@ -232,19 +232,25 @@ back to `llama-cpp-2` if/when changes merge upstream.
 for bindgen), plus optional `.#vulkan` / `.#cuda` shells. The default `cargo test --workspace` never
 enables an engine feature, so it never invokes cmake.
 
-**Compile-verifying an engine lane** — build it through crane, not raw `cargo`. The flake exposes
-`packages.daemon-infer-llama` and `packages.daemon-infer-mistralrs` (`craneLib.buildPackage` with
-`--features {llama,mistralrs}` + the engine `nativeBuildInputs`); `nix build .#daemon-infer-llama`
-compiles llama.cpp from source and type-checks the backend glue against the real engine APIs. This is
-the *only* way that works on NixOS: the `cmake` crate runs GNU `make`, which hardcodes `/bin/sh` — a
-path NixOS does not provide — so a raw `cargo build --features llama` in the dev shell fails the
-cmake C-compiler probe, whereas the nix build sandbox supplies `/bin/sh` and a full stdenv. (Note: a
-flake build only sees git-tracked files, so newly added sources must be `git add`-ed before
-`nix build` can compile them.)
+**Compile-verifying an engine lane.** On NixOS a *from-source* engine compile can't run in a raw
+`cargo build` from the dev shell: the `cmake` crate drives GNU `make`/ninja, which exec a hardcoded
+`/bin/sh` that NixOS does not provide, so the cmake C-compiler probe fails. Two working paths:
 
-**Build-matrix shrinking:** `llama-cpp-4`'s `prebuilt` feature links a pre-built llama.cpp from
-`$LLAMA_PREBUILT_DIR` instead of compiling it per-lane — point it at a cached build to drop the cmake
-step in CI.
+- **From-source static (distribution / CI gate):** `nix build .#daemon-infer-{llama,mistralrs}`
+  (`craneLib.buildPackage` with `--features {llama,mistralrs}` + engine `nativeBuildInputs`) compiles
+  the engine from source *inside the Nix sandbox* (which supplies `/bin/sh` + a full stdenv) and
+  type-checks the backend glue against the real engine APIs. (A flake build only sees git-tracked
+  files, so newly added sources must be `git add`-ed first.)
+- **Prebuilt dynamic (plain dev shell, llama lane):** the flake builds a pinned shared-lib llama.cpp
+  in the sandbox (`packages.llama-cpp`, pinned to `llama-cpp-sys-4 0.3.2`'s exact vendored commit
+  `94a220cd6` / tag `b9496`) and the default dev shell exports `LLAMA_PREBUILT_DIR` +
+  `LLAMA_PREBUILT_SHARED=1` + an `LD_LIBRARY_PATH` for the llama/ggml `.so`s and `libgomp`. With those,
+  `llama-cpp-sys-4` takes its prebuilt branch (no cmake — only a `cc`-built shim), so
+  `nix develop -c cargo build -p daemon-infer --features llama,dynamic-link` builds the lane on NixOS.
+  The `dynamic-link` feature (`daemon-infer` → `llama-cpp-4/dynamic-link`) picks `dylib` linking; the
+  pin must move in lockstep with `llama-cpp-4` upgrades (a skew shows up as undefined/version-mismatched
+  symbols). This is the fast dev-iteration path; `nix build .#daemon-infer-llama` stays the from-source
+  reference.
 
 ---
 
