@@ -9,12 +9,13 @@
 
 use crate::tokens::Tokenizer;
 use daemon_core::{Provider, Request, RequestMsg};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The breaker opens after this many consecutive failures (`LCM:config.py:302`).
-const BREAKER_FAILURE_THRESHOLD: u32 = 2;
-/// The breaker stays open for this long before a half-open retry (`LCM:config.py:304`).
-const BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
+/// The default failure threshold when no config is supplied (`LCM:config.py:302`).
+const DEFAULT_BREAKER_FAILURE_THRESHOLD: u32 = 2;
+/// The default cooldown when no config is supplied (`LCM:config.py:304`).
+const DEFAULT_BREAKER_COOLDOWN_SECONDS: u64 = 300;
 
 /// The escalation level a summary was produced at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,23 +28,46 @@ pub enum Level {
     L3,
 }
 
-/// A single-route circuit breaker for the aux summarization provider (§7.3).
-#[derive(Debug, Default)]
+/// A single-route circuit breaker for one aux summarization provider (§7.3). Thresholds are
+/// config-driven (`summary_circuit_breaker_*`); a chain carries one breaker per route.
+#[derive(Debug)]
 pub struct SummaryCircuitBreaker {
     failures: u32,
     opened_at: Option<Instant>,
+    failure_threshold: u32,
+    cooldown: Duration,
+}
+
+impl Default for SummaryCircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SummaryCircuitBreaker {
-    /// A fresh, closed breaker.
+    /// A fresh, closed breaker with the spec-default thresholds (2 failures / 300s).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_config(
+            DEFAULT_BREAKER_FAILURE_THRESHOLD,
+            DEFAULT_BREAKER_COOLDOWN_SECONDS,
+        )
+    }
+
+    /// A fresh, closed breaker with explicit thresholds (`failure_threshold` consecutive failures /
+    /// `cooldown_seconds` open window).
+    pub fn with_config(failure_threshold: u32, cooldown_seconds: u64) -> Self {
+        Self {
+            failures: 0,
+            opened_at: None,
+            failure_threshold: failure_threshold.max(1),
+            cooldown: Duration::from_secs(cooldown_seconds),
+        }
     }
 
     /// Whether the route is currently open (skip the LLM, fall to L3). The breaker self-heals after
     /// the cooldown elapses (half-open: the next call is allowed).
     pub fn is_open(&self) -> bool {
-        matches!(self.opened_at, Some(t) if t.elapsed() < BREAKER_COOLDOWN)
+        matches!(self.opened_at, Some(t) if t.elapsed() < self.cooldown)
     }
 
     /// Record a successful call (closes the breaker).
@@ -55,7 +79,7 @@ impl SummaryCircuitBreaker {
     /// Record a failed call (opens the breaker at the threshold).
     pub fn record_failure(&mut self) {
         self.failures = self.failures.saturating_add(1);
-        if self.failures >= BREAKER_FAILURE_THRESHOLD {
+        if self.failures >= self.failure_threshold {
             self.opened_at = Some(Instant::now());
         }
     }
@@ -79,45 +103,35 @@ pub struct SummaryRequest<'a> {
 
 /// Summarize with 3-level escalation, returning the summary text and the level it converged at.
 ///
-/// `l2_budget_ratio` (0.50) and `l3_truncate_tokens` (512) are config; `timeout` bounds each LLM
-/// call. The aux provider is consulted for L1/L2 only when the breaker is closed; L3 is local and
-/// always converges.
+/// `aux_chain` is the ordered fallback chain of aux providers (`summary_model` then
+/// `summary_fallback_models`); `breakers` is the parallel per-route breaker slice. Each LLM call
+/// tries the chain in order (skipping open routes); if **all** routes are open/failing the level
+/// falls through. `l2_budget_ratio` (0.50) and `l3_truncate_tokens` (512) are config; `timeout`
+/// bounds each call. L3 is local and always converges.
 pub async fn summarize_with_escalation(
-    aux: &dyn Provider,
+    aux_chain: &[Arc<dyn Provider>],
     tok: &Tokenizer,
-    breaker: &mut SummaryCircuitBreaker,
+    breakers: &mut [SummaryCircuitBreaker],
     l2_budget_ratio: f64,
     l3_truncate_tokens: usize,
     timeout: Duration,
     req: SummaryRequest<'_>,
 ) -> (String, Level) {
-    if !breaker.is_open() {
-        // L1 — detailed summary.
-        let l1_prompt = build_l1_prompt(&req);
-        match call_summary_llm(aux, l1_prompt, timeout).await {
-            Ok(text) => {
-                let text = strip_reasoning_blocks(&text);
-                if !text.is_empty() && tok.count_text(&text) < req.source_tokens {
-                    breaker.record_success();
-                    return (text, Level::L1);
-                }
-                // L2 — aggressive bullets at half budget (the route is healthy, just too verbose).
-                let l2_budget = ((req.token_budget as f64) * l2_budget_ratio) as usize;
-                let l2_prompt = build_l2_prompt(&req, l2_budget.max(1));
-                match call_summary_llm(aux, l2_prompt, timeout).await {
-                    Ok(text2) => {
-                        let text2 = strip_reasoning_blocks(&text2);
-                        if !text2.is_empty() && tok.count_text(&text2) < req.source_tokens {
-                            breaker.record_success();
-                            return (text2, Level::L2);
-                        }
-                        // Both levels produced no shrink; not a transport failure — fall to L3.
-                        breaker.record_success();
-                    }
-                    Err(()) => breaker.record_failure(),
-                }
+    // L1 — detailed summary over the fallback chain.
+    if let Some(text) = call_summary_llm_chain(aux_chain, breakers, build_l1_prompt(&req), timeout).await
+    {
+        let text = strip_reasoning_blocks(&text);
+        if !text.is_empty() && tok.count_text(&text) < req.source_tokens {
+            return (text, Level::L1);
+        }
+        // L2 — aggressive bullets at half budget (a route is healthy, just too verbose).
+        let l2_budget = ((req.token_budget as f64) * l2_budget_ratio) as usize;
+        let l2_prompt = build_l2_prompt(&req, l2_budget.max(1));
+        if let Some(text2) = call_summary_llm_chain(aux_chain, breakers, l2_prompt, timeout).await {
+            let text2 = strip_reasoning_blocks(&text2);
+            if !text2.is_empty() && tok.count_text(&text2) < req.source_tokens {
+                return (text2, Level::L2);
             }
-            Err(()) => breaker.record_failure(),
         }
     }
     // L3 — deterministic truncation; always converges.
@@ -125,6 +139,36 @@ pub async fn summarize_with_escalation(
         deterministic_truncate(req.text, l3_truncate_tokens),
         Level::L3,
     )
+}
+
+/// Try the aux fallback chain for one prompt (`_invoke_summary_llm_chain`, §7.3): skip open routes,
+/// call each in order, record success/failure per route. Returns the first successful text, or
+/// `None` when every route is open or failed.
+async fn call_summary_llm_chain(
+    chain: &[Arc<dyn Provider>],
+    breakers: &mut [SummaryCircuitBreaker],
+    prompt: String,
+    timeout: Duration,
+) -> Option<String> {
+    for (i, provider) in chain.iter().enumerate() {
+        if breakers.get(i).is_some_and(|b| b.is_open()) {
+            continue;
+        }
+        match call_summary_llm(provider.as_ref(), prompt.clone(), timeout).await {
+            Ok(text) => {
+                if let Some(b) = breakers.get_mut(i) {
+                    b.record_success();
+                }
+                return Some(text);
+            }
+            Err(()) => {
+                if let Some(b) = breakers.get_mut(i) {
+                    b.record_failure();
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build the request to the aux provider and await its text under `timeout`. `Err(())` on any
@@ -230,8 +274,9 @@ fn deterministic_truncate(text: &str, max_tokens: usize) -> String {
 
 /// Strip reasoning blocks from summary text before persisting (`_strip_reasoning_blocks`,
 /// `LCM:escalation.py:90-95`). Removes `<think>`, `<thinking>`, `<reasoning>`, `<thought>`, and
-/// `<REASONING_SCRATCHPAD>` paired blocks (case-insensitive), then trims.
-fn strip_reasoning_blocks(text: &str) -> String {
+/// `<REASONING_SCRATCHPAD>` paired blocks (case-insensitive), then trims. Shared with
+/// [`crate::extraction`] (the extraction aux call strips reasoning the same way).
+pub(crate) fn strip_reasoning_blocks(text: &str) -> String {
     const TAGS: [&str; 5] = ["think", "thinking", "reasoning", "thought", "reasoning_scratchpad"];
     let mut out = text.to_string();
     for tag in TAGS {
@@ -306,17 +351,21 @@ mod tests {
         }
     }
 
+    fn chain(reply: Option<&str>) -> Vec<Arc<dyn Provider>> {
+        vec![Arc::new(FixedAux {
+            reply: reply.map(|s| s.to_string()),
+        })]
+    }
+
     #[tokio::test]
     async fn l1_accepts_a_shorter_summary() {
-        let aux = FixedAux {
-            reply: Some("short".into()),
-        };
+        let aux = chain(Some("short"));
         let tok = Tokenizer::heuristic();
-        let mut breaker = SummaryCircuitBreaker::new();
+        let mut breakers = vec![SummaryCircuitBreaker::new()];
         let (text, level) = summarize_with_escalation(
             &aux,
             &tok,
-            &mut breaker,
+            &mut breakers,
             0.5,
             512,
             Duration::from_secs(5),
@@ -332,15 +381,13 @@ mod tests {
         // The aux echoes a long reply that never beats source_tokens=1, forcing L1+L2 to fail the
         // shrink test and fall to deterministic truncation.
         let long = "x".repeat(10_000);
-        let aux = FixedAux {
-            reply: Some(long.clone()),
-        };
+        let aux = chain(Some(&long));
         let tok = Tokenizer::heuristic();
-        let mut breaker = SummaryCircuitBreaker::new();
+        let mut breakers = vec![SummaryCircuitBreaker::new()];
         let (text, level) = summarize_with_escalation(
             &aux,
             &tok,
-            &mut breaker,
+            &mut breakers,
             0.5,
             64,
             Duration::from_secs(5),
@@ -354,18 +401,18 @@ mod tests {
 
     #[tokio::test]
     async fn open_breaker_falls_to_l3_without_calling_the_provider() {
-        let aux = FixedAux { reply: None }; // would error if called
+        let aux = chain(None); // would error if called
         let tok = Tokenizer::heuristic();
-        let mut breaker = SummaryCircuitBreaker::new();
-        // Two failures open the breaker.
-        breaker.record_failure();
-        breaker.record_failure();
-        assert!(breaker.is_open());
+        let mut breakers = vec![SummaryCircuitBreaker::new()];
+        // Two failures open the (single) route.
+        breakers[0].record_failure();
+        breakers[0].record_failure();
+        assert!(breakers[0].is_open());
         let src = "some source text to truncate ".repeat(50);
         let (text, level) = summarize_with_escalation(
             &aux,
             &tok,
-            &mut breaker,
+            &mut breakers,
             0.5,
             16,
             Duration::from_secs(5),
@@ -374,6 +421,33 @@ mod tests {
         .await;
         assert_eq!(level, Level::L3);
         assert!(!text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_route_is_used_when_the_primary_route_is_open() {
+        // Primary errors; fallback returns a usable summary. Open the primary first, then the chain
+        // should skip it and succeed on the fallback.
+        let mut breakers = vec![SummaryCircuitBreaker::new(), SummaryCircuitBreaker::new()];
+        breakers[0].record_failure();
+        breakers[0].record_failure();
+        assert!(breakers[0].is_open());
+        let aux: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(FixedAux { reply: None }),
+            Arc::new(FixedAux { reply: Some("fallback summary".into()) }),
+        ];
+        let tok = Tokenizer::heuristic();
+        let (text, level) = summarize_with_escalation(
+            &aux,
+            &tok,
+            &mut breakers,
+            0.5,
+            512,
+            Duration::from_secs(5),
+            req("a long source that exceeds the fallback summary length", 1000),
+        )
+        .await;
+        assert_eq!(level, Level::L1);
+        assert_eq!(text, "fallback summary");
     }
 
     #[test]

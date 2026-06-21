@@ -11,11 +11,14 @@
 
 use crate::config::LcmConfig;
 use crate::escalation::{summarize_with_escalation, SummaryCircuitBreaker, SummaryRequest};
+use crate::externalize::{extract_ref, gc_placeholder};
+use crate::extraction;
 use crate::ingest::render_turns;
 use crate::store::{NewNode, SourceType, Store};
 use crate::tokens::Tokenizer;
 use daemon_core::conversation::AssistantMsg;
 use daemon_core::{Conversation, Provider, Turn};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The leading marker on a synthetic summary turn (so re-compaction skips it as scaffold — §6.4).
@@ -33,8 +36,8 @@ pub(crate) async fn run_compaction(
     store: &Store,
     tok: &Tokenizer,
     cfg: &LcmConfig,
-    aux: &dyn Provider,
-    breaker: &mut SummaryCircuitBreaker,
+    aux_chain: &[Arc<dyn Provider>],
+    breakers: &mut [SummaryCircuitBreaker],
     session_id: &str,
     first_compaction: bool,
     turn_store_ids: Vec<Vec<i64>>,
@@ -66,10 +69,27 @@ pub(crate) async fn run_compaction(
     // Summarize the leaf chunk: budget = max(2000, 20% of source) capped at 12000 (§6.5).
     let leaf_budget = (source_tokens * 20 / 100).clamp(2000, 12000);
     let text = render_turns(region);
+
+    // §9.2 pre-compaction extraction (opt-in): distill durable decisions to the daily markdown
+    // before this region is summarized. Best-effort — it never blocks or fails compaction. Routed
+    // through the primary aux provider.
+    if cfg.extraction_enabled {
+        if let Some(primary) = aux_chain.first() {
+            let _ = extraction::run_extraction(
+                primary.as_ref(),
+                &text,
+                cfg.extraction_dir().as_deref(),
+                Duration::from_millis(cfg.summary_timeout_ms),
+                now,
+            )
+            .await;
+        }
+    }
+
     let (summary, _level) = summarize_with_escalation(
-        aux,
+        aux_chain,
         tok,
-        breaker,
+        breakers,
         cfg.l2_budget_ratio,
         cfg.l3_truncate_tokens,
         Duration::from_millis(cfg.summary_timeout_ms),
@@ -103,10 +123,15 @@ pub(crate) async fn run_compaction(
     }
     if let Some(max_id) = store_ids.iter().copied().max() {
         let _ = store.advance_frontier(session_id, max_id, now);
+        // §9.1 transcript GC (opt-in): now that this region is summarized, rewrite its
+        // already-externalized payload rows to a compact GC placeholder (store_id-preserving).
+        if cfg.large_output_transcript_gc_enabled {
+            gc_externalized_payloads(store, session_id, max_id);
+        }
     }
 
     // Condensation: climb depths while a level has >= fanin uncondensed siblings (§6.6).
-    condense(store, tok, cfg, aux, breaker, session_id, now).await;
+    condense(store, tok, cfg, aux_chain, breakers, session_id, now).await;
 
     // Assemble: [system] + [summary turn over the DAG frontier] + [fresh tail], rebuilding the
     // ingest index in lockstep (the synthetic summary turn holds no store_ids; the tail keeps its).
@@ -131,6 +156,33 @@ pub(crate) async fn run_compaction(
     )
 }
 
+/// Rewrite summarized rows that still carry an inline externalized-payload placeholder to a compact
+/// GC placeholder (§9.1 transcript GC). The bytes already live on disk under the externalization
+/// dir; this only shrinks the `messages` row (and its FTS shadow) — recovery via the `ref` is
+/// unchanged. Best-effort: a failed row is left as-is.
+fn gc_externalized_payloads(store: &Store, session_id: &str, max_store_id: i64) {
+    let rows = match store.messages_to_gc(session_id, max_store_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "lcm: transcript-GC candidate query failed");
+            return;
+        }
+    };
+    for row in rows {
+        let Some(content) = row.content.as_deref() else {
+            continue;
+        };
+        let Some(reference) = extract_ref(content) else {
+            continue;
+        };
+        let is_tool_output = row.tool_call_id.is_some();
+        let placeholder = gc_placeholder(is_tool_output, &reference);
+        if let Err(e) = store.update_message_content(row.store_id, &placeholder) {
+            tracing::warn!(error = %e, store_id = row.store_id, "lcm: transcript-GC rewrite failed");
+        }
+    }
+}
+
 /// Count leading synthetic-summary turns (the replayed scaffold to skip — §6.4).
 pub(crate) fn leading_scaffold_count(turns: &[Turn]) -> usize {
     turns
@@ -146,8 +198,8 @@ async fn condense(
     store: &Store,
     tok: &Tokenizer,
     cfg: &LcmConfig,
-    aux: &dyn Provider,
-    breaker: &mut SummaryCircuitBreaker,
+    aux_chain: &[Arc<dyn Provider>],
+    breakers: &mut [SummaryCircuitBreaker],
     session_id: &str,
     now: f64,
 ) {
@@ -181,9 +233,9 @@ async fn condense(
         // Condense budget = max(1000, 40% of source) (§6.6).
         let budget = (source_tokens * 40 / 100).max(1000);
         let (summary, _level) = summarize_with_escalation(
-            aux,
+            aux_chain,
             tok,
-            breaker,
+            breakers,
             cfg.l2_budget_ratio,
             cfg.l3_truncate_tokens,
             Duration::from_millis(cfg.summary_timeout_ms),

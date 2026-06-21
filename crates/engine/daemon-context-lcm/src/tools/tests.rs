@@ -69,14 +69,22 @@ impl Fixture {
     }
 
     fn cx(&self) -> ToolCx<'_> {
+        self.cx_with(&CONFIG)
+    }
+
+    fn cx_with<'a>(&'a self, config: &'a LcmConfig) -> ToolCx<'a> {
         ToolCx {
             store: &self.store,
-            config: &CONFIG,
+            config,
             tokenizer: &self.tokenizer,
             aux: &self.aux,
             session_id: "s1",
             threshold_tokens: Some(350),
+            context_length: Some(200_000),
             compaction_count: 2,
+            session_ignored: false,
+            session_stateless: false,
+            ignored_message_count: 0,
         }
     }
 }
@@ -87,6 +95,11 @@ static CONFIG: LazyLock<LcmConfig> = LazyLock::new(LcmConfig::in_memory);
 
 async fn call(fx: &Fixture, name: &str, args: Value) -> Value {
     let s = dispatch(&fx.cx(), name, args).await;
+    serde_json::from_str(&s).unwrap_or_else(|e| panic!("tool {name} returned non-JSON: {e}: {s}"))
+}
+
+async fn call_with(fx: &Fixture, config: &LcmConfig, name: &str, args: Value) -> Value {
+    let s = dispatch(&fx.cx_with(config), name, args).await;
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("tool {name} returned non-JSON: {e}: {s}"))
 }
 
@@ -236,6 +249,67 @@ async fn doctor_is_healthy_on_a_consistent_store() {
     let checks = out["checks"].as_array().unwrap();
     assert!(checks.iter().any(|c| c["check"] == "database_integrity" && c["status"] == "ok"));
     assert!(checks.iter().any(|c| c["check"] == "messages_fts_integrity" && c["status"] == "ok"));
+}
+
+#[tokio::test]
+async fn expand_and_describe_externalized_ref_round_trip() {
+    let fx = Fixture::new("");
+    let dir = std::env::temp_dir().join(format!("lcm-tool-ext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = LcmConfig {
+        data_dir: dir.clone(),
+        bank: "default".to_string(),
+        ..LcmConfig::default()
+    };
+    let payload_dir = config.externalization_dir().unwrap();
+    let body = "RECOVERED-PAYLOAD-".repeat(50);
+    let reference = crate::externalize::store_payload(
+        &payload_dir,
+        &body,
+        &crate::externalize::PayloadMeta {
+            kind: "tool_output",
+            field: "content",
+            role: "tool",
+            tool_call_id: Some("c1"),
+        },
+    )
+    .unwrap();
+
+    let expanded = call_with(&fx, &config, "lcm_expand", json!({"externalized_ref": reference})).await;
+    assert_eq!(expanded["type"], "externalized_payload");
+    assert!(expanded["content"].as_str().unwrap().contains("RECOVERED-PAYLOAD-"));
+
+    let described = call_with(&fx, &config, "lcm_describe", json!({"externalized_ref": reference})).await;
+    assert_eq!(described["type"], "externalized_payload");
+    assert_eq!(described["kind"], "tool_output");
+    assert_eq!(described["tool_call_id"], "c1");
+    assert!(described.get("content").is_none(), "describe is metadata-only");
+
+    let missing = call_with(&fx, &config, "lcm_expand", json!({"externalized_ref": "nope.json"})).await;
+    assert_eq!(missing["status"], "error");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn doctor_reports_payload_and_sensitive_checks() {
+    let fx = Fixture::new("");
+    // Ephemeral bank + an unrecognized sensitive pattern name -> warn on sensitive_pattern_handling.
+    let config = LcmConfig {
+        sensitive_patterns_enabled: true,
+        sensitive_patterns: vec!["api_key".to_string(), "not_a_real_pattern".to_string()],
+        ..LcmConfig::in_memory()
+    };
+    let out = call_with(&fx, &config, "lcm_doctor", json!({})).await;
+    let checks = out["checks"].as_array().unwrap();
+    let storage = checks.iter().find(|c| c["check"] == "payload_storage").unwrap();
+    assert_eq!(storage["status"], "ok", "ephemeral payload storage is ok");
+    let sens = checks.iter().find(|c| c["check"] == "sensitive_pattern_handling").unwrap();
+    assert_eq!(sens["status"], "warn", "unknown pattern name warns");
+    assert_eq!(out["overall"], "warnings");
+    // The two checks are no longer in the skipped list.
+    let skipped = out["skipped"].as_array().unwrap();
+    assert!(!skipped.iter().any(|s| s == "payload_storage"));
+    assert!(!skipped.iter().any(|s| s == "sensitive_pattern_handling"));
 }
 
 #[tokio::test]

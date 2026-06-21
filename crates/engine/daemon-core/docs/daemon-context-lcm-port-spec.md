@@ -1299,13 +1299,36 @@ default stays fully ephemeral).
 
 ## 15. Implementation milestones
 
-**Status (this branch): M1–M4 + M6 + M8 implemented.** The store (lossless `messages` + summary DAG +
-FTS5 + lifecycle frontier), `tiktoken`-rs token counting + `on_model` threshold, the 3-level
+**Status (this branch): M1–M8 implemented (full port).** The store (lossless `messages` + summary DAG
++ FTS5 + lifecycle frontier), `tiktoken`-rs token counting + `on_model` threshold, the 3-level
 escalation summarizer over a host-injected aux `Provider`, the compaction engine
-(`[system]+[summary]+[fresh tail]`), full per-turn transcript ingest, the search stack, and all seven
-`lcm_*` drill-down tools are live and unit-tested; the binary threads the agent's default provider in
-as the LCM aux provider and registers the `lcm_*` tools (session-resolved through a shared
-`LcmBanks`, mirroring `MnemosyneBanks`). M5 (protection) and M7 (routing/presets) remain open.
+(`[system]+[summary]+[fresh tail]`), full per-turn transcript ingest, the search stack, all seven
+`lcm_*` drill-down tools, **M5 ingest protection** (redaction / base64 storage guard / quarantine /
+externalization / pre-compaction extraction), and **M7 filters/routing/presets** (session+message
+filters, the model-routing shim with a per-route fallback chain, inert presets) are live and
+unit-tested; the binary threads the agent's default provider in as the LCM aux provider and registers
+the `lcm_*` tools (session-resolved through a shared `LcmBanks`, mirroring `MnemosyneBanks`).
+
+M5/M7 deviations (all within the milestone intent):
+
+- **The base64/data-URI storage guard (§8.2) is always on, but only for persistent banks.** It
+  activates when an externalization directory exists; for in-memory/ephemeral nodes it no-ops and
+  leaves content inline (no data loss), so the zero-config default path is unchanged. Every other
+  M5/M7 knob defaults off (`sensitive_patterns_enabled`, `large_output_externalization_enabled`,
+  `extraction_enabled`, `*_transcript_gc_enabled`, empty pattern lists).
+- **Routing is a single-provider shim (§7.4/§12.4).** Escalation now takes a fallback chain
+  (`Vec<Arc<dyn Provider>>`) with per-route, config-driven circuit breakers
+  (`summary_circuit_breaker_*`); `model_routing::parse_lcm_model_override` parses the override strings
+  and documents the config→provider-selection effect. The binary wires a single aux provider (chain
+  length 1); multi-provider resolution from a registry is out of scope.
+- **Temperature/`task` labels are not passed.** `Provider::chat` has no per-call kwargs, so the
+  extraction `temperature=0.2` / compression `0.3` and `task` labels are dropped; the aux provider's
+  fixed config governs.
+- **`_EXTERNALIZED_REF_RE` is faithfully broadened** to `[;:]\s*ref=` so the §8.2 ingest-payload,
+  §9.1 tool-output/payload, GC, and quarantine placeholders are all captured by one pattern.
+- **`ignore_message_patterns` matches a turn's content** (user/assistant text or a tool turn's
+  assistant text + result bodies), not the role-tagged render; the platform is unknown in
+  daemon-core, so session match keys reduce to the bare `session_id`.
 
 Three deliberate deviations from the literal milestone text below, all within the milestone's intent:
 
@@ -1328,9 +1351,10 @@ Three deliberate deviations from the literal milestone text below, all within th
    default (which returns `budget_tokens == budget`).
 
 Smaller, noted divergences: the LIKE-fallback CJK/emoji/risky-ASCII detection uses direct Unicode
-range checks rather than a `regex` dependency; `lcm_doctor` runs the available checks
-(`database_integrity`, FTS sync, `orphaned_dag_nodes`) and skips the protection-dependent ones
-(M5: ingest-protection / sensitive-pattern / payload-storage), which it lists under `skipped`.
+range checks rather than a `regex` dependency; `lcm_doctor` runs `database_integrity`, FTS sync,
+`orphaned_dag_nodes`, `payload_storage`, and `sensitive_pattern_handling`, and lists the
+not-yet-ported checks (`schema_core_tables`, `sqlite_storage`, `summary_quality`, `config_validation`,
+`source_lineage_hygiene`, `lifecycle_fragmentation`, `context_pressure`) under `skipped`.
 
 Each milestone is independently testable; constants from §6/§7/§8 are carried verbatim.
 
@@ -1350,19 +1374,25 @@ Each milestone is independently testable; constants from §6/§7/§8 are carried
   cursor + frontier reconcile, debt/critical-pressure/boundary-cooldown. Wire `before_turn`/`compact`.
   Acceptance: a long synthetic conversation compacts to `[summary]+[tail]` under budget; tool pairs
   intact; idempotent re-compaction is a no-op (anti-thrash). (§6)
-- **M5 — Protection.** `protection.rs` (redaction catalog + placeholder formats, base64 storage
-  guard, quarantine) + `externalize.rs` + `extraction.rs`. Acceptance: secrets redacted with correct
-  digest length; oversized base64 externalized with recoverable ref; degenerate assistant output
-  quarantined at the exact thresholds. (§8, §9)
+- **M5 — Protection. (done)** `protection.rs` (redaction catalog + placeholder formats, base64
+  storage guard, quarantine) + `externalize.rs` + `extraction.rs`; wired into `ingest_current`
+  (per-message protection) and `run_compaction` (pre-compaction extraction + opt-in transcript GC via
+  `Store::update_message_content`). Acceptance (met): secrets redacted with correct digest length
+  (password omits the hash); oversized base64 externalized with a recoverable `ref` (recovered via
+  `lcm_expand(externalized_ref=…)`); degenerate assistant output quarantined at the thresholds. (§8, §9)
 - **M6 — Tools + search. (done)** `search.rs` (FTS5 sanitize, LIKE fallback, sort modes, directness,
   snippets) + `tools/mod.rs` (the seven handlers) + `tools/schemas.rs`; full per-turn ingest +
   rehydration reconcile; `tool_defs()`/`call_tool` dispatch on `LcmContextEngine`; binary `LcmBanks`
   cache + `LcmTool` adapter register the tools alongside `mnemosyne_*`. Acceptance (met): each tool's
   paged return shape + cursor families match the schema; cross-session `lcm_grep` returns raw-only;
   `lcm_expand(store_id)` recovers exact content; reconcile never duplicates the tail. (§10, §11)
-- **M7 — Routing + presets + filters.** `model_routing.rs` shim, `presets.rs` metadata,
-  `patterns.rs` (session globs + message regex). Acceptance: ignored/stateless sessions skip
-  ingest/writes; preset suggestion by context window; glob colon-semantics. (§12.3–12.6)
+- **M7 — Routing + presets + filters. (done)** `model_routing.rs` shim (per-route fallback chain
+  with config-driven breakers threaded through `State`/`run_compaction`), `presets.rs` metadata,
+  `patterns.rs` (session globs + message regex); wired into session bind (`session_ignored`/
+  `session_stateless`) and `ingest_current` (message filter + process-lifetime `ignored_message_count`),
+  with `lcm_status` surfacing `preset_suggestion` + filter/protection state. Acceptance (met):
+  ignored/stateless sessions skip ingest/writes; preset suggestion by context window; glob
+  colon-semantics (`*`→one segment, `**`→across). (§12.3–12.6)
 - **M8 — Wire as default + conformance.** `EngineProfile::with_context_engine_builder(...)` at the
   binary (per-session LCM instances over one profile-scoped `lcm.db`); error-driven compaction retry
   on `ContextOverflow`. Acceptance: the engine/ReAct conformance suites stay green with LCM as the

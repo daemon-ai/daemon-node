@@ -35,16 +35,18 @@ pub const LCM_LOAD_SESSION: &str = r#"{
 pub const LCM_DESCRIBE: &str = r#"{
   "type": "object",
   "properties": {
-    "node_id": {"type": "integer", "description": "Describe one node's subtree; omit for a session overview"}
+    "node_id": {"type": "integer", "description": "Describe one node's subtree; omit for a session overview"},
+    "externalized_ref": {"type": "string", "description": "Describe an externalized payload's metadata (no content)"}
   }
 }"#;
 
-/// `lcm_expand` — recover exact content for a node or message (§10.4).
+/// `lcm_expand` — recover exact content for a node, message, or externalized payload (§10.4).
 pub const LCM_EXPAND: &str = r#"{
   "type": "object",
   "properties": {
     "node_id": {"type": "integer", "description": "Expand a summary node (current session)"},
     "store_id": {"type": "integer", "description": "Recover a raw message (cross-session)"},
+    "externalized_ref": {"type": "string", "description": "Recover an externalized payload's bytes by its ref"},
     "max_tokens": {"type": "integer", "default": 4000, "minimum": 1},
     "source_offset": {"type": "integer", "default": 0, "description": "Node-mode source pagination"},
     "source_limit": {"type": "integer", "description": "Max sources to return this page"},

@@ -1779,12 +1779,15 @@ name = "daemon-context-lcm"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "daemon-common",
  "daemon-core",
  "daemon-protocol",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
