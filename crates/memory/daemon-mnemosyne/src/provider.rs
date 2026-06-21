@@ -8,26 +8,36 @@
 
 use crate::embeddings::Embedder;
 use crate::engine::{Engine, MemoryRow, RememberArgs};
+use crate::extract::Extractor;
 use crate::MnemosyneConfig;
 use daemon_core::conversation::{Conversation, Turn};
 use daemon_core::memory::{MemoryProvider, PromptBlock, RecallQuery, RecalledBlock, SwitchReason};
 use daemon_core::tools::ToolDef;
-use daemon_core::EmbeddingProvider;
-use serde_json::{json, Value};
+use daemon_core::{EmbeddingProvider, Provider};
+use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The Mnemosyne memory provider over a single bank engine, with an optional embedding backend.
+/// Auto-sleep cadence: run a consolidation pass every N persisted turns (`__init__.py` auto-sleep
+/// every 10 turns, L1690).
+const AUTO_SLEEP_EVERY_TURNS: u64 = 10;
+
+/// The Mnemosyne memory provider over a single bank engine, with optional embedding + LLM backends.
 pub struct MnemosyneProvider {
     engine: Arc<Engine>,
     embedder: Embedder,
+    extractor: Extractor,
+    turns: AtomicU64,
 }
 
 impl MnemosyneProvider {
-    /// Wrap an existing engine in keyword-only mode (no embeddings).
+    /// Wrap an existing engine in keyword-only mode (no embeddings, no LLM).
     pub fn new(engine: Arc<Engine>) -> Self {
         Self {
             engine,
             embedder: Embedder::new(),
+            extractor: Extractor::new(),
+            turns: AtomicU64::new(0),
         }
     }
 
@@ -36,15 +46,28 @@ impl MnemosyneProvider {
         Self {
             engine,
             embedder: Embedder::with_provider(embedder),
+            extractor: Extractor::new(),
+            turns: AtomicU64::new(0),
+        }
+    }
+
+    /// Wrap an existing engine with optional embedding and LLM backends.
+    pub fn with_backends(
+        engine: Arc<Engine>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        llm: Option<Arc<dyn Provider>>,
+    ) -> Self {
+        Self {
+            engine,
+            embedder: embedder.map(Embedder::with_provider).unwrap_or_default(),
+            extractor: llm.map(Extractor::with_provider).unwrap_or_default(),
+            turns: AtomicU64::new(0),
         }
     }
 
     /// Open a provider for the configured bank in keyword-only mode.
     pub fn open(config: MnemosyneConfig) -> crate::Result<Self> {
-        Ok(Self {
-            engine: Arc::new(Engine::open(config)?),
-            embedder: Embedder::new(),
-        })
+        Ok(Self::new(Arc::new(Engine::open(config)?)))
     }
 
     /// Open a provider for the configured bank with an injected embedding provider.
@@ -52,10 +75,23 @@ impl MnemosyneProvider {
         config: MnemosyneConfig,
         embedder: Arc<dyn EmbeddingProvider>,
     ) -> crate::Result<Self> {
-        Ok(Self {
-            engine: Arc::new(Engine::open(config)?),
-            embedder: Embedder::with_provider(embedder),
-        })
+        Ok(Self::with_embedder(
+            Arc::new(Engine::open(config)?),
+            embedder,
+        ))
+    }
+
+    /// Open a provider for the configured bank with optional embedding and LLM backends.
+    pub fn open_with_backends(
+        config: MnemosyneConfig,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        llm: Option<Arc<dyn Provider>>,
+    ) -> crate::Result<Self> {
+        Ok(Self::with_backends(
+            Arc::new(Engine::open(config)?),
+            embedder,
+            llm,
+        ))
     }
 
     /// Format recall rows into a prompt block (`__init__.py` L1645-L1659):
@@ -120,7 +156,7 @@ impl MemoryProvider for MnemosyneProvider {
         // Embed once at this async seam; the precomputed vector is persisted with the row.
         let vector = self.embedder.embed_query(&content).await;
         let model = self.embedder.model().unwrap_or("");
-        let _ = self.engine.remember_with_vector(
+        let memory_id = match self.engine.remember_with_vector(
             &content,
             &RememberArgs {
                 importance,
@@ -128,7 +164,25 @@ impl MemoryProvider for MnemosyneProvider {
             },
             vector.as_deref(),
             model,
-        );
+        ) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+
+        // LLM extraction layered on top of the always-on regex baseline (`extraction.py`): extract
+        // at this async seam, then merge into the knowledge layer synchronously.
+        if self.extractor.available() {
+            if let Some(extracted) = self.extractor.extract(&content).await {
+                let _ = self.engine.ingest_extracted(&memory_id, &extracted);
+            }
+        }
+
+        // Turn-counter auto-sleep (`__init__.py` L1690): every N persisted turns, run a
+        // consolidation pass (summarizing through the LLM when present).
+        let turns = self.turns.fetch_add(1, Ordering::Relaxed) + 1;
+        if turns % AUTO_SLEEP_EVERY_TURNS == 0 {
+            self.run_sleep(false).await;
+        }
     }
 
     async fn before_compact(&self, _conv: &Conversation) {
@@ -136,11 +190,20 @@ impl MemoryProvider for MnemosyneProvider {
     }
 
     async fn on_session_switch(&self, reason: SwitchReason) {
-        // Promote unconsolidated working memory into the episodic tier at session boundaries (a
-        // minimal slice of BEAM sleep/consolidation; full summarization/degradation is port-spec P1).
+        // Run a full, forced sleep pass at session boundaries (`beam.py` sleep L7576): flush this
+        // session's working memory into the episodic tiers regardless of age, then degrade.
         if matches!(reason, SwitchReason::End | SwitchReason::Handoff) {
-            let _ = self.engine.consolidate();
+            self.run_sleep(true).await;
         }
+    }
+}
+
+impl MnemosyneProvider {
+    /// Drive one sleep/consolidation pass (`beam.py` sleep L7576). When an LLM is present, each
+    /// claimed source group is summarized at this async seam before the synchronous engine writes
+    /// the episodic summary; otherwise the engine falls back to the deterministic AAAK summary.
+    async fn run_sleep(&self, force: bool) {
+        let _ = crate::tools::run_sleep(&self.engine, &self.extractor, force).await;
     }
 }
 
@@ -151,63 +214,12 @@ impl MnemosyneProvider {
     /// dispatch. A host that wants to expose them to the model registers them through the §12
     /// [`ToolRegistry`](daemon_core::tools) like any other tool, calling [`Self::call_tool`].
     pub fn tools(&self) -> Vec<ToolDef> {
-        vec![
-            ToolDef {
-                name: "mnemosyne_remember".to_string(),
-                schema: r#"{"type":"object","properties":{"content":{"type":"string"},"importance":{"type":"number"}},"required":["content"]}"#.to_string(),
-            },
-            ToolDef {
-                name: "mnemosyne_recall".to_string(),
-                schema: r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"}},"required":["query"]}"#.to_string(),
-            },
-        ]
+        crate::tools::defs()
     }
 
     /// Dispatch one of [`Self::tools`] by name, returning a JSON string result.
     pub async fn call_tool(&self, name: &str, args: Value) -> String {
-        match name {
-            "mnemosyne_remember" => {
-                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let importance = args
-                    .get("importance")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.5);
-                let vector = self.embedder.embed_query(content).await;
-                let model = self.embedder.model().unwrap_or("");
-                match self.engine.remember_with_vector(
-                    content,
-                    &RememberArgs {
-                        importance,
-                        ..Default::default()
-                    },
-                    vector.as_deref(),
-                    model,
-                ) {
-                    Ok(id) => json!({"status": "ok", "memory_id": id}).to_string(),
-                    Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
-                }
-            }
-            "mnemosyne_recall" => {
-                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                let query_vec = self.embedder.embed_query(query).await;
-                match self
-                    .engine
-                    .recall_with_vector(query, top_k, query_vec.as_deref())
-                {
-                    Ok(rows) => {
-                        let results: Vec<Value> = rows
-                            .iter()
-                            .map(|r| json!({"id": r.id, "content": r.content, "score": r.score}))
-                            .collect();
-                        json!({"query": query, "count": results.len(), "results": results})
-                            .to_string()
-                    }
-                    Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
-                }
-            }
-            _ => json!({"status": "unknown_tool", "tool": name}).to_string(),
-        }
+        crate::tools::dispatch(&self.engine, &self.embedder, &self.extractor, name, args).await
     }
 }
 
@@ -215,6 +227,7 @@ impl MnemosyneProvider {
 mod tests {
     use super::*;
     use crate::engine::Engine;
+    use serde_json::json;
     use daemon_core::conversation::{Conversation, SystemPrompt, Turn, UserMsg};
     use daemon_core::memory::RecallQuery;
     use daemon_core::MockEmbedder;
@@ -294,5 +307,58 @@ mod tests {
             0,
             "on_session_switch(End) should have already promoted the row"
         );
+    }
+
+    #[tokio::test]
+    async fn after_turn_runs_llm_extraction_into_knowledge_layer() {
+        use daemon_core::MockProvider;
+        let json = r#"{"entities":["Atlas"],"triples":[{"subject":"Denis","predicate":"manages","object":"Atlas","confidence":0.95}],"facts":[]}"#;
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::with_backends(
+            engine.clone(),
+            None,
+            Some(Arc::new(MockProvider::completing(json))),
+        );
+        let conv = Conversation::new(SystemPrompt::new(""));
+        provider
+            .after_turn(&Turn::User(UserMsg::new("a note about the team")), &conv)
+            .await;
+
+        // The LLM triple should have been consolidated even though the regex baseline wouldn't
+        // extract "Denis manages Atlas" from that sentence.
+        assert!(
+            engine.stats().unwrap().facts >= 1,
+            "LLM extraction should reach the knowledge layer as a consolidated fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_dispatch_remember_and_recall_round_trip() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+
+        let defs = provider.tools();
+        assert!(defs.iter().any(|d| d.name == "mnemosyne_remember"));
+        assert!(defs.iter().any(|d| d.name == "mnemosyne_sleep"));
+        assert!(defs.len() >= 25, "full tool surface, got {}", defs.len());
+
+        let remembered = provider
+            .call_tool(
+                "mnemosyne_remember",
+                json!({"content": "the cache uses an LRU eviction policy"}),
+            )
+            .await;
+        assert!(remembered.contains("\"status\":\"ok\""), "got: {remembered}");
+
+        let recalled = provider
+            .call_tool("mnemosyne_recall", json!({"query": "eviction policy"}))
+            .await;
+        assert!(recalled.contains("LRU"), "recall via tool: {recalled}");
+
+        let stats = provider.call_tool("mnemosyne_stats", json!({})).await;
+        assert!(stats.contains("\"working\":1"), "stats: {stats}");
+
+        let unknown = provider.call_tool("mnemosyne_nope", json!({})).await;
+        assert!(unknown.contains("unknown_tool"));
     }
 }

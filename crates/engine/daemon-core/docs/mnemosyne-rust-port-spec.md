@@ -522,8 +522,13 @@ gathers WM **and** EM candidates from FTS5 BM25 (`fts_working` / `fts_episodes`,
 `raw/(1+raw)` and blended with lexical per §7.4 in [`scoring::blend_fts`]), the stored embeddings
 (cosine), and the recency fallback scan (limit 2000), under the always-on validity + scope filters.
 WM rows score with `working_memory_score`; EM rows with `episodic_score` plus the MIB `binary_bonus`
-and the `tier_weight` / `veracity_multiplier` post-multipliers (graph/fact bonuses pass `0` until the
-knowledge layer lands — P1). Results are content-deduped (keeping the higher score), MMR-diversified
+and the `tier_weight` / `veracity_multiplier` post-multipliers. Both tiers now thread the live
+knowledge-layer signals (§10 as-built): `Engine::knowledge_bonuses` supplies the additive
+`graph_bonus` (incident `graph_edges`) and `fact_bonus` (query entities matched in the row's
+`facts`), plus the entity (`*1.3`, capped) / fact (`*1.2`) post-multipliers keyed on the query
+entities from `extract_entities_regex`; `Engine::inject_entity_candidates` adds entity-mentioning
+(and depth-2 graph-related) rows missed by the lexical/FTS/vector gates at the §7.6 new-candidate
+floor. Results are content-deduped (keeping the higher score), MMR-diversified
 for >=4-token queries ([`mmr::mmr_rerank`]), sliced to `top_k`, and have `recall_count` /
 `last_recalled` bumped. The synonym `+0.75` partial, MEMORIA supplement, and `channel_id`/`author_*`
 scope widening remain TODO. Episodic rows are produced by [`Engine::consolidate`] (a minimal
@@ -613,6 +618,23 @@ L7773); `consolidate_to_episodic` (L3956) inserts episodic + embeds + graph; cle
 `consolidation_log`; run `degrade_episodic` (tier T1->T2 at 30d, T2->T3 at 180d). `pinned=1` rows
 skip sleep. Consolidation is **additive**: WM rows are marked, not deleted.
 
+**As-built ([`engine.rs`](../../../memory/daemon-mnemosyne/src/engine.rs), [`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs)):**
+the full `sleep` is live. `Engine::sleep_plan(force)` applies the 84h cutoff (`WORKING_MEMORY_TTL_HOURS/2`,
+skipped on `force`), skips pinned rows, batches at `SLEEP_BATCH_SIZE`, **atomically claims** rows
+(`consolidated_at`/`consolidation_claimed_at` gated on `consolidated_at IS NULL`), and groups them by
+source with aggregated scope (any-global), `valid_until` (earliest), and `veracity::aggregate_veracity`
+(mode, conservative tie-break). The async provider summarizes each group through the injected
+[`Extractor`] LLM (`Engine::summary_prompt`); `Engine::finish_sleep` writes one episodic summary per
+group (`summary_of` = the source WM id list, importance 0.6), falling back to the deterministic
+**AAAK** summary `[source] <aaak_encode>` when no LLM is present, then logs to `consolidation_log` and
+runs `degrade_episodic`. `Engine::sleep(force)` is the standalone no-LLM entrypoint (plan + finish with
+AAAK). `degrade_episodic` promotes tier 1->2 at `TIER2_DAYS=30` (AAAK-compressed) and tier 2->3 at
+`TIER3_DAYS=180` (signal-compressed to `TIER3_MAX_CHARS=300`), invalidating the stale dense embedding
+(+ binary vector) when content changes so recall falls back to lexical/FTS. The provider runs a forced
+sleep at session End/Handoff and an unforced auto-sleep every `AUTO_SLEEP_EVERY_TURNS=10` turns. Still
+open: the embedding-cosine>0.88 conflict heuristic (the `(S,P)` veracity contradiction path is reused
+instead) and the Weibull recall blend (§9.2).
+
 ### 9.4 Patterns — `patterns.py`
 
 `MemoryCompressor` (dict/RLE/semantic/auto) and `PatternDetector` (temporal/content/sequence). Pure
@@ -621,6 +643,27 @@ logic; P3 priority.
 ---
 
 ## 10. The knowledge layer
+
+**As-built (K1, deterministic — [`knowledge/`](../../../memory/daemon-mnemosyne/src/knowledge/)):**
+the SQLite-backed stores are live over their schema tables (§4.6): `triples::{add, end, query}`
+(temporal SPO chains, supersession + `as_of`), `annotations::{add, add_many, query_by_memory,
+query_by_kind}` (`INSERT OR IGNORE`, `mentions` read-time noise filter), `canonical::{remember,
+forget}` (versioned identity cards), `episodic_graph::{extract_facts, store_fact, add_edge,
+edge_count, find_related_memories}` (regex SPO + `graph_edges` BFS), and `veracity::{consolidate_fact,
+record_conflict, run_consolidation_pass}` (`consolidated_facts` upsert with Bayesian confidence,
+`(S,P)` contradiction → `conflicts`, higher-confidence-wins pass). Extraction is deterministic only:
+`entities::extract_entities_regex` (real) feeds `mentions`, and `extract_facts` feeds `facts` +
+`consolidated_facts`. `Engine::ingest_knowledge` runs this on every `remember` (and per episodic id at
+`consolidate`), also drawing bounded entity co-occurrence `references` edges; the recall path consumes
+the graph/fact signals (§7.8).
+
+**As-built (K2 — LLM extraction + temporal, this milestone):** `Engine::ingest_extracted` layers an
+injected-LLM extraction pass (§11) *on top of* the always-on regex baseline — LLM entities become
+higher-confidence `mentions`, SPO triples become `facts` + `consolidated_facts`, and free-text
+statements become `fact` annotations (all stores dedupe, so re-ingesting a regex-captured item is a
+no-op). Deterministic temporal parsing (§10.5 `parse_nl_date`/`extract_temporal`) is live and wired
+into the write path (the `event_date`/`event_date_precision`/`temporal_tags` columns on both tiers).
+Still TODO: the tier-2 LLM conflict detector (§10.7), rule-based gists, and the E6 legacy migration.
 
 ### 10.1 TripleStore — `triples.py`
 
@@ -668,6 +711,11 @@ linking lives in the engine (`_proactively_link`, beam L3358, env-gated): FTS co
   today/yesterday/tomorrow; `last|this|next <weekday>` (`_resolve_relative_day` L60-L103);
   week/month/year; `N units ago` / `in N units`; vague "recently". `extract_temporal` returns
   `{event_date, event_date_precision, temporal_tags, primary_signal}` (L385-L389).
+  **As-built ([`knowledge/temporal.rs`](../../../memory/daemon-mnemosyne/src/knowledge/temporal.rs)):**
+  the full first-match chain + `extract_temporal`/`extract_temporal_with_ref` are ported over `chrono`
+  (`DAY_MAP`/`MONTH_MAP`/`NAMED_TIMES`, `resolve_relative_day`), and `remember_with_vector` populates
+  the `event_date`/`event_date_precision`/`temporal_tags` columns (copied to the episodic row at
+  consolidation). `entities::similarity`/`find_similar_entities` remain TODO.
 
 ### 10.6 VeracityConsolidator — `veracity_consolidation.py`
 
@@ -710,6 +758,17 @@ available — identical to Python's sleep fallback. The Python analog of "Provid
 [`hermes_memory_provider/hermes_llm_adapter.py`](Mnemosyne/hermes_memory_provider/hermes_llm_adapter.py),
 which wraps the host LLM and registers it via `set_host_llm_backend`; in Rust this wrapper disappears
 because the `Provider` is passed directly.
+
+**As-built ([`extract.rs`](../../../memory/daemon-mnemosyne/src/extract.rs)):** `Extractor` wraps an
+`Option<Arc<dyn daemon_core::Provider>>` (the host backend, priority 0). `extract(text)` runs one
+structured-extraction completion (system-less `Request` with a single user message, under a
+`tokio::time::timeout`) and parses the strict-JSON result (`{entities, triples|kg, facts|statements}`,
+fences stripped, outermost object isolated) into `Extracted`; `summarize(prompt)` is the one-shot used
+by sleep. The provider injects it via `with_backends`/`open_with_backends`, the daemon resolves it the
+same way as `lcm_aux` (the profile builder, mock fallback), and `after_turn` runs extraction at the
+async seam before `Engine::ingest_extracted` merges it. The remote-API hop (1) and local GGUF (2) stay
+deferred; **AAAK** ([`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs), full category/phrase/
+structural maps) is the no-LLM fallback.
 
 **Cost logging** (`cost_log.rs` <- [`core/cost_log.py`](Mnemosyne/mnemosyne/core/cost_log.py)): when
 an LLM call is made (extraction and `llm_conflict_detector`), `log_cost(session_id, memory_count,
@@ -801,6 +860,17 @@ Arc<Engine>, config }`.
   `mnemosyne_graph_{query,link}`, `mnemosyne_export/import`, and the `shared_*` surface tools. The 3
   `mnemosyne_sync_*` tools are added under the `sync` feature (parity with `mnemosyne_hermes`).
 
+**As-built ([`tools.rs`](../../../memory/daemon-mnemosyne/src/tools.rs)):** the dispatch is factored
+into `crate::tools::{defs, dispatch}` (one table + one match, not a giant method); `tools()`/
+`call_tool()` delegate to it. The full surface is implemented over the §13 backing `Engine` methods
+(`get`/`update`/`forget`/`invalidate`/`validate`/`stats`/`diagnose`/`scratchpad_{write,read,clear}`/
+`export`/`import`/`graph_{query,link}`/`triple_{add,end,query}`/`canonical_{remember,recall,forget}`):
+`remember/recall/get/update/forget/invalidate/validate`, `sleep/stats/diagnose`, `triple_{add,end,query}`,
+`{remember,recall}_canonical`, `scratchpad_{write,read,clear}`, `graph_{query,link}`, `export/import`,
+and the `shared_{remember,recall,forget,stats}` surface (`shared_remember` = global scope). Under the
+`sync` feature, `sync_{status,export,import}` land as wrappers over the export-bundle / local surface;
+the full event-log replication subsystem stays P3.
+
 `on_pre_compress` and `on_session_switch` are **not implemented** in the Python provider; in Rust
 they are real (no-op-safe) hooks that map to `before_compact` and a session-end sleep respectively.
 
@@ -848,9 +918,15 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
   MMR), `remember`/`get_context`, a minimal WM->episodic promotion ([`Engine::consolidate`]), and
   `MemoryProvider::{prompt_block, recall, after_turn, on_session_switch}`. Result: a working
   SQLite-backed memory provider daemon-core can register.
-- **P1 — depth:** full `sleep`/consolidation (LLM summarization + tier degradation atop the minimal
-  promotion), dynamics (`typed_memory`, `weibull`), the knowledge layer
-  (triples/annotations/canonical/graph/veracity bonuses), and the full tool surface.
+- **P1 — depth (done):** the deterministic knowledge layer (K1, §10) — triples/annotations/canonical/
+  episodic-graph/veracity stores, regex extraction wired into `remember`/`consolidate`, live
+  graph/fact/entity recall bonuses — **plus** the K2 depth milestone: the injected-`Provider` LLM
+  extraction seam (§11, `Engine::ingest_extracted` layered on the regex baseline), deterministic
+  temporal parsing wired into the write path (§10.5), the full `sleep` (cutoff/pin/batch/atomic-claim/
+  source-group/`summary_of`, LLM-or-AAAK summary, `consolidation_log`) with tiered `degrade_episodic`
+  (§9.3), and the complete ~26-tool `mnemosyne_*` surface (§13, incl. `shared_*` and feature-gated
+  `sync_*`). Still open: dynamics (`typed_memory` classifier, `weibull` recall blend), the tier-2 LLM
+  conflict detector (§10.7), rule-based gists, and `entities::similarity`.
 - **P2 — quality:** enhanced + polyphonic recall, `query_intent`/`query_cache`/`synonyms`, MIB binary
   bonus, plugins, and LLM extraction via Provider.
 - **P3 — ecosystem:** sync/streaming, SHMR, patterns, local-GGUF fallback.

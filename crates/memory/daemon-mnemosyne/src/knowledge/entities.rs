@@ -1,8 +1,55 @@
 //! Entity extraction + fuzzy matching — port of `entities.py`.
 //!
 //! `levenshtein_distance` (L69-L97) and `similarity` (L100-L134) are pure and ported with tests.
-//! `extract_entities_regex` (L137-L205) is a scaffold returning an empty set until the regex
-//! patterns + stopword filters are ported.
+//! `extract_entities_regex` (L137-L205) extracts @handles, #tags, quoted spans, and capitalized
+//! phrases, then applies the stopword/number/lowercase/substring filters.
+
+use regex::Regex;
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+/// Stop words filtered from entity extraction (`entities.py` `ENTITY_EXTRACTION_STOP_WORDS`
+/// L19-L39): standard function words plus meta/system noise mined from LLM summaries.
+const STOP_WORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "as", "is", "was", "are", "were", "be", "been", "being", "have", "has", "had", "do",
+    "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall", "i", "you",
+    "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "its",
+    "our", "their", "this", "that", "these", "those", "here", "there", "where", "when", "what",
+    "which", "who", "whom", "whose", "how", "why", "assistant", "user", "skill", "review",
+    "target", "class", "level", "signals", "phase", "api", "pi", "summary", "added", "active",
+    "not", "whether", "all", "no", "replying", "ai", "memory", "conversation", "fact", "false",
+    "true", "none", "null", "signal", "hermes", "agent", "model", "system", "note", "task",
+    "project", "result", "output", "input", "data", "step", "process", "point", "way", "thing",
+    "time", "work",
+];
+
+fn stop_words() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| STOP_WORDS.iter().copied().collect())
+}
+
+/// True if `word` (expected already lowercased) is a meta/system stop word. Shared with the
+/// annotation `mentions` noise filter.
+pub fn is_stop_word(word: &str) -> bool {
+    stop_words().contains(word)
+}
+
+/// The ordered entity-extraction patterns (`entities.py` `_ENTITY_PATTERNS` L49-L62). Each capture
+/// group 1 is the candidate entity span.
+fn entity_patterns() -> &'static [Regex] {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            Regex::new(r"@(\w{2,30})").unwrap(),
+            Regex::new(r"#(\w{2,30})").unwrap(),
+            Regex::new(r#""([^"]{2,50})""#).unwrap(),
+            Regex::new(r"'([^']{2,50})'").unwrap(),
+            Regex::new(r"\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){1,4})\b").unwrap(),
+            Regex::new(r"\b([A-Z][a-zA-Z]{1,20})\b").unwrap(),
+        ]
+    })
+}
 
 /// Levenshtein edit distance (`entities.py` L69-L97).
 pub fn levenshtein_distance(a: &str, b: &str) -> usize {
@@ -63,10 +110,73 @@ pub fn find_similar_entities(entity: &str, known: &[String], threshold: f64) -> 
     out
 }
 
-/// Regex entity extraction (`entities.py` `extract_entities_regex` L137-L205). Scaffold: empty.
-pub fn extract_entities_regex(_text: &str) -> Vec<String> {
-    // TODO: @handles, #tags, quoted spans, capitalized phrases; stopword/number/dedup filters.
-    Vec::new()
+/// True if every character (ignoring `.` and `,`) is an ASCII digit (`entities.py` L164).
+fn is_pure_number(entity: &str) -> bool {
+    let stripped: String = entity.chars().filter(|c| *c != '.' && *c != ',').collect();
+    !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Regex entity extraction (`entities.py` `extract_entities_regex` L137-L205). Returns the unique,
+/// sorted entity candidates after stopword/number/lowercase filtering and substring dedup.
+pub fn extract_entities_regex(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let stop = stop_words();
+    let mut entities: HashSet<String> = HashSet::new();
+
+    for pattern in entity_patterns() {
+        for caps in pattern.captures_iter(text) {
+            let Some(m) = caps.get(1) else { continue };
+            let entity = m.as_str().trim();
+            if entity.len() < 2 {
+                continue;
+            }
+            let words: Vec<&str> = entity.split_whitespace().collect();
+            // Single-word stopword, or any word a stopword (contaminated phrase).
+            if words.iter().any(|w| stop.contains(w.to_lowercase().as_str())) {
+                continue;
+            }
+            if is_pure_number(entity) {
+                continue;
+            }
+            // Standalone lowercase word: keep only when it came from an @mention/#hashtag (the
+            // preceding char in the source text is `@` or `#`).
+            if words.len() == 1
+                && entity.chars().next().is_some_and(|c| c.is_lowercase())
+                && !entity.starts_with('@')
+                && !entity.starts_with('#')
+            {
+                let start = m.start();
+                let prefix = text[..start].chars().next_back();
+                if !matches!(prefix, Some('@') | Some('#')) {
+                    continue;
+                }
+            }
+            entities.insert(entity.to_string());
+        }
+    }
+
+    // Drop entities that are substrings of a longer entity (skipping @mentions/#hashtags).
+    let all: Vec<String> = entities.iter().cloned().collect();
+    let mut filtered: Vec<String> = all
+        .iter()
+        .filter(|entity| {
+            if entity.starts_with('@') || entity.starts_with('#') {
+                return true;
+            }
+            !all.iter().any(|other| {
+                other != *entity
+                    && !other.starts_with('@')
+                    && !other.starts_with('#')
+                    && other.contains(entity.as_str())
+            })
+        })
+        .cloned()
+        .collect();
+    filtered.sort();
+    filtered.dedup();
+    filtered
 }
 
 #[cfg(test)]
@@ -83,5 +193,32 @@ mod tests {
     fn similarity_exact_and_prefix() {
         assert_eq!(similarity("Maya", "maya"), 1.0);
         assert!(similarity("authentication", "auth") > 0.5);
+    }
+
+    #[test]
+    fn extracts_capitalized_handles_and_quotes() {
+        let got = extract_entities_regex("Maya joined Acme. Ping @alice about \"Blue Falcon\".");
+        // Capitalized name, org, @mention (lowercased, prefix-allowed), and a quoted multi-word span.
+        assert!(got.contains(&"Maya".to_string()), "{got:?}");
+        assert!(got.contains(&"Acme".to_string()), "{got:?}");
+        assert!(got.contains(&"alice".to_string()), "{got:?}");
+        assert!(got.contains(&"Blue Falcon".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn filters_stopwords_numbers_and_lowercase() {
+        // "The" is a stopword; "42" pure number; bare lowercase "stuff" rejected (no @/# prefix).
+        let got = extract_entities_regex("The number is 42 and some stuff happened");
+        assert!(!got.iter().any(|e| e.eq_ignore_ascii_case("the")), "{got:?}");
+        assert!(!got.contains(&"42".to_string()), "{got:?}");
+        assert!(!got.contains(&"stuff".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn drops_substrings_of_longer_entities() {
+        let got = extract_entities_regex("New York is in New York State");
+        // "New York" is a substring of "New York State" -> only the longer survives.
+        assert!(got.contains(&"New York State".to_string()), "{got:?}");
+        assert!(!got.contains(&"New York".to_string()), "{got:?}");
     }
 }

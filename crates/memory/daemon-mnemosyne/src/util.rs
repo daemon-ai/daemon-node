@@ -7,6 +7,12 @@ pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Current date as `YYYY-MM-DD` (mirrors Python's `datetime.now().isoformat()[:10]`, used as the
+/// temporal grain for `triples.valid_from` / `valid_until`).
+pub fn today_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
 /// A 16-char SHA-256 prefix memory id (mirrors `beam.py`'s id derivation).
 pub fn memory_id(content: &str) -> String {
     let mut h = Sha256::new();
