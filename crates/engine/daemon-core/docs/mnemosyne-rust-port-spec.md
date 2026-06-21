@@ -517,6 +517,19 @@ Entity match (L5393, L5454): existing candidate `* 1.3` (cap 1.0); new candidate
   (L6006), diversity rerank for >=4-token queries (L6061), slice `[:top_k]`, then bump
   `recall_count` / `last_recalled` (L6084-L6119).
 
+**As-built ([`engine.rs`](../../../memory/daemon-mnemosyne/src/engine.rs)):** `recall_with_vector`
+gathers WM **and** EM candidates from FTS5 BM25 (`fts_working` / `fts_episodes`, normalized via
+`raw/(1+raw)` and blended with lexical per §7.4 in [`scoring::blend_fts`]), the stored embeddings
+(cosine), and the recency fallback scan (limit 2000), under the always-on validity + scope filters.
+WM rows score with `working_memory_score`; EM rows with `episodic_score` plus the MIB `binary_bonus`
+and the `tier_weight` / `veracity_multiplier` post-multipliers (graph/fact bonuses pass `0` until the
+knowledge layer lands — P1). Results are content-deduped (keeping the higher score), MMR-diversified
+for >=4-token queries ([`mmr::mmr_rerank`]), sliced to `top_k`, and have `recall_count` /
+`last_recalled` bumped. The synonym `+0.75` partial, MEMORIA supplement, and `channel_id`/`author_*`
+scope widening remain TODO. Episodic rows are produced by [`Engine::consolidate`] (a minimal
+WM->episodic promotion wired to `MemoryProvider::on_session_switch(End|Handoff)`; full BEAM `sleep`
+summarization + tier degradation stays P1).
+
 ---
 
 ## 8. Retrieval pipelines (enhanced / polyphonic / SHMR)
@@ -829,12 +842,15 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
 
 ## 15. Phasing
 
-- **P0 — minimal default memory:** `store` (schema + connection + banks), `binary_vectors`,
-  `embeddings` (feature), the linear-hybrid `recall` with exact scoring, `remember`/`get_context`,
-  and `MemoryProvider::{prompt_block, recall, after_turn}`. Result: a working SQLite-backed memory
-  provider daemon-core can register.
-- **P1 — depth:** `sleep`/consolidation, dynamics (`typed_memory`, `weibull`, tier degradation), the
-  knowledge layer (triples/annotations/canonical/graph/veracity), and the full tool surface.
+- **P0 — minimal default memory (done):** `store` (schema + connection + banks), `binary_vectors`,
+  the injected `EmbeddingProvider` seam, the hybrid cross-tier `recall` with exact scoring
+  (FTS5 BM25 + vector + recency gather, `binary_bonus`, tier/veracity multipliers, content dedup +
+  MMR), `remember`/`get_context`, a minimal WM->episodic promotion ([`Engine::consolidate`]), and
+  `MemoryProvider::{prompt_block, recall, after_turn, on_session_switch}`. Result: a working
+  SQLite-backed memory provider daemon-core can register.
+- **P1 — depth:** full `sleep`/consolidation (LLM summarization + tier degradation atop the minimal
+  promotion), dynamics (`typed_memory`, `weibull`), the knowledge layer
+  (triples/annotations/canonical/graph/veracity bonuses), and the full tool surface.
 - **P2 — quality:** enhanced + polyphonic recall, `query_intent`/`query_cache`/`synonyms`, MIB binary
   bonus, plugins, and LLM extraction via Provider.
 - **P3 — ecosystem:** sync/streaming, SHMR, patterns, local-GGUF fallback.
