@@ -54,9 +54,9 @@ fn budget_result(result: &mut ToolResult, budget: usize) {
     }
     let dropped = result.content.len() - cut;
     result.content.truncate(cut);
-    result
-        .content
-        .push_str(&format!("\n... [truncated {dropped} bytes over result budget]"));
+    result.content.push_str(&format!(
+        "\n... [truncated {dropped} bytes over result budget]"
+    ));
 }
 
 #[cfg(test)]

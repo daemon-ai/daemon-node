@@ -188,7 +188,11 @@ fn decode_response(resp: ChatResponse, valid_tools: &[String]) -> ModelOutput {
 
 /// Assemble a [`ModelOutput`] from a captured [`StreamEnd`] through §9 repair.
 fn decode_stream_end(end: StreamEnd, valid_tools: &[String]) -> ModelOutput {
-    let usage = end.captured_usage.as_ref().map(usage_from).unwrap_or_default();
+    let usage = end
+        .captured_usage
+        .as_ref()
+        .map(usage_from)
+        .unwrap_or_default();
     let reasoning = end.captured_reasoning_content.clone();
     let text = end
         .captured_texts()

@@ -7,8 +7,8 @@
 //! brain ([`crate::process_agent::ProcessAgentUnit`]). The §17 ⇄ management translation lives in
 //! [`crate::agent_session`]; this module only supplies the in-process transport.
 
+use crate::agent_session::{AgentSession, AgentUnit};
 use crate::journal::JournalFeeder;
-use crate::agent_session::{AgentUnit, AgentSession};
 use async_trait::async_trait;
 use daemon_common::UnitId;
 use daemon_core::{spawn_agent_session, AgentHandle, Engine};
@@ -56,7 +56,11 @@ impl EngineUnit {
 
     /// As [`Self::spawn`], but durably journals the unit's transcript (finished blocks + lifecycle,
     /// sealed per turn) into `journal` when provided — the fleet/live production journaling path.
-    pub fn spawn_journaled(id: UnitId, engine: Engine, journal: Option<Arc<JournalFeeder>>) -> AgentUnit {
+    pub fn spawn_journaled(
+        id: UnitId,
+        engine: Engine,
+        journal: Option<Arc<JournalFeeder>>,
+    ) -> AgentUnit {
         AgentUnit::start_journaled(id, journal, |host: Arc<dyn HostRequestHandler>| {
             Arc::new(LiveAgentSession {
                 handle: spawn_agent_session(engine, host),

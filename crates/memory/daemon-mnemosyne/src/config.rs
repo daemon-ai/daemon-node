@@ -46,7 +46,10 @@ impl MnemosyneConfig {
         if self.bank == "default" {
             self.data_dir.join("mnemosyne.db")
         } else {
-            self.data_dir.join("banks").join(&self.bank).join("mnemosyne.db")
+            self.data_dir
+                .join("banks")
+                .join(&self.bank)
+                .join("mnemosyne.db")
         }
     }
 }

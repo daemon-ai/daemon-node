@@ -163,7 +163,8 @@ impl Incarnation for CoreIncarnation {
         // When journaling, capture the engine's events so they can be coalesced into finished blocks
         // and sealed after the turn, and so the turn's token usage can be folded into the durable
         // per-session usage surface (the tree projection's usage source); otherwise discard.
-        let captured: Arc<Mutex<Vec<daemon_protocol::AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<daemon_protocol::AgentEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let sink = if self.journal.is_some() {
             let cap = captured.clone();
             EventSink::new(move |ev| cap.lock().unwrap().push(ev))

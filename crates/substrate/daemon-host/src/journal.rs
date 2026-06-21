@@ -43,7 +43,10 @@ fn classify(event: &ManageEvent) -> (&'static str, String) {
 
 /// Whether a management event terminates the segment (the boundary at which the root is sealed).
 fn is_terminal(event: &ManageEvent) -> bool {
-    matches!(event, ManageEvent::Finished { .. } | ManageEvent::Error { .. })
+    matches!(
+        event,
+        ManageEvent::Finished { .. } | ManageEvent::Error { .. }
+    )
 }
 
 fn now_ms() -> u64 {
@@ -80,7 +83,11 @@ pub struct JournalSink {
 impl JournalSink {
     /// Open a journal for a non-durable stream (live session / fleet / foreign): segment 0 chaining
     /// onto [`GENESIS_ROOT`], unfenced.
-    pub fn new(store: Arc<dyn SessionStore>, signer: Arc<TraceSigner>, stream: JournalStreamId) -> Self {
+    pub fn new(
+        store: Arc<dyn SessionStore>,
+        signer: Arc<TraceSigner>,
+        stream: JournalStreamId,
+    ) -> Self {
         Self::with_segment(store, signer, stream, None, 0, GENESIS_ROOT)
     }
 
@@ -130,7 +137,11 @@ impl JournalSink {
         self.segment.load(Ordering::Relaxed)
     }
 
-    async fn append(&self, kind: String, payload: JournalPayload) -> Result<(), daemon_store::StoreError> {
+    async fn append(
+        &self,
+        kind: String,
+        payload: JournalPayload,
+    ) -> Result<(), daemon_store::StoreError> {
         let segment = self.segment.load(Ordering::Relaxed);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let view = JournalEntryView {

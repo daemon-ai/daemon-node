@@ -84,13 +84,19 @@ impl MemoryProvider for MnemosyneProvider {
             Turn::User(u) if u.text.len() > 5 => {
                 let _ = self.engine.remember(
                     &format!("[USER] {}", u.text),
-                    &RememberArgs { importance: 0.5, ..Default::default() },
+                    &RememberArgs {
+                        importance: 0.5,
+                        ..Default::default()
+                    },
                 );
             }
             Turn::Assistant(a) if a.text.len() > 10 => {
                 let _ = self.engine.remember(
                     &format!("[ASSISTANT] {}", a.text),
-                    &RememberArgs { importance: 0.15, ..Default::default() },
+                    &RememberArgs {
+                        importance: 0.15,
+                        ..Default::default()
+                    },
                 );
             }
             _ => {}
@@ -130,8 +136,17 @@ impl MnemosyneProvider {
         match name {
             "mnemosyne_remember" => {
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let importance = args.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
-                match self.engine.remember(content, &RememberArgs { importance, ..Default::default() }) {
+                let importance = args
+                    .get("importance")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5);
+                match self.engine.remember(
+                    content,
+                    &RememberArgs {
+                        importance,
+                        ..Default::default()
+                    },
+                ) {
                     Ok(id) => json!({"status": "ok", "memory_id": id}).to_string(),
                     Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
                 }
@@ -145,7 +160,8 @@ impl MnemosyneProvider {
                             .iter()
                             .map(|r| json!({"id": r.id, "content": r.content, "score": r.score}))
                             .collect();
-                        json!({"query": query, "count": results.len(), "results": results}).to_string()
+                        json!({"query": query, "count": results.len(), "results": results})
+                            .to_string()
                     }
                     Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
                 }

@@ -310,8 +310,8 @@ async fn supervise_child(
         let outcome = tokio::spawn(fut).await;
 
         let abnormal = match &outcome {
-            Ok(Ok(())) => false,             // clean return
-            Ok(Err(_)) => true,              // service returned Err
+            Ok(Ok(())) => false,                  // clean return
+            Ok(Err(_)) => true,                   // service returned Err
             Err(join_err) => join_err.is_panic(), // task panicked
         };
 

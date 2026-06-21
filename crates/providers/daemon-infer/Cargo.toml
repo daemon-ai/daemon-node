@@ -1,0 +1,48 @@
+[package]
+name = "daemon-infer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemon-infer"
+path = "src/bin/daemon-infer.rs"
+
+[features]
+# Default = stub worker only. No engine, no cmake, no ML tree — keeps `cargo test --workspace` light.
+default = []
+# Engine selectors (the worker compiles a backend in when one of these is on).
+llama = ["dep:llama-cpp-4", "dep:encoding_rs"]
+# llama.cpp hardware backends (each implies `llama` and forwards to the llama-cpp-4 feature). ROCm
+# is `hip` (llama-cpp-4 naming).
+cuda = ["llama", "llama-cpp-4/cuda"]
+vulkan = ["llama", "llama-cpp-4/vulkan"]
+hip = ["llama", "llama-cpp-4/hip"]
+metal = ["llama", "llama-cpp-4/metal"]
+opencl = ["llama", "llama-cpp-4/opencl"]
+# mistral.rs engine (async). Hardware backends forward to the mistralrs crate's features.
+mistralrs = ["dep:mistralrs"]
+mistralrs-cuda = ["mistralrs", "mistralrs/cuda"]
+mistralrs-metal = ["mistralrs", "mistralrs/metal"]
+
+[dependencies]
+# Protocol (light; this is all `daemon-providers` pulls with default-features = false).
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+# Worker runtime + the engine-agnostic backend seam.
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+daemon-provision = { workspace = true }
+# Optional engines — feature-gated, never built in the default/stub workspace gate.
+llama-cpp-4 = { workspace = true, optional = true }
+encoding_rs = { workspace = true, optional = true }
+mistralrs = { workspace = true, optional = true }

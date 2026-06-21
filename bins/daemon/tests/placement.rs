@@ -24,8 +24,7 @@ const PARTITION: PartitionId = PartitionId::DEFAULT;
 
 /// The node journal signer seed the spawning parent passes down to the placed child (hex of
 /// `[0x11; 32]`), so the child's sealed chain verifies under the matching verifying key.
-const JOURNAL_SEED_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
+const JOURNAL_SEED_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 /// Spawn the `daemon` binary in its placed-child role as the far side of the cut, passing the node's
 /// journal seed so the child journals its durable transcript through the parent's brokered store.
@@ -50,7 +49,9 @@ fn loaded_entries(seg: &TraceSegment) -> Vec<(u64, Vec<u8>, ContentHash)> {
 
 /// Seed a fresh durable session the placed child will be told to activate.
 async fn seed(store: &dyn SessionStore, id: &SessionId) {
-    let blob = Snapshot::fresh(id.clone()).encode().expect("encode snapshot");
+    let blob = Snapshot::fresh(id.clone())
+        .encode()
+        .expect("encode snapshot");
     store
         .create_session(id.clone(), PARTITION, blob)
         .await

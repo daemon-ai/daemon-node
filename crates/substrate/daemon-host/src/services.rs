@@ -24,7 +24,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// One unit of resident-service work, run once per interval tick.
-pub type TickFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send>> + Send + Sync>;
+pub type TickFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send>> + Send + Sync>;
 
 /// Build a permanent, interval-driven supervised child from a per-tick async action.
 pub fn interval_child(

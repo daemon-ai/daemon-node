@@ -477,7 +477,11 @@ impl CredScope {
             (None, None) => None,
         };
         CredScope {
-            profiles: self.profiles.intersection(&other.profiles).cloned().collect(),
+            profiles: self
+                .profiles
+                .intersection(&other.profiles)
+                .cloned()
+                .collect(),
             actions: self.actions.intersection(&other.actions).cloned().collect(),
             max_tokens: tighter,
         }

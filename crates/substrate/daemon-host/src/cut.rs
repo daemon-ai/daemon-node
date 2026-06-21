@@ -18,6 +18,7 @@
 //!   the ordinary [`ActivationManager`] under the parent-granted fence, and stream events back.
 
 use crate::credentials::CredentialBroker;
+use crate::engine_incarnation::CoreEngineFactory;
 use async_trait::async_trait;
 use daemon_activation::{ActivationManager, ActivationSubstrate, EngineFactory, SubErr};
 use daemon_common::{
@@ -26,9 +27,7 @@ use daemon_common::{
     UsageDelta,
 };
 use daemon_core::CredentialProvider;
-use crate::engine_incarnation::CoreEngineFactory;
 use daemon_provision::{ChildGuard, CutChannel, CutReader, CutWriter, Placement};
-use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics, TraceSigner};
 use daemon_store::{
     Activation, Checkpoint, JobCommand, JobCompletion, JournalPage, SessionStatus, SessionStore,
     StoreError, StoreErrorWire, StoreStats, TraceEntry, TraceSegment,
@@ -38,6 +37,7 @@ use daemon_supervision::{
     ManageRequest, ManageRequestHandler, ManageResponseBody, ManagedUnit, Outcome, StartTrigger,
     UnitKind,
 };
+use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics, TraceSigner};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -437,9 +437,10 @@ impl RemoteStoreClient {
             self.pending.lock().unwrap().remove(&id);
             return StoreReplyBody::Unit(Err(StoreErrorWire::Other("cut channel closed".into())));
         }
-        rx.await.unwrap_or(StoreReplyBody::Unit(Err(StoreErrorWire::Other(
-            "cut reply dropped".into(),
-        ))))
+        rx.await
+            .unwrap_or(StoreReplyBody::Unit(Err(StoreErrorWire::Other(
+                "cut reply dropped".into(),
+            ))))
     }
 }
 
@@ -689,7 +690,9 @@ pub async fn serve_credentials(channel: CutChannel, broker: Arc<dyn CredentialBr
                         CredReplyBody::Secret(broker.use_capability(requester, &lease).await)
                     }
                 };
-                let _ = writer.send(&encode(&CutFrame::CredReply { id, body })).await;
+                let _ = writer
+                    .send(&encode(&CutFrame::CredReply { id, body }))
+                    .await;
             }));
         }
     }
@@ -954,7 +957,11 @@ impl ManagedUnit for PlacedUnit {
                 // The parent (placement authority) acquires the lease; the child commits under it.
                 let fence = match self.store.acquire_activation_lease(&session).await {
                     Ok(fence) => fence,
-                    Err(e) => return Ack::Rejected { reason: e.to_string() },
+                    Err(e) => {
+                        return Ack::Rejected {
+                            reason: e.to_string(),
+                        }
+                    }
                 };
                 match self.activate_under(session, fence).await {
                     Ok(()) => Ack::Accepted,
@@ -1028,9 +1035,8 @@ pub async fn run_placed_child_journaled(
 ) {
     let (writer, reader) = channel.split();
     let client = Arc::new(RemoteStoreClient::new(writer.clone()));
-    let factory = Arc::new(
-        factory.with_journal(client.clone() as Arc<dyn SessionStore>, signer),
-    ) as Arc<dyn EngineFactory>;
+    let factory = Arc::new(factory.with_journal(client.clone() as Arc<dyn SessionStore>, signer))
+        as Arc<dyn EngineFactory>;
     drive_placed_child(writer, reader, client, factory, partition).await;
 }
 
@@ -1043,7 +1049,8 @@ async fn drive_placed_child(
     factory: Arc<dyn EngineFactory>,
     partition: PartitionId,
 ) {
-    let manager = ActivationManager::new(client.clone() as Arc<dyn SessionStore>, factory, partition);
+    let manager =
+        ActivationManager::new(client.clone() as Arc<dyn SessionStore>, factory, partition);
 
     while let Some(bytes) = reader.recv().await {
         let Some(Wire { trace, frame }) = decode(&bytes) else {

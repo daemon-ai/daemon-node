@@ -8,12 +8,21 @@ license.workspace = true
 [dependencies]
 daemon-core = { workspace = true }
 daemon-common = { workspace = true }
+# The local-inference worker: only the light `protocol` module is needed here (no engine, no ML
+# tree). The workspace dep is default-features = false, so this stays cheap.
+daemon-infer = { workspace = true }
+daemon-provision = { workspace = true }
 genai = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true }
+daemon-infer = { workspace = true }
+daemon-core = { workspace = true }
+futures = { workspace = true }

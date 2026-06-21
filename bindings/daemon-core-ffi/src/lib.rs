@@ -405,7 +405,9 @@ impl CoreSessionApi {
         // ACP phase. Until then it uses the Mock provider, the engine's embedded L1 credential pool,
         // and no journal.
         EngineProfile::new(
-            Arc::new(|| Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>),
+            Arc::new(|| {
+                Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>
+            }),
             Arc::new(ToolRegistry::new()),
             SystemPrompt::new("daemon-core-ffi session"),
         )

@@ -22,8 +22,8 @@
 
 use async_trait::async_trait;
 use daemon_common::{SessionId, UnitId, UsageDelta, WireVersion};
-use daemon_protocol::{AgentCommand, HostResponse, TranscriptBlock};
 pub use daemon_protocol::Outbound;
+use daemon_protocol::{AgentCommand, HostResponse, TranscriptBlock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -472,7 +472,9 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             Ok(items) => ApiResponse::Drained(items),
             Err(e) => ApiResponse::Error(e),
         },
-        ApiRequest::Respond { session, response } => unit_or_err(api.respond(session, response).await),
+        ApiRequest::Respond { session, response } => {
+            unit_or_err(api.respond(session, response).await)
+        }
         ApiRequest::SessionHistory {
             session,
             after_cursor,

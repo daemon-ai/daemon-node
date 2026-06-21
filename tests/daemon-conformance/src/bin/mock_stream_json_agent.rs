@@ -15,7 +15,10 @@ fn main() {
     let mut out = stdout.lock();
 
     // Session preamble (the codec ignores `system`/`init`).
-    let _ = writeln!(out, r#"{{"type":"system","subtype":"init","model":"mock"}}"#);
+    let _ = writeln!(
+        out,
+        r#"{{"type":"system","subtype":"init","model":"mock"}}"#
+    );
     let _ = out.flush();
 
     for line in stdin.lock().lines() {

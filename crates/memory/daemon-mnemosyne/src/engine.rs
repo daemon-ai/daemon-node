@@ -158,7 +158,11 @@ impl Engine {
     /// path, episodic tier, and bonuses are TODO.
     pub fn recall(&self, query: &str, top_k: usize) -> Result<Vec<MemoryRow>> {
         let candidates = self.get_context(2000)?;
-        let q_tokens: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+        let q_tokens: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
         let floor = scoring::lexical_floor(q_tokens.len());
         let (_vw, _fw, iw) = scoring::DEFAULT_WEIGHTS;
 
@@ -173,7 +177,11 @@ impl Engine {
             row.score = base * scoring::veracity_multiplier(&row.veracity);
             scored.push(row);
         }
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
         Ok(scored)
     }
@@ -189,7 +197,10 @@ fn lexical_relevance(query_tokens: &[String], content: &str) -> f64 {
     if lc.contains(&query_tokens.join(" ")) {
         return 1.0;
     }
-    let hits = query_tokens.iter().filter(|t| lc.contains(t.as_str())).count();
+    let hits = query_tokens
+        .iter()
+        .filter(|t| lc.contains(t.as_str()))
+        .count();
     hits as f64 / query_tokens.len() as f64
 }
 
@@ -212,9 +223,13 @@ mod tests {
     #[test]
     fn remember_then_recall() {
         let e = engine();
-        e.remember("the authentication flow uses JWT tokens", &RememberArgs::default())
+        e.remember(
+            "the authentication flow uses JWT tokens",
+            &RememberArgs::default(),
+        )
+        .unwrap();
+        e.remember("lunch was pizza", &RememberArgs::default())
             .unwrap();
-        e.remember("lunch was pizza", &RememberArgs::default()).unwrap();
         let hits = e.recall("authentication flow", 5).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].content.contains("authentication"));
@@ -223,8 +238,22 @@ mod tests {
     #[test]
     fn get_context_orders_by_importance() {
         let e = engine();
-        e.remember("low", &RememberArgs { importance: 0.1, ..Default::default() }).unwrap();
-        e.remember("high", &RememberArgs { importance: 0.9, ..Default::default() }).unwrap();
+        e.remember(
+            "low",
+            &RememberArgs {
+                importance: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        e.remember(
+            "high",
+            &RememberArgs {
+                importance: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let ctx = e.get_context(10).unwrap();
         assert_eq!(ctx[0].content, "high");
     }

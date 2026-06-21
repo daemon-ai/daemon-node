@@ -66,7 +66,9 @@ pub fn repair_tool_name(raw: &str, valid: &[String]) -> Result<String, NameRepai
 /// Normalize a tool name for matching: trim, strip surrounding quotes/backticks, drop a leading
 /// `functions.`/`tool.`/`tools.` namespace, lowercase, and unify `-`/space to `_`.
 fn normalize(raw: &str) -> String {
-    let mut s = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    let mut s = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`');
     for prefix in ["functions.", "function.", "tools.", "tool.", "namespace."] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest;
@@ -92,7 +94,10 @@ mod tests {
 
     #[test]
     fn exact_match_passes_through() {
-        assert_eq!(repair_tool_name("read_file", &valid()).unwrap(), "read_file");
+        assert_eq!(
+            repair_tool_name("read_file", &valid()).unwrap(),
+            "read_file"
+        );
     }
 
     #[test]

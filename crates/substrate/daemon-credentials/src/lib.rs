@@ -49,11 +49,16 @@ mod tests {
         let auth = authority(CredMode::Native);
         let ctx = AcquireCtx::default();
         let lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         assert_eq!(lease.mode, CredMode::Native);
         assert!(lease.secret.is_some(), "native carries a token");
-        auth.verify(&lease).expect("a freshly minted capability verifies");
+        auth.verify(&lease)
+            .expect("a freshly minted capability verifies");
     }
 
     #[test]
@@ -61,13 +66,24 @@ mod tests {
         let auth = authority(CredMode::Proxied);
         let ctx = AcquireCtx::default();
         let lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         assert_eq!(lease.mode, CredMode::Proxied);
-        assert!(lease.secret.is_none(), "proxied exposes no secret in the lease");
+        assert!(
+            lease.secret.is_none(),
+            "proxied exposes no secret in the lease"
+        );
         // The owner performs the call and returns only a result — never the raw key.
         let result = auth.use_capability(&ctx, &lease).unwrap();
-        assert_ne!(result.expose(), "sk-configured", "the raw key must never cross back");
+        assert_ne!(
+            result.expose(),
+            "sk-configured",
+            "the raw key must never cross back"
+        );
         assert!(result.expose().starts_with("proxied-result:"));
     }
 
@@ -76,11 +92,18 @@ mod tests {
         let auth = authority(CredMode::Bearer);
         let ctx = AcquireCtx::default();
         let lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         assert_eq!(lease.mode, CredMode::Bearer);
         let secret = lease.secret.as_ref().unwrap().expose().to_string();
-        assert!(secret.starts_with("sk-fresh-"), "fresh per-grant key, got {secret}");
+        assert!(
+            secret.starts_with("sk-fresh-"),
+            "fresh per-grant key, got {secret}"
+        );
         // The issuance is recorded — the audit trail is the compensating control for bearer.
         let granted = auth
             .audit_log()
@@ -95,12 +118,21 @@ mod tests {
         let ctx = AcquireCtx::default();
         // Request more than the grant: extra profile/action and a bigger ceiling.
         let req = CredScope::new(["openai", "anthropic"], ["chat", "admin"], Some(10_000));
-        let lease = auth.acquire(&ctx, &ProfileRef::new("openai"), &req).unwrap();
+        let lease = auth
+            .acquire(&ctx, &ProfileRef::new("openai"), &req)
+            .unwrap();
         assert!(lease.scope.profiles.contains("openai"));
         assert!(!lease.scope.profiles.contains("anthropic"));
         assert!(lease.scope.actions.contains("chat"));
-        assert!(!lease.scope.actions.contains("admin"), "admin is not in the grant");
-        assert_eq!(lease.scope.max_tokens, Some(1_000), "ceiling clamps to the grant");
+        assert!(
+            !lease.scope.actions.contains("admin"),
+            "admin is not in the grant"
+        );
+        assert_eq!(
+            lease.scope.max_tokens,
+            Some(1_000),
+            "ceiling clamps to the grant"
+        );
     }
 
     #[test]
@@ -108,7 +140,11 @@ mod tests {
         let auth = authority(CredMode::Native);
         let ctx = AcquireCtx::default();
         let mut lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         // Tamper with the scope after signing.
         lease.scope.actions.insert("admin".into());
@@ -129,7 +165,11 @@ mod tests {
         );
         let ctx = AcquireCtx::default();
         let lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         assert_eq!(auth.verify(&lease).unwrap_err(), CredError::Expired);
     }
@@ -147,11 +187,21 @@ mod tests {
         );
         let ctx = AcquireCtx::default();
         let lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         auth.revoke(&ctx, &lease.cap_id);
-        assert!(source.is_revoked(&lease.cap_id), "fresh key revoked at the source");
-        assert!(auth.use_capability(&ctx, &lease).is_err(), "revoked capability cannot be used");
+        assert!(
+            source.is_revoked(&lease.cap_id),
+            "fresh key revoked at the source"
+        );
+        assert!(
+            auth.use_capability(&ctx, &lease).is_err(),
+            "revoked capability cannot be used"
+        );
     }
 
     #[test]
@@ -171,7 +221,11 @@ mod tests {
         let auth = authority(CredMode::Proxied);
         let ctx = AcquireCtx::default();
         let mut lease = auth
-            .acquire(&ctx, &ProfileRef::new("openai"), &CredScope::new(["openai"], ["chat"], None))
+            .acquire(
+                &ctx,
+                &ProfileRef::new("openai"),
+                &CredScope::new(["openai"], ["chat"], None),
+            )
             .unwrap();
         // Forge a different cap_id (still must fail signature, but ensure no panic path).
         lease.cap_id = CredId::new("forged");

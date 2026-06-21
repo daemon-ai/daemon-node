@@ -123,7 +123,8 @@ impl NodeApiImpl {
         // Verify each distinct sealed segment the page touches exactly once.
         let mut seg_verified: HashMap<u64, bool> = HashMap::new();
         for je in &page.entries {
-            if let std::collections::hash_map::Entry::Vacant(slot) = seg_verified.entry(je.segment) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = seg_verified.entry(je.segment)
+            {
                 let ok = match &key {
                     Some(k) => self.verify_segment_in_store(&stream, je.segment, k).await,
                     None => false,
@@ -567,7 +568,11 @@ impl LiveSessions {
             .get(session)
             .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
         let mut q = s.drain.lock().unwrap();
-        let take = if max == 0 { q.len() } else { (max as usize).min(q.len()) };
+        let take = if max == 0 {
+            q.len()
+        } else {
+            (max as usize).min(q.len())
+        };
         Ok(q.drain(..take).collect())
     }
 

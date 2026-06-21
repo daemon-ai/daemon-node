@@ -125,7 +125,8 @@ impl ManagerInner {
     async fn run_cycle(&self, id: &SessionId, fence: FenceToken) -> Result<(), SubErr> {
         let activation = self.store.load_for_activation(id, fence).await?;
         let mut inc = self.factory.create();
-        inc.hydrate(activation.snapshot, activation.unapplied).await?;
+        inc.hydrate(activation.snapshot, activation.unapplied)
+            .await?;
         match inc.run().await? {
             Step::Suspended { job } => {
                 let snapshot = inc.checkpoint()?;
@@ -234,7 +235,12 @@ impl ActivationManager {
     /// the host's `RecoveryScanner` resident service runs on an interval.
     pub async fn scan_once(&self) -> Result<usize, SubErr> {
         let mut scanned = 0usize;
-        for id in self.inner.store.scan_resumable(self.inner.partition).await? {
+        for id in self
+            .inner
+            .store
+            .scan_resumable(self.inner.partition)
+            .await?
+        {
             self.wake(id).await?;
             scanned += 1;
         }

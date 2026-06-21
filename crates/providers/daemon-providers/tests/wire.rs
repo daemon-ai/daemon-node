@@ -5,7 +5,7 @@
 //! The mock matches `POST` only (genai appends the adapter's path to our `with_endpoint` base, so we
 //! don't pin the exact path) and returns provider-shaped bodies that `genai` decodes.
 
-use daemon_core::{Failure, Provider, Request, RequestMsg, ToolDef, StreamEvent};
+use daemon_core::{Failure, Provider, Request, RequestMsg, StreamEvent, ToolDef};
 use daemon_providers::GenAiProvider;
 use futures::StreamExt;
 use std::time::Duration;

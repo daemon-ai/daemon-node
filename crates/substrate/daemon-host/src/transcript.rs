@@ -86,7 +86,9 @@ impl BlockCoalescer {
             AgentEvent::ContentDelta { kind, body, .. } => {
                 let mut out = Vec::new();
                 match &mut self.pending_content {
-                    Some((pending_kind, buf)) if pending_kind == kind => buf.extend_from_slice(body),
+                    Some((pending_kind, buf)) if pending_kind == kind => {
+                        buf.extend_from_slice(body)
+                    }
                     _ => {
                         // A new content kind: flush the previous content block first.
                         if let Some(block) = self.take_content() {
@@ -201,11 +203,24 @@ mod tests {
     fn text_deltas_coalesce_into_one_message_at_turn_end() {
         let mut c = BlockCoalescer::new();
         assert!(c
-            .push(&ev(AgentEvent::TurnStarted { seq: 0, trigger: TurnTrigger::User }))
+            .push(&ev(AgentEvent::TurnStarted {
+                seq: 0,
+                trigger: TurnTrigger::User
+            }))
             .iter()
             .any(|a| matches!(a, JournalAction::Management { .. })));
-        assert!(c.push(&ev(AgentEvent::TextDelta { seq: 1, text: "Hello ".into() })).is_empty());
-        assert!(c.push(&ev(AgentEvent::TextDelta { seq: 2, text: "world".into() })).is_empty());
+        assert!(c
+            .push(&ev(AgentEvent::TextDelta {
+                seq: 1,
+                text: "Hello ".into()
+            }))
+            .is_empty());
+        assert!(c
+            .push(&ev(AgentEvent::TextDelta {
+                seq: 2,
+                text: "world".into()
+            }))
+            .is_empty());
         let out = c.push(&ev(AgentEvent::TurnFinished {
             seq: 3,
             summary: TurnSummary::ended(EndReason::Completed),
@@ -222,7 +237,10 @@ mod tests {
     #[test]
     fn tool_boundary_flushes_message_then_emits_tool_blocks() {
         let mut c = BlockCoalescer::new();
-        c.push(&ev(AgentEvent::TextDelta { seq: 0, text: "thinking".into() }));
+        c.push(&ev(AgentEvent::TextDelta {
+            seq: 0,
+            text: "thinking".into(),
+        }));
         let started = c.push(&ev(AgentEvent::ToolStarted {
             seq: 1,
             call: ToolCallView {
@@ -232,8 +250,14 @@ mod tests {
                 detail: None,
             },
         }));
-        assert!(matches!(&started[0], JournalAction::Block(TranscriptBlock::Message { .. })));
-        assert!(matches!(&started[1], JournalAction::Block(TranscriptBlock::ToolCall { .. })));
+        assert!(matches!(
+            &started[0],
+            JournalAction::Block(TranscriptBlock::Message { .. })
+        ));
+        assert!(matches!(
+            &started[1],
+            JournalAction::Block(TranscriptBlock::ToolCall { .. })
+        ));
         let finished = c.push(&ev(AgentEvent::ToolFinished {
             seq: 2,
             result: ToolResultView {
@@ -243,14 +267,25 @@ mod tests {
                 detail: None,
             },
         }));
-        assert!(matches!(&finished[0], JournalAction::Block(TranscriptBlock::ToolResult { ok: true, .. })));
+        assert!(matches!(
+            &finished[0],
+            JournalAction::Block(TranscriptBlock::ToolResult { ok: true, .. })
+        ));
     }
 
     #[test]
     fn content_deltas_concatenate_into_one_block() {
         let mut c = BlockCoalescer::new();
-        c.push(&ev(AgentEvent::ContentDelta { seq: 0, kind: "pty".into(), body: b"foo".to_vec() }));
-        c.push(&ev(AgentEvent::ContentDelta { seq: 1, kind: "pty".into(), body: b"bar".to_vec() }));
+        c.push(&ev(AgentEvent::ContentDelta {
+            seq: 0,
+            kind: "pty".into(),
+            body: b"foo".to_vec(),
+        }));
+        c.push(&ev(AgentEvent::ContentDelta {
+            seq: 1,
+            kind: "pty".into(),
+            body: b"bar".to_vec(),
+        }));
         let out = c.push(&ev(AgentEvent::TurnFinished {
             seq: 2,
             summary: TurnSummary::ended(EndReason::Completed),
@@ -265,7 +300,10 @@ mod tests {
     fn reasoning_is_dropped() {
         let mut c = BlockCoalescer::new();
         assert!(c
-            .push(&ev(AgentEvent::ReasoningDelta { seq: 0, text: "secret".into() }))
+            .push(&ev(AgentEvent::ReasoningDelta {
+                seq: 0,
+                text: "secret".into()
+            }))
             .is_empty());
     }
 
@@ -274,7 +312,9 @@ mod tests {
         let mut c = BlockCoalescer::new();
         let out = c.push(&Outbound::Request(HostRequest {
             request_id: ReqId(7),
-            kind: HostRequestKind::Input { prompt: "name?".into() },
+            kind: HostRequestKind::Input {
+                prompt: "name?".into(),
+            },
         }));
         assert!(matches!(
             &out[0],

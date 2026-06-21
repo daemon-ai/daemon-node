@@ -13,6 +13,9 @@ path = "src/main.rs"
 daemon-common = { workspace = true }
 daemon-core = { workspace = true }
 daemon-providers = { workspace = true }
+# Only the light `protocol` types (Engine/ModelParams/Sampling) are needed to build a LocalProvider;
+# the workspace dep is default-features = false, keeping the engine/ML tree out of the daemon binary.
+daemon-infer = { workspace = true }
 daemon-host = { workspace = true }
 daemon-node = { workspace = true }
 daemon-credentials = { workspace = true }

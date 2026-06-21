@@ -25,14 +25,14 @@ use daemon_core::{
 };
 use daemon_host::{
     AgentSession, AgentUnit, CodecSession, CoreEngineFactory, EngineUnit, FleetControl, Host,
-    HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit,
-    ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
+    HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl,
+    ProcessAgentUnit, ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
 };
-use daemon_protocol::HostRequestHandler;
-use daemon_telemetry::TraceSigner;
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
+use daemon_protocol::HostRequestHandler;
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
+use daemon_telemetry::TraceSigner;
 
 /// The provider-registry profile name the orchestrator (parent) engine resolves to.
 const ORCHESTRATOR_PROFILE: &str = "orchestrator";
@@ -175,13 +175,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
 
     // One durable job worker for the whole node: every delegation (top or nested) materializes a
     // parent-bound durable child session seeded from the same orchestrator profile.
-    let host = Host::new(a.store.clone(), Arc::new(factory), a.host_config).with_job_worker(
-        Arc::new(FleetJobWorker::new(
-            a.store.clone(),
-            a.partition,
-            orchestrator_profile,
-        )),
-    );
+    let host =
+        Host::new(a.store.clone(), Arc::new(factory), a.host_config).with_job_worker(Arc::new(
+            FleetJobWorker::new(a.store.clone(), a.partition, orchestrator_profile),
+        ));
     let handle = host.start();
 
     // The interactive (session sub-surface) engines: built from the same seam (resolved provider +
@@ -206,7 +203,8 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             host.manager().clone(),
             a.partition,
             session_builder,
-            Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>),
+            Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone()))
+                as Arc<dyn FleetControl>),
         )
         // Live interactive sessions journal per turn; also records the signer so history reads verify.
         .with_journal(a.store.clone(), signer.clone()),
@@ -420,10 +418,7 @@ impl JobWorker for FleetJobWorker {
                 let work = String::from_utf8_lossy(&job.payload).into_owned();
                 let mut engine = self.profile.fresh(child.clone());
                 engine.push_user(daemon_protocol::UserMsg::new(work));
-                let blob = engine
-                    .snapshot()
-                    .encode()
-                    .map_err(ServiceError::new)?;
+                let blob = engine.snapshot().encode().map_err(ServiceError::new)?;
                 self.store
                     .create_session(child.clone(), self.partition, blob)
                     .await
@@ -485,10 +480,7 @@ impl FleetViewImpl {
             state,
             work: self.store.delegation_work(session).await,
             usage: self.store.usage_of(session).await,
-            children: children
-                .iter()
-                .map(|c| UnitId::new(c.as_str()))
-                .collect(),
+            children: children.iter().map(|c| UnitId::new(c.as_str())).collect(),
         }
     }
 }

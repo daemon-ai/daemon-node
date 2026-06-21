@@ -15,7 +15,9 @@
 //! an incarnation (durable). The store persists only the opaque view bytes, the content hashes, and
 //! the 32-byte roots; all crypto lives here (layout §3 keeps the DAG root crypto-free).
 
-use bc_components::{PrivateKeyBase, Signature, Signer, SigningPrivateKey, SigningPublicKey, Verifier};
+use bc_components::{
+    PrivateKeyBase, Signature, Signer, SigningPrivateKey, SigningPublicKey, Verifier,
+};
 use bc_envelope::prelude::*;
 use daemon_common::{ContentHash, JournalStreamId, MerkleRoot};
 use serde::{Deserialize, Serialize};
@@ -300,7 +302,9 @@ mod tests {
             trace: 1,
             kind: "block.message".into(),
             timestamp_ms: 2_000 + seq,
-            payload: JournalPayload::Block { body: body.to_vec() },
+            payload: JournalPayload::Block {
+                body: body.to_vec(),
+            },
         }
     }
 
@@ -349,17 +353,35 @@ mod tests {
         let records = [mgmt("det", 0, 0, "a"), block("det", 0, 1, b"b")];
         let e1 = build_segment(&records);
         let e2 = build_segment(&records);
-        let i1 = SegmentInput { stream: &stream, segment: 0, prior: GENESIS_ROOT, entries: &e1 };
-        let i2 = SegmentInput { stream: &stream, segment: 0, prior: GENESIS_ROOT, entries: &e2 };
+        let i1 = SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &e1,
+        };
+        let i2 = SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &e2,
+        };
         assert_eq!(segment_root(&i1).unwrap(), segment_root(&i2).unwrap());
     }
 
     #[test]
     fn tampering_a_block_body_is_detected() {
         let stream = JournalStreamId::new("tamper");
-        let records = [block("tamper", 0, 0, b"original"), mgmt("tamper", 0, 1, "mgmt.finished")];
+        let records = [
+            block("tamper", 0, 0, b"original"),
+            mgmt("tamper", 0, 1, "mgmt.finished"),
+        ];
         let mut entries = build_segment(&records);
-        let input = SegmentInput { stream: &stream, segment: 0, prior: GENESIS_ROOT, entries: &entries };
+        let input = SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &entries,
+        };
         let root = segment_root(&input).unwrap();
         let signer = TraceSigner::generate();
         let sig = signer.sign_root(&root);
@@ -368,29 +390,59 @@ mod tests {
         let tampered_view = block("tamper", 0, 0, b"forged!!");
         let (tampered_bytes, _) = encode_entry(&tampered_view);
         entries[0].1 = tampered_bytes;
-        let tampered = SegmentInput { stream: &stream, segment: 0, prior: GENESIS_ROOT, entries: &entries };
+        let tampered = SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &entries,
+        };
         let err = verify_segment(&tampered, &root, &sig, &signer.verifying_key()).unwrap_err();
-        assert!(matches!(err, VerifyError::ContentHashMismatch | VerifyError::RootMismatch));
+        assert!(matches!(
+            err,
+            VerifyError::ContentHashMismatch | VerifyError::RootMismatch
+        ));
     }
 
     #[test]
     fn cross_segment_chain_links() {
         let stream = JournalStreamId::new("chain");
-        let r0 = [mgmt("chain", 0, 0, "mgmt.started"), mgmt("chain", 0, 1, "mgmt.finished")];
+        let r0 = [
+            mgmt("chain", 0, 0, "mgmt.started"),
+            mgmt("chain", 0, 1, "mgmt.finished"),
+        ];
         let e0 = build_segment(&r0);
-        let i0 = SegmentInput { stream: &stream, segment: 0, prior: GENESIS_ROOT, entries: &e0 };
+        let i0 = SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &e0,
+        };
         let root0 = segment_root(&i0).unwrap();
 
-        let r1 = [block("chain", 1, 0, b"turn 2"), mgmt("chain", 1, 1, "mgmt.finished")];
+        let r1 = [
+            block("chain", 1, 0, b"turn 2"),
+            mgmt("chain", 1, 1, "mgmt.finished"),
+        ];
         let e1 = build_segment(&r1);
-        let i1 = SegmentInput { stream: &stream, segment: 1, prior: root0, entries: &e1 };
+        let i1 = SegmentInput {
+            stream: &stream,
+            segment: 1,
+            prior: root0,
+            entries: &e1,
+        };
         let root1 = segment_root(&i1).unwrap();
         let signer = TraceSigner::generate();
         let sig1 = signer.sign_root(&root1);
 
-        verify_segment(&i1, &root1, &sig1, &signer.verifying_key()).expect("chained segment verifies");
+        verify_segment(&i1, &root1, &sig1, &signer.verifying_key())
+            .expect("chained segment verifies");
 
-        let broken = SegmentInput { stream: &stream, segment: 1, prior: GENESIS_ROOT, entries: &e1 };
+        let broken = SegmentInput {
+            stream: &stream,
+            segment: 1,
+            prior: GENESIS_ROOT,
+            entries: &e1,
+        };
         assert_eq!(
             verify_segment(&broken, &root1, &sig1, &signer.verifying_key()).unwrap_err(),
             VerifyError::RootMismatch
@@ -413,7 +465,12 @@ mod tests {
         let stream = JournalStreamId::new("sig");
         let records = [mgmt("sig", 0, 0, "mgmt.started")];
         let entries = build_segment(&records);
-        let input = SegmentInput { stream: &stream, segment: 0, prior: GENESIS_ROOT, entries: &entries };
+        let input = SegmentInput {
+            stream: &stream,
+            segment: 0,
+            prior: GENESIS_ROOT,
+            entries: &entries,
+        };
         let root = segment_root(&input).unwrap();
         let signer = TraceSigner::generate();
         let sig = signer.sign_root(&root);

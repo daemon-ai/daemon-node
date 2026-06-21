@@ -31,7 +31,9 @@ impl AnswerPolicy for DefaultAnswerPolicy {
     fn decide(&self, req: &ManageRequest) -> Decision {
         match &req.kind {
             ManageRequestKind::Approval(_) => Decision::Answer(ManageResponseBody::Approved(true)),
-            ManageRequestKind::Input(_) => Decision::Answer(ManageResponseBody::Input(String::new())),
+            ManageRequestKind::Input(_) => {
+                Decision::Answer(ManageResponseBody::Input(String::new()))
+            }
             ManageRequestKind::Choice(_) => Decision::Answer(ManageResponseBody::Chosen(0)),
             // Delegate is grown by the runtime before the policy is consulted; if it reaches here
             // (e.g. over the child budget) it escalates like any unresolvable request.

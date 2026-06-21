@@ -127,7 +127,13 @@ impl CredentialAuthority {
         profile: &ProfileRef,
         scope: &CredScope,
     ) -> Result<CapabilityLease, CredError> {
-        self.push_audit(CredAuditKind::Request, None, scope.clone(), ctx, String::new());
+        self.push_audit(
+            CredAuditKind::Request,
+            None,
+            scope.clone(),
+            ctx,
+            String::new(),
+        );
         if profile != &self.profile {
             let e = CredError::Unavailable(profile.to_string());
             self.push_audit(CredAuditKind::Deny, None, scope.clone(), ctx, e.to_string());
@@ -151,7 +157,9 @@ impl CredentialAuthority {
         ));
         let provisioned = self.source.provision(&cap_id, self.mode)?;
         let secret = match self.mode {
-            CredMode::Native | CredMode::Bearer => Some(LeaseSecret::new(provisioned.secret.clone())),
+            CredMode::Native | CredMode::Bearer => {
+                Some(LeaseSecret::new(provisioned.secret.clone()))
+            }
             CredMode::Proxied => {
                 // The real key stays here; the holder only ever gets a handle.
                 self.proxied

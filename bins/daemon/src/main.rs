@@ -26,8 +26,9 @@ use daemon_host::{
     CoreEngineFactory, CredentialBroker, EngineUnit, HostConfig, JournalFeeder, JournalSink,
     OwnerBroker,
 };
+use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
-use daemon_providers::GenAiProvider;
+use daemon_providers::{GenAiProvider, LocalProvider, WorkerConfig};
 use daemon_provision::CutChannel;
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
@@ -101,8 +102,44 @@ fn build_providers(cfg: &NodeConfig) -> ProviderRegistry {
                 Arc::new(p) as Arc<dyn Provider>
             }));
         }
+        ProviderKind::LlamaCpp | ProviderKind::MistralRs => {
+            let engine = match cfg.provider_kind {
+                ProviderKind::MistralRs => Engine::MistralRs,
+                _ => Engine::Llama,
+            };
+            if cfg.model.is_empty() {
+                tracing::warn!(
+                    "local provider selected but no model set; set DAEMON_MODEL to the GGUF path / HF id"
+                );
+            }
+            // One supervised worker, shared (cloned) across every profile/engine: a single local
+            // model lives in VRAM once and serializes generations behind the provider's mutex.
+            let provider: Arc<dyn Provider> =
+                Arc::new(LocalProvider::new(local_worker_config(cfg, engine)));
+            providers.set_default(Arc::new(move || provider.clone()));
+        }
     }
     providers
+}
+
+/// Build the [`WorkerConfig`] for a local provider from the node config's `[local]` tuning.
+fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
+    let local = &cfg.local;
+    let mut wc = WorkerConfig::new(local.worker_bin.clone(), engine, cfg.model.clone());
+    wc.params = ModelParams {
+        n_gpu_layers: local.n_gpu_layers,
+        n_ctx: local.n_ctx,
+        n_threads: local.n_threads,
+        flash_attn: local.flash_attn,
+        isq: local.isq.clone(),
+    };
+    wc.max_tokens = local.max_tokens;
+    wc.load_timeout = local.load_timeout;
+    wc.ttft_timeout = local.ttft_timeout;
+    wc.inter_token_timeout = local.inter_token_timeout;
+    wc.max_restarts = local.max_restarts;
+    wc.restart_window = local.restart_window;
+    wc
 }
 
 /// Build the durable store backend the config selected.
@@ -236,7 +273,9 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
     ));
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "transport server listening");
-    Arc::new(RemoteHost::new(store, unit)).serve(listener).await?;
+    Arc::new(RemoteHost::new(store, unit))
+        .serve(listener)
+        .await?;
     Ok(())
 }
 

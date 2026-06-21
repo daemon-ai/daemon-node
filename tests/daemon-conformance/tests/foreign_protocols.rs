@@ -106,7 +106,11 @@ async fn drive_protocol(program: PathBuf, protocol: ForeignProtocol, label: &str
             budget: Budget::unlimited(),
         })
         .await;
-    assert_eq!(ack, Ack::Accepted, "the foreign unit should accept the work");
+    assert_eq!(
+        ack,
+        Ack::Accepted,
+        "the foreign unit should accept the work"
+    );
 
     let terminal = await_terminal(&mut events).await;
     assert!(

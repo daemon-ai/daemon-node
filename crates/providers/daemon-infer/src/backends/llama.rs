@@ -1,0 +1,367 @@
+//! The llama.cpp backend (`llama-cpp-4`).
+//!
+//! `llama-cpp-4` is synchronous and `!Send` (`LlamaModel`/`LlamaContext` wrap raw pointers), so the
+//! model is loaded and used on a single dedicated OS thread. [`LlamaCppBackend`] holds an mpsc sender
+//! to that thread; each [`InferenceBackend::generate`] enqueues a job (request + chunk sender + a
+//! cancel token + a oneshot for the terminal result) and awaits its completion. tokio's
+//! `UnboundedSender` and `tokio_util`'s `CancellationToken` are both usable from the sync thread, so
+//! the thread streams chunks and polls cancellation without any async runtime of its own.
+//!
+//! Phase 1 streams text + usage + classified errors + cooperative cancel. Native tool-call parsing
+//! (this engine emits none) lands in the Phase-1b tool-calling pass; until then `supports_native_tools`
+//! is false and no tool chunks are produced.
+
+use std::num::NonZeroU32;
+use std::sync::mpsc as std_mpsc;
+
+use llama_cpp_4::context::params::LlamaContextParams;
+use llama_cpp_4::llama_backend::LlamaBackend;
+use llama_cpp_4::llama_batch::LlamaBatch;
+use llama_cpp_4::model::params::LlamaModelParams;
+use llama_cpp_4::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
+use llama_cpp_4::sampling::LlamaSampler;
+use llama_cpp_4::DecodeError;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+
+use crate::backend::{BackendChunk, BackendError, GenerateRequest, InferenceBackend};
+use crate::protocol::{Capabilities, ModelParams, Sampling, ToolCallFormat, Usage};
+use crate::tooling;
+
+/// The output-token cap when a request leaves `max_tokens` unset (`0`).
+const DEFAULT_MAX_TOKENS: u32 = 1024;
+
+/// One generation handed to the dedicated llama thread.
+struct Job {
+    req: GenerateRequest,
+    chunks: UnboundedSender<BackendChunk>,
+    cancel: CancellationToken,
+    done: oneshot::Sender<Result<Usage, BackendError>>,
+}
+
+/// A loaded llama.cpp model whose generations run on a dedicated thread.
+pub struct LlamaCppBackend {
+    jobs: std_mpsc::Sender<Job>,
+    capabilities: Capabilities,
+}
+
+impl LlamaCppBackend {
+    /// Spawn the engine thread, load `model_path`, and block until it reports ready (or fails).
+    pub fn load(model_path: &str, params: &ModelParams) -> Result<Self, BackendError> {
+        let (jobs_tx, jobs_rx) = std_mpsc::channel::<Job>();
+        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<Capabilities, BackendError>>();
+        let model_path = model_path.to_string();
+        let params = params.clone();
+        std::thread::Builder::new()
+            .name("llama-infer".into())
+            .spawn(move || worker_thread(model_path, params, jobs_rx, ready_tx))
+            .map_err(|e| BackendError::fatal(format!("spawn llama thread: {e}")))?;
+        match ready_rx.recv() {
+            Ok(Ok(capabilities)) => Ok(Self {
+                jobs: jobs_tx,
+                capabilities,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(BackendError::fatal(
+                "llama worker thread exited during load",
+            )),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl InferenceBackend for LlamaCppBackend {
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    async fn generate(
+        &self,
+        req: GenerateRequest,
+        tx: UnboundedSender<BackendChunk>,
+        cancel: CancellationToken,
+    ) -> Result<Usage, BackendError> {
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = Job {
+            req,
+            chunks: tx,
+            cancel,
+            done: done_tx,
+        };
+        self.jobs
+            .send(job)
+            .map_err(|_| BackendError::fatal("llama worker thread is gone"))?;
+        done_rx
+            .await
+            .map_err(|_| BackendError::transient("llama worker dropped the job"))?
+    }
+}
+
+/// The dedicated thread: init the backend, load the model, then service jobs until the channel closes.
+fn worker_thread(
+    model_path: String,
+    params: ModelParams,
+    jobs_rx: std_mpsc::Receiver<Job>,
+    ready_tx: std_mpsc::Sender<Result<Capabilities, BackendError>>,
+) {
+    let backend = match LlamaBackend::init() {
+        Ok(backend) => backend,
+        Err(e) => {
+            let _ = ready_tx.send(Err(BackendError::fatal(format!("llama backend init: {e}"))));
+            return;
+        }
+    };
+
+    let mut model_params = LlamaModelParams::default();
+    if params.n_gpu_layers > 0 {
+        model_params = model_params.with_n_gpu_layers(params.n_gpu_layers);
+    }
+    let model = match LlamaModel::load_from_file(&backend, &model_path, &model_params) {
+        Ok(model) => model,
+        Err(e) => {
+            let _ = ready_tx.send(Err(BackendError::fatal(format!(
+                "load model {model_path}: {e}"
+            ))));
+            return;
+        }
+    };
+
+    let capabilities = Capabilities {
+        supports_native_tools: false,
+        supports_streaming: true,
+        // The engine emits no native tool calls; Phase 1b parses text per this format.
+        tool_call_format: ToolCallFormat::HermesXml,
+        max_context: Some(model.n_ctx_train()),
+    };
+    if ready_tx.send(Ok(capabilities)).is_err() {
+        return;
+    }
+    drop(ready_tx);
+
+    while let Ok(job) = jobs_rx.recv() {
+        let result = run_generation(
+            &backend,
+            &model,
+            &params,
+            &job.req,
+            &job.chunks,
+            &job.cancel,
+        );
+        let _ = job.done.send(result);
+    }
+}
+
+/// Run one generation: render the prompt, prefill, then sample/decode token-by-token, streaming text.
+fn run_generation(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    params: &ModelParams,
+    req: &GenerateRequest,
+    chunks: &UnboundedSender<BackendChunk>,
+    cancel: &CancellationToken,
+) -> Result<Usage, BackendError> {
+    if cancel.is_cancelled() {
+        return Err(BackendError::cancelled());
+    }
+
+    let prompt = render_prompt(model, req);
+
+    let n_ctx = if params.n_ctx > 0 {
+        params.n_ctx
+    } else {
+        model.n_ctx_train()
+    }
+    .max(8);
+
+    let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
+    if let Some(threads) = params.n_threads {
+        ctx_params = ctx_params.with_n_threads(threads as i32);
+    }
+    if params.flash_attn {
+        ctx_params = ctx_params.with_flash_attention(true);
+    }
+    // A failed context allocation is almost always KV-cache VRAM/host OOM.
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|e| BackendError::out_of_memory(format!("create context: {e}")))?;
+
+    let tokens = model
+        .str_to_token(&prompt, AddBos::Always)
+        .map_err(|e| BackendError::transient(format!("tokenize: {e}")))?;
+    let prompt_len = tokens.len() as u32;
+    if prompt_len >= n_ctx {
+        return Err(BackendError::context_overflow(format!(
+            "prompt {prompt_len} tokens >= context {n_ctx}"
+        )));
+    }
+
+    let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+    let last = tokens.len().saturating_sub(1);
+    for (i, token) in tokens.iter().enumerate() {
+        batch
+            .add(*token, i as i32, &[0], i == last)
+            .map_err(|e| BackendError::transient(format!("batch add: {e}")))?;
+    }
+    ctx.decode(&mut batch).map_err(classify_decode)?;
+
+    let mut sampler = build_sampler(&req.sampling);
+
+    let budget = if req.max_tokens > 0 {
+        req.max_tokens
+    } else {
+        DEFAULT_MAX_TOKENS
+    }
+    .min(n_ctx - prompt_len);
+
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut n_cur = batch.n_tokens();
+    let mut produced: u32 = 0;
+
+    // With tools offered, buffer the full output so tool-call markup can be parsed out before any
+    // text is surfaced; without tools, stream pieces live for low latency.
+    let has_tools = !req.tools.is_empty();
+    let mut buffered = String::new();
+
+    while produced < budget {
+        if cancel.is_cancelled() {
+            return Err(BackendError::cancelled());
+        }
+
+        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let bytes = model
+            .token_to_bytes(token, Special::Plaintext)
+            .map_err(|e| BackendError::transient(format!("detokenize: {e}")))?;
+        let mut piece = String::new();
+        let _ = decoder.decode_to_string(&bytes, &mut piece, false);
+        if !piece.is_empty() {
+            if has_tools {
+                buffered.push_str(&piece);
+            } else if chunks.send(BackendChunk::Text(piece)).is_err() {
+                // The consumer dropped the receiver (cancel/abort upstream); stop quietly.
+                break;
+            }
+        }
+
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .map_err(|e| BackendError::transient(format!("batch add: {e}")))?;
+        n_cur += 1;
+        produced += 1;
+        ctx.decode(&mut batch).map_err(classify_decode)?;
+    }
+
+    if has_tools {
+        let (cleaned, calls) = tooling::extract_tool_calls(&buffered);
+        if !cleaned.is_empty() {
+            let _ = chunks.send(BackendChunk::Text(cleaned));
+        }
+        for call in calls {
+            if chunks.send(BackendChunk::Tool(call)).is_err() {
+                break;
+            }
+        }
+    }
+
+    Ok(Usage {
+        input_tokens: prompt_len as u64,
+        output_tokens: produced as u64,
+    })
+}
+
+/// Render the conversation into a prompt via the model's built-in chat template, falling back to a
+/// simple role-tagged concatenation when the GGUF carries no template.
+fn render_prompt(model: &LlamaModel, req: &GenerateRequest) -> String {
+    let mut messages = Vec::new();
+    let system = compose_system(req);
+    if !system.is_empty() {
+        if let Ok(m) = LlamaChatMessage::new("system".to_string(), system) {
+            messages.push(m);
+        }
+    }
+    for msg in &req.messages {
+        if let Ok(m) =
+            LlamaChatMessage::new(normalize_role(&msg.role).to_string(), msg.content.clone())
+        {
+            messages.push(m);
+        }
+    }
+    let template: Option<String> = None;
+    match model.apply_chat_template(template.as_deref(), &messages, true) {
+        Ok(prompt) => prompt,
+        Err(_) => fallback_prompt(req),
+    }
+}
+
+/// The effective system prompt: the request's system text, prefixed with the tool-advertisement
+/// preamble when tools are offered.
+fn compose_system(req: &GenerateRequest) -> String {
+    match tooling::tool_preamble(&req.tools) {
+        Some(preamble) if req.system.is_empty() => preamble,
+        Some(preamble) => format!("{preamble}\n{}", req.system),
+        None => req.system.clone(),
+    }
+}
+
+/// Map our roles onto the set chat templates accept; unknown roles degrade to `user`.
+fn normalize_role(role: &str) -> &str {
+    match role {
+        "system" | "user" | "assistant" | "tool" => role,
+        _ => "user",
+    }
+}
+
+/// A template-free prompt: role-tagged lines plus a trailing assistant cue.
+fn fallback_prompt(req: &GenerateRequest) -> String {
+    let mut s = String::new();
+    let system = compose_system(req);
+    if !system.is_empty() {
+        s.push_str(&system);
+        s.push_str("\n\n");
+    }
+    for msg in &req.messages {
+        s.push_str(normalize_role(&msg.role));
+        s.push_str(": ");
+        s.push_str(&msg.content);
+        s.push('\n');
+    }
+    s.push_str("assistant: ");
+    s
+}
+
+/// Build a sampler chain from the request's sampling params (greedy when temperature <= 0).
+fn build_sampler(s: &Sampling) -> LlamaSampler {
+    if s.temperature <= 0.0 {
+        return LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+    }
+    let mut chain = Vec::new();
+    if s.top_k > 0 {
+        chain.push(LlamaSampler::top_k(s.top_k as i32));
+    }
+    if s.top_p < 1.0 {
+        chain.push(LlamaSampler::top_p(s.top_p, 1));
+    }
+    chain.push(LlamaSampler::temp(s.temperature));
+    chain.push(LlamaSampler::dist(s.seed as u32));
+    LlamaSampler::chain_simple(chain)
+}
+
+/// Classify a decode failure: a full KV cache / context is a context overflow, an allocator failure
+/// is OOM, anything else is transient (worth one retry on a fresh worker).
+fn classify_decode(e: DecodeError) -> BackendError {
+    let msg = e.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("kv") || lower.contains("n_ctx") || lower.contains("context") {
+        BackendError::context_overflow(format!("decode: {msg}"))
+    } else if lower.contains("memory") || lower.contains("alloc") || lower.contains("oom") {
+        BackendError::out_of_memory(format!("decode: {msg}"))
+    } else {
+        BackendError::transient(format!("decode: {msg}"))
+    }
+}

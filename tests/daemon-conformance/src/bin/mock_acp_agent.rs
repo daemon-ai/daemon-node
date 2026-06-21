@@ -22,9 +22,7 @@ async fn main() -> Result<()> {
         .builder()
         .name("mock-acp-agent")
         .on_receive_request(
-            async move |init: InitializeRequest,
-                        responder: Responder<InitializeResponse>,
-                        _cx| {
+            async move |init: InitializeRequest, responder: Responder<InitializeResponse>, _cx| {
                 responder.respond(
                     InitializeResponse::new(init.protocol_version)
                         .agent_capabilities(AgentCapabilities::new()),
@@ -33,9 +31,9 @@ async fn main() -> Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: NewSessionRequest,
-                        responder: Responder<NewSessionResponse>,
-                        _cx| { responder.respond(NewSessionResponse::new("mock-acp-session")) },
+            async move |_req: NewSessionRequest, responder: Responder<NewSessionResponse>, _cx| {
+                responder.respond(NewSessionResponse::new("mock-acp-session"))
+            },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(

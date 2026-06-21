@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_session;
 pub mod config;
 pub mod credentials;
 pub mod cut;
@@ -37,7 +38,6 @@ pub mod foreign;
 pub mod journal;
 pub mod node_api;
 pub mod process_agent;
-pub mod agent_session;
 pub mod services;
 pub mod socket;
 pub mod streamjson;
@@ -45,6 +45,8 @@ pub mod supervisor;
 pub mod transcript;
 pub mod unit;
 
+pub use agent_session::AgentSession;
+pub use agent_session::AgentUnit;
 pub use config::HostConfig;
 pub use credentials::{
     BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,
@@ -53,20 +55,18 @@ pub use cut::{
     run_placed_child, run_placed_child_journaled, serve_credentials, CredCall, CredReplyBody,
     CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
 };
-pub use journal::{journal_stream, JournalFeeder, JournalSink};
-pub use transcript::{BlockCoalescer, JournalAction};
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
-pub use agent_session::AgentSession;
-pub use streamjson::StreamJsonCodec;
+pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use node_api::{NodeApiImpl, SessionEngineBuilder};
+pub use process_agent::ProcessAgentUnit;
 pub use socket::{serve_api_unix, ApiClient};
+pub use streamjson::StreamJsonCodec;
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle, SupervisorObserver,
 };
-pub use process_agent::ProcessAgentUnit;
-pub use agent_session::AgentUnit;
+pub use transcript::{BlockCoalescer, JournalAction};
 pub use unit::EngineUnit;
 
 use async_trait::async_trait;

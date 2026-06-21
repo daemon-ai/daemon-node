@@ -82,8 +82,14 @@ impl CredentialSource for StubCredentialSource {
             CredMode::Bearer => {
                 if self.can_mint {
                     let key = format!("sk-fresh-{cap_id}");
-                    self.minted.lock().unwrap().insert(cap_id.clone(), key.clone());
-                    Ok(Provisioned { secret: key, fresh: true })
+                    self.minted
+                        .lock()
+                        .unwrap()
+                        .insert(cap_id.clone(), key.clone());
+                    Ok(Provisioned {
+                        secret: key,
+                        fresh: true,
+                    })
                 } else {
                     // Hand over the configured long-lived key (audit-only revocation).
                     Ok(Provisioned {

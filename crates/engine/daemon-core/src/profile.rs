@@ -16,10 +16,10 @@
 use crate::config::Config;
 use crate::context::ContextEngine;
 use crate::conversation::SystemPrompt;
-use crate::memory::MemoryProvider;
 use crate::credentials::CredentialProvider;
 use crate::engine::Engine;
 use crate::exec::ExecutionEnvironment;
+use crate::memory::MemoryProvider;
 use crate::provider::Provider;
 use crate::snapshot::Snapshot;
 use crate::tools::ToolRegistry;
@@ -58,7 +58,11 @@ impl EngineProfile {
     /// A profile over a provider builder, tool registry, and system prompt. Credentials default to
     /// the engine's embedded L1 pool until [`EngineProfile::with_credentials`] injects an
     /// authority-backed one; the budget defaults to unlimited and tunables to [`Config::default`].
-    pub fn new(provider: ProviderBuilder, registry: Arc<ToolRegistry>, system: SystemPrompt) -> Self {
+    pub fn new(
+        provider: ProviderBuilder,
+        registry: Arc<ToolRegistry>,
+        system: SystemPrompt,
+    ) -> Self {
         Self {
             provider,
             registry,

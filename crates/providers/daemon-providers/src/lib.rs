@@ -16,8 +16,10 @@
 //! Native tool **schemas** and **`tool_call_id`** round-trip through the enriched [`Request`].
 
 mod genai_provider;
+mod local;
 
 pub use genai_provider::GenAiProvider;
+pub use local::{LocalProvider, WorkerConfig};
 
 use daemon_common::UsageDelta;
 use daemon_core::{
@@ -107,9 +109,7 @@ pub(crate) fn classify_genai_error(err: genai::Error) -> Failure {
         E::WebModelCall { webc_error, .. } | E::WebAdapterCall { webc_error, .. } => {
             classify_webc(webc_error)
         }
-        E::HttpError { status, body, .. } => {
-            classify_api_error(status.as_u16(), |_| None, &body)
-        }
+        E::HttpError { status, body, .. } => classify_api_error(status.as_u16(), |_| None, &body),
         E::StreamParse { .. } | E::InvalidJsonResponseElement { .. } => {
             Failure::FormatError(format!("genai decode: {err}"))
         }

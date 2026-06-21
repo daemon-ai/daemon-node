@@ -94,11 +94,7 @@ impl StreamJsonCodec {
             "tool_use" => {
                 let name = block.name.unwrap_or_default();
                 let call_id = block.id.unwrap_or_default();
-                let args_summary = block
-                    .input
-                    .as_ref()
-                    .map(summarize)
-                    .unwrap_or_default();
+                let args_summary = block.input.as_ref().map(summarize).unwrap_or_default();
                 let detail = block
                     .input
                     .as_ref()
@@ -338,13 +334,17 @@ mod tests {
             br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
         );
         // A synthesized TurnStarted then the text delta.
-        assert!(matches!(assistant[0], Outbound::Event(AgentEvent::TurnStarted { .. })));
+        assert!(matches!(
+            assistant[0],
+            Outbound::Event(AgentEvent::TurnStarted { .. })
+        ));
         assert!(matches!(
             &assistant[1],
             Outbound::Event(AgentEvent::TextDelta { text, .. }) if text == "hi"
         ));
 
-        let result = codec.decode(br#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#);
+        let result = codec
+            .decode(br#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#);
         assert!(matches!(
             &result[0],
             Outbound::Event(AgentEvent::TurnFinished { summary, .. })

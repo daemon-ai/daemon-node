@@ -161,7 +161,11 @@ impl SqliteStore {
     }
 
     /// Read the committed (sealed) root of a `(stream, segment)`, if any.
-    fn committed_root(conn: &Connection, stream: &JournalStreamId, segment: u64) -> Option<CommittedRoot> {
+    fn committed_root(
+        conn: &Connection,
+        stream: &JournalStreamId,
+        segment: u64,
+    ) -> Option<CommittedRoot> {
         conn.query_row(
             "SELECT root, signature FROM journal_roots WHERE stream = ?1 AND segment = ?2",
             params![stream.as_str(), segment as i64],
@@ -586,7 +590,12 @@ impl SessionStore for SqliteStore {
             .query_row(
                 "SELECT rowseq, session_id FROM wake_outbox ORDER BY rowseq LIMIT 1",
                 [],
-                |row| Ok((row.get::<_, i64>(0)?, SessionId::new(row.get::<_, String>(1)?))),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        SessionId::new(row.get::<_, String>(1)?),
+                    ))
+                },
             )
             .optional()
             .ok()??;
@@ -615,12 +624,11 @@ impl SessionStore for SqliteStore {
 
     async fn list_sessions(&self) -> Vec<(SessionId, SessionStatus)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn
-            .prepare("SELECT session_id, status_kind, status_job FROM session_record")
-        {
-            Ok(stmt) => stmt,
-            Err(_) => return Vec::new(),
-        };
+        let mut stmt =
+            match conn.prepare("SELECT session_id, status_kind, status_job FROM session_record") {
+                Ok(stmt) => stmt,
+                Err(_) => return Vec::new(),
+            };
         let rows = stmt.query_map([], |row| {
             Ok((
                 SessionId::new(row.get::<_, String>(0)?),

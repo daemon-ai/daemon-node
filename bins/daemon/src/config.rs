@@ -42,6 +42,32 @@ const JOURNAL_SEED_ENV: &str = "DAEMON_JOURNAL_SEED";
 /// How many orchestrator levels the top fleet materializes before its leaves (fleets-of-fleets).
 const NESTING_DEPTH_ENV: &str = "DAEMON_NESTING_DEPTH";
 
+// --- Local-inference worker (`daemon-infer`) tuning (DAEMON_INFER_*) -------------------------
+/// Path to the `daemon-infer` worker binary (default: a `daemon-infer` next to the daemon binary).
+const INFER_BIN_ENV: &str = "DAEMON_INFER_BIN";
+/// llama.cpp: number of layers offloaded to the GPU (`0` = CPU only).
+const INFER_N_GPU_LAYERS_ENV: &str = "DAEMON_INFER_N_GPU_LAYERS";
+/// The context window to allocate (`0` = the model's training default).
+const INFER_N_CTX_ENV: &str = "DAEMON_INFER_N_CTX";
+/// Threads used for generation/prompt processing.
+const INFER_N_THREADS_ENV: &str = "DAEMON_INFER_N_THREADS";
+/// Enable Flash Attention where the backend supports it (`1`/`true`).
+const INFER_FLASH_ATTN_ENV: &str = "DAEMON_INFER_FLASH_ATTN";
+/// mistral.rs in-situ quantization spec (e.g. `Q4K`).
+const INFER_ISQ_ENV: &str = "DAEMON_INFER_ISQ";
+/// The output-token cap per generation (`0` = the worker default).
+const INFER_MAX_TOKENS_ENV: &str = "DAEMON_INFER_MAX_TOKENS";
+/// How long to wait for the model to load (ms).
+const INFER_LOAD_TIMEOUT_MS_ENV: &str = "DAEMON_INFER_LOAD_TIMEOUT_MS";
+/// Watchdog: max wait for the first token of a generation (ms).
+const INFER_TTFT_TIMEOUT_MS_ENV: &str = "DAEMON_INFER_TTFT_TIMEOUT_MS";
+/// Watchdog: max wait between tokens once streaming (ms).
+const INFER_INTER_TOKEN_TIMEOUT_MS_ENV: &str = "DAEMON_INFER_INTER_TOKEN_TIMEOUT_MS";
+/// Crash-loop meltdown: max worker restarts within the restart window.
+const INFER_MAX_RESTARTS_ENV: &str = "DAEMON_INFER_MAX_RESTARTS";
+/// The sliding window (ms) over which restarts are counted for meltdown.
+const INFER_RESTART_WINDOW_MS_ENV: &str = "DAEMON_INFER_RESTART_WINDOW_MS";
+
 /// Which model provider implementation the node uses (selected by config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -51,6 +77,67 @@ pub enum ProviderKind {
     OpenAi,
     /// The networked Anthropic Messages provider.
     Anthropic,
+    /// A local llama.cpp model via the supervised `daemon-infer` worker.
+    LlamaCpp,
+    /// A local mistral.rs model via the supervised `daemon-infer` worker.
+    MistralRs,
+}
+
+/// Tuning for the local-inference [`daemon-infer`] worker (used only for the local provider kinds).
+#[derive(Clone, Debug)]
+pub struct LocalConfig {
+    /// Path to the `daemon-infer` worker binary.
+    pub worker_bin: PathBuf,
+    /// llama.cpp: number of layers offloaded to the GPU (`0` = CPU only).
+    pub n_gpu_layers: u32,
+    /// The context window to allocate (`0` = the model's training default).
+    pub n_ctx: u32,
+    /// Threads used for generation/prompt processing (`None` = engine default).
+    pub n_threads: Option<u32>,
+    /// Enable Flash Attention where supported.
+    pub flash_attn: bool,
+    /// mistral.rs in-situ quantization spec (e.g. `Q4K`); `None` = load as-is.
+    pub isq: Option<String>,
+    /// The output-token cap per generation (`0` = the worker default).
+    pub max_tokens: u32,
+    /// How long to wait for `Event::Ready` after load.
+    pub load_timeout: Duration,
+    /// Watchdog: max wait for the first token of a generation.
+    pub ttft_timeout: Duration,
+    /// Watchdog: max wait between tokens once streaming.
+    pub inter_token_timeout: Duration,
+    /// Crash-loop meltdown: max restarts within [`LocalConfig::restart_window`].
+    pub max_restarts: u32,
+    /// The sliding window over which restarts are counted for meltdown.
+    pub restart_window: Duration,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            worker_bin: default_worker_bin(),
+            n_gpu_layers: 0,
+            n_ctx: 0,
+            n_threads: None,
+            flash_attn: false,
+            isq: None,
+            max_tokens: 0,
+            load_timeout: Duration::from_secs(120),
+            ttft_timeout: Duration::from_secs(60),
+            inter_token_timeout: Duration::from_secs(30),
+            max_restarts: 3,
+            restart_window: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The default worker binary: a `daemon-infer` next to the running daemon executable, falling back
+/// to a bare `daemon-infer` (resolved on `PATH`).
+fn default_worker_bin() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("daemon-infer")))
+        .unwrap_or_else(|| PathBuf::from("daemon-infer"))
 }
 
 /// The durable store backend selected by config.
@@ -85,8 +172,12 @@ pub struct NodeConfig {
     /// An optional provider API base-URL override. `None` uses the provider's default endpoint (the
     /// usual case); `Some` points the client elsewhere (a gateway/proxy, or a test mock server).
     pub base_url: Option<String>,
-    /// The model name sent to a real provider (resolved with a per-provider default; empty for mock).
+    /// The model name sent to a real provider, or the model path / HF id for a local provider
+    /// (resolved with a per-provider default; empty for mock and local kinds — set explicitly).
     pub model: String,
+    /// Local-inference worker tuning (meaningful only for the [`ProviderKind::LlamaCpp`] /
+    /// [`ProviderKind::MistralRs`] kinds).
+    pub local: LocalConfig,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -120,10 +211,55 @@ struct FileConfig {
     tool_result_budget: Option<usize>,
     journal_seed: Option<String>,
     nesting_depth: Option<usize>,
+    local: Option<FileLocalConfig>,
+}
+
+/// The `[local]` TOML table — local-inference worker tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileLocalConfig {
+    worker_bin: Option<PathBuf>,
+    n_gpu_layers: Option<u32>,
+    n_ctx: Option<u32>,
+    n_threads: Option<u32>,
+    flash_attn: Option<bool>,
+    isq: Option<String>,
+    max_tokens: Option<u32>,
+    load_timeout_ms: Option<u64>,
+    ttft_timeout_ms: Option<u64>,
+    inter_token_timeout_ms: Option<u64>,
+    max_restarts: Option<u32>,
+    restart_window_ms: Option<u64>,
 }
 
 fn env_string(key: &str) -> Option<String> {
     std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Parse a permissive boolean (`1`/`true`/`yes`/`on`, case-insensitive => true).
+fn parse_bool(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Overlay a millisecond [`Duration`] field from an optional TOML value then an env override.
+fn resolve_duration_ms(
+    field: &mut Duration,
+    file: Option<u64>,
+    env_key: &str,
+) -> anyhow::Result<()> {
+    if let Some(ms) = file {
+        *field = Duration::from_millis(ms);
+    }
+    if let Some(s) = env_string(env_key) {
+        let ms = s
+            .parse::<u64>()
+            .with_context(|| format!("{env_key} must be a u64 (milliseconds)"))?;
+        *field = Duration::from_millis(ms);
+    }
+    Ok(())
 }
 
 /// Parse a 64-char hex string into a 32-byte journal signer seed.
@@ -152,9 +288,8 @@ impl NodeConfig {
     pub fn load() -> anyhow::Result<Self> {
         let file = match std::env::var_os(CONFIG_ENV) {
             Some(path) => {
-                let text = std::fs::read_to_string(&path).with_context(|| {
-                    format!("reading config file {}", path.to_string_lossy())
-                })?;
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading config file {}", path.to_string_lossy()))?;
                 toml::from_str::<FileConfig>(&text).context("parsing TOML config")?
             }
             None => FileConfig::default(),
@@ -162,7 +297,10 @@ impl NodeConfig {
 
         let partition = match env_string(PARTITION_ENV) {
             Some(s) => PartitionId(s.parse().context("DAEMON_PARTITION must be a u64")?),
-            None => file.partition.map(PartitionId).unwrap_or(PartitionId::DEFAULT),
+            None => file
+                .partition
+                .map(PartitionId)
+                .unwrap_or(PartitionId::DEFAULT),
         };
 
         let store = Self::resolve_store(&file)?;
@@ -174,8 +312,7 @@ impl NodeConfig {
             .or(file.socket_path)
             .unwrap_or_else(default_socket);
 
-        let dispatch_interval =
-            Duration::from_millis(file.dispatch_interval_ms.unwrap_or(2));
+        let dispatch_interval = Duration::from_millis(file.dispatch_interval_ms.unwrap_or(2));
         let scan_interval = Duration::from_millis(file.scan_interval_ms.unwrap_or(10));
 
         let profile = env_string(PROFILE_ENV)
@@ -191,8 +328,10 @@ impl NodeConfig {
             "mock" => ProviderKind::Mock,
             "openai" => ProviderKind::OpenAi,
             "anthropic" => ProviderKind::Anthropic,
+            "llama" | "llamacpp" | "llama-cpp" => ProviderKind::LlamaCpp,
+            "mistralrs" | "mistral-rs" | "mistral.rs" => ProviderKind::MistralRs,
             other => anyhow::bail!(
-                "unknown model provider {other:?} (expected mock|openai|anthropic)"
+                "unknown model provider {other:?} (expected mock|openai|anthropic|llama|mistralrs)"
             ),
         };
         // No default: `None` lets the provider client use its own default endpoint. An override is
@@ -203,7 +342,10 @@ impl NodeConfig {
             .unwrap_or_else(|| match provider_kind {
                 ProviderKind::OpenAi => "gpt-4o-mini".to_string(),
                 ProviderKind::Anthropic => "claude-3-5-sonnet-latest".to_string(),
-                ProviderKind::Mock => String::new(),
+                // Mock and the local kinds have no sensible default model — set DAEMON_MODEL.
+                ProviderKind::Mock | ProviderKind::LlamaCpp | ProviderKind::MistralRs => {
+                    String::new()
+                }
             });
 
         let credential_key = env_string(CREDENTIAL_KEY_ENV)
@@ -220,6 +362,8 @@ impl NodeConfig {
             None => file.nesting_depth.unwrap_or(0),
         };
 
+        let local = Self::resolve_local(file.local.unwrap_or_default())?;
+
         Ok(Self {
             partition,
             socket_path,
@@ -230,11 +374,91 @@ impl NodeConfig {
             provider_kind,
             base_url,
             model,
+            local,
             credential_key,
             engine,
             journal_seed,
             nesting_depth,
         })
+    }
+
+    /// Resolve the local-inference worker tuning (env overriding the `[local]` TOML table overriding
+    /// [`LocalConfig`] defaults).
+    fn resolve_local(file: FileLocalConfig) -> anyhow::Result<LocalConfig> {
+        let mut local = LocalConfig::default();
+        if let Some(path) = file.worker_bin {
+            local.worker_bin = path;
+        }
+        if let Some(s) = env_string(INFER_BIN_ENV) {
+            local.worker_bin = PathBuf::from(s);
+        }
+        if let Some(n) = file.n_gpu_layers {
+            local.n_gpu_layers = n;
+        }
+        if let Some(s) = env_string(INFER_N_GPU_LAYERS_ENV) {
+            local.n_gpu_layers = s
+                .parse()
+                .context("DAEMON_INFER_N_GPU_LAYERS must be a u32")?;
+        }
+        if let Some(n) = file.n_ctx {
+            local.n_ctx = n;
+        }
+        if let Some(s) = env_string(INFER_N_CTX_ENV) {
+            local.n_ctx = s.parse().context("DAEMON_INFER_N_CTX must be a u32")?;
+        }
+        if let Some(n) = file.n_threads {
+            local.n_threads = Some(n);
+        }
+        if let Some(s) = env_string(INFER_N_THREADS_ENV) {
+            local.n_threads = Some(s.parse().context("DAEMON_INFER_N_THREADS must be a u32")?);
+        }
+        if let Some(b) = file.flash_attn {
+            local.flash_attn = b;
+        }
+        if let Some(s) = env_string(INFER_FLASH_ATTN_ENV) {
+            local.flash_attn = parse_bool(&s);
+        }
+        if let Some(isq) = file.isq {
+            local.isq = Some(isq);
+        }
+        if let Some(s) = env_string(INFER_ISQ_ENV) {
+            local.isq = Some(s);
+        }
+        if let Some(n) = file.max_tokens {
+            local.max_tokens = n;
+        }
+        if let Some(s) = env_string(INFER_MAX_TOKENS_ENV) {
+            local.max_tokens = s.parse().context("DAEMON_INFER_MAX_TOKENS must be a u32")?;
+        }
+        resolve_duration_ms(
+            &mut local.load_timeout,
+            file.load_timeout_ms,
+            INFER_LOAD_TIMEOUT_MS_ENV,
+        )?;
+        resolve_duration_ms(
+            &mut local.ttft_timeout,
+            file.ttft_timeout_ms,
+            INFER_TTFT_TIMEOUT_MS_ENV,
+        )?;
+        resolve_duration_ms(
+            &mut local.inter_token_timeout,
+            file.inter_token_timeout_ms,
+            INFER_INTER_TOKEN_TIMEOUT_MS_ENV,
+        )?;
+        if let Some(n) = file.max_restarts {
+            local.max_restarts = n;
+        }
+        if let Some(s) = env_string(INFER_MAX_RESTARTS_ENV) {
+            local.max_restarts = s
+                .parse()
+                .context("DAEMON_INFER_MAX_RESTARTS must be a u32")?;
+        }
+        resolve_duration_ms(
+            &mut local.restart_window,
+            file.restart_window_ms,
+            INFER_RESTART_WINDOW_MS_ENV,
+        )?;
+        Ok(local)
     }
 
     /// Resolve the engine tunables (§20), env overriding TOML overriding [`daemon_core::Config`]

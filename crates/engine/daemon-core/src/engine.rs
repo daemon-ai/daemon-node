@@ -461,7 +461,9 @@ impl Engine {
         }
         if let Some(turn) = self.snapshot.conversation.turns.last().cloned() {
             for provider in &self.memory {
-                provider.after_turn(&turn, &self.snapshot.conversation).await;
+                provider
+                    .after_turn(&turn, &self.snapshot.conversation)
+                    .await;
             }
         }
     }
@@ -475,7 +477,9 @@ impl Engine {
         self.assembler.reset_turn();
         self.gather_memory().await;
         let budget = self.config.context_budget_tokens.map(|b| b as usize);
-        let pressure = self.context.before_turn(&self.snapshot.conversation, budget);
+        let pressure = self
+            .context
+            .before_turn(&self.snapshot.conversation, budget);
         if let (true, Some(b)) = (pressure.over_budget(), budget) {
             self.before_compact_memory().await;
             let conv = std::mem::take(&mut self.snapshot.conversation);
@@ -1001,7 +1005,11 @@ mod tests {
         }
     }
 
-    fn looping_engine(provider: Arc<dyn Provider>, runs: Arc<AtomicU64>, max_iterations: u32) -> Engine {
+    fn looping_engine(
+        provider: Arc<dyn Provider>,
+        runs: Arc<AtomicU64>,
+        max_iterations: u32,
+    ) -> Engine {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(CounterTool { runs }));
         let config = Config {
@@ -1049,7 +1057,11 @@ mod tests {
             }
             _ => panic!("expected completion after the loop"),
         }
-        assert_eq!(runs.load(Ordering::Relaxed), 2, "the tool ran on both rounds");
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the tool ran on both rounds"
+        );
         // 3 model rounds: two tool rounds + the final-text round.
         assert_eq!(provider.call_count(), 3);
         // Two tool turns are recorded in the durable conversation.
@@ -1194,7 +1206,10 @@ mod tests {
         engine.push_user(UserMsg::new("hello"));
         let (sink, log) = collecting();
 
-        let outcome = engine.run_turn(&NoopHost, &sink, &TurnControl::new()).await.unwrap();
+        let outcome = engine
+            .run_turn(&NoopHost, &sink, &TurnControl::new())
+            .await
+            .unwrap();
         match outcome {
             TurnOutcome::Completed(s) => {
                 assert_eq!(s.end_reason, EndReason::Completed);
@@ -1202,9 +1217,16 @@ mod tests {
             }
             _ => panic!("expected completion after backoff retries"),
         }
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 3, "two retries then success");
+        assert_eq!(
+            provider.calls.load(Ordering::Relaxed),
+            3,
+            "two retries then success"
+        );
         assert!(
-            log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::RateLimit { .. })),
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RateLimit { .. })),
             "a RateLimit event was emitted during backoff"
         );
     }
@@ -1237,7 +1259,11 @@ mod tests {
             TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("after compact")),
             _ => panic!("expected completion after compaction"),
         }
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "overflow then retry");
+        assert_eq!(
+            provider.calls.load(Ordering::Relaxed),
+            2,
+            "overflow then retry"
+        );
         assert!(
             engine.snapshot().conversation.turns.len() < before,
             "the conversation was compacted"

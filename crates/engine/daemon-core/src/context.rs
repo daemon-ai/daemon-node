@@ -301,6 +301,10 @@ mod tests {
         let eng = BudgetedContextEngine::default();
         // A budget just 1 token under current: dropping one small turn frees < 10% -> skip.
         let compacted = eng.compact(c.clone(), used.saturating_sub(1)).await;
-        assert_eq!(compacted.turns.len(), c.turns.len(), "marginal compaction skipped");
+        assert_eq!(
+            compacted.turns.len(),
+            c.turns.len(),
+            "marginal compaction skipped"
+        );
     }
 }

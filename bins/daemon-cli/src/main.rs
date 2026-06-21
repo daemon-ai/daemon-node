@@ -262,7 +262,10 @@ fn render(resp: ApiResponse) {
             println!("health: all_ok={}", h.all_ok);
             for s in h.services {
                 let detail = s.detail.map(|d| format!(" ({d})")).unwrap_or_default();
-                println!("  - {} ok={} restarts={}{}", s.name, s.ok, s.restarts, detail);
+                println!(
+                    "  - {} ok={} restarts={}{}",
+                    s.name, s.ok, s.restarts, detail
+                );
             }
         }
         ApiResponse::Stats(s) => println!(
@@ -296,7 +299,10 @@ fn render(resp: ApiResponse) {
         ApiResponse::Tree(t) => {
             println!(
                 "tree: root={} nodes={}",
-                t.root.as_ref().map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
+                t.root
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "-".into()),
                 t.nodes.len()
             );
             render_tree(&t);

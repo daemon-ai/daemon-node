@@ -19,11 +19,11 @@
 #![forbid(unsafe_code)]
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, EnvVariable, InitializeRequest, McpServer, McpServerStdio,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
-    CancelNotification, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
+    CancelNotification, ContentBlock, ContentChunk, EnvVariable, InitializeRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
+    ToolCall, ToolCallStatus, ToolCallUpdate,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
@@ -60,7 +60,7 @@ impl AcpLaunch {
             args: Vec::new(),
             env: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            }
+        }
     }
 
     /// Set the agent arguments.
@@ -87,14 +87,12 @@ impl AcpLaunch {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "acp-agent".to_string());
-        let stdio = McpServerStdio::new(name, self.program)
-            .args(self.args)
-            .env(
-                self.env
-                    .into_iter()
-                    .map(|(k, v)| EnvVariable::new(k, v))
-                    .collect(),
-            );
+        let stdio = McpServerStdio::new(name, self.program).args(self.args).env(
+            self.env
+                .into_iter()
+                .map(|(k, v)| EnvVariable::new(k, v))
+                .collect(),
+        );
         (AcpAgent::new(McpServer::Stdio(stdio)), self.cwd)
     }
 }

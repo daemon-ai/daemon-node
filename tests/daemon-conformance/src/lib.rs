@@ -333,13 +333,13 @@ mod supervision {
     use super::harness::{seed, status};
     use daemon_activation::ActivationManager;
     use daemon_common::{PartitionId, SessionId};
-    use daemon_host::supervisor::ServiceFactory;
     use daemon_host::services::{interval_child, job_tick, scan_tick, wake_tick, TickFn};
+    use daemon_host::supervisor::ServiceFactory;
+    use daemon_host::CoreEngineFactory;
     use daemon_host::{
         Backoff, ChildSpec, HealthStatus, Host, HostConfig, MeltdownPolicy, RestartPolicy,
         ServiceError, Supervisor,
     };
-    use daemon_host::CoreEngineFactory;
     use daemon_store::{InMemoryStore, SessionStatus, SessionStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -434,9 +434,7 @@ mod supervision {
     async fn transient_vs_permanent() {
         let cancel = CancellationToken::new();
         let handle = Supervisor::new(lenient_meltdown())
-            .child(
-                ChildSpec::permanent("perm", immediate(true)).with_backoff(fast_backoff()),
-            )
+            .child(ChildSpec::permanent("perm", immediate(true)).with_backoff(fast_backoff()))
             .child(
                 ChildSpec::permanent("temp", immediate(true))
                     .with_policy(RestartPolicy::Temporary)
@@ -456,11 +454,18 @@ mod supervision {
 
         // Give the permanent/transient-err children time to restart several times.
         assert!(
-            wait_until(Duration::from_secs(2), || handle.restarts("perm").unwrap_or(0) >= 2).await,
+            wait_until(Duration::from_secs(2), || handle
+                .restarts("perm")
+                .unwrap_or(0)
+                >= 2)
+            .await,
             "permanent child should keep restarting after clean exits"
         );
 
-        assert!(handle.restarts("temp").unwrap() == 0, "temporary must not restart");
+        assert!(
+            handle.restarts("temp").unwrap() == 0,
+            "temporary must not restart"
+        );
         assert!(
             handle.restarts("trans_ok").unwrap() == 0,
             "transient + clean exit must not restart"
@@ -506,7 +511,9 @@ mod supervision {
 
         // Wait until the service recovers past its 3 panics (the 4th invocation).
         assert!(
-            wait_until(Duration::from_secs(2), || counter.load(Ordering::SeqCst) >= 4).await,
+            wait_until(Duration::from_secs(2), || counter.load(Ordering::SeqCst)
+                >= 4)
+            .await,
             "service never recovered past its panics"
         );
         let elapsed = started.elapsed();
@@ -555,7 +562,11 @@ mod supervision {
         // It stopped restarting after meltdown (count stays put).
         let after = handle.restarts("doomed").unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(handle.restarts("doomed"), Some(after), "child kept restarting after meltdown");
+        assert_eq!(
+            handle.restarts("doomed"),
+            Some(after),
+            "child kept restarting after meltdown"
+        );
 
         handle.shutdown().await;
     }
@@ -570,7 +581,9 @@ mod supervision {
             HostConfig::default(),
         );
 
-        let ids: Vec<SessionId> = (0..25).map(|i| SessionId::new(format!("host-{i}"))).collect();
+        let ids: Vec<SessionId> = (0..25)
+            .map(|i| SessionId::new(format!("host-{i}")))
+            .collect();
         for id in &ids {
             seed(&store, id).await;
         }
@@ -580,7 +593,11 @@ mod supervision {
         assert!(completed, "running host failed to complete all sessions");
 
         handle.shutdown().await;
-        assert_eq!(host.manager().active_count(), 0, "active directory above baseline");
+        assert_eq!(
+            host.manager().active_count(),
+            0,
+            "active directory above baseline"
+        );
     }
 
     /// THE PHASE-2 GATE: resident dispatchers crash repeatedly during churn, yet the supervisor
@@ -628,13 +645,18 @@ mod supervision {
         ))
         .start(cancel.clone());
 
-        let ids: Vec<SessionId> = (0..30).map(|i| SessionId::new(format!("churn-{i}"))).collect();
+        let ids: Vec<SessionId> = (0..30)
+            .map(|i| SessionId::new(format!("churn-{i}")))
+            .collect();
         for id in &ids {
             seed(&store, id).await;
         }
 
         let completed = poll_until_completed(&store, &ids, Duration::from_secs(10)).await;
-        assert!(completed, "sessions did not complete despite supervised restarts");
+        assert!(
+            completed,
+            "sessions did not complete despite supervised restarts"
+        );
 
         // The injected crashes were consumed and caused real restarts...
         assert_eq!(wake_budget.load(Ordering::SeqCst), 0);
@@ -643,7 +665,11 @@ mod supervision {
         assert!(handle.restarts("JobOutboxDispatcher").unwrap() >= 2);
 
         // ...but no service melted down.
-        for svc in ["WakeOutboxDispatcher", "JobOutboxDispatcher", "RecoveryScanner"] {
+        for svc in [
+            "WakeOutboxDispatcher",
+            "JobOutboxDispatcher",
+            "RecoveryScanner",
+        ] {
             assert!(
                 !matches!(handle.health(svc), Some(HealthStatus::Unhealthy { .. })),
                 "{svc} melted down"
@@ -654,7 +680,10 @@ mod supervision {
         assert_eq!(manager.active_count(), 0, "active directory above baseline");
 
         // ensure status() import is exercised (sanity on one session)
-        assert_eq!(status(&store, &ids[0]).await, Some(SessionStatus::Completed));
+        assert_eq!(
+            status(&store, &ids[0]).await,
+            Some(SessionStatus::Completed)
+        );
     }
 }
 
@@ -727,7 +756,10 @@ mod translation {
             }
         };
 
-        assert!(saw_started, "no Started{{Assigned}} mapped from TurnStarted");
+        assert!(
+            saw_started,
+            "no Started{{Assigned}} mapped from TurnStarted"
+        );
         assert!(saw_progress, "no Progress{{Text}} mapped from TextDelta");
         assert_eq!(outcome.end_reason, EndReason::Completed);
     }
@@ -910,9 +942,7 @@ mod journal {
         assert!(
             matches!(
                 err,
-                VerifyError::Decode
-                    | VerifyError::ContentHashMismatch
-                    | VerifyError::RootMismatch
+                VerifyError::Decode | VerifyError::ContentHashMismatch | VerifyError::RootMismatch
             ),
             "tampering must be detected, got {err:?}"
         );
@@ -1099,7 +1129,9 @@ mod orchestration {
     }
 
     async fn seed(store: &InMemoryStore, id: &SessionId) {
-        let blob = Snapshot::fresh(id.clone()).encode().expect("encode snapshot");
+        let blob = Snapshot::fresh(id.clone())
+            .encode()
+            .expect("encode snapshot");
         store
             .create_session(id.clone(), PARTITION, blob)
             .await
@@ -1275,7 +1307,9 @@ mod credentials {
     ) -> (Arc<RemoteCredentialClient>, Arc<CredentialAuthority>) {
         let signer = Arc::new(CapabilitySigner::generate());
         let source = Arc::new(StubCredentialSource::minting("openai", "sk-configured"));
-        let authority = Arc::new(CredentialAuthority::new(grant_a, mode, 60_000, signer, source));
+        let authority = Arc::new(CredentialAuthority::new(
+            grant_a, mode, 60_000, signer, source,
+        ));
 
         // Cut A<->B: A serves as the owner.
         let (a_parent, a_child) = cut_pair();
@@ -1316,7 +1350,11 @@ mod credentials {
         let (c, _auth) = build_chain(CredMode::Native, grant_a, grant_b, None);
 
         // C asks for *more* than either hop grants: extra profile/actions, a bigger ceiling.
-        let broad = CredScope::new(["openai", "anthropic"], ["chat", "embed", "admin"], Some(10_000));
+        let broad = CredScope::new(
+            ["openai", "anthropic"],
+            ["chat", "embed", "admin"],
+            Some(10_000),
+        );
         let lease = c
             .acquire(unit_c(), &ProfileRef::new("openai"), &broad)
             .await
@@ -1326,9 +1364,19 @@ mod credentials {
         assert!(lease.scope.profiles.contains("openai"));
         assert!(!lease.scope.profiles.contains("anthropic"));
         assert!(lease.scope.actions.contains("chat"));
-        assert!(!lease.scope.actions.contains("embed"), "embed is not in grant_B");
-        assert!(!lease.scope.actions.contains("admin"), "admin is in no grant");
-        assert_eq!(lease.scope.max_tokens, Some(500), "ceiling clamps to the tightest hop");
+        assert!(
+            !lease.scope.actions.contains("embed"),
+            "embed is not in grant_B"
+        );
+        assert!(
+            !lease.scope.actions.contains("admin"),
+            "admin is in no grant"
+        );
+        assert_eq!(
+            lease.scope.max_tokens,
+            Some(500),
+            "ceiling clamps to the tightest hop"
+        );
         assert!(lease.secret.is_some(), "Native carries a short-lived token");
 
         // A request with no overlap is denied at the narrowing hop (never forwarded to the owner).
@@ -1354,12 +1402,21 @@ mod credentials {
         assert!(lease.secret.is_none(), "Proxied hands C only a handle");
 
         let result = c.use_capability(unit_c(), &lease).await.unwrap();
-        assert_ne!(result.expose(), "sk-configured", "the raw key must never reach C/B");
-        assert!(result.expose().starts_with("proxied-result:"), "owner returns a result");
+        assert_ne!(
+            result.expose(),
+            "sk-configured",
+            "the raw key must never reach C/B"
+        );
+        assert!(
+            result.expose().starts_with("proxied-result:"),
+            "owner returns a result"
+        );
 
         // The owner recorded the use (the round-trip reached A).
         assert!(
-            auth.audit_log().iter().any(|e| e.kind == CredAuditKind::Use),
+            auth.audit_log()
+                .iter()
+                .any(|e| e.kind == CredAuditKind::Use),
             "the proxied use must be audited at the owner"
         );
     }
@@ -1375,15 +1432,26 @@ mod credentials {
             .acquire(unit_c(), &ProfileRef::new("openai"), &grant)
             .await
             .unwrap();
-        let key = lease.secret.as_ref().expect("Bearer carries a usable key").expose();
-        assert!(key.starts_with("sk-fresh-"), "a minting source issues a fresh per-grant key");
+        let key = lease
+            .secret
+            .as_ref()
+            .expect("Bearer carries a usable key")
+            .expose();
+        assert!(
+            key.starts_with("sk-fresh-"),
+            "a minting source issues a fresh per-grant key"
+        );
 
         let granted = auth
             .audit_log()
             .into_iter()
             .find(|e| e.kind == CredAuditKind::Grant)
             .expect("the issuance is audited");
-        assert_eq!(granted.requester, unit_c(), "the audit answers *who* was issued the key");
+        assert_eq!(
+            granted.requester,
+            unit_c(),
+            "the audit answers *who* was issued the key"
+        );
     }
 
     /// (4): a stale incarnation cannot acquire — the superseded hop (here the relay B) rejects with
@@ -1406,7 +1474,11 @@ mod credentials {
             .acquire(unit_c(), &ProfileRef::new("openai"), &grant)
             .await
             .unwrap_err();
-        assert_eq!(err, CredError::Fenced, "the superseded hop must reject the acquire");
+        assert_eq!(
+            err,
+            CredError::Fenced,
+            "the superseded hop must reject the acquire"
+        );
     }
 
     /// (5): a capability whose signed fields were edited fails verification (signature), and a
@@ -1419,7 +1491,8 @@ mod credentials {
             .acquire(unit_c(), &ProfileRef::new("openai"), &grant)
             .await
             .unwrap();
-        auth.verify(&lease).expect("a freshly minted capability verifies");
+        auth.verify(&lease)
+            .expect("a freshly minted capability verifies");
 
         // Tamper with a signed field: verification fails.
         lease.scope.max_tokens = Some(999_999);
@@ -1514,8 +1587,16 @@ mod credentials {
         )
         .with_cost_ceiling(100);
 
-        assert_eq!(auth.charge(60).tokens, Some(40), "headroom remains under the ceiling");
-        assert_eq!(auth.charge(60).tokens, Some(0), "throttled once the ceiling is reached");
+        assert_eq!(
+            auth.charge(60).tokens,
+            Some(40),
+            "headroom remains under the ceiling"
+        );
+        assert_eq!(
+            auth.charge(60).tokens,
+            Some(0),
+            "throttled once the ceiling is reached"
+        );
         assert_eq!(auth.spent_tokens(), 120);
     }
 }
@@ -1768,7 +1849,10 @@ mod node_interface {
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "the assigned session never completed");
+            assert!(
+                Instant::now() < deadline,
+                "the assigned session never completed"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -1778,7 +1862,10 @@ mod node_interface {
             ApiResponse::Tree(t) => t,
             other => panic!("expected Tree, got {other:?}"),
         };
-        assert_eq!(inproc_tree, socket_tree, "tree must agree across transports");
+        assert_eq!(
+            inproc_tree, socket_tree,
+            "tree must agree across transports"
+        );
         assert!(
             !socket_tree.nodes.is_empty(),
             "expected at least one unit in the tree"
@@ -1819,7 +1906,10 @@ mod node_interface {
             ApiResponse::Unit(u) => u,
             other => panic!("expected Unit, got {other:?}"),
         };
-        assert_eq!(inproc_unit, socket_unit, "unit view must agree across transports");
+        assert_eq!(
+            inproc_unit, socket_unit,
+            "unit view must agree across transports"
+        );
         assert!(socket_unit.is_some(), "the child unit should resolve");
 
         // unit_events() parity: the child emitted at least Started + Finished views.
@@ -1919,7 +2009,10 @@ mod node_interface {
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "the assigned session never completed");
+            assert!(
+                Instant::now() < deadline,
+                "the assigned session never completed"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -1930,7 +2023,10 @@ mod node_interface {
             ApiResponse::Tree(t) => t,
             other => panic!("expected Tree, got {other:?}"),
         };
-        assert_eq!(inproc_tree, socket_tree, "tree must agree across transports");
+        assert_eq!(
+            inproc_tree, socket_tree,
+            "tree must agree across transports"
+        );
 
         let root = socket_tree.root.clone().expect("the node tree is rooted");
         let orchestrator = socket_tree
@@ -2127,7 +2223,10 @@ mod node_interface {
         // delegation job), and node A's stalled cadence will not advance it any further.
         let after_assign = store.status(&session).await;
         assert!(
-            !matches!(after_assign, Some(daemon_store::SessionStatus::Completed) | None),
+            !matches!(
+                after_assign,
+                Some(daemon_store::SessionStatus::Completed) | None
+            ),
             "the top should be mid-flight (not completed) after assign, got {after_assign:?}"
         );
         // Crash: stop node A. The durable store retains the mid-flight top (+ any pending job).
@@ -2179,9 +2278,9 @@ mod node_interface {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_delegation_recovers_after_restart_sqlite() {
-        nested_delegation_recovers_after_restart(
-            Arc::new(SqliteStore::open_in_memory().expect("open sqlite store")),
-        )
+        nested_delegation_recovers_after_restart(Arc::new(
+            SqliteStore::open_in_memory().expect("open sqlite store"),
+        ))
         .await;
     }
 
@@ -2210,9 +2309,10 @@ mod node_interface {
         let mut finished = false;
         while Instant::now() < deadline {
             let drained = node.poll(session.clone(), 0).await.expect("poll");
-            if drained.iter().any(|o| {
-                matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. }))
-            }) {
+            if drained
+                .iter()
+                .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))
+            {
                 finished = true;
                 break;
             }
@@ -2294,7 +2394,10 @@ mod node_interface {
 
         // Non-destructive: a repeat read from the same cursor returns the same entries.
         let again = node.session_history(session.clone(), 0, 0).await;
-        assert_eq!(again.entries, page.entries, "history read must be non-destructive");
+        assert_eq!(
+            again.entries, page.entries,
+            "history read must be non-destructive"
+        );
 
         // The node publishes its verifying key so an auditor can verify the chain offline.
         let key = node.verifying_key().await;
@@ -2318,7 +2421,9 @@ mod node_interface {
                 vec![
                     ScriptStep::Call {
                         name: "fs".into(),
-                        args: r#"{"op":"write","path":"note.txt","content":"hello from daemon-core"}"#.into(),
+                        args:
+                            r#"{"op":"write","path":"note.txt","content":"hello from daemon-core"}"#
+                                .into(),
                     },
                     ScriptStep::Call {
                         name: "fs".into(),
@@ -2334,7 +2439,9 @@ mod node_interface {
         }));
         providers.register(
             "orchestrator",
-            Arc::new(|| Arc::new(MockProvider::completing("orchestrator done")) as Arc<dyn Provider>),
+            Arc::new(|| {
+                Arc::new(MockProvider::completing("orchestrator done")) as Arc<dyn Provider>
+            }),
         );
         providers.register(
             "child",
@@ -2414,7 +2521,9 @@ mod node_interface {
             "the fs read should return the written content: {tool_results:?}"
         );
         assert!(
-            tool_results.iter().any(|r| r.ok && r.summary.contains("ran-ok")),
+            tool_results
+                .iter()
+                .any(|r| r.ok && r.summary.contains("ran-ok")),
             "the shell command should run in the workspace: {tool_results:?}"
         );
 
@@ -2475,9 +2584,9 @@ mod node_interface {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn core_tools_session_does_real_work_sqlite() {
-        core_tools_session_does_real_work(
-            Arc::new(SqliteStore::open_in_memory().expect("open sqlite store")),
-        )
+        core_tools_session_does_real_work(Arc::new(
+            SqliteStore::open_in_memory().expect("open sqlite store"),
+        ))
         .await;
     }
 
@@ -2628,7 +2737,10 @@ mod node_interface {
             {
                 break;
             }
-            assert!(Instant::now() < inproc_deadline, "in-proc turn never finished");
+            assert!(
+                Instant::now() < inproc_deadline,
+                "in-proc turn never finished"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         node.submit(
@@ -2646,7 +2758,10 @@ mod node_interface {
             if let Some(view) = find_snapshot(&inproc_items, ReqId(2)) {
                 break view;
             }
-            assert!(Instant::now() < snap_deadline, "in-proc snapshot never arrived");
+            assert!(
+                Instant::now() < snap_deadline,
+                "in-proc snapshot never arrived"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -2700,7 +2815,9 @@ mod store_backends {
     }
 
     async fn seed<S: SessionStore>(store: &S, id: &SessionId) {
-        let blob = Snapshot::fresh(id.clone()).encode().expect("encode snapshot");
+        let blob = Snapshot::fresh(id.clone())
+            .encode()
+            .expect("encode snapshot");
         store
             .create_session(id.clone(), PARTITION, blob)
             .await

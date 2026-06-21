@@ -35,7 +35,11 @@ pub fn similarity(s1: &str, s2: &str) -> f64 {
     if a == b {
         return 1.0;
     }
-    let (shorter, longer) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    let (shorter, longer) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     let ratio = shorter.len() as f64 / longer.len() as f64;
     if longer.starts_with(shorter.as_str()) && ratio >= 0.3 {
         return 0.7 + ratio * 0.3;

@@ -13,8 +13,8 @@
 //! foreign brain owns its own state, so its lifecycle is adapter-owned (the child is killed on drop,
 //! relaunched from its launch profile) rather than hydrated/dehydrated from a `daemon-core` snapshot.
 
+use crate::agent_session::{AgentSession, AgentUnit};
 use crate::foreign::{CodecSession, NativeCutCodec};
-use crate::agent_session::{AgentUnit, AgentSession};
 use daemon_common::UnitId;
 use daemon_protocol::HostRequestHandler;
 use daemon_provision::Placement;
@@ -67,11 +67,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use daemon_common::{Budget, ReqId};
-    use daemon_provision::CutChannel;
     use daemon_protocol::{
-        AgentCommand, AgentEvent, EndReason, HostRequest, HostRequestKind, HostResponseBody, Inbound,
-        Outbound, TurnSummary, TurnTrigger,
+        AgentCommand, AgentEvent, EndReason, HostRequest, HostRequestKind, HostResponseBody,
+        Inbound, Outbound, TurnSummary, TurnTrigger,
     };
+    use daemon_provision::CutChannel;
     use daemon_supervision::{
         Ack, ManageCommand, ManageEvent, ManageRequest, ManageRequestHandler, ManageResponse,
         ManageResponseBody, ManagedUnit, StreamLagged, UnitKind, WorkRef,

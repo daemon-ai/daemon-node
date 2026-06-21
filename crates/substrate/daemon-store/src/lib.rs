@@ -869,8 +869,11 @@ impl SessionStore for InMemoryStore {
             return JournalPage::default();
         };
         let head_cursor = log.iter().map(|e| e.cursor).max().unwrap_or(0);
-        let mut entries: Vec<JournalEntry> =
-            log.iter().filter(|e| e.cursor > after_cursor).cloned().collect();
+        let mut entries: Vec<JournalEntry> = log
+            .iter()
+            .filter(|e| e.cursor > after_cursor)
+            .cloned()
+            .collect();
         entries.sort_by_key(|e| e.cursor);
         if max > 0 {
             entries.truncate(max as usize);
@@ -930,14 +933,29 @@ mod journal_tests {
         let (store, id, _f) = seeded().await;
         let stream = JournalStreamId::session(&id);
         // Append out of order; load_trace_segment returns them sorted by seq.
-        store.append_trace(&stream, 0, entry(2, 0x22)).await.unwrap();
-        store.append_trace(&stream, 0, entry(0, 0x00)).await.unwrap();
-        store.append_trace(&stream, 0, entry(1, 0x11)).await.unwrap();
+        store
+            .append_trace(&stream, 0, entry(2, 0x22))
+            .await
+            .unwrap();
+        store
+            .append_trace(&stream, 0, entry(0, 0x00))
+            .await
+            .unwrap();
+        store
+            .append_trace(&stream, 0, entry(1, 0x11))
+            .await
+            .unwrap();
         // Redelivered seq is a no-op (append-only, idempotent).
-        store.append_trace(&stream, 0, entry(1, 0xFF)).await.unwrap();
+        store
+            .append_trace(&stream, 0, entry(1, 0xFF))
+            .await
+            .unwrap();
 
         let seg = store.load_trace_segment(&stream, 0).await.unwrap();
-        assert_eq!(seg.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(
+            seg.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
         // The first writer of seq=1 wins; the duplicate did not overwrite.
         assert_eq!(seg.entries[1].bytes, vec![0x11; 4]);
         assert!(seg.committed.is_none(), "segment is still open");
@@ -965,14 +983,29 @@ mod journal_tests {
         let (store, id, _f) = seeded().await;
         let stream = JournalStreamId::session(&id);
         // Segment 0 then segment 1, each with two entries.
-        store.append_trace(&stream, 0, entry(0, 0xA0)).await.unwrap();
-        store.append_trace(&stream, 0, entry(1, 0xA1)).await.unwrap();
-        store.append_trace(&stream, 1, entry(0, 0xB0)).await.unwrap();
-        store.append_trace(&stream, 1, entry(1, 0xB1)).await.unwrap();
+        store
+            .append_trace(&stream, 0, entry(0, 0xA0))
+            .await
+            .unwrap();
+        store
+            .append_trace(&stream, 0, entry(1, 0xA1))
+            .await
+            .unwrap();
+        store
+            .append_trace(&stream, 1, entry(0, 0xB0))
+            .await
+            .unwrap();
+        store
+            .append_trace(&stream, 1, entry(1, 0xB1))
+            .await
+            .unwrap();
 
         let page = store.load_journal(&stream, 0, 3).await;
         assert_eq!(page.entries.len(), 3, "max caps the page");
-        assert_eq!(page.entries[0].segment, 0, "from the start (after_cursor 0 is inclusive)");
+        assert_eq!(
+            page.entries[0].segment, 0,
+            "from the start (after_cursor 0 is inclusive)"
+        );
         assert_eq!(page.head_cursor, 4, "four entries -> 1-based cursors 1..=4");
         // Walk the rest from the returned cursor.
         let rest = store.load_journal(&stream, page.next_cursor, 0).await;

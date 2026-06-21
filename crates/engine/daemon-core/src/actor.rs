@@ -275,9 +275,10 @@ mod tests {
         let handle = spawn_agent_session(completing_engine("snap"), Arc::new(NoopHost));
         let mut rx = handle.subscribe();
         handle.snapshot(ReqId(5)).await;
-        let ev = recv_until(&mut rx, |e| {
-            matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(5))
-        })
+        let ev = recv_until(
+            &mut rx,
+            |e| matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(5)),
+        )
         .await;
         assert!(matches!(ev, AgentEvent::Snapshot { .. }));
         handle.shutdown().await;

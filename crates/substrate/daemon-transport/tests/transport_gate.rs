@@ -58,7 +58,11 @@ async fn unit_driven_over_socket_with_trace_propagation() {
             "the trace must ride the socket and be restored on the server"
         );
         // ...and the reply envelope carried it back (restored into this task's scope).
-        assert_eq!(current_trace(), trace, "the peer trace must round-trip back");
+        assert_eq!(
+            current_trace(),
+            trace,
+            "the peer trace must round-trip back"
+        );
     })
     .await;
 }
@@ -70,7 +74,11 @@ async fn stale_remote_fence_is_rejected() {
     let (store, addr) = start_server().await;
     let session = SessionId::new("remote-fenced");
     store
-        .create_session(session.clone(), PartitionId::DEFAULT, SnapshotBlob::default())
+        .create_session(
+            session.clone(),
+            PartitionId::DEFAULT,
+            SnapshotBlob::default(),
+        )
         .await
         .unwrap();
 
@@ -101,5 +109,8 @@ async fn stale_remote_fence_is_rejected() {
         .commit(&session, Epoch(1), current)
         .await
         .expect("the current remote owner commits");
-    assert_eq!(client.status(&session).await.unwrap(), Some(SessionStatus::Completed));
+    assert_eq!(
+        client.status(&session).await.unwrap(),
+        Some(SessionStatus::Completed)
+    );
 }

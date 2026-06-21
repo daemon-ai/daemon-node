@@ -314,7 +314,10 @@ impl RemoteClient {
     }
 
     /// Acquire a fresh fencing token for `session` from the remote authority (cross-node lease).
-    pub async fn acquire_fence(&mut self, session: &SessionId) -> Result<FenceToken, TransportError> {
+    pub async fn acquire_fence(
+        &mut self,
+        session: &SessionId,
+    ) -> Result<FenceToken, TransportError> {
         match self
             .call(Req::AcquireFence {
                 session: session.clone(),

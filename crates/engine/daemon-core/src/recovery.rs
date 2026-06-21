@@ -436,8 +436,14 @@ mod tests {
             classify_api_error(429, |h| (h == "retry-after").then(|| "30".into()), ""),
             Failure::RateLimit { retry_after: Some(d), .. } if d == Duration::from_secs(30)
         ));
-        assert!(matches!(classify_api_error(401, no_hdr, ""), Failure::Auth(_)));
-        assert!(matches!(classify_api_error(402, no_hdr, ""), Failure::Billing(_)));
+        assert!(matches!(
+            classify_api_error(401, no_hdr, ""),
+            Failure::Auth(_)
+        ));
+        assert!(matches!(
+            classify_api_error(402, no_hdr, ""),
+            Failure::Billing(_)
+        ));
         assert!(matches!(
             classify_api_error(413, no_hdr, ""),
             Failure::PayloadTooLarge(_)
@@ -501,6 +507,9 @@ mod tests {
             p.decide(&Failure::ContentPolicy("x".into()), 0),
             RecoveryStep::Fallback
         );
-        assert_eq!(p.decide(&Failure::Fatal("x".into()), 0), RecoveryStep::Abort);
+        assert_eq!(
+            p.decide(&Failure::Fatal("x".into()), 0),
+            RecoveryStep::Abort
+        );
     }
 }

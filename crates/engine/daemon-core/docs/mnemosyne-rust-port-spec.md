@@ -185,9 +185,22 @@ Default dependencies (light; no native ML stack):
 - `daemon-core` (path dep) for the `MemoryProvider` trait + `Provider` + conversation types.
 
 Feature-gated (off by default, to keep the engine light and network-free):
-- `embeddings` -> `fastembed = "5"` (default model `EmbeddingModel::BGESmallENV15`, 384-dim; uses
-  `ort`/ONNX; **no Tokio dep**). When disabled, the crate runs in **keyword-only mode** (mirrors
-  `MNEMOSYNE_NO_EMBEDDINGS`, `embeddings.py` L190).
+- `embeddings` — two interchangeable backends behind the same `Embedder` seam; **keyword-only mode**
+  when neither is enabled (mirrors `MNEMOSYNE_NO_EMBEDDINGS`, `embeddings.py` L190):
+  - **PREFERRED: GGUF embeddings via the `daemon-infer` worker (`llama-cpp-4`).** A GGUF embedding
+    model (e.g. `nomic-embed-text`, `bge-*-gguf`) is embedded through the *same* supervised worker the
+    chat providers already build — `llama-cpp-4` exposes native embeddings (`LlamaContextParams`
+    `with_embeddings(true)` + `LlamaContext::embeddings_seq_ith`). This adds **zero new ML dependency
+    tree**: no `ort`/ONNX runtime, no `fastembed`, no second model-acquisition path — it reuses the
+    crash-isolated worker, its build matrix (CUDA/Vulkan/Metal/ROCm), and the shared model cache. This
+    is the recommended path now that the worker is in-tree (see
+    [`local-inference-spec.md`](../../../../docs/specs/local-inference-spec.md)). Realizing it needs an
+    embeddings method on the `InferenceBackend` seam + an `Embed` protocol command (a documented
+    follow-up; the chat path ships first).
+  - **ALTERNATIVE: `fastembed = "5"`** (default model `EmbeddingModel::BGESmallENV15`, 384-dim; uses
+    `ort`/ONNX; **no Tokio dep**). Self-contained and simple to wire, but pulls the `ort`/ONNX runtime
+    and a separate model download — kept as the documented alternative for deployments that do not run
+    a local `llama-cpp-4` worker (e.g. remote-only chat providers that still want local memory recall).
 - `vec-ext` -> `sqlite-vec` crate + `zerocopy`. Registers `sqlite3_vec_init` via
   `rusqlite::auto_extension::register_auto_extension` (a `RawAutoExtension` transmute — the only
   `unsafe` in the crate, isolated to one function). Provides `vec0` virtual tables and native
@@ -198,10 +211,14 @@ Feature-gated (off by default, to keep the engine light and network-free):
 - `sync` -> `chacha20poly1305` + `argon2` + `pbkdf2` + `reqwest` (workspace pin) for the event-log
   replication subsystem.
 - `tiktoken` -> `tiktoken-rs` for exact token counts (else `len/4`).
-- `local-llm` (deferred, P3) -> a `llama-cpp-2`-style backend replacing `local_llm.py`.
+- `local-llm` (deferred, P3) -> now realized out-of-crate by the supervised `daemon-infer` worker
+  (`llama-cpp-4` / `mistral.rs`), reachable via `daemon_core::Provider`/`MemoryProvider`, so this
+  crate no longer needs its own in-process engine backend.
 
 > Design rule: `daemon-core` itself never depends on `fastembed`/`ort`; the heavy stack is confined
-> to this crate behind features, mirroring how `reqwest` is confined to `daemon-providers`.
+> to this crate behind features, mirroring how `reqwest` is confined to `daemon-providers`. The
+> PREFERRED embeddings path goes one step further and avoids `ort`/`fastembed` entirely by reusing the
+> `daemon-infer` worker's `llama-cpp-4` GGUF embeddings.
 
 ---
 

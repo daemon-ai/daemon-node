@@ -68,16 +68,8 @@ pub struct CredentialAuditEvent {
 impl CredentialAuditEvent {
     /// A compact one-line rendering for the journal detail field.
     pub fn summary(&self) -> String {
-        let cap = self
-            .cap_id
-            .as_ref()
-            .map(|c| c.as_str())
-            .unwrap_or("-");
-        let who = self
-            .requester
-            .as_ref()
-            .map(|u| u.as_str())
-            .unwrap_or("-");
+        let cap = self.cap_id.as_ref().map(|c| c.as_str()).unwrap_or("-");
+        let who = self.requester.as_ref().map(|u| u.as_str()).unwrap_or("-");
         format!(
             "{} profile={} cap={} requester={} {}",
             self.kind.label(),

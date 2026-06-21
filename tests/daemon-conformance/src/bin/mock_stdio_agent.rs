@@ -71,7 +71,10 @@ async fn main() {
                             name: "web_search".into(),
                             args_summary: "query=rustlang".into(),
                             // Opaque structured arguments object for a rich consumer.
-                            detail: Some(ToolDetail::new("search.args", b"{\"query\":\"rustlang\"}".to_vec())),
+                            detail: Some(ToolDetail::new(
+                                "search.args",
+                                b"{\"query\":\"rustlang\"}".to_vec(),
+                            )),
                         },
                     }),
                     // Stream content not tied to a tool: a terminal/PTY chunk under a reserved kind.
@@ -87,7 +90,10 @@ async fn main() {
                             ok: true,
                             summary: "1 result".into(),
                             // Opaque structured results payload (a kind the daemon never parses).
-                            detail: Some(ToolDetail::new(TOOL_DETAIL_KIND, TOOL_DETAIL_BODY.to_vec())),
+                            detail: Some(ToolDetail::new(
+                                TOOL_DETAIL_KIND,
+                                TOOL_DETAIL_BODY.to_vec(),
+                            )),
                         },
                     }),
                     Outbound::Event(AgentEvent::TextDelta {

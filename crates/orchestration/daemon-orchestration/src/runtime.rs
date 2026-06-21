@@ -33,8 +33,8 @@ use daemon_supervision::{
     ManageRequest, ManageRequestHandler, ManageRequestKind, ManageResponse, ManageResponseBody,
     ManagedUnit, Outcome, ProgressDelta, StreamLagged, UnitKind, WorkRef,
 };
-use std::collections::HashSet;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -82,8 +82,10 @@ impl FleetInner {
         };
 
         let unit = self.spawner.spawn(child_id.clone(), spec).await;
-        self.children
-            .insert(child_id.clone(), ChildRecord::new(unit.clone(), spec.work.clone()));
+        self.children.insert(
+            child_id.clone(),
+            ChildRecord::new(unit.clone(), spec.work.clone()),
+        );
 
         // Answer-authority for this child + lossless fan-in: install + subscribe before Assign.
         let handler: Arc<dyn ManageRequestHandler> = Arc::new(FleetRequestHandler {
@@ -270,7 +272,10 @@ impl FleetRuntime {
                 job_id: job.job_id,
                 payload,
             };
-            self.inner.store.record_completion_and_wake(&completion).await?;
+            self.inner
+                .store
+                .record_completion_and_wake(&completion)
+                .await?;
             tracing::debug!(%child_id, "fleet processed a delegation job");
             processed += 1;
         }
@@ -322,7 +327,11 @@ impl FleetRuntime {
 
     /// The ids of all registered children.
     pub fn children(&self) -> Vec<UnitId> {
-        self.inner.children.iter().map(|e| e.key().clone()).collect()
+        self.inner
+            .children
+            .iter()
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// The requests children have raised so far (observability / the gate's answer-authority proof).
@@ -472,9 +481,12 @@ impl FleetRuntime {
 
     /// Scale a unit (sub-fleet) to `n` members; `false` if unknown or unsupported.
     pub async fn scale(&self, id: &UnitId, n: u32) -> bool {
-        self.route_lifecycle(id, ManageCommand::Scale {
-            target: Concurrency(n),
-        })
+        self.route_lifecycle(
+            id,
+            ManageCommand::Scale {
+                target: Concurrency(n),
+            },
+        )
         .await
     }
 }

@@ -222,7 +222,10 @@ mod tests {
         // Intersection: profile narrows to {openai}, actions to {chat}, ceiling to min(1000, 5000).
         assert!(lease.scope.profiles.contains("openai"));
         assert!(!lease.scope.profiles.contains("anthropic"));
-        assert_eq!(lease.scope.actions.iter().cloned().collect::<Vec<_>>(), ["chat"]);
+        assert_eq!(
+            lease.scope.actions.iter().cloned().collect::<Vec<_>>(),
+            ["chat"]
+        );
         assert_eq!(lease.scope.max_tokens, Some(1_000));
         assert!(lease.secret.is_some());
     }
@@ -231,7 +234,10 @@ mod tests {
     async fn unknown_profile_is_unavailable() {
         let p = pool();
         let req = CredScope::new(["ghost"], ["chat"], None);
-        let err = p.acquire(&ProfileRef::new("ghost"), &req).await.unwrap_err();
+        let err = p
+            .acquire(&ProfileRef::new("ghost"), &req)
+            .await
+            .unwrap_err();
         assert_eq!(err, CredError::Unavailable("ghost".into()));
     }
 

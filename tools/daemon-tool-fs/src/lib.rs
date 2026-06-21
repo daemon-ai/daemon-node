@@ -145,15 +145,15 @@ impl Tool for FsTool {
                 }
                 let edited = original.replacen(&find, &replace, 1);
                 match cx.exec.write(Path::new(&path), edited.as_bytes()).await {
-                    Ok(()) => ToolOutcome::text(
-                        call.call_id.clone(),
-                        true,
-                        format!("edited {path}"),
-                    )
-                    .with_detail(Self::detail("edit", &path, edited.len())),
-                    Err(e) => {
-                        ToolOutcome::text(call.call_id.clone(), false, format!("fs edit (write): {e}"))
+                    Ok(()) => {
+                        ToolOutcome::text(call.call_id.clone(), true, format!("edited {path}"))
+                            .with_detail(Self::detail("edit", &path, edited.len()))
                     }
+                    Err(e) => ToolOutcome::text(
+                        call.call_id.clone(),
+                        false,
+                        format!("fs edit (write): {e}"),
+                    ),
                 }
             }
         }
@@ -245,7 +245,11 @@ mod tests {
     async fn out_of_workspace_write_is_rejected() {
         let root = temp_root("escape");
         let env = LocalEnvironment::new(&root);
-        let w = run(&env, r#"{"op":"write","path":"../escaped.txt","content":"x"}"#).await;
+        let w = run(
+            &env,
+            r#"{"op":"write","path":"../escaped.txt","content":"x"}"#,
+        )
+        .await;
         assert!(!w.result.ok, "an out-of-workspace write must fail");
         assert!(w.result.content.contains("escapes the workspace"));
         let _ = std::fs::remove_dir_all(&root);

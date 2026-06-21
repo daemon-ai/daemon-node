@@ -280,7 +280,9 @@ impl ManagedUnit for AgentUnit {
                 Ack::Accepted
             }
             ManageCommand::Cancel { reason } => {
-                self.session.submit(AgentCommand::Interrupt { reason }).await;
+                self.session
+                    .submit(AgentCommand::Interrupt { reason })
+                    .await;
                 Ack::Accepted
             }
             ManageCommand::Snapshot { .. } => Ack::Accepted,

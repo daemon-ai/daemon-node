@@ -142,10 +142,10 @@ async fn fleet_drives_a_foreign_agent_to_completion() {
         "a foreign brain is an Engine leaf in the tree"
     );
     assert!(
-        fleet.unit_events(child, 0).iter().any(|e| matches!(
-            e,
-            daemon_api::ManageEventView::Finished { .. }
-        )),
+        fleet
+            .unit_events(child, 0)
+            .iter()
+            .any(|e| matches!(e, daemon_api::ManageEventView::Finished { .. })),
         "the foreign child's drill-down events should include Finished"
     );
 

@@ -205,8 +205,17 @@ mod tests {
         let root = temp_root("ok");
         let env = LocalEnvironment::new(&root);
         let host = FixedHost(true);
-        let out = run(&env, &host, r#"{"command":"printf","args":["hi-%s","there"]}"#).await;
-        assert!(out.result.ok, "benign command should succeed: {}", out.result.content);
+        let out = run(
+            &env,
+            &host,
+            r#"{"command":"printf","args":["hi-%s","there"]}"#,
+        )
+        .await;
+        assert!(
+            out.result.ok,
+            "benign command should succeed: {}",
+            out.result.content
+        );
         assert!(out.result.content.contains("hi-there"));
         assert!(out.detail.is_some());
         let _ = std::fs::remove_dir_all(&root);

@@ -88,7 +88,11 @@ pub trait Provisioner: Send + Sync {
     /// Open a newline-framed placement cut for `id` (NDJSON stdio), returning the live [`Placement`]
     /// whose [`CutChannel`] is [`Framing::Lines`]. Used to host foreign CLI agents (Claude-Code
     /// `stream-json`, etc.); the default backend declares it unavailable.
-    async fn place_lines(&self, _id: &SessionId, _spec: PlacementSpec) -> Result<Placement, ProvErr> {
+    async fn place_lines(
+        &self,
+        _id: &SessionId,
+        _spec: PlacementSpec,
+    ) -> Result<Placement, ProvErr> {
         Err(ProvErr::Unavailable(
             "newline-framed placement not supported by this backend".into(),
         ))
@@ -328,7 +332,11 @@ impl Provisioner for ProcessProvisioner {
         Self::spawn_framed(spec, Framing::Length).await
     }
 
-    async fn place_lines(&self, _id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr> {
+    async fn place_lines(
+        &self,
+        _id: &SessionId,
+        spec: PlacementSpec,
+    ) -> Result<Placement, ProvErr> {
         Self::spawn_framed(spec, Framing::Lines).await
     }
 

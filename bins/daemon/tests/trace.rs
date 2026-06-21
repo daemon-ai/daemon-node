@@ -38,7 +38,9 @@ fn placement_spec() -> PlacementSpec {
 }
 
 async fn seed(store: &dyn SessionStore, id: &SessionId) {
-    let blob = Snapshot::fresh(id.clone()).encode().expect("encode snapshot");
+    let blob = Snapshot::fresh(id.clone())
+        .encode()
+        .expect("encode snapshot");
     store
         .create_session(id.clone(), PARTITION, blob)
         .await
