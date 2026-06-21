@@ -24,6 +24,8 @@ pub mod dynamics;
 pub mod embeddings;
 pub mod engine;
 pub mod error;
+pub mod extract;
+pub mod tools;
 pub mod knowledge;
 pub mod provider;
 pub mod recall;

@@ -208,6 +208,7 @@ impl MemoryWiring {
 fn build_memory(
     cfg: &NodeConfig,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    llm: Option<Arc<dyn Provider>>,
 ) -> MemoryWiring {
     match cfg.memory_provider {
         MemoryProviderKind::None => MemoryWiring::off(),
@@ -231,7 +232,12 @@ fn build_memory(
             } else {
                 MnemosyneConfig::default()
             };
-            let banks = Arc::new(MnemosyneBanks::new(base, cfg.persist_providers(), embedder));
+            let banks = Arc::new(MnemosyneBanks::new(
+                base,
+                cfg.persist_providers(),
+                embedder,
+                llm,
+            ));
             // The `mnemosyne_*` tool defs are session-independent; enumerate them once from a probe
             // instance (its bank is shared, so this is cheap and discarded).
             let tool_defs = match banks.probe_tool_defs() {
@@ -275,6 +281,7 @@ struct MnemosyneBanks {
     base: MnemosyneConfig,
     persist: bool,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    llm: Option<Arc<dyn Provider>>,
     sessions: Mutex<HashMap<SessionId, Arc<MnemosyneProvider>>>,
 }
 
@@ -283,11 +290,13 @@ impl MnemosyneBanks {
         base: MnemosyneConfig,
         persist: bool,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
+        llm: Option<Arc<dyn Provider>>,
     ) -> Self {
         Self {
             base,
             persist,
             embedder,
+            llm,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -302,14 +311,11 @@ impl MnemosyneBanks {
         let mut cfg = self.base.clone();
         cfg.session_id = session.as_str().to_string();
         let provider = if self.persist {
-            match &self.embedder {
-                Some(embedder) => MnemosyneProvider::open_with_embedder(cfg, embedder.clone()),
-                None => MnemosyneProvider::open(cfg),
-            }
+            MnemosyneProvider::open_with_backends(cfg, self.embedder.clone(), self.llm.clone())
         } else {
             // Ephemeral node: a private in-memory bank per session (no cross-session sharing, which
             // is acceptable when the session store itself is non-durable).
-            crate::ephemeral_mnemosyne(cfg, self.embedder.clone())
+            crate::ephemeral_mnemosyne(cfg, self.embedder.clone(), self.llm.clone())
         };
         match provider {
             Ok(p) => {
@@ -340,13 +346,11 @@ impl MnemosyneBanks {
 fn ephemeral_mnemosyne(
     cfg: MnemosyneConfig,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    llm: Option<Arc<dyn Provider>>,
 ) -> daemon_mnemosyne::Result<MnemosyneProvider> {
     use daemon_mnemosyne::Engine;
     let engine = Arc::new(Engine::open_in_memory(cfg)?);
-    Ok(match embedder {
-        Some(embedder) => MnemosyneProvider::with_embedder(engine, embedder),
-        None => MnemosyneProvider::new(engine),
-    })
+    Ok(MnemosyneProvider::with_backends(engine, embedder, llm))
 }
 
 /// A §12 [`Tool`] adapter that dispatches a `mnemosyne_*` call to the calling session's bank,
@@ -643,7 +647,14 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // The optional embedding backend (Mnemosyne vector recall), reusing the shared `ModelManager`
     // for local-model acquisition. `Off` by default — recall stays keyword-only.
     let embedder = build_embedder(&cfg, &manager).await;
-    let memory = build_memory(&cfg, embedder);
+    // Mnemosyne's optional LLM backend for structured extraction + sleep summarization, resolved the
+    // same way as `lcm_aux` (the profile's builder, falling back to a mock). With no provider the
+    // knowledge layer stays on its deterministic regex/AAAK baselines.
+    let mnemosyne_llm: Arc<dyn Provider> = providers
+        .builder_for(&cred_profile)
+        .map(|b| b())
+        .unwrap_or_else(|| Arc::new(MockProvider::completing("")) as Arc<dyn Provider>);
+    let memory = build_memory(&cfg, embedder, Some(mnemosyne_llm));
 
     let host_config = HostConfig {
         partition: cfg.partition,

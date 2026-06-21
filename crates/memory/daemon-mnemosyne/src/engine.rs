@@ -12,11 +12,12 @@
 use crate::config::MnemosyneConfig;
 use crate::dynamics::typed_memory;
 use crate::error::Result;
-use crate::knowledge::{annotations, entities, episodic_graph, veracity};
+use crate::knowledge::{annotations, entities, episodic_graph, temporal, veracity};
 use crate::recall::{mmr, scoring};
 use crate::store::Store;
 use crate::{binary_vectors, sanitize, util};
 use rusqlite::{params, Connection};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 /// Max co-occurrence edges drawn per shared entity at ingest, bounding the proactive-link fan-out
@@ -26,6 +27,94 @@ const MAX_COOCCURRENCE_EDGES_PER_ENTITY: usize = 10;
 /// The vector-similarity floor that lets a vector-only hit survive the lexical gate (mirrors the
 /// episodic candidate-drop rule `lexical < floor && sim < 0.65 -> drop`, `beam.py` L5720+).
 const VEC_SIM_FLOOR: f64 = 0.65;
+
+/// Working-memory TTL in hours (`beam.py` `WORKING_MEMORY_TTL_HOURS` L269). Sleep's age cutoff is
+/// half this (rows older than `TTL/2` are eligible for consolidation).
+const WORKING_MEMORY_TTL_HOURS: i64 = 168;
+
+/// Max working rows claimed per sleep pass (`beam.py` `SLEEP_BATCH_SIZE` L276).
+const SLEEP_BATCH_SIZE: usize = 5000;
+
+/// Tier 1->2 degradation age in days (`beam.py` `TIER2_DAYS` L281).
+const TIER2_DAYS: i64 = 30;
+
+/// Tier 2->3 degradation age in days (`beam.py` `TIER3_DAYS` L282).
+const TIER3_DAYS: i64 = 180;
+
+/// Max rows degraded per tier per pass (`beam.py` `DEGRADE_BATCH_SIZE` L286).
+const DEGRADE_BATCH_SIZE: usize = 100;
+
+/// Tier-3 compression target length (`beam.py` `TIER3_MAX_CHARS` L288).
+const TIER3_MAX_CHARS: usize = 300;
+
+/// A pending consolidation group (rows sharing a `source`), produced by [`Engine::sleep_plan`] and
+/// summarized by the async provider before [`Engine::finish_sleep`] writes the episodic summary.
+#[derive(Clone, Debug)]
+pub struct SleepGroup {
+    /// The shared ingestion source.
+    pub source: String,
+    /// The claimed working-memory row ids.
+    pub ids: Vec<String>,
+    /// The row contents, in timestamp order (the summarization input).
+    pub contents: Vec<String>,
+    /// Aggregated scope: `global` if any member is global, else `session` (`beam.py` L7686).
+    pub scope: String,
+    /// Aggregated veracity label (`beam.py` `aggregate_veracity` L7701).
+    pub veracity: String,
+    /// Aggregated `valid_until` (earliest member expiry, if any).
+    pub valid_until: Option<String>,
+}
+
+/// Bank statistics (`beam.py` `stats`).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Stats {
+    /// Live working-memory rows for the session/global scope.
+    pub working: i64,
+    /// Live episodic rows.
+    pub episodic: i64,
+    /// Episodic rows at tier 1/2/3.
+    pub episodic_tier1: i64,
+    /// Episodic rows at tier 2.
+    pub episodic_tier2: i64,
+    /// Episodic rows at tier 3.
+    pub episodic_tier3: i64,
+    /// Stored consolidated facts.
+    pub facts: i64,
+    /// Open temporal triples.
+    pub triples: i64,
+    /// Recorded conflicts.
+    pub conflicts: i64,
+}
+
+/// A lightweight diagnostics summary (`beam.py` `health`/diagnostics).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Diagnostics {
+    /// Working rows awaiting consolidation.
+    pub pending_consolidation: i64,
+    /// Episodic rows with a stored dense embedding.
+    pub embedded_episodic: i64,
+    /// Total episodic rows.
+    pub episodic: i64,
+    /// The most recent consolidation timestamp, if any.
+    pub last_consolidation: Option<String>,
+    /// Unresolved conflicts.
+    pub open_conflicts: i64,
+}
+
+/// The outcome of a [`Engine::sleep`] pass.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct SleepReport {
+    /// Working rows consolidated.
+    pub items_consolidated: usize,
+    /// Episodic summaries written.
+    pub summaries_created: usize,
+    /// Summaries that used an injected LLM (vs the AAAK fallback).
+    pub llm_used: usize,
+    /// Tier 1->2 degradations.
+    pub tier1_to_tier2: usize,
+    /// Tier 2->3 degradations.
+    pub tier2_to_tier3: usize,
+}
 
 /// Which BEAM tier a row lives in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,12 +222,16 @@ impl Engine {
         let id = util::memory_id(&format!("{}:{}", self.config.session_id, content));
         let memory_type = typed_memory::classify(&content).as_str();
         let now = util::now_iso();
+        // Deterministic temporal extraction (`temporal_parser.py`): populate the event_date columns
+        // so recall + degradation can reason over when an event occurred, not just when it was stored.
+        let temporal = temporal::extract_temporal(&content);
+        let temporal_tags_json = serde_json::to_string(&temporal.temporal_tags)?;
         let conn = self.store.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO working_memory \
              (id, content, source, timestamp, session_id, importance, metadata_json, veracity, \
-              memory_type, scope) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, ?9)",
+              memory_type, scope, event_date, event_date_precision, temporal_tags) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 content,
@@ -149,6 +242,9 @@ impl Engine {
                 args.veracity,
                 memory_type,
                 args.scope,
+                temporal.event_date,
+                temporal.event_date_precision,
+                temporal_tags_json,
             ],
         )?;
         if let Some(vector) = vector {
@@ -193,8 +289,19 @@ impl Engine {
             )?;
         }
 
-        // Proactive linking: connect this memory to earlier ones that mention a shared entity.
-        for entity in &entity_list {
+        self.link_cooccurring(conn, memory_id, &entity_list)?;
+        Ok(())
+    }
+
+    /// Proactive linking: connect `memory_id` to earlier memories that mention a shared entity
+    /// (bounded fan-out per entity). Shared by the regex and LLM ingest paths.
+    fn link_cooccurring(
+        &self,
+        conn: &Connection,
+        memory_id: &str,
+        entity_list: &[String],
+    ) -> Result<()> {
+        for entity in entity_list {
             let mentions = annotations::query_by_kind(conn, "mentions", Some(entity), false)?;
             let mut linked = 0usize;
             for other in mentions {
@@ -216,6 +323,59 @@ impl Engine {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Merge an LLM extraction result into the knowledge layer for a stored memory (`extraction.py`
+    /// host-LLM path L203-L264). LLM entities/triples are layered **on top of** the always-on regex
+    /// baseline ([`Self::ingest_knowledge`]): entities become higher-confidence `mentions`
+    /// annotations (source `llm`), SPO triples become `facts` + `consolidated_facts`, and free-text
+    /// statements become `fact` annotations. Annotation/fact stores dedupe, so re-ingesting an item
+    /// the regex pass already captured is a no-op upsert. Best-effort: a malformed item is skipped,
+    /// never failing the turn.
+    pub fn ingest_extracted(&self, memory_id: &str, extracted: &crate::extract::Extracted) -> Result<()> {
+        let conn = self.store.conn.lock().unwrap();
+        let now = util::now_iso();
+
+        let entity_list: Vec<String> = extracted
+            .entities
+            .iter()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect();
+        if !entity_list.is_empty() {
+            annotations::add_many(&conn, memory_id, "mentions", &entity_list, "llm", 0.9)?;
+        }
+
+        for (n, t) in extracted.triples.iter().enumerate() {
+            let (subject, predicate, object) =
+                (t.subject.trim(), t.predicate.trim(), t.object.trim());
+            if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+                continue;
+            }
+            let fact = episodic_graph::Fact {
+                id: format!("fact_{memory_id}_llm_{n}"),
+                subject: subject.to_string(),
+                predicate: predicate.to_string(),
+                object: object.to_string(),
+                timestamp: now.clone(),
+                confidence: t.confidence,
+            };
+            episodic_graph::store_fact(&conn, &fact, memory_id, &self.config.session_id)?;
+            veracity::consolidate_fact(&conn, subject, predicate, object, "inferred", memory_id)?;
+        }
+
+        let statements: Vec<String> = extracted
+            .facts
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.len() >= 5)
+            .collect();
+        if !statements.is_empty() {
+            annotations::add_many(&conn, memory_id, "fact", &statements, "llm", 0.9)?;
+        }
+
+        self.link_cooccurring(&conn, memory_id, &entity_list)?;
         Ok(())
     }
 
@@ -465,7 +625,7 @@ impl Engine {
         {
             let mut stmt = conn.prepare(
                 "SELECT id, content, source, timestamp, importance, veracity, trust_tier, scope, \
-                        memory_type \
+                        memory_type, event_date, event_date_precision, temporal_tags \
                  FROM working_memory \
                  WHERE consolidated_at IS NULL AND session_id = ?1 AND superseded_by IS NULL",
             )?;
@@ -482,6 +642,11 @@ impl Engine {
                     memory_type: r
                         .get::<_, Option<String>>(8)?
                         .unwrap_or_else(|| "unknown".into()),
+                    event_date: r.get::<_, Option<String>>(9)?,
+                    event_date_precision: r
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_else(|| "unknown".into()),
+                    temporal_tags: r.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".into()),
                 })
             })?;
             for row in rows {
@@ -503,8 +668,9 @@ impl Engine {
             conn.execute(
                 "INSERT OR IGNORE INTO episodic_memory \
                  (id, content, source, timestamp, session_id, importance, metadata_json, veracity, \
-                  memory_type, tier, binary_vector, scope, trust_tier, summary_of) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, '')",
+                  memory_type, tier, binary_vector, scope, trust_tier, summary_of, \
+                  event_date, event_date_precision, temporal_tags) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, '', ?12, ?13, ?14)",
                 params![
                     ep_id,
                     seed.content,
@@ -517,6 +683,9 @@ impl Engine {
                     binary,
                     seed.scope,
                     seed.trust_tier,
+                    seed.event_date,
+                    seed.event_date_precision,
+                    seed.temporal_tags,
                 ],
             )?;
             conn.execute(
@@ -542,6 +711,666 @@ impl Engine {
             params![self.config.session_id, count as i64, preview],
         )?;
         Ok(count)
+    }
+
+    /// The summarization prompt for one source group (`beam.py` sleep LLM path L7749). Built here so
+    /// the async provider and the engine agree on the contract.
+    pub fn summary_prompt(contents: &[String]) -> String {
+        format!(
+            "Summarize the following related memories into a single concise note that preserves all \
+             durable facts, names, decisions, and dates. Be terse; no preamble.\n\n{}\n\nSummary:",
+            contents.join("\n- ")
+        )
+    }
+
+    /// Plan a sleep pass (`beam.py` sleep L7597-L7676): select eligible working rows (older than the
+    /// `TTL/2` cutoff unless `force`, skipping pinned/consolidated rows, oldest-first, capped at
+    /// [`SLEEP_BATCH_SIZE`]), **atomically claim** them (set `consolidated_at`/`consolidation_claimed_at`
+    /// gated on `consolidated_at IS NULL` for crash-/concurrency-safety), and group the claimed rows
+    /// by source. The caller (the async provider) summarizes each group and hands the summaries to
+    /// [`Engine::finish_sleep`]. Returns an empty vec when nothing is eligible.
+    pub fn sleep_plan(&self, force: bool) -> Result<Vec<SleepGroup>> {
+        let conn = self.store.conn.lock().unwrap();
+        let cutoff = if force {
+            "9999-12-31T23:59:59+00:00".to_string()
+        } else {
+            (chrono::Utc::now() - chrono::Duration::hours(WORKING_MEMORY_TTL_HOURS / 2))
+                .to_rfc3339()
+        };
+
+        struct Claimable {
+            id: String,
+            content: String,
+            source: String,
+            scope: String,
+            valid_until: Option<String>,
+            veracity: String,
+        }
+        let candidates: Vec<Claimable> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, COALESCE(source, 'conversation'), \
+                        COALESCE(scope, 'session'), valid_until, COALESCE(veracity, 'unknown') \
+                 FROM working_memory \
+                 WHERE COALESCE(session_id, 'default') = ?1 \
+                   AND timestamp < ?2 \
+                   AND consolidated_at IS NULL \
+                   AND (pinned IS NULL OR pinned = 0) \
+                   AND superseded_by IS NULL \
+                 ORDER BY timestamp ASC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![self.config.session_id, cutoff, SLEEP_BATCH_SIZE as i64],
+                |r| {
+                    Ok(Claimable {
+                        id: r.get(0)?,
+                        content: r.get(1)?,
+                        source: r.get(2)?,
+                        scope: r.get(3)?,
+                        valid_until: r.get(4)?,
+                        veracity: r.get(5)?,
+                    })
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Atomic claim: mark consolidated_at gated on it still being NULL, then keep only the rows we
+        // actually won (a concurrent sleep may have claimed some).
+        let now = util::now_iso();
+        let mut claimed: Vec<Claimable> = Vec::new();
+        for c in candidates {
+            let n = conn.execute(
+                "UPDATE working_memory SET consolidated_at = ?2, consolidation_claimed_at = ?2 \
+                 WHERE id = ?1 AND consolidated_at IS NULL",
+                params![c.id, now],
+            )?;
+            if n == 1 {
+                claimed.push(c);
+            }
+        }
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Group by source, aggregating scope/veracity/valid_until (`beam.py` L7674-L7703).
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, SleepGroup> = HashMap::new();
+        let mut veracities: HashMap<String, Vec<String>> = HashMap::new();
+        for c in claimed {
+            let g = groups.entry(c.source.clone()).or_insert_with(|| {
+                order.push(c.source.clone());
+                SleepGroup {
+                    source: c.source.clone(),
+                    ids: Vec::new(),
+                    contents: Vec::new(),
+                    scope: "session".to_string(),
+                    veracity: "unknown".to_string(),
+                    valid_until: None,
+                }
+            });
+            g.ids.push(c.id);
+            g.contents.push(c.content);
+            if c.scope == "global" {
+                g.scope = "global".to_string();
+            }
+            if let Some(vu) = c.valid_until {
+                g.valid_until = Some(match g.valid_until.take() {
+                    Some(existing) if existing < vu => existing,
+                    _ => vu,
+                });
+            }
+            veracities.entry(c.source).or_default().push(c.veracity);
+        }
+        for (source, vs) in &veracities {
+            if let Some(g) = groups.get_mut(source) {
+                g.veracity = veracity::aggregate_veracity(vs);
+            }
+        }
+        Ok(order.into_iter().filter_map(|s| groups.remove(&s)).collect())
+    }
+
+    /// Write the episodic summaries for the claimed [`SleepGroup`]s (`beam.py` sleep L7784-L7824),
+    /// then run tiered degradation. `summaries` maps a group's `source` to an LLM summary; a group
+    /// with no entry falls back to the deterministic AAAK summary `[source] <aaak>`. Clears each
+    /// group's `consolidation_claimed_at`, writes a `consolidation_log` row, and returns the report.
+    pub fn finish_sleep(
+        &self,
+        groups: &[SleepGroup],
+        summaries: &HashMap<String, String>,
+    ) -> Result<SleepReport> {
+        let mut report = SleepReport::default();
+        if !groups.is_empty() {
+            let conn = self.store.conn.lock().unwrap();
+            for group in groups {
+                let (summary, llm) = match summaries.get(&group.source) {
+                    Some(s) if !s.trim().is_empty() => (s.trim().to_string(), true),
+                    _ => (
+                        format!("[{}] {}", group.source, crate::aaak::summarize_group(&group.contents)),
+                        false,
+                    ),
+                };
+                let ep_id = util::memory_id(&format!(
+                    "episodic:{}:{}",
+                    self.config.session_id, summary
+                ));
+                let summary_of = serde_json::to_string(&group.ids)?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO episodic_memory \
+                     (id, content, source, timestamp, session_id, importance, metadata_json, \
+                      veracity, memory_type, tier, scope, summary_of, valid_until) \
+                     VALUES (?1, ?2, 'sleep_consolidation', ?3, ?4, 0.6, '{}', ?5, 'unknown', 1, \
+                             ?6, ?7, ?8)",
+                    params![
+                        ep_id,
+                        summary,
+                        util::now_iso(),
+                        self.config.session_id,
+                        group.veracity,
+                        group.scope,
+                        summary_of,
+                        group.valid_until,
+                    ],
+                )?;
+                self.ingest_knowledge(&conn, &ep_id, &summary, &group.veracity)?;
+                let placeholders = group
+                    .ids
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "UPDATE working_memory SET consolidation_claimed_at = NULL WHERE id IN ({placeholders})"
+                );
+                let id_params: Vec<&dyn rusqlite::ToSql> =
+                    group.ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                conn.execute(&sql, id_params.as_slice())?;
+
+                report.items_consolidated += group.ids.len();
+                report.summaries_created += 1;
+                if llm {
+                    report.llm_used += 1;
+                }
+            }
+            let method = if report.llm_used == report.summaries_created {
+                "llm"
+            } else if report.llm_used > 0 {
+                "llm+aaak"
+            } else {
+                "aaak"
+            };
+            conn.execute(
+                "INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    self.config.session_id,
+                    report.items_consolidated as i64,
+                    format!(
+                        "{} summaries ({method}) from {} items",
+                        report.summaries_created, report.items_consolidated
+                    ),
+                ],
+            )?;
+        }
+
+        let (t1, t2) = self.degrade_episodic()?;
+        report.tier1_to_tier2 = t1;
+        report.tier2_to_tier3 = t2;
+        Ok(report)
+    }
+
+    /// Run a full sleep pass with the deterministic AAAK summary (no LLM). Equivalent to
+    /// [`Engine::sleep_plan`] + [`Engine::finish_sleep`] with no LLM summaries. The async provider
+    /// uses the split form to inject LLM summaries; this is the standalone/no-LLM entrypoint.
+    pub fn sleep(&self, force: bool) -> Result<SleepReport> {
+        let groups = self.sleep_plan(force)?;
+        self.finish_sleep(&groups, &HashMap::new())
+    }
+
+    /// Tiered episodic degradation (`beam.py` `degrade_episodic` L7241-L7366): tier 1 rows older than
+    /// [`TIER2_DAYS`] are AAAK-compressed and promoted to tier 2; tier 2 rows older than
+    /// [`TIER3_DAYS`] are signal-compressed to <=[`TIER3_MAX_CHARS`] and promoted to tier 3. When a
+    /// row's content changes its stale dense embedding is invalidated (dropped + binary vector
+    /// cleared) so recall doesn't score against text that no longer exists. Recall already applies a
+    /// tier weight, so degraded rows score down automatically. Returns `(tier1->2, tier2->3)` counts.
+    pub fn degrade_episodic(&self) -> Result<(usize, usize)> {
+        let conn = self.store.conn.lock().unwrap();
+        let now = util::now_iso();
+
+        // Tier 1 -> 2: AAAK-compress.
+        let tier1: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM episodic_memory \
+                 WHERE tier = 1 AND created_at < datetime('now', ?1) \
+                 ORDER BY created_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![format!("-{TIER2_DAYS} days"), DEGRADE_BATCH_SIZE as i64],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut t1 = 0usize;
+        for (id, content) in &tier1 {
+            let compressed = crate::aaak::encode(content);
+            let final_content: String = compressed.chars().take(800).collect();
+            conn.execute(
+                "UPDATE episodic_memory SET content = ?2, tier = 2, degraded_at = ?3 WHERE id = ?1",
+                params![id, final_content, now],
+            )?;
+            if &final_content != content {
+                self.invalidate_episodic_embedding(&conn, id)?;
+            }
+            t1 += 1;
+        }
+
+        // Tier 2 -> 3: signal-compress to TIER3_MAX_CHARS.
+        let tier2: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM episodic_memory \
+                 WHERE tier = 2 AND created_at < datetime('now', ?1) \
+                 ORDER BY created_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![format!("-{TIER3_DAYS} days"), (DEGRADE_BATCH_SIZE / 2) as i64],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut t2 = 0usize;
+        for (id, content) in &tier2 {
+            let compressed = compress_to(content, TIER3_MAX_CHARS);
+            conn.execute(
+                "UPDATE episodic_memory SET content = ?2, tier = 3, degraded_at = ?3 WHERE id = ?1",
+                params![id, compressed, now],
+            )?;
+            if &compressed != content {
+                self.invalidate_episodic_embedding(&conn, id)?;
+            }
+            t2 += 1;
+        }
+        Ok((t1, t2))
+    }
+
+    /// Drop a degraded row's stale dense embedding + binary vector (`beam.py`
+    /// `_refresh_episodic_embedding` invalidation path C18.b) so recall falls back to lexical/FTS
+    /// until a fresh embedding is computed.
+    fn invalidate_episodic_embedding(&self, conn: &Connection, id: &str) -> Result<()> {
+        conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", params![id])?;
+        conn.execute(
+            "UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    // ── Tool-surface backing methods (`beam.py` get/update/forget/invalidate/validate/stats/...) ──
+
+    /// Fetch a single live memory by id, working tier first then episodic (`beam.py` `get`).
+    pub fn get(&self, id: &str) -> Result<Option<MemoryRow>> {
+        let conn = self.store.conn.lock().unwrap();
+        if let Some(row) = self.fetch_working(&conn, id)? {
+            return Ok(Some(row));
+        }
+        self.fetch_episodic(&conn, id)
+    }
+
+    /// Update a memory's `content` and/or `importance` in whichever tier holds it (`beam.py`
+    /// `update`). FTS stays in sync via the content-update triggers. Returns whether a row changed.
+    pub fn update(&self, id: &str, content: Option<&str>, importance: Option<f64>) -> Result<bool> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut changed = false;
+        for table in ["working_memory", "episodic_memory"] {
+            if let Some(c) = content {
+                changed |= conn.execute(
+                    &format!("UPDATE {table} SET content = ?2 WHERE id = ?1"),
+                    params![id, c],
+                )? > 0;
+            }
+            if let Some(imp) = importance {
+                changed |= conn.execute(
+                    &format!("UPDATE {table} SET importance = ?2 WHERE id = ?1"),
+                    params![id, imp],
+                )? > 0;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Hard-delete a memory from both tiers plus its stored embedding (`beam.py` `forget`). FTS rows
+    /// are removed by the delete triggers. Returns whether anything was deleted.
+    pub fn forget(&self, id: &str) -> Result<bool> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut deleted = conn.execute("DELETE FROM working_memory WHERE id = ?1", params![id])?;
+        deleted += conn.execute("DELETE FROM episodic_memory WHERE id = ?1", params![id])?;
+        conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", params![id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Soft-invalidate a memory: stamp `valid_until` now and point `superseded_by` at an optional
+    /// replacement (`beam.py` `invalidate` L7725). The row drops out of recall (which filters
+    /// `valid_until IS NULL AND superseded_by IS NULL`). Returns whether a row changed.
+    pub fn invalidate(&self, id: &str, replacement_id: Option<&str>) -> Result<bool> {
+        let conn = self.store.conn.lock().unwrap();
+        let now = util::now_iso();
+        let mut changed = false;
+        for table in ["working_memory", "episodic_memory"] {
+            changed |= conn.execute(
+                &format!(
+                    "UPDATE {table} SET valid_until = ?2, superseded_by = ?3 \
+                     WHERE id = ?1 AND valid_until IS NULL"
+                ),
+                params![id, now, replacement_id],
+            )? > 0;
+        }
+        Ok(changed)
+    }
+
+    /// Record a human/agent validation action on a memory (`beam.py` `validate`). Appends a
+    /// `memory_validations` row and bumps the row's `validation_count`/`validated_at`/`validator`.
+    /// `action = "correct"` with `new_content` rewrites the content; `action = "reject"` invalidates
+    /// the row. Returns whether the target memory exists.
+    pub fn validate(
+        &self,
+        id: &str,
+        action: &str,
+        validator: Option<&str>,
+        new_content: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let now = util::now_iso();
+        {
+            let conn = self.store.conn.lock().unwrap();
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM working_memory WHERE id = ?1 \
+                 UNION ALL SELECT 1 FROM episodic_memory WHERE id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            conn.execute(
+                "INSERT INTO memory_validations (memory_id, validator, validated_at, action, \
+                 new_content, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, validator, now, action, new_content, note],
+            )?;
+            for table in ["working_memory", "episodic_memory"] {
+                conn.execute(
+                    &format!(
+                        "UPDATE {table} SET validation_count = validation_count + 1, \
+                         validated_at = ?2, validator = ?3 WHERE id = ?1"
+                    ),
+                    params![id, now, validator],
+                )?;
+            }
+        }
+        match action {
+            "correct" => {
+                if let Some(c) = new_content {
+                    self.update(id, Some(c), None)?;
+                }
+            }
+            "reject" => {
+                self.invalidate(id, None)?;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// Bank statistics (`beam.py` `stats`): tier counts + structured-store sizes.
+    pub fn stats(&self) -> Result<Stats> {
+        let conn = self.store.conn.lock().unwrap();
+        let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
+        Ok(Stats {
+            working: count(
+                "SELECT COUNT(*) FROM working_memory WHERE valid_until IS NULL AND superseded_by IS NULL",
+            )?,
+            episodic: count(
+                "SELECT COUNT(*) FROM episodic_memory WHERE valid_until IS NULL AND superseded_by IS NULL",
+            )?,
+            episodic_tier1: count("SELECT COUNT(*) FROM episodic_memory WHERE tier = 1")?,
+            episodic_tier2: count("SELECT COUNT(*) FROM episodic_memory WHERE tier = 2")?,
+            episodic_tier3: count("SELECT COUNT(*) FROM episodic_memory WHERE tier = 3")?,
+            facts: count("SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NULL")?,
+            triples: count("SELECT COUNT(*) FROM triples WHERE valid_until IS NULL")?,
+            conflicts: count("SELECT COUNT(*) FROM conflicts")?,
+        })
+    }
+
+    /// A lightweight diagnostics summary (`beam.py` `health`).
+    pub fn diagnose(&self) -> Result<Diagnostics> {
+        let conn = self.store.conn.lock().unwrap();
+        Ok(Diagnostics {
+            pending_consolidation: conn.query_row(
+                "SELECT COUNT(*) FROM working_memory WHERE consolidated_at IS NULL \
+                 AND session_id = ?1 AND superseded_by IS NULL",
+                params![self.config.session_id],
+                |r| r.get(0),
+            )?,
+            embedded_episodic: conn.query_row(
+                "SELECT COUNT(*) FROM episodic_memory WHERE binary_vector IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?,
+            episodic: conn.query_row("SELECT COUNT(*) FROM episodic_memory", [], |r| r.get(0))?,
+            last_consolidation: conn
+                .query_row(
+                    "SELECT MAX(created_at) FROM consolidation_log WHERE items_consolidated > 0",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap_or(None),
+            open_conflicts: conn.query_row(
+                "SELECT COUNT(*) FROM conflicts WHERE resolution IS NULL",
+                [],
+                |r| r.get(0),
+            )?,
+        })
+    }
+
+    /// Write a scratchpad note for the session (`beam.py` scratchpad). Returns the row id.
+    pub fn scratchpad_write(&self, content: &str) -> Result<String> {
+        let conn = self.store.conn.lock().unwrap();
+        let now = util::now_iso();
+        let id = util::memory_id(&format!("scratch:{}:{}:{}", self.config.session_id, now, content));
+        conn.execute(
+            "INSERT OR REPLACE INTO scratchpad (id, content, session_id) VALUES (?1, ?2, ?3)",
+            params![id, content, self.config.session_id],
+        )?;
+        Ok(id)
+    }
+
+    /// Read the session's scratchpad notes, newest first (`(id, content)` pairs).
+    pub fn scratchpad_read(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, content FROM scratchpad WHERE session_id = ?1 ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![self.config.session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Clear the session's scratchpad. Returns the number of notes removed.
+    pub fn scratchpad_clear(&self) -> Result<usize> {
+        let conn = self.store.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM scratchpad WHERE session_id = ?1",
+            params![self.config.session_id],
+        )?)
+    }
+
+    /// Export the session's working + episodic rows as a portable JSON bundle (`beam.py`
+    /// `export`/sync surface). Knowledge structures are re-derivable from content on import.
+    pub fn export(&self) -> Result<serde_json::Value> {
+        let conn = self.store.conn.lock().unwrap();
+        let dump = |table: &str| -> Result<Vec<serde_json::Value>> {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, content, source, timestamp, importance, veracity, scope \
+                 FROM {table} WHERE session_id = ?1 AND valid_until IS NULL AND superseded_by IS NULL"
+            ))?;
+            let rows = stmt.query_map(params![self.config.session_id], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "content": r.get::<_, String>(1)?,
+                    "source": r.get::<_, Option<String>>(2)?,
+                    "timestamp": r.get::<_, Option<String>>(3)?,
+                    "importance": r.get::<_, f64>(4)?,
+                    "veracity": r.get::<_, Option<String>>(5)?,
+                    "scope": r.get::<_, Option<String>>(6)?,
+                }))
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        };
+        Ok(json!({
+            "version": 1,
+            "session_id": self.config.session_id,
+            "working_memory": dump("working_memory")?,
+            "episodic_memory": dump("episodic_memory")?,
+        }))
+    }
+
+    /// Import rows from an [`Engine::export`] bundle into this session, re-running knowledge + temporal
+    /// ingestion for working rows. Returns the number of working rows imported.
+    pub fn import(&self, bundle: &serde_json::Value) -> Result<usize> {
+        let mut imported = 0usize;
+        if let Some(rows) = bundle.get("working_memory").and_then(|v| v.as_array()) {
+            for row in rows {
+                let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    continue;
+                }
+                let importance = row.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                let scope = row
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("session")
+                    .to_string();
+                let veracity = row
+                    .get("veracity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("imported")
+                    .to_string();
+                self.remember_with_vector(
+                    content,
+                    &RememberArgs {
+                        source: "import".to_string(),
+                        importance,
+                        scope,
+                        veracity,
+                    },
+                    None,
+                    "",
+                )?;
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+
+    /// Graph neighbours of a memory within `depth` hops (`beam.py` `graph_query` /
+    /// `episodic_graph::find_related_memories`).
+    pub fn graph_query(&self, memory_id: &str, depth: usize) -> Result<Vec<episodic_graph::Related>> {
+        let conn = self.store.conn.lock().unwrap();
+        episodic_graph::find_related_memories(&conn, memory_id, depth.max(1), "", 0.0)
+    }
+
+    /// Add a manual graph edge between two memories (`beam.py` `graph_link` /
+    /// `episodic_graph::add_edge`).
+    pub fn graph_link(&self, source: &str, target: &str, edge_type: &str, weight: f64) -> Result<()> {
+        let conn = self.store.conn.lock().unwrap();
+        episodic_graph::add_edge(
+            &conn,
+            &episodic_graph::GraphEdge {
+                source: source.to_string(),
+                target: target.to_string(),
+                edge_type: if edge_type.is_empty() {
+                    "related_to".to_string()
+                } else {
+                    edge_type.to_string()
+                },
+                weight,
+            },
+        )
+    }
+
+    /// Add a temporal triple (`triples::add`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn triple_add(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+        source: &str,
+        confidence: f64,
+        supersede: bool,
+    ) -> Result<i64> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::knowledge::triples::add(
+            &conn, subject, predicate, object, valid_from, valid_until, source, confidence, supersede,
+        )
+    }
+
+    /// Expire open triples (`triples::end`).
+    pub fn triple_end(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: Option<&str>,
+        valid_until: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::knowledge::triples::end(&conn, subject, predicate, object, valid_until)
+    }
+
+    /// Query temporal triples valid at `as_of` (`triples::query`).
+    pub fn triple_query(
+        &self,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        object: Option<&str>,
+        as_of: Option<&str>,
+    ) -> Result<Vec<crate::knowledge::triples::Triple>> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::knowledge::triples::query(&conn, subject, predicate, object, as_of)
+    }
+
+    /// Upsert a canonical identity fact (`canonical::remember`).
+    pub fn canonical_remember(
+        &self,
+        owner_id: &str,
+        category: &str,
+        name: &str,
+        body: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<(crate::knowledge::canonical::CanonicalRow, crate::knowledge::canonical::Status)> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::knowledge::canonical::remember(&conn, owner_id, category, name, body, source, confidence)
+    }
+
+    /// Read live canonical facts for an owner (`canonical::current`).
+    pub fn canonical_recall(
+        &self,
+        owner_id: &str,
+        category: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Vec<crate::knowledge::canonical::CanonicalRow>> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::knowledge::canonical::current(&conn, owner_id, category, name)
+    }
+
+    /// Retire a canonical fact slot (`canonical::forget`).
+    pub fn canonical_forget(&self, owner_id: &str, category: &str, name: &str) -> Result<bool> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::knowledge::canonical::forget(&conn, owner_id, category, name)
     }
 
     /// Run an FTS5 `MATCH` query (`sql` selecting `(id, bm25)`), returning `id -> normalized BM25`
@@ -795,6 +1624,19 @@ struct EpisodicSeed {
     trust_tier: String,
     scope: String,
     memory_type: String,
+    event_date: Option<String>,
+    event_date_precision: String,
+    temporal_tags: String,
+}
+
+/// Compress `content` to at most `max_chars` characters for tier-3 degradation (`beam.py`
+/// `_extract_key_signal`/truncation L7344-L7349): keep the head and mark elision.
+fn compress_to(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(max_chars).collect();
+    format!("{head} [...]")
 }
 
 /// Load the stored f32 embeddings (`memory_embeddings.embedding_json`), keyed by memory id.
@@ -1251,5 +2093,214 @@ mod tests {
             related.iter().any(|r| r.memory_id == b),
             "graph should relate the two Maya/Phoenix memories"
         );
+    }
+
+    #[test]
+    fn ingest_extracted_merges_llm_entities_and_triples() {
+        let e = engine();
+        let id = e
+            .remember("a routine note", &RememberArgs::default())
+            .unwrap();
+        let extracted = crate::extract::Extracted {
+            entities: vec!["Denis".into()],
+            triples: vec![crate::extract::ExtractedTriple {
+                subject: "Denis".into(),
+                predicate: "manages".into(),
+                object: "Atlas".into(),
+                confidence: 0.9,
+            }],
+            facts: vec!["Denis manages the Atlas project".into()],
+        };
+        e.ingest_extracted(&id, &extracted).unwrap();
+        let c = e.store.conn.lock().unwrap();
+        let mentions: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1 AND kind = 'mentions' AND value = 'Denis'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mentions, 1, "LLM entity should land as a mention");
+        let triple: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM consolidated_facts WHERE subject='Denis' AND predicate='manages' AND object='Atlas'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triple, 1, "LLM triple should be consolidated");
+        let fact_ann: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1 AND kind = 'fact'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fact_ann, 1, "LLM statement should land as a fact annotation");
+    }
+
+    #[test]
+    fn temporal_columns_populated_on_write() {
+        let e = engine();
+        let id = e
+            .remember("ship the release on 2026-05-20", &RememberArgs::default())
+            .unwrap();
+        let c = e.store.conn.lock().unwrap();
+        let (date, precision): (Option<String>, String) = c
+            .query_row(
+                "SELECT event_date, event_date_precision FROM working_memory WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(date.as_deref(), Some("2026-05-20"));
+        assert_eq!(precision, "day");
+    }
+
+    #[test]
+    fn sleep_groups_and_summarizes_with_aaak() {
+        let e = engine();
+        // Two rows from the same source -> one summary group.
+        e.remember("User prefers dark mode", &RememberArgs::default())
+            .unwrap();
+        e.remember("User prefers tabs over spaces", &RememberArgs::default())
+            .unwrap();
+        let report = e.sleep(true).expect("forced sleep");
+        assert_eq!(report.items_consolidated, 2);
+        assert_eq!(report.summaries_created, 1);
+        assert_eq!(report.llm_used, 0, "no LLM -> AAAK fallback");
+        // A summary episodic row was written, tagged as a sleep consolidation.
+        let c = e.store.conn.lock().unwrap();
+        let summaries: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM episodic_memory WHERE source = 'sleep_consolidation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(summaries, 1);
+        // The originals are marked consolidated (additive: still present).
+        let pending: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM working_memory WHERE consolidated_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "all working rows claimed");
+    }
+
+    #[test]
+    fn sleep_skips_pinned_and_respects_cutoff() {
+        let e = engine();
+        let id = e
+            .remember("recent unpinned note", &RememberArgs::default())
+            .unwrap();
+        {
+            let c = e.store.conn.lock().unwrap();
+            c.execute("UPDATE working_memory SET pinned = 1 WHERE id = ?1", params![id])
+                .unwrap();
+        }
+        // force=false: the row is fresh (after the cutoff) AND pinned -> nothing consolidates.
+        let report = e.sleep(false).expect("sleep");
+        assert_eq!(report.items_consolidated, 0);
+    }
+
+    #[test]
+    fn degrade_episodic_promotes_old_tiers() {
+        let e = engine();
+        // Seed an episodic row backdated > TIER2_DAYS so tier1->2 fires.
+        {
+            let c = e.store.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO episodic_memory (id, content, session_id, tier, created_at) \
+                 VALUES ('old1', 'User prefers Python and Rust over Go', 'default', 1, \
+                         datetime('now', '-60 days'))",
+                [],
+            )
+            .unwrap();
+            // And one backdated > TIER3_DAYS at tier 2 so tier2->3 fires.
+            let long = "x ".repeat(400);
+            c.execute(
+                "INSERT INTO episodic_memory (id, content, session_id, tier, created_at) \
+                 VALUES ('old2', ?1, 'default', 2, datetime('now', '-200 days'))",
+                params![long],
+            )
+            .unwrap();
+        }
+        let (t1, t2) = e.degrade_episodic().expect("degrade");
+        assert_eq!(t1, 1, "tier1 row should promote to tier2");
+        assert_eq!(t2, 1, "tier2 row should promote to tier3");
+        let c = e.store.conn.lock().unwrap();
+        let tier1: i64 = c
+            .query_row("SELECT tier FROM episodic_memory WHERE id='old1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tier1, 2);
+        let (tier2, len): (i64, i64) = c
+            .query_row(
+                "SELECT tier, LENGTH(content) FROM episodic_memory WHERE id='old2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tier2, 3);
+        assert!(len as usize <= TIER3_MAX_CHARS + 8, "tier3 content compressed");
+    }
+
+    #[test]
+    fn tool_backing_methods_round_trip() {
+        let e = engine();
+        let id = e.remember("a fact to manage", &RememberArgs::default()).unwrap();
+        assert!(e.get(&id).unwrap().is_some());
+        assert!(e.update(&id, Some("an updated fact"), Some(0.9)).unwrap());
+        assert_eq!(e.get(&id).unwrap().unwrap().content, "an updated fact");
+
+        // Scratchpad CRUD.
+        e.scratchpad_write("remember to ship").unwrap();
+        assert_eq!(e.scratchpad_read().unwrap().len(), 1);
+        assert_eq!(e.scratchpad_clear().unwrap(), 1);
+        assert!(e.scratchpad_read().unwrap().is_empty());
+
+        // Triples + canonical.
+        e.triple_add("Ada", "uses", "Rust", None, None, "tool", 1.0, true)
+            .unwrap();
+        assert_eq!(e.triple_query(Some("Ada"), None, None, None).unwrap().len(), 1);
+        let (_row, status) = e
+            .canonical_remember("ada", "identity", "lang", "Rust", "tool", 1.0)
+            .unwrap();
+        assert_eq!(status, crate::knowledge::canonical::Status::Created);
+        assert_eq!(e.canonical_recall("ada", None, None).unwrap().len(), 1);
+
+        // Invalidate drops it from recall surface.
+        assert!(e.invalidate(&id, None).unwrap());
+        assert!(e.get(&id).unwrap().is_none());
+
+        // Forget hard-deletes.
+        let id2 = e.remember("ephemeral", &RememberArgs::default()).unwrap();
+        assert!(e.forget(&id2).unwrap());
+        assert!(!e.forget(&id2).unwrap(), "already gone");
+    }
+
+    #[test]
+    fn export_import_round_trips_rows() {
+        let e = engine();
+        e.remember("portable memory one", &RememberArgs::default()).unwrap();
+        e.remember("portable memory two", &RememberArgs::default()).unwrap();
+        let bundle = e.export().unwrap();
+
+        let e2 = engine();
+        let n = e2.import(&bundle).unwrap();
+        assert_eq!(n, 2, "both working rows imported");
+        assert!(!e2.recall("portable memory", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stats_and_diagnose_report_counts() {
+        let e = engine();
+        e.remember("count me", &RememberArgs::default()).unwrap();
+        let stats = e.stats().unwrap();
+        assert_eq!(stats.working, 1);
+        let diag = e.diagnose().unwrap();
+        assert_eq!(diag.pending_consolidation, 1);
     }
 }

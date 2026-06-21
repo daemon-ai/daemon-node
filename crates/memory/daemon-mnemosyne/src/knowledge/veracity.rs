@@ -22,6 +22,48 @@ pub fn veracity_weight(veracity: &str) -> f64 {
     }
 }
 
+/// The canonical veracity labels (`veracity_consolidation.py` `VERACITY_ALLOWED`).
+const VERACITY_ALLOWED: &[&str] = &["stated", "inferred", "tool", "imported", "unknown"];
+
+/// Aggregate per-source veracity labels into one summary label (`veracity_consolidation.py`
+/// `aggregate_veracity` L183-L244): drop non-canonical labels; treat `unknown` as low-priority (only
+/// counted when no canonical non-`unknown` label is present); then take the mode, breaking multi-way
+/// ties toward the lowest-weight (most conservative) label.
+pub fn aggregate_veracity(source_veracities: &[String]) -> String {
+    let valid: Vec<&str> = source_veracities
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|v| VERACITY_ALLOWED.contains(v))
+        .collect();
+    if valid.is_empty() {
+        return "unknown".to_string();
+    }
+    let non_unknown: Vec<&str> = valid.iter().copied().filter(|v| *v != "unknown").collect();
+    let candidates = if non_unknown.is_empty() { &valid } else { &non_unknown };
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for v in candidates {
+        *counts.entry(*v).or_insert(0) += 1;
+    }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    let mut most_common: Vec<&str> = counts
+        .iter()
+        .filter(|(_, c)| **c == max_count)
+        .map(|(v, _)| *v)
+        .collect();
+    if most_common.len() == 1 {
+        return most_common[0].to_string();
+    }
+    // Tie: most conservative (lowest weight), deterministic by name on weight ties.
+    most_common.sort_by(|a, b| {
+        veracity_weight(a)
+            .partial_cmp(&veracity_weight(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(b))
+    });
+    most_common[0].to_string()
+}
+
 /// Deterministic fact id `cf_<sha256(len-prefixed NFC SPO)[:24]>` (`veracity_consolidation.py`
 /// L111-L115). Length-prefix framing prevents separator smuggling; NFC for Unicode stability.
 pub fn compute_fact_id(subject: &str, predicate: &str, object: &str) -> String {

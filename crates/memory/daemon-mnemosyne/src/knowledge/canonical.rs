@@ -115,6 +115,43 @@ pub fn forget(conn: &Connection, owner_id: &str, category: &str, name: &str) -> 
     Ok(n > 0)
 }
 
+/// Read the live canonical rows for `owner_id`, optionally filtered by `category` and `name`
+/// (`canonical.py` recall path). Only rows with `valid_until IS NULL` are returned.
+pub fn current(
+    conn: &Connection,
+    owner_id: &str,
+    category: Option<&str>,
+    name: Option<&str>,
+) -> Result<Vec<CanonicalRow>> {
+    use rusqlite::types::Value;
+    let mut sql = String::from(
+        "SELECT id, owner_id, category, name, body, version FROM canonical_facts \
+         WHERE owner_id = ? AND valid_until IS NULL",
+    );
+    let mut binds: Vec<Value> = vec![Value::Text(owner_id.to_string())];
+    if let Some(c) = category {
+        sql.push_str(" AND category = ?");
+        binds.push(Value::Text(c.to_string()));
+    }
+    if let Some(n) = name {
+        sql.push_str(" AND name = ?");
+        binds.push(Value::Text(n.to_string()));
+    }
+    sql.push_str(" ORDER BY category ASC, name ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
+        Ok(CanonicalRow {
+            id: r.get(0)?,
+            owner_id: r.get(1)?,
+            category: r.get(2)?,
+            name: r.get(3)?,
+            body: r.get(4)?,
+            version: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 fn fetch_by_id(conn: &Connection, id: i64) -> Result<CanonicalRow> {
     let row = conn.query_row(
         "SELECT id, owner_id, category, name, body, version FROM canonical_facts WHERE id = ?1",
