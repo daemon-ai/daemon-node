@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use daemon_api::FleetReport;
 use daemon_common::{JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
-    Config, ContextEngine, CredentialBuilder, EngineProfile, MemoryProvider, ProviderRegistry,
-    SystemPrompt, Tool, ToolRegistry,
+    Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile, MemoryBuilder,
+    MemoryProvider, ProviderRegistry, SystemPrompt, Tool, ToolRegistry,
 };
 use daemon_host::{
     AgentSession, AgentUnit, CodecSession, CoreEngineFactory, EngineUnit, FleetControl, Host,
@@ -67,12 +67,20 @@ pub struct NodeAssembly {
     /// flat fleet of engine leaves; `1` makes every top child an orchestrator owning a sub-fleet of
     /// leaves (fleets-of-fleets), `n` nests `n` deep — the tree the GUI projects and addresses.
     pub nesting_depth: usize,
-    /// The default §10 context engine (e.g. LCM) injected into every engine this node builds. `None`
-    /// keeps the in-core [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) (tests / CI).
+    /// A shared (session-independent) §10 context engine injected into every engine this node builds.
+    /// `None` keeps the in-core [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) (tests
+    /// / CI). For stateful engines prefer [`Self::context_builder`].
     pub context: Option<Arc<dyn ContextEngine>>,
-    /// The default §11 memory providers (e.g. Mnemosyne) injected into every engine this node builds.
-    /// Empty keeps memory off (tests / CI).
+    /// A per-session §10 context-engine builder (e.g. LCM, which keeps per-session compaction state).
+    /// Takes precedence over [`Self::context`] so each session gets its own instance.
+    pub context_builder: Option<ContextEngineBuilder>,
+    /// The default §11 memory providers (e.g. a frozen `FileMemory`) injected into every engine this
+    /// node builds. Empty keeps memory off (tests / CI). For session-scoped backends prefer
+    /// [`Self::memory_builder`].
     pub memory: Vec<Arc<dyn MemoryProvider>>,
+    /// A per-session §11 memory builder (e.g. Mnemosyne, scoped by `session_id` over a shared bank).
+    /// Takes precedence over [`Self::memory`] so each session gets its own provider set.
+    pub memory_builder: Option<MemoryBuilder>,
     /// Extra tools (e.g. `mnemosyne_*` / `lcm_*`) registered into every role's tool registry on top
     /// of the core fs + shell toolset, so the model can drive memory/context backends.
     pub extra_tools: Vec<Arc<dyn Tool>>,
@@ -95,10 +103,15 @@ pub struct AssembledNode {
 /// optional brokered credentials uniformly to a role profile.
 fn dress(profile: EngineProfile, a: &NodeAssembly) -> EngineProfile {
     let mut profile = profile.with_config(a.engine_config);
-    if let Some(context) = &a.context {
+    // Per-session builders (stateful/session-scoped backends) take precedence over shared instances.
+    if let Some(builder) = &a.context_builder {
+        profile = profile.with_context_engine_builder(builder.clone());
+    } else if let Some(context) = &a.context {
         profile = profile.with_context_engine(context.clone());
     }
-    if !a.memory.is_empty() {
+    if let Some(builder) = &a.memory_builder {
+        profile = profile.with_memory_builder(builder.clone());
+    } else if !a.memory.is_empty() {
         profile = profile.with_memory(a.memory.clone());
     }
     match &a.credentials {
@@ -605,7 +618,7 @@ mod tests {
 
     use super::*;
     use daemon_common::SessionId;
-    use daemon_context_lcm::LcmContextEngine;
+    use daemon_context_lcm::{LcmConfig, LcmContextEngine};
     use daemon_core::{
         EventSink, MockProvider, Provider, ToolCall, ToolOutcome, TurnControl, TurnOutcome,
     };
@@ -613,6 +626,8 @@ mod tests {
     use daemon_protocol::{
         HostRequest, HostRequestHandler, HostResponse, HostResponseBody, UserMsg,
     };
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     struct NoopHost;
 
@@ -626,10 +641,42 @@ mod tests {
         }
     }
 
-    /// A §12 tool adapter dispatching a `mnemosyne_*` call to the shared provider (mirrors the
-    /// `MemoryProviderTool` the binary registers).
+    /// A shared per-session Mnemosyne bank cache (mirrors the binary's `MnemosyneBanks`): one
+    /// provider per session over the same on-disk bank, shared by the memory builder and the tools so
+    /// the §11 hook and the `mnemosyne_*` tools always hit the same per-session instance.
+    struct TestBanks {
+        dir: std::path::PathBuf,
+        sessions: Mutex<HashMap<SessionId, Arc<MnemosyneProvider>>>,
+    }
+
+    impl TestBanks {
+        fn new(dir: std::path::PathBuf) -> Self {
+            Self {
+                dir,
+                sessions: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn get_or_open(&self, session: &SessionId) -> Arc<MnemosyneProvider> {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(p) = sessions.get(session) {
+                return p.clone();
+            }
+            let cfg = MnemosyneConfig {
+                data_dir: self.dir.clone(),
+                session_id: session.as_str().to_string(),
+                ..MnemosyneConfig::default()
+            };
+            let p = Arc::new(MnemosyneProvider::open(cfg).expect("open mnemosyne bank"));
+            sessions.insert(session.clone(), p.clone());
+            p
+        }
+    }
+
+    /// A §12 tool adapter resolving the calling session's provider from the shared cache by
+    /// `cx.session_id` (mirrors the binary's `MemoryProviderTool`).
     struct MemTool {
-        provider: Arc<MnemosyneProvider>,
+        banks: Arc<TestBanks>,
         def: daemon_core::ToolDef,
     }
 
@@ -641,9 +688,10 @@ mod tests {
         fn schema(&self) -> &str {
             &self.def.schema
         }
-        async fn run(&self, call: &ToolCall, _cx: &daemon_core::TurnCx<'_>) -> ToolOutcome {
+        async fn run(&self, call: &ToolCall, cx: &daemon_core::TurnCx<'_>) -> ToolOutcome {
             let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
-            let out = self.provider.call_tool(&self.def.name, args).await;
+            let provider = self.banks.get_or_open(&cx.session_id);
+            let out = provider.call_tool(&self.def.name, args).await;
             ToolOutcome::text(call.call_id.clone(), true, out)
         }
     }
@@ -652,33 +700,38 @@ mod tests {
     async fn lcm_and_mnemosyne_defaults_run_a_turn() {
         // A unique on-disk Mnemosyne bank so parallel tests do not collide.
         let dir = std::env::temp_dir().join(format!("daemon-node-smoke-{}", std::process::id()));
-        let mem_cfg = MnemosyneConfig {
-            data_dir: dir.clone(),
-            ..MnemosyneConfig::default()
-        };
-        let memory: Arc<MnemosyneProvider> =
-            Arc::new(MnemosyneProvider::open(mem_cfg).expect("open mnemosyne"));
-        let context: Arc<dyn ContextEngine> =
-            Arc::new(LcmContextEngine::open_in_memory().expect("open lcm"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let banks = Arc::new(TestBanks::new(dir.clone()));
 
-        // Register the mnemosyne_* tools through the registry (sharing the provider), exactly as the
-        // composition layer does.
+        // Register the mnemosyne_* tools (session-resolved through the shared cache), exactly as the
+        // composition layer does. Tool defs are session-independent; read them from a probe instance.
         let mut registry = ToolRegistry::new();
-        for def in memory.tools() {
+        for def in banks.get_or_open(&SessionId::new("__probe__")).tools() {
             registry.register(Arc::new(MemTool {
-                provider: memory.clone(),
+                banks: banks.clone(),
                 def,
             }) as Arc<dyn Tool>);
         }
         assert!(registry.get("mnemosyne_recall").is_some(), "memory tools registered");
+
+        // Per-session builders, exactly as [`dress`] wires them from [`NodeAssembly`]: LCM gets a
+        // fresh instance per session; Mnemosyne resolves the session's bank from the shared cache.
+        let context_builder: ContextEngineBuilder = Arc::new(|id: &SessionId| {
+            Arc::new(LcmContextEngine::open_for_session(LcmConfig::in_memory(), id).expect("lcm"))
+                as Arc<dyn ContextEngine>
+        });
+        let memory_builder: MemoryBuilder = {
+            let banks = banks.clone();
+            Arc::new(move |id: &SessionId| vec![banks.get_or_open(id) as Arc<dyn MemoryProvider>])
+        };
 
         let profile = EngineProfile::new(
             Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
             Arc::new(registry),
             SystemPrompt::new("smoke"),
         )
-        .with_context_engine(context)
-        .with_memory(vec![memory.clone() as Arc<dyn MemoryProvider>]);
+        .with_context_engine_builder(context_builder)
+        .with_memory_builder(memory_builder);
 
         let mut engine = profile.fresh(SessionId::new("smoke"));
         engine.push_user(UserMsg::new("remember that the sky is blue today"));

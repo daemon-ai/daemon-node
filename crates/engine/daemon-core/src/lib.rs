@@ -54,7 +54,10 @@ pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironme
 pub use memory::{
     FileMemory, MemoryProvider, PromptBlock, RecallQuery, RecalledBlock, SwitchReason,
 };
-pub use profile::{CredentialBuilder, EngineProfile, ExecEnvBuilder, ProviderBuilder};
+pub use profile::{
+    ContextEngineBuilder, CredentialBuilder, EngineProfile, ExecEnvBuilder, MemoryBuilder,
+    ProviderBuilder,
+};
 pub use provider::{
     build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
     Recovery, Request, RequestMsg, ScriptStep, ScriptedProvider, StreamEvent, ToolCallFormat,

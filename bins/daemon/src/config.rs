@@ -17,6 +17,9 @@ const API_SOCKET_ENV: &str = "DAEMON_API_SOCKET";
 const STORE_ENV: &str = "DAEMON_STORE";
 /// The SQLite database path (when the backend is `sqlite`).
 const STORE_PATH_ENV: &str = "DAEMON_STORE_PATH";
+/// The host data directory rooting the profile-scoped subsystem databases (the §10/§11 LCM +
+/// Mnemosyne stores live under `<data_dir>/<profile>/`, mirroring hermes' per-profile home).
+const DATA_DIR_ENV: &str = "DAEMON_DATA_DIR";
 /// Overrides the owned partition id (a `u64`).
 const PARTITION_ENV: &str = "DAEMON_PARTITION";
 /// Overrides the model provider/credential profile name.
@@ -188,6 +191,9 @@ pub struct NodeConfig {
     pub socket_path: PathBuf,
     /// The durable store backend.
     pub store: StoreBackend,
+    /// The host data directory rooting the profile-scoped subsystem databases (§10/§11). The LCM and
+    /// Mnemosyne stores live under [`NodeConfig::profile_home`]; see [`NodeConfig::persist_providers`].
+    pub data_dir: PathBuf,
     /// How often the wake/job dispatchers poll the durable outboxes.
     pub dispatch_interval: Duration,
     /// How often the recovery scanner re-checks for resumable sessions.
@@ -231,6 +237,7 @@ struct FileConfig {
     socket_path: Option<PathBuf>,
     store: Option<String>,
     store_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     dispatch_interval_ms: Option<u64>,
     scan_interval_ms: Option<u64>,
     profile: Option<String>,
@@ -319,7 +326,32 @@ fn default_socket() -> PathBuf {
     PathBuf::from(dir).join("daemon-api.sock")
 }
 
+/// The default host data directory: `$DAEMON_DATA_DIR` is resolved first by the caller; this fallback
+/// prefers `$XDG_DATA_HOME/daemon`, then `$HOME/.local/share/daemon`, else a temp-dir `daemon` home.
+fn default_data_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("daemon");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join(".local/share/daemon");
+    }
+    std::env::temp_dir().join("daemon")
+}
+
 impl NodeConfig {
+    /// The profile-scoped data home (`<data_dir>/<profile>/`) rooting this node's §10/§11 subsystem
+    /// databases. Mirrors hermes' per-profile layout so different profiles never share a memory bank.
+    pub fn profile_home(&self) -> PathBuf {
+        self.data_dir.join(&self.profile)
+    }
+
+    /// Whether the §10/§11 providers persist to disk. Durability follows the store backend: an
+    /// in-memory session store (the zero-config default) keeps memory/context ephemeral too, so the
+    /// default node is fully ephemeral and coherent; the SQLite backend persists under [`Self::profile_home`].
+    pub fn persist_providers(&self) -> bool {
+        matches!(self.store, StoreBackend::Sqlite { .. })
+    }
+
     /// Load the layered config: read the optional TOML file at `$DAEMON_CONFIG`, then overlay env.
     pub fn load() -> anyhow::Result<Self> {
         let file = match std::env::var_os(CONFIG_ENV) {
@@ -340,6 +372,10 @@ impl NodeConfig {
         };
 
         let store = Self::resolve_store(&file)?;
+        let data_dir = env_string(DATA_DIR_ENV)
+            .map(PathBuf::from)
+            .or_else(|| file.data_dir.clone())
+            .unwrap_or_else(default_data_dir);
         // Resolve engine tunables before the `String`/`PathBuf` fields below partially move `file`.
         let engine = Self::resolve_engine(&file)?;
 
@@ -433,6 +469,7 @@ impl NodeConfig {
             partition,
             socket_path,
             store,
+            data_dir,
             dispatch_interval,
             scan_interval,
             profile,

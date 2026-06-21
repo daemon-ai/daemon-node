@@ -1671,7 +1671,9 @@ mod node_interface {
             journal_seed: Some(journal_seed),
             nesting_depth,
             context: None,
+            context_builder: None,
             memory: Vec::new(),
+            memory_builder: None,
             extra_tools: Vec::new(),
         })
     }
@@ -2465,7 +2467,9 @@ mod node_interface {
             journal_seed: Some([0x33; 32]),
             nesting_depth: 0,
             context: None,
+            context_builder: None,
             memory: Vec::new(),
+            memory_builder: None,
             extra_tools: Vec::new(),
         })
     }

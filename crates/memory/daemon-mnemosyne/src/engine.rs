@@ -236,6 +236,47 @@ mod tests {
     }
 
     #[test]
+    fn session_scoping_over_shared_bank() {
+        // Two engines over the *same* agent-wide bank, each bound to its own session id (the
+        // per-session construction the composition layer's `MnemosyneBanks` performs). Session-scoped
+        // rows must not leak across sessions, while `scope='global'` rows are visible to both.
+        let dir = std::env::temp_dir().join(format!("mnemosyne-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = |sid: &str| MnemosyneConfig {
+            data_dir: dir.clone(),
+            session_id: sid.to_string(),
+            ..MnemosyneConfig::default()
+        };
+        let s1 = Engine::open(cfg("s1")).expect("open s1");
+        let s2 = Engine::open(cfg("s2")).expect("open s2");
+
+        s1.remember("alpha private to one", &RememberArgs::default())
+            .unwrap();
+        s2.remember("beta private to two", &RememberArgs::default())
+            .unwrap();
+        s1.remember(
+            "gamma shared globally",
+            &RememberArgs {
+                scope: "global".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Each session sees its own session-scoped row...
+        assert!(!s1.recall("alpha", 5).unwrap().is_empty());
+        assert!(!s2.recall("beta", 5).unwrap().is_empty());
+        // ...but not the other session's.
+        assert!(s1.recall("beta", 5).unwrap().is_empty(), "s1 must not see s2's row");
+        assert!(s2.recall("alpha", 5).unwrap().is_empty(), "s2 must not see s1's row");
+        // The global row is visible to both.
+        assert!(!s1.recall("gamma", 5).unwrap().is_empty());
+        assert!(!s2.recall("gamma", 5).unwrap().is_empty(), "global row visible across sessions");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn get_context_orders_by_importance() {
         let e = engine();
         e.remember(

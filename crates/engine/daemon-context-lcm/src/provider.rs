@@ -52,6 +52,18 @@ impl LcmContextEngine {
         Self::open(LcmConfig::in_memory())
     }
 
+    /// Open an engine already bound to `session` — the per-session construction seam (the
+    /// composition layer's [`ContextEngineBuilder`](daemon_core::ContextEngineBuilder)). Seeding the
+    /// session id at construction means compaction attributes summaries correctly even before the
+    /// first `on_session_start`, and — since each session gets its own instance — the runtime
+    /// `state` is never shared across concurrent sessions. All instances still share `lcm.db`.
+    pub fn open_for_session(config: LcmConfig, session: &SessionId) -> Result<Self> {
+        let engine = Self::open(config)?;
+        engine.state.lock().expect("lcm state poisoned").session_id =
+            session.as_str().to_string();
+        Ok(engine)
+    }
+
     /// The current compaction threshold (the model-derived budget), if known.
     fn threshold(&self) -> Option<usize> {
         self.state.lock().expect("lcm state poisoned").threshold_tokens
@@ -152,5 +164,41 @@ mod tests {
         let compacted = lcm.compact(c, used / 4).await;
         assert!(compacted.turns.len() < before, "older turns dropped");
         assert_eq!(lcm.store.summary_count("s1").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn per_session_instances_attribute_summaries_correctly() {
+        // Two per-session LCM instances over the *same* on-disk lcm.db (the per-session construction
+        // the composition layer's `ContextEngineBuilder` performs). Concurrent compaction must
+        // attribute each summary node to the right `session_id` — the bug a single shared instance,
+        // whose mutable `state.session_id` would race, cannot avoid.
+        let dir = std::env::temp_dir().join(format!("lcm-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            threshold_percent: 0.75,
+        };
+        let s1 = LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"))
+            .expect("open s1");
+        let s2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s2")).expect("open s2");
+
+        let c1 = convo(10);
+        let c2 = convo(8);
+        let b1 = estimate_tokens(&c1) / 4;
+        let b2 = estimate_tokens(&c2) / 4;
+        // Drive both concurrently; their per-session runtime state must stay isolated.
+        let (_r1, _r2) = tokio::join!(s1.compact(c1, b1), s2.compact(c2, b2));
+
+        // Each session's summary node is attributed to *its* session id (and only one each), and a
+        // fresh reader over the shared db sees both.
+        let reader =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("reader")).expect("open reader");
+        assert_eq!(reader.store.summary_count("s1").unwrap(), 1, "s1 attributed once");
+        assert_eq!(reader.store.summary_count("s2").unwrap(), 1, "s2 attributed once");
+        assert_eq!(reader.store.summary_count("reader").unwrap(), 0, "no cross-attribution");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

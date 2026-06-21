@@ -61,8 +61,9 @@ how to rebuild it in Rust*: every table, every scoring constant, every algorithm
 `daemon-core` declares the contract this port satisfies. **RECONCILED (as-built):** the seam is now
 implemented in [`memory.rs`](../src/memory.rs) and is deliberately **narrower** than earlier drafts —
 tools are **not** on the seam. A backend's `remember`/`recall` tools register through the §12
-[`ToolRegistry`](../src/tools.rs) (an `Arc<MnemosyneProvider>` captured in the tool closure), exactly
-as the composition layer does in `bins/daemon` (`MemoryProviderTool`). The locked trait:
+[`ToolRegistry`](../src/tools.rs) (the tool resolves the calling session's `Arc<MnemosyneProvider>`
+from a shared per-session bank cache via `cx.session_id`), exactly as the composition layer does in
+`bins/daemon` (`MemoryProviderTool` over `MnemosyneBanks`). The locked trait:
 
 ```rust
 #[async_trait]
@@ -80,6 +81,18 @@ pub trait MemoryProvider: Send + Sync {
 adapts them into the registry. The engine drives `on_session_switch` at the real boundaries:
 `Start`/`Resume` before the first turn, `Compaction` after a compaction, `Handoff` at a delegating
 suspension, and `End` from `Engine::end_session`.
+
+**Per-session construction (as-built):** the provider is **constructed per-session** by the
+composition layer. `EngineProfile::with_memory_builder(MemoryBuilder)` — `Arc<dyn Fn(&SessionId) ->
+Vec<Arc<dyn MemoryProvider>>>`, mirroring `ExecEnvBuilder` — gives each engine its own provider bound
+to that engine's session id. The bank database is **agent-wide / shared** (one `mnemosyne.db` per
+profile); per-session separation is **row-level** via the `session_id` column (`remember` writes it;
+`recall`/`get_context` filter `WHERE (session_id = ? OR scope = 'global')`), so sessions share
+global/long-term rows while keeping their own session-local working memory. A shared `MnemosyneBanks`
+cache (`Mutex<HashMap<SessionId, Arc<MnemosyneProvider>>>`) opens one provider per session over the
+shared bank and is held by both the memory builder and the `mnemosyne_*` tools, so the §11 hook and
+the tool dispatch always hit the *same* instance for a session. (Contrast LCM: shared store, but the
+*engine instance* is per-session because LCM carries per-session runtime state.)
 
 Hook order (spec §11): `recall -> before_turn -> before_compact -> compact -> assemble -> after_turn`.
 
@@ -248,9 +261,15 @@ pub struct Store { conn: Mutex<Connection> }
 ```
 
 One SQLite file per **bank** (`banks.py`): default bank at `{data_dir}/mnemosyne.db`, named banks at
-`{data_dir}/banks/{name}/mnemosyne.db` (`banks.py` L123-L132). `data_dir` resolves from
-`$HERMES_HOME/mnemosyne/data` or `MNEMOSYNE_DATA_DIR` (`banks.py` L31-L37). Bank names: alphanumeric
-+ `-_`, max 64 (`banks.py` L176-L185).
+`{data_dir}/banks/{name}/mnemosyne.db` (`banks.py` L123-L132). The bank is **agent-wide**: it is
+*not* per-session — all of a profile's sessions share one bank and are separated at the row level by
+`session_id` (§5.x). In the daemon the `data_dir` is **profile-scoped**: the host sets it to
+`<DAEMON_DATA_DIR>/<profile>/` (mirroring hermes' per-profile home), so different profiles never share
+a bank; the crate-level `MNEMOSYNE_DATA_DIR` / `$HERMES_HOME` fallbacks (`banks.py` L31-L37) remain a
+manual escape hatch. Durability follows the session store — an in-memory `daemon-store` keeps the
+bank in-memory too (a private per-session in-memory bank, since `:memory:` connections can't be
+shared), so the zero-config default node stays fully ephemeral. Bank names: alphanumeric + `-_`, max
+64 (`banks.py` L176-L185).
 
 Schema evolution: Python uses `_add_column_if_missing` (`beam.py` L1147-L1154 — `PRAGMA table_info`
 then conditional `ALTER TABLE ADD COLUMN`). The Rust port emits all *current* columns in the
@@ -792,6 +811,10 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
 7. **Legacy `memories` dual-write** (`memory.py` L356-L375) is **dropped** — it exists only for
    pre-BEAM backward compatibility and is not needed for a fresh Rust store.
 8. **No MCP/CLI/importers** (per scope).
+9. **Per-session construction over a shared bank:** the daemon constructs one provider *per session*
+   via `EngineProfile::with_memory_builder` (the bank is agent-wide; sessions are row-scoped by
+   `session_id`), held in a shared `MnemosyneBanks` cache so the §11 hook and `mnemosyne_*` tools
+   share the same instance — replacing Python's `clone_for_agent`/singleton model.
 
 ---
 

@@ -13,14 +13,15 @@
 
 mod config;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use daemon_common::{CredMode, CredScope, JournalStreamId, ProfileRef, SessionId, UnitId};
 use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
-    ContextEngine, CredentialBuilder, CredentialProvider, EngineProfile, FileMemory, MemoryProvider,
-    MockProvider, Provider, ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome,
-    ToolRegistry, TurnCx,
+    ContextEngine, ContextEngineBuilder, CredentialBuilder, CredentialProvider, EngineProfile,
+    FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider, ProviderRegistry,
+    SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
 };
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
@@ -125,73 +126,195 @@ fn build_providers(cfg: &NodeConfig) -> ProviderRegistry {
     providers
 }
 
-/// Build the default §10 context engine the config selected. `Lcm` opens the native LCM port (its
-/// summary store); `Budgeted` (or any open failure) returns `None`, leaving the engine on the in-core
+/// Build the default §10 context-engine *builder* the config selected. `Lcm` returns a per-session
+/// builder ([`ContextEngineBuilder`]) that opens a fresh [`LcmContextEngine`] bound to each session
+/// (so its per-session compaction state is never shared across concurrent sessions) over the shared
+/// profile-scoped `lcm.db`; `Budgeted` returns `None`, leaving the engine on the in-core
 /// [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) fallback.
-fn build_context_engine(cfg: &NodeConfig) -> Option<Arc<dyn ContextEngine>> {
+fn build_context_engine(cfg: &NodeConfig) -> Option<ContextEngineBuilder> {
     match cfg.context_engine {
         ContextEngineKind::Budgeted => None,
-        ContextEngineKind::Lcm => match LcmContextEngine::open(LcmConfig::default()) {
-            Ok(lcm) => Some(Arc::new(lcm) as Arc<dyn ContextEngine>),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to open LCM context engine; using budgeted fallback");
-                None
-            }
-        },
+        ContextEngineKind::Lcm => {
+            let lcm_cfg = if cfg.persist_providers() {
+                LcmConfig {
+                    data_dir: cfg.profile_home(),
+                    bank: "default".to_string(),
+                    ..LcmConfig::default()
+                }
+            } else {
+                LcmConfig::in_memory()
+            };
+            Some(Arc::new(move |id: &SessionId| {
+                match LcmContextEngine::open_for_session(lcm_cfg.clone(), id) {
+                    Ok(lcm) => Arc::new(lcm) as Arc<dyn ContextEngine>,
+                    Err(e) => {
+                        tracing::warn!(error = %e, session = %id,
+                            "failed to open LCM context engine for session; using budgeted fallback");
+                        Arc::new(daemon_core::BudgetedContextEngine::default())
+                            as Arc<dyn ContextEngine>
+                    }
+                }
+            }) as ContextEngineBuilder)
+        }
     }
 }
 
-/// The default §11 memory wiring: the providers injected into every engine, plus the tools
-/// registered into every role registry (kept paired so their shared backend instances stay in sync).
-type MemoryWiring = (Vec<Arc<dyn MemoryProvider>>, Vec<Arc<dyn Tool>>);
+/// The default §11 memory wiring: an optional per-session memory *builder*, an optional set of
+/// shared (session-independent) providers, and the tools registered into every role registry. The
+/// builder/shared split mirrors [`EngineProfile`](daemon_core::EngineProfile) — Mnemosyne is
+/// session-scoped (a builder), while `FileMemory` is a frozen, stateless snapshot (shared).
+struct MemoryWiring {
+    builder: Option<MemoryBuilder>,
+    shared: Vec<Arc<dyn MemoryProvider>>,
+    tools: Vec<Arc<dyn Tool>>,
+}
 
-/// Build the default §11 memory providers + their registered tools the config selected. Mnemosyne is
-/// the default (its `mnemosyne_*` tools are registered through the §12 registry, sharing the same
-/// engine instance as the provider). On any open failure memory is simply left off (the node still
-/// runs). Returns `(providers, extra_tools)`.
+impl MemoryWiring {
+    fn off() -> Self {
+        Self {
+            builder: None,
+            shared: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+}
+
+/// Build the default §11 memory wiring the config selected. Mnemosyne is the default: a shared
+/// [`MnemosyneBanks`] cache opens one per-session provider over the agent-wide bank (correct
+/// `session_id` row scoping), and both the per-session memory builder and the registered
+/// `mnemosyne_*` tools resolve the *same* per-session instance from it. On any open failure memory
+/// is simply left off (the node still runs).
 fn build_memory(cfg: &NodeConfig) -> MemoryWiring {
     match cfg.memory_provider {
-        MemoryProviderKind::None => (Vec::new(), Vec::new()),
+        MemoryProviderKind::None => MemoryWiring::off(),
         MemoryProviderKind::File => match &cfg.memory_file {
-            Some(path) => {
-                let mem = Arc::new(FileMemory::load(path)) as Arc<dyn MemoryProvider>;
-                (vec![mem], Vec::new())
-            }
+            Some(path) => MemoryWiring {
+                builder: None,
+                shared: vec![Arc::new(FileMemory::load(path)) as Arc<dyn MemoryProvider>],
+                tools: Vec::new(),
+            },
             None => {
                 tracing::warn!("memory_provider=file but DAEMON_MEMORY_FILE is unset; memory off");
-                (Vec::new(), Vec::new())
+                MemoryWiring::off()
             }
         },
-        MemoryProviderKind::Mnemosyne => match MnemosyneProvider::open(MnemosyneConfig::default()) {
-            Ok(provider) => {
-                let provider = Arc::new(provider);
-                // Register each `mnemosyne_*` tool through the §12 registry, sharing the provider's
-                // engine (tools are not part of the §11 seam — see `daemon_core::memory`).
-                let tools: Vec<Arc<dyn Tool>> = provider
-                    .tools()
-                    .into_iter()
-                    .map(|def| {
-                        Arc::new(MemoryProviderTool {
-                            provider: provider.clone(),
-                            def,
-                        }) as Arc<dyn Tool>
-                    })
-                    .collect();
-                (vec![provider as Arc<dyn MemoryProvider>], tools)
+        MemoryProviderKind::Mnemosyne => {
+            let base = if cfg.persist_providers() {
+                MnemosyneConfig {
+                    data_dir: cfg.profile_home(),
+                    ..MnemosyneConfig::default()
+                }
+            } else {
+                MnemosyneConfig::default()
+            };
+            let banks = Arc::new(MnemosyneBanks::new(base, cfg.persist_providers()));
+            // The `mnemosyne_*` tool defs are session-independent; enumerate them once from a probe
+            // instance (its bank is shared, so this is cheap and discarded).
+            let tool_defs = match banks.probe_tool_defs() {
+                Some(defs) => defs,
+                None => {
+                    tracing::warn!("failed to open Mnemosyne memory; memory off");
+                    return MemoryWiring::off();
+                }
+            };
+            let tools: Vec<Arc<dyn Tool>> = tool_defs
+                .into_iter()
+                .map(|def| {
+                    Arc::new(MemoryProviderTool {
+                        banks: banks.clone(),
+                        def,
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let builder: MemoryBuilder = {
+                let banks = banks.clone();
+                Arc::new(move |id: &SessionId| match banks.get_or_open(id) {
+                    Some(p) => vec![p as Arc<dyn MemoryProvider>],
+                    None => Vec::new(),
+                })
+            };
+            MemoryWiring {
+                builder: Some(builder),
+                shared: Vec::new(),
+                tools,
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to open Mnemosyne memory; memory off");
-                (Vec::new(), Vec::new())
-            }
-        },
+        }
     }
 }
 
-/// A §12 [`Tool`] adapter that dispatches a `mnemosyne_*` call to the shared [`MnemosyneProvider`].
-/// This keeps memory tools out of the §11 seam (which is about context, not dispatch) while still
-/// exposing them to the model through the registry.
+/// A shared, agent-wide Mnemosyne bank cache: one per-session [`MnemosyneProvider`] over the same
+/// bank database (or a per-session in-memory bank when the node is ephemeral). Memory is scoped at
+/// the row level by `session_id`, so all sessions share global/long-term rows while keeping their own
+/// session-local working memory. The cache lets the §11 memory builder and the `mnemosyne_*` tools
+/// resolve the *same* instance for a given session.
+struct MnemosyneBanks {
+    base: MnemosyneConfig,
+    persist: bool,
+    sessions: Mutex<HashMap<SessionId, Arc<MnemosyneProvider>>>,
+}
+
+impl MnemosyneBanks {
+    fn new(base: MnemosyneConfig, persist: bool) -> Self {
+        Self {
+            base,
+            persist,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Open (once) and cache the provider for `session`, configured with that session id over the
+    /// shared bank. Returns `None` if the bank cannot be opened.
+    fn get_or_open(&self, session: &SessionId) -> Option<Arc<MnemosyneProvider>> {
+        let mut sessions = self.sessions.lock().expect("mnemosyne banks poisoned");
+        if let Some(existing) = sessions.get(session) {
+            return Some(existing.clone());
+        }
+        let mut cfg = self.base.clone();
+        cfg.session_id = session.as_str().to_string();
+        let provider = if self.persist {
+            MnemosyneProvider::open(cfg)
+        } else {
+            // Ephemeral node: a private in-memory bank per session (no cross-session sharing, which
+            // is acceptable when the session store itself is non-durable).
+            crate::ephemeral_mnemosyne(cfg)
+        };
+        match provider {
+            Ok(p) => {
+                let p = Arc::new(p);
+                sessions.insert(session.clone(), p.clone());
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session, "failed to open Mnemosyne bank");
+                None
+            }
+        }
+    }
+
+    /// Enumerate the `mnemosyne_*` tool defs from a throwaway probe instance (session-independent).
+    fn probe_tool_defs(&self) -> Option<Vec<ToolDef>> {
+        let probe = self.get_or_open(&SessionId::new("__probe__"))?;
+        let defs = probe.tools();
+        self.sessions
+            .lock()
+            .expect("mnemosyne banks poisoned")
+            .remove(&SessionId::new("__probe__"));
+        Some(defs)
+    }
+}
+
+/// Open an in-memory Mnemosyne provider for an ephemeral node.
+fn ephemeral_mnemosyne(cfg: MnemosyneConfig) -> daemon_mnemosyne::Result<MnemosyneProvider> {
+    use daemon_mnemosyne::Engine;
+    Ok(MnemosyneProvider::new(Arc::new(Engine::open_in_memory(cfg)?)))
+}
+
+/// A §12 [`Tool`] adapter that dispatches a `mnemosyne_*` call to the calling session's bank,
+/// resolved from the shared [`MnemosyneBanks`] by `cx.session_id` at run time (so the tool and the
+/// §11 memory hook always operate on the same per-session instance). This keeps memory tools out of
+/// the §11 seam (which is about context, not dispatch) while still exposing them to the model.
 struct MemoryProviderTool {
-    provider: Arc<MnemosyneProvider>,
+    banks: Arc<MnemosyneBanks>,
     def: ToolDef,
 }
 
@@ -205,9 +328,15 @@ impl Tool for MemoryProviderTool {
         &self.def.schema
     }
 
-    async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {
+    async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
-        let result = self.provider.call_tool(&self.def.name, args).await;
+        let result = match self.banks.get_or_open(&cx.session_id) {
+            Some(provider) => provider.call_tool(&self.def.name, args).await,
+            None => {
+                serde_json::json!({"status": "error", "error": "memory bank unavailable"})
+                    .to_string()
+            }
+        };
         ToolOutcome::text(call.call_id.clone(), true, result)
     }
 }
@@ -269,9 +398,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let providers = build_providers(&cfg);
 
     // The default context engine (§10, LCM) and memory providers (§11, Mnemosyne) wired into every
-    // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry.
-    let context = build_context_engine(&cfg);
-    let (memory, extra_tools) = build_memory(&cfg);
+    // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry. Both
+    // are per-session builders (LCM keeps per-session compaction state; Mnemosyne scopes by
+    // `session_id`), so concurrent sessions never share mutable provider state.
+    let context_builder = build_context_engine(&cfg);
+    let memory = build_memory(&cfg);
 
     let host_config = HostConfig {
         partition: cfg.partition,
@@ -290,9 +421,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         engine_config: cfg.engine,
         journal_seed: cfg.journal_seed,
         nesting_depth: cfg.nesting_depth,
-        context,
-        memory,
-        extra_tools,
+        context: None,
+        context_builder,
+        memory: memory.shared,
+        memory_builder: memory.builder,
+        extra_tools: memory.tools,
     });
     tracing::info!("daemon host node started");
 
