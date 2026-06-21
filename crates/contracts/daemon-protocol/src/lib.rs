@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-use daemon_common::{Budget, JobId, RateLimitSnapshot, ReqId, UnitId, UsageDelta};
+use daemon_common::{Budget, JobId, RateLimitSnapshot, ReqId, SessionId, UnitId, UsageDelta};
 use serde::{Deserialize, Serialize};
 
 /// A user-authored turn input (the `StartTurn` payload; the §5 message type proper lives in core).
@@ -656,6 +656,147 @@ impl SessionLogEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound normalisation: deterministic origin -> SessionId derivation
+// ---------------------------------------------------------------------------
+//
+// The daemon analogue of hermes's `build_session_key`: one place owns the origin -> session mapping
+// and the per-user/per-thread isolation rules (hermes scattered these across the gateway). The result
+// is an ordinary `SessionId` the rest of daemon already understands; attribution stays explicit on the
+// `Origin` (never via env/`ContextVars`). The first consumer is a transport that has an `Origin` but
+// no caller-supplied `SessionId` (a chat adapter, or the HTTP surface deriving an id from a key).
+
+/// How finely an [`Origin`] is split into distinct sessions — the isolation policy a transport
+/// applies when deriving a [`SessionId`]. Coarser policies collapse principals/threads onto one
+/// shared conversation; finer ones fork a session per principal or per thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum IsolationPolicy {
+    /// One session per principal (the DM user / API key). Groups fall back to per-chat (no principal).
+    PerUser,
+    /// One session per chat/channel (threads collapse onto the chat).
+    PerChat,
+    /// One session per thread within a chat (the finest grouping; falls back to per-chat when the
+    /// scope is unthreaded).
+    PerThread,
+    /// One session per transport+scope-kind — principals and threads all share a single conversation.
+    Shared,
+}
+
+/// Deterministically map an [`Origin`] to a stable [`SessionId`] under an [`IsolationPolicy`]. The
+/// single source of truth for origin -> session derivation and isolation (the daemon analogue of
+/// `build_session_key`); the same origin+policy always yields the same id, and distinct
+/// principals/threads diverge exactly as the policy dictates.
+pub fn session_id_for(origin: &Origin, policy: IsolationPolicy) -> SessionId {
+    let t = origin.transport.as_str();
+    let key = match &origin.scope {
+        OriginScope::Dm { user } => match policy {
+            IsolationPolicy::Shared => format!("{t}:dm"),
+            _ => format!("{t}:dm:{user}"),
+        },
+        OriginScope::Group { chat, thread } => match policy {
+            IsolationPolicy::PerThread => match thread {
+                Some(th) => format!("{t}:group:{chat}:{th}"),
+                None => format!("{t}:group:{chat}"),
+            },
+            IsolationPolicy::Shared => format!("{t}:group"),
+            // PerUser/PerChat: chat-level (a group has no single principal; threads collapse).
+            _ => format!("{t}:group:{chat}"),
+        },
+        OriginScope::Api { key } => match policy {
+            IsolationPolicy::Shared => format!("{t}:api"),
+            _ => format!("{t}:api:{key}"),
+        },
+        OriginScope::Internal => format!("{t}:internal"),
+    };
+    SessionId::new(key)
+}
+
+// ---------------------------------------------------------------------------
+// Outbound delivery targets (where a session's replies are posted) + handover
+// ---------------------------------------------------------------------------
+//
+// §5.4 demotes "primary handover" from an organising concept to an attribute: where an *outbound*
+// reply must be posted (e.g. the Telegram message send) is a property of the session, populated from
+// the opening `Origin`. A surface attaching is, by default, an observer+submitter (a `Spectator`);
+// "handover" is the single explicit op that re-points the `Primary` target. Note: actually *posting*
+// to a Primary needs a chat transport (deferred); these types + the host state they back are the
+// contract that makes handover expressible now.
+
+/// An adapter-opaque outbound route handle within a transport (e.g. a Telegram chat id, an HTTP
+/// connection id). The originating adapter owns its meaning; the daemon never matches on it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RouteAddr(pub String);
+
+impl RouteAddr {
+    /// Construct a route address from its opaque handle.
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self(addr.into())
+    }
+
+    /// The route address as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Whether an outbound delivery target is the session's authoritative reply sink (`Primary`) or a
+/// passive observer (`Spectator`). Exactly one `Primary` is in force at a time; handover re-points it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SinkKind {
+    /// The authoritative reply sink — where outbound replies post.
+    Primary,
+    /// A passive observer — receives the stream but is not the reply sink.
+    Spectator,
+}
+
+/// Where a session's outbound replies are delivered. A property of the session (populated from the
+/// opening [`Origin`]), not caller state — the daemon analogue of hermes's `DeliveryRouter`, but
+/// owned by the session rather than threaded through the caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DeliveryTarget {
+    /// The surface/adapter replies post through.
+    pub transport: TransportId,
+    /// The opaque route within that transport.
+    pub route: RouteAddr,
+    /// Whether this is the authoritative reply sink or a passive observer.
+    pub kind: SinkKind,
+}
+
+impl DeliveryTarget {
+    /// Construct a delivery target.
+    pub fn new(
+        transport: impl Into<TransportId>,
+        route: impl Into<String>,
+        kind: SinkKind,
+    ) -> Self {
+        Self {
+            transport: transport.into(),
+            route: RouteAddr::new(route),
+            kind,
+        }
+    }
+}
+
+impl Origin {
+    /// The default `Primary` [`DeliveryTarget`] implied by this origin — the same transport, routed
+    /// to the scope's principal/chat handle. The host seeds a session's reply sink from this when the
+    /// session opens.
+    pub fn primary_target(&self) -> DeliveryTarget {
+        let route = match &self.scope {
+            OriginScope::Dm { user } => user.clone(),
+            OriginScope::Group { chat, thread } => match thread {
+                Some(th) => format!("{chat}:{th}"),
+                None => chat.clone(),
+            },
+            OriginScope::Api { key } => key.clone(),
+            OriginScope::Internal => "internal".to_string(),
+        };
+        DeliveryTarget::new(self.transport.clone(), route, SinkKind::Primary)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Durable transcript blocks (the verifiable journal's chat-entry payload)
 // ---------------------------------------------------------------------------
 
@@ -962,5 +1103,103 @@ mod tests {
             assert_eq!(origin, cbor_round_trip(&origin));
             assert_eq!(origin, json_round_trip(&origin));
         }
+    }
+
+    #[test]
+    fn session_id_for_is_deterministic() {
+        let origin = Origin::new("telegram", OriginScope::Dm { user: "u1".into() });
+        assert_eq!(
+            session_id_for(&origin, IsolationPolicy::PerUser),
+            session_id_for(&origin, IsolationPolicy::PerUser),
+        );
+        assert_eq!(
+            session_id_for(&origin, IsolationPolicy::PerUser).as_str(),
+            "telegram:dm:u1",
+        );
+    }
+
+    #[test]
+    fn session_id_for_isolates_principals_unless_shared() {
+        let u1 = Origin::new("telegram", OriginScope::Dm { user: "u1".into() });
+        let u2 = Origin::new("telegram", OriginScope::Dm { user: "u2".into() });
+        // Per-user forks a session per principal...
+        assert_ne!(
+            session_id_for(&u1, IsolationPolicy::PerUser),
+            session_id_for(&u2, IsolationPolicy::PerUser),
+        );
+        // ...while Shared collapses them onto one conversation.
+        assert_eq!(
+            session_id_for(&u1, IsolationPolicy::Shared),
+            session_id_for(&u2, IsolationPolicy::Shared),
+        );
+    }
+
+    #[test]
+    fn session_id_for_threads_collapse_under_per_chat() {
+        let t1 = Origin::new(
+            "slack",
+            OriginScope::Group {
+                chat: "c1".into(),
+                thread: Some("t1".into()),
+            },
+        );
+        let t2 = Origin::new(
+            "slack",
+            OriginScope::Group {
+                chat: "c1".into(),
+                thread: Some("t2".into()),
+            },
+        );
+        // PerThread keeps threads distinct...
+        assert_ne!(
+            session_id_for(&t1, IsolationPolicy::PerThread),
+            session_id_for(&t2, IsolationPolicy::PerThread),
+        );
+        assert_eq!(
+            session_id_for(&t1, IsolationPolicy::PerThread).as_str(),
+            "slack:group:c1:t1",
+        );
+        // ...PerChat folds them onto the chat.
+        assert_eq!(
+            session_id_for(&t1, IsolationPolicy::PerChat),
+            session_id_for(&t2, IsolationPolicy::PerChat),
+        );
+        assert_eq!(
+            session_id_for(&t1, IsolationPolicy::PerChat).as_str(),
+            "slack:group:c1",
+        );
+    }
+
+    #[test]
+    fn session_id_for_internal_scope() {
+        let origin = Origin::internal("schedule");
+        assert_eq!(
+            session_id_for(&origin, IsolationPolicy::Shared).as_str(),
+            "schedule:internal",
+        );
+    }
+
+    #[test]
+    fn primary_target_derives_from_origin_and_round_trips() {
+        let origin = Origin::new(
+            "telegram",
+            OriginScope::Group {
+                chat: "c1".into(),
+                thread: Some("t1".into()),
+            },
+        );
+        let target = origin.primary_target();
+        assert_eq!(target.transport, TransportId::new("telegram"));
+        assert_eq!(target.route.as_str(), "c1:t1");
+        assert_eq!(target.kind, SinkKind::Primary);
+        assert_eq!(target, cbor_round_trip(&target));
+        assert_eq!(target, json_round_trip(&target));
+    }
+
+    #[test]
+    fn isolation_policy_round_trips() {
+        let policy = IsolationPolicy::PerThread;
+        assert_eq!(policy, cbor_round_trip(&policy));
+        assert_eq!(policy, json_round_trip(&policy));
     }
 }

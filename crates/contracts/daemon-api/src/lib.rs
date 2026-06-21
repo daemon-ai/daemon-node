@@ -26,7 +26,7 @@ use daemon_common::{
     ModelRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage, SearchQuery, SessionId,
     UnitId, UsageDelta, WireVersion,
 };
-use daemon_protocol::{AgentCommand, HostResponse, TranscriptBlock};
+use daemon_protocol::{AgentCommand, DeliveryTarget, HostResponse, Origin, TranscriptBlock};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -51,6 +51,19 @@ pub const API_WIRE_VERSION: WireVersion = WireVersion::CURRENT;
 pub trait SessionApi: Send + Sync {
     /// Submit a §17 command to `session` (opening it on the first `StartTurn`).
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError>;
+
+    /// Submit a §17 command attributed to a specific [`Origin`], so the per-event provenance ("from
+    /// the Telegram user" vs "steered via the GUI") is recorded on the merged session log rather than
+    /// collapsed to the host-local default. Default: drop the attribution and delegate to
+    /// [`Self::submit`] (a transport that does not carry origins keeps working unchanged).
+    async fn submit_from(
+        &self,
+        session: SessionId,
+        _origin: Origin,
+        command: AgentCommand,
+    ) -> Result<(), ApiError> {
+        self.submit(session, command).await
+    }
 
     /// Drain up to `max` outbound items (events + raised host requests) for `session`.
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError>;
@@ -94,6 +107,36 @@ pub trait SessionApi: Send + Sync {
     /// stream (a transport that exposes no live log — callers fall back to `log_after`).
     async fn subscribe(&self, _session: SessionId, _after_seq: u64) -> Result<LogStream, ApiError> {
         Ok(stream::empty().boxed())
+    }
+
+    /// The session's current outbound [`DeliveryTarget`]s — where its replies post (the `Primary`)
+    /// and any passive `Spectator`s. A session property populated from the opening [`Origin`]; the
+    /// authoritative source for "who receives the reply." Default: empty (a transport that does not
+    /// track delivery targets).
+    async fn delivery_targets(&self, _session: SessionId) -> Vec<DeliveryTarget> {
+        Vec::new()
+    }
+
+    /// Re-point a session's `Primary` reply sink to `target` (the single explicit "handover" op): the
+    /// new target becomes `Primary` and any prior `Primary` is demoted to `Spectator`. Auth is
+    /// single-tenant local-trust for v1 (any authenticated local client may hand over). Default:
+    /// unsupported (a transport that does not track delivery targets).
+    async fn handover(&self, _session: SessionId, _target: DeliveryTarget) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("handover".into()))
+    }
+
+    /// Record an observability-only transport/meta event ([`Disposition::Transport`]) on the merged
+    /// log — presence, a surface attaching/detaching, a delivery receipt. It is fanned out to
+    /// subscribers but never enters the prompt or the journal (cache-safe by construction). Default:
+    /// accept and drop (a transport with no live log to record onto).
+    async fn record_meta(
+        &self,
+        _session: SessionId,
+        _origin: Origin,
+        _kind: String,
+        _body: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        Ok(())
     }
 }
 
@@ -459,12 +502,16 @@ pub struct LogPageView {
 /// marshals onto the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiRequest {
-    /// [`SessionApi::submit`].
+    /// [`SessionApi::submit`] / [`SessionApi::submit_from`].
     Submit {
         /// Target session.
         session: SessionId,
         /// The §17 command.
         command: AgentCommand,
+        /// Optional per-event attribution. `None` (old encodings) drops to the host-local default;
+        /// `Some` routes through [`SessionApi::submit_from`] so the origin is recorded on the log.
+        #[serde(default)]
+        origin: Option<Origin>,
     },
     /// [`SessionApi::poll`].
     Poll {
@@ -537,6 +584,29 @@ pub enum ApiRequest {
         after_seq: u64,
         /// Maximum entries to return (0 = all available).
         max: u32,
+    },
+    /// [`SessionApi::delivery_targets`].
+    DeliveryTargets {
+        /// The session whose delivery targets to read.
+        session: SessionId,
+    },
+    /// [`SessionApi::handover`].
+    Handover {
+        /// The session whose `Primary` reply sink to re-point.
+        session: SessionId,
+        /// The new `Primary` target.
+        target: DeliveryTarget,
+    },
+    /// [`SessionApi::record_meta`] — record an observability-only transport/meta event.
+    RecordMeta {
+        /// The session whose merged log to append to.
+        session: SessionId,
+        /// The attribution for the meta event.
+        origin: Origin,
+        /// The renderer/router discriminator (e.g. `"presence"` / `"attach"`).
+        kind: String,
+        /// The opaque encoded body, decoded by the consumer per `kind`.
+        body: Vec<u8>,
     },
     /// [`ControlApi::unit_history`].
     UnitHistory {
@@ -672,6 +742,8 @@ pub enum ApiResponse {
     Journal(JournalPageView),
     /// A page of the merged live session event log (the cursor read of `subscribe`).
     LogPage(LogPageView),
+    /// A session's outbound delivery targets (the reply sinks of `delivery_targets`).
+    DeliveryTargets(Vec<DeliveryTarget>),
     /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
     VerifyingKey(Option<String>),
     /// A page of model search results.
@@ -728,7 +800,14 @@ fn unit_or_err(r: Result<(), ApiError>) -> ApiResponse {
 
 async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
-        ApiRequest::Submit { session, command } => unit_or_err(api.submit(session, command).await),
+        ApiRequest::Submit {
+            session,
+            command,
+            origin,
+        } => match origin {
+            Some(origin) => unit_or_err(api.submit_from(session, origin, command).await),
+            None => unit_or_err(api.submit(session, command).await),
+        },
         ApiRequest::Poll { session, max } => match api.poll(session, max).await {
             Ok(items) => ApiResponse::Drained(items),
             Err(e) => ApiResponse::Error(e),
@@ -749,6 +828,18 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             Ok(page) => ApiResponse::LogPage(page),
             Err(e) => ApiResponse::Error(e),
         },
+        ApiRequest::DeliveryTargets { session } => {
+            ApiResponse::DeliveryTargets(api.delivery_targets(session).await)
+        }
+        ApiRequest::Handover { session, target } => {
+            unit_or_err(api.handover(session, target).await)
+        }
+        ApiRequest::RecordMeta {
+            session,
+            origin,
+            kind,
+            body,
+        } => unit_or_err(api.record_meta(session, origin, kind, body).await),
         _ => return None,
     })
 }
@@ -843,7 +934,10 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         | ApiRequest::Poll { .. }
         | ApiRequest::Respond { .. }
         | ApiRequest::SessionHistory { .. }
-        | ApiRequest::Subscribe { .. } => {
+        | ApiRequest::Subscribe { .. }
+        | ApiRequest::DeliveryTargets { .. }
+        | ApiRequest::Handover { .. }
+        | ApiRequest::RecordMeta { .. } => {
             unreachable!("session variants handled above")
         }
     }
@@ -897,6 +991,19 @@ mod tests {
                     input: UserMsg::new("hi"),
                     request_id: ReqId(7),
                 },
+                origin: None,
+            },
+            // The origin-carrying form (per-event attribution) must round-trip too.
+            ApiRequest::Submit {
+                session: SessionId::new("s1"),
+                command: AgentCommand::Steer {
+                    request_id: ReqId(8),
+                    text: "go on".into(),
+                },
+                origin: Some(daemon_protocol::Origin::new(
+                    "telegram",
+                    daemon_protocol::OriginScope::Dm { user: "u1".into() },
+                )),
             },
             ApiRequest::Poll {
                 session: SessionId::new("s1"),
@@ -908,6 +1015,75 @@ mod tests {
             let back: ApiRequest = from_cbor(&bytes).unwrap();
             assert_eq!(req, back);
         }
+    }
+
+    #[test]
+    fn delivery_and_meta_requests_round_trip() {
+        let reqs = vec![
+            ApiRequest::DeliveryTargets {
+                session: SessionId::new("s1"),
+            },
+            ApiRequest::Handover {
+                session: SessionId::new("s1"),
+                target: daemon_protocol::DeliveryTarget::new(
+                    "telegram",
+                    "chat-9",
+                    daemon_protocol::SinkKind::Primary,
+                ),
+            },
+            ApiRequest::RecordMeta {
+                session: SessionId::new("s1"),
+                origin: daemon_protocol::Origin::new(
+                    "gui",
+                    daemon_protocol::OriginScope::Api {
+                        key: "owner".into(),
+                    },
+                ),
+                kind: "attach".into(),
+                body: vec![9, 9, 9],
+            },
+        ];
+        for req in reqs {
+            let bytes = to_cbor(&req);
+            let back: ApiRequest = from_cbor(&bytes).unwrap();
+            assert_eq!(req, back);
+        }
+
+        let resp = ApiResponse::DeliveryTargets(vec![daemon_protocol::DeliveryTarget::new(
+            "telegram",
+            "chat-9",
+            daemon_protocol::SinkKind::Primary,
+        )]);
+        let bytes = to_cbor(&resp);
+        let back: ApiResponse = from_cbor(&bytes).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn submit_origin_field_defaults_when_absent() {
+        // An old-shape Submit encoded WITHOUT `origin` must still decode (serde default -> None),
+        // proving the additive field is backward compatible on the v2 wire.
+        #[derive(Serialize)]
+        enum LegacyRequest {
+            Submit {
+                session: SessionId,
+                command: AgentCommand,
+            },
+        }
+        let legacy = LegacyRequest::Submit {
+            session: SessionId::new("s1"),
+            command: AgentCommand::Shutdown,
+        };
+        let bytes = to_cbor(&legacy);
+        let back: ApiRequest = from_cbor(&bytes).unwrap();
+        assert_eq!(
+            back,
+            ApiRequest::Submit {
+                session: SessionId::new("s1"),
+                command: AgentCommand::Shutdown,
+                origin: None,
+            }
+        );
     }
 
     #[test]

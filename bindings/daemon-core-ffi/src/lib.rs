@@ -244,6 +244,7 @@ pub unsafe extern "C" fn daemon_session_submit(
         let req = ApiRequest::Submit {
             session: session.session.clone(),
             command,
+            origin: None,
         };
         match session
             .handle
@@ -557,10 +558,12 @@ impl CoreSessionApi {
         handle
     }
 
-    /// Append an inbound entry to a session's merged log (no-op if the session is gone).
+    /// Append an inbound entry to a session's merged log (no-op if the session is gone), attributed
+    /// to `origin` so per-event provenance is preserved on the log.
     fn record_inbound(
         &self,
         session: &SessionId,
+        origin: Origin,
         disposition: Disposition,
         payload: SessionPayload,
     ) {
@@ -568,7 +571,7 @@ impl CoreSessionApi {
             s.log
                 .lock()
                 .unwrap()
-                .append(Direction::Inbound, ffi_origin(), disposition, payload);
+                .append(Direction::Inbound, origin, disposition, payload);
         }
     }
 }
@@ -576,11 +579,23 @@ impl CoreSessionApi {
 #[async_trait]
 impl SessionApi for CoreSessionApi {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
+        // The bare FFI surface carries no external attribution: default to the host-internal `ffi`
+        // origin. Callers that have an `Origin` use `submit_from`.
+        self.submit_from(session, ffi_origin(), command).await
+    }
+
+    async fn submit_from(
+        &self,
+        session: SessionId,
+        origin: Origin,
+        command: AgentCommand,
+    ) -> Result<(), ApiError> {
         match command {
             AgentCommand::StartTurn { input, request_id } => {
                 let handle = self.ensure(&session);
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Context,
                     SessionPayload::Command(AgentCommand::StartTurn {
                         input: input.clone(),
@@ -600,6 +615,7 @@ impl SessionApi for CoreSessionApi {
                     .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Transport,
                     SessionPayload::Command(AgentCommand::Interrupt {
                         reason: reason.clone(),
@@ -611,6 +627,7 @@ impl SessionApi for CoreSessionApi {
             AgentCommand::Shutdown => {
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Transport,
                     SessionPayload::Command(AgentCommand::Shutdown),
                 );
@@ -623,6 +640,7 @@ impl SessionApi for CoreSessionApi {
                 let handle = self.ensure(&session);
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Context,
                     SessionPayload::Command(AgentCommand::Steer {
                         text: text.clone(),
@@ -640,6 +658,7 @@ impl SessionApi for CoreSessionApi {
                     .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Transport,
                     SessionPayload::Command(AgentCommand::Snapshot { request_id }),
                 );
@@ -702,6 +721,24 @@ impl SessionApi for CoreSessionApi {
             Some(s) => Ok(s.log.lock().unwrap().subscribe(after_seq)),
             None => Ok(stream::empty().boxed()),
         }
+    }
+
+    async fn record_meta(
+        &self,
+        session: SessionId,
+        origin: Origin,
+        kind: String,
+        body: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        // Observability-only: lands on the merged log + broadcast as `Transport`, never the engine
+        // or journal. No-op if the session is gone.
+        self.record_inbound(
+            &session,
+            origin,
+            Disposition::Transport,
+            SessionPayload::Meta { kind, body },
+        );
+        Ok(())
     }
 }
 
@@ -885,5 +922,76 @@ mod merged_log_tests {
             .unwrap();
         assert!(tail.entries.is_empty());
         assert_eq!(tail.head_seq, page.head_seq);
+    }
+
+    #[tokio::test]
+    async fn submit_from_attributes_inbound_to_origin() {
+        // `submit_from` carries per-event provenance onto the merged log: the inbound entry is
+        // attributed to the submitting surface's origin, not the host-local `ffi` default.
+        let api = CoreSessionApi::new();
+        let session = SessionId::new("attributed");
+        let origin = Origin::new("telegram", OriginScope::Dm { user: "u1".into() });
+
+        api.submit_from(
+            session.clone(),
+            origin.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hi"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit_from");
+
+        let page = api.log_after(session.clone(), 0, 0).await.unwrap();
+        let inbound = page
+            .entries
+            .iter()
+            .find(|e| e.direction == Direction::Inbound)
+            .expect("an inbound entry");
+        assert_eq!(inbound.origin, origin);
+        assert_ne!(inbound.origin, ffi_origin());
+    }
+
+    #[tokio::test]
+    async fn record_meta_is_observable_but_not_in_history() {
+        // A `Transport` meta event lands on the merged live log (observable via `log_after`) but is
+        // never folded into durable history (`session_history`) — observability, not context.
+        let api = CoreSessionApi::new();
+        let session = SessionId::new("meta");
+
+        // Open the session so it has a live log to record onto.
+        api.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hi"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit");
+
+        let origin = Origin::new(
+            "gui",
+            OriginScope::Api {
+                key: "owner".into(),
+            },
+        );
+        api.record_meta(session.clone(), origin, "attach".into(), vec![1, 2, 3])
+            .await
+            .expect("record_meta");
+
+        let page = api.log_after(session.clone(), 0, 0).await.unwrap();
+        let meta = page
+            .entries
+            .iter()
+            .find(|e| matches!(&e.payload, SessionPayload::Meta { .. }))
+            .expect("a meta entry on the live log");
+        assert_eq!(meta.disposition, Disposition::Transport);
+
+        // The FFI exposes no durable journal, so history is empty: the meta event is observability
+        // only and never graduates into durable history.
+        let history = api.session_history(session.clone(), 0, 0).await;
+        assert!(history.entries.is_empty());
     }
 }
