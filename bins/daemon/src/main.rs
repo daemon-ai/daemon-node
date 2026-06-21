@@ -16,7 +16,10 @@ mod config;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use daemon_common::{CredMode, CredScope, JournalStreamId, ProfileRef, SessionId, UnitId};
+use daemon_common::{
+    CredMode, CredScope, JournalStreamId, ModelEngine, ModelRef, ModelSource, ProfileRef,
+    SessionId, UnitId,
+};
 use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
     ContextEngine, ContextEngineBuilder, CredentialBuilder, CredentialProvider, EngineProfile,
@@ -24,6 +27,7 @@ use daemon_core::{
     SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
 };
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
+use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
@@ -32,7 +36,7 @@ use daemon_host::{
 };
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
-use daemon_providers::{GenAiProvider, LocalProvider, WorkerConfig};
+use daemon_providers::{GenAiProvider, SwitchableLocalProvider, WorkerConfig};
 use daemon_provision::CutChannel;
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
@@ -67,7 +71,11 @@ async fn main() -> anyhow::Result<()> {
 /// (a completing default plus the delegating-orchestrator / completing-child demo profiles); a real
 /// provider becomes the registry default for every profile (the engine threads the credential lease
 /// secret onto each request as the bearer).
-fn build_providers(cfg: &NodeConfig) -> ProviderRegistry {
+fn build_providers(
+    cfg: &NodeConfig,
+    manager: &Arc<ModelManager>,
+    active: &ActiveModels,
+) -> ProviderRegistry {
     let mut providers = ProviderRegistry::new();
     match cfg.provider_kind {
         ProviderKind::Mock => {
@@ -117,9 +125,15 @@ fn build_providers(cfg: &NodeConfig) -> ProviderRegistry {
                 );
             }
             // One supervised worker, shared (cloned) across every profile/engine: a single local
-            // model lives in VRAM once and serializes generations behind the provider's mutex.
-            let provider: Arc<dyn Provider> =
-                Arc::new(LocalProvider::new(local_worker_config(cfg, engine)));
+            // model lives in VRAM once and serializes generations behind the provider's mutex. The
+            // switchable wrapper resolves the profile's *active* model through `daemon-models`
+            // (download-on-first-use into the shared cache) and hot-swaps the worker on activation.
+            let provider: Arc<dyn Provider> = Arc::new(SwitchableLocalProvider::new(
+                local_worker_config(cfg, engine),
+                manager.clone(),
+                active.clone(),
+                cfg.profile.clone(),
+            ));
             providers.set_default(Arc::new(move || provider.clone()));
         }
     }
@@ -341,6 +355,48 @@ impl Tool for MemoryProviderTool {
     }
 }
 
+/// Parse the configured `model` string into a [`ModelRef`] for a local engine: an existing local
+/// path becomes a [`ModelSource::Local`]; otherwise it is a Hugging Face id (`org/name` for
+/// mistral.rs; `org/name/file.gguf` for llama, which names the GGUF to fetch).
+fn parse_model_ref(kind: ProviderKind, s: &str) -> Option<ModelRef> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let engine = match kind {
+        ProviderKind::MistralRs => ModelEngine::MistralRs,
+        _ => ModelEngine::Llama,
+    };
+    let path = std::path::Path::new(s);
+    if path.exists() {
+        return Some(ModelRef::new(
+            engine,
+            ModelSource::Local {
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    match engine {
+        ModelEngine::Llama => {
+            if s.to_ascii_lowercase().ends_with(".gguf") {
+                // `org/name/<file path>` → repo `org/name`, file the remainder.
+                let segs: Vec<&str> = s.splitn(3, '/').collect();
+                match segs.as_slice() {
+                    [org, name, file] => Some(ModelRef::new(
+                        engine,
+                        ModelSource::hf_file(format!("{org}/{name}"), *file),
+                    )),
+                    _ => None,
+                }
+            } else {
+                // A bare repo: llama still needs a file at resolve time (surfaced as an error then).
+                Some(ModelRef::new(engine, ModelSource::hf(s)))
+            }
+        }
+        ModelEngine::MistralRs => Some(ModelRef::new(engine, ModelSource::hf(s))),
+    }
+}
+
 /// Build the [`WorkerConfig`] for a local provider from the node config's `[local]` tuning.
 fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
     let local = &cfg.local;
@@ -391,11 +447,37 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         })
     };
 
+    // Model management: the daemon owns search + acquisition + caching + catalog for the local
+    // engines (unified across llama.cpp + mistral.rs). Built unconditionally so the `ModelApi`
+    // surface works even on a remote-only node (the GUI can browse/download regardless).
+    let manager = Arc::new(
+        ModelManager::new(ManagerConfig {
+            cache_dir: cfg.models.cache_dir.clone(),
+            registry_path: cfg.models.registry_path.clone(),
+            endpoint: cfg.models.endpoint.clone(),
+            // Offline quantization runs out-of-process via the llama-enabled inference worker; reuse
+            // the configured worker binary (it has the `quantize` subcommand when built with llama).
+            quantize_worker_bin: Some(cfg.local.worker_bin.clone()),
+        })
+        .await?,
+    );
+    let active = manager.active_handle();
+    // Seed the configured model as the active selection for a local provider, so resolve-before-load
+    // downloads it into the shared cache on first use.
+    if matches!(
+        cfg.provider_kind,
+        ProviderKind::LlamaCpp | ProviderKind::MistralRs
+    ) {
+        if let Some(model_ref) = parse_model_ref(cfg.provider_kind, &cfg.model) {
+            active.set(cfg.profile.clone(), model_ref).await;
+        }
+    }
+
     // Provider selection seam: Mock is the zero-config default; a real networked provider drops in
     // via `set_default(...)` without touching the engine or the construction sites. The API key
     // flows per-call through the credential broker (the lease secret -> `Request.auth`), so a real
     // provider builder needs only the base URL + model.
-    let providers = build_providers(&cfg);
+    let providers = build_providers(&cfg, &manager, &active);
 
     // The default context engine (§10, LCM) and memory providers (§11, Mnemosyne) wired into every
     // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry. Both
@@ -426,6 +508,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         memory: memory.shared,
         memory_builder: memory.builder,
         extra_tools: memory.tools,
+        models: Some(manager.clone()),
     });
     tracing::info!("daemon host node started");
 

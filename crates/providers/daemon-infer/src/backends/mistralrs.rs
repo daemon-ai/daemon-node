@@ -10,7 +10,7 @@
 //! `mistralrs-depth` pass; the [`InferenceBackend`] contract is identical to the llama backend so
 //! the daemon-side `LocalProvider` does not change.
 
-use mistralrs::{IsqType, Response, TextMessageRole, TextMessages, TextModelBuilder};
+use mistralrs::{IsqType, RequestBuilder, Response, TextMessageRole, TextModelBuilder};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -40,7 +40,8 @@ impl MistralRsBackend {
             supports_native_tools: true,
             supports_streaming: true,
             tool_call_format: ToolCallFormat::Native,
-            max_context: None,
+            // Advertise the configured context window when set (the model default otherwise).
+            max_context: (params.n_ctx > 0).then_some(params.n_ctx),
         };
         Ok(Self {
             model,
@@ -61,10 +62,10 @@ impl InferenceBackend for MistralRsBackend {
         tx: UnboundedSender<BackendChunk>,
         cancel: CancellationToken,
     ) -> Result<Usage, BackendError> {
-        let messages = build_messages(&req);
+        let request = build_request(&req);
         let mut stream = self
             .model
-            .stream_chat_request(messages)
+            .stream_chat_request(request)
             .await
             .map_err(|e| BackendError::transient(format!("mistralrs request: {e}")))?;
 
@@ -74,6 +75,8 @@ impl InferenceBackend for MistralRsBackend {
         let has_tools = !req.tools.is_empty();
         let mut buffered = String::new();
         let mut produced: u64 = 0;
+        // The final streaming chunk carries authoritative prompt/completion token counts.
+        let mut token_usage: Option<(u64, u64)> = None;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(BackendError::cancelled()),
@@ -81,6 +84,12 @@ impl InferenceBackend for MistralRsBackend {
                     let Some(resp) = next else { break };
                     match resp {
                         Response::Chunk(chunk) => {
+                            if let Some(usage) = chunk.usage.as_ref() {
+                                token_usage = Some((
+                                    usage.prompt_tokens as u64,
+                                    usage.completion_tokens as u64,
+                                ));
+                            }
                             if let Some(choice) = chunk.choices.first() {
                                 if let Some(text) = choice.delta.content.as_ref() {
                                     if !text.is_empty() {
@@ -122,25 +131,28 @@ impl InferenceBackend for MistralRsBackend {
             }
         }
 
-        // mistral.rs streaming chunks do not carry token usage; report output chunk count.
-        // (Phase 2 wires exact prompt/completion token usage.)
+        // Prefer the engine's authoritative token usage (final chunk); fall back to the streamed
+        // chunk count for completion when the engine reported none.
+        let (input_tokens, output_tokens) = token_usage.unwrap_or((0, produced));
         Ok(Usage {
-            input_tokens: 0,
-            output_tokens: produced,
+            input_tokens,
+            output_tokens,
         })
     }
 }
 
-/// Translate our protocol messages into mistral.rs `TextMessages`.
-fn build_messages(req: &GenerateRequest) -> TextMessages {
-    let mut messages = TextMessages::new();
+/// Translate our protocol request into a mistral.rs [`RequestBuilder`], applying the conversation,
+/// the tool-advertisement preamble, and the sampling knobs (`temperature`/`top_p`/`top_k` and the
+/// output-token cap), mirroring the llama backend's sampling semantics.
+fn build_request(req: &GenerateRequest) -> RequestBuilder {
+    let mut builder = RequestBuilder::new();
     let system = match tooling::tool_preamble(&req.tools) {
         Some(preamble) if req.system.is_empty() => preamble,
         Some(preamble) => format!("{preamble}\n{}", req.system),
         None => req.system.clone(),
     };
     if !system.is_empty() {
-        messages = messages.add_message(TextMessageRole::System, &system);
+        builder = builder.add_message(TextMessageRole::System, &system);
     }
     for msg in &req.messages {
         let role = match msg.role.as_str() {
@@ -149,9 +161,26 @@ fn build_messages(req: &GenerateRequest) -> TextMessages {
             "tool" => TextMessageRole::Tool,
             _ => TextMessageRole::User,
         };
-        messages = messages.add_message(role, &msg.content);
+        builder = builder.add_message(role, &msg.content);
     }
-    messages
+
+    // Sampling: a non-positive temperature is greedy/deterministic (matches the llama backend).
+    let s = &req.sampling;
+    if s.temperature <= 0.0 {
+        builder = builder.set_deterministic_sampler();
+    } else {
+        builder = builder.set_sampler_temperature(s.temperature as f64);
+        if s.top_k > 0 {
+            builder = builder.set_sampler_topk(s.top_k as usize);
+        }
+        if s.top_p < 1.0 {
+            builder = builder.set_sampler_topp(s.top_p as f64);
+        }
+    }
+    if req.max_tokens > 0 {
+        builder = builder.set_sampler_max_len(req.max_tokens as usize);
+    }
+    builder
 }
 
 /// Parse a textual ISQ name (config-supplied) into a mistral.rs [`IsqType`]. Unknown names are

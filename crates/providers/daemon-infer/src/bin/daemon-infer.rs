@@ -20,6 +20,13 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
+    // A one-shot `quantize` subcommand (not part of the stdio protocol): offline-quantize a GGUF
+    // via llama.cpp's native quantizer, then exit. The daemon's model manager shells out to this.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("quantize") {
+        std::process::exit(run_quantize_cli(&raw_args[2..]));
+    }
+
     let selected_engine = parse_engine_arg();
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
@@ -191,6 +198,57 @@ async fn send_event(writer: &CutWriter, event: &Event) {
     };
     if let Err(e) = writer.send(&bytes).await {
         eprintln!("daemon-infer: failed to send event (parent gone?): {e}");
+    }
+}
+
+/// Run the one-shot `quantize` subcommand, returning a process exit code.
+///
+/// Usage: `daemon-infer quantize --in <f16.gguf> --out <q4km.gguf> --ftype Q4_K_M [--nthread N]`.
+/// Without the `llama` feature this is a clear non-zero error (no engine linked).
+fn run_quantize_cli(args: &[String]) -> i32 {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut ftype: Option<String> = None;
+    let mut nthread: i32 = 0;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--in" | "--input" => input = it.next().cloned(),
+            "--out" | "--output" => output = it.next().cloned(),
+            "--ftype" | "--type" => ftype = it.next().cloned(),
+            "--nthread" | "--threads" => {
+                nthread = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            other => eprintln!("daemon-infer quantize: ignoring unknown arg '{other}'"),
+        }
+    }
+    let (Some(input), Some(output), Some(ftype)) = (input, output, ftype) else {
+        eprintln!(
+            "daemon-infer quantize: required --in <gguf> --out <gguf> --ftype <Q4_K_M> [--nthread N]"
+        );
+        return 2;
+    };
+
+    #[cfg(feature = "llama")]
+    {
+        match backends::quantize::run_quantize(&input, &output, &ftype, nthread) {
+            Ok(()) => {
+                println!("daemon-infer quantize: wrote {output}");
+                0
+            }
+            Err(e) => {
+                eprintln!("daemon-infer quantize: {e}");
+                1
+            }
+        }
+    }
+    #[cfg(not(feature = "llama"))]
+    {
+        let _ = (input, output, ftype, nthread);
+        eprintln!(
+            "daemon-infer quantize: built without the `llama` feature; rebuild the worker with --features llama"
+        );
+        3
     }
 }
 

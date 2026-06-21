@@ -21,10 +21,15 @@ use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
     ApiError, ControlApi, FleetReport, HealthReport, JournalPageView, JournalRecord,
-    JournalRecordPayload, ManageEventView, Outbound, ServiceHealth, SessionApi, SessionInfo,
-    SessionState, StatsReport, TreeReport, UnitNode,
+    JournalRecordPayload, ManageEventView, ModelApi, Outbound, ServiceHealth, SessionApi,
+    SessionInfo, SessionState, StatsReport, TreeReport, UnitNode,
 };
-use daemon_common::{ContentHash, JournalStreamId, PartitionId, ReqId, SessionId, UnitId};
+use daemon_common::{
+    ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JournalStreamId,
+    ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, QuantizeId, QuantizeStatus,
+    QuantRecommendation, ReqId, SearchPage, SearchQuery, SessionId, UnitId,
+};
+use daemon_models::{ModelError, ModelManager};
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
 use daemon_protocol::{
     AgentCommand, HostRequest, HostRequestHandler, HostResponse, HostResponseBody, TranscriptBlock,
@@ -70,6 +75,12 @@ pub struct NodeApiImpl {
     /// The node's journal signer, when journaling is enabled. Held here so a history read can verify
     /// each sealed segment (recompute root + check signature) before reporting it as `verified`.
     verifier: Option<Arc<TraceSigner>>,
+    /// The model-management facade backing the `ModelApi` sub-surface. `None` on a node built
+    /// without local-inference model management (every `ModelApi` call then resolves to
+    /// [`ApiError::Unsupported`]).
+    models: Option<Arc<ModelManager>>,
+    /// The default profile a `model_activate` with no explicit profile applies to.
+    default_local_profile: String,
 }
 
 impl NodeApiImpl {
@@ -95,7 +106,21 @@ impl NodeApiImpl {
             live: Arc::new(LiveSessions::new(engine_builder)),
             owners: Arc::new(DashMap::new()),
             verifier: None,
+            models: None,
+            default_local_profile: "default".to_string(),
         }
+    }
+
+    /// Attach the model-management facade backing the `ModelApi` sub-surface, with the default
+    /// profile a `model_activate` (no explicit profile) applies to. Call during assembly.
+    pub fn with_models(
+        mut self,
+        models: Arc<ModelManager>,
+        default_local_profile: impl Into<String>,
+    ) -> Self {
+        self.models = Some(models);
+        self.default_local_profile = default_local_profile.into();
+        self
     }
 
     /// Durably journal live interactive sessions: each session's transcript (finished blocks +
@@ -415,6 +440,133 @@ impl SessionApi for NodeApiImpl {
     ) -> JournalPageView {
         self.read_history(JournalStreamId::session(&session), after_cursor, max)
             .await
+    }
+}
+
+/// Map a `daemon-models` error onto the transport-stable [`ApiError`].
+fn map_model_err(e: ModelError) -> ApiError {
+    match e {
+        ModelError::NotFound(m) => ApiError::Other(format!("not found: {m}")),
+        ModelError::AccessDenied(m) => ApiError::Other(format!("access denied: {m}")),
+        ModelError::Invalid(m) => ApiError::Unsupported(m),
+        ModelError::Unknown(m) => ApiError::Other(format!("unknown id: {m}")),
+        other => ApiError::Other(other.to_string()),
+    }
+}
+
+#[async_trait]
+impl ModelApi for NodeApiImpl {
+    async fn model_search(&self, query: SearchQuery) -> Result<SearchPage, ApiError> {
+        let m = self.require_models()?;
+        m.search(query).await.map_err(map_model_err)
+    }
+
+    async fn model_files(
+        &self,
+        repo: String,
+        revision: Option<String>,
+        engine: ModelEngine,
+    ) -> Result<Vec<ModelFile>, ApiError> {
+        let m = self.require_models()?;
+        m.model_files(&repo, revision.as_deref(), engine)
+            .await
+            .map_err(map_model_err)
+    }
+
+    async fn model_download(&self, model: ModelRef) -> Result<DownloadId, ApiError> {
+        let m = self.require_models()?;
+        m.download(model).await.map_err(map_model_err)
+    }
+
+    async fn model_downloads(&self) -> Vec<DownloadStatus> {
+        match &self.models {
+            Some(m) => m.downloads().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn model_cancel(&self, id: DownloadId) -> Result<(), ApiError> {
+        let m = self.require_models()?;
+        m.cancel(id).await.map_err(map_model_err)
+    }
+
+    async fn model_pause(&self, id: DownloadId) -> Result<(), ApiError> {
+        let m = self.require_models()?;
+        m.pause(id).await.map_err(map_model_err)
+    }
+
+    async fn model_resume(&self, id: DownloadId) -> Result<(), ApiError> {
+        let m = self.require_models()?;
+        m.resume(id).await.map_err(map_model_err)
+    }
+
+    async fn model_catalog(&self) -> Vec<InstalledModel> {
+        match &self.models {
+            Some(m) => m.catalog().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn model_delete(&self, id: ModelId) -> Result<(), ApiError> {
+        let m = self.require_models()?;
+        m.delete(&id).await.map_err(map_model_err)
+    }
+
+    async fn model_activate(
+        &self,
+        id: ModelId,
+        profile: Option<String>,
+    ) -> Result<(), ApiError> {
+        let m = self.require_models()?;
+        let profile = profile.unwrap_or_else(|| self.default_local_profile.clone());
+        m.activate(&id, &profile).await.map(|_| ()).map_err(map_model_err)
+    }
+
+    async fn model_recommend(
+        &self,
+        repo: String,
+        revision: Option<String>,
+        engine: ModelEngine,
+        budget_bytes: Option<u64>,
+    ) -> Result<QuantRecommendation, ApiError> {
+        let m = self.require_models()?;
+        m.recommend(&repo, revision.as_deref(), engine, budget_bytes)
+            .await
+            .map_err(map_model_err)
+    }
+
+    async fn model_quantize(
+        &self,
+        repo: String,
+        revision: Option<String>,
+        target_quant: String,
+        source_file: Option<String>,
+    ) -> Result<QuantizeId, ApiError> {
+        let m = self.require_models()?;
+        m.quantize(&repo, revision.as_deref(), &target_quant, source_file)
+            .await
+            .map_err(map_model_err)
+    }
+
+    async fn model_quantizes(&self) -> Vec<QuantizeStatus> {
+        match &self.models {
+            Some(m) => m.quantizes().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn model_inspect(&self, id: ModelId) -> Result<GgufInfo, ApiError> {
+        let m = self.require_models()?;
+        m.inspect(&id).await.map_err(map_model_err)
+    }
+}
+
+impl NodeApiImpl {
+    /// The model-management facade, or [`ApiError::Unsupported`] when this node has none.
+    fn require_models(&self) -> Result<&Arc<ModelManager>, ApiError> {
+        self.models
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("model management is not enabled".into()))
     }
 }
 

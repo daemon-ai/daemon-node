@@ -11,6 +11,9 @@ use crate::protocol::{Engine, ModelParams};
 mod llama;
 #[cfg(feature = "mistralrs")]
 mod mistralrs;
+/// Offline GGUF quantization (llama.cpp's native quantizer); only built with the `llama` feature.
+#[cfg(feature = "llama")]
+pub mod quantize;
 
 /// Load `model` into a backend for `engine`. Returns a classified [`BackendError`] when the
 /// requested engine was not compiled into this worker build.

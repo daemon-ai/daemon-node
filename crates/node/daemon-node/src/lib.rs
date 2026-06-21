@@ -84,6 +84,10 @@ pub struct NodeAssembly {
     /// Extra tools (e.g. `mnemosyne_*` / `lcm_*`) registered into every role's tool registry on top
     /// of the core fs + shell toolset, so the model can drive memory/context backends.
     pub extra_tools: Vec<Arc<dyn Tool>>,
+    /// The model-management facade backing the node's `ModelApi` sub-surface (search/download/
+    /// catalog/activate). `None` builds a node without local-inference model management (tests, a
+    /// remote-only node); the `ModelApi` calls then resolve to `ApiError::Unsupported`.
+    pub models: Option<Arc<daemon_models::ModelManager>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -229,19 +233,21 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         Arc::new(move |id: SessionId| profile.fresh(id))
     };
 
-    let node = Arc::new(
-        NodeApiImpl::new(
-            handle.observer(),
-            a.store.clone(),
-            host.manager().clone(),
-            a.partition,
-            session_builder,
-            Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone()))
-                as Arc<dyn FleetControl>),
-        )
-        // Live interactive sessions journal per turn; also records the signer so history reads verify.
-        .with_journal(a.store.clone(), signer.clone()),
-    );
+    let mut node_api = NodeApiImpl::new(
+        handle.observer(),
+        a.store.clone(),
+        host.manager().clone(),
+        a.partition,
+        session_builder,
+        Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>),
+    )
+    // Live interactive sessions journal per turn; also records the signer so history reads verify.
+    .with_journal(a.store.clone(), signer.clone());
+    // Bind the model-management sub-surface when this node hosts local-inference model management.
+    if let Some(models) = a.models.clone() {
+        node_api = node_api.with_models(models, a.profile.as_str().to_string());
+    }
+    let node = Arc::new(node_api);
 
     AssembledNode {
         node,

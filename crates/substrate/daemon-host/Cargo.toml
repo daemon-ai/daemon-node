@@ -21,6 +21,8 @@ daemon-activation = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-telemetry = { workspace = true }
+# The model-management facade backing the node's `ModelApi` sub-surface (search/download/catalog).
+daemon-models = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 dashmap = { workspace = true }

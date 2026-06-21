@@ -77,6 +77,14 @@ const INFER_MAX_RESTARTS_ENV: &str = "DAEMON_INFER_MAX_RESTARTS";
 /// The sliding window (ms) over which restarts are counted for meltdown.
 const INFER_RESTART_WINDOW_MS_ENV: &str = "DAEMON_INFER_RESTART_WINDOW_MS";
 
+// --- Model management (`daemon-models`) tuning (DAEMON_MODELS_*) ------------------------------
+/// The shared Hugging Face hub cache directory (default: the `HF_*`/XDG precedence).
+const MODELS_CACHE_DIR_ENV: &str = "DAEMON_MODELS_CACHE_DIR";
+/// The installed-model catalog manifest path (default: `<hub>/daemon-catalog.json`).
+const MODELS_REGISTRY_ENV: &str = "DAEMON_MODELS_REGISTRY";
+/// The Hugging Face Hub endpoint override (default: `https://huggingface.co`; mainly for tests).
+const MODELS_ENDPOINT_ENV: &str = "DAEMON_MODELS_ENDPOINT";
+
 /// Which model provider implementation the node uses (selected by config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -170,6 +178,17 @@ fn default_worker_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("daemon-infer"))
 }
 
+/// Tuning for the `daemon-models` model-management facade (shared cache + catalog + Hub endpoint).
+#[derive(Clone, Debug, Default)]
+pub struct ModelsConfig {
+    /// The shared Hugging Face hub cache directory; `None` follows the `HF_*`/XDG precedence.
+    pub cache_dir: Option<PathBuf>,
+    /// The catalog manifest path; `None` places it next to the cache.
+    pub registry_path: Option<PathBuf>,
+    /// The Hugging Face Hub endpoint; `None` uses the default.
+    pub endpoint: Option<String>,
+}
+
 /// The durable store backend selected by config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreBackend {
@@ -217,6 +236,8 @@ pub struct NodeConfig {
     /// Local-inference worker tuning (meaningful only for the [`ProviderKind::LlamaCpp`] /
     /// [`ProviderKind::MistralRs`] kinds).
     pub local: LocalConfig,
+    /// Model-management (search/download/cache/catalog) tuning.
+    pub models: ModelsConfig,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -255,6 +276,16 @@ struct FileConfig {
     journal_seed: Option<String>,
     nesting_depth: Option<usize>,
     local: Option<FileLocalConfig>,
+    models: Option<FileModelsConfig>,
+}
+
+/// The `[models]` TOML table — model-management tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileModelsConfig {
+    cache_dir: Option<PathBuf>,
+    registry_path: Option<PathBuf>,
+    endpoint: Option<String>,
 }
 
 /// The `[local]` TOML table — local-inference worker tuning (every field optional; env wins).
@@ -464,6 +495,7 @@ impl NodeConfig {
         };
 
         let local = Self::resolve_local(file.local.unwrap_or_default())?;
+        let models = Self::resolve_models(file.models.unwrap_or_default());
 
         Ok(Self {
             partition,
@@ -480,11 +512,28 @@ impl NodeConfig {
             base_url,
             model,
             local,
+            models,
             credential_key,
             engine,
             journal_seed,
             nesting_depth,
         })
+    }
+
+    /// Resolve model-management tuning (env overriding the `[models]` TOML table).
+    fn resolve_models(file: FileModelsConfig) -> ModelsConfig {
+        let cache_dir = env_string(MODELS_CACHE_DIR_ENV)
+            .map(PathBuf::from)
+            .or(file.cache_dir);
+        let registry_path = env_string(MODELS_REGISTRY_ENV)
+            .map(PathBuf::from)
+            .or(file.registry_path);
+        let endpoint = env_string(MODELS_ENDPOINT_ENV).or(file.endpoint);
+        ModelsConfig {
+            cache_dir,
+            registry_path,
+            endpoint,
+        }
     }
 
     /// Resolve the local-inference worker tuning (env overriding the `[local]` TOML table overriding

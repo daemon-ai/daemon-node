@@ -520,8 +520,9 @@ The GUI becomes a thin NodeApi client; it does **not** talk to Hugging Face dire
    pause = cancel-and-keep-part, resume = re-invoke (§4.7).
 8. **Resumability** — provided by hf-hub 0.5 itself (`*.sync.part` + committed-offset trailer); no
    custom reqwest downloader (§4.7).
-9. **mistral.rs prewarm scope** — selective sibling download mirroring mistral.rs weight selection,
-   not download-all (§4.7).
+9. **mistral.rs prewarm scope** — full-repo prewarm (every tree file) so the offline sidecar load
+   never misses a sibling (config/tokenizer/generation_config/weights). Implemented via
+   `hf::files::list_all`; a future selective port can narrow this without changing the contract.
 10. **Search filter per engine** — llama -> `library=gguf`; mistral.rs -> `library=safetensors` +
     `pipeline_tag=text-generation`.
 
@@ -540,14 +541,129 @@ The GUI becomes a thin NodeApi client; it does **not** talk to Hugging Face dire
 ## 8. Suggested phasing
 
 1. **Contracts** — add `ModelRef`/catalog types and the `ModelApi` sub-surface (traits + `ApiRequest`/
-   `ApiResponse` + CDDL). No behavior yet.
+   `ApiResponse` + CDDL). No behavior yet. — **done** (`daemon-common`, `daemon-api`, `daemon-api.cddl`).
 2. **daemon-models (acquire + cache)** — hf-hub download into shared cache, resume, GGUF resolve,
-   registry; wire `model_download`/`model_downloads`/`model_catalog`.
-3. **Provider wiring** — `ProviderKind::Local`, resolve-before-load, config surface.
-4. **Search** — `models-json` + tree endpoints behind `model_search`/`model_files`.
+   registry; wire `model_download`/`model_downloads`/`model_catalog`. — **done** (`crates/providers/
+   daemon-models`: `cache.rs`, `acquire.rs`, `resolve.rs`, `registry.rs`, `gguf.rs`, `manager.rs`).
+3. **Provider wiring** — `ProviderKind::Local`, resolve-before-load, config surface. — **done**
+   (`SwitchableLocalProvider`, `ModelsConfig`, `parse_model_ref` + active-model seeding in `bins/daemon`).
+4. **Search** — `models-json` + tree endpoints behind `model_search`/`model_files`. — **done**
+   (`hf/search.rs` over `/api/models`, `hf/files.rs` over `/api/models/{id}/tree`).
 5. **daemon-app client + Models UI** — gateway client, ports of Discover/Downloads/Installed, bind
-   `ModelPill`.
+   `ModelPill`. — **not in scope for this branch** (GUI side).
 6. **Parity polish** — mistral.rs `ModelParams`/usage wiring, optional embeddings, progress for loads.
+   — **done** for sampling + accurate token usage + advertised context (`backends/mistralrs.rs`);
+   embeddings remain deferred (§7.1).
+
+7. **UX expansion** — hardware-aware recommender, offline local quantize, gguf-rs introspection, and
+   the `model up` quickstart. — **done** (§8a; `hardware.rs`, `recommend.rs`, `inspect.rs`,
+   `quantize.rs`, `daemon-infer/backends/quantize.rs`, CLI `recommend|quantize|quantizes|inspect|up`).
+
+> Implementation status: the Rust backend (phases 1–4, the backend half of 6, and the §8a UX
+> expansion) is implemented in this worktree, builds across the workspace, is clippy-clean, and is
+> covered by unit + `wiremock` tests (`daemon-models`, incl. recommender fit logic, ftype mapping, and
+> hardware budget) plus ignored live-network integration tests (`tests/network.rs`, incl. live
+> recommend + a `DAEMON_INFER_WORKER_BIN`-gated live quantize). Both the `mistralrs` and `llama` engine
+> lanes build via `nix build .#daemon-infer-{mistralrs,llama}` (the Nix sandbox supplies the `/bin/sh`
+> that a raw dev-shell `cargo --features llama` lacks — see §8a build note), and `live_quantize_small_gguf`
+> was verified end-to-end against the llama worker. Headless end-to-end verification is available via
+> `daemon-cli model
+> search|files|pull|downloads|ls|rm|activate|recommend|quantize|quantizes|inspect|up`.
+
+---
+
+## 8a. UX expansion — recommend, quantize, inspect, quickstart
+
+A follow-on workstream layered ergonomics on top of the acquisition core so a user gets a working
+local model fast on **any** backend. All four pieces are additive; nothing in §1–8 changed shape.
+
+### 8a.1 Hardware-aware recommender (pure Rust, no engine link)
+
+- `daemon-models/src/hardware.rs` — `HardwareProbe { vram_bytes: Option<u64>, ram_bytes: u64 }`. RAM
+  via `sysinfo`; VRAM best-effort via `nvidia-smi --query-gpu=memory.total` when on PATH (no CUDA/GPU
+  SDK link). On Metal/unified-memory or no NVIDIA GPU, VRAM is `None` and the budget falls back to RAM.
+  `budget_bytes()` = `min(vram, ram)` when VRAM is known, else RAM.
+- `daemon-models/src/recommend.rs` — engine-aware:
+  - **Llama**: from `hf::files::list_files`, rank GGUF files by a static quality table aligned with
+    `LlamaFtype` (`Q8_0 > Q6_K > Q5_K_M > Q4_K_M > Q3_K_M > Q2_K` …), sum split shards, and pick the
+    highest-quality quant whose weight footprint fits `budget * WEIGHT_BUDGET_FRACTION`. Falls back to
+    the smallest quant when nothing fits (with `fits=false`). Returns a ranked `Vec<QuantCandidate>`
+    plus the chosen `file`.
+  - **MistralRs**: recommends an in-engine ISQ level (e.g. `Q8_0`/`Q6K`/`Q4K`) from the model parameter
+    count (`safetensors.total` via `hf/files::repo_param_count`, or `SearchHit.num_parameters`) and the
+    budget; downshifts on small budgets.
+- `ModelManager::recommend(repo, revision, engine, budget_override) -> QuantRecommendation`.
+
+### 8a.2 Offline local quantize (llama.cpp's real quantizer, in the worker)
+
+llama.cpp loads pre-quantized GGUFs — there is no in-situ-at-load path, so mistral.rs ISQ does **not**
+port; and `gguf-rs` is a reader/writer/dequantizer, not a quantizer. But `llama-cpp-4 0.3.2` already
+wraps the real quantizer, so we never reimplement kernels:
+
+- `daemon-infer/src/backends/quantize.rs` (`#[cfg(feature = "llama")]`) calls
+  `llama_cpp_4::quantize::model_quantize` with `LlamaFtype`/`QuantizeParams`.
+- A `quantize` subcommand at the top of `daemon-infer`'s `main()` (`daemon-infer quantize --in
+  <f16.gguf> --out <q4km.gguf> --ftype Q4_K_M --nthread N`) runs it out-of-band of the stdio protocol.
+  Without the `llama` feature it errors clearly and exits non-zero.
+- `daemon-models/src/quantize.rs` — a `Quantizer` job table mirroring the downloader: resolve a
+  high-precision source GGUF (F16 > Q8_0 > best in repo; errors if the repo has no GGUF source —
+  safetensors→GGUF conversion is out of scope), compute an output path under `<hub>/daemon-quantized/`,
+  spawn `worker_bin quantize …`, verify the GGUF magic, and catalog the result as
+  `InstalledModel { engine: Llama, source: Local }`. `ManagerConfig.quantize_worker_bin` supplies the
+  worker; `ModelManager::quantize(...) -> QuantizeId` and `quantizes() -> Vec<QuantizeStatus>`.
+
+### 8a.3 gguf-rs introspection
+
+- `daemon-models/src/inspect.rs` — `inspect(path) -> GgufInfo { architecture, name, file_type,
+  context_length, block_count, quantization_version, parameter_count?, size_bytes }` via `gguf-rs`.
+- `enrich_installed` populates `InstalledModel`'s new `arch`/`context_length`/`file_type` (accurate
+  ftype from header metadata, replacing filename-only quant guesses) on download/quantize completion.
+- `ModelManager::inspect(id) -> GgufInfo`.
+
+### 8a.4 Contracts, API, CLI, quickstart
+
+- `daemon-common`: `QuantRecommendation`, `QuantCandidate`, `QuantizeId`/`QuantizeState`/
+  `QuantizeStatus`, `GgufInfo`; `InstalledModel` extended with `arch`/`context_length`/`file_type`/
+  `parameter_count`.
+- `daemon-api`: `ModelApi::{model_recommend, model_quantize, model_quantizes, model_inspect}` +
+  matching `ApiRequest`/`ApiResponse` variants + `dispatch` arms + `daemon-api.cddl` shapes.
+- `daemon-cli`: `model recommend <repo> [--engine] [--vram GB]`, `model quantize <repo> --ftype
+  Q4_K_M [--source f16.gguf]`, `model quantizes`, `model inspect <id>`, and the headline `model up
+  <repo> [--engine]` which **recommends → pulls → activates** (the mistralrs path injects the
+  recommended `isq` param). This is the "up and running quickly regardless of backend" entry point.
+- `bins/daemon`: `local.worker_bin` is passed into `ManagerConfig.quantize_worker_bin`;
+  `SwitchableLocalProvider` feeds a recommended `isq` into the active mistralrs worker config when one
+  is not set explicitly.
+
+> Build note: the `llama` engine lane (and therefore the `quantize` backend) is cmake-based. A raw
+> dev-shell `cargo build -p daemon-infer --features llama` fails on hosts without `/bin/sh` (e.g.
+> NixOS) because llama-cpp-sys → cmake → GNU make hardcodes `/bin/sh`. The supported way to compile
+> and verify it is the Nix sandbox build the flake already defines, which supplies `/bin/sh` + a full
+> stdenv:
+>
+> ```bash
+> nix build .#daemon-infer-llama            # -> result/bin/daemon-infer (llama-enabled worker)
+> ```
+>
+> This was run and the `#[cfg(feature = "llama")]` quantize code (`backends/quantize.rs` + the
+> `quantize` subcommand) compiles against the real `llama_cpp_4::quantize` API. The end-to-end
+> `live_quantize_small_gguf` test then passed against that worker (download `tinyllamas/stories15M.gguf`
+> → quantize to `Q4_K_M` → GGUF-magic verify → catalog), e.g.:
+>
+> ```bash
+> DAEMON_INFER_WORKER_BIN="$(readlink -f result)/bin/daemon-infer" \
+>   LD_LIBRARY_PATH="$(nix eval --raw nixpkgs#gcc.cc.lib)/lib" \
+>   nix develop -c cargo test -p daemon-models --test network -- --ignored live_quantize_small_gguf
+> ```
+>
+> (`LD_LIBRARY_PATH` supplies `libgomp.so.1` to the spawned worker outside the Nix store.) The default
+> workspace lane still builds only the stub worker and exercises the non-llama error path.
+>
+> Optional dev speedup: to skip the per-lane cmake compile, point `llama-cpp-4`'s prebuilt path at an
+> existing llama.cpp build via `LLAMA_PREBUILT_DIR` (searches root/`lib`/`lib64`/`bin`) — e.g.
+> `nix build nixpkgs#llama-cpp` or a local `~/experiments/*/build/bin` — with `--features llama,dynamic-link`.
+> This is ABI/version-sensitive: the prebuilt libs must match `llama-cpp-sys-4 0.3.2`'s vendored
+> headers, so the version-consistent `nix build .#daemon-infer-llama` above is the reference path.
 
 ---
 
@@ -567,6 +683,14 @@ daemon (backend):
 - Socket transport: [`crates/substrate/daemon-host/src/socket.rs`](../../crates/substrate/daemon-host/src/socket.rs:14-44)
 - Host provider wiring: [`bins/daemon/src/main.rs`](../../bins/daemon/src/main.rs:65-105,164-168)
 - Node config: [`bins/daemon/src/config.rs`](../../bins/daemon/src/config.rs:47-54,105-123,201-207)
+
+UX expansion (§8a):
+- Hardware probe: [`crates/providers/daemon-models/src/hardware.rs`](../../crates/providers/daemon-models/src/hardware.rs)
+- Recommender: [`crates/providers/daemon-models/src/recommend.rs`](../../crates/providers/daemon-models/src/recommend.rs)
+- GGUF introspection: [`crates/providers/daemon-models/src/inspect.rs`](../../crates/providers/daemon-models/src/inspect.rs)
+- Quantize job table: [`crates/providers/daemon-models/src/quantize.rs`](../../crates/providers/daemon-models/src/quantize.rs)
+- Worker quantize backend + subcommand: [`crates/providers/daemon-infer/src/backends/quantize.rs`](../../crates/providers/daemon-infer/src/backends/quantize.rs), [`crates/providers/daemon-infer/src/bin/daemon-infer.rs`](../../crates/providers/daemon-infer/src/bin/daemon-infer.rs)
+- CLI quickstart: [`bins/daemon-cli/src/main.rs`](../../bins/daemon-cli/src/main.rs)
 
 Engines:
 - mistral.rs auto-download analysis: [`../../research/mistral-rs-feature-analysis.md`](../../research/mistral-rs-feature-analysis.md)

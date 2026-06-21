@@ -19,7 +19,7 @@ mod genai_provider;
 mod local;
 
 pub use genai_provider::GenAiProvider;
-pub use local::{LocalProvider, WorkerConfig};
+pub use local::{LocalProvider, SwitchableLocalProvider, WorkerConfig};
 
 use daemon_common::UsageDelta;
 use daemon_core::{

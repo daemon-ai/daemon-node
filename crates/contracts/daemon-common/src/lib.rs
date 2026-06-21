@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 /// Macro to declare a string-backed, stable logical identifier newtype.
 macro_rules! string_id {
@@ -590,4 +591,405 @@ pub enum DaemonError {
     /// Any other failure.
     #[error("{0}")]
     Other(String),
+}
+
+// ---------------------------------------------------------------------------
+// Model management primitives (the unified local-inference model surface)
+// ---------------------------------------------------------------------------
+//
+// These are the transport-stable shapes the model-management surface (`ModelApi` in `daemon-api`)
+// marshals and the `daemon-models` crate produces: a `ModelRef` names a model for a local engine,
+// `ModelSource` says where its bytes come from (a Hugging Face repo or a local path), and the
+// search / file / download / catalog DTOs carry discovery + acquisition state. They live here (the
+// DAG root) so the contract crate, the implementer (`daemon-models`), and every transport share one
+// definition without dragging engine types into the contract.
+
+string_id! {
+    /// Stable catalog identity of an installed model (a content-derived handle, so the same model
+    /// resolves to the same id regardless of which engine/profile activated it).
+    ModelId
+}
+
+/// Which local inference engine a model targets. Mirrors `daemon_infer::protocol::Engine`, kept
+/// independent so this DAG-root crate carries no engine dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelEngine {
+    /// llama.cpp (GGUF) via the `llama-cpp-4` bindings.
+    Llama,
+    /// mistral.rs (Hugging Face repo / UQFF / GGUF) via the `mistralrs` crate.
+    MistralRs,
+}
+
+impl ModelEngine {
+    /// Parse an engine selector (`llama`, `mistralrs`, and common spellings).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "llama" | "llama-cpp" | "llamacpp" | "gguf" => Some(ModelEngine::Llama),
+            "mistralrs" | "mistral-rs" | "mistral.rs" => Some(ModelEngine::MistralRs),
+            _ => None,
+        }
+    }
+
+    /// The canonical lowercase spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelEngine::Llama => "llama",
+            ModelEngine::MistralRs => "mistralrs",
+        }
+    }
+}
+
+impl fmt::Display for ModelEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where a model's bytes come from.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelSource {
+    /// A Hugging Face Hub repo. `file` selects a single artifact within the repo (the GGUF file for
+    /// llama; `None` means "the repo" — mistral.rs loads a repo directory). `revision` pins a
+    /// branch / tag / commit (`"main"` by default).
+    Hf {
+        /// The `org/name` repo id.
+        repo: String,
+        /// The artifact path within the repo (e.g. `Model-Q4_K_M.gguf`), if a single file is named.
+        file: Option<String>,
+        /// The git revision (branch / tag / commit) to pin.
+        revision: String,
+    },
+    /// An already-present local path (a GGUF file or a model directory).
+    Local {
+        /// The local filesystem path.
+        path: PathBuf,
+    },
+}
+
+impl ModelSource {
+    /// A Hugging Face repo source at the default (`main`) revision.
+    pub fn hf(repo: impl Into<String>) -> Self {
+        ModelSource::Hf {
+            repo: repo.into(),
+            file: None,
+            revision: "main".to_string(),
+        }
+    }
+
+    /// A Hugging Face single-file source (e.g. one GGUF in a repo) at the default revision.
+    pub fn hf_file(repo: impl Into<String>, file: impl Into<String>) -> Self {
+        ModelSource::Hf {
+            repo: repo.into(),
+            file: Some(file.into()),
+            revision: "main".to_string(),
+        }
+    }
+}
+
+/// A model named for a specific local engine — the unit a client downloads, activates, and the
+/// daemon resolves to a ready on-disk artifact before loading.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelRef {
+    /// The engine that will load this model.
+    pub engine: ModelEngine,
+    /// Where the model's bytes come from.
+    pub source: ModelSource,
+}
+
+impl ModelRef {
+    /// A reference to a model `source` for `engine`.
+    pub fn new(engine: ModelEngine, source: ModelSource) -> Self {
+        Self { engine, source }
+    }
+}
+
+/// How a model search result set is ordered (Hugging Face `sort` values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchSort {
+    /// Trending score (the Hub default).
+    #[default]
+    Trending,
+    /// Most downloaded.
+    Downloads,
+    /// Most liked.
+    Likes,
+    /// Most recently modified.
+    Modified,
+    /// Most recently created.
+    Created,
+}
+
+impl SearchSort {
+    /// The Hugging Face `sort` query value.
+    pub fn as_query(self) -> &'static str {
+        match self {
+            SearchSort::Trending => "trending",
+            SearchSort::Downloads => "downloads",
+            SearchSort::Likes => "likes",
+            SearchSort::Modified => "lastModified",
+            SearchSort::Created => "createdAt",
+        }
+    }
+}
+
+/// A model-search request a client issues (step 1 of the two-step search→select→download flow).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchQuery {
+    /// The free-text query (matched against repo id / name).
+    pub text: String,
+    /// The engine the results must be loadable by (filters the file/format the repo must carry).
+    pub engine: ModelEngine,
+    /// The result ordering.
+    pub sort: SearchSort,
+    /// The 0-based result page.
+    pub page: u32,
+    /// The page size (results per page).
+    pub limit: u32,
+}
+
+impl SearchQuery {
+    /// A first-page query for `text` against `engine`, ordered by the Hub default.
+    pub fn new(text: impl Into<String>, engine: ModelEngine) -> Self {
+        Self {
+            text: text.into(),
+            engine,
+            sort: SearchSort::default(),
+            page: 0,
+            limit: 25,
+        }
+    }
+}
+
+/// One repo in a search result page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// The `org/name` repo id.
+    pub repo: String,
+    /// The repo author / org, when distinct from the id prefix.
+    pub author: Option<String>,
+    /// Cumulative download count.
+    pub downloads: u64,
+    /// Like count.
+    pub likes: u64,
+    /// The model's parameter count, when the Hub reports it.
+    pub num_parameters: Option<u64>,
+    /// The pipeline tag (e.g. `text-generation`).
+    pub pipeline_tag: Option<String>,
+    /// ISO-8601 last-modified timestamp, when present.
+    pub last_modified: Option<String>,
+    /// Whether the repo is gated (requires accepting terms / a token).
+    pub gated: bool,
+    /// Whether the repo is private.
+    pub private: bool,
+}
+
+/// A page of search results (step 1 result).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchPage {
+    /// The 0-based page index this set corresponds to.
+    pub page: u32,
+    /// The repos on this page.
+    pub results: Vec<SearchHit>,
+    /// Whether another page is likely available (the page came back full).
+    pub has_more: bool,
+}
+
+/// One downloadable file within a repo (step 2 result — what the client selects to download).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFile {
+    /// The file path within the repo (e.g. `Model-Q4_K_M.gguf`).
+    pub path: String,
+    /// The file size in bytes, when the Hub reports it.
+    pub size_bytes: u64,
+    /// The quantization label parsed from the filename (e.g. `Q4_K_M`), for GGUF artifacts.
+    pub quant: Option<String>,
+    /// Whether this file is one shard of a multi-part (split) GGUF.
+    pub is_split: bool,
+    /// Whether this is the *first* shard of a split set (the file to name when downloading the set).
+    pub is_first_shard: bool,
+}
+
+/// A handle to one in-flight or completed download job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DownloadId(pub u64);
+
+impl fmt::Display for DownloadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dl-{}", self.0)
+    }
+}
+
+/// The lifecycle state of a download job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadState {
+    /// Accepted, not yet started transferring.
+    Queued,
+    /// Actively transferring bytes.
+    Downloading,
+    /// All selected files are present and verified.
+    Completed,
+    /// Paused by the client (partial bytes kept for resume).
+    Paused,
+    /// Cancelled by the client (partial bytes discarded).
+    Cancelled,
+    /// Failed; `error` on the [`DownloadStatus`] carries the reason.
+    Failed,
+}
+
+/// A point-in-time snapshot of a download job's progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadStatus {
+    /// The job handle.
+    pub id: DownloadId,
+    /// The model being acquired.
+    pub model: ModelRef,
+    /// The current lifecycle state.
+    pub state: DownloadState,
+    /// Bytes transferred so far (across all selected files).
+    pub downloaded_bytes: u64,
+    /// Total bytes to transfer, when known (the sum of selected file sizes).
+    pub total_bytes: u64,
+    /// Files completed so far.
+    pub files_done: u32,
+    /// Total files selected for this job.
+    pub files_total: u32,
+    /// A failure reason when `state == Failed`.
+    pub error: Option<String>,
+}
+
+/// An installed (downloaded + cataloged) model the daemon can activate and load.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledModel {
+    /// The stable catalog id.
+    pub id: ModelId,
+    /// The reference that resolves this model.
+    pub model: ModelRef,
+    /// A human-friendly display name (the repo id, or file stem).
+    pub display_name: String,
+    /// The resolved on-disk artifact: the GGUF file (llama) or the model directory (mistral.rs).
+    pub local_path: PathBuf,
+    /// Total on-disk size in bytes.
+    pub size_bytes: u64,
+    /// The quantization label, when known.
+    pub quant: Option<String>,
+    /// Milliseconds since the Unix epoch when the model was installed.
+    pub installed_at_ms: u64,
+    /// The model architecture (e.g. `llama`, `qwen2`), read from GGUF metadata when available.
+    #[serde(default)]
+    pub arch: Option<String>,
+    /// The training context length, read from GGUF metadata when available.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// The authoritative GGUF file-type label (from metadata), more reliable than the filename guess.
+    #[serde(default)]
+    pub file_type: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Quantization recommendation + local quantize + GGUF introspection
+// ---------------------------------------------------------------------------
+
+/// A recommended quantization for a repo given detected hardware — the "tune"-like selection that
+/// helps a user get running quickly regardless of engine. For llama it names a GGUF file to pull;
+/// for mistral.rs it names an in-engine ISQ level to apply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuantRecommendation {
+    /// The engine the recommendation targets.
+    pub engine: ModelEngine,
+    /// The `org/name` repo the recommendation is for.
+    pub repo: String,
+    /// For llama: the chosen GGUF file to download. `None` for mistral.rs (whole-repo + ISQ).
+    pub file: Option<String>,
+    /// The chosen quant label: a GGUF quant (llama, e.g. `Q4_K_M`) or an ISQ level (mistral.rs).
+    pub quant: String,
+    /// Estimated on-disk / resident bytes for the choice, when known.
+    pub size_bytes: Option<u64>,
+    /// The memory budget (bytes) the choice was fit against.
+    pub budget_bytes: u64,
+    /// Whether the choice is expected to fit the budget.
+    pub fits: bool,
+    /// A short human-readable rationale.
+    pub reason: String,
+    /// The full ranked candidate list (best-first), so a client can override the pick.
+    pub candidates: Vec<QuantCandidate>,
+}
+
+/// One ranked quantization candidate the recommender considered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuantCandidate {
+    /// The quant label (GGUF quant or ISQ level).
+    pub quant: String,
+    /// The candidate GGUF file (llama), if applicable.
+    pub file: Option<String>,
+    /// Size in bytes, when known.
+    pub size_bytes: Option<u64>,
+    /// Whether it fits the budget.
+    pub fits: bool,
+}
+
+/// A handle to a local quantization job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct QuantizeId(pub u64);
+
+impl fmt::Display for QuantizeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "qz-{}", self.0)
+    }
+}
+
+/// The lifecycle state of a quantization job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantizeState {
+    /// Accepted, not yet started.
+    Queued,
+    /// Acquiring the high-precision source GGUF.
+    Preparing,
+    /// Running the quantizer (worker process).
+    Quantizing,
+    /// Done; the result is cataloged.
+    Completed,
+    /// Failed; `error` on the [`QuantizeStatus`] carries the reason.
+    Failed,
+}
+
+/// A point-in-time snapshot of a quantization job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuantizeStatus {
+    /// The job handle.
+    pub id: QuantizeId,
+    /// The source repo.
+    pub repo: String,
+    /// The high-precision source GGUF file being quantized.
+    pub source_file: String,
+    /// The target quant label (e.g. `Q4_K_M`).
+    pub target_quant: String,
+    /// The current lifecycle state.
+    pub state: QuantizeState,
+    /// The produced GGUF path, once quantization finishes.
+    pub output_path: Option<PathBuf>,
+    /// The catalog id of the produced model, once cataloged.
+    pub model_id: Option<ModelId>,
+    /// A failure reason when `state == Failed`.
+    pub error: Option<String>,
+}
+
+/// Metadata read from a GGUF file header (via `gguf-rs`) without loading the model.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GgufInfo {
+    /// The model architecture (`general.architecture`, e.g. `llama`, `qwen2`).
+    pub architecture: Option<String>,
+    /// The model name (`general.name`).
+    pub name: Option<String>,
+    /// The GGUF file-type / quant label (`general.file_type`).
+    pub file_type: Option<String>,
+    /// The training context length (`<arch>.context_length`).
+    pub context_length: Option<u32>,
+    /// The transformer block count (`<arch>.block_count`).
+    pub block_count: Option<u32>,
+    /// The GGUF quantization version (`general.quantization_version`).
+    pub quantization_version: Option<u32>,
+    /// The total parameter count, when derivable.
+    pub parameter_count: Option<u64>,
+    /// The file size in bytes.
+    pub size_bytes: u64,
 }

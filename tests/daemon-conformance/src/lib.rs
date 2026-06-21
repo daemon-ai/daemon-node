@@ -1675,6 +1675,7 @@ mod node_interface {
             memory: Vec::new(),
             memory_builder: None,
             extra_tools: Vec::new(),
+            models: None,
         })
     }
 
@@ -2471,6 +2472,7 @@ mod node_interface {
             memory: Vec::new(),
             memory_builder: None,
             extra_tools: Vec::new(),
+            models: None,
         })
     }
 

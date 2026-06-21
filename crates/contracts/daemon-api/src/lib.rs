@@ -21,7 +21,11 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use daemon_common::{SessionId, UnitId, UsageDelta, WireVersion};
+use daemon_common::{
+    DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile, ModelId, ModelRef,
+    QuantizeId, QuantizeStatus, QuantRecommendation, SearchPage, SearchQuery, SessionId, UnitId,
+    UsageDelta, WireVersion,
+};
 pub use daemon_protocol::Outbound;
 use daemon_protocol::{AgentCommand, HostResponse, TranscriptBlock};
 use serde::de::DeserializeOwned;
@@ -143,9 +147,115 @@ pub trait ControlApi: Send + Sync {
     }
 }
 
-/// The whole node surface: the session sub-surface plus the control sub-surface.
-pub trait NodeApi: SessionApi + ControlApi {}
-impl<T: SessionApi + ControlApi> NodeApi for T {}
+/// The model-management sub-surface: search/download/cache/catalog/activate the local-inference
+/// models the node can run. Every method has a default so a transport that does not host model
+/// management (the session-only FFI, test stubs) inherits the surface without implementing it; the
+/// node's [`NodeApi`] binds the real implementation (backed by `daemon-models`' `ModelManager`).
+///
+/// The discovery half is a **two-step** flow: [`Self::model_search`] returns matching repos (step
+/// 1), then [`Self::model_files`] lists a chosen repo's loadable files (step 2); the client selects
+/// one and calls [`Self::model_download`].
+#[async_trait]
+pub trait ModelApi: Send + Sync {
+    /// Step 1 — search Hugging Face for repos loadable by the query's engine.
+    async fn model_search(&self, _query: SearchQuery) -> Result<SearchPage, ApiError> {
+        Err(ApiError::Unsupported("model_search".into()))
+    }
+
+    /// Step 2 — list a repo's loadable files for `engine` (the set a client selects to download).
+    async fn model_files(
+        &self,
+        _repo: String,
+        _revision: Option<String>,
+        _engine: ModelEngine,
+    ) -> Result<Vec<ModelFile>, ApiError> {
+        Err(ApiError::Unsupported("model_files".into()))
+    }
+
+    /// Start downloading a model into the shared cache; returns the job handle.
+    async fn model_download(&self, _model: ModelRef) -> Result<DownloadId, ApiError> {
+        Err(ApiError::Unsupported("model_download".into()))
+    }
+
+    /// All download job statuses (in-flight + finished this run).
+    async fn model_downloads(&self) -> Vec<DownloadStatus> {
+        Vec::new()
+    }
+
+    /// Cancel a download (abandon partial bytes).
+    async fn model_cancel(&self, _id: DownloadId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("model_cancel".into()))
+    }
+
+    /// Pause a download (keep partial bytes for resume).
+    async fn model_pause(&self, _id: DownloadId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("model_pause".into()))
+    }
+
+    /// Resume a paused/failed download.
+    async fn model_resume(&self, _id: DownloadId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("model_resume".into()))
+    }
+
+    /// The installed-model catalog.
+    async fn model_catalog(&self) -> Vec<InstalledModel> {
+        Vec::new()
+    }
+
+    /// Delete an installed model (catalog record + cached artifact).
+    async fn model_delete(&self, _id: ModelId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("model_delete".into()))
+    }
+
+    /// Activate a cataloged model for a profile (`None` = the node's default local profile), so new
+    /// worker spawns load it.
+    async fn model_activate(
+        &self,
+        _id: ModelId,
+        _profile: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("model_activate".into()))
+    }
+
+    /// Recommend a quantization for a repo given the detected hardware (the "tune"-like pick): for
+    /// llama a GGUF file to download, for mistral.rs an in-engine ISQ level. `budget_bytes`
+    /// overrides the auto-detected VRAM/RAM budget when set.
+    async fn model_recommend(
+        &self,
+        _repo: String,
+        _revision: Option<String>,
+        _engine: ModelEngine,
+        _budget_bytes: Option<u64>,
+    ) -> Result<QuantRecommendation, ApiError> {
+        Err(ApiError::Unsupported("model_recommend".into()))
+    }
+
+    /// Start an offline quantization of a repo's GGUF to `target_quant` (e.g. `Q4_K_M`); returns the
+    /// job handle. `source_file` selects the source GGUF (`None` = the highest-precision one).
+    async fn model_quantize(
+        &self,
+        _repo: String,
+        _revision: Option<String>,
+        _target_quant: String,
+        _source_file: Option<String>,
+    ) -> Result<QuantizeId, ApiError> {
+        Err(ApiError::Unsupported("model_quantize".into()))
+    }
+
+    /// All quantization job statuses (in-flight + finished this run).
+    async fn model_quantizes(&self) -> Vec<QuantizeStatus> {
+        Vec::new()
+    }
+
+    /// Read GGUF metadata for a cataloged model (architecture, context length, file-type, …).
+    async fn model_inspect(&self, _id: ModelId) -> Result<GgufInfo, ApiError> {
+        Err(ApiError::Unsupported("model_inspect".into()))
+    }
+}
+
+/// The whole node surface: the session, control, and model-management sub-surfaces.
+pub trait NodeApi: SessionApi + ControlApi + ModelApi {}
+impl<T: SessionApi + ControlApi + ModelApi> NodeApi for T {}
 
 // ---------------------------------------------------------------------------
 // Outbound drain item (§17 events + raised host requests share one queue)
@@ -404,6 +514,85 @@ pub enum ApiRequest {
     },
     /// [`ControlApi::verifying_key`].
     VerifyingKey,
+    /// [`ModelApi::model_search`].
+    ModelSearch {
+        /// The search request.
+        query: SearchQuery,
+    },
+    /// [`ModelApi::model_files`].
+    ModelFiles {
+        /// The `org/name` repo id.
+        repo: String,
+        /// The git revision to list (`None` = `main`).
+        revision: Option<String>,
+        /// The engine the listed files must be loadable by.
+        engine: ModelEngine,
+    },
+    /// [`ModelApi::model_download`].
+    ModelDownload {
+        /// The model to acquire.
+        model: ModelRef,
+    },
+    /// [`ModelApi::model_downloads`].
+    ModelDownloads,
+    /// [`ModelApi::model_cancel`].
+    ModelCancel {
+        /// The download job to cancel.
+        id: DownloadId,
+    },
+    /// [`ModelApi::model_pause`].
+    ModelPause {
+        /// The download job to pause.
+        id: DownloadId,
+    },
+    /// [`ModelApi::model_resume`].
+    ModelResume {
+        /// The download job to resume.
+        id: DownloadId,
+    },
+    /// [`ModelApi::model_catalog`].
+    ModelCatalog,
+    /// [`ModelApi::model_delete`].
+    ModelDelete {
+        /// The installed model to delete.
+        id: ModelId,
+    },
+    /// [`ModelApi::model_activate`].
+    ModelActivate {
+        /// The installed model to activate.
+        id: ModelId,
+        /// The profile to activate it for (`None` = the default local profile).
+        profile: Option<String>,
+    },
+    /// [`ModelApi::model_recommend`].
+    ModelRecommend {
+        /// The `org/name` repo id.
+        repo: String,
+        /// The git revision (`None` = `main`).
+        revision: Option<String>,
+        /// The engine the recommendation targets.
+        engine: ModelEngine,
+        /// An explicit memory budget in bytes (`None` = auto-detect VRAM/RAM).
+        budget_bytes: Option<u64>,
+    },
+    /// [`ModelApi::model_quantize`].
+    ModelQuantize {
+        /// The `org/name` repo id whose GGUF is quantized.
+        repo: String,
+        /// The git revision (`None` = `main`).
+        revision: Option<String>,
+        /// The target quant label (e.g. `Q4_K_M`).
+        target_quant: String,
+        /// The source GGUF file (`None` = the highest-precision one in the repo).
+        source_file: Option<String>,
+    },
+    /// [`ModelApi::model_quantizes`].
+    ModelQuantizes,
+    /// [`ModelApi::model_inspect`].
+    ModelInspect {
+        /// The installed model to introspect.
+        id: ModelId,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -431,6 +620,24 @@ pub enum ApiResponse {
     Journal(JournalPageView),
     /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
     VerifyingKey(Option<String>),
+    /// A page of model search results.
+    ModelSearch(SearchPage),
+    /// A repo's loadable files.
+    ModelFiles(Vec<ModelFile>),
+    /// A started download's job handle.
+    ModelDownloadStarted(DownloadId),
+    /// Download job statuses.
+    ModelDownloads(Vec<DownloadStatus>),
+    /// The installed-model catalog.
+    ModelCatalog(Vec<InstalledModel>),
+    /// A quantization recommendation.
+    ModelRecommend(QuantRecommendation),
+    /// A started quantization's job handle.
+    ModelQuantizeStarted(QuantizeId),
+    /// Quantization job statuses.
+    ModelQuantizes(Vec<QuantizeStatus>),
+    /// A model's GGUF metadata.
+    ModelInspect(GgufInfo),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -515,6 +722,57 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::Resume { unit } => unit_or_err(api.resume(unit).await),
         ApiRequest::Scale { unit, n } => unit_or_err(api.scale(unit, n).await),
         ApiRequest::VerifyingKey => ApiResponse::VerifyingKey(api.verifying_key().await),
+        ApiRequest::ModelSearch { query } => match api.model_search(query).await {
+            Ok(page) => ApiResponse::ModelSearch(page),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ModelFiles {
+            repo,
+            revision,
+            engine,
+        } => match api.model_files(repo, revision, engine).await {
+            Ok(files) => ApiResponse::ModelFiles(files),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ModelDownload { model } => match api.model_download(model).await {
+            Ok(id) => ApiResponse::ModelDownloadStarted(id),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ModelDownloads => ApiResponse::ModelDownloads(api.model_downloads().await),
+        ApiRequest::ModelCancel { id } => unit_or_err(api.model_cancel(id).await),
+        ApiRequest::ModelPause { id } => unit_or_err(api.model_pause(id).await),
+        ApiRequest::ModelResume { id } => unit_or_err(api.model_resume(id).await),
+        ApiRequest::ModelCatalog => ApiResponse::ModelCatalog(api.model_catalog().await),
+        ApiRequest::ModelDelete { id } => unit_or_err(api.model_delete(id).await),
+        ApiRequest::ModelActivate { id, profile } => {
+            unit_or_err(api.model_activate(id, profile).await)
+        }
+        ApiRequest::ModelRecommend {
+            repo,
+            revision,
+            engine,
+            budget_bytes,
+        } => match api.model_recommend(repo, revision, engine, budget_bytes).await {
+            Ok(rec) => ApiResponse::ModelRecommend(rec),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ModelQuantize {
+            repo,
+            revision,
+            target_quant,
+            source_file,
+        } => match api
+            .model_quantize(repo, revision, target_quant, source_file)
+            .await
+        {
+            Ok(id) => ApiResponse::ModelQuantizeStarted(id),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ModelQuantizes => ApiResponse::ModelQuantizes(api.model_quantizes().await),
+        ApiRequest::ModelInspect { id } => match api.model_inspect(id).await {
+            Ok(info) => ApiResponse::ModelInspect(info),
+            Err(e) => ApiResponse::Error(e),
+        },
         // Session variants were handled by `serve_session`.
         ApiRequest::Submit { .. }
         | ApiRequest::Poll { .. }

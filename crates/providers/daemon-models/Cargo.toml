@@ -1,0 +1,32 @@
+[package]
+name = "daemon-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Shared model DTOs (ModelRef/SearchQuery/DownloadStatus/InstalledModel …) live at the DAG root.
+daemon-common = { workspace = true }
+# Hugging Face Hub client: search + file listing over `reqwest`, acquisition over `hf-hub` (the same
+# crate + cache layout the mistral.rs engine reads, so a warmed cache loads offline).
+reqwest = { workspace = true }
+hf-hub = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+# Hardware-aware quant recommender: RAM budget (sysinfo) + GGUF metadata introspection (gguf-rs).
+sysinfo = { workspace = true }
+gguf-rs = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true }

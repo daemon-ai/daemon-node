@@ -37,6 +37,16 @@ encoding_rs = "0.8"
 mistralrs = { version = "0.8", default-features = false }
 # in-process mock HTTP server for provider wire tests (no live network in the suite).
 wiremock = "0.6"
+# Hugging Face Hub client for model acquisition into the shared cache (async tokio API + rustls).
+# Same crate (and cache layout) mistral.rs uses, so a warmed cache is read by the mistralrs engine.
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
+# content hashing for stable model-catalog ids.
+sha2 = "0.10"
+# system memory probe for the hardware-aware quant recommender (RAM budget; VRAM is best-effort via
+# nvidia-smi, no GPU SDK link). default-features off keeps it to the system-info we use.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# pure-Rust GGUF reader for metadata introspection (arch / context / ftype) without loading a model.
+gguf-rs = "0.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
@@ -63,6 +73,7 @@ daemon-providers = { path = "crates/providers/daemon-providers" }
 # default-features = false here so workspace consumers inherit the light (no-engine) build; a worker
 # build opts into an engine via `--features llama` / `--features mistralrs` on the crate directly.
 daemon-infer = { path = "crates/providers/daemon-infer", default-features = false }
+daemon-models = { path = "crates/providers/daemon-models" }
 daemon-store = { path = "crates/substrate/daemon-store" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
 daemon-provision = { path = "crates/substrate/daemon-provision" }

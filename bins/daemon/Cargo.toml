@@ -21,6 +21,7 @@ daemon-providers = { workspace = true }
 daemon-infer = { workspace = true }
 daemon-host = { workspace = true }
 daemon-node = { workspace = true }
+daemon-models = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }

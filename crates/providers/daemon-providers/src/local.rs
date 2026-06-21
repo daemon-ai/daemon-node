@@ -21,11 +21,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use daemon_common::{SessionId, UsageDelta};
+use daemon_common::{ModelRef, ModelSource, SessionId, UsageDelta};
 use daemon_core::{
     Capabilities, Failure, ModelOutput, Provider, Request, RequestMsg, StreamEvent, ToolCallFormat,
 };
 use daemon_infer::protocol::{self, Command, Engine, Event, ModelParams, Sampling};
+use daemon_models::{ActiveModels, ModelManager};
 use daemon_provision::{
     ChildGuard, CutWriter, Placement, PlacementSpec, ProcessProvisioner, Provisioner,
 };
@@ -444,6 +445,139 @@ fn should_replace_worker(failure: &Failure) -> bool {
         failure,
         Failure::TransientTransport(_) | Failure::ProviderOverloaded(_) | Failure::Fatal(_)
     )
+}
+
+/// A [`Provider`] that resolves the profile's **active model** before each load and hot-swaps the
+/// underlying [`LocalProvider`] when the active model changes (the runtime `model_activate` seam).
+///
+/// `daemon-models`' [`ModelManager`] owns acquisition: this provider asks it to [`resolve`] the
+/// active [`ModelRef`] to a ready on-disk artifact (downloading + cataloging on first use), then
+/// builds a [`LocalProvider`] whose worker loads that path with the shared cache's offline env
+/// (`HF_HUB_OFFLINE=1` + `HF_HUB_CACHE`), so the engine never reaches the network. When no model is
+/// active for the profile it falls back to the `template`'s configured model string.
+///
+/// [`resolve`]: daemon_models::ModelManager::resolve
+pub struct SwitchableLocalProvider {
+    inner: Arc<SwitchInner>,
+}
+
+struct SwitchInner {
+    /// The base worker config (engine, params, env, timeouts); its `model` is the configured
+    /// fallback when no model is active.
+    template: WorkerConfig,
+    manager: Arc<ModelManager>,
+    active: ActiveModels,
+    profile: String,
+    capabilities: Capabilities,
+    /// The currently-built provider keyed by the active model (`None` key = the template fallback).
+    current: Mutex<Option<(Option<ModelRef>, Arc<LocalProvider>)>>,
+}
+
+impl SwitchableLocalProvider {
+    /// Build a switchable provider for `profile`, resolving its active model through `manager`.
+    pub fn new(
+        template: WorkerConfig,
+        manager: Arc<ModelManager>,
+        active: ActiveModels,
+        profile: impl Into<String>,
+    ) -> Self {
+        let capabilities = default_capabilities(&template);
+        Self {
+            inner: Arc::new(SwitchInner {
+                template,
+                manager,
+                active,
+                profile: profile.into(),
+                capabilities,
+                current: Mutex::new(None),
+            }),
+        }
+    }
+}
+
+impl SwitchInner {
+    /// Resolve the active model and return a [`LocalProvider`] loaded for it, (re)building only when
+    /// the active selection changed since the last call.
+    async fn provider(&self) -> Result<Arc<LocalProvider>, Failure> {
+        let want = self.active.get(&self.profile).await;
+        let mut cur = self.current.lock().await;
+        if let Some((have, provider)) = cur.as_ref() {
+            if *have == want {
+                return Ok(provider.clone());
+            }
+        }
+        let provider = match &want {
+            Some(model) => {
+                let artifact = self
+                    .manager
+                    .resolve(model)
+                    .await
+                    .map_err(|e| Failure::Fatal(format!("resolve model: {e}")))?;
+                let mut wc = self.template.clone();
+                wc.model = artifact.local_path.to_string_lossy().into_owned();
+                // The engine loads from the warmed cache offline (the daemon owns acquisition).
+                wc.env.extend(self.manager.cache().sidecar_env());
+                // mistral.rs quantizes in-engine (ISQ); when no level was configured, pick one that
+                // fits the detected hardware so an unquantized HF repo still runs out of the box.
+                if matches!(wc.engine, Engine::MistralRs) && wc.params.isq.is_none() {
+                    if let Some(isq) = self.recommended_isq(model).await {
+                        wc.params.isq = Some(isq);
+                    }
+                }
+                Arc::new(LocalProvider::new(wc))
+            }
+            // No active model: use the configured fallback model string as-is.
+            None => Arc::new(LocalProvider::new(self.template.clone())),
+        };
+        *cur = Some((want, provider.clone()));
+        Ok(provider)
+    }
+
+    /// Best-effort hardware-aware ISQ level for a mistral.rs HF model (`None` for local paths or on
+    /// any recommender miss — the worker then loads the repo as-is).
+    async fn recommended_isq(&self, model: &ModelRef) -> Option<String> {
+        let ModelSource::Hf { repo, revision, .. } = &model.source else {
+            return None;
+        };
+        self.manager
+            .recommend(repo, Some(revision), model.engine, None)
+            .await
+            .ok()
+            .map(|rec| rec.quant)
+    }
+}
+
+#[async_trait]
+impl Provider for SwitchableLocalProvider {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities
+    }
+
+    async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+        self.inner.provider().await?.chat(req).await
+    }
+
+    fn stream(&self, req: Request) -> BoxStream<'_, Result<StreamEvent, Failure>> {
+        let inner = self.inner.clone();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        tokio::spawn(async move {
+            let provider = match inner.provider().await {
+                Ok(p) => p,
+                Err(failure) => {
+                    let _ = tx.unbounded_send(Err(failure));
+                    return;
+                }
+            };
+            let mut stream = provider.stream(req);
+            use futures::StreamExt;
+            while let Some(item) = stream.next().await {
+                if tx.unbounded_send(item).is_err() {
+                    break;
+                }
+            }
+        });
+        Box::pin(rx)
+    }
 }
 
 /// The pre-load capabilities advertised for `cfg`, derived from the engine + configured context.

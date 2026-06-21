@@ -169,6 +169,119 @@ api-error = { "UnknownSession": tstr }
           / { "Conflict": tstr }
           / { "Other": tstr }
 
+; ----- model-management DTOs (daemon-common; the ModelApi sub-surface) -----
+model-id = tstr                       ; content-derived catalog handle
+download-id = uint                    ; numeric job handle (rendered "dl-N")
+model-engine = "Llama" / "MistralRs"
+
+model-source = { "Hf": { repo: tstr, file: (tstr / null), revision: tstr } }
+             / { "Local": { path: tstr } }
+
+model-ref = { engine: model-engine, source: model-source }
+
+search-sort = "Trending" / "Downloads" / "Likes" / "Modified" / "Created"
+
+search-query = {
+  text: tstr,
+  engine: model-engine,
+  sort: search-sort,
+  page: uint,
+  limit: uint,
+}
+
+search-hit = {
+  repo: tstr,
+  author: (tstr / null),
+  downloads: uint,
+  likes: uint,
+  num_parameters: (uint / null),
+  pipeline_tag: (tstr / null),
+  last_modified: (tstr / null),
+  gated: bool,
+  private: bool,
+}
+
+search-page = { page: uint, results: [* search-hit], has_more: bool }
+
+model-file = {
+  path: tstr,
+  size_bytes: uint,
+  quant: (tstr / null),
+  is_split: bool,
+  is_first_shard: bool,
+}
+
+download-state = "Queued" / "Downloading" / "Completed" / "Paused" / "Cancelled" / "Failed"
+
+download-status = {
+  id: download-id,
+  model: model-ref,
+  state: download-state,
+  downloaded_bytes: uint,
+  total_bytes: uint,
+  files_done: uint,
+  files_total: uint,
+  error: (tstr / null),
+}
+
+installed-model = {
+  id: model-id,
+  model: model-ref,
+  display_name: tstr,
+  local_path: tstr,
+  size_bytes: uint,
+  quant: (tstr / null),
+  installed_at_ms: uint,
+  ? arch: (tstr / null),
+  ? context_length: (uint / null),
+  ? file_type: (tstr / null),
+}
+
+; ----- recommend / quantize / inspect DTOs -----
+quantize-id = uint                    ; numeric job handle (rendered "qz-N")
+quantize-state = "Queued" / "Preparing" / "Quantizing" / "Completed" / "Failed"
+
+quant-candidate = {
+  quant: tstr,
+  file: (tstr / null),
+  size_bytes: (uint / null),
+  fits: bool,
+}
+
+quant-recommendation = {
+  engine: model-engine,
+  repo: tstr,
+  file: (tstr / null),
+  quant: tstr,
+  size_bytes: (uint / null),
+  budget_bytes: uint,
+  fits: bool,
+  reason: tstr,
+  candidates: [* quant-candidate],
+}
+
+quantize-status = {
+  id: quantize-id,
+  repo: tstr,
+  source_file: tstr,
+  target_quant: tstr,
+  state: quantize-state,
+  output_path: (tstr / null),
+  model_id: (model-id / null),
+  error: (tstr / null),
+}
+
+gguf-info = {
+  architecture: (tstr / null),
+  name: (tstr / null),
+  file_type: (tstr / null),
+  context_length: (uint / null),
+  block_count: (uint / null),
+  quantization_version: (uint / null),
+  parameter_count: (uint / null),
+  size_bytes: uint,
+}
+
 ; ----- the request/response mirror (1:1 with the interface methods) -----
 api-request = { "Submit": { session: session-id, command: agent-command } }
             / { "Poll": { session: session-id, max: uint } }
@@ -189,6 +302,21 @@ api-request = { "Submit": { session: session-id, command: agent-command } }
             / { "Resume": { unit: unit-id } }
             / { "Scale": { unit: unit-id, n: uint } }
             / "VerifyingKey"
+            ; ----- model management (ModelApi) -----
+            / { "ModelSearch": { query: search-query } }
+            / { "ModelFiles": { repo: tstr, revision: (tstr / null), engine: model-engine } }
+            / { "ModelDownload": { model: model-ref } }
+            / "ModelDownloads"
+            / { "ModelCancel": { id: download-id } }
+            / { "ModelPause": { id: download-id } }
+            / { "ModelResume": { id: download-id } }
+            / "ModelCatalog"
+            / { "ModelDelete": { id: model-id } }
+            / { "ModelActivate": { id: model-id, profile: (tstr / null) } }
+            / { "ModelRecommend": { repo: tstr, revision: (tstr / null), engine: model-engine, budget_bytes: (uint / null) } }
+            / { "ModelQuantize": { repo: tstr, revision: (tstr / null), target_quant: tstr, source_file: (tstr / null) } }
+            / "ModelQuantizes"
+            / { "ModelInspect": { id: model-id } }
 
 api-response = "Ok"
              / { "Drained": [* outbound] }
@@ -201,4 +329,13 @@ api-response = "Ok"
              / { "UnitEvents": [* manage-event-view] }
              / { "Journal": journal-page-view }
              / { "VerifyingKey": (tstr / null) }
+             / { "ModelSearch": search-page }
+             / { "ModelFiles": [* model-file] }
+             / { "ModelDownloadStarted": download-id }
+             / { "ModelDownloads": [* download-status] }
+             / { "ModelCatalog": [* installed-model] }
+             / { "ModelRecommend": quant-recommendation }
+             / { "ModelQuantizeStarted": quantize-id }
+             / { "ModelQuantizes": [* quantize-status] }
+             / { "ModelInspect": gguf-info }
              / { "Error": api-error }
