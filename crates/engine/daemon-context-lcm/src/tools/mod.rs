@@ -66,8 +66,16 @@ pub(crate) struct ToolCx<'a> {
     pub session_id: &'a str,
     /// The model-window-derived compaction threshold, if known (status/doctor).
     pub threshold_tokens: Option<usize>,
+    /// The model context window in tokens, if known (drives the preset suggestion).
+    pub context_length: Option<usize>,
     /// How many compactions have run this incarnation (status).
     pub compaction_count: u64,
+    /// Whether the session is ignored (no ingest/compaction) — §12.5.
+    pub session_ignored: bool,
+    /// Whether the session is stateless (read-only) — §12.5.
+    pub session_stateless: bool,
+    /// The process-lifetime ignored-message count (§12.5).
+    pub ignored_message_count: u64,
 }
 
 /// Dispatch one `lcm_*` tool by name, returning a JSON string (§10.7).
@@ -222,6 +230,9 @@ fn load_session(cx: &ToolCx<'_>, args: &Value) -> String {
 // ---- 10.3 lcm_describe --------------------------------------------------------------------------
 
 fn describe(cx: &ToolCx<'_>, args: &Value) -> String {
+    if let Some(reference) = args.get("externalized_ref").and_then(Value::as_str) {
+        return describe_externalized_ref(cx, reference);
+    }
     if let Some(node_id) = args.get("node_id").and_then(Value::as_i64) {
         return describe_node(cx, node_id);
     }
@@ -257,6 +268,30 @@ fn describe(cx: &ToolCx<'_>, args: &Value) -> String {
         "session_id": cx.session_id,
         "total_nodes": cx.store.summary_count(cx.session_id).unwrap_or(0),
         "depths": depths,
+    })
+    .to_string()
+}
+
+/// Metadata-only view of an externalized payload (§10.3) — never returns the raw bytes (use
+/// `lcm_expand(externalized_ref=…)` to recover content).
+fn describe_externalized_ref(cx: &ToolCx<'_>, reference: &str) -> String {
+    let Some(dir) = cx.config.externalization_dir() else {
+        return err("no externalization directory configured (ephemeral bank)");
+    };
+    let Some(record) = crate::externalize::read_payload_record(&dir, reference) else {
+        return err(&format!("externalized payload {reference} not found"));
+    };
+    json!({
+        "type": "externalized_payload",
+        "ref": reference,
+        "kind": record.get("kind"),
+        "field": record.get("field"),
+        "role": record.get("role"),
+        "tool_call_id": record.get("tool_call_id"),
+        "chars": record.get("chars"),
+        "bytes": record.get("bytes"),
+        "digest": record.get("digest"),
+        "created_at": record.get("created_at"),
     })
     .to_string()
 }
@@ -299,13 +334,47 @@ fn expand(cx: &ToolCx<'_>, args: &Value) -> String {
     let max_tokens = arg_u64(args, "max_tokens", 4000).max(1) as usize;
     let content_offset = arg_u64(args, "content_offset", 0) as usize;
 
+    if let Some(reference) = args.get("externalized_ref").and_then(Value::as_str) {
+        return expand_externalized_ref(cx, reference, max_tokens, content_offset);
+    }
     if let Some(store_id) = args.get("store_id").and_then(Value::as_i64) {
         return expand_store_id(cx, store_id, max_tokens, content_offset);
     }
     if let Some(node_id) = args.get("node_id").and_then(Value::as_i64) {
         return expand_node(cx, node_id, args, max_tokens, content_offset);
     }
-    err("exactly one of node_id or store_id is required")
+    err("exactly one of node_id, store_id, or externalized_ref is required")
+}
+
+/// Recover an externalized payload's bytes from disk by its `ref` (§9.1 / §10.4) — the read-back
+/// path for the storage guard / threshold externalization placeholders.
+fn expand_externalized_ref(
+    cx: &ToolCx<'_>,
+    reference: &str,
+    max_tokens: usize,
+    content_offset: usize,
+) -> String {
+    let Some(dir) = cx.config.externalization_dir() else {
+        return err("no externalization directory configured (ephemeral bank)");
+    };
+    let Some(full) = crate::externalize::read_externalized(&dir, reference) else {
+        return err(&format!("externalized payload {reference} not found"));
+    };
+    let sliced = slice_chars_from(&full, content_offset);
+    let (content, next_content_offset) = truncate_to_token_budget(cx.tokenizer, &sliced, max_tokens);
+    let consumed = content.chars().count();
+    json!({
+        "type": "externalized_payload",
+        "ref": reference,
+        "content": content,
+        "pagination": {
+            "content_offset": content_offset,
+            "next_content_offset": next_content_offset.map(|n| content_offset + n),
+            "has_more": next_content_offset.is_some(),
+            "returned_chars": consumed,
+        },
+    })
+    .to_string()
 }
 
 fn expand_store_id(
@@ -540,11 +609,40 @@ async fn expand_query(cx: &ToolCx<'_>, args: &Value) -> String {
 fn status(cx: &ToolCx<'_>) -> String {
     let counts = cx.store.table_counts().unwrap_or_default();
     let frontier = cx.store.get_frontier(cx.session_id).unwrap_or(0);
+    let preset_suggestion = cx
+        .context_length
+        .and_then(crate::presets::suggest_preset_for_engine)
+        .map(|p| {
+            json!({
+                "name": p.name,
+                "context_threshold": p.context_threshold,
+                "fresh_tail_count": p.fresh_tail_count,
+                "leaf_chunk_tokens": p.leaf_chunk_tokens,
+                "description": p.description,
+            })
+        });
     json!({
         "session_id": cx.session_id,
         "compaction_count": cx.compaction_count,
         "threshold_tokens": cx.threshold_tokens,
+        "context_length": cx.context_length,
         "frontier_store_id": frontier,
+        "preset_suggestion": preset_suggestion,
+        "filters": {
+            "session_ignored": cx.session_ignored,
+            "session_stateless": cx.session_stateless,
+            "ignored_message_count": cx.ignored_message_count,
+            "ignore_message_patterns": cx.config.ignore_message_patterns.len(),
+            "ignore_session_patterns": cx.config.ignore_session_patterns.len(),
+            "stateless_session_patterns": cx.config.stateless_session_patterns.len(),
+        },
+        "protection": {
+            "sensitive_patterns_enabled": cx.config.sensitive_patterns_enabled,
+            "large_output_externalization_enabled": cx.config.large_output_externalization_enabled,
+            "large_output_transcript_gc_enabled": cx.config.large_output_transcript_gc_enabled,
+            "extraction_enabled": cx.config.extraction_enabled,
+            "externalization_dir": cx.config.externalization_dir().map(|p| p.display().to_string()),
+        },
         "store": {
             "messages": counts.messages,
             "summary_nodes": counts.nodes,
@@ -603,13 +701,82 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         &format!("{orphans} orphaned child references"),
     );
 
+    // payload_storage — the externalization side channel (§9.1).
+    let (storage_ok, storage_detail) = payload_storage_check(cx);
+    push_check(
+        &mut checks,
+        &mut worst,
+        "payload_storage",
+        storage_ok,
+        Health::Warnings,
+        &storage_detail,
+    );
+
+    // sensitive_pattern_handling — the redaction catalog config (§8.1).
+    let (sens_ok, sens_detail) = sensitive_pattern_check(cx);
+    push_check(
+        &mut checks,
+        &mut worst,
+        "sensitive_pattern_handling",
+        sens_ok,
+        Health::Warnings,
+        &sens_detail,
+    );
+
     json!({
         "overall": worst.as_str(),
         "runtime_identity": {"session_id": cx.session_id, "bank": cx.config.bank},
         "checks": checks,
-        "skipped": ["ingest_protection", "sensitive_pattern_handling", "payload_storage"],
+        // Spec checks not yet ported (separate config knobs, not part of the M5/M7 acceptance).
+        "skipped": [
+            "schema_core_tables",
+            "sqlite_storage",
+            "summary_quality",
+            "config_validation",
+            "source_lineage_hygiene",
+            "lifecycle_fragmentation",
+            "context_pressure",
+        ],
     })
     .to_string()
+}
+
+/// `payload_storage` doctor check: the externalization directory is usable (metadata-only).
+fn payload_storage_check(cx: &ToolCx<'_>) -> (bool, String) {
+    match cx.config.externalization_dir() {
+        None => (true, "ephemeral bank: payloads kept inline (no externalization dir)".to_string()),
+        Some(dir) => {
+            if !dir.exists() {
+                (true, format!("not yet created: {}", dir.display()))
+            } else if dir.is_dir() {
+                let count = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+                (true, format!("{count} externalized payload(s) at {}", dir.display()))
+            } else {
+                (false, format!("externalization path is not a directory: {}", dir.display()))
+            }
+        }
+    }
+}
+
+/// `sensitive_pattern_handling` doctor check: the configured redaction catalog is valid.
+fn sensitive_pattern_check(cx: &ToolCx<'_>) -> (bool, String) {
+    if !cx.config.sensitive_patterns_enabled {
+        return (true, "disabled".to_string());
+    }
+    let unknown: Vec<&String> = cx
+        .config
+        .sensitive_patterns
+        .iter()
+        .filter(|n| !crate::protection::is_known_sensitive_pattern(n))
+        .collect();
+    if unknown.is_empty() {
+        (
+            true,
+            format!("enabled; {} catalog pattern(s)", cx.config.sensitive_patterns.len()),
+        )
+    } else {
+        (false, format!("enabled; unrecognized pattern names: {unknown:?}"))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

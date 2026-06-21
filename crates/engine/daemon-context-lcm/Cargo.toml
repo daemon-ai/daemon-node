@@ -21,6 +21,9 @@ tracing = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tiktoken-rs = "0.6"
 tokio = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

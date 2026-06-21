@@ -308,6 +308,35 @@ impl Store {
         Ok(())
     }
 
+    /// Rewrite a single message's `content` in place, preserving its `store_id` (the FTS update
+    /// trigger keeps the shadow in sync). The §9.1 transcript-GC path — the one path that mutates a
+    /// `messages` row after insert.
+    pub fn update_message_content(&self, store_id: i64, content: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        conn.execute(
+            "UPDATE messages SET content = ?2 WHERE store_id = ?1",
+            params![store_id, content],
+        )?;
+        Ok(())
+    }
+
+    /// Transcript-GC candidates (§9.1): summarized rows (`store_id <= max_store_id`) that still carry
+    /// an *un-GC'd* externalized-payload placeholder inline, for `gc_externalized_tool_result`.
+    pub fn messages_to_gc(&self, session_id: &str, max_store_id: i64) -> Result<Vec<MessageRow>> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT store_id, session_id, source, role, content, tool_call_id, tool_calls, \
+             tool_name, timestamp, token_estimate FROM messages \
+             WHERE session_id = ?1 AND store_id <= ?2 \
+             AND content LIKE '%Externalized %' AND content NOT LIKE '%GC''d externalized%' \
+             ORDER BY store_id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, max_store_id], map_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// All messages for `session_id`, oldest first.
     pub fn session_messages(&self, session_id: &str) -> Result<Vec<MessageRow>> {
         let conn = self.conn.lock().expect("lcm store poisoned");

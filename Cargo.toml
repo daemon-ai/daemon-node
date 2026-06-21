@@ -41,8 +41,13 @@ wiremock = "0.6"
 # Hugging Face Hub client for model acquisition into the shared cache (async tokio API + rustls).
 # Same crate (and cache layout) mistral.rs uses, so a warmed cache is read by the mistralrs engine.
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
-# content hashing for stable model-catalog ids.
+# content hashing for stable model-catalog ids and LCM sensitive-redaction / externalization digests.
 sha2 = "0.10"
+# LCM ingest-protection + message/session filters: sensitive-pattern catalog, base64/data-URI guard,
+# externalized-payload reference parsing, and message/session glob compilation.
+regex = "1"
+# LCM externalization: base64 decode of stored payload bodies on read-back.
+base64 = "0.22"
 # system memory probe for the hardware-aware quant recommender (RAM budget; VRAM is best-effort via
 # nvidia-smi, no GPU SDK link). default-features off keeps it to the system-info we use.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
