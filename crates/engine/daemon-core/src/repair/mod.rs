@@ -1,8 +1,10 @@
 //! Output/tool repair (§9) — run **once at the decode boundary**.
 //!
-//! A typed [`Conversation`](crate::conversation) means the engine never re-parses its own history
-//! (hermes' preflight conversation sanitizer is unnecessary here). What *does* need repair is the
-//! freshly decoded model output, which is the most adversarial input in the loop: providers emit
+//! A typed [`Conversation`](crate::conversation) means the engine never re-parses its own history,
+//! so most of hermes' preflight conversation sanitizer is unnecessary here — except at the *flatten
+//! boundary*, where Turn-granular compaction can still produce a wire sequence that violates a
+//! provider's structural contract; [`message_sequence`] is that narrow safety net. What *also* needs
+//! repair is the freshly decoded model output, which is the most adversarial input in the loop: providers emit
 //! truncated/loosely-quoted tool-call JSON, slightly-wrong tool names, leaked `<think>` spans in the
 //! content channel, and tool errors carrying control bytes / untrusted instructions.
 //!
@@ -18,11 +20,13 @@
 //!   it as data, not instructions.
 
 pub mod content;
+pub mod message_sequence;
 pub mod tool_arg;
 pub mod tool_error;
 pub mod tool_name;
 
 pub use content::{scrub_content, ScrubChunk, StreamingThinkScrubber};
+pub use message_sequence::repair_message_sequence;
 pub use tool_arg::{repair_tool_args, ArgRepair};
 pub use tool_error::{sanitize_tool_error, wrap_untrusted_tool_result};
 pub use tool_name::{repair_tool_name, NameRepairError};

@@ -64,6 +64,12 @@ pub trait CredentialBroker: Send + Sync {
         requester: Option<UnitId>,
         lease: &CapabilityLease,
     ) -> Result<LeaseSecret, CredError>;
+
+    /// Signal a rotatable failure for `cap_id` (quota/auth) so the owning authority's pooled source
+    /// prefers a different key on the next acquire. Owner-local by default: relays and the wire
+    /// client no-op (cross-cut rotation propagation is a later refinement), and a single-key source
+    /// no-ops too. This backs the engine's `Recovery::Rotate` hop.
+    async fn rotate(&self, _requester: Option<UnitId>, _profile: &ProfileRef, _cap_id: &CredId) {}
 }
 
 /// The owner endpoint: serves brokered calls directly against the authority it holds.
@@ -121,6 +127,13 @@ impl CredentialBroker for OwnerBroker {
         self.fence_ok()?;
         let ctx = AcquireCtx::new(requester, current_trace());
         self.authority.use_capability(&ctx, lease)
+    }
+
+    async fn rotate(&self, _requester: Option<UnitId>, _profile: &ProfileRef, cap_id: &CredId) {
+        // A superseded incarnation must not mutate pool state; otherwise rotate the owned source.
+        if self.fence_ok().is_ok() {
+            self.authority.rotate(cap_id);
+        }
     }
 }
 
@@ -221,5 +234,9 @@ impl CredentialProvider for BrokeredCredentialProvider {
 
     async fn release(&self, _lease: &CapabilityLease) {}
 
-    async fn rotate(&self, _profile: &ProfileRef, _cap_id: &CredId) {}
+    async fn rotate(&self, profile: &ProfileRef, cap_id: &CredId) {
+        self.broker
+            .rotate(self.requester.clone(), profile, cap_id)
+            .await;
+    }
 }

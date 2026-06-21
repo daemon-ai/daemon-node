@@ -59,6 +59,9 @@ pub struct EngineProfile {
     registry: Arc<ToolRegistry>,
     system: SystemPrompt,
     credentials: Option<(CredentialBuilder, ProfileRef)>,
+    /// The credential profile to fall back to when the primary credential profile is exhausted
+    /// (the `Recovery::Fallback` hop). `None` => no fallback (a single-profile engine).
+    fallback_profile: Option<ProfileRef>,
     budget: Budget,
     config: Config,
     exec: Option<ExecEnvBuilder>,
@@ -82,6 +85,7 @@ impl EngineProfile {
             registry,
             system,
             credentials: None,
+            fallback_profile: None,
             budget: Budget::unlimited(),
             config: Config::default(),
             exec: None,
@@ -97,6 +101,15 @@ impl EngineProfile {
     /// and fleet-child paths).
     pub fn with_credentials(mut self, credentials: CredentialBuilder, profile: ProfileRef) -> Self {
         self.credentials = Some((credentials, profile));
+        self
+    }
+
+    /// Set the credential profile every engine this profile builds falls back to when its primary
+    /// credential profile is exhausted (the engine's `Recovery::Fallback` hop). The fallback uses
+    /// the same provider client/broker, only re-keying the acquired capability — so it composes a
+    /// cross-credential failover chain on top of the per-profile multi-key pool.
+    pub fn with_fallback_profile(mut self, profile: ProfileRef) -> Self {
+        self.fallback_profile = Some(profile);
         self
     }
 
@@ -165,6 +178,9 @@ impl EngineProfile {
     fn dress(&self, mut engine: Engine) -> Engine {
         if let Some((build, profile)) = &self.credentials {
             engine = engine.with_credentials(build(), profile.clone());
+        }
+        if let Some(fallback) = &self.fallback_profile {
+            engine = engine.with_fallback_profile(fallback.clone());
         }
         if let Some(build) = &self.exec {
             let exec = build(&engine.snapshot().session_id);

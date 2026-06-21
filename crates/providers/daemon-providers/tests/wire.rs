@@ -26,6 +26,7 @@ fn req() -> Request {
         }],
         auth: Some("sk-test".into()),
         constraint: None,
+        cache_system: false,
     }
 }
 
@@ -223,4 +224,108 @@ async fn anthropic_chat_decodes_text_thinking_and_tool_use() {
     assert_eq!(out.tool_calls.len(), 1);
     assert_eq!(out.tool_calls[0].name, "read_file");
     assert_eq!(out.usage.output_tokens, 9);
+}
+
+/// With a price sheet attached, decoded usage carries an estimated `cost_micros` derived from the
+/// token breakdown (fresh input + cache read/write + output), so cost flows through the usage stream.
+#[tokio::test]
+async fn anthropic_chat_computes_cost_from_pricing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_c", "type": "message", "role": "assistant", "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok"}],
+            // input_tokens excludes cache; genai's Anthropic adapter normalizes prompt_tokens to
+            // include cache_creation + cache_read, so prompt_tokens = 1000 + 2000 + 5000 = 8000.
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_creation_input_tokens": 2000,
+                "cache_read_input_tokens": 5000
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    // $3 / $15 per Mtok (cache read 0.1x, write 1.25x).
+    let provider = GenAiProvider::anthropic("claude-test")
+        .with_endpoint(endpoint(&server))
+        .with_pricing(daemon_common::Pricing::from_io(3_000_000, 15_000_000));
+    let out = provider.chat(req()).await.expect("chat succeeds");
+
+    // prompt_tokens=8000, cache_read=5000, cache_write=2000 => fresh input = 1000.
+    // fresh 1000 * 3.0 = 3_000; read 5000 * 0.3 = 1_500; write 2000 * 3.75 = 7_500; out 500 * 15 = 7_500.
+    assert_eq!(out.usage.input_tokens, 8000);
+    assert_eq!(out.usage.cache_read_tokens, 5000);
+    assert_eq!(out.usage.cache_write_tokens, 2000);
+    assert_eq!(out.usage.cost_micros, 3_000 + 1_500 + 7_500 + 7_500);
+}
+
+/// Without a price sheet, `cost_micros` stays unset (0) — cost is simply not computed.
+#[tokio::test]
+async fn anthropic_chat_without_pricing_leaves_cost_zero() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_d", "type": "message", "role": "assistant", "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1000, "output_tokens": 500}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GenAiProvider::anthropic("claude-test").with_endpoint(endpoint(&server));
+    let out = provider.chat(req()).await.expect("chat succeeds");
+    assert_eq!(out.usage.cost_micros, 0);
+}
+
+/// The engine's cache-policy markers (`cache_system` + a last-message breakpoint) serialize onto the
+/// Anthropic wire request as `cache_control` blocks on the system prefix and the marked message.
+#[tokio::test]
+async fn anthropic_cache_breakpoints_serialize_to_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_2", "type": "message", "role": "assistant", "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let mut request = req();
+    request.cache_system = true;
+    request.messages.last_mut().unwrap().cache_breakpoint = true;
+
+    let provider = GenAiProvider::anthropic("claude-test").with_endpoint(endpoint(&server));
+    provider.chat(request).await.expect("chat succeeds");
+
+    let received = server.received_requests().await.expect("captured requests");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+
+    // System is sent as a structured array carrying a cache_control breakpoint (not a plain string).
+    let system = &body["system"];
+    assert!(
+        system.is_array(),
+        "cached system should be a structured block array, got {system}"
+    );
+    assert!(
+        system
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.get("cache_control").is_some()),
+        "system prefix should carry a cache_control breakpoint: {system}"
+    );
+
+    // The last user message carries a content-part cache_control breakpoint.
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let has_cc = last["content"]
+        .as_array()
+        .map(|parts| parts.iter().any(|p| p.get("cache_control").is_some()))
+        .unwrap_or(false);
+    assert!(has_cc, "last message should carry a cache_control block: {last}");
 }

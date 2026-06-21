@@ -144,17 +144,22 @@ Each step lists what works and what blocks it today.
   (`hermes-agent/acp_adapter/server.py:1989`); multi-source key resolution in
   `hermes-agent/agent/anthropic_adapter.py:1162-1203`.
 - **Daemon:**
-  - Model id is a free-form config string and Anthropic is wired, so Opus *works once passed* —
-    `ProviderKind::Anthropic` and default `claude-3-5-sonnet-latest`
-    ([bins/daemon/src/config.rs](../../bins/daemon/src/config.rs):631-633);
-    `GenAiProvider::anthropic`
-    ([crates/providers/daemon-providers/src/genai_provider.rs](../../crates/providers/daemon-providers/src/genai_provider.rs):67-70).
-  - **Dynamic discovery: MISSING.** `ModelApi` is HF/local-GGUF only
-    ([crates/providers/daemon-models/src/lib.rs](../../crates/providers/daemon-models/src/lib.rs):1-9);
-    `GenAiProvider` holds a fixed `model` and exposes no list-models
-    ([crates/providers/daemon-providers/src/genai_provider.rs](../../crates/providers/daemon-providers/src/genai_provider.rs):30-31,294-301);
-    the `Provider` trait has no catalog method
-    ([crates/engine/daemon-core/src/provider.rs](../../crates/engine/daemon-core/src/provider.rs):252-268).
+  - Model id is a free-form config string; the provider is no longer enumerated daemon-side. The
+    wire selector collapsed to `mock | genai | llama_cpp | mistral_rs` (`ProviderSelector`,
+    [crates/contracts/daemon-api/src/profile.rs](../../crates/contracts/daemon-api/src/profile.rs)),
+    and `genai` infers the adapter (Anthropic/OpenAI/Gemini/Groq/…) from the model id, so
+    `claude-opus-4-8` *just works* — `GenAiProvider::for_model`
+    ([crates/providers/daemon-providers/src/genai_provider.rs](../../crates/providers/daemon-providers/src/genai_provider.rs)).
+    Legacy per-provider profile names (`anthropic`, `openai`, …) deserialize to `genai` via serde
+    aliases (wire `v3`).
+  - **Dynamic discovery: DONE (genai-native).** `ModelApi::models()` lists networked models live
+    from `genai::Client::all_model_names` for every adapter whose key resolves
+    (`daemon_providers::genai_listed_models`, namespaced ids), injected into the provider-agnostic
+    host via the `CloudCatalog` hook
+    ([crates/substrate/daemon-host/src/node_api.rs](../../crates/substrate/daemon-host/src/node_api.rs)),
+    with the static catalog as the no-key fallback + pricing/context overlay
+    ([crates/contracts/daemon-api/src/profile.rs](../../crates/contracts/daemon-api/src/profile.rs));
+    local GGUF models still merge from the `ModelManager` catalog.
   - **Key injection: PARTIAL.** The credential lease feeds `Request.auth`
     ([crates/engine/daemon-core/src/engine.rs](../../crates/engine/daemon-core/src/engine.rs):357-365),
     but the host source is `StubCredentialSource`

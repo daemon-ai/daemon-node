@@ -36,6 +36,8 @@ enum Command {
     Health,
     /// Durable queue depths and session/active counts.
     Stats,
+    /// Telemetry dump: folded usage/cost + event count + health + queue depths.
+    Telemetry,
     /// List durable sessions and their states.
     Sessions,
     /// Create-if-absent and wake a durable session.
@@ -513,6 +515,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Health => render(client.call(ApiRequest::Health).await?),
         Command::Stats => render(client.call(ApiRequest::Stats).await?),
+        Command::Telemetry => render(client.call(ApiRequest::Telemetry).await?),
         Command::Sessions => render(client.call(ApiRequest::Sessions).await?),
         Command::Assign { id } => render(
             client
@@ -634,8 +637,33 @@ fn render(resp: ApiResponse) {
             }
         }
         ApiResponse::Stats(s) => println!(
-            "stats: jobs={} wakes={} sessions={} active={}",
-            s.pending_jobs, s.pending_wakes, s.sessions, s.active
+            "stats: jobs={} wakes={} sessions={} active={} usage(in={} out={} cache_r={} cache_w={} reason={} cost=${:.4})",
+            s.pending_jobs,
+            s.pending_wakes,
+            s.sessions,
+            s.active,
+            s.usage.input_tokens,
+            s.usage.output_tokens,
+            s.usage.cache_read_tokens,
+            s.usage.cache_write_tokens,
+            s.usage.reasoning_tokens,
+            s.usage.cost_micros as f64 / 1_000_000.0,
+        ),
+        ApiResponse::Telemetry(d) => println!(
+            "telemetry: healthy={} events={} jobs={} wakes={} sessions={} active={} usage(in={} out={} cache_r={} cache_w={} reason={} api_calls={} cost=${:.4})",
+            d.healthy,
+            d.events,
+            d.pending_jobs,
+            d.pending_wakes,
+            d.sessions,
+            d.active,
+            d.usage.input_tokens,
+            d.usage.output_tokens,
+            d.usage.cache_read_tokens,
+            d.usage.cache_write_tokens,
+            d.usage.reasoning_tokens,
+            d.usage.api_calls,
+            d.usage.cost_micros as f64 / 1_000_000.0,
         ),
         ApiResponse::Sessions(list) => {
             println!("sessions: {}", list.len());

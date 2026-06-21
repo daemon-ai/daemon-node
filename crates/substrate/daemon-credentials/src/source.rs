@@ -28,6 +28,10 @@ pub trait CredentialSource: Send + Sync {
     fn provision(&self, cap_id: &CredId, mode: CredMode) -> Result<Provisioned, CredError>;
     /// Revoke a previously-provisioned fresh credential (no-op where unsupported).
     fn revoke(&self, cap_id: &CredId);
+    /// Signal that the credential behind `cap_id` failed in a rotatable way (quota/auth): a
+    /// multi-key (pooled) source marks the underlying key exhausted so the next `provision` prefers
+    /// another. Single-key sources cannot rotate — default no-op.
+    fn rotate(&self, _cap_id: &CredId) {}
 }
 
 /// A stub source over a single configured key, optionally able to "mint" fresh per-grant keys.

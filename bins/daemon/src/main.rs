@@ -29,12 +29,13 @@ use daemon_core::{
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
-    CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit, FileCredentialStore,
-    FileProfileStore, HostConfig, JournalFeeder, JournalSink, MemCredentialStore, MemProfileStore,
-    OwnerBroker, ProfileStore, StoreCredentialSource,
+    CloudCatalog, CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit,
+    FileCredentialStore, FileProfileStore, HostConfig, JournalFeeder, JournalSink,
+    MemCredentialStore, MemProfileStore, OwnerBroker, PooledStoreCredentialSource, ProfileStore,
 };
 use daemon_api::{
-    BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ProfileSpec, ProviderSelector,
+    BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileSpec,
+    ProviderSelector,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_metta::protocol::Bounds as MettaBounds;
@@ -50,7 +51,8 @@ use daemon_tool_web::{
 use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly, ProviderResolver};
 use daemon_providers::{
-    GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider, WorkerConfig,
+    genai_listed_models, GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider,
+    WorkerConfig,
 };
 use daemon_provision::CutChannel;
 use daemon_store::{InMemoryStore, SessionStore};
@@ -88,6 +90,54 @@ async fn main() -> anyhow::Result<()> {
 /// (a completing default plus the delegating-orchestrator / completing-child demo profiles); a real
 /// provider becomes the registry default for every profile (the engine threads the credential lease
 /// secret onto each request as the bearer).
+/// The price sheet for a cloud `model`, looked up in the built-in catalog (the static fallback that
+/// also backs the GUI model picker). `None` for an unknown / local model — cost is then left
+/// uncomputed (`cost_micros == 0`). Cache read/write rates are derived from the base input rate.
+fn pricing_for(model: &str) -> Option<daemon_common::Pricing> {
+    ModelDescriptor::builtin_cloud_catalog()
+        .into_iter()
+        .find(|m| m.id == model)
+        .and_then(|m| match (m.input_price_micros_per_mtok, m.output_price_micros_per_mtok) {
+            (Some(input), Some(output)) => Some(daemon_common::Pricing::from_io(input, output)),
+            _ => None,
+        })
+}
+
+/// The binary's live networked-model discovery hook (the `daemon-host` is provider-agnostic and
+/// never links `genai`). Asks `genai` for the models of every adapter whose key resolves, unions
+/// them with the static catalog (which also carries the pricing/context overlay), and namespaces
+/// live ids so they round-trip through adapter inference.
+struct GenAiCloudCatalog;
+
+#[async_trait::async_trait]
+impl CloudCatalog for GenAiCloudCatalog {
+    async fn list(&self) -> Vec<ModelDescriptor> {
+        // Start from the static catalog: the pricing/context overlay + the no-key fallback list.
+        let mut out = ModelDescriptor::builtin_cloud_catalog();
+        let mut seen: std::collections::HashSet<String> =
+            out.iter().map(|m| m.id.clone()).collect();
+        // Overlay pricing/context for any live id that the static table also knows (by id).
+        let overlay = ModelDescriptor::builtin_cloud_catalog();
+        for id in genai_listed_models().await {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let known = overlay.iter().find(|m| m.id == id);
+            out.push(ModelDescriptor {
+                context_length: known
+                    .and_then(|m| m.context_length)
+                    .or_else(|| ModelDescriptor::known_context_length(&id)),
+                input_price_micros_per_mtok: known.and_then(|m| m.input_price_micros_per_mtok),
+                output_price_micros_per_mtok: known.and_then(|m| m.output_price_micros_per_mtok),
+                id,
+                provider: ProviderSelector::GenAi,
+                local: false,
+            });
+        }
+        out
+    }
+}
+
 fn build_providers(
     cfg: &NodeConfig,
     manager: &Arc<ModelManager>,
@@ -111,22 +161,17 @@ fn build_providers(
                 Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
             );
         }
-        ProviderKind::OpenAi => {
+        ProviderKind::GenAi => {
+            // One genai-backed default; the adapter is inferred from the model name (`for_model`).
             let (base, model) = (cfg.base_url.clone(), cfg.model.clone());
+            let pricing = pricing_for(&model);
             providers.set_default(Arc::new(move || {
-                let mut p = GenAiProvider::openai(model.clone());
+                let mut p = GenAiProvider::for_model(model.clone());
                 if let Some(base) = &base {
                     p = p.with_endpoint(base.clone());
                 }
-                Arc::new(p) as Arc<dyn Provider>
-            }));
-        }
-        ProviderKind::Anthropic => {
-            let (base, model) = (cfg.base_url.clone(), cfg.model.clone());
-            providers.set_default(Arc::new(move || {
-                let mut p = GenAiProvider::anthropic(model.clone());
-                if let Some(base) = &base {
-                    p = p.with_endpoint(base.clone());
+                if let Some(pricing) = pricing {
+                    p = p.with_pricing(pricing);
                 }
                 Arc::new(p) as Arc<dyn Provider>
             }));
@@ -172,22 +217,17 @@ fn provider_builder_for(
         ProviderSelector::Mock => {
             Arc::new(|| Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>)
         }
-        ProviderSelector::Openai => {
+        // The single genai-backed path; the adapter is inferred from the model name (`for_model`).
+        ProviderSelector::GenAi => {
             let (base, model) = (spec.base_url.clone(), spec.model.clone());
+            let pricing = pricing_for(&model);
             Arc::new(move || {
-                let mut p = GenAiProvider::openai(model.clone());
+                let mut p = GenAiProvider::for_model(model.clone());
                 if let Some(base) = &base {
                     p = p.with_endpoint(base.clone());
                 }
-                Arc::new(p) as Arc<dyn Provider>
-            })
-        }
-        ProviderSelector::Anthropic => {
-            let (base, model) = (spec.base_url.clone(), spec.model.clone());
-            Arc::new(move || {
-                let mut p = GenAiProvider::anthropic(model.clone());
-                if let Some(base) = &base {
-                    p = p.with_endpoint(base.clone());
+                if let Some(pricing) = pricing {
+                    p = p.with_pricing(pricing);
                 }
                 Arc::new(p) as Arc<dyn Provider>
             })
@@ -214,8 +254,7 @@ fn provider_builder_for(
 fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
     let provider = match cfg.provider_kind {
         ProviderKind::Mock => ProviderSelector::Mock,
-        ProviderKind::OpenAi => ProviderSelector::Openai,
-        ProviderKind::Anthropic => ProviderSelector::Anthropic,
+        ProviderKind::GenAi => ProviderSelector::GenAi,
         ProviderKind::LlamaCpp => ProviderSelector::LlamaCpp,
         ProviderKind::MistralRs => ProviderSelector::MistralRs,
     };
@@ -245,6 +284,7 @@ fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
         context_engine,
         memory_provider,
         credential_ref: None,
+        fallback_credential_ref: None,
     }
 }
 
@@ -1059,6 +1099,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         profiles: Some(profile_store),
         provider_resolver: Some(provider_resolver),
         credential_store: Some(credential_store),
+        cloud_catalog: Some(Arc::new(GenAiCloudCatalog)),
     });
     tracing::info!("daemon host node started");
 
@@ -1107,7 +1148,9 @@ fn build_owner_broker(
     store: Arc<dyn CredentialStore>,
 ) -> Arc<dyn CredentialBroker> {
     let signer = Arc::new(CapabilitySigner::generate());
-    let source = Arc::new(StoreCredentialSource::new(store, profile, fallback_key));
+    // The pooled source selects/rotates among the profile's key pool (multi-key) on a rotatable
+    // failure, falling back to the launch-configured key when the pool is empty.
+    let source = Arc::new(PooledStoreCredentialSource::new(store, profile, fallback_key));
     let scope = CredScope::new([profile], ["chat", "embed"], Some(1_000));
     let authority = Arc::new(CredentialAuthority::new(
         scope,

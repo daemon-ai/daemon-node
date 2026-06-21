@@ -335,6 +335,17 @@ engine shape, provider selection, brokered credentials, and engine tunables (`da
 `daemon-node` sits *above* `daemon-host` because the fleet + orchestrate-tool glue is composition
 policy; `daemon-host` itself stays free of `daemon-orchestration`.
 
+> **Provider selection is genai-native (wire v3).** The host keeps **no** cloud-provider registry:
+> the `ProviderSelector` is just `mock | genai | llama_cpp | mistral_rs`, and for `genai` the adapter
+> (Anthropic/OpenAI/Gemini/Groq/DeepSeek/xAI/OpenRouter/Cohere/…) is *inferred from the model id* by
+> `genai` (`GenAiProvider::for_model`), with namespaced ids (`groq::…`) forcing the adapter. Live
+> model listing for the GUI picker (`ModelApi::models()`) is delegated to
+> `genai::Client::all_model_names` for every adapter whose key resolves, injected into the
+> provider-agnostic host through the `CloudCatalog` hook (the binary owns `genai`; the host never
+> links it) with a static catalog as the no-key fallback + the pricing/context overlay. Local GGUF
+> models continue to come from the `ModelManager` catalog. Legacy per-provider profile names migrate
+> to `genai` via serde aliases.
+
 **One-lifecycle-owner invariant.** The durable and live lifecycles are intentionally distinct: a
 durable session runs its engine dormant-between-turns through the activation seam (control surface,
 `assign`), while a live session keeps it resident in the §17 actor (session surface, `submit`). A

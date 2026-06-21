@@ -1680,6 +1680,7 @@ mod node_interface {
             profiles: None,
             provider_resolver: None,
             credential_store: None,
+            cloud_catalog: None,
         })
     }
 
@@ -1746,6 +1747,7 @@ mod node_interface {
             profiles: Some(Arc::new(MemProfileStore::new())),
             provider_resolver: Some(resolver),
             credential_store: Some(Arc::new(MemCredentialStore::new())),
+            cloud_catalog: None,
         });
         (node, handle)
     }
@@ -2410,9 +2412,10 @@ mod node_interface {
             other => panic!("expected Credentials, got {other:?}"),
         }
 
-        // 2. Create the anthropic/claude-opus-4-8 profile and make it the active default.
+        // 2. Create the genai/claude-opus-4-8 profile and make it the active default (the genai
+        // adapter is inferred from the model id — the daemon keeps no per-provider selector).
         let spec = {
-            let mut s = ProfileSpec::new("opus", ProviderSelector::Anthropic, "claude-opus-4-8");
+            let mut s = ProfileSpec::new("opus", ProviderSelector::GenAi, "claude-opus-4-8");
             s.system_prompt = "You are Opus.".into();
             s
         };
@@ -2434,7 +2437,7 @@ mod node_interface {
             ApiResponse::Profiles(list) => {
                 let opus = list.iter().find(|p| p.id == "opus").expect("opus profile");
                 assert!(opus.is_active, "opus should be the active default");
-                assert_eq!(opus.provider, ProviderSelector::Anthropic);
+                assert_eq!(opus.provider, ProviderSelector::GenAi);
             }
             other => panic!("expected Profiles, got {other:?}"),
         }
@@ -2446,7 +2449,7 @@ mod node_interface {
                     .iter()
                     .find(|m| m.id == "claude-opus-4-8")
                     .expect("claude-opus-4-8 in the catalog");
-                assert_eq!(opus.provider, ProviderSelector::Anthropic);
+                assert_eq!(opus.provider, ProviderSelector::GenAi);
                 assert_eq!(opus.context_length, Some(200_000));
             }
             other => panic!("expected Models, got {other:?}"),
@@ -2678,6 +2681,7 @@ mod node_interface {
             profiles: None,
             provider_resolver: None,
             credential_store: None,
+            cloud_catalog: None,
         })
     }
 
@@ -3253,6 +3257,58 @@ mod store_backends {
     #[tokio::test]
     async fn sqlite_backend_acceptance() {
         run_suite(|| Arc::new(SqliteStore::open_in_memory().expect("open sqlite"))).await;
+    }
+
+    /// Both backends round-trip the full enriched `UsageDelta` (cache/reasoning/cost) additively and
+    /// answer full-text session search identically — the P1 persistence surface (token columns + FTS).
+    async fn usage_and_search_suite<S: SessionStore>(store: Arc<S>) {
+        use daemon_common::UsageDelta;
+
+        let s = SessionId::new("acct");
+        let delta = UsageDelta {
+            input_tokens: 100,
+            output_tokens: 40,
+            api_calls: 1,
+            cache_read_tokens: 60,
+            cache_write_tokens: 20,
+            reasoning_tokens: 10,
+            cost_micros: 1234,
+        };
+        store.record_usage(&s, delta).await;
+        store.record_usage(&s, delta).await;
+        let total = store.usage_of(&s).await;
+        assert_eq!(total.input_tokens, 200);
+        assert_eq!(total.cache_read_tokens, 120);
+        assert_eq!(total.cache_write_tokens, 40);
+        assert_eq!(total.reasoning_tokens, 20);
+        assert_eq!(total.cost_micros, 2468);
+
+        store
+            .index_session_text(&s, Some("Parser work".into()), "refactored the parser pipeline today")
+            .await;
+        store
+            .index_session_text(
+                &SessionId::new("other"),
+                Some("Renderer".into()),
+                "fixed a crash in the gpu renderer",
+            )
+            .await;
+
+        let hits = store.search_sessions("parser", 10).await;
+        assert_eq!(hits.len(), 1, "exactly one session mentions the parser");
+        assert_eq!(hits[0].session_id, s);
+        assert!(hits[0].snippet.to_lowercase().contains("parser"));
+        assert!(store.search_sessions("nonexistent-term", 10).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_usage_and_search() {
+        usage_and_search_suite(Arc::new(InMemoryStore::new())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_and_search() {
+        usage_and_search_suite(Arc::new(SqliteStore::open_in_memory().expect("open sqlite"))).await;
     }
 
     #[tokio::test]

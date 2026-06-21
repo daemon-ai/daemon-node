@@ -18,7 +18,7 @@
 mod genai_provider;
 mod local;
 
-pub use genai_provider::{GenAiEmbedder, GenAiProvider};
+pub use genai_provider::{genai_listed_models, GenAiEmbedder, GenAiProvider};
 pub use local::{LocalEmbedder, LocalProvider, SwitchableLocalProvider, WorkerConfig};
 
 use daemon_common::UsageDelta;

@@ -196,6 +196,49 @@ pub struct StoreStats {
     pub sessions: usize,
 }
 
+/// One hit from [`SessionStore::search_sessions`]: the matching session, its indexed title, and a
+/// highlighted snippet of the matching body text (matched terms wrapped in `[`…`]`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    /// The session that matched.
+    pub session_id: SessionId,
+    /// The session's indexed title (empty when none was indexed).
+    pub title: String,
+    /// A highlighted excerpt of the matching body text.
+    pub snippet: String,
+}
+
+/// Build a highlighted excerpt of `body` around the first occurrence of `needle` (lowercased), with
+/// the match wrapped in `[`…`]` and `…` elision — the in-memory analogue of SQLite FTS5 `snippet()`.
+fn snippet_around(body: &str, needle: &str) -> String {
+    let lower = body.to_lowercase();
+    let Some(pos) = lower.find(needle) else {
+        return body.chars().take(64).collect();
+    };
+    const PAD: usize = 24;
+    let start = body[..pos].char_indices().rev().nth(PAD).map(|(i, _)| i).unwrap_or(0);
+    let match_end = pos + needle.len();
+    let tail_len = body[match_end..]
+        .char_indices()
+        .nth(PAD)
+        .map(|(i, _)| i)
+        .unwrap_or(body.len() - match_end);
+    let end = match_end + tail_len;
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&body[start..pos]);
+    out.push('[');
+    out.push_str(&body[pos..match_end]);
+    out.push(']');
+    out.push_str(&body[match_end..end]);
+    if end < body.len() {
+        out.push('…');
+    }
+    out
+}
+
 /// One durable, append-only journal entry, keyed `(stream, segment, seq)`.
 ///
 /// The store sees only opaque bytes — a deterministically-encoded (dCBOR) Gordian Envelope built by
@@ -358,6 +401,20 @@ pub trait SessionStore: Send + Sync {
         UsageDelta::default()
     }
 
+    /// Index (or re-index) searchable text for a session — an optional `title` plus a `body` blob
+    /// (e.g. coalesced turn text / a generated recap) — feeding the durable full-text session search
+    /// surface. The store is handed already-extracted text by the host; it never parses snapshots,
+    /// so this stays protocol-free. Replaces any prior index row for the session. Default: no-op (a
+    /// backend without a text index).
+    async fn index_session_text(&self, _id: &SessionId, _title: Option<String>, _body: &str) {}
+
+    /// Full-text search over the indexed session text, most-relevant first, capped at `limit`
+    /// (`0` => a sensible default). Returns per-session hits with a highlighted snippet. Default:
+    /// empty (a backend without a text index).
+    async fn search_sessions(&self, _query: &str, _limit: u32) -> Vec<SessionSearchHit> {
+        Vec::new()
+    }
+
     /// Scan for sessions in a resumable (`Ready`/`Active`) state for the recovery scanner
     /// (lifecycle §5; invariant #7).
     async fn scan_resumable(&self, partition: PartitionId) -> Result<Vec<SessionId>, StoreError>;
@@ -461,6 +518,9 @@ struct Inner {
     child_index: HashMap<SessionId, Vec<SessionId>>,
     /// Per-session folded usage total (the durable usage surface the tree projection reads).
     usage: HashMap<SessionId, UsageDelta>,
+    /// Per-session indexed search text `(title, body)` — the in-memory analogue of the SQLite
+    /// `session_fts` index, searched by case-insensitive substring.
+    session_text: HashMap<SessionId, (String, String)>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
     journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
@@ -721,6 +781,36 @@ impl SessionStore for InMemoryStore {
             .get(id)
             .copied()
             .unwrap_or_default()
+    }
+
+    async fn index_session_text(&self, id: &SessionId, title: Option<String>, body: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .session_text
+            .insert(id.clone(), (title.unwrap_or_default(), body.to_string()));
+    }
+
+    async fn search_sessions(&self, query: &str, limit: u32) -> Vec<SessionSearchHit> {
+        let limit = if limit == 0 { 50 } else { limit } as usize;
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().unwrap();
+        inner
+            .session_text
+            .iter()
+            .filter(|(_, (title, body))| {
+                title.to_lowercase().contains(&needle) || body.to_lowercase().contains(&needle)
+            })
+            .take(limit)
+            .map(|(id, (title, body))| SessionSearchHit {
+                session_id: id.clone(),
+                title: title.clone(),
+                snippet: snippet_around(body, &needle),
+            })
+            .collect()
     }
 
     async fn scan_resumable(&self, partition: PartitionId) -> Result<Vec<SessionId>, StoreError> {

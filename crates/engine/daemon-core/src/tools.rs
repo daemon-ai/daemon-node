@@ -66,6 +66,22 @@ impl ToolOutcome {
     }
 }
 
+/// A tool's batch-concurrency class (§12). The engine may run a model-emitted tool batch
+/// concurrently, but only when **every** call in the batch is [`Parallel`](ToolConcurrency::Parallel)
+/// — an all-or-nothing rule that conservatively stands in for hermes' path-overlap analysis
+/// (`agent/tool_executor.py`). Any [`Exclusive`](ToolConcurrency::Exclusive) call forces the whole
+/// batch to run sequentially.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolConcurrency {
+    /// Side-effect-free / read-only: safe to run alongside other parallel calls in the same batch
+    /// (e.g. `web_search`, `web_extract`). The tool must not mutate shared state or block on a host
+    /// request whose ordering matters.
+    Parallel,
+    /// Must run alone (the default): the tool mutates state, has ordered side effects, or blocks on
+    /// the host (e.g. `shell`, an fs write, `delegate`, `clarify`). One such call serializes the batch.
+    Exclusive,
+}
+
 /// A registry entry's static description (schemars-generated schema in the real engine).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolDef {
@@ -84,6 +100,12 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> &str;
     /// Execute the call against the turn context.
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome;
+    /// The tool's batch-concurrency class (§12). Defaults to [`ToolConcurrency::Exclusive`] (the
+    /// safe, sequential behaviour); a read-only tool overrides this to
+    /// [`ToolConcurrency::Parallel`] to opt into concurrent batch execution.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
 }
 
 /// The tool registry: resolves a call name to its handler (§12 `tools.rs`).

@@ -250,6 +250,14 @@ impl CredentialAuthority {
         );
     }
 
+    /// Rotate the credential behind `cap_id`: ask the source to prefer a different key on the next
+    /// acquire (a pooled source marks the underlying key exhausted). Single-key sources no-op. This
+    /// is the owner-local hop of the engine's `Recovery::Rotate` path; it does not invalidate the
+    /// outstanding lease (the engine re-acquires), so no audit `Revoke` is recorded.
+    pub fn rotate(&self, cap_id: &CredId) {
+        self.source.rotate(cap_id);
+    }
+
     /// Charge `tokens` of provider usage against the fleet ceiling and return the `Budget` cap a
     /// supervisor should now enforce: the remaining headroom, or a zeroed (throttled) budget once
     /// the ceiling is reached. Unbounded when no ceiling is set.

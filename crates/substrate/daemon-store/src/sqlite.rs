@@ -13,7 +13,8 @@
 
 use crate::{
     Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
+    JournalPage, SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry,
+    TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -77,10 +78,24 @@ CREATE TABLE IF NOT EXISTS delegations (
 );
 
 CREATE TABLE IF NOT EXISTS session_usage (
-    session_id    TEXT PRIMARY KEY,
-    input_tokens  INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    api_calls     INTEGER NOT NULL
+    session_id          TEXT PRIMARY KEY,
+    input_tokens        INTEGER NOT NULL,
+    output_tokens       INTEGER NOT NULL,
+    api_calls           INTEGER NOT NULL,
+    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
+    cost_micros         INTEGER NOT NULL DEFAULT 0
+);
+
+-- A full-text index over per-session metadata (title + body): the durable substrate for session
+-- search. The store is handed already-extracted text by the host (it never parses snapshots), so
+-- this stays protocol-free. `session_id` is UNINDEXED (a stored key, not a search term).
+CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5 (
+    session_id UNINDEXED,
+    title,
+    body,
+    tokenize = 'unicode61'
 );
 
 CREATE TABLE IF NOT EXISTS journal_entries (
@@ -113,6 +128,28 @@ fn sql_err(e: rusqlite::Error) -> StoreError {
     StoreError::Common(DaemonError::Other(format!("sqlite: {e}")))
 }
 
+/// Forward-only column migrations for tables that predate the enriched-usage columns. `CREATE TABLE
+/// IF NOT EXISTS` never alters an existing table, so a database created before the cache/reasoning/
+/// cost columns existed needs these `ALTER TABLE ... ADD COLUMN`s. Each is idempotent: a
+/// "duplicate column name" error (the column already exists, e.g. on a fresh schema) is ignored.
+fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    const USAGE_COLUMNS: &[&str] = &[
+        "ALTER TABLE session_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE session_usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE session_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE session_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
+    ];
+    for stmt in USAGE_COLUMNS {
+        match conn.execute(stmt, []) {
+            Ok(_) => {}
+            // Already migrated (column present): the only benign failure here.
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {}
+            Err(e) => return Err(sql_err(e)),
+        }
+    }
+    Ok(())
+}
+
 fn status_from_row(kind: &str, job: Option<String>) -> SessionStatus {
     match kind {
         "active" => SessionStatus::Active,
@@ -129,6 +166,7 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             fault: Mutex::new(None),
@@ -139,6 +177,7 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             fault: Mutex::new(None),
@@ -455,17 +494,27 @@ impl SessionStore for SqliteStore {
     async fn record_usage(&self, id: &SessionId, delta: UsageDelta) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO session_usage (session_id, input_tokens, output_tokens, api_calls) \
-             VALUES (?1, ?2, ?3, ?4) \
+            "INSERT INTO session_usage \
+               (session_id, input_tokens, output_tokens, api_calls, \
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_micros) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT(session_id) DO UPDATE SET \
                input_tokens = input_tokens + excluded.input_tokens, \
                output_tokens = output_tokens + excluded.output_tokens, \
-               api_calls = api_calls + excluded.api_calls",
+               api_calls = api_calls + excluded.api_calls, \
+               cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, \
+               cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, \
+               reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens, \
+               cost_micros = cost_micros + excluded.cost_micros",
             params![
                 id.as_str(),
                 delta.input_tokens as i64,
                 delta.output_tokens as i64,
                 delta.api_calls as i64,
+                delta.cache_read_tokens as i64,
+                delta.cache_write_tokens as i64,
+                delta.reasoning_tokens as i64,
+                delta.cost_micros as i64,
             ],
         );
     }
@@ -473,14 +522,19 @@ impl SessionStore for SqliteStore {
     async fn usage_of(&self, id: &SessionId) -> UsageDelta {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT input_tokens, output_tokens, api_calls FROM session_usage WHERE session_id = ?1",
+            "SELECT input_tokens, output_tokens, api_calls, \
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_micros \
+             FROM session_usage WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
                 Ok(UsageDelta {
                     input_tokens: row.get::<_, i64>(0)? as u64,
                     output_tokens: row.get::<_, i64>(1)? as u64,
                     api_calls: row.get::<_, i64>(2)? as u32,
-                    ..Default::default()
+                    cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(4)? as u64,
+                    reasoning_tokens: row.get::<_, i64>(5)? as u64,
+                    cost_micros: row.get::<_, i64>(6)? as u64,
                 })
             },
         )
@@ -488,6 +542,42 @@ impl SessionStore for SqliteStore {
         .ok()
         .flatten()
         .unwrap_or_default()
+    }
+
+    async fn index_session_text(&self, id: &SessionId, title: Option<String>, body: &str) {
+        let conn = self.conn.lock().unwrap();
+        // Replace any prior row for this session (the FTS index carries one row per session).
+        let _ = conn.execute(
+            "DELETE FROM session_fts WHERE session_id = ?1",
+            params![id.as_str()],
+        );
+        let _ = conn.execute(
+            "INSERT INTO session_fts (session_id, title, body) VALUES (?1, ?2, ?3)",
+            params![id.as_str(), title.unwrap_or_default(), body],
+        );
+    }
+
+    async fn search_sessions(&self, query: &str, limit: u32) -> Vec<SessionSearchHit> {
+        let conn = self.conn.lock().unwrap();
+        let limit = if limit == 0 { 50 } else { limit };
+        let mut stmt = match conn.prepare(
+            "SELECT session_id, title, snippet(session_fts, 2, '[', ']', '…', 12) \
+             FROM session_fts WHERE session_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            Ok(SessionSearchHit {
+                session_id: SessionId::new(row.get::<_, String>(0)?),
+                title: row.get::<_, String>(1)?,
+                snippet: row.get::<_, String>(2)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     async fn record_completion_and_wake(&self, c: &JobCompletion) -> Result<(), StoreError> {
@@ -812,5 +902,61 @@ impl SessionStore for SqliteStore {
             next_cursor,
             head_cursor,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FTS5 is compiled into the bundled SQLite: indexing + a `MATCH` query returns a highlighted
+    /// snippet, proving the `session_fts` virtual table is usable on this build.
+    #[tokio::test]
+    async fn fts_search_round_trips() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let a = SessionId::new("sess-a");
+        let b = SessionId::new("sess-b");
+        store
+            .index_session_text(&a, Some("Refactor".into()), "we refactored the parser pipeline")
+            .await;
+        store
+            .index_session_text(&b, Some("Bugfix".into()), "fixed a crash in the renderer")
+            .await;
+
+        let hits = store.search_sessions("parser", 10).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, a);
+        assert_eq!(hits[0].title, "Refactor");
+        assert!(hits[0].snippet.contains("[parser]"), "snippet: {}", hits[0].snippet);
+
+        // Re-indexing replaces the prior row (no duplicate hits).
+        store.index_session_text(&a, Some("Refactor".into()), "now about the lexer").await;
+        assert!(store.search_sessions("parser", 10).await.is_empty());
+        assert_eq!(store.search_sessions("lexer", 10).await.len(), 1);
+    }
+
+    /// All seven `UsageDelta` fields round-trip through the enriched `session_usage` schema and
+    /// accumulate additively across `record_usage` calls.
+    #[tokio::test]
+    async fn enriched_usage_round_trips_and_accumulates() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = SessionId::new("sess");
+        let delta = UsageDelta {
+            input_tokens: 100,
+            output_tokens: 40,
+            api_calls: 1,
+            cache_read_tokens: 60,
+            cache_write_tokens: 20,
+            reasoning_tokens: 10,
+            cost_micros: 1234,
+        };
+        store.record_usage(&s, delta).await;
+        store.record_usage(&s, delta).await;
+        let total = store.usage_of(&s).await;
+        assert_eq!(total.input_tokens, 200);
+        assert_eq!(total.cache_read_tokens, 120);
+        assert_eq!(total.cache_write_tokens, 40);
+        assert_eq!(total.reasoning_tokens, 20);
+        assert_eq!(total.cost_micros, 2468);
     }
 }

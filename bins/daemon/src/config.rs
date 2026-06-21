@@ -151,10 +151,9 @@ const MODELS_ENDPOINT_ENV: &str = "DAEMON_MODELS_ENDPOINT";
 pub enum ProviderKind {
     /// The deterministic in-tree provider (zero-config default; no network/keys).
     Mock,
-    /// The networked OpenAI Chat Completions provider.
-    OpenAi,
-    /// The networked Anthropic Messages provider.
-    Anthropic,
+    /// Any networked provider served by `genai`; the adapter is inferred from the (optionally
+    /// namespaced) `DAEMON_MODEL` name. Replaces the former per-family launch kinds.
+    GenAi,
     /// A local llama.cpp model via the supervised `daemon-infer` worker.
     LlamaCpp,
     /// A local mistral.rs model via the supervised `daemon-infer` worker.
@@ -732,27 +731,23 @@ impl NodeConfig {
             .as_str()
         {
             "mock" => ProviderKind::Mock,
-            "openai" => ProviderKind::OpenAi,
-            "anthropic" => ProviderKind::Anthropic,
+            // All networked providers are genai-backed; the adapter is inferred from DAEMON_MODEL.
+            // The legacy per-family names remain accepted for launch back-compat and all map here.
+            "genai" | "openai" | "anthropic" | "gemini" | "google" | "groq" | "deepseek"
+            | "deep_seek" | "deep-seek" | "xai" | "grok" | "openrouter" | "open_router"
+            | "open-router" | "cohere" => ProviderKind::GenAi,
             "llama" | "llamacpp" | "llama-cpp" => ProviderKind::LlamaCpp,
             "mistralrs" | "mistral-rs" | "mistral.rs" => ProviderKind::MistralRs,
             other => anyhow::bail!(
-                "unknown model provider {other:?} (expected mock|openai|anthropic|llama|mistralrs)"
+                "unknown model provider {other:?} (expected mock|genai|llama|mistralrs)"
             ),
         };
         // No default: `None` lets the provider client use its own default endpoint. An override is
         // only meaningful for a gateway/proxy or the in-process wire tests.
         let base_url = env_string(BASE_URL_ENV).or(file.base_url);
-        let model = env_string(MODEL_ENV)
-            .or(file.model)
-            .unwrap_or_else(|| match provider_kind {
-                ProviderKind::OpenAi => "gpt-4o-mini".to_string(),
-                ProviderKind::Anthropic => "claude-3-5-sonnet-latest".to_string(),
-                // Mock and the local kinds have no sensible default model — set DAEMON_MODEL.
-                ProviderKind::Mock | ProviderKind::LlamaCpp | ProviderKind::MistralRs => {
-                    String::new()
-                }
-            });
+        // The genai adapter is inferred from the model name, so there is no per-provider default
+        // model: a networked launch must set DAEMON_MODEL (e.g. `claude-opus-4-8`, `groq::…`).
+        let model = env_string(MODEL_ENV).or(file.model).unwrap_or_default();
 
         let credential_key = env_string(CREDENTIAL_KEY_ENV)
             .or(file.credential_key)

@@ -184,6 +184,7 @@ async fn call_summary_llm(aux: &dyn Provider, prompt: String, timeout: Duration)
         tools: Vec::new(),
         auth: None,
         constraint: None,
+        cache_system: false,
     };
     match tokio::time::timeout(timeout, aux.chat(request)).await {
         Ok(Ok(out)) => Ok(out.text),

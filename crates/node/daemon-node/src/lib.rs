@@ -107,6 +107,10 @@ pub struct NodeAssembly {
     /// The persisted credential store backing the node's `CredentialApi` sub-surface (the same store
     /// the credential authority provisions from). `None` builds a node without credential management.
     pub credential_store: Option<Arc<dyn CredentialStore>>,
+    /// The live networked-model discovery hook backing `ModelApi::models()` (the binary's
+    /// `genai`-backed catalog; the host never links `genai`). `None` lists only the static cloud
+    /// catalog + local models.
+    pub cloud_catalog: Option<Arc<dyn daemon_host::CloudCatalog>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -236,6 +240,11 @@ impl SessionFactoryCtx {
         if let Some(credentials) = &self.credentials {
             profile =
                 profile.with_credentials(credentials.clone(), ProfileRef::new(spec.credential_profile()));
+            // A configured fallback credential profile composes a failover chain on top of the
+            // per-profile multi-key pool: the engine re-keys to it when the primary is exhausted.
+            if let Some(fallback) = spec.fallback_credential_profile() {
+                profile = profile.with_fallback_profile(ProfileRef::new(fallback));
+            }
         }
         profile
     }
@@ -390,7 +399,9 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>),
     )
     // Live interactive sessions journal per turn; also records the signer so history reads verify.
-    .with_journal(a.store.clone(), signer.clone());
+    .with_journal(a.store.clone(), signer.clone())
+    // Surface the resident telemetry aggregator through the `telemetry` control op.
+    .with_metrics(host.metrics().clone());
     // Bind the model-management sub-surface when this node hosts local-inference model management.
     if let Some(models) = a.models.clone() {
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
@@ -402,6 +413,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // Bind the credential sub-surface when this node hosts credential management.
     if let Some(credentials) = a.credential_store.clone() {
         node_api = node_api.with_credential_store(credentials);
+    }
+    // Bind the live cloud-model discovery hook when the binary provided one.
+    if let Some(cloud_catalog) = a.cloud_catalog.clone() {
+        node_api = node_api.with_cloud_catalog(cloud_catalog);
     }
     let node = Arc::new(node_api);
 

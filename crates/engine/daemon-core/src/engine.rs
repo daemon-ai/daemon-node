@@ -726,43 +726,87 @@ impl Engine {
                 tool_result_budget,
             };
 
-            // execute_tools: run each call through the §12 pipeline, collecting result slots,
-            // effects, and structured detail for the rich §17 transcript views.
+            // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
+            // slots, effects, and structured detail for the rich §17 transcript views.
+            //
+            // A batch runs **concurrently** only when it has more than one call and *every* call
+            // resolves to a tool that declares itself [`ToolConcurrency::Parallel`] (all-or-nothing;
+            // any exclusive/mutating call serializes the batch — see [`crate::tools::Tool::concurrency`]).
+            let view_of = |call: &crate::conversation::ToolCall| ToolCallView {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                args_summary: call.args.clone(),
+                // A generic structured echo of the call arguments, opaque to the daemon; a tool
+                // with a richer call schema can refine this once providers carry structured args.
+                detail: Some(ToolDetail {
+                    kind: call.name.clone(),
+                    body: call.args.clone().into_bytes(),
+                }),
+            };
+            let result_view_of = |outcome: &crate::tools::ToolOutcome| ToolResultView {
+                call_id: outcome.result.call_id.clone(),
+                ok: outcome.result.ok,
+                summary: outcome.result.content.clone(),
+                // The tool's typed output (fs listing, command exit/stdout, ...) for a rich
+                // consumer; `None` for plain-text tools.
+                detail: outcome.detail.clone(),
+            };
+
             let mut calls = Vec::new();
             let mut effects: Vec<Effect> = Vec::new();
             let mut interrupted = false;
-            for call in &out.tool_calls {
-                let view = ToolCallView {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    args_summary: call.args.clone(),
-                    // A generic structured echo of the call arguments, opaque to the daemon; a tool
-                    // with a richer call schema can refine this once providers carry structured args.
-                    detail: Some(ToolDetail {
-                        kind: call.name.clone(),
-                        body: call.args.clone().into_bytes(),
-                    }),
-                };
-                events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-                let outcome = run_tool(call, &registry, &cx).await;
-                let result_view = ToolResultView {
-                    call_id: outcome.result.call_id.clone(),
-                    ok: outcome.result.ok,
-                    summary: outcome.result.content.clone(),
-                    // The tool's typed output (fs listing, command exit/stdout, ...) for a rich
-                    // consumer; `None` for plain-text tools.
-                    detail: outcome.detail.clone(),
-                };
-                events.emit(|seq| AgentEvent::ToolFinished {
-                    seq,
-                    result: result_view,
+
+            let parallel = out.tool_calls.len() > 1
+                && out.tool_calls.iter().all(|c| {
+                    registry
+                        .get(&c.name)
+                        .map(|t| t.concurrency() == crate::tools::ToolConcurrency::Parallel)
+                        .unwrap_or(false)
                 });
-                calls.push((call.clone(), outcome.result));
-                effects.extend(outcome.effects);
-                // Boundary after each tool: an interrupt stops further tool execution.
+
+            if parallel {
+                // Emit all starts in call order, run the batch concurrently, then drain results in
+                // call order. Read-only parallel tools have no ordered side effects, so the boundary
+                // is evaluated once after the whole batch settles.
+                for call in &out.tool_calls {
+                    let view = view_of(call);
+                    events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                }
+                let outcomes = futures::future::join_all(
+                    out.tool_calls
+                        .iter()
+                        .map(|call| async { (call.clone(), run_tool(call, &registry, &cx).await) }),
+                )
+                .await;
+                for (call, outcome) in outcomes {
+                    let result_view = result_view_of(&outcome);
+                    events.emit(|seq| AgentEvent::ToolFinished {
+                        seq,
+                        result: result_view,
+                    });
+                    calls.push((call, outcome.result));
+                    effects.extend(outcome.effects);
+                }
                 if self.boundary_readonly(control, events) {
                     interrupted = true;
-                    break;
+                }
+            } else {
+                for call in &out.tool_calls {
+                    let view = view_of(call);
+                    events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                    let outcome = run_tool(call, &registry, &cx).await;
+                    let result_view = result_view_of(&outcome);
+                    events.emit(|seq| AgentEvent::ToolFinished {
+                        seq,
+                        result: result_view,
+                    });
+                    calls.push((call.clone(), outcome.result));
+                    effects.extend(outcome.effects);
+                    // Boundary after each tool: an interrupt stops further tool execution.
+                    if self.boundary_readonly(control, events) {
+                        interrupted = true;
+                        break;
+                    }
                 }
             }
 
@@ -945,6 +989,108 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Completed(_)));
         assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "retried once");
         assert_eq!(pool.live_count(), 1, "the rotated key is cooling down");
+    }
+
+    /// A credential provider serving two profiles with distinct secrets, recording each acquisition
+    /// — so a test can observe the engine hopping from the primary to the fallback profile.
+    struct TwoProfileCreds {
+        acquired: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialProvider for TwoProfileCreds {
+        async fn acquire(
+            &self,
+            profile: &ProfileRef,
+            scope: &CredScope,
+        ) -> Result<daemon_common::CapabilityLease, daemon_common::CredError> {
+            self.acquired.lock().unwrap().push(profile.to_string());
+            Ok(daemon_common::CapabilityLease {
+                cap_id: daemon_common::CredId::new(format!("{profile}-cap")),
+                profile: profile.clone(),
+                scope: scope.clone(),
+                mode: daemon_common::CredMode::Native,
+                expires_at_ms: crate::credentials::now_ms() + 60_000,
+                secret: Some(daemon_common::LeaseSecret::new(format!("sk-{profile}"))),
+                signature: Vec::new(),
+            })
+        }
+        async fn release(&self, _lease: &daemon_common::CapabilityLease) {}
+        async fn rotate(&self, _profile: &ProfileRef, _cap_id: &daemon_common::CredId) {}
+    }
+
+    /// A provider that rejects every credential with a content-policy failure *except* the fallback
+    /// profile's secret — so the turn only completes once the engine has hopped profiles.
+    struct PolicyGatedProvider {
+        ok_secret: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PolicyGatedProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+
+        async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+            if req.auth.as_deref() == Some(self.ok_secret.as_str()) {
+                Ok(ModelOutput {
+                    text: "ok on fallback profile".into(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: UsageDelta::default(),
+                })
+            } else {
+                Err(Failure::ContentPolicy("blocked on primary".into()))
+            }
+        }
+    }
+
+    /// A persistent content-policy failure hops once to the configured fallback profile (wired via
+    /// `EngineProfile::with_fallback_profile`); the engine then completes on the fallback's
+    /// credential, having acquired the primary first and the fallback second.
+    #[tokio::test]
+    async fn fallback_profile_hops_credential_profile() {
+        use crate::EngineProfile;
+        use std::sync::Arc;
+
+        let creds = Arc::new(TwoProfileCreds {
+            acquired: std::sync::Mutex::new(Vec::new()),
+        });
+        let creds_for_builder = creds.clone();
+        let profile = EngineProfile::new(
+            Arc::new(|| {
+                Arc::new(PolicyGatedProvider {
+                    ok_secret: "sk-fallback".into(),
+                }) as Arc<dyn Provider>
+            }),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("test"),
+        )
+        .with_credentials(
+            Arc::new(move || creds_for_builder.clone() as Arc<dyn crate::credentials::CredentialProvider>),
+            ProfileRef::new("primary"),
+        )
+        .with_fallback_profile(ProfileRef::new("fallback"));
+
+        let mut engine = profile.fresh(SessionId::new("fallback-hop"));
+        engine.push_user(UserMsg::new("hello"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .expect("turn completes after hopping to the fallback profile");
+        assert!(matches!(outcome, TurnOutcome::Completed(_)));
+        let acquired = creds.acquired.lock().unwrap().clone();
+        assert_eq!(
+            acquired,
+            vec!["primary".to_string(), "fallback".to_string()],
+            "acquired the primary first, then hopped to the fallback profile"
+        );
     }
 
     /// A provider that always fails with a non-rotatable error.
@@ -1181,6 +1327,125 @@ mod tests {
         assert_eq!(tool_turns, 2);
     }
 
+    /// A tool that records the *peak* number of concurrent in-flight executions across a batch. By
+    /// holding a short overlap window in `run`, two genuinely concurrent calls observe `max_seen == 2`
+    /// while serialized calls only ever observe `1` — a deterministic probe for §12 batch concurrency.
+    struct ProbeTool {
+        name: &'static str,
+        concurrency: crate::tools::ToolConcurrency,
+        active: Arc<AtomicU64>,
+        max_seen: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn schema(&self) -> &str {
+            "{}"
+        }
+        fn concurrency(&self) -> crate::tools::ToolConcurrency {
+            self.concurrency
+        }
+        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> crate::tools::ToolOutcome {
+            let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_seen.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            crate::tools::ToolOutcome::text(call.call_id.clone(), true, "ok")
+        }
+    }
+
+    fn probe_engine(provider: Arc<dyn Provider>, tools: Vec<Arc<dyn Tool>>) -> Engine {
+        let mut registry = ToolRegistry::new();
+        for t in tools {
+            registry.register(t);
+        }
+        Engine::fresh(
+            SessionId::new("probe"),
+            SystemPrompt::new("test"),
+            provider,
+            Arc::new(registry),
+        )
+        .with_config(Config {
+            max_iterations: 8,
+            ..Config::default()
+        })
+    }
+
+    /// A batch of two `Parallel` tool calls runs concurrently: the peak observed in-flight count is 2.
+    #[tokio::test]
+    async fn parallel_tool_batch_runs_concurrently() {
+        let active = Arc::new(AtomicU64::new(0));
+        let max_seen = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![ScriptStep::Calls(vec![
+                ("para".into(), "{}".into()),
+                ("para".into(), "{}".into()),
+            ])],
+            "done",
+        ));
+        let tool = Arc::new(ProbeTool {
+            name: "para",
+            concurrency: crate::tools::ToolConcurrency::Parallel,
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+        });
+        let mut engine = probe_engine(provider, vec![tool]);
+        engine.push_user(UserMsg::new("go"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Completed(_)));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "both parallel calls should be in flight at once"
+        );
+    }
+
+    /// A mixed batch (one `Parallel`, one `Exclusive`) is serialized all-or-nothing: peak in-flight is 1.
+    #[tokio::test]
+    async fn exclusive_call_serializes_the_batch() {
+        let active = Arc::new(AtomicU64::new(0));
+        let max_seen = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![ScriptStep::Calls(vec![
+                ("para".into(), "{}".into()),
+                ("excl".into(), "{}".into()),
+            ])],
+            "done",
+        ));
+        let para = Arc::new(ProbeTool {
+            name: "para",
+            concurrency: crate::tools::ToolConcurrency::Parallel,
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+        });
+        let excl = Arc::new(ProbeTool {
+            name: "excl",
+            concurrency: crate::tools::ToolConcurrency::Exclusive,
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+        });
+        let mut engine = probe_engine(provider, vec![para, excl]);
+        engine.push_user(UserMsg::new("go"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Completed(_)));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "an exclusive call must force the whole batch to run sequentially"
+        );
+    }
+
     /// A provider that never stops calling a (non-delegating) tool exhausts the iteration budget; the
     /// turn ends `BudgetExhausted` after one final toolless summary call.
     #[tokio::test]
@@ -1402,6 +1667,61 @@ mod tests {
             TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
             _ => panic!("expected a failed outcome, not a hang"),
         }
+    }
+
+    /// A context engine that always reports over-budget and drops one turn on compaction — used to
+    /// prove the §10 compaction signal reaches the §17 stream as an `AgentEvent::Context`.
+    struct DroppingContext;
+    #[async_trait::async_trait]
+    impl ContextEngine for DroppingContext {
+        fn before_turn(
+            &self,
+            _conv: &Conversation,
+            budget: Option<usize>,
+        ) -> crate::context::Pressure {
+            crate::context::Pressure {
+                used_tokens: 1_000_000,
+                budget_tokens: budget.or(Some(1)),
+            }
+        }
+        async fn compact(&self, mut conv: Conversation, _budget: usize) -> Conversation {
+            // Drop the oldest turn so the engine observes a non-zero `dropped_turns`.
+            if !conv.turns.is_empty() {
+                conv.turns.remove(0);
+            }
+            conv
+        }
+    }
+
+    /// Compaction at the pre-turn pressure check emits an `AgentEvent::Context { compacted: true,
+    /// dropped_turns >= 1 }` on the stream — the data a GUI renders as a "compacted" toast.
+    #[tokio::test]
+    async fn compaction_surfaces_context_event() {
+        let mut engine = Engine::fresh(
+            SessionId::new("compact-evt"),
+            SystemPrompt::new("test"),
+            Arc::new(crate::provider::MockProvider::completing("done")),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_config(Config {
+            context_budget_tokens: Some(1),
+            ..Config::default()
+        })
+        .with_context_engine(Arc::new(DroppingContext));
+        engine.push_user(UserMsg::new("first"));
+        engine.push_user(UserMsg::new("second"));
+        let (sink, log) = collecting();
+
+        engine.run_turn(&NoopHost, &sink, &TurnControl::new()).await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| matches!(
+                e,
+                AgentEvent::Context { status, .. } if status.compacted && status.dropped_turns >= 1
+            )),
+            "expected a compaction Context event, got: {log:?}"
+        );
     }
 
     // §10/§11 hook-order instrumentation.

@@ -2,7 +2,7 @@
 
 use crate::{classify_genai_error, finalize_output, RawToolCall};
 use async_trait::async_trait;
-use daemon_common::UsageDelta;
+use daemon_common::{Pricing, UsageDelta};
 use daemon_core::{
     Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestMsg,
     StreamEvent, ToolCallFormat,
@@ -11,7 +11,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamEvent, ContentPart,
+    CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamEvent, ContentPart,
     MessageContent, StreamEnd, Tool, ToolCall as GenToolCall, ToolResponse,
 };
 use genai::embed::{EmbedOptions, EmbedRequest};
@@ -20,30 +20,51 @@ use genai::{Client, ModelIden, ServiceTarget};
 
 /// A networked model provider backed by [`genai`].
 ///
-/// One adapter serves any `genai`-supported provider; the daemon picks the [`AdapterKind`] + model
-/// from config. The credential lease secret (`Request.auth`) is threaded per-call as the provider's
-/// API key, so the engine's §7 credential broker stays the source of truth. An optional `endpoint`
-/// override points the client at a custom base URL (used by the in-process wire tests).
+/// One client serves any `genai`-supported provider: the adapter (OpenAI, Anthropic, Gemini, Groq,
+/// DeepSeek, xAI, OpenRouter, Cohere, Ollama, …) is *inferred from the model name* via
+/// [`Client::default_model`] / [`AdapterKind::from_model`] (namespaced ids like `groq::…` force the
+/// adapter), so there is no daemon-side provider registry. The credential lease secret
+/// (`Request.auth`) is threaded per-call as the API key; when absent, genai falls back to the
+/// adapter's `default_key_env_name()` from the environment. An optional `endpoint` override points
+/// at a custom base URL (the in-process wire tests), and an optional explicit `adapter` forces the
+/// protocol for a model name that does not self-identify (used by those tests).
 pub struct GenAiProvider {
     client: Client,
-    adapter: AdapterKind,
+    /// Explicit adapter override. `None` => infer from the model name (the default path). `Some`
+    /// forces the protocol regardless of the model id (wire tests, custom gateways).
+    adapter: Option<AdapterKind>,
     model: String,
     endpoint: Option<String>,
     max_tokens: u32,
+    /// The model's price sheet, when known: used to fill `UsageDelta::cost_micros` at decode time
+    /// so cost flows through the usage stream like any other usage field. `None` => `cost_micros`
+    /// stays `0` (cost not computed).
+    pricing: Option<Pricing>,
 }
 
 /// The default output cap sent to providers that require one (e.g. Anthropic Messages).
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_MAX_TOKENS: u32 = 4096; // TODO FIX THIS
 
 impl GenAiProvider {
-    /// A provider for `adapter`/`model` using `genai`'s default endpoint and a default output cap.
-    pub fn new(adapter: AdapterKind, model: impl Into<String>) -> Self {
+    /// A provider for `model`, with the genai adapter inferred from the (optionally namespaced)
+    /// model name — the primary construction path. Uses genai's default endpoint and output cap.
+    pub fn for_model(model: impl Into<String>) -> Self {
         Self {
             client: Client::default(),
-            adapter,
+            adapter: None,
             model: model.into(),
             endpoint: None,
             max_tokens: DEFAULT_MAX_TOKENS,
+            pricing: None,
+        }
+    }
+
+    /// A provider for an *explicit* `adapter`/`model` — forces the protocol regardless of the model
+    /// id. Prefer [`GenAiProvider::for_model`]; this exists for wire tests and custom gateways.
+    pub fn new(adapter: AdapterKind, model: impl Into<String>) -> Self {
+        Self {
+            adapter: Some(adapter),
+            ..Self::for_model(model)
         }
     }
 
@@ -59,12 +80,18 @@ impl GenAiProvider {
         self
     }
 
-    /// The OpenAI Chat Completions provider for `model`.
+    /// Attach the model's price sheet so decoded usage carries an estimated `cost_micros`.
+    pub fn with_pricing(mut self, pricing: Pricing) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// The OpenAI Chat Completions provider for `model` (explicit adapter; for wire tests).
     pub fn openai(model: impl Into<String>) -> Self {
         Self::new(AdapterKind::OpenAI, model)
     }
 
-    /// The Anthropic Messages provider for `model`.
+    /// The Anthropic Messages provider for `model` (explicit adapter; for wire tests).
     pub fn anthropic(model: impl Into<String>) -> Self {
         Self::new(AdapterKind::Anthropic, model)
     }
@@ -80,9 +107,20 @@ impl GenAiProvider {
     }
 
     fn chat_request(&self, req: &Request) -> ChatRequest {
-        let messages: Vec<ChatMessage> = req.messages.iter().map(to_chat_message).collect();
+        let mut messages: Vec<ChatMessage> = req.messages.iter().map(to_chat_message).collect();
+        // A cache breakpoint on the tools+system prefix (the largest stable block) when the engine
+        // requests it. genai ignores `cache_control` on the request-level `system` string for
+        // Anthropic, so the system must be passed as a leading System *message* to carry the
+        // breakpoint; otherwise it stays the plain request-level system.
+        let cache_system = req.cache_system && !req.system.is_empty();
+        if cache_system {
+            messages.insert(
+                0,
+                ChatMessage::system(req.system.clone()).with_options(CacheControl::Ephemeral),
+            );
+        }
         let mut chat = ChatRequest::new(messages);
-        if !req.system.is_empty() {
+        if !req.system.is_empty() && !cache_system {
             chat = chat.with_system(req.system.clone());
         }
         if !req.tools.is_empty() {
@@ -98,6 +136,59 @@ impl GenAiProvider {
             chat = chat.with_tools(tools);
         }
         chat
+    }
+}
+
+/// The genai adapters the node probes for live model discovery. genai 0.6.5 exposes no public
+/// enumeration of [`AdapterKind`], so this is the curated set the model picker asks; each is queried
+/// only when its API key resolves from the environment, so a no-key node makes no network calls.
+const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
+    AdapterKind::OpenAI,
+    AdapterKind::Anthropic,
+    AdapterKind::Gemini,
+    AdapterKind::Groq,
+    AdapterKind::DeepSeek,
+    AdapterKind::Xai,
+    AdapterKind::Cohere,
+    AdapterKind::OpenRouter,
+];
+
+/// Live model ids from `genai` for every [`DISCOVERY_ADAPTERS`] adapter whose API key is present in
+/// the environment ([`AdapterKind::default_key_env_name`]), each namespaced so
+/// [`AdapterKind::from_model`] round-trips the adapter. Adapters without a key are skipped (their
+/// models come from the static fallback catalog); a per-adapter listing error is swallowed so one
+/// unreachable provider does not blank the picker. This is the genai-native replacement for a
+/// daemon-side cloud-model registry.
+pub async fn genai_listed_models() -> Vec<String> {
+    let client = Client::default();
+    let mut out = Vec::new();
+    for &adapter in DISCOVERY_ADAPTERS {
+        let has_key = adapter
+            .default_key_env_name()
+            .map(|env| std::env::var(env).is_ok())
+            .unwrap_or(false);
+        if !has_key {
+            continue;
+        }
+        // `()` => genai resolves the adapter's default endpoint + env key for the listing call.
+        if let Ok(names) = client.all_model_names(adapter, ()).await {
+            out.extend(names.iter().map(|name| namespace_model(adapter, name)));
+        }
+    }
+    out
+}
+
+/// Prefix a model id with its `genai` adapter namespace (`groq::…`) unless the id already
+/// self-identifies — i.e. [`AdapterKind::from_model`] resolves the same adapter — so a GUI that
+/// stores the returned id round-trips through inference at chat time.
+fn namespace_model(adapter: AdapterKind, model: &str) -> String {
+    let self_identifies = AdapterKind::from_model(model)
+        .map(|a| a == adapter)
+        .unwrap_or(false);
+    if self_identifies {
+        model.to_string()
+    } else {
+        format!("{}::{}", adapter.as_lower_str(), model)
     }
 }
 
@@ -169,7 +260,7 @@ impl EmbeddingProvider for GenAiEmbedder {
         }
         let target = resolve_target(
             &self.client,
-            self.adapter,
+            Some(self.adapter),
             &self.model,
             self.endpoint.as_deref(),
             self.auth.as_deref(),
@@ -186,17 +277,25 @@ impl EmbeddingProvider for GenAiEmbedder {
     }
 }
 
-/// Build the per-call [`ServiceTarget`]: `genai`'s resolved default for the adapter/model, with the
-/// auth key (the lease secret) and any endpoint override applied. Free (not a method) so the
-/// streaming task can resolve it without borrowing the provider.
+/// Build the per-call [`ServiceTarget`]: `genai`'s resolved default for the model, with the auth key
+/// (the lease secret) and any endpoint override applied. When `adapter` is `None` the genai adapter
+/// is *inferred* from the model name (namespace or prefix; see [`AdapterKind::from_model`]); a
+/// `Some` forces it. Free (not a method) so the streaming task can resolve without borrowing the
+/// provider. When `auth` is `None`, genai resolves the adapter's `default_key_env_name()` from the
+/// environment as the fallback credential.
 async fn resolve_target(
     client: &Client,
-    adapter: AdapterKind,
+    adapter: Option<AdapterKind>,
     model: &str,
     endpoint: Option<&str>,
     auth: Option<&str>,
 ) -> Result<ServiceTarget, Failure> {
-    let model_iden = ModelIden::new(adapter, model.to_string());
+    let model_iden = match adapter {
+        Some(adapter) => ModelIden::new(adapter, model.to_string()),
+        None => client
+            .default_model(model)
+            .map_err(|e| Failure::Provider(format!("infer adapter for {model:?}: {e}")))?,
+    };
     let mut target = client
         .resolve_service_target(model_iden)
         .await
@@ -211,8 +310,10 @@ async fn resolve_target(
 }
 
 /// Map one flattened [`RequestMsg`] into a `genai` [`ChatMessage`], preserving native tool linkage.
+/// A [`RequestMsg::cache_breakpoint`] becomes an ephemeral `cache_control` marker so a prefix-caching
+/// provider (Anthropic) caches the conversation up to that message; other providers ignore it.
 fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
-    match msg.role.as_str() {
+    let chat_msg = match msg.role.as_str() {
         "tool" => {
             let call_id = msg.tool_call_id.clone().unwrap_or_default();
             ChatMessage::from(ToolResponse::new(call_id, msg.content.clone()))
@@ -236,6 +337,11 @@ fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
         }
         "assistant" => ChatMessage::assistant(msg.content.clone()),
         _ => ChatMessage::user(msg.content.clone()),
+    };
+    if msg.cache_breakpoint {
+        chat_msg.with_options(CacheControl::Ephemeral)
+    } else {
+        chat_msg
     }
 }
 
@@ -263,7 +369,7 @@ fn known_context_window(model: &str) -> Option<u32> {
 /// Map `genai`'s [`Usage`](genai::chat::Usage) into the canonical [`UsageDelta`], including the
 /// Anthropic/OpenAI prompt-cache + reasoning-token breakdowns the provider surfaces in the
 /// `*_details` sub-objects.
-fn usage_from(usage: &genai::chat::Usage) -> UsageDelta {
+fn usage_from(usage: &genai::chat::Usage, pricing: Option<&Pricing>) -> UsageDelta {
     let prompt = usage.prompt_tokens_details.as_ref();
     let completion = usage.completion_tokens_details.as_ref();
     let cache_read = prompt.and_then(|d| d.cached_tokens).unwrap_or(0).max(0) as u64;
@@ -272,7 +378,7 @@ fn usage_from(usage: &genai::chat::Usage) -> UsageDelta {
         .unwrap_or(0)
         .max(0) as u64;
     let reasoning = completion.and_then(|d| d.reasoning_tokens).unwrap_or(0).max(0) as u64;
-    UsageDelta {
+    let mut delta = UsageDelta {
         input_tokens: usage.prompt_tokens.unwrap_or(0).max(0) as u64,
         output_tokens: usage.completion_tokens.unwrap_or(0).max(0) as u64,
         api_calls: 1,
@@ -280,7 +386,11 @@ fn usage_from(usage: &genai::chat::Usage) -> UsageDelta {
         cache_write_tokens: cache_write,
         reasoning_tokens: reasoning,
         cost_micros: 0,
+    };
+    if let Some(pricing) = pricing {
+        delta.cost_micros = delta.estimate_cost_micros(pricing);
     }
+    delta
 }
 
 /// Map `genai` tool calls into the pre-repair [`RawToolCall`]s.
@@ -300,8 +410,12 @@ fn raw_calls(calls: Vec<GenToolCall>) -> Vec<RawToolCall> {
 }
 
 /// Decode a non-streaming [`ChatResponse`] into the canonical [`ModelOutput`] through §9 repair.
-fn decode_response(resp: ChatResponse, valid_tools: &[String]) -> ModelOutput {
-    let usage = usage_from(&resp.usage);
+fn decode_response(
+    resp: ChatResponse,
+    valid_tools: &[String],
+    pricing: Option<&Pricing>,
+) -> ModelOutput {
+    let usage = usage_from(&resp.usage, pricing);
     let reasoning = resp.reasoning_content.clone();
     let text = resp.content.joined_texts().unwrap_or_default();
     let calls = raw_calls(resp.content.into_tool_calls());
@@ -309,11 +423,15 @@ fn decode_response(resp: ChatResponse, valid_tools: &[String]) -> ModelOutput {
 }
 
 /// Assemble a [`ModelOutput`] from a captured [`StreamEnd`] through §9 repair.
-fn decode_stream_end(end: StreamEnd, valid_tools: &[String]) -> ModelOutput {
+fn decode_stream_end(
+    end: StreamEnd,
+    valid_tools: &[String],
+    pricing: Option<&Pricing>,
+) -> ModelOutput {
     let usage = end
         .captured_usage
         .as_ref()
-        .map(usage_from)
+        .map(|u| usage_from(u, pricing))
         .unwrap_or_default();
     let reasoning = end.captured_reasoning_content.clone();
     let text = end
@@ -354,7 +472,7 @@ impl Provider for GenAiProvider {
             .exec_chat(target, chat, Some(&opts))
             .await
             .map_err(classify_genai_error)?;
-        Ok(decode_response(resp, &valid))
+        Ok(decode_response(resp, &valid, self.pricing.as_ref()))
     }
 
     fn stream(&self, req: Request) -> BoxStream<'_, Result<StreamEvent, Failure>> {
@@ -366,6 +484,7 @@ impl Provider for GenAiProvider {
         let chat = self.chat_request(&req);
         let opts = self.options();
         let valid = req.tool_names();
+        let pricing = self.pricing;
         let (tx, rx) = futures::channel::mpsc::unbounded();
 
         tokio::spawn(async move {
@@ -411,7 +530,7 @@ impl Provider for GenAiProvider {
                         }
                     }
                     Ok(ChatStreamEvent::End(end)) => {
-                        let out = decode_stream_end(end, &valid);
+                        let out = decode_stream_end(end, &valid, pricing.as_ref());
                         let _ = tx.unbounded_send(Ok(StreamEvent::Done(out)));
                         return;
                     }

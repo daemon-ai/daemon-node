@@ -155,6 +155,23 @@ pub trait ControlApi: Send + Sync {
     /// Durable queue depths + session/active counts.
     async fn stats(&self) -> StatsReport;
 
+    /// A point-in-time telemetry [`TelemetryDump`] (folded usage + cost + events + health + queue
+    /// depths) — the operator/GUI "live HUD" read. The default projects [`Self::stats`] +
+    /// [`Self::health`] (no separate event counter); a node with a resident metrics aggregator
+    /// overrides it to surface the folded event count and aggregator usage.
+    async fn telemetry(&self) -> TelemetryDump {
+        let stats = self.stats().await;
+        TelemetryDump {
+            usage: stats.usage,
+            events: 0,
+            healthy: self.health().await.all_ok,
+            pending_jobs: stats.pending_jobs,
+            pending_wakes: stats.pending_wakes,
+            sessions: stats.sessions,
+            active: stats.active,
+        }
+    }
+
     /// The known durable sessions and their statuses.
     async fn sessions(&self) -> Vec<SessionInfo>;
 
@@ -476,6 +493,31 @@ pub struct StatsReport {
     pub sessions: u64,
     /// Currently-active (in-memory) incarnations.
     pub active: u64,
+    /// The folded durable usage total across every session (tokens, cache, reasoning, and estimated
+    /// `cost_micros`) — the node-wide accounting line a GUI renders alongside the queue depths.
+    #[serde(default)]
+    pub usage: UsageDelta,
+}
+
+/// A point-in-time observability snapshot exposed over the control surface (the API-level mirror of
+/// the resident `daemon-telemetry` metrics dump): folded usage + an event counter + aggregate health
+/// + the durable queue depths. This is the `Dump` op a GUI/operator polls for a live HUD.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryDump {
+    /// Cumulative usage folded across every unit reporting to the node aggregator (incl. cost).
+    pub usage: UsageDelta,
+    /// Management events folded so far (the resident aggregator's event counter).
+    pub events: u64,
+    /// Aggregate service-tree health bit.
+    pub healthy: bool,
+    /// Pending background jobs on the durable job outbox.
+    pub pending_jobs: u64,
+    /// Pending wake hints on the durable wake outbox.
+    pub pending_wakes: u64,
+    /// Total durable session records.
+    pub sessions: u64,
+    /// Currently-active (in-memory) incarnations.
+    pub active: u64,
 }
 
 /// A durable session's identity + lifecycle state.
@@ -634,6 +676,8 @@ pub enum ApiRequest {
     Health,
     /// [`ControlApi::stats`].
     Stats,
+    /// [`ControlApi::telemetry`].
+    Telemetry,
     /// [`ControlApi::sessions`].
     Sessions,
     /// [`ControlApi::assign`].
@@ -893,6 +937,8 @@ pub enum ApiResponse {
     Health(HealthReport),
     /// A stats report.
     Stats(StatsReport),
+    /// A telemetry dump (folded usage/cost + events + health + queue depths).
+    Telemetry(TelemetryDump),
     /// A session list.
     Sessions(Vec<SessionInfo>),
     /// A fleet report.
@@ -1030,6 +1076,7 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
     match req {
         ApiRequest::Health => ApiResponse::Health(api.health().await),
         ApiRequest::Stats => ApiResponse::Stats(api.stats().await),
+        ApiRequest::Telemetry => ApiResponse::Telemetry(api.telemetry().await),
         ApiRequest::Sessions => ApiResponse::Sessions(api.sessions().await),
         ApiRequest::Assign { session } => unit_or_err(api.assign(session).await),
         ApiRequest::Cancel { session } => unit_or_err(api.cancel(session).await),

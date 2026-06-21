@@ -25,13 +25,13 @@ use daemon_api::{
     ApiError, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo, FleetReport,
     HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView, LogStream,
     ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo, ProfileSpec,
-    ProviderSelector, ServiceHealth, SessionApi, SessionInfo, SessionState, StatsReport, TreeReport,
-    UnitNode,
+    ProviderSelector, ServiceHealth, SessionApi, SessionInfo, SessionState, StatsReport,
+    TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JournalStreamId,
     ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, QuantRecommendation, QuantizeId,
-    QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId,
+    QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
 };
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
 use daemon_models::{ModelError, ModelManager};
@@ -42,7 +42,7 @@ use daemon_protocol::{
 };
 use daemon_store::{SessionStatus, SessionStore};
 use daemon_telemetry::{
-    decode_entry, verify_segment, JournalPayload, SegmentInput, TraceSigner, VerifyingKey,
+    decode_entry, verify_segment, JournalPayload, Metrics, SegmentInput, TraceSigner, VerifyingKey,
     GENESIS_ROOT,
 };
 use dashmap::DashMap;
@@ -87,6 +87,20 @@ enum Lifecycle {
     Live,
 }
 
+/// The live networked-model discovery seam for the `ModelApi`'s `models()` listing.
+///
+/// `daemon-host` is provider-agnostic (it never links `genai`), so live cloud-model enumeration is
+/// injected by the binary that *does* own the provider client. The implementation asks `genai`
+/// (`Client::all_model_names`) for every adapter whose API key resolves, namespaces the ids so the
+/// adapter round-trips through inference, and overlays local pricing/context. When no hook is wired
+/// (tests, a remote-only node) `models()` falls back to the static [`ModelDescriptor`] catalog.
+#[async_trait]
+pub trait CloudCatalog: Send + Sync {
+    /// The networked models a GUI can pick right now: the static catalog unioned with any live
+    /// `genai` listing for adapters that have a resolvable key. Ids are namespaced (`groq::…`).
+    async fn list(&self) -> Vec<ModelDescriptor>;
+}
+
 /// The node interface implemented over a running [`crate::Host`].
 #[derive(Clone)]
 pub struct NodeApiImpl {
@@ -114,6 +128,13 @@ pub struct NodeApiImpl {
     /// built without credential management (every `CredentialApi` call then resolves to
     /// [`ApiError::Unsupported`]).
     credentials: Option<Arc<dyn CredentialStore>>,
+    /// The resident telemetry aggregator (the same handle the host's `Metrics/health` service
+    /// dumps), surfaced through the `telemetry` control op. `None` => the op falls back to the
+    /// store-projected default with a zero event counter.
+    metrics: Option<Metrics>,
+    /// The live networked-model discovery hook injected by the binary (the host never links
+    /// `genai`). `None` => `models()` lists only the static cloud catalog + local models.
+    cloud_catalog: Option<Arc<dyn CloudCatalog>>,
 }
 
 impl NodeApiImpl {
@@ -143,7 +164,23 @@ impl NodeApiImpl {
             default_local_profile: "default".to_string(),
             profiles: None,
             credentials: None,
+            metrics: None,
+            cloud_catalog: None,
         }
+    }
+
+    /// Attach the resident telemetry aggregator so the `telemetry` control op surfaces the node's
+    /// folded usage + event count + health (the same `Metrics` the host's metrics service dumps).
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach the live networked-model discovery hook (the binary's `genai`-backed catalog) so
+    /// `models()` lists cloud models for adapters that have a resolvable key. Call during assembly.
+    pub fn with_cloud_catalog(mut self, cloud_catalog: Arc<dyn CloudCatalog>) -> Self {
+        self.cloud_catalog = Some(cloud_catalog);
+        self
     }
 
     /// Attach the model-management facade backing the `ModelApi` sub-surface, with the default
@@ -169,6 +206,16 @@ impl NodeApiImpl {
     pub fn with_credential_store(mut self, credentials: Arc<dyn CredentialStore>) -> Self {
         self.credentials = Some(credentials);
         self
+    }
+
+    /// Fold the durable per-session usage totals across every known session — the node-wide
+    /// accounting line (tokens, cache, reasoning, estimated `cost_micros`) reported on `stats`.
+    async fn folded_usage(&self) -> UsageDelta {
+        let mut total = UsageDelta::default();
+        for (session, _status) in self.store.list_sessions().await {
+            total.add(&self.store.usage_of(&session).await);
+        }
+        total
     }
 
     /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.
@@ -366,6 +413,26 @@ impl ControlApi for NodeApiImpl {
     async fn stats(&self) -> StatsReport {
         let s = self.store.stats().await;
         StatsReport {
+            pending_jobs: s.pending_jobs as u64,
+            pending_wakes: s.pending_wakes as u64,
+            sessions: s.sessions as u64,
+            active: self.manager.active_count() as u64,
+            usage: self.folded_usage().await,
+        }
+    }
+
+    async fn telemetry(&self) -> TelemetryDump {
+        let s = self.store.stats().await;
+        // Prefer the resident aggregator's folded usage + event count when present; otherwise fall
+        // back to the durable per-session fold (with no event counter).
+        let (usage, events) = match &self.metrics {
+            Some(m) => (m.usage(), m.events()),
+            None => (self.folded_usage().await, 0),
+        };
+        TelemetryDump {
+            usage,
+            events,
+            healthy: self.supervisor.all_ok(),
             pending_jobs: s.pending_jobs as u64,
             pending_wakes: s.pending_wakes as u64,
             sessions: s.sessions as u64,
@@ -669,8 +736,13 @@ impl ModelApi for NodeApiImpl {
     }
 
     async fn models(&self) -> Vec<ModelDescriptor> {
-        // The well-known cloud catalog (incl. claude-opus-4-8) merged with locally-installed models.
-        let mut out = ModelDescriptor::builtin_cloud_catalog();
+        // Networked models: a live `genai` listing (per adapter with a resolvable key, namespaced,
+        // pricing/context overlaid) when the discovery hook is wired, else the static catalog
+        // (incl. claude-opus-4-8). Then merge any locally-installed (GGUF) models.
+        let mut out = match &self.cloud_catalog {
+            Some(catalog) => catalog.list().await,
+            None => ModelDescriptor::builtin_cloud_catalog(),
+        };
         if let Some(m) = &self.models {
             for im in m.catalog().await {
                 let provider = match im.model.engine {

@@ -59,6 +59,10 @@ pub struct Request {
     /// MeTTa "draft" path that constrains generation to the symbolic-coprocessor grammar). `None` =
     /// unconstrained. A provider that cannot constrain generation ignores it.
     pub constraint: Option<GrammarConstraint>,
+    /// Whether to mark the system prompt as a prompt-cache breakpoint (§ prompt caching). Set by the
+    /// engine's cache policy; a provider that supports prefix caching (e.g. Anthropic via
+    /// `cache_control`) caches the tools+system prefix, and a provider without it ignores the hint.
+    pub cache_system: bool,
 }
 
 /// An engine-agnostic grammar constraint carried on a [`Request`]. It holds both grammar dialects so
@@ -106,6 +110,11 @@ pub struct RequestMsg {
     pub tool_calls: Vec<ToolCall>,
     /// For a `tool` message: the id of the call this result answers (native round-trip).
     pub tool_call_id: Option<String>,
+    /// A prompt-cache breakpoint marker (§ prompt caching): when set, the stable prefix up to and
+    /// including this message should be cached. The engine's cache policy marks the last message of
+    /// the request so the growing conversation reuses the cached prefix across turns; a provider
+    /// without prefix caching ignores it.
+    pub cache_breakpoint: bool,
 }
 
 /// What a model produced for one turn (§4.4).
@@ -327,25 +336,46 @@ pub fn build_context(conv: &Conversation, tools: &[ToolDef]) -> Request {
                     role: "assistant".into(),
                     content: t.assistant.text.clone(),
                     tool_calls: t.calls.iter().map(|(call, _)| call.clone()).collect(),
-                    tool_call_id: None,
+                    ..Default::default()
                 });
                 for (_call, result) in &t.calls {
                     messages.push(RequestMsg {
                         role: "tool".into(),
                         content: result.content.clone(),
-                        tool_calls: Vec::new(),
                         tool_call_id: Some(result.call_id.clone()),
+                        ..Default::default()
                     });
                 }
             }
         }
     }
-    Request {
+    // Repair the flattened wire sequence (§9): Turn-granular compaction can drop a leading user turn
+    // or leave a suspended tool call unanswered, so enforce the provider structural contract here
+    // (leading-user, tool pairing, no empty blocks). No-op for a well-formed sequence.
+    let messages = crate::repair::repair_message_sequence(messages);
+    let mut req = Request {
         system: conv.system.text.clone(),
         messages,
         tools: tools.to_vec(),
         auth: None,
         constraint: None,
+        cache_system: false,
+    };
+    mark_cache_breakpoints(&mut req);
+    req
+}
+
+/// Place prompt-cache breakpoints on the request's stable prefix (§ prompt caching).
+///
+/// Two breakpoints, mirroring Anthropic's incremental multi-turn recommendation and hermes'
+/// `prompt_caching` policy: (1) the **tools+system** prefix (the largest stable block, unchanged
+/// turn to turn), and (2) the **last message** of the request, so the entire conversation prefix is
+/// cached and the *next* turn reads it as a hit before appending. Providers without prefix caching
+/// ignore both markers, so this is always safe to apply.
+pub fn mark_cache_breakpoints(req: &mut Request) {
+    req.cache_system = !req.system.is_empty();
+    if let Some(last) = req.messages.last_mut() {
+        last.cache_breakpoint = true;
     }
 }
 
@@ -559,5 +589,49 @@ impl Provider for ScriptedProvider {
             .cloned()
             .unwrap_or_else(|| ScriptStep::Final(self.final_text.clone()));
         Ok(self.output(&step, n, usage))
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::conversation::{AssistantMsg, Conversation, SystemPrompt};
+    use daemon_protocol::UserMsg;
+
+    #[test]
+    fn build_context_marks_system_and_last_message() {
+        let mut conv = Conversation::new(SystemPrompt::new("a stable system prompt"));
+        conv.push_user(UserMsg::new("hello"));
+        conv.push_assistant(AssistantMsg::text("hi there"));
+        let req = build_context(&conv, &[]);
+
+        assert!(req.cache_system, "a non-empty system is a cache breakpoint");
+        assert!(
+            req.messages.last().unwrap().cache_breakpoint,
+            "the last message anchors the conversation-prefix breakpoint"
+        );
+        assert_eq!(
+            req.messages.iter().filter(|m| m.cache_breakpoint).count(),
+            1,
+            "exactly one message-level breakpoint (the last)"
+        );
+    }
+
+    #[test]
+    fn empty_system_is_not_a_cache_breakpoint() {
+        let mut conv = Conversation::new(SystemPrompt::new(""));
+        conv.push_user(UserMsg::new("hello"));
+        let req = build_context(&conv, &[]);
+        assert!(!req.cache_system);
+        // The message-prefix breakpoint still applies even without a system.
+        assert!(req.messages.last().unwrap().cache_breakpoint);
+    }
+
+    #[test]
+    fn no_messages_yields_no_message_breakpoint() {
+        let conv = Conversation::new(SystemPrompt::new("sys"));
+        let req = build_context(&conv, &[]);
+        assert!(req.cache_system);
+        assert!(req.messages.is_empty());
     }
 }

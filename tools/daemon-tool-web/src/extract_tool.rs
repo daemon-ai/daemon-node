@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use daemon_core::{check_url, Tool, ToolCall, ToolOutcome, TurnCx};
+use daemon_core::{check_url, Tool, ToolCall, ToolConcurrency, ToolOutcome, TurnCx};
 use daemon_protocol::ToolDetail;
 use serde::Deserialize;
 
@@ -50,6 +50,11 @@ impl Tool for WebExtractTool {
 
     fn schema(&self) -> &str {
         WEB_EXTRACT_SCHEMA
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        // Read-only fetch + clean with no shared-state mutation: safe to batch concurrently.
+        ToolConcurrency::Parallel
     }
 
     async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {

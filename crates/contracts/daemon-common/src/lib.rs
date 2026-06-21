@@ -258,6 +258,56 @@ impl UsageDelta {
         self.reasoning_tokens += other.reasoning_tokens;
         self.cost_micros += other.cost_micros;
     }
+
+    /// Estimate this step's cost in micro-USD under `pricing`, returning the value `cost_micros`
+    /// should carry. Fresh (un-cached) input is `input_tokens - cache_read_tokens -
+    /// cache_write_tokens` billed at the base input rate, cache reads/writes at their own rates, and
+    /// all output at the output rate. `reasoning_tokens` are a billed subset of `output_tokens`, so
+    /// they are *not* charged again. Token counts are per-step; rates are micro-USD per million
+    /// tokens (see [`Pricing`]).
+    pub fn estimate_cost_micros(&self, pricing: &Pricing) -> u64 {
+        let fresh_input = self
+            .input_tokens
+            .saturating_sub(self.cache_read_tokens)
+            .saturating_sub(self.cache_write_tokens);
+        let per_mtok = |tokens: u64, rate: u64| -> u64 {
+            // tokens * rate / 1_000_000, in u128 to avoid overflow on large windows.
+            ((tokens as u128 * rate as u128) / 1_000_000u128) as u64
+        };
+        per_mtok(fresh_input, pricing.input_micros_per_mtok)
+            + per_mtok(self.cache_read_tokens, pricing.cache_read_micros_per_mtok)
+            + per_mtok(self.cache_write_tokens, pricing.cache_write_micros_per_mtok)
+            + per_mtok(self.output_tokens, pricing.output_micros_per_mtok)
+    }
+}
+
+/// A per-model price sheet in micro-USD per **million** tokens (the unit cloud providers publish:
+/// e.g. $3.00 / Mtok => `3_000_000`). Used by [`UsageDelta::estimate_cost_micros`] to fill in
+/// `cost_micros` at the provider boundary. Cache read/write rates default to the Anthropic public
+/// ratios relative to base input (reads at 0.1x, writes at 1.25x) when not set explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pricing {
+    /// Base (un-cached) input rate, micro-USD per million tokens.
+    pub input_micros_per_mtok: u64,
+    /// Output rate, micro-USD per million tokens.
+    pub output_micros_per_mtok: u64,
+    /// Cache-read rate (prompt tokens served from cache), micro-USD per million tokens.
+    pub cache_read_micros_per_mtok: u64,
+    /// Cache-write rate (cache-creation surcharge), micro-USD per million tokens.
+    pub cache_write_micros_per_mtok: u64,
+}
+
+impl Pricing {
+    /// A price sheet from base input/output rates (micro-USD per million tokens), deriving the
+    /// cache rates from Anthropic's public ratios: reads at 0.1x input, writes at 1.25x input.
+    pub fn from_io(input_micros_per_mtok: u64, output_micros_per_mtok: u64) -> Self {
+        Self {
+            input_micros_per_mtok,
+            output_micros_per_mtok,
+            cache_read_micros_per_mtok: input_micros_per_mtok / 10,
+            cache_write_micros_per_mtok: input_micros_per_mtok * 5 / 4,
+        }
+    }
 }
 
 /// A point-in-time view of a provider rate-limit window, identical at every level (supervision
@@ -282,7 +332,11 @@ impl WireVersion {
     /// v2 (event-io edge): adds the merged session-event-log surface (`Origin`, `Disposition`,
     /// `Direction`, `SessionLogEntry`), the `subscribe`/`log_after` api ops, and the
     /// `TurnTrigger::Scheduled` arm.
-    pub const CURRENT: Self = Self(2);
+    ///
+    /// v3 (genai-native providers): collapses `ProviderSelector` to `mock | genai | llama_cpp |
+    /// mistral_rs` (the genai adapter is inferred from the model id; legacy per-provider names
+    /// deserialize to `genai` via serde aliases) and lists networked models live from genai.
+    pub const CURRENT: Self = Self(3);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -1015,4 +1069,52 @@ pub struct GgufInfo {
     pub parameter_count: Option<u64>,
     /// The file size in bytes.
     pub size_bytes: u64,
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::{Pricing, UsageDelta};
+
+    #[test]
+    fn from_io_derives_anthropic_cache_ratios() {
+        // $3 / $15 per Mtok => cache read 0.1x input, cache write 1.25x input.
+        let p = Pricing::from_io(3_000_000, 15_000_000);
+        assert_eq!(p.input_micros_per_mtok, 3_000_000);
+        assert_eq!(p.output_micros_per_mtok, 15_000_000);
+        assert_eq!(p.cache_read_micros_per_mtok, 300_000);
+        assert_eq!(p.cache_write_micros_per_mtok, 3_750_000);
+    }
+
+    #[test]
+    fn cost_splits_fresh_cached_and_output() {
+        let pricing = Pricing::from_io(3_000_000, 15_000_000);
+        let usage = UsageDelta {
+            // 1M input tokens of which 600k are cache reads and 100k cache writes => 300k fresh.
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            api_calls: 1,
+            cache_read_tokens: 600_000,
+            cache_write_tokens: 100_000,
+            reasoning_tokens: 0,
+            cost_micros: 0,
+        };
+        // fresh: 300_000 * 3_000_000 / 1e6 = 900_000
+        // cache_read: 600_000 * 300_000 / 1e6 = 180_000
+        // cache_write: 100_000 * 3_750_000 / 1e6 = 375_000
+        // output: 500_000 * 15_000_000 / 1e6 = 7_500_000
+        assert_eq!(usage.estimate_cost_micros(&pricing), 900_000 + 180_000 + 375_000 + 7_500_000);
+    }
+
+    #[test]
+    fn no_cache_charges_all_input_fresh() {
+        let pricing = Pricing::from_io(2_000_000, 8_000_000);
+        let usage = UsageDelta {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            api_calls: 1,
+            ..Default::default()
+        };
+        // 1M * 2.0 + 1M * 8.0 = 2_000_000 + 8_000_000
+        assert_eq!(usage.estimate_cost_micros(&pricing), 10_000_000);
+    }
 }

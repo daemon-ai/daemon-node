@@ -22,14 +22,36 @@ pub enum ProviderSelector {
     /// The deterministic in-tree provider (no network/keys).
     #[default]
     Mock,
-    /// The networked OpenAI Chat Completions provider.
-    Openai,
-    /// The networked Anthropic Messages provider.
-    Anthropic,
-    /// A local llama.cpp model via the supervised `daemon-infer` worker.
+    /// Any networked provider served by `genai` — the adapter (OpenAI, Anthropic, Gemini, Groq,
+    /// DeepSeek, xAI, OpenRouter, Cohere, …) is inferred from the (optionally namespaced) model
+    /// name; there is no daemon-side provider registry. Legacy provider names persisted before this
+    /// collapse (`openai`, `anthropic`, and the short-lived per-family variants) deserialize here
+    /// via serde aliases.
+    #[serde(
+        rename = "genai",
+        alias = "openai",
+        alias = "anthropic",
+        alias = "gemini",
+        alias = "groq",
+        alias = "deep_seek",
+        alias = "xai",
+        alias = "open_router",
+        alias = "cohere"
+    )]
+    GenAi,
+    /// A local llama.cpp model via the supervised `daemon-infer` worker (on-disk GGUF, listed from
+    /// the `ModelManager` catalog).
     LlamaCpp,
-    /// A local mistral.rs model via the supervised `daemon-infer` worker.
+    /// A local mistral.rs model via the supervised `daemon-infer` worker (on-disk, listed from the
+    /// `ModelManager` catalog).
     MistralRs,
+}
+
+impl ProviderSelector {
+    /// Whether this selector is a local-inference engine (llama.cpp / mistral.rs).
+    pub fn is_local(self) -> bool {
+        matches!(self, ProviderSelector::LlamaCpp | ProviderSelector::MistralRs)
+    }
 }
 
 /// Which default context engine (§10) a profile wires into its engine.
@@ -122,6 +144,11 @@ pub struct ProfileSpec {
     /// defaults to the profile `id`.
     #[serde(default)]
     pub credential_ref: Option<String>,
+    /// An optional fallback credential profile the engine fails over to when the primary credential
+    /// profile is exhausted (the `Recovery::Fallback` hop). Composes a cross-credential failover
+    /// chain on top of the per-profile multi-key pool. `None` = no fallback.
+    #[serde(default)]
+    pub fallback_credential_ref: Option<String>,
 }
 
 impl ProfileSpec {
@@ -139,12 +166,18 @@ impl ProfileSpec {
             context_engine: ContextEngineSel::default(),
             memory_provider: MemoryProviderSel::default(),
             credential_ref: None,
+            fallback_credential_ref: None,
         }
     }
 
     /// The credential profile this spec acquires from (explicit `credential_ref`, else the id).
     pub fn credential_profile(&self) -> &str {
         self.credential_ref.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The fallback credential profile, if configured (the `Recovery::Fallback` target).
+    pub fn fallback_credential_profile(&self) -> Option<&str> {
+        self.fallback_credential_ref.as_deref()
     }
 }
 
@@ -282,23 +315,42 @@ impl ModelDescriptor {
         self
     }
 
-    /// The built-in cloud catalog: the well-known Anthropic + OpenAI chat models a GUI can pick
-    /// without live `/v1/models` discovery (the static fallback table). Context windows are the
-    /// published maxima; pricing is the public list price (USD per million tokens).
+    /// The built-in genai-model catalog: a curated static fallback for the GUI picker (used when no
+    /// provider key is set for live `all_model_names` discovery) and the pricing/context overlay
+    /// keyed by model id (genai supplies neither price nor context window). Every entry is the
+    /// `GenAi` provider; the genai adapter is inferred from the model id, so ids that do not
+    /// self-identify by prefix (Groq, OpenRouter) are namespaced (`groq::…`, `open_router::…`).
+    /// Context windows are the published maxima; pricing is the public list price (USD per Mtok).
     pub fn builtin_cloud_catalog() -> Vec<ModelDescriptor> {
-        use ProviderSelector::{Anthropic, Openai};
+        use ProviderSelector::GenAi;
         vec![
-            ModelDescriptor::cloud("claude-opus-4-8", Anthropic, Some(200_000))
+            ModelDescriptor::cloud("claude-opus-4-8", GenAi, Some(200_000))
                 .with_pricing(15.0, 75.0),
-            ModelDescriptor::cloud("claude-sonnet-4-5", Anthropic, Some(200_000))
+            ModelDescriptor::cloud("claude-sonnet-4-5", GenAi, Some(200_000))
                 .with_pricing(3.0, 15.0),
-            ModelDescriptor::cloud("claude-3-5-sonnet-latest", Anthropic, Some(200_000))
+            ModelDescriptor::cloud("claude-3-5-sonnet-latest", GenAi, Some(200_000))
                 .with_pricing(3.0, 15.0),
-            ModelDescriptor::cloud("claude-3-5-haiku-latest", Anthropic, Some(200_000))
+            ModelDescriptor::cloud("claude-3-5-haiku-latest", GenAi, Some(200_000))
                 .with_pricing(0.80, 4.0),
-            ModelDescriptor::cloud("gpt-4o", Openai, Some(128_000)).with_pricing(2.5, 10.0),
-            ModelDescriptor::cloud("gpt-4o-mini", Openai, Some(128_000)).with_pricing(0.15, 0.60),
-            ModelDescriptor::cloud("o3", Openai, Some(200_000)).with_pricing(2.0, 8.0),
+            ModelDescriptor::cloud("gpt-4o", GenAi, Some(128_000)).with_pricing(2.5, 10.0),
+            ModelDescriptor::cloud("gpt-4o-mini", GenAi, Some(128_000)).with_pricing(0.15, 0.60),
+            ModelDescriptor::cloud("o3", GenAi, Some(200_000)).with_pricing(2.0, 8.0),
+            ModelDescriptor::cloud("gemini-2.5-pro", GenAi, Some(1_048_576))
+                .with_pricing(1.25, 10.0),
+            ModelDescriptor::cloud("gemini-2.5-flash", GenAi, Some(1_048_576))
+                .with_pricing(0.30, 2.5),
+            ModelDescriptor::cloud("deepseek-chat", GenAi, Some(128_000))
+                .with_pricing(0.27, 1.10),
+            ModelDescriptor::cloud("deepseek-reasoner", GenAi, Some(128_000))
+                .with_pricing(0.55, 2.19),
+            ModelDescriptor::cloud("grok-4", GenAi, Some(256_000)).with_pricing(3.0, 15.0),
+            // Groq models need an explicit namespace for adapter inference (genai v0.6.0+).
+            ModelDescriptor::cloud("groq::llama-3.3-70b-versatile", GenAi, Some(131_072))
+                .with_pricing(0.59, 0.79),
+            ModelDescriptor::cloud("command-r-plus", GenAi, Some(128_000)).with_pricing(2.5, 10.0),
+            // OpenRouter is a namespaced gateway: a representative default entry.
+            ModelDescriptor::cloud("open_router::openai/gpt-4o", GenAi, Some(128_000))
+                .with_pricing(2.5, 10.0),
         ]
     }
 
@@ -368,7 +420,7 @@ impl ConfigSchema {
                     "provider",
                     "enum",
                     "Model provider implementation",
-                    &["mock", "openai", "anthropic", "llama_cpp", "mistral_rs"],
+                    &["mock", "genai", "llama_cpp", "mistral_rs"],
                 ),
                 field("model", "string", "Model name / id (e.g. claude-opus-4-8)", &[]),
                 field("base_url", "string", "Provider API base URL override (empty = default)", &[]),
@@ -378,5 +430,72 @@ impl ConfigSchema {
                 field("max_iterations", "u32", "Per-turn ReAct round cap", &[]),
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_locality_and_serde_form() {
+        assert!(ProviderSelector::LlamaCpp.is_local());
+        assert!(ProviderSelector::MistralRs.is_local());
+        assert!(!ProviderSelector::GenAi.is_local());
+        assert!(!ProviderSelector::Mock.is_local());
+        // The networked selector serializes to the stable "genai" wire id.
+        assert_eq!(
+            serde_json::to_string(&ProviderSelector::GenAi).unwrap(),
+            "\"genai\""
+        );
+    }
+
+    #[test]
+    fn legacy_provider_names_migrate_to_genai() {
+        // Profiles persisted before the collapse used per-provider names; they all deserialize to
+        // the single genai-backed selector (the adapter is then inferred from the model id).
+        for legacy in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "groq",
+            "deep_seek",
+            "xai",
+            "open_router",
+            "cohere",
+            "genai",
+        ] {
+            let sel: ProviderSelector =
+                serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            assert_eq!(sel, ProviderSelector::GenAi, "{legacy} should map to GenAi");
+        }
+        // The local engines keep their own ids.
+        assert_eq!(
+            serde_json::from_str::<ProviderSelector>("\"llama_cpp\"").unwrap(),
+            ProviderSelector::LlamaCpp
+        );
+    }
+
+    #[test]
+    fn catalog_is_genai_with_known_context() {
+        let catalog = ModelDescriptor::builtin_cloud_catalog();
+        assert!(catalog.iter().all(|m| m.provider == ProviderSelector::GenAi));
+        // opus is still discoverable with its published context window (the overlay).
+        assert_eq!(
+            ModelDescriptor::known_context_length("claude-opus-4-8"),
+            Some(200_000)
+        );
+        // Groq/OpenRouter ids are namespaced so genai can infer the adapter.
+        assert!(catalog
+            .iter()
+            .any(|m| m.id.starts_with("groq::") || m.id.starts_with("open_router::")));
+    }
+
+    #[test]
+    fn fallback_credential_ref_accessor() {
+        let mut spec = ProfileSpec::new("primary", ProviderSelector::GenAi, "claude-opus-4-8");
+        assert_eq!(spec.fallback_credential_profile(), None);
+        spec.fallback_credential_ref = Some("backup".into());
+        assert_eq!(spec.fallback_credential_profile(), Some("backup"));
     }
 }

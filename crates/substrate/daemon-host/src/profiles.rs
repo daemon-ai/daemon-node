@@ -261,7 +261,7 @@ mod tests {
     use daemon_api::ProviderSelector;
 
     fn sample(id: &str) -> ProfileSpec {
-        ProfileSpec::new(id, ProviderSelector::Anthropic, "claude-opus-4-8")
+        ProfileSpec::new(id, ProviderSelector::GenAi, "claude-opus-4-8")
     }
 
     #[test]
