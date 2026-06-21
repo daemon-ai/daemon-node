@@ -21,6 +21,12 @@ const STORE_PATH_ENV: &str = "DAEMON_STORE_PATH";
 const PARTITION_ENV: &str = "DAEMON_PARTITION";
 /// Overrides the model provider/credential profile name.
 const PROFILE_ENV: &str = "DAEMON_PROFILE";
+/// Selects the model provider implementation: `mock` (default), `openai`, or `anthropic`.
+const MODEL_PROVIDER_ENV: &str = "DAEMON_MODEL_PROVIDER";
+/// Overrides the provider API base URL (defaults per provider).
+const BASE_URL_ENV: &str = "DAEMON_BASE_URL";
+/// Overrides the model name sent to a real provider.
+const MODEL_ENV: &str = "DAEMON_MODEL";
 /// Overrides the (stub) credential key the owner authority mints.
 const CREDENTIAL_KEY_ENV: &str = "DAEMON_CREDENTIAL_KEY";
 /// Overrides the engine's `model_retry_attempts` tunable.
@@ -35,6 +41,17 @@ const TOOL_RESULT_BUDGET_ENV: &str = "DAEMON_TOOL_RESULT_BUDGET";
 const JOURNAL_SEED_ENV: &str = "DAEMON_JOURNAL_SEED";
 /// How many orchestrator levels the top fleet materializes before its leaves (fleets-of-fleets).
 const NESTING_DEPTH_ENV: &str = "DAEMON_NESTING_DEPTH";
+
+/// Which model provider implementation the node uses (selected by config).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// The deterministic in-tree provider (zero-config default; no network/keys).
+    Mock,
+    /// The networked OpenAI Chat Completions provider.
+    OpenAi,
+    /// The networked Anthropic Messages provider.
+    Anthropic,
+}
 
 /// The durable store backend selected by config.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +80,13 @@ pub struct NodeConfig {
     pub scan_interval: Duration,
     /// The model provider + credential profile name (selects the registered provider builder).
     pub profile: String,
+    /// Which model provider implementation to use (mock|openai|anthropic).
+    pub provider_kind: ProviderKind,
+    /// An optional provider API base-URL override. `None` uses the provider's default endpoint (the
+    /// usual case); `Some` points the client elsewhere (a gateway/proxy, or a test mock server).
+    pub base_url: Option<String>,
+    /// The model name sent to a real provider (resolved with a per-provider default; empty for mock).
+    pub model: String,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -86,6 +110,9 @@ struct FileConfig {
     dispatch_interval_ms: Option<u64>,
     scan_interval_ms: Option<u64>,
     profile: Option<String>,
+    model_provider: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
     credential_key: Option<String>,
     model_retry_attempts: Option<u8>,
     context_budget_tokens: Option<u32>,
@@ -154,6 +181,31 @@ impl NodeConfig {
         let profile = env_string(PROFILE_ENV)
             .or(file.profile)
             .unwrap_or_else(|| "openai".to_string());
+
+        let provider_kind = match env_string(MODEL_PROVIDER_ENV)
+            .or(file.model_provider)
+            .unwrap_or_else(|| "mock".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mock" => ProviderKind::Mock,
+            "openai" => ProviderKind::OpenAi,
+            "anthropic" => ProviderKind::Anthropic,
+            other => anyhow::bail!(
+                "unknown model provider {other:?} (expected mock|openai|anthropic)"
+            ),
+        };
+        // No default: `None` lets the provider client use its own default endpoint. An override is
+        // only meaningful for a gateway/proxy or the in-process wire tests.
+        let base_url = env_string(BASE_URL_ENV).or(file.base_url);
+        let model = env_string(MODEL_ENV)
+            .or(file.model)
+            .unwrap_or_else(|| match provider_kind {
+                ProviderKind::OpenAi => "gpt-4o-mini".to_string(),
+                ProviderKind::Anthropic => "claude-3-5-sonnet-latest".to_string(),
+                ProviderKind::Mock => String::new(),
+            });
+
         let credential_key = env_string(CREDENTIAL_KEY_ENV)
             .or(file.credential_key)
             .unwrap_or_else(|| "sk-configured".to_string());
@@ -175,6 +227,9 @@ impl NodeConfig {
             dispatch_interval,
             scan_interval,
             profile,
+            provider_kind,
+            base_url,
+            model,
             credential_key,
             engine,
             journal_seed,

@@ -27,12 +27,13 @@ use daemon_host::{
     OwnerBroker,
 };
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
+use daemon_providers::GenAiProvider;
 use daemon_provision::CutChannel;
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
 use daemon_transport::RemoteHost;
 
-use config::{NodeConfig, StoreBackend};
+use config::{NodeConfig, ProviderKind, StoreBackend};
 
 /// The environment variable that selects the placed-child role.
 const PLACED_CHILD_ENV: &str = "DAEMON_PLACED_CHILD";
@@ -55,6 +56,53 @@ async fn main() -> anyhow::Result<()> {
     }
 
     run_as_host(NodeConfig::load()?).await
+}
+
+/// Build the provider registry the config selected. `Mock` keeps the deterministic fleet wiring
+/// (a completing default plus the delegating-orchestrator / completing-child demo profiles); a real
+/// provider becomes the registry default for every profile (the engine threads the credential lease
+/// secret onto each request as the bearer).
+fn build_providers(cfg: &NodeConfig) -> ProviderRegistry {
+    let mut providers = ProviderRegistry::new();
+    match cfg.provider_kind {
+        ProviderKind::Mock => {
+            providers.set_default(Arc::new(|| {
+                Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
+            }));
+            providers.register(
+                "orchestrator",
+                Arc::new(|| {
+                    Arc::new(MockProvider::delegating("orchestrate", "fleet done"))
+                        as Arc<dyn Provider>
+                }),
+            );
+            providers.register(
+                "child",
+                Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
+            );
+        }
+        ProviderKind::OpenAi => {
+            let (base, model) = (cfg.base_url.clone(), cfg.model.clone());
+            providers.set_default(Arc::new(move || {
+                let mut p = GenAiProvider::openai(model.clone());
+                if let Some(base) = &base {
+                    p = p.with_endpoint(base.clone());
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            }));
+        }
+        ProviderKind::Anthropic => {
+            let (base, model) = (cfg.base_url.clone(), cfg.model.clone());
+            providers.set_default(Arc::new(move || {
+                let mut p = GenAiProvider::anthropic(model.clone());
+                if let Some(base) = &base {
+                    p = p.with_endpoint(base.clone());
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            }));
+        }
+    }
+    providers
 }
 
 /// Build the durable store backend the config selected.
@@ -87,22 +135,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         })
     };
 
-    // Provider selection seam: Mock is the default; a real networked provider drops in via a single
-    // `register(...)` / `set_default(...)` without touching the engine or the construction sites.
-    let mut providers = ProviderRegistry::new();
-    providers.set_default(Arc::new(|| {
-        Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
-    }));
-    providers.register(
-        "orchestrator",
-        Arc::new(|| {
-            Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
-        }),
-    );
-    providers.register(
-        "child",
-        Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
-    );
+    // Provider selection seam: Mock is the zero-config default; a real networked provider drops in
+    // via `set_default(...)` without touching the engine or the construction sites. The API key
+    // flows per-call through the credential broker (the lease secret -> `Request.auth`), so a real
+    // provider builder needs only the base URL + model.
+    let providers = build_providers(&cfg);
 
     let host_config = HostConfig {
         partition: cfg.partition,

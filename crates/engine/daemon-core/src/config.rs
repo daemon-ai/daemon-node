@@ -15,6 +15,20 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 90;
 /// pipeline so one tool cannot dominate the model context.
 pub const DEFAULT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
 
+/// The default §8 recovery budget: how many times a single `call_model` retries a *recoverable*
+/// model failure (rate-limit/transport/overload/format) before giving up (hermes' parent default 3).
+pub const DEFAULT_MODEL_MAX_RETRIES: u32 = 3;
+
+/// The default §8 backoff floor (ms): the base of the jittered exponential backoff (2s).
+pub const DEFAULT_MODEL_BACKOFF_BASE_MS: u64 = 2_000;
+
+/// The default §8 backoff ceiling (ms): the cap on any single backoff sleep (120s).
+pub const DEFAULT_MODEL_BACKOFF_MAX_MS: u64 = 120_000;
+
+/// The default §8 stale-stream watchdog (ms): a model stream that emits nothing for this long is
+/// classified as a transient transport failure and recovered (180s).
+pub const DEFAULT_MODEL_STREAM_WATCHDOG_MS: u64 = 180_000;
+
 /// Engine tunables governing one engine's turns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -31,6 +45,16 @@ pub struct Config {
     pub max_iterations: u32,
     /// The per-tool result-byte budget (§12 sanitize+budget); `0` disables truncation.
     pub tool_result_budget: usize,
+    /// The §8 recovery budget: how many times one `call_model` retries a *recoverable* model
+    /// failure (rate-limit/transport/overload/format) before giving up.
+    pub model_max_retries: u32,
+    /// The §8 backoff floor (ms): the base of the jittered exponential backoff.
+    pub model_backoff_base_ms: u64,
+    /// The §8 backoff ceiling (ms): the cap on any single backoff sleep.
+    pub model_backoff_max_ms: u64,
+    /// The §8 stale-stream watchdog (ms): a model stream silent this long is recovered as a
+    /// transient transport failure. `0` disables the watchdog.
+    pub model_stream_watchdog_ms: u64,
 }
 
 impl Default for Config {
@@ -40,6 +64,10 @@ impl Default for Config {
             context_budget_tokens: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             tool_result_budget: DEFAULT_TOOL_RESULT_BUDGET,
+            model_max_retries: DEFAULT_MODEL_MAX_RETRIES,
+            model_backoff_base_ms: DEFAULT_MODEL_BACKOFF_BASE_MS,
+            model_backoff_max_ms: DEFAULT_MODEL_BACKOFF_MAX_MS,
+            model_stream_watchdog_ms: DEFAULT_MODEL_STREAM_WATCHDOG_MS,
         }
     }
 }

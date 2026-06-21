@@ -1,14 +1,19 @@
-//! The model provider port (§7) and a deterministic [`MockProvider`].
+//! The model provider port (§7) and the deterministic [`MockProvider`]/[`ScriptedProvider`].
 //!
 //! The engine talks to a model through this trait, not a concrete client, so providers are
-//! swappable and standalone-embeddable. Phase 3 ships only the [`MockProvider`]; real provider
-//! clients (and streaming) arrive later.
+//! swappable and standalone-embeddable. The trait now carries streaming ([`Provider::stream`] +
+//! [`StreamEvent`]) with a `chat()`-adapting default and the §8 [`Failure`] taxonomy + [`Recovery`]
+//! mapping consumed by [`crate::recovery`]. The in-tree providers stay deterministic (no network);
+//! real networked clients live in the sibling `daemon-providers` crate.
 
 use crate::conversation::{Conversation, ToolCall, Turn};
 use crate::profile::ProviderBuilder;
+use crate::tools::ToolDef;
 use daemon_common::{ProfileRef, UsageDelta};
+use futures::stream::{self, BoxStream};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// How a model expects tool calls to be encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +46,15 @@ pub struct Request {
     pub system: String,
     /// The flattened conversation messages.
     pub messages: Vec<RequestMsg>,
-    /// The names of the tools offered this turn.
-    pub tools: Vec<String>,
+    /// The tools offered this turn, each with its JSON-Schema (the §12 registry's
+    /// [`ToolDef`](crate::tools::ToolDef)s). A provider that supports native tools sends the schema;
+    /// a name-only consumer can use [`Request::tool_names`].
+    pub tools: Vec<ToolDef>,
+    /// The bearer credential for the call, threaded from the acquired capability lease
+    /// ([`daemon_common::CapabilityLease::secret`]). `None` for the deterministic in-tree providers
+    /// (which ignore it); a real networked provider sends it as the `Authorization` bearer. Treat as
+    /// a secret — never log it.
+    pub auth: Option<String>,
 }
 
 impl Request {
@@ -50,15 +62,28 @@ impl Request {
     pub fn has_tool_result(&self) -> bool {
         self.messages.iter().any(|m| m.role == "tool")
     }
+
+    /// The names of the offered tools (the valid set §9 tool-name repair resolves against).
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name.clone()).collect()
+    }
 }
 
 /// One flattened message in a [`Request`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Carries the native tool-call linkage so a provider can round-trip a tool exchange faithfully: an
+/// `assistant` message that called tools fills [`RequestMsg::tool_calls`], and the matching `tool`
+/// result message fills [`RequestMsg::tool_call_id`]. Name-only providers can ignore both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RequestMsg {
     /// The role: `user`, `assistant`, or `tool`.
     pub role: String,
-    /// The message content.
+    /// The message content (assistant/user text, or the tool result payload).
     pub content: String,
+    /// For an `assistant` message: the tool calls it emitted (native round-trip).
+    pub tool_calls: Vec<ToolCall>,
+    /// For a `tool` message: the id of the call this result answers (native round-trip).
+    pub tool_call_id: Option<String>,
 }
 
 /// What a model produced for one turn (§4.4).
@@ -74,16 +99,89 @@ pub struct ModelOutput {
     pub usage: UsageDelta,
 }
 
-/// A model/provider failure.
+/// One event in a streamed model response (§7). Real providers emit incremental
+/// [`StreamEvent::TextDelta`]/[`StreamEvent::ReasoningDelta`] as SSE chunks arrive and a terminal
+/// [`StreamEvent::Done`] carrying the assembled canonical [`ModelOutput`]; deterministic providers
+/// emit a single `Done` via the [`Provider::stream`] default.
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+    /// Incremental assistant text.
+    TextDelta(String),
+    /// Incremental reasoning text (the separate reasoning channel).
+    ReasoningDelta(String),
+    /// Incremental usage accounting (folded into the running total).
+    Usage(UsageDelta),
+    /// The terminal canonical output (text/reasoning/tool-calls/usage assembled).
+    Done(ModelOutput),
+}
+
+/// What recovery action a [`Failure`] suggests (§8). The recovery middleware
+/// ([`crate::recovery`]) maps failures to one of these and drives retry/rotate/compact/fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// Retry after an optional backoff (honors a server `Retry-After`).
+    Retry {
+        /// The minimum delay before retrying, if the provider specified one.
+        after: Option<Duration>,
+    },
+    /// Rotate the credential and retry (quota/auth on a poolable key).
+    Rotate,
+    /// The request exceeded the context window — compact then retry once (§8 -> §10 tie-in).
+    Compact,
+    /// Hop to the single fallback profile (the failure is not retryable on this profile).
+    Fallback,
+    /// Give up — the turn ends `Failed`.
+    Abort,
+}
+
+/// A model/provider failure (§8 taxonomy). The legacy [`Failure::Provider`]/[`Failure::Rotatable`]/
+/// [`Failure::Other`] variants are retained for the in-tree call sites; the networked providers
+/// classify HTTP responses into the precise variants via
+/// [`classify_api_error`](crate::recovery::classify_api_error).
 #[derive(Debug, thiserror::Error)]
 pub enum Failure {
-    /// The provider itself failed.
+    /// The provider itself failed (unclassified).
     #[error("provider: {0}")]
     Provider(String),
-    /// A rotatable provider failure (quota/rate-limit/auth, e.g. HTTP 429/402/401): the engine
-    /// should mark the credential and retry on a rotated one (`credential_pool.py` `should_rotate`).
+    /// A rotatable provider failure (quota/rate-limit/auth on a poolable key): mark the credential
+    /// and retry on a rotated one (`credential_pool.py` `should_rotate`).
     #[error("rotatable: {0}")]
     Rotatable(String),
+    /// Rate limited (HTTP 429) — back off, honoring `Retry-After` when present.
+    #[error("rate limited")]
+    RateLimit {
+        /// The server-advised minimum delay before retrying, if any.
+        retry_after: Option<Duration>,
+        /// A human-readable detail.
+        message: String,
+    },
+    /// A billing/quota-exhausted condition (HTTP 402) — not retryable on this credential.
+    #[error("billing: {0}")]
+    Billing(String),
+    /// An authentication/authorization failure (HTTP 401/403) — rotate the credential.
+    #[error("auth: {0}")]
+    Auth(String),
+    /// The request exceeded the model context window — compact and retry once.
+    #[error("context overflow: {0}")]
+    ContextOverflow(String),
+    /// The request payload was too large (HTTP 413) — compact and retry once.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+    /// The request/response tripped a content policy filter — not retryable as-is.
+    #[error("content policy: {0}")]
+    ContentPolicy(String),
+    /// The provider returned a malformed/unparseable response — retry once to re-elicit.
+    #[error("format error: {0}")]
+    FormatError(String),
+    /// A transient transport error (timeout, reset, hung stream) — retry with backoff.
+    #[error("transient transport: {0}")]
+    TransientTransport(String),
+    /// The provider is overloaded (HTTP 503/529) — retry with backoff.
+    #[error("provider overloaded: {0}")]
+    ProviderOverloaded(String),
+    /// An unrecoverable provider error — abort the turn.
+    #[error("fatal: {0}")]
+    Fatal(String),
     /// The turn was cancelled cooperatively.
     #[error("cancelled")]
     Cancelled,
@@ -93,9 +191,38 @@ pub enum Failure {
 }
 
 impl Failure {
-    /// Whether this failure should trigger a credential rotation + retry.
+    /// Whether this failure should trigger a credential rotation + retry. Quota/auth-class failures
+    /// rotate; `RateLimit` is also rotatable (a fresh key may have headroom).
     pub fn is_rotatable(&self) -> bool {
-        matches!(self, Failure::Rotatable(_))
+        matches!(
+            self,
+            Failure::Rotatable(_)
+                | Failure::Auth(_)
+                | Failure::Billing(_)
+                | Failure::RateLimit { .. }
+        )
+    }
+
+    /// The recovery action this failure suggests (§8). Exhaustive over the taxonomy so a new variant
+    /// forces a deliberate recovery decision.
+    pub fn recovery(&self) -> Recovery {
+        match self {
+            Failure::RateLimit { retry_after, .. } => Recovery::Retry {
+                after: *retry_after,
+            },
+            Failure::TransientTransport(_) | Failure::ProviderOverloaded(_) => {
+                Recovery::Retry { after: None }
+            }
+            // A malformed response: one bounded retry can re-elicit a clean parse.
+            Failure::FormatError(_) => Recovery::Retry { after: None },
+            Failure::Rotatable(_) | Failure::Auth(_) => Recovery::Rotate,
+            // Billing/content-policy can't clear on the same profile: hop to the fallback profile.
+            Failure::Billing(_) | Failure::ContentPolicy(_) => Recovery::Fallback,
+            Failure::ContextOverflow(_) | Failure::PayloadTooLarge(_) => Recovery::Compact,
+            Failure::Provider(_) | Failure::Other(_) | Failure::Fatal(_) | Failure::Cancelled => {
+                Recovery::Abort
+            }
+        }
     }
 }
 
@@ -106,6 +233,16 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     /// Run a (non-streaming) chat completion.
     async fn chat(&self, req: Request) -> Result<ModelOutput, Failure>;
+    /// Stream a chat completion as [`StreamEvent`]s, terminating with [`StreamEvent::Done`].
+    ///
+    /// The provided default adapts [`Provider::chat`] into a single terminal `Done` event, so a
+    /// non-streaming provider (the deterministic [`MockProvider`]/[`ScriptedProvider`]) needs no
+    /// extra code; a real streaming provider overrides this to forward SSE deltas as they arrive.
+    fn stream(&self, req: Request) -> BoxStream<'_, Result<StreamEvent, Failure>> {
+        Box::pin(stream::once(async move {
+            self.chat(req).await.map(StreamEvent::Done)
+        }))
+    }
 }
 
 /// A name -> [`ProviderBuilder`] map with a fallback default — the provider *selection* seam.
@@ -146,28 +283,36 @@ impl ProviderRegistry {
     }
 }
 
-/// Flatten a conversation into a [`Request`] (the `build_context` phase, minimal form).
-pub fn build_context(conv: &Conversation, tools: &[String]) -> Request {
+/// Flatten a conversation into a [`Request`] (the `build_context` phase). A tool turn becomes an
+/// `assistant` message carrying its native [`ToolCall`]s plus one `tool` message per result (tagged
+/// with its `call_id`), so a native provider round-trips the exchange faithfully.
+pub fn build_context(conv: &Conversation, tools: &[ToolDef]) -> Request {
     let mut messages = Vec::new();
     for turn in &conv.turns {
         match turn {
             Turn::User(u) => messages.push(RequestMsg {
                 role: "user".into(),
                 content: u.text.clone(),
+                ..Default::default()
             }),
             Turn::Assistant(a) => messages.push(RequestMsg {
                 role: "assistant".into(),
                 content: a.text.clone(),
+                ..Default::default()
             }),
             Turn::Tool(t) => {
                 messages.push(RequestMsg {
                     role: "assistant".into(),
                     content: t.assistant.text.clone(),
+                    tool_calls: t.calls.iter().map(|(call, _)| call.clone()).collect(),
+                    tool_call_id: None,
                 });
                 for (_call, result) in &t.calls {
                     messages.push(RequestMsg {
                         role: "tool".into(),
                         content: result.content.clone(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(result.call_id.clone()),
                     });
                 }
             }
@@ -177,6 +322,7 @@ pub fn build_context(conv: &Conversation, tools: &[String]) -> Request {
         system: conv.system.text.clone(),
         messages,
         tools: tools.to_vec(),
+        auth: None,
     }
 }
 

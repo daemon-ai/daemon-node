@@ -7,23 +7,27 @@
 //! deterministic phase boundary (lifecycle §3.1).
 
 use crate::config::Config;
+use crate::context::{BudgetedContextEngine, ContextEngine, PromptAssembler};
 use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
 use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
 use crate::events::EventSink;
 use crate::exec::{ExecutionEnvironment, LocalEnvironment};
-use crate::provider::{build_context, ModelOutput, Provider};
+use crate::memory::{MemoryProvider, RecallQuery};
+use crate::provider::{ModelOutput, Provider};
+use crate::recovery::{drive_model_call, ModelCallPolicy, RecoveryStep};
 use crate::snapshot::Snapshot;
 use crate::tool_pipeline::run_tool;
 use crate::tools::ToolRegistry;
 use crate::turn::{Effect, TurnCx};
 use crate::Failure;
-use daemon_common::{Budget, CredScope, Epoch, JobId, ProfileRef, SessionId};
+use daemon_common::{Budget, CredScope, Epoch, JobId, ProfileRef, RateLimitSnapshot, SessionId};
 use daemon_protocol::{
     AgentEvent, CompletionSource, ConvTurnView, ConvView, EndReason, HostRequestHandler,
     ToolCallView, ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// A background-job completion handed back to the engine on rehydration (the core-local form of the
 /// durable `JobCompletion`; the host adapter converts between them).
@@ -62,10 +66,22 @@ pub struct Engine {
     budget: Budget,
     credentials: Arc<dyn CredentialProvider>,
     profile: ProfileRef,
+    /// The single fallback profile the §8 recovery loop hops to when the active profile cannot
+    /// recover (persistent auth/billing/content-policy). `None` disables the hop (the default).
+    fallback_profile: Option<ProfileRef>,
     config: Config,
     /// The contained execution environment (§13) tools run in; the host injects a per-session
     /// workspace-rooted one via [`crate::EngineProfile`], else the default sandbox.
     exec: Arc<dyn ExecutionEnvironment>,
+    /// The context engine (§10): prompt assembly, budget pressure, and compaction. Defaults to the
+    /// cheap [`BudgetedContextEngine`] (drop-oldest).
+    context: Arc<dyn ContextEngine>,
+    /// The tiered prompt assembler (§10) for the current turn; memory (§11) populates its non-body
+    /// tiers at turn start, the call_model phase folds them into the request.
+    assembler: PromptAssembler,
+    /// The registered memory providers (§11). Empty by default — memory is opt-in; the engine drives
+    /// their hook order (`recall -> prompt_block -> before_compact -> after_turn`) around each turn.
+    memory: Vec<Arc<dyn MemoryProvider>>,
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
     next_trigger: Option<TurnTrigger>,
@@ -91,8 +107,12 @@ impl Engine {
             // injected via `with_credentials` (host-spec §6).
             credentials: Arc::new(EmbeddedCredentialPool::single_key()),
             profile: ProfileRef::new("default"),
+            fallback_profile: None,
             config: Config::default(),
             exec,
+            context: Arc::new(BudgetedContextEngine::default()),
+            assembler: PromptAssembler::default(),
+            memory: Vec::new(),
             next_trigger: None,
         }
     }
@@ -128,6 +148,19 @@ impl Engine {
         self
     }
 
+    /// Inject the context engine (§10) this engine assembles/compacts context with (the default is
+    /// the cheap [`BudgetedContextEngine`]).
+    pub fn with_context_engine(mut self, context: Arc<dyn ContextEngine>) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Register the memory providers (§11) this engine consults around each turn (default empty).
+    pub fn with_memory(mut self, memory: Vec<Arc<dyn MemoryProvider>>) -> Self {
+        self.memory = memory;
+        self
+    }
+
     /// Inject the credential provider + profile this engine acquires capabilities from (the host
     /// injects an authority-backed or brokered impl; the default is the embedded L1 pool).
     pub fn with_credentials(
@@ -137,6 +170,13 @@ impl Engine {
     ) -> Self {
         self.credentials = credentials;
         self.profile = profile;
+        self
+    }
+
+    /// Set the single fallback profile the §8 recovery loop hops to when the active profile cannot
+    /// recover a model failure (persistent auth/billing/content-policy).
+    pub fn with_fallback_profile(mut self, profile: ProfileRef) -> Self {
+        self.fallback_profile = Some(profile);
         self
     }
 
@@ -271,64 +311,199 @@ impl Engine {
         self.snapshot.epoch
     }
 
-    /// The registered tool names (offered to the model each turn).
-    fn tool_names(&self) -> Vec<String> {
-        self.registry.names()
+    /// The registered tool definitions (name + JSON-Schema) offered to the model each turn.
+    fn tool_defs(&self) -> Vec<crate::tools::ToolDef> {
+        self.registry.defs()
     }
 
-    /// `call_model` phase: acquire a scoped credential capability, flatten context, ask the
-    /// provider under that capability, stream usage + reasoning. On a rotatable failure
-    /// (quota/auth) the credential is rotated and the call retried once (§7 `should_rotate`).
+    /// `call_model` phase (§4.2) wrapped in §8 recovery: acquire a scoped credential, thread its
+    /// secret onto the request, and drive the provider **stream** under the stale-stream watchdog +
+    /// cancel token (streaming `TextDelta`/`ReasoningDelta`/`Usage` to the host). A failure is
+    /// classified and bounded by [`ModelCallPolicy::decide`]:
+    ///
+    /// - *retry* (rate-limit/transport/overload/format): emit `RateLimit`, sleep a jittered backoff
+    ///   (honoring `Retry-After`), retry on the same profile;
+    /// - *rotate* (auth/quota): mark the credential out, retry on a rotated one;
+    /// - *compact* (context/payload overflow): compact the context once and retry (the §8 -> §10
+    ///   tie-in; a no-op until a [`ContextEngine`](crate::context::ContextEngine) is wired);
+    /// - *fallback*: hop once to the configured fallback profile;
+    /// - *abort*: surface the failure (the turn ends `Failed`).
     ///
     /// `offer_tools` is `false` for the final budget-exhausted summary call (no tools offered, so the
     /// model must produce prose), `true` for every normal ReAct round.
-    async fn call_model(&self, events: &EventSink, offer_tools: bool) -> Result<ModelOutput, Failure> {
+    async fn call_model(
+        &mut self,
+        events: &EventSink,
+        offer_tools: bool,
+        cancel: &CancellationToken,
+    ) -> Result<ModelOutput, Failure> {
+        let policy = ModelCallPolicy::from_config(&self.config);
         let tools = if offer_tools {
-            self.tool_names()
+            self.tool_defs()
         } else {
             Vec::new()
         };
-        let req = build_context(&self.snapshot.conversation, &tools);
-        // The scope a turn needs: the `chat` action on this engine's profile.
-        let want = CredScope::new([self.profile.as_str()], ["chat"], self.budget.tokens);
-        let mut attempt = 0u8;
-        let out = loop {
+        let mut attempt = 0u32;
+        let mut compacted = false;
+        loop {
+            // Rebuilt each attempt: a compaction step rewrites the conversation in place. The §10
+            // assembler folds memory/stable tiers into the system preamble (empty by default).
+            let mut req = self.assembler.assemble(&self.snapshot.conversation, &tools);
+            // The scope a turn needs: the `chat` action on this engine's profile.
+            let want = CredScope::new([self.profile.as_str()], ["chat"], self.budget.tokens);
             let lease = self
                 .credentials
                 .acquire(&self.profile, &want)
                 .await
                 .map_err(|e| Failure::Provider(format!("credential acquire: {e}")))?;
-            let result = self.provider.chat(req.clone()).await;
+            // Thread the lease secret as the request's bearer credential (the §7 credential layer):
+            // the deterministic providers ignore it; a networked provider sends it as `Authorization`.
+            req.auth = lease.secret.as_ref().map(|s| s.expose().to_string());
+            let result =
+                drive_model_call(&*self.provider, req, cancel, policy.watchdog, events).await;
             self.credentials.release(&lease).await;
-            match result {
-                Ok(out) => break out,
-                Err(f) if f.is_rotatable() && attempt < self.config.model_retry_attempts => {
-                    // Mark the credential out and retry on a rotated one (up to the configured count).
+            let failure = match result {
+                Ok(out) => return Ok(out),
+                Err(f) => f,
+            };
+            match policy.decide(&failure, attempt) {
+                RecoveryStep::Retry { after } => {
+                    if let Failure::RateLimit { retry_after, .. } = &failure {
+                        let reset_ms = retry_after.map(|d| d.as_millis() as u64);
+                        events.emit(|seq| AgentEvent::RateLimit {
+                            seq,
+                            snapshot: RateLimitSnapshot {
+                                remaining: None,
+                                limit: None,
+                                reset_ms,
+                            },
+                        });
+                    }
+                    tokio::time::sleep(after).await;
+                    attempt += 1;
+                }
+                RecoveryStep::Rotate => {
                     self.credentials.rotate(&self.profile, &lease.cap_id).await;
                     attempt += 1;
-                    continue;
                 }
-                Err(f) => return Err(f),
+                RecoveryStep::Compact => {
+                    // Compact at most once; if it freed nothing the overflow is unrecoverable.
+                    if !compacted && self.compact_context().await {
+                        compacted = true;
+                    } else {
+                        return Err(failure);
+                    }
+                }
+                RecoveryStep::Fallback => {
+                    // A single hop to the configured fallback profile with a fresh retry budget.
+                    match self.fallback_profile.clone() {
+                        Some(fb) if fb != self.profile => {
+                            self.profile = fb;
+                            attempt = 0;
+                        }
+                        _ => return Err(failure),
+                    }
+                }
+                RecoveryStep::Abort => return Err(failure),
             }
-        };
-        let usage = out.usage;
-        events.emit(|seq| AgentEvent::Usage { seq, delta: usage });
-        if let Some(reasoning) = &out.reasoning {
-            let reasoning = reasoning.clone();
-            events.emit(|seq| AgentEvent::ReasoningDelta {
-                seq,
-                text: reasoning,
-            });
         }
-        Ok(out)
     }
 
-    /// Finalize a text-only turn: stream the text and append the assistant turn.
-    fn finalize_text(&mut self, out: &ModelOutput, events: &EventSink) {
-        if !out.text.is_empty() {
-            let text = out.text.clone();
-            events.emit(|seq| AgentEvent::TextDelta { seq, text });
+    /// §11 `recall` + `prompt_block` gathering into the §10 assembler tiers, in spec order: each
+    /// provider's recall results land in the `recalled` tier and its persistent `prompt_block` in
+    /// the `stable` tier. A no-op when no [`MemoryProvider`](crate::memory::MemoryProvider) is
+    /// registered. The recall query is the latest user message.
+    async fn gather_memory(&mut self) {
+        if self.memory.is_empty() {
+            return;
         }
+        let query = RecallQuery {
+            text: self.latest_user_text(),
+            top_k: 5,
+        };
+        for provider in &self.memory {
+            if let Some(block) = provider.recall(&query).await {
+                self.assembler.recalled.push(block.text);
+            }
+            if let Some(block) = provider.prompt_block() {
+                self.assembler.stable.push(block.text);
+            }
+        }
+    }
+
+    /// The most recent user message text (the salient §11 recall query); empty if none.
+    fn latest_user_text(&self) -> String {
+        self.snapshot
+            .conversation
+            .turns
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                Turn::User(u) => Some(u.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// §11 `before_compact` notification to every memory provider (a chance to persist before the
+    /// context engine drops/summarizes turns).
+    async fn before_compact_memory(&mut self) {
+        for provider in &self.memory {
+            provider.before_compact(&self.snapshot.conversation).await;
+        }
+    }
+
+    /// §11 `after_turn` notification: hand every memory provider the just-recorded turn so it can
+    /// persist new memories. Called after a turn's content is recorded, before `ctx.after_response`.
+    async fn after_turn_memory(&self) {
+        if self.memory.is_empty() {
+            return;
+        }
+        if let Some(turn) = self.snapshot.conversation.turns.last().cloned() {
+            for provider in &self.memory {
+                provider.after_turn(&turn, &self.snapshot.conversation).await;
+            }
+        }
+    }
+
+    /// §10/§11 pre-turn hooks (run once before the ReAct loop): re-gather memory recall/blocks into
+    /// the §10 [`PromptAssembler`] tiers, then measure budget [`Pressure`](crate::context::Pressure)
+    /// and proactively compact when over the configured budget (`memory.before_compact` ->
+    /// `ctx.compact`). Memory population is a no-op until a [`MemoryProvider`](crate::memory::MemoryProvider)
+    /// is registered.
+    async fn prepare_turn_context(&mut self) {
+        self.assembler.reset_turn();
+        self.gather_memory().await;
+        let budget = self.config.context_budget_tokens.map(|b| b as usize);
+        let pressure = self.context.before_turn(&self.snapshot.conversation, budget);
+        if let (true, Some(b)) = (pressure.over_budget(), budget) {
+            self.before_compact_memory().await;
+            let conv = std::mem::take(&mut self.snapshot.conversation);
+            self.snapshot.conversation = self.context.compact(conv, b).await;
+        }
+    }
+
+    /// Compact the conversation via the §10 context engine (the §8 -> §10 tie-in). On an explicit
+    /// `ContextOverflow`/`PayloadTooLarge` we compact regardless of the soft budget: use the
+    /// configured budget if set, else force a reduction by targeting half the current estimate.
+    /// Returns whether any turn was actually dropped (the recovery loop treats `false` as
+    /// "overflow is unrecoverable").
+    async fn compact_context(&mut self) -> bool {
+        let target = self
+            .config
+            .context_budget_tokens
+            .map(|b| b as usize)
+            .unwrap_or_else(|| crate::context::estimate_tokens(&self.snapshot.conversation) / 2);
+        let before = self.snapshot.conversation.turns.len();
+        let conv = std::mem::take(&mut self.snapshot.conversation);
+        self.snapshot.conversation = self.context.compact(conv, target).await;
+        self.snapshot.conversation.turns.len() < before
+    }
+
+    /// Finalize a text-only turn: append the assistant turn. The text/reasoning deltas were already
+    /// streamed to the host by [`Engine::call_model`] (via [`drive_model_call`]); this only records
+    /// the durable conversation turn.
+    fn finalize_text(&mut self, out: &ModelOutput, _events: &EventSink) {
         self.snapshot.conversation.push_assistant(AssistantMsg {
             text: out.text.clone(),
             reasoning: out.reasoning.clone(),
@@ -395,6 +570,10 @@ impl Engine {
             return Ok(self.suspend(job_id, events, false));
         }
 
+        // §11/§10 pre-turn hooks: gather memory recall/blocks into the assembler, then measure
+        // budget pressure and compact if over budget (memory.before_compact -> ctx.compact).
+        self.prepare_turn_context().await;
+
         // The in-turn ReAct loop (§4.2): build_context -> call_model -> execute_tools -> observe ->
         // call_model again, until the model returns final text (completion) or a tool delegates
         // (durable suspension). The iteration budget is the hard stop. The loop runs fully
@@ -404,15 +583,16 @@ impl Engine {
         let tool_result_budget = self.config.tool_result_budget;
         let mut rounds_left = self.config.max_iterations;
 
+        let cancel = control.cancel_token();
         loop {
             if rounds_left == 0 {
                 // Budget exhausted: one final toolless call asks the model to summarize what it has,
                 // then the turn ends `BudgetExhausted` (the model cannot keep calling tools forever).
-                return Ok(self.finish_budget_exhausted(events).await);
+                return Ok(self.finish_budget_exhausted(events, &cancel).await);
             }
             rounds_left -= 1;
 
-            let out = match self.call_model(events, true).await {
+            let out = match self.call_model(events, true, &cancel).await {
                 Ok(out) => out,
                 Err(f) => return Ok(self.finish_failed(f, events)),
             };
@@ -423,7 +603,11 @@ impl Engine {
             }
 
             if out.tool_calls.is_empty() {
+                // §11 -> §10 post-turn hooks (spec order): record the assistant turn, then
+                // memory.after_turn, then ctx.after_response.
                 self.finalize_text(&out, events);
+                self.after_turn_memory().await;
+                self.context.after_response(&out.usage);
                 return Ok(self.complete(out, events));
             }
 
@@ -503,15 +687,22 @@ impl Engine {
                 self.snapshot.waiting_for.push(job_id.clone());
                 return Ok(self.suspend(job_id, events, true));
             }
-            // No delegation: loop — the next `call_model` sees the tool results in context.
+            // §11 -> §10 post-round hooks (spec order) on the recorded tool turn, then loop — the
+            // next `call_model` sees the tool results in context.
+            self.after_turn_memory().await;
+            self.context.after_response(&out.usage);
         }
     }
 
     /// Finalize a turn that hit its iteration budget: one final toolless model call to summarize,
     /// then `TurnFinished { BudgetExhausted }`. Any tool calls the model attempts on this pass are
     /// ignored — the turn is ending.
-    async fn finish_budget_exhausted(&mut self, events: &EventSink) -> TurnOutcome {
-        let out = match self.call_model(events, false).await {
+    async fn finish_budget_exhausted(
+        &mut self,
+        events: &EventSink,
+        cancel: &CancellationToken,
+    ) -> TurnOutcome {
+        let out = match self.call_model(events, false, cancel).await {
             Ok(out) => out,
             Err(f) => return self.finish_failed(f, events),
         };
@@ -921,5 +1112,254 @@ mod tests {
             TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
             _ => panic!("expected interruption"),
         }
+    }
+
+    // --- §8 recovery + §10/§11 hooks ---
+
+    use std::collections::VecDeque;
+
+    /// A provider that replays a scripted sequence of results (failures then success), defaulting to
+    /// a completing response once the script is exhausted.
+    struct FaultProvider {
+        script: std::sync::Mutex<VecDeque<Result<ModelOutput, Failure>>>,
+        calls: AtomicU64,
+    }
+
+    impl FaultProvider {
+        fn new(seq: Vec<Result<ModelOutput, Failure>>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(seq.into_iter().collect()),
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    fn ok_text(text: &str) -> ModelOutput {
+        ModelOutput {
+            text: text.into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: UsageDelta::default(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FaultProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(ok_text("default")))
+        }
+    }
+
+    /// A 429 with backoff retries (emitting `RateLimit`) and then completes on a fresh attempt.
+    #[tokio::test]
+    async fn rate_limit_retries_with_backoff_then_completes() {
+        let provider = Arc::new(FaultProvider::new(vec![
+            Err(Failure::RateLimit {
+                retry_after: None,
+                message: "slow down".into(),
+            }),
+            Err(Failure::RateLimit {
+                retry_after: None,
+                message: "slow down".into(),
+            }),
+            Ok(ok_text("recovered")),
+        ]));
+        // Tiny backoff so the test is fast.
+        let config = Config {
+            model_backoff_base_ms: 1,
+            model_backoff_max_ms: 2,
+            model_max_retries: 3,
+            ..Config::default()
+        };
+        let mut engine = Engine::fresh(
+            SessionId::new("rl"),
+            SystemPrompt::new("test"),
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_config(config);
+        engine.push_user(UserMsg::new("hello"));
+        let (sink, log) = collecting();
+
+        let outcome = engine.run_turn(&NoopHost, &sink, &TurnControl::new()).await.unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => {
+                assert_eq!(s.end_reason, EndReason::Completed);
+                assert_eq!(s.final_text.as_deref(), Some("recovered"));
+            }
+            _ => panic!("expected completion after backoff retries"),
+        }
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3, "two retries then success");
+        assert!(
+            log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::RateLimit { .. })),
+            "a RateLimit event was emitted during backoff"
+        );
+    }
+
+    /// A `ContextOverflow` compacts the conversation once (the §8 -> §10 tie-in) then retries and
+    /// completes; the conversation is shorter afterwards.
+    #[tokio::test]
+    async fn context_overflow_compacts_then_retries() {
+        let provider = Arc::new(FaultProvider::new(vec![
+            Err(Failure::ContextOverflow("too long".into())),
+            Ok(ok_text("after compact")),
+        ]));
+        let mut engine = Engine::fresh(
+            SessionId::new("overflow"),
+            SystemPrompt::new("test"),
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+        );
+        // Enough turns that drop-oldest frees > 10%.
+        for i in 0..8 {
+            engine.push_user(UserMsg::new(format!("message {i} ").repeat(20)));
+        }
+        let before = engine.snapshot().conversation.turns.len();
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("after compact")),
+            _ => panic!("expected completion after compaction"),
+        }
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "overflow then retry");
+        assert!(
+            engine.snapshot().conversation.turns.len() < before,
+            "the conversation was compacted"
+        );
+    }
+
+    /// An always-overflowing provider compacts once then aborts (no infinite loop): the turn ends
+    /// `Failed` rather than hanging.
+    #[tokio::test]
+    async fn unrecoverable_overflow_aborts() {
+        let provider = Arc::new(FaultProvider::new(vec![
+            Err(Failure::ContextOverflow("a".into())),
+            Err(Failure::ContextOverflow("b".into())),
+            Err(Failure::ContextOverflow("c".into())),
+        ]));
+        let mut engine = Engine::fresh(
+            SessionId::new("overflow2"),
+            SystemPrompt::new("test"),
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+        );
+        for i in 0..8 {
+            engine.push_user(UserMsg::new(format!("message {i} ").repeat(20)));
+        }
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
+            _ => panic!("expected a failed outcome, not a hang"),
+        }
+    }
+
+    // §10/§11 hook-order instrumentation.
+    struct RecordingContext {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait::async_trait]
+    impl ContextEngine for RecordingContext {
+        fn before_turn(
+            &self,
+            _conv: &Conversation,
+            budget: Option<usize>,
+        ) -> crate::context::Pressure {
+            self.log.lock().unwrap().push("before_turn");
+            // Force over-budget so the compaction hooks fire.
+            crate::context::Pressure {
+                used_tokens: 10_000,
+                budget_tokens: budget,
+            }
+        }
+        async fn compact(&self, conv: Conversation, _budget: usize) -> Conversation {
+            self.log.lock().unwrap().push("compact");
+            conv
+        }
+        fn after_response(&self, _usage: &UsageDelta) {
+            self.log.lock().unwrap().push("after_response");
+        }
+    }
+
+    struct RecordingMemory {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait::async_trait]
+    impl MemoryProvider for RecordingMemory {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        fn prompt_block(&self) -> Option<crate::memory::PromptBlock> {
+            self.log.lock().unwrap().push("prompt_block");
+            None
+        }
+        async fn recall(&self, _q: &RecallQuery) -> Option<crate::memory::RecalledBlock> {
+            self.log.lock().unwrap().push("recall");
+            None
+        }
+        async fn after_turn(&self, _turn: &Turn, _conv: &Conversation) {
+            self.log.lock().unwrap().push("after_turn");
+        }
+        async fn before_compact(&self, _conv: &Conversation) {
+            self.log.lock().unwrap().push("before_compact");
+        }
+    }
+
+    /// The §10/§11 hooks fire in spec order around a turn:
+    /// `recall -> prompt_block -> before_turn -> before_compact -> compact -> after_turn -> after_response`.
+    #[tokio::test]
+    async fn memory_and_context_hooks_fire_in_spec_order() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let config = Config {
+            context_budget_tokens: Some(1),
+            ..Config::default()
+        };
+        let mut engine = Engine::fresh(
+            SessionId::new("hooks"),
+            SystemPrompt::new("test"),
+            Arc::new(crate::provider::MockProvider::completing("done")),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_config(config)
+        .with_context_engine(Arc::new(RecordingContext { log: log.clone() }))
+        .with_memory(vec![Arc::new(RecordingMemory { log: log.clone() })]);
+        engine.push_user(UserMsg::new("hello"));
+
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+
+        let order = log.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec![
+                "recall",
+                "prompt_block",
+                "before_turn",
+                "before_compact",
+                "compact",
+                "after_turn",
+                "after_response",
+            ]
+        );
     }
 }

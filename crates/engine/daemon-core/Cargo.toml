@@ -14,3 +14,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ciborium = { workspace = true }
+futures = { workspace = true }
+strsim = { workspace = true }
+serde_json = { workspace = true }

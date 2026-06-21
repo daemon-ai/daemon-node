@@ -1,0 +1,19 @@
+[package]
+name = "daemon-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-common = { workspace = true }
+genai = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true }

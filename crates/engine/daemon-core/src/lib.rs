@@ -20,14 +20,18 @@
 
 pub mod actor;
 pub mod config;
+pub mod context;
 pub mod control;
 pub mod conversation;
 pub mod credentials;
 pub mod engine;
 pub mod events;
 pub mod exec;
+pub mod memory;
 pub mod profile;
 pub mod provider;
+pub mod recovery;
+pub mod repair;
 pub mod snapshot;
 pub mod tool_pipeline;
 pub mod tools;
@@ -35,6 +39,10 @@ pub mod turn;
 
 pub use actor::{spawn_agent_session, AgentHandle};
 pub use config::Config;
+pub use context::{
+    estimate_tokens, BudgetedContextEngine, ContextEngine, ContextStrategy, Pressure,
+    PromptAssembler,
+};
 pub use control::{SteerReq, TurnControl};
 pub use conversation::{
     AssistantMsg, Conversation, SystemPrompt, ToolCall, ToolResult, ToolTurn, Turn,
@@ -43,10 +51,18 @@ pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use engine::{Completion, Engine, Suspension, TurnOutcome};
 pub use events::EventSink;
 pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+pub use memory::{
+    FileMemory, MemoryProvider, PromptBlock, RecallQuery, RecalledBlock, SwitchReason,
+};
 pub use profile::{CredentialBuilder, EngineProfile, ExecEnvBuilder, ProviderBuilder};
 pub use provider::{
     build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
-    Request, RequestMsg, ScriptStep, ScriptedProvider, ToolCallFormat,
+    Recovery, Request, RequestMsg, ScriptStep, ScriptedProvider, StreamEvent, ToolCallFormat,
+};
+pub use recovery::{classify_api_error, drive_model_call, ModelCallPolicy, RecoveryStep};
+pub use repair::{
+    repair_tool_args, repair_tool_call, repair_tool_name, sanitize_tool_error, scrub_content,
+    wrap_untrusted_tool_result, ArgRepair, NameRepairError, ScrubChunk, StreamingThinkScrubber,
 };
 pub use snapshot::{ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;

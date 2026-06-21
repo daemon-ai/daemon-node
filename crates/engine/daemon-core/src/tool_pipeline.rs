@@ -6,18 +6,32 @@
 //! cross-cutting **sanitize + result-byte budget** stage uniformly so one oversized tool result can
 //! never blow the model context.
 //!
-//! Deferred (later slices, noted so the seam is explicit): arg-JSON repair, the checkpoint-if-mutating
-//! stage (needs the store/git), untrusted-output wrapping for web/MCP sources, and parallel tool
-//! batching (tools run sequentially here). An unknown tool surfaces a failed result, never a panic.
+//! Stage 2 (validate/repair args) reuses the §9 [`repair_tool_args`] pass so a tool always receives
+//! canonical JSON even when the model emitted fenced/trailing-comma/truncated arguments.
+//!
+//! Deferred (later slices, noted so the seam is explicit): the checkpoint-if-mutating stage (needs
+//! the store/git), untrusted-output wrapping for web/MCP sources (the §9 [`wrap_untrusted_tool_result`](crate::repair::wrap_untrusted_tool_result)
+//! helper exists; tools opt in once a source is flagged untrusted), and parallel tool batching
+//! (tools run sequentially here). An unknown tool surfaces a failed result, never a panic.
 
 use crate::conversation::{ToolCall, ToolResult};
+use crate::repair::repair_tool_args;
 use crate::tools::{ToolOutcome, ToolRegistry};
 use crate::turn::TurnCx;
 
-/// Run one tool call through the pipeline (§12): resolve -> execute -> sanitize + budget.
+/// Run one tool call through the pipeline (§12): resolve -> validate/repair args -> execute ->
+/// sanitize + budget.
 pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>) -> ToolOutcome {
+    // Stage 2: repair + canonicalize the argument JSON (§9). Cheap no-op for already-clean args;
+    // recovers fenced/trailing-comma/truncated payloads so the tool's own decode succeeds.
+    let repaired = repair_tool_args(&call.args);
+    let call = ToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        args: repaired.args,
+    };
     let mut outcome = match registry.get(&call.name) {
-        Some(tool) => tool.run(call, cx).await,
+        Some(tool) => tool.run(&call, cx).await,
         None => ToolOutcome::text(
             call.call_id.clone(),
             false,

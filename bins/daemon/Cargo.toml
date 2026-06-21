@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 daemon-common = { workspace = true }
 daemon-core = { workspace = true }
+daemon-providers = { workspace = true }
 daemon-host = { workspace = true }
 daemon-node = { workspace = true }
 daemon-credentials = { workspace = true }

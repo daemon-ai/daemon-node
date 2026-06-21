@@ -16,10 +16,32 @@
 > and surfaces structured `ToolDetail` into the `ToolCall`/`ToolResult` transcript views. Real
 > **fs** (read/write/list/edit) and **shell** (exec, with hardline-deny + approval gate) tools ship
 > in `tools/daemon-tool-fs` + `tools/daemon-tool-shell` and are registered on every node engine, so a
-> leaf/session/orchestrator does real local work in its workspace. **Still deferred** (provider stays
-> deterministic this phase): the real networked provider (P3 — a `ScriptedProvider`/`MockProvider`
-> drives the loop+tools end-to-end without network/keys), context/memory depth (P2), mutating-op
-> checkpoints, untrusted-output wrapping, parallel tool batching, and remote (docker/ssh) exec
+> leaf/session/orchestrator does real local work in its workspace.
+
+> **Implementation status (real model I/O on a context/memory foundation — landed).** The provider
+> layer is no longer deterministic-only. The §7 `Provider` trait gained streaming (`StreamEvent` +
+> `stream()` with a `chat()`-adapting default) and a `Request.auth` field threaded from the §7
+> credential lease; `Failure` now carries the full §8 taxonomy with a `recovery()` mapping. §8
+> **recovery middleware** (`recovery.rs`) wraps every model call: `ModelCallPolicy` (jittered
+> backoff honoring `Retry-After`, a stale-stream watchdog, rotate + single fallback hop,
+> `ContextOverflow → compact → retry`), and `drive_model_call` streams `TextDelta`/`ReasoningDelta`
+> to the host. §9 **repair** (`repair/`) runs at the decode boundary: tool-arg JSON repair (reused at
+> tool-pipeline stage 2), fuzzy tool-name repair (`strsim`), the `StreamingThinkScrubber`, and tool-
+> error sanitize + untrusted-output wrap. §10 **context** (`context.rs`) and §11 **memory**
+> (`memory.rs`) are now real seams: a `ContextEngine` (`before_turn`/`compact`/`after_response`, the
+> default `BudgetedContextEngine` drop-oldest + anti-thrash; `Summarize` provided non-default) and a
+> set of `MemoryProvider`s (`recall`/`prompt_block`/`before_compact`/`after_turn`, builtin
+> `FileMemory`) wired into `run_turn` in spec hook order, assembled via the tiered `PromptAssembler`.
+> Real networked providers ship in the sibling crate `crates/providers/daemon-providers` as a single
+> `GenAiProvider` over the `genai` native-protocol client (OpenAI/Anthropic/Gemini/Groq/… with
+> streaming + native tools), dropping into the binary via config (`DAEMON_MODEL_PROVIDER`) with Mock
+> the zero-config default. `genai` owns only the wire (request/response mapping, SSE framing,
+> reasoning normalization); the §8 `Failure` taxonomy + recovery, §9 repair (`finalize_output` at the
+> decode boundary), and the §10/§11 seams stay in-tree. Native tool **JSON-Schema** and
+> **`tool_call_id`** now round-trip through the enriched `Request` (tools carry their registry
+> `ToolDef` schema; tool turns carry native call/result linkage). **Still deferred**: the deep
+> summary-DAG / embedding memory store, mutating-op checkpoints, untrusted-output wrapping at the
+> pipeline (the helper exists; tools opt in), parallel tool batching, and remote (docker/ssh) exec
 > backends.
 
 ## Source-of-truth discipline (read first)
@@ -900,15 +922,21 @@ cross-session memory captures detail *before* the body is compacted
 ```rust
 #[async_trait]
 trait MemoryProvider: Send + Sync {
-    fn prompt_block(&self) -> Option<PromptBlock>;                    // stable tier
-    async fn recall(&self, q: &RecallQuery) -> Option<RecalledBlock>; // volatile tier
-    async fn after_turn(&self, turn: &Turn, conv: &Conversation);     // remember / extract / sync
-    async fn before_compact(&self, conv: &Conversation);              // last chance to capture
-    async fn on_session_switch(&self, reason: SwitchReason);
-    fn tools(&self) -> Vec<ToolDef>;
-    async fn call_tool(&self, name: &str, args: Value, cx: &ToolCx<'_>) -> ToolResult;
+    fn name(&self) -> &str;
+    fn prompt_block(&self) -> Option<PromptBlock> { None }                    // stable tier
+    async fn recall(&self, q: &RecallQuery) -> Option<RecalledBlock> { None } // volatile tier
+    async fn after_turn(&self, turn: &Turn, conv: &Conversation) {}           // remember / extract / sync
+    async fn before_compact(&self, conv: &Conversation) {}                    // last chance to capture
+    async fn on_session_switch(&self, reason: SwitchReason) {}
 }
 ```
+
+> **Why no `tools()`/`call_tool` on the seam.** Unlike the `hermes-agent` ABC (which folds memory
+> tools into the provider), the §11 seam is deliberately about *context* — recall and persistent
+> prompt blocks — not *dispatch*. A backend that exposes management tools (e.g. Mnemosyne's
+> `remember`/`recall`) registers them through the §12 `ToolRegistry` like any other tool, so there is
+> one tool-dispatch path and the memory seam stays narrow. A provider keeps its `call_tool`/`tools`
+> as inherent methods the host wires into the registry, rather than as part of this trait.
 
 The fixed, documented turn pipeline (the main correctness win over `hermes-agent`'s implicit
 ordering):
@@ -946,8 +974,9 @@ sequenceDiagram
 Memory) engine with working/episodic/scratchpad tiers, hybrid recall (sqlite-vec + FTS5 +
 importance), MIB 48-byte binary vectors, and a temporal knowledge layer — is wired via PyO3 as the
 default provider: `prompt_block` = memory-override instructions, `recall` = BEAM hybrid recall ->
-injected block, `after_turn` = `remember` + extraction, `before_compact` = persist salient facts,
-`tools` = its remember/recall/triple/scratchpad set. The built-in `MEMORY.md`/`USER.md` provider
+injected block, `after_turn` = `remember` + extraction, `before_compact` = persist salient facts; its
+remember/recall/triple/scratchpad set is exposed as inherent `tools()`/`call_tool` that the host wires
+into the §12 `ToolRegistry` (not through the §11 seam). The built-in `MEMORY.md`/`USER.md` provider
 remains the dependency-free peer.
 
 **Priority.** P1 for the `MemoryProvider` trait + builtin + documented hook order + frozen snapshot.
@@ -1645,10 +1674,15 @@ acceptance criteria. Each phase is shippable.
 > (§20–21) are implemented. From P1, the §13 **`LocalEnvironment`** (per-session workspace,
 > containment, child-env scrub) and the real **fs/shell** tools are implemented and registered on
 > every node engine, and async sub-agent delegation (`Effect::Delegate → BackgroundCompletion`, §16.2)
-> plus the host protocol + in-process `AgentHandle` (§17) are in place. **Provider stays
-> deterministic** (the real networked transport is P1/P2); context summarization/memory (§10–11),
-> checkpoint/rewind + parallel tool batching (§12), and remote exec backends (§13, P3) remain
-> deferred.
+> plus the host protocol + in-process `AgentHandle` (§17) are in place. **Real model I/O has landed**:
+> the §7 streaming `Provider` + `Request.auth`, §8 recovery middleware (backoff/`Retry-After`/watchdog/
+> rotate/fallback/`ContextOverflow→compact`), §9 repair at the decode boundary, the §10 `ContextEngine`
+> and §11 `MemoryProvider` seams (wired into `run_turn` in hook order; default `BudgetedContextEngine`
+> + builtin `FileMemory`), and a networked `GenAiProvider` in `daemon-providers` — one `genai`
+> native-protocol client over OpenAI/Anthropic/Gemini/Groq/… under our `Provider` trait, with native
+> tool JSON-Schema + `tool_call_id` round-tripping (config-selected; Mock is the zero-config default).
+> **Still deferred**: the deep summary-DAG / embedding memory store, checkpoint/rewind + parallel tool
+> batching (§12), and remote exec backends (§13, P3).
 
 ### P0 — Production survival
 - Typed `Conversation`/`Turn`/`ToolTurn` (§5) + wire conversion + serialization skeleton (§6).

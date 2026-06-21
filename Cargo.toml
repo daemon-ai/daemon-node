@@ -20,6 +20,15 @@ ciborium = "0.2"
 async-trait = "0.1"
 thiserror = "2"
 anyhow = "1"
+futures = "0.3"
+strsim = "0.11"
+# real networked providers (isolated to the `daemon-providers` crate): genai gives one native-protocol
+# client over OpenAI/Anthropic/Gemini/… so we don't hand-roll wire/SSE/JSON. Default TLS is rustls.
+genai = "0.6"
+# still used by the in-process mock HTTP server in the provider wire tests.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# in-process mock HTTP server for provider wire tests (no live network in the suite).
+wiremock = "0.6"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
@@ -40,6 +49,8 @@ daemon-protocol = { path = "crates/contracts/daemon-protocol" }
 daemon-supervision = { path = "crates/contracts/daemon-supervision" }
 daemon-api = { path = "crates/contracts/daemon-api" }
 daemon-core = { path = "crates/engine/daemon-core" }
+daemon-mnemosyne = { path = "crates/memory/daemon-mnemosyne" }
+daemon-providers = { path = "crates/providers/daemon-providers" }
 daemon-store = { path = "crates/substrate/daemon-store" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
 daemon-provision = { path = "crates/substrate/daemon-provision" }

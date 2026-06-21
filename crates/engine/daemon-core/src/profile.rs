@@ -14,7 +14,9 @@
 //! same `EngineProfile`.
 
 use crate::config::Config;
+use crate::context::ContextEngine;
 use crate::conversation::SystemPrompt;
+use crate::memory::MemoryProvider;
 use crate::credentials::CredentialProvider;
 use crate::engine::Engine;
 use crate::exec::ExecutionEnvironment;
@@ -48,6 +50,8 @@ pub struct EngineProfile {
     budget: Budget,
     config: Config,
     exec: Option<ExecEnvBuilder>,
+    context: Option<Arc<dyn ContextEngine>>,
+    memory: Vec<Arc<dyn MemoryProvider>>,
 }
 
 impl EngineProfile {
@@ -63,6 +67,8 @@ impl EngineProfile {
             budget: Budget::unlimited(),
             config: Config::default(),
             exec: None,
+            context: None,
+            memory: Vec::new(),
         }
     }
 
@@ -94,6 +100,20 @@ impl EngineProfile {
         self
     }
 
+    /// Inject the context engine (§10) every engine this profile builds assembles/compacts context
+    /// with. Without it, engines use the default [`BudgetedContextEngine`](crate::context::BudgetedContextEngine).
+    pub fn with_context_engine(mut self, context: Arc<dyn ContextEngine>) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Register the memory providers (§11) every engine this profile builds consults around each
+    /// turn (default empty — memory is opt-in).
+    pub fn with_memory(mut self, memory: Vec<Arc<dyn MemoryProvider>>) -> Self {
+        self.memory = memory;
+        self
+    }
+
     /// The tool registry shared by engines this profile builds.
     pub fn registry(&self) -> Arc<ToolRegistry> {
         self.registry.clone()
@@ -113,6 +133,12 @@ impl EngineProfile {
         if let Some(build) = &self.exec {
             let exec = build(&engine.snapshot().session_id);
             engine = engine.with_exec(exec);
+        }
+        if let Some(context) = &self.context {
+            engine = engine.with_context_engine(context.clone());
+        }
+        if !self.memory.is_empty() {
+            engine = engine.with_memory(self.memory.clone());
         }
         engine.with_budget(self.budget).with_config(self.config)
     }

@@ -61,7 +61,6 @@ impl MemoryProvider for MnemosyneProvider {
 
     fn prompt_block(&self) -> Option<PromptBlock> {
         Some(PromptBlock {
-            id: "mnemosyne.instructions".to_string(),
             text: "You have a persistent memory (Mnemosyne). Recalled context is injected below; \
                    use the mnemosyne_* tools to remember, recall, and manage long-term memory."
                 .to_string(),
@@ -74,9 +73,7 @@ impl MemoryProvider for MnemosyneProvider {
             return None;
         }
         Some(RecalledBlock {
-            provider: "mnemosyne".to_string(),
             text: Self::format_block(&rows),
-            count: rows.len(),
         })
     }
 
@@ -107,8 +104,15 @@ impl MemoryProvider for MnemosyneProvider {
     async fn on_session_switch(&self, _reason: SwitchReason) {
         // TODO: consolidate via engine.sleep() on session end.
     }
+}
 
-    fn tools(&self) -> Vec<ToolDef> {
+impl MnemosyneProvider {
+    /// The memory-management tools this backend exposes (`mnemosyne_remember`/`mnemosyne_recall`).
+    ///
+    /// These are *not* part of the §11 [`MemoryProvider`] seam — that seam is about context, not
+    /// dispatch. A host that wants to expose them to the model registers them through the §12
+    /// [`ToolRegistry`](daemon_core::tools) like any other tool, calling [`Self::call_tool`].
+    pub fn tools(&self) -> Vec<ToolDef> {
         vec![
             ToolDef {
                 name: "mnemosyne_remember".to_string(),
@@ -121,7 +125,8 @@ impl MemoryProvider for MnemosyneProvider {
         ]
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> String {
+    /// Dispatch one of [`Self::tools`] by name, returning a JSON string result.
+    pub async fn call_tool(&self, name: &str, args: Value) -> String {
         match name {
             "mnemosyne_remember" => {
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
