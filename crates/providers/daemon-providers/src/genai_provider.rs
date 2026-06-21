@@ -239,12 +239,47 @@ fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
     }
 }
 
-/// Map `genai`'s [`Usage`](genai::chat::Usage) into the canonical [`UsageDelta`].
+/// The published context window for a well-known cloud chat model, matched by id prefix so dated /
+/// `-latest` aliases resolve. `None` for unknown models (the engine then has no denominator). Kept
+/// local to the provider so this crate stays free of the `daemon-api` catalog type.
+fn known_context_window(model: &str) -> Option<u32> {
+    const TABLE: &[(&str, u32)] = &[
+        ("claude-opus-4", 200_000),
+        ("claude-sonnet-4", 200_000),
+        ("claude-3-5-sonnet", 200_000),
+        ("claude-3-5-haiku", 200_000),
+        ("claude-3-opus", 200_000),
+        ("gpt-4o", 128_000),
+        ("gpt-4.1", 1_000_000),
+        ("o3", 200_000),
+        ("o4-mini", 200_000),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|&(_, ctx)| ctx)
+}
+
+/// Map `genai`'s [`Usage`](genai::chat::Usage) into the canonical [`UsageDelta`], including the
+/// Anthropic/OpenAI prompt-cache + reasoning-token breakdowns the provider surfaces in the
+/// `*_details` sub-objects.
 fn usage_from(usage: &genai::chat::Usage) -> UsageDelta {
+    let prompt = usage.prompt_tokens_details.as_ref();
+    let completion = usage.completion_tokens_details.as_ref();
+    let cache_read = prompt.and_then(|d| d.cached_tokens).unwrap_or(0).max(0) as u64;
+    let cache_write = prompt
+        .and_then(|d| d.cache_creation_tokens)
+        .unwrap_or(0)
+        .max(0) as u64;
+    let reasoning = completion.and_then(|d| d.reasoning_tokens).unwrap_or(0).max(0) as u64;
     UsageDelta {
-        input_tokens: usage.prompt_tokens.unwrap_or(0) as u64,
-        output_tokens: usage.completion_tokens.unwrap_or(0) as u64,
+        input_tokens: usage.prompt_tokens.unwrap_or(0).max(0) as u64,
+        output_tokens: usage.completion_tokens.unwrap_or(0).max(0) as u64,
         api_calls: 1,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        reasoning_tokens: reasoning,
+        cost_micros: 0,
     }
 }
 
@@ -296,7 +331,9 @@ impl Provider for GenAiProvider {
             supports_native_tools: true,
             supports_streaming: true,
             tool_call_format: ToolCallFormat::Native,
-            max_context: None,
+            // The published context window for a well-known cloud model (the context-fill HUD's
+            // denominator). `None` when the model is unknown to the static table.
+            max_context: known_context_window(&self.model),
         }
     }
 

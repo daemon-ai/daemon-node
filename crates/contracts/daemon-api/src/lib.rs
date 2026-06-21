@@ -32,6 +32,12 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub mod profile;
+pub use profile::{
+    BudgetSpec, ConfigField, ConfigPatch, ConfigSchema, ContextEngineSel, CredentialInfo,
+    EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec, ProviderSelector,
+};
+
 /// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
 /// shape a streaming transport (in-process, socket, HTTP/WS) returns from [`SessionApi::subscribe`].
 /// Streaming is a *transport capability*, not a wire-mirror variant: the cursor read
@@ -322,11 +328,108 @@ pub trait ModelApi: Send + Sync {
     async fn model_inspect(&self, _id: ModelId) -> Result<GgufInfo, ApiError> {
         Err(ApiError::Unsupported("model_inspect".into()))
     }
+
+    /// The discoverable model catalog a GUI's model picker renders: well-known cloud models (incl.
+    /// `claude-opus-4-8`) merged with locally-installed models. Default: the built-in cloud catalog.
+    async fn models(&self) -> Vec<ModelDescriptor> {
+        ModelDescriptor::builtin_cloud_catalog()
+    }
+
+    /// The model a profile currently resolves to (`None` profile = the active default). `None` when
+    /// no profile/model is resolvable. Default: `None`.
+    async fn model_current(
+        &self,
+        _profile: Option<String>,
+    ) -> Result<Option<ModelDescriptor>, ApiError> {
+        Ok(None)
+    }
 }
 
-/// The whole node surface: the session, control, and model-management sub-surfaces.
-pub trait NodeApi: SessionApi + ControlApi + ModelApi {}
-impl<T: SessionApi + ControlApi + ModelApi> NodeApi for T {}
+/// The profile / runtime-config sub-surface: create, inspect, edit, and select the agent
+/// configuration bundles ([`ProfileSpec`]) a session binds to, plus the dynamically-settable
+/// runtime config (`DAEMON_MODEL`/`DAEMON_MODEL_PROVIDER`/persona/credential-ref) the GUI drives
+/// without restarting the node. Every method defaults to [`ApiError::Unsupported`] / empty so a
+/// transport that hosts no profile store (the session-only FFI, test stubs) inherits the surface;
+/// the node's [`NodeApi`] binds the real implementation (backed by a `ProfileStore`).
+#[async_trait]
+pub trait ProfileApi: Send + Sync {
+    /// All known profiles (listing view, with the active default marked).
+    async fn profile_list(&self) -> Vec<ProfileInfo> {
+        Vec::new()
+    }
+
+    /// Fetch one profile's full spec by id (`None` if unknown).
+    async fn profile_get(&self, _id: String) -> Result<Option<ProfileSpec>, ApiError> {
+        Err(ApiError::Unsupported("profile_get".into()))
+    }
+
+    /// Create a new profile (errors if the id already exists).
+    async fn profile_create(&self, _spec: ProfileSpec) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("profile_create".into()))
+    }
+
+    /// Replace an existing profile (errors if the id is unknown).
+    async fn profile_update(&self, _spec: ProfileSpec) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("profile_update".into()))
+    }
+
+    /// Delete a profile by id.
+    async fn profile_delete(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("profile_delete".into()))
+    }
+
+    /// Select the active default profile (new sessions bind to it unless overridden).
+    async fn profile_select(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("profile_select".into()))
+    }
+
+    /// The resolved effective config for `profile` (`None` = the active default).
+    async fn config_get(&self, _profile: Option<String>) -> Result<Option<ProfileSpec>, ApiError> {
+        Err(ApiError::Unsupported("config_get".into()))
+    }
+
+    /// Apply a runtime-config patch to `profile` (`None` = the active default).
+    async fn config_set(
+        &self,
+        _profile: Option<String>,
+        _patch: ConfigPatch,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("config_set".into()))
+    }
+
+    /// The settable-config schema (a GUI renders it as a settings form). Default: the built-in schema.
+    async fn config_schema(&self) -> ConfigSchema {
+        ConfigSchema::builtin()
+    }
+}
+
+/// The credential sub-surface: set / list (redacted) / remove the provider secrets the node's
+/// credential authority provisions onto each model request (`Request.auth`). Keyed by profile /
+/// credential-ref, mirroring hermes' `/api/env`. Every method defaults to
+/// [`ApiError::Unsupported`] / empty so a transport that hosts no credential store inherits the
+/// surface; the node binds the real implementation.
+#[async_trait]
+pub trait CredentialApi: Send + Sync {
+    /// Store (or replace) the secret for `profile`.
+    async fn credential_set(&self, _profile: String, _secret: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("credential_set".into()))
+    }
+
+    /// List the stored credentials, redacted (never returns secrets).
+    async fn credential_list(&self) -> Vec<CredentialInfo> {
+        Vec::new()
+    }
+
+    /// Remove the secret for `profile`.
+    async fn credential_remove(&self, _profile: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("credential_remove".into()))
+    }
+}
+
+/// The whole node surface: the session, control, model-management, profile/config, and credential
+/// sub-surfaces.
+pub trait NodeApi: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi {}
+impl<T: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi> NodeApi for T {}
 
 // ---------------------------------------------------------------------------
 // Outbound drain item (§17 events + raised host requests share one queue)
@@ -715,6 +818,68 @@ pub enum ApiRequest {
         /// The installed model to introspect.
         id: ModelId,
     },
+    /// [`ProfileApi::profile_list`].
+    ProfileList,
+    /// [`ProfileApi::profile_get`].
+    ProfileGet {
+        /// The profile id to fetch.
+        id: String,
+    },
+    /// [`ProfileApi::profile_create`].
+    ProfileCreate {
+        /// The new profile bundle.
+        spec: ProfileSpec,
+    },
+    /// [`ProfileApi::profile_update`].
+    ProfileUpdate {
+        /// The replacement profile bundle (keyed by its id).
+        spec: ProfileSpec,
+    },
+    /// [`ProfileApi::profile_delete`].
+    ProfileDelete {
+        /// The profile id to delete.
+        id: String,
+    },
+    /// [`ProfileApi::profile_select`].
+    ProfileSelect {
+        /// The profile id to make the active default.
+        id: String,
+    },
+    /// [`ProfileApi::config_get`].
+    ConfigGet {
+        /// The profile to resolve (`None` = the active default).
+        profile: Option<String>,
+    },
+    /// [`ProfileApi::config_set`].
+    ConfigSet {
+        /// The profile to patch (`None` = the active default).
+        profile: Option<String>,
+        /// The partial config update.
+        patch: ConfigPatch,
+    },
+    /// [`ProfileApi::config_schema`].
+    ConfigSchema,
+    /// [`CredentialApi::credential_set`].
+    CredentialSet {
+        /// The profile / credential-ref to key the secret by.
+        profile: String,
+        /// The secret value (provider API key / token).
+        secret: String,
+    },
+    /// [`CredentialApi::credential_list`].
+    CredentialList,
+    /// [`CredentialApi::credential_remove`].
+    CredentialRemove {
+        /// The profile / credential-ref to clear.
+        profile: String,
+    },
+    /// [`ModelApi::models`].
+    Models,
+    /// [`ModelApi::model_current`].
+    ModelCurrent {
+        /// The profile to resolve (`None` = the active default).
+        profile: Option<String>,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -764,6 +929,18 @@ pub enum ApiResponse {
     ModelQuantizes(Vec<QuantizeStatus>),
     /// A model's GGUF metadata.
     ModelInspect(GgufInfo),
+    /// A profile listing (the active default marked).
+    Profiles(Vec<ProfileInfo>),
+    /// One profile's full spec, or `None` if unknown / no active default (profile_get/config_get).
+    Profile(Option<ProfileSpec>),
+    /// The settable-config schema.
+    ConfigSchema(ConfigSchema),
+    /// A redacted credential listing.
+    Credentials(Vec<CredentialInfo>),
+    /// A discoverable model catalog (cloud + local).
+    Models(Vec<ModelDescriptor>),
+    /// The model a profile currently resolves to (`None` = none resolvable).
+    ModelCurrent(Option<ModelDescriptor>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -927,6 +1104,35 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::ModelQuantizes => ApiResponse::ModelQuantizes(api.model_quantizes().await),
         ApiRequest::ModelInspect { id } => match api.model_inspect(id).await {
             Ok(info) => ApiResponse::ModelInspect(info),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ProfileList => ApiResponse::Profiles(api.profile_list().await),
+        ApiRequest::ProfileGet { id } => match api.profile_get(id).await {
+            Ok(spec) => ApiResponse::Profile(spec),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ProfileCreate { spec } => unit_or_err(api.profile_create(spec).await),
+        ApiRequest::ProfileUpdate { spec } => unit_or_err(api.profile_update(spec).await),
+        ApiRequest::ProfileDelete { id } => unit_or_err(api.profile_delete(id).await),
+        ApiRequest::ProfileSelect { id } => unit_or_err(api.profile_select(id).await),
+        ApiRequest::ConfigGet { profile } => match api.config_get(profile).await {
+            Ok(spec) => ApiResponse::Profile(spec),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ConfigSet { profile, patch } => {
+            unit_or_err(api.config_set(profile, patch).await)
+        }
+        ApiRequest::ConfigSchema => ApiResponse::ConfigSchema(api.config_schema().await),
+        ApiRequest::CredentialSet { profile, secret } => {
+            unit_or_err(api.credential_set(profile, secret).await)
+        }
+        ApiRequest::CredentialList => ApiResponse::Credentials(api.credential_list().await),
+        ApiRequest::CredentialRemove { profile } => {
+            unit_or_err(api.credential_remove(profile).await)
+        }
+        ApiRequest::Models => ApiResponse::Models(api.models().await),
+        ApiRequest::ModelCurrent { profile } => match api.model_current(profile).await {
+            Ok(m) => ApiResponse::ModelCurrent(m),
             Err(e) => ApiResponse::Error(e),
         },
         // Session variants were handled by `serve_session`.

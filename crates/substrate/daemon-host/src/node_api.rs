@@ -19,10 +19,14 @@ use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
+use crate::credstore::CredentialStore;
+use crate::profiles::ProfileStore;
 use daemon_api::{
-    ApiError, ControlApi, FleetReport, HealthReport, JournalPageView, JournalRecord,
-    JournalRecordPayload, LogPageView, LogStream, ManageEventView, ModelApi, Outbound,
-    ServiceHealth, SessionApi, SessionInfo, SessionState, StatsReport, TreeReport, UnitNode,
+    ApiError, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo, FleetReport,
+    HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView, LogStream,
+    ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo, ProfileSpec,
+    ProviderSelector, ServiceHealth, SessionApi, SessionInfo, SessionState, StatsReport, TreeReport,
+    UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JournalStreamId,
@@ -103,6 +107,13 @@ pub struct NodeApiImpl {
     models: Option<Arc<ModelManager>>,
     /// The default profile a `model_activate` with no explicit profile applies to.
     default_local_profile: String,
+    /// The durable profile store backing the `ProfileApi` sub-surface. `None` on a node built
+    /// without profile management (every `ProfileApi` call then resolves to [`ApiError::Unsupported`]).
+    profiles: Option<Arc<dyn ProfileStore>>,
+    /// The persisted credential store backing the `CredentialApi` sub-surface. `None` on a node
+    /// built without credential management (every `CredentialApi` call then resolves to
+    /// [`ApiError::Unsupported`]).
+    credentials: Option<Arc<dyn CredentialStore>>,
 }
 
 impl NodeApiImpl {
@@ -130,6 +141,8 @@ impl NodeApiImpl {
             verifier: None,
             models: None,
             default_local_profile: "default".to_string(),
+            profiles: None,
+            credentials: None,
         }
     }
 
@@ -143,6 +156,39 @@ impl NodeApiImpl {
         self.models = Some(models);
         self.default_local_profile = default_local_profile.into();
         self
+    }
+
+    /// Attach the durable profile store backing the `ProfileApi` sub-surface. Call during assembly.
+    pub fn with_profiles(mut self, profiles: Arc<dyn ProfileStore>) -> Self {
+        self.profiles = Some(profiles);
+        self
+    }
+
+    /// Attach the persisted credential store backing the `CredentialApi` sub-surface. Call during
+    /// assembly (the same store the node's credential authority provisions from).
+    pub fn with_credential_store(mut self, credentials: Arc<dyn CredentialStore>) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.
+    fn profile_store(&self) -> Result<&Arc<dyn ProfileStore>, ApiError> {
+        self.profiles
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("profile management not available".into()))
+    }
+
+    /// Resolve the spec for an explicit id, or the active default when `profile` is `None`.
+    fn resolve_profile(&self, profile: Option<String>) -> Result<Option<ProfileSpec>, ApiError> {
+        let store = self.profile_store()?;
+        let id = match profile {
+            Some(id) => Some(id),
+            None => store.active().map_err(profile_err)?,
+        };
+        match id {
+            Some(id) => store.get(&id).map_err(profile_err),
+            None => Ok(None),
+        }
     }
 
     /// Durably journal live interactive sessions: each session's transcript (finished blocks +
@@ -621,6 +667,55 @@ impl ModelApi for NodeApiImpl {
         let m = self.require_models()?;
         m.inspect(&id).await.map_err(map_model_err)
     }
+
+    async fn models(&self) -> Vec<ModelDescriptor> {
+        // The well-known cloud catalog (incl. claude-opus-4-8) merged with locally-installed models.
+        let mut out = ModelDescriptor::builtin_cloud_catalog();
+        if let Some(m) = &self.models {
+            for im in m.catalog().await {
+                let provider = match im.model.engine {
+                    ModelEngine::MistralRs => ProviderSelector::MistralRs,
+                    ModelEngine::Llama => ProviderSelector::LlamaCpp,
+                };
+                out.push(ModelDescriptor {
+                    id: im.id.as_str().to_string(),
+                    provider,
+                    context_length: im.context_length,
+                    input_price_micros_per_mtok: None,
+                    output_price_micros_per_mtok: None,
+                    local: true,
+                });
+            }
+        }
+        out
+    }
+
+    async fn model_current(
+        &self,
+        profile: Option<String>,
+    ) -> Result<Option<ModelDescriptor>, ApiError> {
+        let spec = if self.profiles.is_some() {
+            self.resolve_profile(profile)?
+        } else {
+            None
+        };
+        let Some(spec) = spec else { return Ok(None) };
+        // Prefer a catalog entry (carries context/pricing); else synthesize from the profile spec.
+        if let Some(found) = self.models().await.into_iter().find(|m| m.id == spec.model) {
+            return Ok(Some(found));
+        }
+        Ok(Some(ModelDescriptor {
+            id: spec.model.clone(),
+            provider: spec.provider,
+            context_length: ModelDescriptor::known_context_length(&spec.model),
+            input_price_micros_per_mtok: None,
+            output_price_micros_per_mtok: None,
+            local: matches!(
+                spec.provider,
+                ProviderSelector::LlamaCpp | ProviderSelector::MistralRs
+            ),
+        }))
+    }
 }
 
 impl NodeApiImpl {
@@ -629,6 +724,116 @@ impl NodeApiImpl {
         self.models
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("model management is not enabled".into()))
+    }
+}
+
+/// Map a profile-store error onto the wire [`ApiError`].
+fn profile_err(e: crate::profiles::ProfileError) -> ApiError {
+    use crate::profiles::ProfileError;
+    match e {
+        ProfileError::NotFound(id) => ApiError::UnknownSession(id),
+        ProfileError::Exists(id) => ApiError::Conflict(format!("profile exists: {id}")),
+        other => ApiError::Other(other.to_string()),
+    }
+}
+
+#[async_trait]
+impl ProfileApi for NodeApiImpl {
+    async fn profile_list(&self) -> Vec<ProfileInfo> {
+        let Ok(store) = self.profile_store() else {
+            return Vec::new();
+        };
+        let active = store.active().ok().flatten();
+        match store.list() {
+            Ok(specs) => {
+                let mut out: Vec<ProfileInfo> = specs
+                    .iter()
+                    .map(|s| ProfileInfo::from_spec(s, active.as_deref() == Some(s.id.as_str())))
+                    .collect();
+                out.sort_by(|a, b| a.id.cmp(&b.id));
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn profile_get(&self, id: String) -> Result<Option<ProfileSpec>, ApiError> {
+        self.profile_store()?.get(&id).map_err(profile_err)
+    }
+
+    async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
+        self.profile_store()?.create(spec).map_err(profile_err)
+    }
+
+    async fn profile_update(&self, spec: ProfileSpec) -> Result<(), ApiError> {
+        self.profile_store()?.update(spec).map_err(profile_err)
+    }
+
+    async fn profile_delete(&self, id: String) -> Result<(), ApiError> {
+        self.profile_store()?.delete(&id).map_err(profile_err)
+    }
+
+    async fn profile_select(&self, id: String) -> Result<(), ApiError> {
+        self.profile_store()?.set_active(&id).map_err(profile_err)
+    }
+
+    async fn config_get(&self, profile: Option<String>) -> Result<Option<ProfileSpec>, ApiError> {
+        self.resolve_profile(profile)
+    }
+
+    async fn config_set(
+        &self,
+        profile: Option<String>,
+        patch: ConfigPatch,
+    ) -> Result<(), ApiError> {
+        let store = self.profile_store()?;
+        let id = match profile {
+            Some(id) => id,
+            None => store
+                .active()
+                .map_err(profile_err)?
+                .ok_or_else(|| ApiError::Other("no active profile to patch".into()))?,
+        };
+        let mut spec = store
+            .get(&id)
+            .map_err(profile_err)?
+            .ok_or_else(|| ApiError::UnknownSession(id.clone()))?;
+        patch.apply(&mut spec);
+        store.update(spec).map_err(profile_err)
+    }
+
+    async fn config_schema(&self) -> ConfigSchema {
+        ConfigSchema::builtin()
+    }
+}
+
+#[async_trait]
+impl CredentialApi for NodeApiImpl {
+    async fn credential_set(&self, profile: String, secret: String) -> Result<(), ApiError> {
+        let store = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
+        store
+            .set(&profile, &secret)
+            .map_err(|e| ApiError::Other(format!("credential set: {e}")))
+    }
+
+    async fn credential_list(&self) -> Vec<CredentialInfo> {
+        match &self.credentials {
+            Some(store) => store.list_redacted(),
+            None => Vec::new(),
+        }
+    }
+
+    async fn credential_remove(&self, profile: String) -> Result<(), ApiError> {
+        let store = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
+        store
+            .remove(&profile)
+            .map_err(|e| ApiError::Other(format!("credential remove: {e}")))
     }
 }
 

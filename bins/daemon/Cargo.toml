@@ -9,6 +9,11 @@ license.workspace = true
 name = "daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+# Compile + register the CDP `browser` tool (pulls chromiumoxide via `daemon-tool-browser/cdp`).
+browser = ["dep:daemon-tool-browser", "daemon-tool-browser/cdp"]
+
 [dependencies]
 daemon-common = { workspace = true }
 daemon-core = { workspace = true }
@@ -27,6 +32,14 @@ daemon-node = { workspace = true }
 daemon-metta = { workspace = true }
 daemon-metta-client = { workspace = true }
 daemon-tool-metta = { workspace = true }
+# The web tools (`web_search`/`web_extract`); opt-in at runtime via `[web].enable`.
+daemon-tool-web = { workspace = true }
+# Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.
+daemon-tool-todo = { workspace = true }
+daemon-tool-clarify = { workspace = true }
+# The `browser` tool; gated behind the `browser` feature so the default build never compiles the
+# heavy chromiumoxide CDP bindings.
+daemon-tool-browser = { workspace = true, optional = true }
 daemon-models = { workspace = true }
 daemon-api = { workspace = true }
 # Optional in-process HTTP/WS surface, toggled on at launch by a configured bind address.

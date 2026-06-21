@@ -99,6 +99,32 @@ const METTA_MAX_RESTARTS_ENV: &str = "DAEMON_METTA_MAX_RESTARTS";
 /// The sliding window (ms) over which restarts are counted for meltdown.
 const METTA_RESTART_WINDOW_MS_ENV: &str = "DAEMON_METTA_RESTART_WINDOW_MS";
 
+// --- Web tools (`daemon-tool-web`) tuning (DAEMON_WEB_*) --------------------------------------
+/// Register the `web_search`/`web_extract` tools (`false` by default — opt-in, like `metta`).
+const WEB_ENABLE_ENV: &str = "DAEMON_WEB_ENABLE";
+/// Include the dependency-light local `reqwest`+readability `web_extract` fallback (default `true`).
+const WEB_LOCAL_FALLBACK_ENV: &str = "DAEMON_WEB_LOCAL_FALLBACK";
+/// The credential-profile id the Tavily search key is read from (default `tavily`).
+const WEB_TAVILY_KEY_ENV: &str = "DAEMON_WEB_TAVILY_KEY_ID";
+/// The credential-profile id the Firecrawl scraper key is read from (default `firecrawl`).
+const WEB_FIRECRAWL_KEY_ENV: &str = "DAEMON_WEB_FIRECRAWL_KEY_ID";
+
+// --- Browser tool (`daemon-tool-browser`, `browser` feature) tuning (DAEMON_BROWSER_*) --------
+/// Register the `browser` tool (`false` by default; also requires the `browser` build feature).
+const BROWSER_ENABLE_ENV: &str = "DAEMON_BROWSER_ENABLE";
+/// An explicit Chromium/Chrome executable path (`None` => chromiumoxide auto-detection).
+const BROWSER_CHROME_PATH_ENV: &str = "DAEMON_BROWSER_CHROME_PATH";
+/// Run the browser headless (default `true`).
+const BROWSER_HEADLESS_ENV: &str = "DAEMON_BROWSER_HEADLESS";
+/// The directory screenshots are written to (`None` => `<profile_home>/browser/screenshots`).
+const BROWSER_SCREENSHOT_DIR_ENV: &str = "DAEMON_BROWSER_SCREENSHOT_DIR";
+/// Require interactive host approval before each navigation (default `false`).
+const BROWSER_APPROVE_NAV_ENV: &str = "DAEMON_BROWSER_APPROVE_NAVIGATION";
+/// The browser launch timeout in milliseconds (default `20000`).
+const BROWSER_LAUNCH_TIMEOUT_MS_ENV: &str = "DAEMON_BROWSER_LAUNCH_TIMEOUT_MS";
+/// Auto-dismiss JS dialogs so a modal cannot wedge the session (default `true`).
+const BROWSER_DISMISS_DIALOGS_ENV: &str = "DAEMON_BROWSER_DISMISS_DIALOGS";
+
 // --- Embeddings (`daemon-mnemosyne` vector recall) tuning (DAEMON_EMBED_*) --------------------
 /// Selects the embedding backend: `off` (default, keyword-only), `genai` (remote, OpenAI-compatible),
 /// or `local` (a `daemon-infer` embedding worker).
@@ -259,6 +285,68 @@ fn default_metta_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("daemon-metta"))
 }
 
+/// Tuning for the web tools (`daemon-tool-web`). `enable = false` keeps `web_search`/`web_extract`
+/// unregistered (the default). The Tavily/Firecrawl keys are read live from the `CredentialStore`
+/// under [`WebConfig::tavily_key_id`]/[`WebConfig::firecrawl_key_id`], so a GUI-set key applies
+/// without a restart; an unkeyed `web_extract` falls back to the local readability path.
+#[derive(Clone, Debug)]
+pub struct WebConfig {
+    /// Whether to register the `web_search` + `web_extract` tools.
+    pub enable: bool,
+    /// Include the dependency-light local `reqwest`+readability `web_extract` fallback.
+    pub local_fallback: bool,
+    /// The credential-profile id the Tavily search key is read from.
+    pub tavily_key_id: String,
+    /// The credential-profile id the Firecrawl scraper key is read from.
+    pub firecrawl_key_id: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            local_fallback: true,
+            tavily_key_id: "tavily".to_string(),
+            firecrawl_key_id: "firecrawl".to_string(),
+        }
+    }
+}
+
+/// Tuning for the `browser` tool (`daemon-tool-browser`). `enable = false` keeps the tool
+/// unregistered (the default); registration also requires the daemon to be built with the `browser`
+/// feature (which compiles the heavy chromiumoxide CDP bindings).
+#[derive(Clone, Debug)]
+pub struct BrowserConfig {
+    /// Whether to register the `browser` tool (launching Chromium lazily on first use).
+    pub enable: bool,
+    /// An explicit Chromium/Chrome executable path (`None` => chromiumoxide auto-detection).
+    pub chrome_path: Option<PathBuf>,
+    /// Run headless (the default; `false` shows a window — local debugging only).
+    pub headless: bool,
+    /// The screenshot output directory (`None` => `<profile_home>/browser/screenshots`).
+    pub screenshot_dir: Option<PathBuf>,
+    /// Require interactive host approval before each navigation.
+    pub approve_navigation: bool,
+    /// The browser launch timeout.
+    pub launch_timeout: Duration,
+    /// Auto-dismiss JS dialogs so a modal cannot wedge the session.
+    pub auto_dismiss_dialogs: bool,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            chrome_path: None,
+            headless: true,
+            screenshot_dir: None,
+            approve_navigation: false,
+            launch_timeout: Duration::from_secs(20),
+            auto_dismiss_dialogs: true,
+        }
+    }
+}
+
 /// Which embedding backend Mnemosyne uses for vector recall (selected by config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbedKind {
@@ -365,6 +453,10 @@ pub struct NodeConfig {
     pub embed: EmbedConfig,
     /// MeTTa symbolic-coprocessor tuning (`enable = false` by default — the `metta` tool is opt-in).
     pub metta: MettaConfig,
+    /// Web-tool tuning (`enable = false` by default — `web_search`/`web_extract` are opt-in).
+    pub web: WebConfig,
+    /// Browser-tool tuning (`enable = false` by default — also requires the `browser` build feature).
+    pub browser: BrowserConfig,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -407,6 +499,8 @@ struct FileConfig {
     models: Option<FileModelsConfig>,
     embed: Option<FileEmbedConfig>,
     metta: Option<FileMettaConfig>,
+    web: Option<FileWebConfig>,
+    browser: Option<FileBrowserConfig>,
 }
 
 /// The `[metta]` TOML table — symbolic-coprocessor tuning (every field optional; env wins).
@@ -421,6 +515,29 @@ struct FileMettaConfig {
     max_results: Option<u64>,
     max_restarts: Option<u32>,
     restart_window_ms: Option<u64>,
+}
+
+/// The `[web]` TOML table — web-tool tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileWebConfig {
+    enable: Option<bool>,
+    local_fallback: Option<bool>,
+    tavily_key_id: Option<String>,
+    firecrawl_key_id: Option<String>,
+}
+
+/// The `[browser]` TOML table — browser-tool tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileBrowserConfig {
+    enable: Option<bool>,
+    chrome_path: Option<PathBuf>,
+    headless: Option<bool>,
+    screenshot_dir: Option<PathBuf>,
+    approve_navigation: Option<bool>,
+    launch_timeout_ms: Option<u64>,
+    auto_dismiss_dialogs: Option<bool>,
 }
 
 /// The `[embed]` TOML table — embeddings tuning (every field optional; env wins).
@@ -655,6 +772,8 @@ impl NodeConfig {
         let models = Self::resolve_models(file.models.unwrap_or_default());
         let embed = Self::resolve_embed(file.embed.unwrap_or_default())?;
         let metta = Self::resolve_metta(file.metta.unwrap_or_default())?;
+        let web = Self::resolve_web(file.web.unwrap_or_default());
+        let browser = Self::resolve_browser(file.browser.unwrap_or_default())?;
 
         Ok(Self {
             partition,
@@ -675,6 +794,8 @@ impl NodeConfig {
             models,
             embed,
             metta,
+            web,
+            browser,
             credential_key,
             engine,
             journal_seed,
@@ -765,6 +886,77 @@ impl NodeConfig {
             METTA_RESTART_WINDOW_MS_ENV,
         )?;
         Ok(metta)
+    }
+
+    /// Resolve web-tool tuning (env overriding the `[web]` TOML table overriding defaults).
+    fn resolve_web(file: FileWebConfig) -> WebConfig {
+        let mut web = WebConfig::default();
+        if let Some(b) = file.enable {
+            web.enable = b;
+        }
+        if let Some(s) = env_string(WEB_ENABLE_ENV) {
+            web.enable = parse_bool(&s);
+        }
+        if let Some(b) = file.local_fallback {
+            web.local_fallback = b;
+        }
+        if let Some(s) = env_string(WEB_LOCAL_FALLBACK_ENV) {
+            web.local_fallback = parse_bool(&s);
+        }
+        if let Some(s) = file.tavily_key_id {
+            web.tavily_key_id = s;
+        }
+        if let Some(s) = env_string(WEB_TAVILY_KEY_ENV) {
+            web.tavily_key_id = s;
+        }
+        if let Some(s) = file.firecrawl_key_id {
+            web.firecrawl_key_id = s;
+        }
+        if let Some(s) = env_string(WEB_FIRECRAWL_KEY_ENV) {
+            web.firecrawl_key_id = s;
+        }
+        web
+    }
+
+    /// Resolve browser-tool tuning (env overriding the `[browser]` TOML table overriding defaults).
+    fn resolve_browser(file: FileBrowserConfig) -> anyhow::Result<BrowserConfig> {
+        let mut browser = BrowserConfig::default();
+        if let Some(b) = file.enable {
+            browser.enable = b;
+        }
+        if let Some(s) = env_string(BROWSER_ENABLE_ENV) {
+            browser.enable = parse_bool(&s);
+        }
+        browser.chrome_path = env_string(BROWSER_CHROME_PATH_ENV)
+            .map(PathBuf::from)
+            .or(file.chrome_path);
+        if let Some(b) = file.headless {
+            browser.headless = b;
+        }
+        if let Some(s) = env_string(BROWSER_HEADLESS_ENV) {
+            browser.headless = parse_bool(&s);
+        }
+        browser.screenshot_dir = env_string(BROWSER_SCREENSHOT_DIR_ENV)
+            .map(PathBuf::from)
+            .or(file.screenshot_dir);
+        if let Some(b) = file.approve_navigation {
+            browser.approve_navigation = b;
+        }
+        if let Some(s) = env_string(BROWSER_APPROVE_NAV_ENV) {
+            browser.approve_navigation = parse_bool(&s);
+        }
+        if let Some(b) = file.auto_dismiss_dialogs {
+            browser.auto_dismiss_dialogs = b;
+        }
+        if let Some(s) = env_string(BROWSER_DISMISS_DIALOGS_ENV) {
+            browser.auto_dismiss_dialogs = parse_bool(&s);
+        }
+        resolve_duration_ms(
+            &mut browser.launch_timeout,
+            file.launch_timeout_ms,
+            BROWSER_LAUNCH_TIMEOUT_MS_ENV,
+        )?;
+        Ok(browser)
     }
 
     /// Resolve model-management tuning (env overriding the `[models]` TOML table).

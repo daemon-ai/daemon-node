@@ -23,6 +23,10 @@ pub struct ToolOutcome {
     /// envelope): the tool's typed output (a diff, a command's exit/stdout, a file listing, ...),
     /// opaque to the daemon and rendered by the GUI per `kind`. `None` for plain-text tools.
     pub detail: Option<ToolDetail>,
+    /// Whether the result content came from an external/untrusted source (web/MCP/browser fetch). The
+    /// §12 pipeline fences such content with [`wrap_untrusted_tool_result`](crate::repair::wrap_untrusted_tool_result)
+    /// before the byte-budget stage so the model reads it as inert data, never as instructions.
+    pub untrusted: bool,
 }
 
 impl ToolOutcome {
@@ -36,12 +40,28 @@ impl ToolOutcome {
             },
             effects: Vec::new(),
             detail: None,
+            untrusted: false,
         }
+    }
+
+    /// A text-only outcome whose content is **untrusted** external data (web/MCP/browser): the §12
+    /// pipeline fences it before budgeting. Use this for any tool result derived from a fetched page,
+    /// search hit, or other source outside the agent's own trust boundary.
+    pub fn untrusted_text(call_id: impl Into<String>, ok: bool, content: impl Into<String>) -> Self {
+        let mut out = Self::text(call_id, ok, content);
+        out.untrusted = true;
+        out
     }
 
     /// Attach a structured detail envelope to this outcome.
     pub fn with_detail(mut self, detail: ToolDetail) -> Self {
         self.detail = Some(detail);
+        self
+    }
+
+    /// Mark this outcome's content as untrusted external data (the §12 wrap-untrusted stage).
+    pub fn mark_untrusted(mut self) -> Self {
+        self.untrusted = true;
         self
     }
 }
@@ -162,6 +182,7 @@ impl Tool for DelegateTool {
             },
             effects: vec![Effect::Delegate(job_id)],
             detail: None,
+            untrusted: false,
         }
     }
 }

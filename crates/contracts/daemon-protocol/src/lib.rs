@@ -138,6 +138,23 @@ impl TurnSummary {
     }
 }
 
+/// A point-in-time context-window status (the §10 context engine's view), carried on
+/// [`AgentEvent::Context`]. `max_tokens` is the model window (the HUD denominator) when the provider
+/// declares one; `budget_tokens` is the configured soft compaction budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextStatus {
+    /// The estimated tokens the assembled context currently uses.
+    pub used_tokens: u64,
+    /// The model's context window in tokens, when known (the fill denominator).
+    pub max_tokens: Option<u64>,
+    /// The configured soft compaction budget in tokens, when set.
+    pub budget_tokens: Option<u64>,
+    /// Whether a compaction just occurred (drops/summarization reduced the context).
+    pub compacted: bool,
+    /// How many conversation turns the compaction dropped (`0` when none / no compaction).
+    pub dropped_turns: u32,
+}
+
 /// A read-only projection of one conversation turn, carried in a [`ConvView`] (§17 snapshot reply).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvTurnView {
@@ -285,6 +302,14 @@ pub enum AgentEvent {
         /// The usage increment.
         delta: UsageDelta,
     },
+    /// A context-window status update (the §10 context engine's fill + compaction signal) — the
+    /// data a GUI renders as a context-fill HUD ("128k / 200k") and a "compacted" toast.
+    Context {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// The current context status.
+        status: ContextStatus,
+    },
     /// A provider rate-limit window update.
     RateLimit {
         /// Monotonic event sequence number.
@@ -337,6 +362,7 @@ impl AgentEvent {
             | AgentEvent::ToolStarted { seq, .. }
             | AgentEvent::ToolFinished { seq, .. }
             | AgentEvent::Usage { seq, .. }
+            | AgentEvent::Context { seq, .. }
             | AgentEvent::RateLimit { seq, .. }
             | AgentEvent::TurnFinished { seq, .. }
             | AgentEvent::Error { seq, .. }

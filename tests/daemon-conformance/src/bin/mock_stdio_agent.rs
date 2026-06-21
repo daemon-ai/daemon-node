@@ -62,6 +62,7 @@ async fn main() {
                             input_tokens: 7,
                             output_tokens: 3,
                             api_calls: 1,
+                            ..Default::default()
                         },
                     }),
                     Outbound::Event(AgentEvent::ToolStarted {

@@ -862,6 +862,64 @@ fn render(resp: ApiResponse) {
             );
             println!("  size_bytes: {}", info.size_bytes);
         }
+        ApiResponse::Profiles(profiles) => {
+            println!("profiles: {}", profiles.len());
+            for p in profiles {
+                let active = if p.is_active { " *" } else { "" };
+                println!("  - {} [{:?}] {}{}", p.id, p.provider, p.model, active);
+            }
+        }
+        ApiResponse::Profile(spec) => match spec {
+            Some(s) => {
+                println!("profile: {}", s.id);
+                println!("  provider: {:?}", s.provider);
+                println!("  model: {}", s.model);
+                if let Some(base) = &s.base_url {
+                    println!("  base_url: {base}");
+                }
+                println!("  credential_ref: {}", s.credential_profile());
+            }
+            None => println!("profile: none"),
+        },
+        ApiResponse::ConfigSchema(schema) => {
+            println!("config schema: {} field(s)", schema.fields.len());
+            for f in schema.fields {
+                let opts = if f.options.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", f.options.join("|"))
+                };
+                println!("  - {} ({}){}: {}", f.key, f.kind, opts, f.description);
+            }
+        }
+        ApiResponse::Credentials(creds) => {
+            println!("credentials: {}", creds.len());
+            for c in creds {
+                let state = if c.present { c.hint.clone() } else { "(none)".to_string() };
+                println!("  - {} {}", c.profile, state);
+            }
+        }
+        ApiResponse::Models(models) => {
+            println!("models: {}", models.len());
+            for m in models {
+                let ctx = m
+                    .context_length
+                    .map(|c| format!(" ctx={c}"))
+                    .unwrap_or_default();
+                let kind = if m.local { " [local]" } else { "" };
+                println!("  - {} [{:?}]{}{}", m.id, m.provider, ctx, kind);
+            }
+        }
+        ApiResponse::ModelCurrent(model) => match model {
+            Some(m) => {
+                let ctx = m
+                    .context_length
+                    .map(|c| format!(" ctx={c}"))
+                    .unwrap_or_default();
+                println!("current model: {} [{:?}]{}", m.id, m.provider, ctx);
+            }
+            None => println!("current model: none"),
+        },
         ApiResponse::Error(e) => println!("error: {e}"),
     }
 }

@@ -21,10 +21,12 @@ use crate::tool_pipeline::run_tool;
 use crate::tools::ToolRegistry;
 use crate::turn::{Effect, TurnCx};
 use crate::Failure;
-use daemon_common::{Budget, CredScope, Epoch, JobId, ProfileRef, RateLimitSnapshot, SessionId};
+use daemon_common::{
+    Budget, CredScope, Epoch, JobId, ProfileRef, RateLimitSnapshot, SessionId, UsageDelta,
+};
 use daemon_protocol::{
-    AgentEvent, CompletionSource, ConvTurnView, ConvView, EndReason, HostRequestHandler,
-    ToolCallView, ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
+    AgentEvent, CompletionSource, ContextStatus, ConvTurnView, ConvView, EndReason,
+    HostRequestHandler, ToolCallView, ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -392,7 +394,7 @@ impl Engine {
                 }
                 RecoveryStep::Compact => {
                     // Compact at most once; if it freed nothing the overflow is unrecoverable.
-                    if !compacted && self.compact_context().await {
+                    if !compacted && self.compact_context(events).await {
                         compacted = true;
                     } else {
                         return Err(failure);
@@ -524,23 +526,41 @@ impl Engine {
     /// and proactively compact when over the configured budget (`memory.before_compact` ->
     /// `ctx.compact`). Memory population is a no-op until a [`MemoryProvider`](crate::memory::MemoryProvider)
     /// is registered.
-    async fn prepare_turn_context(&mut self) {
+    async fn prepare_turn_context(&mut self, events: &EventSink) {
         self.assembler.reset_turn();
         self.gather_memory().await;
         let budget = self.config.context_budget_tokens.map(|b| b as usize);
         let pressure = self
             .context
             .before_turn(&self.snapshot.conversation, budget);
+        let max_context = self.provider.capabilities().max_context.map(|c| c as u64);
         // Compact to the context engine's *effective* budget: the host `context_budget_tokens`
         // override when set, else the engine's own threshold (LCM sizes one from the model window in
         // `on_model`). The budgeted default returns `budget_tokens == budget`, so this is a no-op
         // change for it (None => never over budget).
+        let mut compacted = false;
+        let mut dropped_turns = 0u32;
         if let (true, Some(target)) = (pressure.over_budget(), pressure.budget_tokens) {
             self.before_compact_memory().await;
+            let before = self.snapshot.conversation.turns.len();
             let conv = std::mem::take(&mut self.snapshot.conversation);
             self.snapshot.conversation = self.context.compact(conv, target).await;
+            dropped_turns = before.saturating_sub(self.snapshot.conversation.turns.len()) as u32;
+            compacted = dropped_turns > 0;
             self.notify_session_switch(SwitchReason::Compaction).await;
         }
+        // Re-measure after a possible compaction so the HUD reflects the context the turn will use.
+        let used = crate::context::estimate_tokens(&self.snapshot.conversation) as u64;
+        events.emit(|seq| AgentEvent::Context {
+            seq,
+            status: ContextStatus {
+                used_tokens: used,
+                max_tokens: max_context,
+                budget_tokens: pressure.budget_tokens.map(|b| b as u64),
+                compacted,
+                dropped_turns,
+            },
+        });
     }
 
     /// Compact the conversation via the §10 context engine (the §8 -> §10 tie-in). On an explicit
@@ -548,7 +568,7 @@ impl Engine {
     /// configured budget if set, else force a reduction by targeting half the current estimate.
     /// Returns whether any turn was actually dropped (the recovery loop treats `false` as
     /// "overflow is unrecoverable").
-    async fn compact_context(&mut self) -> bool {
+    async fn compact_context(&mut self, events: &EventSink) -> bool {
         let target = self
             .config
             .context_budget_tokens
@@ -557,9 +577,21 @@ impl Engine {
         let before = self.snapshot.conversation.turns.len();
         let conv = std::mem::take(&mut self.snapshot.conversation);
         self.snapshot.conversation = self.context.compact(conv, target).await;
-        let dropped = self.snapshot.conversation.turns.len() < before;
+        let after = self.snapshot.conversation.turns.len();
+        let dropped = after < before;
         if dropped {
             self.notify_session_switch(SwitchReason::Compaction).await;
+            let used = crate::context::estimate_tokens(&self.snapshot.conversation) as u64;
+            events.emit(|seq| AgentEvent::Context {
+                seq,
+                status: ContextStatus {
+                    used_tokens: used,
+                    max_tokens: self.provider.capabilities().max_context.map(|c| c as u64),
+                    budget_tokens: self.config.context_budget_tokens.map(|b| b as u64),
+                    compacted: true,
+                    dropped_turns: (before - after) as u32,
+                },
+            });
         }
         dropped
     }
@@ -639,7 +671,7 @@ impl Engine {
 
         // §11/§10 pre-turn hooks: gather memory recall/blocks into the assembler, then measure
         // budget pressure and compact if over budget (memory.before_compact -> ctx.compact).
-        self.prepare_turn_context().await;
+        self.prepare_turn_context(events).await;
 
         // The in-turn ReAct loop (§4.2): build_context -> call_model -> execute_tools -> observe ->
         // call_model again, until the model returns final text (completion) or a tool delegates
@@ -649,13 +681,18 @@ impl Engine {
         let registry = self.registry.clone();
         let tool_result_budget = self.config.tool_result_budget;
         let mut rounds_left = self.config.max_iterations;
+        // Accumulated usage across every model call this turn makes (each round + the final summary
+        // call), so `TurnSummary.usage` is the turn total, not just the last call's delta.
+        let mut turn_usage = UsageDelta::default();
 
         let cancel = control.cancel_token();
         loop {
             if rounds_left == 0 {
                 // Budget exhausted: one final toolless call asks the model to summarize what it has,
                 // then the turn ends `BudgetExhausted` (the model cannot keep calling tools forever).
-                return Ok(self.finish_budget_exhausted(events, &cancel).await);
+                return Ok(self
+                    .finish_budget_exhausted(events, &cancel, turn_usage)
+                    .await);
             }
             rounds_left -= 1;
 
@@ -663,6 +700,7 @@ impl Engine {
                 Ok(out) => out,
                 Err(f) => return Ok(self.finish_failed(f, events)),
             };
+            turn_usage.add(&out.usage);
 
             // Boundary after the model call: serve snapshots/steer, honor a mid-call interrupt.
             if self.boundary(control, events) {
@@ -675,7 +713,7 @@ impl Engine {
                 self.finalize_text(&out, events);
                 self.after_turn_memory().await;
                 self.context.after_response(&out.usage);
-                return Ok(self.complete(out, events));
+                return Ok(self.complete(out, events, turn_usage));
             }
 
             let cx = TurnCx {
@@ -770,16 +808,18 @@ impl Engine {
         &mut self,
         events: &EventSink,
         cancel: &CancellationToken,
+        mut turn_usage: UsageDelta,
     ) -> TurnOutcome {
         let out = match self.call_model(events, false, cancel).await {
             Ok(out) => out,
             Err(f) => return self.finish_failed(f, events),
         };
         self.finalize_text(&out, events);
+        turn_usage.add(&out.usage);
         let summary = TurnSummary {
             end_reason: EndReason::BudgetExhausted,
             final_text: Some(out.text),
-            usage: out.usage,
+            usage: turn_usage,
         };
         let emitted = summary.clone();
         events.emit(|seq| AgentEvent::TurnFinished {
@@ -789,12 +829,13 @@ impl Engine {
         TurnOutcome::Completed(summary)
     }
 
-    /// Emit the terminal `TurnFinished` and build the completed outcome.
-    fn complete(&self, out: ModelOutput, events: &EventSink) -> TurnOutcome {
+    /// Emit the terminal `TurnFinished` and build the completed outcome. `turn_usage` is the folded
+    /// usage of every model call this turn made (the per-call deltas were already streamed live).
+    fn complete(&self, out: ModelOutput, events: &EventSink, turn_usage: UsageDelta) -> TurnOutcome {
         let summary = TurnSummary {
             end_reason: EndReason::Completed,
             final_text: Some(out.text),
-            usage: out.usage,
+            usage: turn_usage,
         };
         let emitted = summary.clone();
         events.emit(|seq| AgentEvent::TurnFinished {

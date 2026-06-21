@@ -28,6 +28,13 @@ strsim = "0.11"
 genai = "0.6"
 # still used by the in-process mock HTTP server in the provider wire tests.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# readability/HTML->markdown extraction for the key-less `web_extract` fallback (Mozilla readability
+# port). Isolated to the `daemon-tool-web` crate; no network I/O of its own.
+dom_smoothie = "0.18"
+# headless-browser control over the Chrome DevTools Protocol for the `browser` tool. tokio-native;
+# isolated to the `daemon-tool-browser` crate behind the `browser` feature (slow first compile: the
+# CDP bindings are ~60K generated LOC), so the default workspace build never pays for it.
+chromiumoxide = { version = "0.9", default-features = false }
 # local inference engines (feature-gated, isolated to the `daemon-infer` worker crate; never built
 # in the default workspace gate). llama-cpp-4 tracks upstream llama.cpp closely (a llama-cpp-2 fork);
 # default-features off drops its `mtmd`/`dynamic-link` defaults — we add `openmp` + a backend.
@@ -114,6 +121,10 @@ daemon-tool-shell = { path = "tools/daemon-tool-shell" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }
 daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
 daemon-tool-orchestrate = { path = "tools/daemon-tool-orchestrate" }
+daemon-tool-web = { path = "tools/daemon-tool-web" }
+daemon-tool-browser = { path = "tools/daemon-tool-browser" }
+daemon-tool-todo = { path = "tools/daemon-tool-todo" }
+daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
 
 [profile.release]
 panic = "unwind"   # catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)

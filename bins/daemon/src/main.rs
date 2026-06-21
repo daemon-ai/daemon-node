@@ -26,19 +26,29 @@ use daemon_core::{
     EngineProfile, FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider,
     ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
 };
-use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
+use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
-    CoreEngineFactory, CredentialBroker, EngineUnit, HostConfig, JournalFeeder, JournalSink,
-    OwnerBroker,
+    CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit, FileCredentialStore,
+    FileProfileStore, HostConfig, JournalFeeder, JournalSink, MemCredentialStore, MemProfileStore,
+    OwnerBroker, ProfileStore, StoreCredentialSource,
+};
+use daemon_api::{
+    BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ProfileSpec, ProviderSelector,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_metta::protocol::Bounds as MettaBounds;
 use daemon_metta_client::{MettaConfig as MettaClientConfig, MettaCoprocessor};
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
 use daemon_tool_metta::MettaTool;
+use daemon_tool_clarify::ClarifyTool;
+use daemon_tool_todo::TodoTool;
+use daemon_tool_web::{
+    FirecrawlFetch, LocalFetch, SecretSource, TavilySearch, WebExtractTool, WebFetchBackend,
+    WebSearchTool,
+};
 use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
-use daemon_node::{assemble, AssembledNode, NodeAssembly};
+use daemon_node::{assemble, AssembledNode, NodeAssembly, ProviderResolver};
 use daemon_providers::{
     GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider, WorkerConfig,
 };
@@ -145,6 +155,97 @@ fn build_providers(
         }
     }
     providers
+}
+
+/// Build a single provider client for a [`ProfileSpec`] — the per-session resolution seam handed to
+/// [`daemon_node::assemble`] so an interactive session's provider/model/base-URL come from the
+/// active profile bundle (the GUI-settable surface), not the fixed launch config. Mirrors
+/// [`build_providers`]' per-kind construction. The API key still flows per-call through the
+/// credential broker.
+fn provider_builder_for(
+    spec: &ProfileSpec,
+    cfg: &NodeConfig,
+    manager: &Arc<ModelManager>,
+    active: &ActiveModels,
+) -> daemon_core::ProviderBuilder {
+    match spec.provider {
+        ProviderSelector::Mock => {
+            Arc::new(|| Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>)
+        }
+        ProviderSelector::Openai => {
+            let (base, model) = (spec.base_url.clone(), spec.model.clone());
+            Arc::new(move || {
+                let mut p = GenAiProvider::openai(model.clone());
+                if let Some(base) = &base {
+                    p = p.with_endpoint(base.clone());
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            })
+        }
+        ProviderSelector::Anthropic => {
+            let (base, model) = (spec.base_url.clone(), spec.model.clone());
+            Arc::new(move || {
+                let mut p = GenAiProvider::anthropic(model.clone());
+                if let Some(base) = &base {
+                    p = p.with_endpoint(base.clone());
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            })
+        }
+        ProviderSelector::LlamaCpp | ProviderSelector::MistralRs => {
+            let engine = match spec.provider {
+                ProviderSelector::MistralRs => Engine::MistralRs,
+                _ => Engine::Llama,
+            };
+            let provider: Arc<dyn Provider> = Arc::new(SwitchableLocalProvider::new(
+                local_worker_config(cfg, engine),
+                manager.clone(),
+                active.clone(),
+                spec.id.clone(),
+            ));
+            Arc::new(move || provider.clone())
+        }
+    }
+}
+
+/// Seed the launch [`NodeConfig`] as the node's default [`ProfileSpec`] so existing env/TOML
+/// launches keep working: the active profile mirrors the configured provider/model/base-URL/engine
+/// tunables, and a GUI can then clone/edit/select alternatives over the `ProfileApi`.
+fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
+    let provider = match cfg.provider_kind {
+        ProviderKind::Mock => ProviderSelector::Mock,
+        ProviderKind::OpenAi => ProviderSelector::Openai,
+        ProviderKind::Anthropic => ProviderSelector::Anthropic,
+        ProviderKind::LlamaCpp => ProviderSelector::LlamaCpp,
+        ProviderKind::MistralRs => ProviderSelector::MistralRs,
+    };
+    let context_engine = match cfg.context_engine {
+        ContextEngineKind::Lcm => ContextEngineSel::Lcm,
+        ContextEngineKind::Budgeted => ContextEngineSel::Budgeted,
+    };
+    let memory_provider = match cfg.memory_provider {
+        MemoryProviderKind::Mnemosyne => MemoryProviderSel::Mnemosyne,
+        MemoryProviderKind::File => MemoryProviderSel::File,
+        MemoryProviderKind::None => MemoryProviderSel::None,
+    };
+    ProfileSpec {
+        id: cfg.profile.clone(),
+        provider,
+        model: cfg.model.clone(),
+        base_url: cfg.base_url.clone(),
+        system_prompt: String::new(),
+        tool_allowlist: None,
+        budget: BudgetSpec::default(),
+        tunables: EngineTunables {
+            model_retry_attempts: Some(cfg.engine.model_retry_attempts),
+            context_budget_tokens: cfg.engine.context_budget_tokens,
+            max_iterations: Some(cfg.engine.max_iterations),
+            tool_result_budget: Some(cfg.engine.tool_result_budget),
+        },
+        context_engine,
+        memory_provider,
+        credential_ref: None,
+    }
 }
 
 /// The default §10 context wiring: an optional per-session context-engine *builder* and the
@@ -403,6 +504,88 @@ fn build_metta_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
         "metta symbolic coprocessor tool enabled"
     );
     Some(Arc::new(tool) as Arc<dyn Tool>)
+}
+
+/// Adapts the host's [`CredentialStore`] to the web tools' [`SecretSource`] seam so the heavy
+/// substrate type never enters the tool crate. Reads happen at call time, so a key set later via
+/// `CredentialApi` takes effect immediately.
+struct CredentialSecrets(Arc<dyn CredentialStore>);
+
+impl SecretSource for CredentialSecrets {
+    fn secret(&self, key: &str) -> Option<String> {
+        self.0.get(key)
+    }
+}
+
+/// Build the `web_search` + `web_extract` tools when enabled. `web_search` resolves through Tavily
+/// (keyed); `web_extract` tries Firecrawl (keyed) then, when enabled, the dependency-light local
+/// readability fallback. Both return their content marked untrusted (the §12 pipeline fences it).
+fn build_web_tools(cfg: &NodeConfig, credentials: Arc<dyn CredentialStore>) -> Vec<Arc<dyn Tool>> {
+    if !cfg.web.enable {
+        return Vec::new();
+    }
+    let secrets: Arc<dyn SecretSource> = Arc::new(CredentialSecrets(credentials));
+    let search = TavilySearch::new(secrets.clone()).with_key_id(cfg.web.tavily_key_id.clone());
+    let mut fetchers: Vec<Arc<dyn WebFetchBackend>> = vec![Arc::new(
+        FirecrawlFetch::new(secrets).with_key_id(cfg.web.firecrawl_key_id.clone()),
+    )];
+    if cfg.web.local_fallback {
+        fetchers.push(Arc::new(LocalFetch::new()));
+    }
+    tracing::info!(
+        local_fallback = cfg.web.local_fallback,
+        "web_search + web_extract tools enabled"
+    );
+    vec![
+        Arc::new(WebSearchTool::new(Arc::new(search))) as Arc<dyn Tool>,
+        Arc::new(WebExtractTool::new(fetchers)) as Arc<dyn Tool>,
+    ]
+}
+
+/// Build the `browser` tool when enabled and compiled in (the `browser` feature). The supervised
+/// Chromium is launched lazily on first use.
+#[cfg(feature = "browser")]
+fn build_browser_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
+    use daemon_tool_browser::{BrowserSettings, BrowserSupervisor, BrowserTool};
+
+    if !cfg.browser.enable {
+        return None;
+    }
+    let screenshot_dir = cfg
+        .browser
+        .screenshot_dir
+        .clone()
+        .unwrap_or_else(|| cfg.profile_home().join("browser").join("screenshots"));
+    let settings = BrowserSettings {
+        chrome_path: cfg.browser.chrome_path.clone(),
+        headless: cfg.browser.headless,
+        screenshot_dir,
+        launch_timeout: cfg.browser.launch_timeout,
+        auto_dismiss_dialogs: cfg.browser.auto_dismiss_dialogs,
+    };
+    let supervisor = Arc::new(BrowserSupervisor::new(settings));
+    let mut tool = BrowserTool::new(supervisor);
+    if cfg.browser.approve_navigation {
+        tool = tool.with_navigation_approval();
+    }
+    tracing::info!(
+        headless = cfg.browser.headless,
+        approve_navigation = cfg.browser.approve_navigation,
+        "browser tool enabled"
+    );
+    Some(Arc::new(tool) as Arc<dyn Tool>)
+}
+
+/// The `browser` feature is off: the tool is never registered (and chromiumoxide is not compiled).
+#[cfg(not(feature = "browser"))]
+fn build_browser_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
+    if cfg.browser.enable {
+        tracing::warn!(
+            "browser tool is enabled in config but the daemon was built without the `browser` \
+             feature; the tool will not be registered"
+        );
+    }
+    None
 }
 
 /// A shared, agent-wide Mnemosyne bank cache: one per-session [`MnemosyneProvider`] over the same
@@ -722,9 +905,21 @@ fn build_store(backend: &StoreBackend) -> anyhow::Result<Arc<dyn SessionStore>> 
 async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let store = build_store(&cfg.store)?;
 
+    // The persisted credential store backing the `CredentialApi` surface and the owner authority.
+    // Durable nodes persist secrets under the data root; the ephemeral default keeps them in memory.
+    let credential_store: Arc<dyn CredentialStore> = if cfg.persist_providers() {
+        Arc::new(FileCredentialStore::open(cfg.data_dir.join("credentials.json"))?)
+    } else {
+        Arc::new(MemCredentialStore::new())
+    };
+    // Seed the launch-configured key so existing launches keep authenticating until a GUI sets one.
+    credential_store
+        .set(&cfg.profile, &cfg.credential_key)
+        .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+
     // Credentials: an owner authority brokered into *every* engine, uniformly across the durable,
     // interactive, and fleet-child construction paths (host-spec §6).
-    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key);
+    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key, credential_store.clone());
     let cred_profile = ProfileRef::new(cfg.profile.clone());
     let credentials: CredentialBuilder = {
         let owner = owner.clone();
@@ -803,11 +998,46 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         extra_tools.push(metta_tool);
     }
 
+    // Core chat tools registered on every role: the per-session `todo` planner and the `clarify`
+    // human-in-the-loop ask (both dependency-light, so they are always on).
+    extra_tools.push(Arc::new(TodoTool::new()) as Arc<dyn Tool>);
+    extra_tools.push(Arc::new(ClarifyTool::new()) as Arc<dyn Tool>);
+
+    // The optional web tools (`web_search`/`web_extract`, opt-in). Keys are read live from the
+    // credential store, so a GUI-set Tavily/Firecrawl key applies without a restart.
+    extra_tools.extend(build_web_tools(&cfg, credential_store.clone()));
+
+    // The optional `browser` tool — only available when the daemon is built with the `browser`
+    // feature (which compiles chromiumoxide); a no-op otherwise.
+    if let Some(browser_tool) = build_browser_tool(&cfg) {
+        extra_tools.push(browser_tool);
+    }
+
     let host_config = HostConfig {
         partition: cfg.partition,
         dispatch_interval: cfg.dispatch_interval,
         scan_interval: cfg.scan_interval,
         ..HostConfig::default()
+    };
+
+    // The profile store backing the `ProfileApi` surface + per-session engine resolution. It
+    // persists alongside the durable subsystem databases when the node is durable (sqlite), else it
+    // is in-memory (the ephemeral default). The launch config is seeded as the active default.
+    let profile_store: Arc<dyn ProfileStore> = if cfg.persist_providers() {
+        Arc::new(FileProfileStore::open(cfg.data_dir.join("profiles"))?)
+    } else {
+        Arc::new(MemProfileStore::new())
+    };
+    profile_store
+        .seed(default_profile_spec(&cfg))
+        .map_err(|e| anyhow::anyhow!("seeding default profile: {e}"))?;
+    // The per-session provider resolution seam: maps the active profile bundle onto a provider
+    // client (so a GUI can switch model/provider live).
+    let provider_resolver: ProviderResolver = {
+        let cfg = cfg.clone();
+        let manager = manager.clone();
+        let active = active.clone();
+        Arc::new(move |spec: &ProfileSpec| provider_builder_for(spec, &cfg, &manager, &active))
     };
 
     let AssembledNode { node, handle, .. } = assemble(NodeAssembly {
@@ -826,6 +1056,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         memory_builder: memory.builder,
         extra_tools,
         models: Some(manager.clone()),
+        profiles: Some(profile_store),
+        provider_resolver: Some(provider_resolver),
+        credential_store: Some(credential_store),
     });
     tracing::info!("daemon host node started");
 
@@ -864,15 +1097,21 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the owner end of the credential brokering chain over a stub source (host-spec §7), minting
-/// the configured key for the configured profile.
-fn build_owner_broker(profile: &str, key: &str) -> Arc<dyn CredentialBroker> {
+/// Build the owner end of the credential brokering chain over the persisted credential store
+/// (host-spec §7). The authority hands over the stored provider key (the GUI-set secret, falling
+/// back to the configured key) as the request bearer for `profile`, so a real provider call carries
+/// the live credential. Bearer mode + non-minting: the stored key is the secret, no STS dance.
+fn build_owner_broker(
+    profile: &str,
+    fallback_key: &str,
+    store: Arc<dyn CredentialStore>,
+) -> Arc<dyn CredentialBroker> {
     let signer = Arc::new(CapabilitySigner::generate());
-    let source = Arc::new(StubCredentialSource::minting(profile, key));
+    let source = Arc::new(StoreCredentialSource::new(store, profile, fallback_key));
     let scope = CredScope::new([profile], ["chat", "embed"], Some(1_000));
     let authority = Arc::new(CredentialAuthority::new(
         scope,
-        CredMode::Native,
+        CredMode::Bearer,
         60_000,
         signer,
         source,
@@ -891,7 +1130,11 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
 
     // A transport node owns its store, so it mints its own credentials (the host path's owner
     // broker) rather than brokering from a parent — the engine is therefore not credential-less.
-    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key);
+    let cred_store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+    cred_store
+        .set(&cfg.profile, &cfg.credential_key)
+        .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key, cred_store);
     let credentials: CredentialBuilder = {
         let owner = owner.clone();
         Arc::new(move || {

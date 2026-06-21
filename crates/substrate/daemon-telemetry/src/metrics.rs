@@ -116,11 +116,13 @@ mod tests {
             input_tokens: 10,
             output_tokens: 5,
             api_calls: 1,
+            ..Default::default()
         });
         m.fold_usage(&UsageDelta {
             input_tokens: 1,
             output_tokens: 2,
             api_calls: 1,
+            ..Default::default()
         });
         m.record_event();
         m.record_event();

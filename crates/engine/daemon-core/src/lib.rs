@@ -33,6 +33,7 @@ pub mod profile;
 pub mod provider;
 pub mod recovery;
 pub mod repair;
+pub mod safety;
 pub mod snapshot;
 pub mod tool_pipeline;
 pub mod tools;
@@ -69,6 +70,7 @@ pub use repair::{
     repair_tool_args, repair_tool_call, repair_tool_name, sanitize_tool_error, scrub_content,
     wrap_untrusted_tool_result, ArgRepair, NameRepairError, ScrubChunk, StreamingThinkScrubber,
 };
+pub use safety::{check_url, CheckedUrl, UrlReject};
 pub use snapshot::{ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;
 pub use tools::{DelegateTool, Tool, ToolDef, ToolOutcome, ToolRegistry};

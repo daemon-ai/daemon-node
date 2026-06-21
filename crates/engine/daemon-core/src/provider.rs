@@ -416,6 +416,7 @@ impl Provider for MockProvider {
             input_tokens: 8,
             output_tokens: 4,
             api_calls: 1,
+            ..Default::default()
         };
         let wants_tool = matches!(self.behaviour, Behaviour::Delegating) && !req.has_tool_result();
         if wants_tool {
@@ -549,6 +550,7 @@ impl Provider for ScriptedProvider {
             input_tokens: 8,
             output_tokens: 4,
             api_calls: 1,
+            ..Default::default()
         };
         let step = self
             .steps

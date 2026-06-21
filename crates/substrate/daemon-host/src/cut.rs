@@ -1084,6 +1084,7 @@ async fn drive_placed_child(
                                 input_tokens: 0,
                                 output_tokens: 0,
                                 api_calls: 1,
+                                ..Default::default()
                             },
                         },
                     )

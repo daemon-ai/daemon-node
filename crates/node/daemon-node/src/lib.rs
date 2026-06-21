@@ -18,16 +18,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use daemon_api::FleetReport;
-use daemon_common::{JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
+use daemon_api::{EngineTunables, FleetReport, ProfileSpec};
+use daemon_common::{Budget, JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile, MemoryBuilder,
-    MemoryProvider, ProviderRegistry, SystemPrompt, Tool, ToolRegistry,
+    MemoryProvider, ProviderBuilder, ProviderRegistry, SystemPrompt, Tool, ToolRegistry,
 };
 use daemon_host::{
-    AgentSession, AgentUnit, CodecSession, CoreEngineFactory, EngineUnit, FleetControl, Host,
-    HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl,
-    ProcessAgentUnit, ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
+    AgentSession, AgentUnit, CodecSession, CoreEngineFactory, CredentialStore, EngineUnit,
+    FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink,
+    NodeApiImpl, ProcessAgentUnit, ProfileStore, ServiceError, SessionEngineBuilder,
+    StreamJsonCodec, SupervisorHandle,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -39,6 +40,14 @@ use daemon_telemetry::TraceSigner;
 const ORCHESTRATOR_PROFILE: &str = "orchestrator";
 /// The provider-registry profile name the (legacy synchronous) fleet-child engine resolves to.
 const CHILD_PROFILE: &str = "child";
+
+/// Resolves a [`ProviderBuilder`] for a profile bundle — the seam letting the binary map a
+/// [`ProfileSpec`]'s `provider`/`model`/`base_url` onto a concrete provider client without
+/// `daemon-node` depending on `daemon-providers`. When a node supplies a resolver and a
+/// [`ProfileStore`], interactive sessions resolve their provider/persona/tools/budget per session
+/// from the active profile (so a GUI can switch model/provider live); otherwise the node falls back
+/// to a single fixed session profile.
+pub type ProviderResolver = Arc<dyn Fn(&ProfileSpec) -> ProviderBuilder + Send + Sync>;
 
 /// The policy inputs for [`assemble`]: everything that varies between a production node and a test
 /// node. The standard plumbing (role profiles, fleet, factory, host, session surface) is derived.
@@ -88,6 +97,16 @@ pub struct NodeAssembly {
     /// catalog/activate). `None` builds a node without local-inference model management (tests, a
     /// remote-only node); the `ModelApi` calls then resolve to `ApiError::Unsupported`.
     pub models: Option<Arc<daemon_models::ModelManager>>,
+    /// The durable profile store backing the node's `ProfileApi` sub-surface and per-session engine
+    /// resolution. `None` builds a node without profile management (the `profile` field then fixes
+    /// every interactive session's engine shape, the legacy behavior).
+    pub profiles: Option<Arc<dyn ProfileStore>>,
+    /// Maps an active [`ProfileSpec`] onto a concrete provider client. Required (with `profiles`) for
+    /// per-session profile resolution; `None` keeps the fixed session profile.
+    pub provider_resolver: Option<ProviderResolver>,
+    /// The persisted credential store backing the node's `CredentialApi` sub-surface (the same store
+    /// the credential authority provisions from). `None` builds a node without credential management.
+    pub credential_store: Option<Arc<dyn CredentialStore>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -104,8 +123,17 @@ pub struct AssembledNode {
 }
 
 /// Apply the engine tunables, the default context engine + memory providers (§10/§11), and the
-/// optional brokered credentials uniformly to a role profile.
+/// optional brokered credentials uniformly to a role profile (credentials bound to the node profile).
 fn dress(profile: EngineProfile, a: &NodeAssembly) -> EngineProfile {
+    dress_with_credential(profile, a, a.profile.clone())
+}
+
+/// Like [`dress`] but binds credentials to an explicit profile ref (the per-session credential ref).
+fn dress_with_credential(
+    profile: EngineProfile,
+    a: &NodeAssembly,
+    cred_profile: ProfileRef,
+) -> EngineProfile {
     let mut profile = profile.with_config(a.engine_config);
     // Per-session builders (stateful/session-scoped backends) take precedence over shared instances.
     if let Some(builder) = &a.context_builder {
@@ -119,8 +147,97 @@ fn dress(profile: EngineProfile, a: &NodeAssembly) -> EngineProfile {
         profile = profile.with_memory(a.memory.clone());
     }
     match &a.credentials {
-        Some(credentials) => profile.with_credentials(credentials.clone(), a.profile.clone()),
+        Some(credentials) => profile.with_credentials(credentials.clone(), cred_profile),
         None => profile,
+    }
+}
+
+/// Overlay a [`ProfileSpec`]'s engine-tunable overrides onto the node's base [`Config`].
+fn merged_config(base: Config, t: &EngineTunables) -> Config {
+    let mut c = base;
+    if let Some(v) = t.model_retry_attempts {
+        c.model_retry_attempts = v;
+    }
+    if let Some(v) = t.context_budget_tokens {
+        c.context_budget_tokens = Some(v);
+    }
+    if let Some(v) = t.max_iterations {
+        c.max_iterations = v;
+    }
+    if let Some(v) = t.tool_result_budget {
+        c.tool_result_budget = v;
+    }
+    c
+}
+
+/// Build the interactive tool registry for a session: the core fs + shell toolset plus node-level
+/// `extra` tools, optionally narrowed to an allowlist of tool names.
+fn session_tool_registry(extra: &[Arc<dyn Tool>], allowlist: Option<&[String]>) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    let mut candidates: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(daemon_tool_fs::FsTool::new()) as Arc<dyn Tool>,
+        Arc::new(daemon_tool_shell::ShellTool::new()) as Arc<dyn Tool>,
+    ];
+    candidates.extend(extra.iter().cloned());
+    for tool in candidates {
+        let allowed = match allowlist {
+            Some(list) => list.iter().any(|n| n == tool.name()),
+            None => true,
+        };
+        if allowed {
+            registry.register(tool);
+        }
+    }
+    registry
+}
+
+/// The captured node context a profile-aware session builder needs to materialize a per-session
+/// [`EngineProfile`] from the active [`ProfileSpec`] (provider + persona + tools + budget +
+/// context/memory + credentials), without re-borrowing the consumed [`NodeAssembly`].
+struct SessionFactoryCtx {
+    resolver: ProviderResolver,
+    extra_tools: Vec<Arc<dyn Tool>>,
+    engine_config: Config,
+    credentials: Option<CredentialBuilder>,
+    context: Option<Arc<dyn ContextEngine>>,
+    context_builder: Option<ContextEngineBuilder>,
+    memory: Vec<Arc<dyn MemoryProvider>>,
+    memory_builder: Option<MemoryBuilder>,
+}
+
+impl SessionFactoryCtx {
+    /// Materialize a per-session engine profile from a profile bundle.
+    fn profile_from_spec(&self, spec: &ProfileSpec) -> EngineProfile {
+        let provider = (self.resolver)(spec);
+        let registry = session_tool_registry(&self.extra_tools, spec.tool_allowlist.as_deref());
+        let persona = if spec.system_prompt.trim().is_empty() {
+            "interactive session".to_string()
+        } else {
+            spec.system_prompt.clone()
+        };
+        let mut profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new(persona))
+            .with_config(merged_config(self.engine_config, &spec.tunables));
+        if spec.budget.tokens.is_some() || spec.budget.wall_ms.is_some() {
+            profile = profile.with_budget(Budget {
+                tokens: spec.budget.tokens,
+                wall_ms: spec.budget.wall_ms,
+            });
+        }
+        if let Some(builder) = &self.context_builder {
+            profile = profile.with_context_engine_builder(builder.clone());
+        } else if let Some(context) = &self.context {
+            profile = profile.with_context_engine(context.clone());
+        }
+        if let Some(builder) = &self.memory_builder {
+            profile = profile.with_memory_builder(builder.clone());
+        } else if !self.memory.is_empty() {
+            profile = profile.with_memory(self.memory.clone());
+        }
+        if let Some(credentials) = &self.credentials {
+            profile =
+                profile.with_credentials(credentials.clone(), ProfileRef::new(spec.credential_profile()));
+        }
+        profile
     }
 }
 
@@ -228,10 +345,41 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         ),
         &a,
     );
-    let session_builder: SessionEngineBuilder = {
-        let profile = session_profile;
-        Arc::new(move |id: SessionId| profile.fresh(id))
-    };
+    // Profile-aware interactive session builder: when the node carries a profile store + provider
+    // resolver, each session resolves the *active* profile bundle at open and materializes its
+    // engine (provider/persona/tools/budget/credentials) from it, so a GUI can switch model/provider
+    // live. Otherwise sessions are built from the single fixed `session_profile` (legacy behavior).
+    let session_builder: SessionEngineBuilder =
+        match (a.profiles.clone(), a.provider_resolver.clone()) {
+            (Some(store), Some(resolver)) => {
+                let ctx = SessionFactoryCtx {
+                    resolver,
+                    extra_tools: a.extra_tools.clone(),
+                    engine_config: a.engine_config,
+                    credentials: a.credentials.clone(),
+                    context: a.context.clone(),
+                    context_builder: a.context_builder.clone(),
+                    memory: a.memory.clone(),
+                    memory_builder: a.memory_builder.clone(),
+                };
+                let fallback = session_profile;
+                Arc::new(move |id: SessionId| {
+                    let spec = store
+                        .active()
+                        .ok()
+                        .flatten()
+                        .and_then(|active| store.get(&active).ok().flatten());
+                    match spec {
+                        Some(spec) => ctx.profile_from_spec(&spec).fresh(id),
+                        None => fallback.fresh(id),
+                    }
+                })
+            }
+            _ => {
+                let profile = session_profile;
+                Arc::new(move |id: SessionId| profile.fresh(id))
+            }
+        };
 
     let mut node_api = NodeApiImpl::new(
         handle.observer(),
@@ -246,6 +394,14 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // Bind the model-management sub-surface when this node hosts local-inference model management.
     if let Some(models) = a.models.clone() {
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
+    }
+    // Bind the profile/config sub-surface when this node hosts profile management.
+    if let Some(profiles) = a.profiles.clone() {
+        node_api = node_api.with_profiles(profiles);
+    }
+    // Bind the credential sub-surface when this node hosts credential management.
+    if let Some(credentials) = a.credential_store.clone() {
+        node_api = node_api.with_credential_store(credentials);
     }
     let node = Arc::new(node_api);
 

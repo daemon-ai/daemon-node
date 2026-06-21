@@ -480,6 +480,7 @@ impl SessionStore for SqliteStore {
                     input_tokens: row.get::<_, i64>(0)? as u64,
                     output_tokens: row.get::<_, i64>(1)? as u64,
                     api_calls: row.get::<_, i64>(2)? as u32,
+                    ..Default::default()
                 })
             },
         )

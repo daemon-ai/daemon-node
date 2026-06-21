@@ -230,6 +230,21 @@ pub struct UsageDelta {
     pub output_tokens: u64,
     /// Provider API calls made by this step.
     pub api_calls: u32,
+    /// Prompt tokens served from the provider's prompt cache (a subset of `input_tokens` billed at a
+    /// reduced rate). `0` when the provider does not surface cache reads.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the provider's prompt cache this step (the cache-creation surcharge).
+    /// `0` when the provider does not surface cache writes.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Reasoning/thinking tokens (a subset of `output_tokens` for reasoning models). `0` when none.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// The estimated cost of this step in micro-USD (millionths of a dollar), when a pricing table is
+    /// available. `0`/unset where cost is not computed.
+    #[serde(default)]
+    pub cost_micros: u64,
 }
 
 impl UsageDelta {
@@ -238,6 +253,10 @@ impl UsageDelta {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.api_calls += other.api_calls;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cost_micros += other.cost_micros;
     }
 }
 

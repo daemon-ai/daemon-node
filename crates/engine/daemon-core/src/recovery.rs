@@ -355,6 +355,7 @@ mod tests {
                     input_tokens: 5,
                     output_tokens: 2,
                     api_calls: 1,
+                    ..Default::default()
                 },
             };
             Box::pin(stream::iter(vec![

@@ -496,6 +496,7 @@ async fn drive_generation(
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
                     api_calls: 1,
+                    ..Default::default()
                 };
                 break;
             }

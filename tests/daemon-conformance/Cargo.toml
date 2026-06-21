@@ -20,6 +20,7 @@ daemon-provision = { workspace = true }
 daemon-telemetry = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
+daemon-tool-web = { workspace = true }
 daemon-node = { workspace = true }
 daemon-acp = { workspace = true }
 agent-client-protocol = { workspace = true }

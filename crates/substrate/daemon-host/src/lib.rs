@@ -32,12 +32,14 @@
 pub mod agent_session;
 pub mod config;
 pub mod credentials;
+pub mod credstore;
 pub mod cut;
 pub mod engine_incarnation;
 pub mod foreign;
 pub mod journal;
 pub mod node_api;
 pub mod process_agent;
+pub mod profiles;
 pub mod services;
 pub mod socket;
 pub mod streamjson;
@@ -51,6 +53,9 @@ pub use config::HostConfig;
 pub use credentials::{
     BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,
 };
+pub use credstore::{
+    CredentialStore, FileCredentialStore, MemCredentialStore, StoreCredentialSource,
+};
 pub use cut::{
     run_placed_child, run_placed_child_journaled, serve_credentials, CredCall, CredReplyBody,
     CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
@@ -60,6 +65,7 @@ pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCu
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use node_api::{NodeApiImpl, SessionEngineBuilder};
 pub use process_agent::ProcessAgentUnit;
+pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use socket::{serve_api_unix, ApiClient};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{

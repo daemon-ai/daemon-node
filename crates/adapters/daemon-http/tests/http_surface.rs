@@ -91,6 +91,12 @@ impl ControlApi for MockApi {
 // All `ModelApi` methods carry defaults; the mock exposes no model management.
 impl ModelApi for MockApi {}
 
+// All `ProfileApi` methods carry defaults; the mock exposes no profile management.
+impl daemon_api::ProfileApi for MockApi {}
+
+// All `CredentialApi` methods carry defaults; the mock exposes no credential management.
+impl daemon_api::CredentialApi for MockApi {}
+
 async fn spawn_server() -> String {
     let api: Arc<dyn NodeApi> = Arc::new(MockApi);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
