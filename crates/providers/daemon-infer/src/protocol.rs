@@ -110,6 +110,23 @@ impl Default for Sampling {
     }
 }
 
+/// A grammar constraint applied to one generation, bounding the model's output to a formal grammar.
+///
+/// Each engine accepts a different dialect, so the constraint carries both renderings and each
+/// backend picks its own: mistral.rs consumes [`Constraint::lark`] via
+/// `RequestBuilder::set_constraint`; llama.cpp consumes [`Constraint::gbnf`] (root rule `root`) via
+/// `LlamaSampler::grammar`. A backend whose dialect is absent ignores the constraint (with a
+/// warning) rather than failing the generation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Constraint {
+    /// A Lark grammar (mistral.rs / llguidance), if available.
+    #[serde(default)]
+    pub lark: Option<String>,
+    /// A GBNF grammar (llama.cpp, root rule `root`), if available.
+    #[serde(default)]
+    pub gbnf: Option<String>,
+}
+
 /// One flattened conversation message (mirrors `daemon_core::RequestMsg`, preserving native
 /// tool-call linkage so the worker can apply a faithful chat template).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +216,9 @@ pub enum Command {
         sampling: Sampling,
         /// The output-token cap (`0` = the worker's default).
         max_tokens: u32,
+        /// An optional grammar constraint bounding the output (e.g. MeTTa). `None` = unconstrained.
+        #[serde(default)]
+        constraint: Option<Constraint>,
     },
     /// Embed a batch of texts against an embedding-mode model (loaded with
     /// [`ModelParams::embeddings`]). The worker answers [`Event::Embeddings`] or [`Event::Error`].
@@ -371,6 +391,10 @@ mod tests {
             }],
             sampling: Sampling::default(),
             max_tokens: 512,
+            constraint: Some(Constraint {
+                gbnf: Some("root ::= \"a\"".into()),
+                lark: None,
+            }),
         });
         round_trip_command(Command::Embed {
             request_id: 9,

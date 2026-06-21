@@ -1,0 +1,43 @@
+[package]
+name = "daemon-metta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemon-metta"
+path = "src/bin/daemon-metta.rs"
+
+[features]
+# Default = no engine. The crate compiles a pure-Rust fallback evaluator (structural match + the
+# full persistence/versioning/lifecycle), so `cargo test --workspace` stays light: no hyperon, no
+# git2/libgit2, no second git dependency. `daemon-metta-client`/`daemon-tool-metta` consume the
+# crate with default-features = false for the `protocol` module only.
+default = []
+# The real MeTTa engine (hyperon). Built only for a dedicated worker output (mirrors the
+# `daemon-infer` engine lanes) — never in the default workspace gate.
+hyperon = ["dep:hyperon"]
+
+[dependencies]
+# Protocol + state are pure: serde + ciborium + serde_json only (no daemon-core, no engine).
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+# Worker runtime + the framed stdio cut (shared with the inference worker).
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+daemon-provision = { workspace = true }
+# The MeTTa engine — feature-gated, never built in the default/fallback workspace gate.
+hyperon = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Integration test spawns the real worker bin through the process provisioner (needs SessionId).
+daemon-common = { workspace = true }

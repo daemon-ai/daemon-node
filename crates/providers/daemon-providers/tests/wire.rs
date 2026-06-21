@@ -25,6 +25,7 @@ fn req() -> Request {
             schema: r#"{"type":"object","properties":{"path":{"type":"string"}}}"#.into(),
         }],
         auth: Some("sk-test".into()),
+        constraint: None,
     }
 }
 

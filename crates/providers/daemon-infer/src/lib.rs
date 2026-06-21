@@ -15,6 +15,7 @@
 
 pub mod backend;
 pub mod backends;
+pub mod grammar;
 pub mod protocol;
 pub mod tooling;
 

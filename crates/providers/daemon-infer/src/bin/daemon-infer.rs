@@ -89,6 +89,7 @@ async fn main() {
                         tools,
                         sampling,
                         max_tokens,
+                        constraint,
                     } => {
                         let Some(backend) = backend.clone() else {
                             send_event(
@@ -111,6 +112,7 @@ async fn main() {
                             tools,
                             sampling,
                             max_tokens,
+                            constraint,
                         };
                         let writer = writer.clone();
                         let done_tx = done_tx.clone();

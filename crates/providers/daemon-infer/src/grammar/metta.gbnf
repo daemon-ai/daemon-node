@@ -1,0 +1,37 @@
+# GBNF grammar for MeTTa source (llama.cpp / `llama-cpp-4` `LlamaSampler::grammar`).
+#
+# A direct transcription of the supplied MeTTa EBNF:
+#   METTA      ::= { [ '!', [ DELIM ] ], ATOM, [ DELIM ] }
+#   ATOM       ::= SYMBOL | VARIABLE | GROUNDED | EXPRESSION   (SYMBOL = GROUNDED-word = WORD)
+#   WORD       ::= ( CHAR | '#' ), { CHAR | '"' | '#' }
+#   VARIABLE   ::= '$', ( CHAR | '"' ), { CHAR | '"' }
+#   EXPRESSION ::= '(', { ATOM, [ DELIM ] }, ')'
+#   STRING     ::= '"', { <any char except '"'> }, '"'
+#   COMMENT    ::= ';', { <any char except EOL> }
+#   CHAR       ::= any char except WHITESPACE and ( '"' '#' '(' ')' ';' )
+#
+# `ws` (a possibly-empty run of whitespace/comments) realizes the optional DELIM. The leading
+# optional '!' is the MeTTa "evaluate" marker.
+
+root        ::= ws (item ws)*
+item        ::= ("!" ws)? atom
+atom        ::= expression | variable | string | word
+expression  ::= "(" ws (atom ws)* ")"
+
+# WORD: first char is CHAR or '#'; subsequent chars are CHAR, '"' or '#'.
+word        ::= word-first word-rest*
+word-first  ::= [^ \t\r\n"#();] | "#"
+word-rest   ::= [^ \t\r\n"#();] | "\"" | "#"
+
+# VARIABLE: '$' then one-or-more of (CHAR | '"').
+variable    ::= "$" var-char var-char*
+var-char    ::= [^ \t\r\n#();] 
+
+# STRING: double-quoted, any character except an unescaped '"'.
+string      ::= "\"" str-char* "\""
+str-char    ::= [^"]
+
+# DELIM: whitespace and ';' line comments, possibly empty.
+ws          ::= (ws-char | comment)*
+ws-char     ::= [ \t\r\n]
+comment     ::= ";" [^\r\n]*

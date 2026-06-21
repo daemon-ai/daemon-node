@@ -55,6 +55,21 @@ pub struct Request {
     /// (which ignore it); a real networked provider sends it as the `Authorization` bearer. Treat as
     /// a secret — never log it.
     pub auth: Option<String>,
+    /// An optional grammar constraint bounding the model's output to a formal language (e.g. the
+    /// MeTTa "draft" path that constrains generation to the symbolic-coprocessor grammar). `None` =
+    /// unconstrained. A provider that cannot constrain generation ignores it.
+    pub constraint: Option<GrammarConstraint>,
+}
+
+/// An engine-agnostic grammar constraint carried on a [`Request`]. It holds both grammar dialects so
+/// any local engine can pick the one it supports (mistral.rs => [`GrammarConstraint::lark`], llama
+/// => [`GrammarConstraint::gbnf`]); networked providers that cannot constrain output ignore it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GrammarConstraint {
+    /// A Lark grammar (mistral.rs / llguidance), if available.
+    pub lark: Option<String>,
+    /// A GBNF grammar (llama.cpp, root rule `root`), if available.
+    pub gbnf: Option<String>,
 }
 
 impl Request {
@@ -66,6 +81,13 @@ impl Request {
     /// The names of the offered tools (the valid set §9 tool-name repair resolves against).
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// Bound this request's output to `constraint` (e.g. the MeTTa "draft" grammar). A provider that
+    /// cannot constrain generation ignores it.
+    pub fn with_constraint(mut self, constraint: GrammarConstraint) -> Self {
+        self.constraint = Some(constraint);
+        self
     }
 }
 
@@ -323,6 +345,7 @@ pub fn build_context(conv: &Conversation, tools: &[ToolDef]) -> Request {
         messages,
         tools: tools.to_vec(),
         auth: None,
+        constraint: None,
     }
 }
 

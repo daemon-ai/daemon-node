@@ -66,6 +66,15 @@ bc-rand = "0.5"
 # Agent Client Protocol (ACP): JSON-RPC 2.0 over stdio for foreign agents. Pinned; isolated to the
 # `daemon-acp` adapter crate so its runtime model never leaks into `daemon-host`.
 agent-client-protocol = "=0.15.0"
+# hyperon (MeTTa): the symbolic-coprocessor engine. NOT a published crate — pinned by rev so the
+# Cargo.lock git source matches the Nix `fetchFromGitHub` hash (flake.nix vendoring, Option A).
+# default-features off drops `das` (a second git dependency, `metta-bus-client`) and the `git`
+# feature (`git2`/vendored-libgit2 — a native C build). We DO opt into `pkg_mgmt` because this rev's
+# `builtin_mods/json.rs` references `serde_json` unconditionally, so it fails to compile without it;
+# `pkg_mgmt` pulls only crates.io deps (serde/serde_json/semver/xxhash) — no native libs, no extra
+# git source. Feature-gated + isolated to the `daemon-metta` worker crate, never built in the default
+# workspace gate (mirrors the `daemon-infer` engine lanes).
+hyperon = { git = "https://github.com/trueagi-io/hyperon-experimental.git", rev = "3f76dc460da6961f57f69f6c3e550c59c74ada83", default-features = false, features = ["pkg_mgmt"] }
 
 # internal crates (path deps; referenced by member crates via `workspace = true`)
 daemon-common = { path = "crates/contracts/daemon-common" }
@@ -91,6 +100,11 @@ daemon-http = { path = "crates/adapters/daemon-http" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }
+# default-features = false here so workspace consumers (the client + tool) inherit the light
+# (no-hyperon) build; the worker build opts into the engine via `--features hyperon` on the crate.
+daemon-metta = { path = "crates/coprocessor/daemon-metta", default-features = false }
+daemon-metta-client = { path = "crates/coprocessor/daemon-metta-client" }
+daemon-tool-metta = { path = "tools/daemon-tool-metta" }
 daemon-tool-shell = { path = "tools/daemon-tool-shell" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }
 daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }

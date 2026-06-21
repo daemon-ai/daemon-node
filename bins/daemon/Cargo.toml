@@ -21,6 +21,12 @@ daemon-providers = { workspace = true }
 daemon-infer = { workspace = true }
 daemon-host = { workspace = true }
 daemon-node = { workspace = true }
+# The MeTTa symbolic coprocessor: the supervised client + the `metta` tool. Both pull `daemon-metta`
+# default-features = false (wire types only), so `hyperon` never reaches the daemon binary — the
+# engine lives entirely in the separately-built worker process.
+daemon-metta = { workspace = true }
+daemon-metta-client = { workspace = true }
+daemon-tool-metta = { workspace = true }
 daemon-models = { workspace = true }
 daemon-api = { workspace = true }
 # Optional in-process HTTP/WS surface, toggled on at launch by a configured bind address.

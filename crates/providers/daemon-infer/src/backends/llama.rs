@@ -26,7 +26,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{BackendChunk, BackendError, GenerateRequest, InferenceBackend};
-use crate::protocol::{Capabilities, ModelParams, Sampling, ToolCallFormat, Usage};
+use crate::protocol::{Capabilities, Constraint, ModelParams, Sampling, ToolCallFormat, Usage};
 use crate::tooling;
 
 /// The output-token cap when a request leaves `max_tokens` unset (`0`).
@@ -303,7 +303,7 @@ fn run_generation(
     }
     ctx.decode(&mut batch).map_err(classify_decode)?;
 
-    let mut sampler = build_sampler(&req.sampling);
+    let mut sampler = build_sampler(model, &req.sampling, req.constraint.as_ref());
 
     let budget = if req.max_tokens > 0 {
         req.max_tokens
@@ -433,12 +433,28 @@ fn fallback_prompt(req: &GenerateRequest) -> String {
     s
 }
 
-/// Build a sampler chain from the request's sampling params (greedy when temperature <= 0).
-fn build_sampler(s: &Sampling) -> LlamaSampler {
+/// Build a sampler chain from the request's sampling params (greedy when temperature <= 0),
+/// prepending a GBNF grammar sampler when the request carries a [`Constraint::Gbnf`]. The grammar
+/// sampler is applied first so it masks invalid tokens before the selection samplers run. A
+/// [`Constraint::Lark`] is for the mistral.rs engine — ignored here (with a warning).
+fn build_sampler(model: &LlamaModel, s: &Sampling, constraint: Option<&Constraint>) -> LlamaSampler {
+    let grammar = match constraint.map(|c| &c.gbnf) {
+        Some(Some(g)) => Some(LlamaSampler::grammar(model, g, "root")),
+        Some(None) => {
+            tracing::warn!("llama: constraint carries no GBNF grammar; ignoring");
+            None
+        }
+        None => None,
+    };
+
     if s.temperature <= 0.0 {
-        return LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        let mut chain = Vec::new();
+        chain.extend(grammar);
+        chain.push(LlamaSampler::greedy());
+        return LlamaSampler::chain_simple(chain);
     }
     let mut chain = Vec::new();
+    chain.extend(grammar);
     if s.top_k > 0 {
         chain.push(LlamaSampler::top_k(s.top_k as i32));
     }
