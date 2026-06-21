@@ -1,0 +1,29 @@
+[package]
+name = "daemon-tool-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The real CDP browser tool. Off by default so the default workspace build never compiles the heavy
+# (~60K generated LOC) chromiumoxide bindings; `bins/daemon`'s `browser` feature turns it on.
+default = []
+cdp = ["dep:chromiumoxide", "dep:futures", "dep:dom_smoothie", "dep:tokio"]
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chromiumoxide = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+dom_smoothie = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
