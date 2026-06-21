@@ -50,6 +50,7 @@ fn user_request(text: &str) -> Request {
         }],
         tools: Vec::new(),
         auth: None,
+        constraint: None,
     }
 }
 

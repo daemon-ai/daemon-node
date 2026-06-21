@@ -80,6 +80,25 @@ const INFER_MAX_RESTARTS_ENV: &str = "DAEMON_INFER_MAX_RESTARTS";
 /// The sliding window (ms) over which restarts are counted for meltdown.
 const INFER_RESTART_WINDOW_MS_ENV: &str = "DAEMON_INFER_RESTART_WINDOW_MS";
 
+// --- MeTTa symbolic coprocessor (`daemon-metta`) tuning (DAEMON_METTA_*) ----------------------
+/// Enable the `metta` symbolic-coprocessor tool (default: off; opt-in like the HTTP/MCP surfaces).
+const METTA_ENABLE_ENV: &str = "DAEMON_METTA_ENABLE";
+/// Path to the `daemon-metta` worker binary (default: a `daemon-metta` next to the daemon binary).
+const METTA_BIN_ENV: &str = "DAEMON_METTA_BIN";
+/// The worker's durable state directory (default: `<profile_home>/metta` when persisting, else
+/// ephemeral / in-memory).
+const METTA_STATE_DIR_ENV: &str = "DAEMON_METTA_STATE_DIR";
+/// Default bounded-eval step cap.
+const METTA_MAX_STEPS_ENV: &str = "DAEMON_METTA_MAX_STEPS";
+/// Default bounded-eval wall-clock timeout (ms).
+const METTA_TIMEOUT_MS_ENV: &str = "DAEMON_METTA_TIMEOUT_MS";
+/// Default bounded-eval result cap.
+const METTA_MAX_RESULTS_ENV: &str = "DAEMON_METTA_MAX_RESULTS";
+/// Crash-loop meltdown: max worker restarts within the restart window.
+const METTA_MAX_RESTARTS_ENV: &str = "DAEMON_METTA_MAX_RESTARTS";
+/// The sliding window (ms) over which restarts are counted for meltdown.
+const METTA_RESTART_WINDOW_MS_ENV: &str = "DAEMON_METTA_RESTART_WINDOW_MS";
+
 // --- Embeddings (`daemon-mnemosyne` vector recall) tuning (DAEMON_EMBED_*) --------------------
 /// Selects the embedding backend: `off` (default, keyword-only), `genai` (remote, OpenAI-compatible),
 /// or `local` (a `daemon-infer` embedding worker).
@@ -194,6 +213,52 @@ fn default_worker_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("daemon-infer"))
 }
 
+/// Tuning for the MeTTa symbolic coprocessor (`daemon-metta`). `enable = false` keeps the `metta`
+/// tool unregistered (the default), exactly like the opt-in HTTP/MCP surfaces.
+#[derive(Clone, Debug)]
+pub struct MettaConfig {
+    /// Whether to register the `metta` tool (spawning the supervised worker on first use).
+    pub enable: bool,
+    /// Path to the `daemon-metta` worker binary.
+    pub worker_bin: PathBuf,
+    /// The worker's durable state directory (`None` => ephemeral / in-memory).
+    pub state_dir: Option<PathBuf>,
+    /// Default bounded-eval step cap.
+    pub max_steps: u64,
+    /// Default bounded-eval timeout (ms).
+    pub timeout_ms: u64,
+    /// Default bounded-eval result cap.
+    pub max_results: u64,
+    /// Crash-loop meltdown: max restarts within [`MettaConfig::restart_window`].
+    pub max_restarts: u32,
+    /// The sliding window over which restarts are counted for meltdown.
+    pub restart_window: Duration,
+}
+
+impl Default for MettaConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            worker_bin: default_metta_bin(),
+            state_dir: None,
+            max_steps: 1_000,
+            timeout_ms: 1_000,
+            max_results: 100,
+            max_restarts: 3,
+            restart_window: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The default worker binary: a `daemon-metta` next to the running daemon executable, else a bare
+/// `daemon-metta` (resolved on `PATH`).
+fn default_metta_bin() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("daemon-metta")))
+        .unwrap_or_else(|| PathBuf::from("daemon-metta"))
+}
+
 /// Which embedding backend Mnemosyne uses for vector recall (selected by config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbedKind {
@@ -298,6 +363,8 @@ pub struct NodeConfig {
     pub models: ModelsConfig,
     /// Embeddings backend tuning (Mnemosyne vector recall; `Off` by default).
     pub embed: EmbedConfig,
+    /// MeTTa symbolic-coprocessor tuning (`enable = false` by default — the `metta` tool is opt-in).
+    pub metta: MettaConfig,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -339,6 +406,21 @@ struct FileConfig {
     local: Option<FileLocalConfig>,
     models: Option<FileModelsConfig>,
     embed: Option<FileEmbedConfig>,
+    metta: Option<FileMettaConfig>,
+}
+
+/// The `[metta]` TOML table — symbolic-coprocessor tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMettaConfig {
+    enable: Option<bool>,
+    worker_bin: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    max_steps: Option<u64>,
+    timeout_ms: Option<u64>,
+    max_results: Option<u64>,
+    max_restarts: Option<u32>,
+    restart_window_ms: Option<u64>,
 }
 
 /// The `[embed]` TOML table — embeddings tuning (every field optional; env wins).
@@ -572,6 +654,7 @@ impl NodeConfig {
         let local = Self::resolve_local(file.local.unwrap_or_default())?;
         let models = Self::resolve_models(file.models.unwrap_or_default());
         let embed = Self::resolve_embed(file.embed.unwrap_or_default())?;
+        let metta = Self::resolve_metta(file.metta.unwrap_or_default())?;
 
         Ok(Self {
             partition,
@@ -591,6 +674,7 @@ impl NodeConfig {
             local,
             models,
             embed,
+            metta,
             credential_key,
             engine,
             journal_seed,
@@ -631,6 +715,56 @@ impl NodeConfig {
             base_url,
             engine,
         })
+    }
+
+    /// Resolve MeTTa coprocessor tuning (env overriding the `[metta]` TOML table overriding defaults).
+    fn resolve_metta(file: FileMettaConfig) -> anyhow::Result<MettaConfig> {
+        let mut metta = MettaConfig::default();
+        if let Some(b) = file.enable {
+            metta.enable = b;
+        }
+        if let Some(s) = env_string(METTA_ENABLE_ENV) {
+            metta.enable = parse_bool(&s);
+        }
+        if let Some(path) = file.worker_bin {
+            metta.worker_bin = path;
+        }
+        if let Some(s) = env_string(METTA_BIN_ENV) {
+            metta.worker_bin = PathBuf::from(s);
+        }
+        metta.state_dir = env_string(METTA_STATE_DIR_ENV)
+            .map(PathBuf::from)
+            .or(file.state_dir);
+        if let Some(n) = file.max_steps {
+            metta.max_steps = n;
+        }
+        if let Some(s) = env_string(METTA_MAX_STEPS_ENV) {
+            metta.max_steps = s.parse().context("DAEMON_METTA_MAX_STEPS must be a u64")?;
+        }
+        if let Some(n) = file.timeout_ms {
+            metta.timeout_ms = n;
+        }
+        if let Some(s) = env_string(METTA_TIMEOUT_MS_ENV) {
+            metta.timeout_ms = s.parse().context("DAEMON_METTA_TIMEOUT_MS must be a u64")?;
+        }
+        if let Some(n) = file.max_results {
+            metta.max_results = n;
+        }
+        if let Some(s) = env_string(METTA_MAX_RESULTS_ENV) {
+            metta.max_results = s.parse().context("DAEMON_METTA_MAX_RESULTS must be a u64")?;
+        }
+        if let Some(n) = file.max_restarts {
+            metta.max_restarts = n;
+        }
+        if let Some(s) = env_string(METTA_MAX_RESTARTS_ENV) {
+            metta.max_restarts = s.parse().context("DAEMON_METTA_MAX_RESTARTS must be a u32")?;
+        }
+        resolve_duration_ms(
+            &mut metta.restart_window,
+            file.restart_window_ms,
+            METTA_RESTART_WINDOW_MS_ENV,
+        )?;
+        Ok(metta)
     }
 
     /// Resolve model-management tuning (env overriding the `[models]` TOML table).

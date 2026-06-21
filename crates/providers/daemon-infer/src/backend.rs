@@ -7,7 +7,7 @@
 //! daemon never sees engine specifics.
 
 use crate::protocol::{
-    Capabilities, ErrorClass, Msg, Sampling, ToolCall, ToolCallFormat, ToolDef, Usage,
+    Capabilities, Constraint, ErrorClass, Msg, Sampling, ToolCall, ToolCallFormat, ToolDef, Usage,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,9 @@ pub struct GenerateRequest {
     pub sampling: Sampling,
     /// The output-token cap (`0` = backend default).
     pub max_tokens: u32,
+    /// An optional grammar constraint bounding the output. A backend that does not support the
+    /// supplied dialect ignores it (with a warning).
+    pub constraint: Option<Constraint>,
 }
 
 /// One incremental output of a generation. The terminal `Done`/usage is the [`InferenceBackend::generate`]
@@ -170,6 +173,7 @@ mod tests {
             tools: Vec::new(),
             sampling: Sampling::default(),
             max_tokens: 0,
+            constraint: None,
         };
         let err = backend
             .generate(req, tx, CancellationToken::new())

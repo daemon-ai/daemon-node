@@ -426,6 +426,10 @@ async fn drive_generation(
             .collect(),
         sampling: cfg.sampling,
         max_tokens: cfg.max_tokens,
+        constraint: req.constraint.as_ref().map(|c| protocol::Constraint {
+            lark: c.lark.clone(),
+            gbnf: c.gbnf.clone(),
+        }),
     };
     worker
         .send(&cmd)

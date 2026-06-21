@@ -33,7 +33,10 @@ use daemon_host::{
     OwnerBroker,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
+use daemon_metta::protocol::Bounds as MettaBounds;
+use daemon_metta_client::{MettaConfig as MettaClientConfig, MettaCoprocessor};
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
+use daemon_tool_metta::MettaTool;
 use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
 use daemon_providers::{
@@ -264,6 +267,38 @@ fn build_memory(
             }
         }
     }
+}
+
+/// Build the optional `metta` symbolic-coprocessor tool the config selected. Disabled by default;
+/// when enabled it wires a supervised [`MettaCoprocessor`] over the configured worker binary + state
+/// dir + bounds, exposed through the single `metta` [`Tool`]. The worker (and `hyperon`) is a
+/// separately-built process spawned lazily on first use — nothing engine-heavy links into the daemon.
+fn build_metta_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
+    if !cfg.metta.enable {
+        return None;
+    }
+    // Persisting nodes default the worker state dir to `<profile_home>/metta`; ephemeral nodes (and
+    // an unset dir) keep the worker in-memory so the coprocessor matches the store's durability.
+    let state_dir = cfg.metta.state_dir.clone().or_else(|| {
+        cfg.persist_providers()
+            .then(|| cfg.profile_home().join("metta"))
+    });
+    let mut client_cfg = MettaClientConfig::new(cfg.metta.worker_bin.clone());
+    client_cfg.state_dir = state_dir;
+    client_cfg.max_restarts = cfg.metta.max_restarts;
+    client_cfg.restart_window = cfg.metta.restart_window;
+    let copro = Arc::new(MettaCoprocessor::new(client_cfg));
+    let default_bounds = MettaBounds {
+        max_steps: cfg.metta.max_steps,
+        timeout_ms: cfg.metta.timeout_ms,
+        max_results: cfg.metta.max_results,
+    };
+    let tool = MettaTool::new(copro).with_default_bounds(default_bounds);
+    tracing::info!(
+        worker = %cfg.metta.worker_bin.display(),
+        "metta symbolic coprocessor tool enabled"
+    );
+    Some(Arc::new(tool) as Arc<dyn Tool>)
 }
 
 /// A shared, agent-wide Mnemosyne bank cache: one per-session [`MnemosyneProvider`] over the same
@@ -645,6 +680,14 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let embedder = build_embedder(&cfg, &manager).await;
     let memory = build_memory(&cfg, embedder);
 
+    // The optional MeTTa symbolic-coprocessor tool (opt-in, like the HTTP/MCP surfaces). When
+    // enabled it is appended to the role tool registry alongside the memory tools; its supervised
+    // worker is spawned lazily on first use.
+    let mut extra_tools = memory.tools;
+    if let Some(metta_tool) = build_metta_tool(&cfg) {
+        extra_tools.push(metta_tool);
+    }
+
     let host_config = HostConfig {
         partition: cfg.partition,
         dispatch_interval: cfg.dispatch_interval,
@@ -666,7 +709,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         context_builder,
         memory: memory.shared,
         memory_builder: memory.builder,
-        extra_tools: memory.tools,
+        extra_tools,
         models: Some(manager.clone()),
     });
     tracing::info!("daemon host node started");

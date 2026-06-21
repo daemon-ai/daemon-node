@@ -1,0 +1,41 @@
+// Lark grammar for MeTTa source (mistral.rs `Constraint::Lark`, llguidance dialect).
+//
+// The same language as `metta.gbnf`, expressed with Lark terminals (regex) + an ignored
+// whitespace/comment layer (the EBNF DELIM). The leading optional "!" is the MeTTa "evaluate"
+// marker.
+//
+//   METTA      ::= { [ '!' [ DELIM ] ] ATOM [ DELIM ] }
+//   ATOM       ::= WORD | VARIABLE | STRING | EXPRESSION
+//   WORD       ::= ( CHAR | '#' ) { CHAR | '"' | '#' }
+//   VARIABLE   ::= '$' ( CHAR | '"' ) { CHAR | '"' }
+//   EXPRESSION ::= '(' { ATOM [ DELIM ] } ')'
+//   STRING     ::= '"' { any-char-except-'"' } '"'
+//   CHAR       ::= any char except WHITESPACE and ( '"' '#' '(' ')' ';' )
+
+start: item*
+
+item: BANG? atom
+
+?atom: expression
+     | VARIABLE
+     | STRING
+     | WORD
+
+expression: LPAR atom* RPAR
+
+BANG: "!"
+LPAR: "("
+RPAR: ")"
+
+// WORD: first char = CHAR|'#' (i.e. not whitespace/"/(/)/;), rest = CHAR|'"'|'#' (allows '"').
+WORD: /[^\s"();][^\s();]*/
+// VARIABLE: '$' then one-or-more of (CHAR | '"')  (excludes whitespace/#/(/)/;).
+VARIABLE: /\$[^\s#();]+/
+// STRING: double-quoted, any char except an unescaped '"'.
+STRING: /"[^"]*"/
+
+// DELIM: whitespace + ';' line comments, ignored between tokens.
+COMMENT: /;[^\r\n]*/
+%import common.WS
+%ignore WS
+%ignore COMMENT

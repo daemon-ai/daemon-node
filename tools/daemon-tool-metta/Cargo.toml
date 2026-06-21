@@ -1,0 +1,25 @@
+[package]
+name = "daemon-tool-metta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# Protocol + supervised client only — no `hyperon` reaches the daemon (the engine lives in the
+# worker child). `daemon-metta` is pulled default-features = false (wire types only).
+daemon-metta = { workspace = true }
+daemon-metta-client = { workspace = true }
+# The MeTTa grammar artifacts (Lark + GBNF) for the constrained "draft MeTTa" generation path. This
+# is the light, engine-free `grammar` module of `daemon-infer` (default-features = false).
+daemon-infer = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }

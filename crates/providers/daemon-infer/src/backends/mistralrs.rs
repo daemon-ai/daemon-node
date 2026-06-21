@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{BackendChunk, BackendError, GenerateRequest, InferenceBackend};
-use crate::protocol::{Capabilities, ModelParams, ToolCallFormat, Usage};
+use crate::protocol::{Capabilities, Constraint, ModelParams, ToolCallFormat, Usage};
 use crate::tooling;
 
 /// A loaded mistral.rs model.
@@ -188,6 +188,17 @@ fn build_request(req: &GenerateRequest) -> RequestBuilder {
     }
     if req.max_tokens > 0 {
         builder = builder.set_sampler_max_len(req.max_tokens as usize);
+    }
+
+    // Grammar constraint: mistral.rs consumes the Lark dialect (llguidance). When only a GBNF
+    // rendering is present it is for the llama engine — ignore it here rather than fail.
+    if let Some(constraint) = &req.constraint {
+        match &constraint.lark {
+            Some(grammar) => {
+                builder = builder.set_constraint(mistralrs::Constraint::Lark(grammar.clone()));
+            }
+            None => tracing::warn!("mistralrs: constraint carries no Lark grammar; ignoring"),
+        }
     }
     builder
 }

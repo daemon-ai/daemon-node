@@ -50,8 +50,35 @@
 
         src = craneLib.cleanCargoSource ./.;
 
-        commonArgs = {
+        # hyperon (MeTTa) is a *git* dependency (no crates.io release). crane's default vendoring would
+        # re-fetch it with a `fetchgit` hash we don't have; instead (vendoring "Option A") we pin the
+        # checkout to `fetchFromGitHub` at the exact rev in `Cargo.toml`, using the prefetched
+        # `nix flake prefetch` hash. The repo provides several crates (hyperon, hyperon-atom,
+        # hyperon-space, hyperon-common, hyperon-macros) from this one checkout, so the override keys
+        # off any `hyperon*` package sharing the git source.
+        hyperonSrc = pkgs.fetchFromGitHub {
+          owner = "trueagi-io";
+          repo = "hyperon-experimental";
+          rev = "3f76dc460da6961f57f69f6c3e550c59c74ada83";
+          hash = "sha256-qTx32OBwtcytMPbPTnhNUD+Eccir3oFQhpjPgyfa5IA=";
+        };
+
+        # The vendored Cargo registry+git sources, with the hyperon git checkout swapped for the
+        # `fetchFromGitHub` source above. Shared by `buildDepsOnly` and every `buildPackage` via
+        # `commonArgs.cargoVendorDir`, so the pin is consistent across the default gate and the
+        # hyperon worker lane.
+        cargoVendorDir = craneLib.vendorCargoDeps {
           inherit src;
+          overrideVendorGitCheckout =
+            ps: drv:
+            if lib.any (p: lib.hasPrefix "hyperon" p.name) ps then
+              drv.overrideAttrs (_: { src = hyperonSrc; })
+            else
+              drv;
+        };
+
+        commonArgs = {
+          inherit src cargoVendorDir;
           pname = "daemon-workspace";
           version = "0.0.0";
           strictDeps = true;
@@ -95,6 +122,25 @@
 
         daemon-infer-llama = buildEngineWorker "llama";
         daemon-infer-mistralrs = buildEngineWorker "mistralrs";
+
+        # The MeTTa symbolic-coprocessor worker, built WITH the real engine (`--features hyperon`).
+        # This is a deliberately separate output, NOT part of the default workspace gate: the default
+        # `daemon-metta` (fallback engine) and every other crate never link `hyperon`. The hyperon
+        # build pulls only crates.io deps (the `pkg_mgmt` feature: serde/serde_json/semver/xxhash) —
+        # no `git2`/libgit2 and no second git source (`das`/metta-bus-client are not enabled) — so no
+        # extra native build inputs are required beyond the Rust toolchain. `pkg-config` is included
+        # defensively for any transitive sys-crate probe.
+        daemon-metta = craneLib.buildPackage (
+          commonArgs
+          // {
+            pname = "daemon-metta";
+            version = "0.0.0";
+            inherit cargoArtifacts;
+            cargoExtraArgs = "-p daemon-metta --features hyperon";
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            doCheck = false;
+          }
+        );
       in
       {
         packages = {
@@ -103,6 +149,7 @@
             daemon-cli
             daemon-infer-llama
             daemon-infer-mistralrs
+            daemon-metta
             ;
           default = daemon;
         };
