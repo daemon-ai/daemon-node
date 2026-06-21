@@ -12,4 +12,7 @@ pub enum Error {
     /// A filesystem error (e.g. creating the data dir).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A JSON (de)serialization error (e.g. node `source_ids`).
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
 }

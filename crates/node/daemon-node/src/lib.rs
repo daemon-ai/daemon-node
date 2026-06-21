@@ -726,18 +726,8 @@ mod tests {
         // Per-session builders, exactly as [`dress`] wires them from [`NodeAssembly`]: LCM gets a
         // fresh instance per session; Mnemosyne resolves the session's bank from the shared cache.
         let context_builder: ContextEngineBuilder = Arc::new(|id: &SessionId| {
-            Arc::new(LcmContextEngine::open_for_session(LcmConfig::in_memory(), id).expect("lcm"))
-                as Arc<dyn ContextEngine>
-        });
-        let memory_builder: MemoryBuilder = {
-            let banks = banks.clone();
-            Arc::new(move |id: &SessionId| vec![banks.get_or_open(id) as Arc<dyn MemoryProvider>])
-        };
-
-        // Per-session builders, exactly as [`dress`] wires them from [`NodeAssembly`]: LCM gets a
-        // fresh instance per session; Mnemosyne resolves the session's bank from the shared cache.
-        let context_builder: ContextEngineBuilder = Arc::new(|id: &SessionId| {
-            Arc::new(LcmContextEngine::open_for_session(LcmConfig::in_memory(), id).expect("lcm"))
+            let aux: Arc<dyn Provider> = Arc::new(MockProvider::completing("summary"));
+            Arc::new(LcmContextEngine::open_for_session(LcmConfig::in_memory(), id, aux).expect("lcm"))
                 as Arc<dyn ContextEngine>
         });
         let memory_builder: MemoryBuilder = {

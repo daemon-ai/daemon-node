@@ -1299,6 +1299,27 @@ default stays fully ephemeral).
 
 ## 15. Implementation milestones
 
+**Status (this branch): M1–M4 + M8 implemented.** The store (lossless `messages` + summary DAG +
+FTS5 + lifecycle frontier), `tiktoken`-rs token counting + `on_model` threshold, the 3-level
+escalation summarizer over a host-injected aux `Provider`, and the compaction engine
+(`[system]+[summary]+[fresh tail]`) are live and unit-tested; the binary threads the agent's default
+provider in as the LCM aux provider. M5 (protection), M6 (`lcm_*` tools + search), and M7
+(routing/presets) remain open.
+
+Two deliberate deviations from the literal milestone text below, both within the milestone's intent:
+
+1. **Ingest is driven from `compact()`** over exactly the region being summarized (so each D0 node
+   references real `store_id`s), rather than per-turn in `before_turn` with an `ingest_cursor`. Since
+   `compact()`'s result *replaces* the durable conversation (`CORE:engine.rs`), the in-memory cursor
+   wouldn't survive rehydration and turns carry no stable identity, so per-turn ingest would duplicate
+   rows across incarnations. Full per-turn transcript ingest (needed by `lcm_grep`/`lcm_expand`) lands
+   with M6, which requires the whole transcript, not just compacted spans.
+2. **The proactive-compaction gate now triggers on the context engine's effective budget**
+   (`Pressure::budget_tokens`) instead of only the host `context_budget_tokens` (`CORE:engine.rs`
+   `prepare_turn_context`). This realizes §2.4 — LCM sizes its own `threshold_tokens` from the model
+   window and `context_budget_tokens` is the host override. Backward-compatible for the budgeted
+   default (which returns `budget_tokens == budget`).
+
 Each milestone is independently testable; constants from §6/§7/§8 are carried verbatim.
 
 - **M1 — Store + schema.** `bootstrap.rs` (pragmas, v4 DDL, FTS create/triggers, `json_each`

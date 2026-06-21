@@ -531,10 +531,14 @@ impl Engine {
         let pressure = self
             .context
             .before_turn(&self.snapshot.conversation, budget);
-        if let (true, Some(b)) = (pressure.over_budget(), budget) {
+        // Compact to the context engine's *effective* budget: the host `context_budget_tokens`
+        // override when set, else the engine's own threshold (LCM sizes one from the model window in
+        // `on_model`). The budgeted default returns `budget_tokens == budget`, so this is a no-op
+        // change for it (None => never over budget).
+        if let (true, Some(target)) = (pressure.over_budget(), pressure.budget_tokens) {
             self.before_compact_memory().await;
             let conv = std::mem::take(&mut self.snapshot.conversation);
-            self.snapshot.conversation = self.context.compact(conv, b).await;
+            self.snapshot.conversation = self.context.compact(conv, target).await;
             self.notify_session_switch(SwitchReason::Compaction).await;
         }
     }
