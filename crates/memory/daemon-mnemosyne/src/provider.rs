@@ -107,8 +107,10 @@ impl MemoryProvider for MnemosyneProvider {
         // TODO: persist salient facts before the body is compacted (`on_pre_compress`).
     }
 
-    async fn on_session_switch(&self, _reason: SwitchReason) {
-        // TODO: consolidate via engine.sleep() on session end.
+    async fn on_session_switch(&self, reason: SwitchReason) {
+        // TODO: consolidate via engine.sleep() on `End`/`Handoff`; reset prefetch on `Resume`.
+        // Deliberate no-op until the BEAM sleep/consolidation port lands (port-spec P1).
+        let _ = reason;
     }
 }
 

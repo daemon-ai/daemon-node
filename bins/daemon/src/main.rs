@@ -16,10 +16,13 @@ mod config;
 use std::sync::Arc;
 
 use daemon_common::{CredMode, CredScope, JournalStreamId, ProfileRef, SessionId, UnitId};
+use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
-    CredentialBuilder, CredentialProvider, EngineProfile, MockProvider, Provider, ProviderRegistry,
-    SystemPrompt, ToolRegistry,
+    ContextEngine, CredentialBuilder, CredentialProvider, EngineProfile, FileMemory, MemoryProvider,
+    MockProvider, Provider, ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome,
+    ToolRegistry, TurnCx,
 };
+use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
@@ -34,7 +37,7 @@ use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
 use daemon_transport::RemoteHost;
 
-use config::{NodeConfig, ProviderKind, StoreBackend};
+use config::{ContextEngineKind, MemoryProviderKind, NodeConfig, ProviderKind, StoreBackend};
 
 /// The environment variable that selects the placed-child role.
 const PLACED_CHILD_ENV: &str = "DAEMON_PLACED_CHILD";
@@ -122,6 +125,93 @@ fn build_providers(cfg: &NodeConfig) -> ProviderRegistry {
     providers
 }
 
+/// Build the default §10 context engine the config selected. `Lcm` opens the native LCM port (its
+/// summary store); `Budgeted` (or any open failure) returns `None`, leaving the engine on the in-core
+/// [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) fallback.
+fn build_context_engine(cfg: &NodeConfig) -> Option<Arc<dyn ContextEngine>> {
+    match cfg.context_engine {
+        ContextEngineKind::Budgeted => None,
+        ContextEngineKind::Lcm => match LcmContextEngine::open(LcmConfig::default()) {
+            Ok(lcm) => Some(Arc::new(lcm) as Arc<dyn ContextEngine>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open LCM context engine; using budgeted fallback");
+                None
+            }
+        },
+    }
+}
+
+/// The default §11 memory wiring: the providers injected into every engine, plus the tools
+/// registered into every role registry (kept paired so their shared backend instances stay in sync).
+type MemoryWiring = (Vec<Arc<dyn MemoryProvider>>, Vec<Arc<dyn Tool>>);
+
+/// Build the default §11 memory providers + their registered tools the config selected. Mnemosyne is
+/// the default (its `mnemosyne_*` tools are registered through the §12 registry, sharing the same
+/// engine instance as the provider). On any open failure memory is simply left off (the node still
+/// runs). Returns `(providers, extra_tools)`.
+fn build_memory(cfg: &NodeConfig) -> MemoryWiring {
+    match cfg.memory_provider {
+        MemoryProviderKind::None => (Vec::new(), Vec::new()),
+        MemoryProviderKind::File => match &cfg.memory_file {
+            Some(path) => {
+                let mem = Arc::new(FileMemory::load(path)) as Arc<dyn MemoryProvider>;
+                (vec![mem], Vec::new())
+            }
+            None => {
+                tracing::warn!("memory_provider=file but DAEMON_MEMORY_FILE is unset; memory off");
+                (Vec::new(), Vec::new())
+            }
+        },
+        MemoryProviderKind::Mnemosyne => match MnemosyneProvider::open(MnemosyneConfig::default()) {
+            Ok(provider) => {
+                let provider = Arc::new(provider);
+                // Register each `mnemosyne_*` tool through the §12 registry, sharing the provider's
+                // engine (tools are not part of the §11 seam — see `daemon_core::memory`).
+                let tools: Vec<Arc<dyn Tool>> = provider
+                    .tools()
+                    .into_iter()
+                    .map(|def| {
+                        Arc::new(MemoryProviderTool {
+                            provider: provider.clone(),
+                            def,
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect();
+                (vec![provider as Arc<dyn MemoryProvider>], tools)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open Mnemosyne memory; memory off");
+                (Vec::new(), Vec::new())
+            }
+        },
+    }
+}
+
+/// A §12 [`Tool`] adapter that dispatches a `mnemosyne_*` call to the shared [`MnemosyneProvider`].
+/// This keeps memory tools out of the §11 seam (which is about context, not dispatch) while still
+/// exposing them to the model through the registry.
+struct MemoryProviderTool {
+    provider: Arc<MnemosyneProvider>,
+    def: ToolDef,
+}
+
+#[async_trait::async_trait]
+impl Tool for MemoryProviderTool {
+    fn name(&self) -> &str {
+        &self.def.name
+    }
+
+    fn schema(&self) -> &str {
+        &self.def.schema
+    }
+
+    async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {
+        let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
+        let result = self.provider.call_tool(&self.def.name, args).await;
+        ToolOutcome::text(call.call_id.clone(), true, result)
+    }
+}
+
 /// Build the [`WorkerConfig`] for a local provider from the node config's `[local]` tuning.
 fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
     let local = &cfg.local;
@@ -178,6 +268,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // provider builder needs only the base URL + model.
     let providers = build_providers(&cfg);
 
+    // The default context engine (§10, LCM) and memory providers (§11, Mnemosyne) wired into every
+    // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry.
+    let context = build_context_engine(&cfg);
+    let (memory, extra_tools) = build_memory(&cfg);
+
     let host_config = HostConfig {
         partition: cfg.partition,
         dispatch_interval: cfg.dispatch_interval,
@@ -195,6 +290,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         engine_config: cfg.engine,
         journal_seed: cfg.journal_seed,
         nesting_depth: cfg.nesting_depth,
+        context,
+        memory,
+        extra_tools,
     });
     tracing::info!("daemon host node started");
 

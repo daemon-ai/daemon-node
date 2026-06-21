@@ -96,21 +96,30 @@ in a sibling `daemon-providers` crate).
 
 ### 2.1 The `ContextEngine` trait (the surface to implement)
 
-`SPEC §10` (lines 805–816) defines the trait the port implements:
+`SPEC §10` defines the trait the port implements. **RECONCILED (as-built):** the seam is now
+implemented in [`context.rs`](../src/context.rs) with the signatures below. The differences from
+earlier drafts: `before_turn`/`after_response`/session hooks are **sync** (LCM enqueues to its store,
+not awaiting in the hook); `compact` takes `budget: usize`; and **tools are not on the seam** —
+`tools()` returns only the advisory *names* the engine owns, while the actual `lcm_*` drill-down tools
+register through the §12 [`ToolRegistry`](../src/tools.rs) (an `Arc<LcmContextEngine>` captured in the
+tool closure, mirroring `MemoryProviderTool` in `bins/daemon`).
 
 ```rust
 #[async_trait]
-trait ContextEngine: Send + Sync {
-    fn on_model(&self, model: &ModelInfo);                              // set budgets/threshold
-    async fn on_session_start(&self, s: &SessionId);
-    async fn before_turn(&self, conv: &Conversation) -> Pressure;       // persist + report pressure
-    async fn compact(&self, conv: Conversation, budget: Tokens) -> Conversation;  // THE step
-    async fn after_response(&self, usage: &Usage);
-    async fn on_session_end(&self, s: &SessionId, conv: &Conversation);
-    fn tools(&self) -> Vec<ToolDef>;                                    // engine-owned drill-down tools
-    async fn call_tool(&self, name: &str, args: Value, cx: &ToolCx<'_>) -> ToolResult;
+pub trait ContextEngine: Send + Sync {
+    fn on_model(&self, model: &ModelInfo) {}                                  // set budgets/threshold
+    fn before_turn(&self, conv: &Conversation, budget: Option<usize>) -> Pressure;
+    async fn compact(&self, conv: Conversation, budget: usize) -> Conversation;  // THE step
+    fn after_response(&self, usage: &UsageDelta) {}
+    fn on_session_start(&self, session: &SessionId) {}                        // once, before turn 1
+    fn on_session_end(&self, session: &SessionId, conv: &Conversation) {}     // on teardown
+    fn tools(&self) -> Vec<String> { Vec::new() }                            // advisory names only
 }
 ```
+
+`ModelInfo { model: String, max_context: Option<u32> }` is supplied by the engine from
+`Provider::capabilities()`. The engine calls `on_model` + `on_session_start` once before the first
+turn and `on_session_end` from `Engine::end_session` on teardown.
 
 The §11 hook order the loop guarantees (`SPEC §10`/§11 mermaid, lines 913–933):
 

@@ -1561,11 +1561,14 @@ name = "daemon"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "daemon-common",
+ "daemon-context-lcm",
  "daemon-core",
  "daemon-credentials",
  "daemon-host",
  "daemon-infer",
+ "daemon-mnemosyne",
  "daemon-node",
  "daemon-providers",
  "daemon-provision",
@@ -1574,6 +1577,7 @@ dependencies = [
  "daemon-telemetry",
  "daemon-transport",
  "serde",
+ "serde_json",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -1668,6 +1672,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "daemon-context-lcm"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1798,8 +1818,10 @@ dependencies = [
  "daemon-acp",
  "daemon-api",
  "daemon-common",
+ "daemon-context-lcm",
  "daemon-core",
  "daemon-host",
+ "daemon-mnemosyne",
  "daemon-orchestration",
  "daemon-protocol",
  "daemon-provision",
@@ -1809,6 +1831,8 @@ dependencies = [
  "daemon-tool-fs",
  "daemon-tool-orchestrate",
  "daemon-tool-shell",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -21,7 +21,8 @@ use async_trait::async_trait;
 use daemon_api::FleetReport;
 use daemon_common::{JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
-    Config, CredentialBuilder, EngineProfile, ProviderRegistry, SystemPrompt, ToolRegistry,
+    Config, ContextEngine, CredentialBuilder, EngineProfile, MemoryProvider, ProviderRegistry,
+    SystemPrompt, Tool, ToolRegistry,
 };
 use daemon_host::{
     AgentSession, AgentUnit, CodecSession, CoreEngineFactory, EngineUnit, FleetControl, Host,
@@ -66,6 +67,15 @@ pub struct NodeAssembly {
     /// flat fleet of engine leaves; `1` makes every top child an orchestrator owning a sub-fleet of
     /// leaves (fleets-of-fleets), `n` nests `n` deep — the tree the GUI projects and addresses.
     pub nesting_depth: usize,
+    /// The default §10 context engine (e.g. LCM) injected into every engine this node builds. `None`
+    /// keeps the in-core [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) (tests / CI).
+    pub context: Option<Arc<dyn ContextEngine>>,
+    /// The default §11 memory providers (e.g. Mnemosyne) injected into every engine this node builds.
+    /// Empty keeps memory off (tests / CI).
+    pub memory: Vec<Arc<dyn MemoryProvider>>,
+    /// Extra tools (e.g. `mnemosyne_*` / `lcm_*`) registered into every role's tool registry on top
+    /// of the core fs + shell toolset, so the model can drive memory/context backends.
+    pub extra_tools: Vec<Arc<dyn Tool>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -81,9 +91,16 @@ pub struct AssembledNode {
     pub signer: Arc<TraceSigner>,
 }
 
-/// Apply the optional brokered credentials to a role profile.
+/// Apply the engine tunables, the default context engine + memory providers (§10/§11), and the
+/// optional brokered credentials uniformly to a role profile.
 fn dress(profile: EngineProfile, a: &NodeAssembly) -> EngineProfile {
-    let profile = profile.with_config(a.engine_config);
+    let mut profile = profile.with_config(a.engine_config);
+    if let Some(context) = &a.context {
+        profile = profile.with_context_engine(context.clone());
+    }
+    if !a.memory.is_empty() {
+        profile = profile.with_memory(a.memory.clone());
+    }
     match &a.credentials {
         Some(credentials) => profile.with_credentials(credentials.clone(), a.profile.clone()),
         None => profile,
@@ -98,12 +115,15 @@ fn provider_for(providers: &ProviderRegistry, name: &str) -> daemon_core::Provid
 }
 
 /// A registry seeded with the core local toolset (fs + shell) every daemon-core engine carries, so a
-/// leaf or session can do real work in its contained workspace (§12/§13). Callers add role tools
-/// (e.g. orchestrate) on top.
-fn core_tool_registry() -> ToolRegistry {
+/// leaf or session can do real work in its contained workspace (§12/§13), plus any node-level
+/// `extra` tools (e.g. `mnemosyne_*` / `lcm_*`). Callers add role tools (e.g. orchestrate) on top.
+fn core_tool_registry(extra: &[Arc<dyn Tool>]) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(daemon_tool_fs::FsTool::new()));
     registry.register(Arc::new(daemon_tool_shell::ShellTool::new()));
+    for tool in extra {
+        registry.register(tool.clone());
+    }
     registry
 }
 
@@ -129,7 +149,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let child_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, CHILD_PROFILE),
-            Arc::new(core_tool_registry()),
+            Arc::new(core_tool_registry(&a.extra_tools)),
             SystemPrompt::new("fleet child"),
         ),
         &a,
@@ -155,7 +175,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // (top -> leaf child), `n` allows `n + 1` levels of nested delegation.
     // The orchestrator-capable engine carries the core local toolset (fs + shell) *plus* orchestrate,
     // so a node can both do real local work and delegate.
-    let mut registry = core_tool_registry();
+    let mut registry = core_tool_registry(&a.extra_tools);
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
             .with_max_depth(a.nesting_depth + 1),
@@ -186,7 +206,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let session_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, a.profile.as_str()),
-            Arc::new(core_tool_registry()),
+            Arc::new(core_tool_registry(&a.extra_tools)),
             SystemPrompt::new("interactive session"),
         ),
         &a,
@@ -573,5 +593,102 @@ impl FleetControl for FleetViewImpl {
 
     async fn scale(&self, _id: &UnitId, _n: u32) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Composition smoke test for the wired-in defaults: an [`EngineProfile`] dressed with the LCM
+    //! context engine + the Mnemosyne memory provider (the same way [`dress`] wires them from
+    //! [`NodeAssembly`]) runs one full turn end-to-end, exercising the §10/§11 seams against the real
+    //! port implementations and the once-per-incarnation lifecycle hooks.
+
+    use super::*;
+    use daemon_common::SessionId;
+    use daemon_context_lcm::LcmContextEngine;
+    use daemon_core::{
+        EventSink, MockProvider, Provider, ToolCall, ToolOutcome, TurnControl, TurnOutcome,
+    };
+    use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
+    use daemon_protocol::{
+        HostRequest, HostRequestHandler, HostResponse, HostResponseBody, UserMsg,
+    };
+
+    struct NoopHost;
+
+    #[async_trait]
+    impl HostRequestHandler for NoopHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved(true),
+            }
+        }
+    }
+
+    /// A §12 tool adapter dispatching a `mnemosyne_*` call to the shared provider (mirrors the
+    /// `MemoryProviderTool` the binary registers).
+    struct MemTool {
+        provider: Arc<MnemosyneProvider>,
+        def: daemon_core::ToolDef,
+    }
+
+    #[async_trait]
+    impl Tool for MemTool {
+        fn name(&self) -> &str {
+            &self.def.name
+        }
+        fn schema(&self) -> &str {
+            &self.def.schema
+        }
+        async fn run(&self, call: &ToolCall, _cx: &daemon_core::TurnCx<'_>) -> ToolOutcome {
+            let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
+            let out = self.provider.call_tool(&self.def.name, args).await;
+            ToolOutcome::text(call.call_id.clone(), true, out)
+        }
+    }
+
+    #[tokio::test]
+    async fn lcm_and_mnemosyne_defaults_run_a_turn() {
+        // A unique on-disk Mnemosyne bank so parallel tests do not collide.
+        let dir = std::env::temp_dir().join(format!("daemon-node-smoke-{}", std::process::id()));
+        let mem_cfg = MnemosyneConfig {
+            data_dir: dir.clone(),
+            ..MnemosyneConfig::default()
+        };
+        let memory: Arc<MnemosyneProvider> =
+            Arc::new(MnemosyneProvider::open(mem_cfg).expect("open mnemosyne"));
+        let context: Arc<dyn ContextEngine> =
+            Arc::new(LcmContextEngine::open_in_memory().expect("open lcm"));
+
+        // Register the mnemosyne_* tools through the registry (sharing the provider), exactly as the
+        // composition layer does.
+        let mut registry = ToolRegistry::new();
+        for def in memory.tools() {
+            registry.register(Arc::new(MemTool {
+                provider: memory.clone(),
+                def,
+            }) as Arc<dyn Tool>);
+        }
+        assert!(registry.get("mnemosyne_recall").is_some(), "memory tools registered");
+
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
+            Arc::new(registry),
+            SystemPrompt::new("smoke"),
+        )
+        .with_context_engine(context)
+        .with_memory(vec![memory.clone() as Arc<dyn MemoryProvider>]);
+
+        let mut engine = profile.fresh(SessionId::new("smoke"));
+        engine.push_user(UserMsg::new("remember that the sky is blue today"));
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .expect("turn runs through the wired LCM + Mnemosyne defaults");
+        assert!(matches!(outcome, TurnOutcome::Completed(_)));
+        engine.end_session().await;
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -58,28 +58,38 @@ how to rebuild it in Rust*: every table, every scoring constant, every algorithm
 
 ## 1. Target: the `daemon-core` `MemoryProvider` seam
 
-`daemon-core` already declares the contract this port must satisfy in
-[`daemon-core-spec.md`](../daemon/crates/engine/daemon-core/docs/daemon-core-spec.md) §11 (L900-L911):
+`daemon-core` declares the contract this port satisfies. **RECONCILED (as-built):** the seam is now
+implemented in [`memory.rs`](../src/memory.rs) and is deliberately **narrower** than earlier drafts —
+tools are **not** on the seam. A backend's `remember`/`recall` tools register through the §12
+[`ToolRegistry`](../src/tools.rs) (an `Arc<MnemosyneProvider>` captured in the tool closure), exactly
+as the composition layer does in `bins/daemon` (`MemoryProviderTool`). The locked trait:
 
 ```rust
 #[async_trait]
-trait MemoryProvider: Send + Sync {
-    fn prompt_block(&self) -> Option<PromptBlock>;                    // stable tier
-    async fn recall(&self, q: &RecallQuery) -> Option<RecalledBlock>; // volatile tier
-    async fn after_turn(&self, turn: &Turn, conv: &Conversation);     // remember / extract / sync
-    async fn before_compact(&self, conv: &Conversation);              // last chance to capture
-    async fn on_session_switch(&self, reason: SwitchReason);
-    fn tools(&self) -> Vec<ToolDef>;
-    async fn call_tool(&self, name: &str, args: Value, cx: &ToolCx<'_>) -> ToolResult;
+pub trait MemoryProvider: Send + Sync {
+    fn name(&self) -> &str;
+    fn prompt_block(&self) -> Option<PromptBlock> { None }            // stable tier
+    async fn recall(&self, q: &RecallQuery) -> Option<RecalledBlock> { None } // volatile tier
+    async fn after_turn(&self, turn: &Turn, conv: &Conversation) {}   // remember / extract / sync
+    async fn before_compact(&self, conv: &Conversation) {}            // last chance to capture
+    async fn on_session_switch(&self, reason: SwitchReason) {}        // Start|Compaction|Handoff|Resume|End|Manual
 }
 ```
 
+`MnemosyneProvider::tools()` / `call_tool()` remain inherent methods (not trait methods); the host
+adapts them into the registry. The engine drives `on_session_switch` at the real boundaries:
+`Start`/`Resume` before the first turn, `Compaction` after a compaction, `Handoff` at a delegating
+suspension, and `End` from `Engine::end_session`.
+
 Hook order (spec §11): `recall -> before_turn -> before_compact -> compact -> assemble -> after_turn`.
 
-The `memory.rs` seam itself is **not yet created** — it is a pending todo in the
-[model-I/O foundation plan](../../.cursor/plans/daemon_core_model_io_foundation_bc5a5f48.plan.md)
-(`memory-seam`). This port is that seam's deep implementation. The provider binds to the engine's
-existing typed shapes:
+**Embeddings (as-built):** the default build is **keyword-only** (the `Embedder` returns `None`), so
+the wired-in default provider runs without any embedding model. The preferred GGUF-embeddings path is
+still blocked on a `daemon-infer` `Embed` command + an `embeddings` method on `InferenceBackend`
+(local-inference-spec §10); until that lands, embeddings are opt-in via the `embeddings` feature
+(fastembed/ONNX) and never on the default path.
+
+The provider binds to the engine's existing typed shapes:
 
 - [`conversation.rs`](../daemon/crates/engine/daemon-core/src/conversation.rs) — `Conversation`,
   `Turn::{User, Assistant, Tool}`, `ToolTurn`, `ToolCall`, `ToolResult` (the source of truth the

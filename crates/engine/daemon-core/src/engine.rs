@@ -13,7 +13,7 @@ use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Tu
 use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
 use crate::events::EventSink;
 use crate::exec::{ExecutionEnvironment, LocalEnvironment};
-use crate::memory::{MemoryProvider, RecallQuery};
+use crate::memory::{MemoryProvider, RecallQuery, SwitchReason};
 use crate::provider::{ModelOutput, Provider};
 use crate::recovery::{drive_model_call, ModelCallPolicy, RecoveryStep};
 use crate::snapshot::Snapshot;
@@ -85,6 +85,9 @@ pub struct Engine {
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
     next_trigger: Option<TurnTrigger>,
+    /// Whether the once-per-incarnation §10/§11 lifecycle hooks (`on_model`, `on_session_start`,
+    /// `on_session_switch(Start|Resume)`) have fired yet. Set on the first `run_turn`.
+    lifecycle_started: bool,
 }
 
 impl Engine {
@@ -114,6 +117,7 @@ impl Engine {
             assembler: PromptAssembler::default(),
             memory: Vec::new(),
             next_trigger: None,
+            lifecycle_started: false,
         }
     }
 
@@ -468,6 +472,53 @@ impl Engine {
         }
     }
 
+    /// §11 `on_session_switch` fan-out to every memory provider (a session-boundary consolidation
+    /// chance). The reason distinguishes start/resume/compaction/handoff/end.
+    async fn notify_session_switch(&self, reason: SwitchReason) {
+        for provider in &self.memory {
+            provider.on_session_switch(reason).await;
+        }
+    }
+
+    /// A best-effort description of the active model for the §10 [`on_model`](ContextEngine::on_model)
+    /// hook: the profile label plus the provider's declared context window (if any).
+    fn model_info(&self) -> crate::context::ModelInfo {
+        crate::context::ModelInfo {
+            model: self.profile.as_str().to_string(),
+            max_context: self.provider.capabilities().max_context,
+        }
+    }
+
+    /// Fire the once-per-incarnation §10/§11 lifecycle hooks before the first turn does any work:
+    /// `context.on_model` -> `context.on_session_start` -> `memory.on_session_switch(Start|Resume)`.
+    /// Idempotent — a no-op on every turn after the first. `resuming` reflects whether this
+    /// incarnation re-activated on a background completion (so the boundary is a `Resume`, not a
+    /// fresh `Start`).
+    async fn ensure_session_started(&mut self, resuming: bool) {
+        if self.lifecycle_started {
+            return;
+        }
+        self.lifecycle_started = true;
+        let info = self.model_info();
+        self.context.on_model(&info);
+        self.context.on_session_start(&self.snapshot.session_id);
+        let reason = if resuming {
+            SwitchReason::Resume
+        } else {
+            SwitchReason::Start
+        };
+        self.notify_session_switch(reason).await;
+    }
+
+    /// End the session: notify the §10 context engine and §11 memory providers so they can flush /
+    /// consolidate. A host calls this on incarnation teardown (terminal deactivation). The context
+    /// engine sees the final conversation; memory providers get `on_session_switch(End)`.
+    pub async fn end_session(&mut self) {
+        self.context
+            .on_session_end(&self.snapshot.session_id, &self.snapshot.conversation);
+        self.notify_session_switch(SwitchReason::End).await;
+    }
+
     /// §10/§11 pre-turn hooks (run once before the ReAct loop): re-gather memory recall/blocks into
     /// the §10 [`PromptAssembler`] tiers, then measure budget [`Pressure`](crate::context::Pressure)
     /// and proactively compact when over the configured budget (`memory.before_compact` ->
@@ -484,6 +535,7 @@ impl Engine {
             self.before_compact_memory().await;
             let conv = std::mem::take(&mut self.snapshot.conversation);
             self.snapshot.conversation = self.context.compact(conv, b).await;
+            self.notify_session_switch(SwitchReason::Compaction).await;
         }
     }
 
@@ -501,7 +553,11 @@ impl Engine {
         let before = self.snapshot.conversation.turns.len();
         let conv = std::mem::take(&mut self.snapshot.conversation);
         self.snapshot.conversation = self.context.compact(conv, target).await;
-        self.snapshot.conversation.turns.len() < before
+        let dropped = self.snapshot.conversation.turns.len() < before;
+        if dropped {
+            self.notify_session_switch(SwitchReason::Compaction).await;
+        }
+        dropped
     }
 
     /// Finalize a text-only turn: append the assistant turn. The text/reasoning deltas were already
@@ -573,6 +629,9 @@ impl Engine {
             // same job deterministically; the durable outbox dedupes the re-enqueue.
             return Ok(self.suspend(job_id, events, false));
         }
+
+        // §10/§11 once-per-incarnation lifecycle hooks before the first turn's work.
+        self.ensure_session_started(resuming).await;
 
         // §11/§10 pre-turn hooks: gather memory recall/blocks into the assembler, then measure
         // budget pressure and compact if over budget (memory.before_compact -> ctx.compact).
@@ -687,7 +746,9 @@ impl Engine {
             }
 
             if let Some(job_id) = delegated {
-                // A delegation crosses the durable boundary: suspend the turn and wait for the wake.
+                // A delegation crosses the durable boundary: notify memory of the handoff, then
+                // suspend the turn and wait for the wake.
+                self.notify_session_switch(SwitchReason::Handoff).await;
                 self.snapshot.waiting_for.push(job_id.clone());
                 return Ok(self.suspend(job_id, events, true));
             }
@@ -1304,6 +1365,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ContextEngine for RecordingContext {
+        fn on_model(&self, _model: &crate::context::ModelInfo) {
+            self.log.lock().unwrap().push("on_model");
+        }
         fn before_turn(
             &self,
             _conv: &Conversation,
@@ -1322,6 +1386,12 @@ mod tests {
         }
         fn after_response(&self, _usage: &UsageDelta) {
             self.log.lock().unwrap().push("after_response");
+        }
+        fn on_session_start(&self, _session: &SessionId) {
+            self.log.lock().unwrap().push("session_start");
+        }
+        fn on_session_end(&self, _session: &SessionId, _conv: &Conversation) {
+            self.log.lock().unwrap().push("session_end");
         }
     }
 
@@ -1347,10 +1417,24 @@ mod tests {
         async fn before_compact(&self, _conv: &Conversation) {
             self.log.lock().unwrap().push("before_compact");
         }
+        async fn on_session_switch(&self, reason: SwitchReason) {
+            let label = match reason {
+                SwitchReason::Start => "switch:start",
+                SwitchReason::Compaction => "switch:compaction",
+                SwitchReason::Handoff => "switch:handoff",
+                SwitchReason::Resume => "switch:resume",
+                SwitchReason::End => "switch:end",
+                SwitchReason::Manual => "switch:manual",
+            };
+            self.log.lock().unwrap().push(label);
+        }
     }
 
-    /// The §10/§11 hooks fire in spec order around a turn:
-    /// `recall -> prompt_block -> before_turn -> before_compact -> compact -> after_turn -> after_response`.
+    /// The §10/§11 hooks fire in spec order across an incarnation: the once-per-incarnation
+    /// lifecycle hooks (`on_model -> session_start -> switch:start`) precede the per-turn hooks
+    /// (`recall -> prompt_block -> before_turn -> before_compact -> compact -> switch:compaction ->
+    /// after_turn -> after_response`), and `end_session` fires the teardown hooks
+    /// (`session_end -> switch:end`).
     #[tokio::test]
     async fn memory_and_context_hooks_fire_in_spec_order() {
         let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -1373,18 +1457,25 @@ mod tests {
             .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
             .await
             .unwrap();
+        engine.end_session().await;
 
         let order = log.lock().unwrap().clone();
         assert_eq!(
             order,
             vec![
+                "on_model",
+                "session_start",
+                "switch:start",
                 "recall",
                 "prompt_block",
                 "before_turn",
                 "before_compact",
                 "compact",
+                "switch:compaction",
                 "after_turn",
                 "after_response",
+                "session_end",
+                "switch:end",
             ]
         );
     }

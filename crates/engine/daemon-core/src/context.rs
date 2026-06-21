@@ -15,7 +15,7 @@
 use crate::conversation::{AssistantMsg, Conversation, Turn};
 use crate::provider::{build_context, Provider, Request};
 use async_trait::async_trait;
-use daemon_common::UsageDelta;
+use daemon_common::{SessionId, UsageDelta};
 use std::sync::Arc;
 
 /// A cheap token estimate: ~4 chars/token plus a small per-turn structural overhead. Good enough to
@@ -105,10 +105,37 @@ impl PromptAssembler {
     }
 }
 
+/// A lightweight description of the active model, handed to a [`ContextEngine`] via
+/// [`ContextEngine::on_model`] so a stateful engine can size its token budgets/thresholds from the
+/// real context window (e.g. LCM's compaction threshold). Best-effort: `max_context` is `None` when
+/// the provider does not declare a window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// The profile/model identifier the engine is running under (a best-effort label, e.g. the
+    /// active profile name — providers do not yet surface a canonical model id).
+    pub model: String,
+    /// The model's maximum context window in tokens, if the provider declares one
+    /// ([`crate::provider::Capabilities::max_context`]).
+    pub max_context: Option<u32>,
+}
+
 /// The context-engine seam (§10). The engine calls these hooks around each turn; the default impl is
 /// stateless so it is trivially `Send + Sync` and cheap to share.
+///
+/// Lifecycle ordering (driven by the engine): `on_model` + `on_session_start` fire once before the
+/// first turn; `before_turn`/`compact`/`after_response` fire around each turn; `on_session_end` fires
+/// when the host tears the session down ([`crate::Engine::end_session`]).
+///
+/// Tools are intentionally *not* dispatched through this seam: an engine that exposes drill-down
+/// tools (e.g. LCM's `lcm_*`) registers them through the §12 [`ToolRegistry`](crate::tools) like any
+/// other tool, holding an `Arc` to itself in the closure. [`ContextEngine::tools`] returns only the
+/// advisory names it owns (for diagnostics / dedup), never a dispatch entrypoint.
 #[async_trait]
 pub trait ContextEngine: Send + Sync {
+    /// Observe the active model so the engine can size budgets/thresholds (default no-op). Called
+    /// once before the first turn (and again if the host swaps the model).
+    fn on_model(&self, _model: &ModelInfo) {}
+
     /// Measure budget pressure for the conversation as it would be sent this turn.
     fn before_turn(&self, conv: &Conversation, budget: Option<usize>) -> Pressure;
 
@@ -119,13 +146,15 @@ pub trait ContextEngine: Send + Sync {
     /// Observe the usage a model response accrued (for adaptive budgeting; default no-op).
     fn after_response(&self, _usage: &UsageDelta) {}
 
-    /// Session-lifecycle hooks (default no-ops; a stateful engine can warm/flush here).
-    fn on_session_start(&self) {}
-    /// See [`ContextEngine::on_session_start`].
-    fn on_session_end(&self) {}
+    /// Session-lifecycle hooks (default no-ops; a stateful engine warms/flushes here).
+    /// `on_session_start` fires once before the first turn of an incarnation.
+    fn on_session_start(&self, _session: &SessionId) {}
+    /// See [`ContextEngine::on_session_start`]. Fires on session teardown with the final
+    /// conversation so the engine can flush a closing summary.
+    fn on_session_end(&self, _session: &SessionId, _conv: &Conversation) {}
 
-    /// Context-management tools this engine exposes to the model (e.g. an explicit `compact`); empty
-    /// by default.
+    /// The advisory names of the context-management tools this engine owns (registered separately
+    /// through the §12 [`ToolRegistry`](crate::tools)); empty by default.
     fn tools(&self) -> Vec<String> {
         Vec::new()
     }

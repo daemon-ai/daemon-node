@@ -40,10 +40,12 @@ pub enum SwitchReason {
     Start,
     /// The switch is a context compaction event.
     Compaction,
-    /// Work is being handed off to/from another session.
+    /// Work is being handed off to/from another session (e.g. a turn suspending to a delegation).
     Handoff,
-    /// A suspended session is resuming.
+    /// A suspended session is resuming (a background completion re-activates the incarnation).
     Resume,
+    /// The session is ending (the host is tearing the incarnation down).
+    End,
     /// An operator-initiated switch.
     Manual,
 }
@@ -86,7 +88,9 @@ pub trait MemoryProvider: Send + Sync {
     /// The context is about to be compacted (a chance to persist salient facts before loss).
     async fn before_compact(&self, _conv: &Conversation) {}
 
-    /// The session boundary was crossed (a chance to consolidate).
+    /// The session boundary was crossed (a chance to consolidate). The provider already knows its
+    /// own session/bank (it is constructed per-session by the composition layer), so the reason —
+    /// not a session id — is all the engine threads here.
     async fn on_session_switch(&self, _reason: SwitchReason) {}
 }
 

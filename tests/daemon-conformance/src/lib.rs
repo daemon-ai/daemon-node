@@ -1670,6 +1670,9 @@ mod node_interface {
             engine_config: daemon_core::Config::default(),
             journal_seed: Some(journal_seed),
             nesting_depth,
+            context: None,
+            memory: Vec::new(),
+            extra_tools: Vec::new(),
         })
     }
 
@@ -2461,6 +2464,9 @@ mod node_interface {
             engine_config: daemon_core::Config::default(),
             journal_seed: Some([0x33; 32]),
             nesting_depth: 0,
+            context: None,
+            memory: Vec::new(),
+            extra_tools: Vec::new(),
         })
     }
 

@@ -26,3 +26,10 @@ daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }
 daemon-telemetry = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+# Smoke-test the wired-in defaults (LCM context + Mnemosyne memory) end-to-end through an engine turn.
+tokio = { workspace = true }
+serde_json = { workspace = true }
+daemon-context-lcm = { workspace = true }
+daemon-mnemosyne = { workspace = true }

@@ -21,6 +21,12 @@ const STORE_PATH_ENV: &str = "DAEMON_STORE_PATH";
 const PARTITION_ENV: &str = "DAEMON_PARTITION";
 /// Overrides the model provider/credential profile name.
 const PROFILE_ENV: &str = "DAEMON_PROFILE";
+/// Selects the default context engine (§10): `lcm` (default) or `budgeted`/`none`.
+const CONTEXT_ENGINE_ENV: &str = "DAEMON_CONTEXT_ENGINE";
+/// Selects the default memory provider (§11): `mnemosyne` (default), `file`, or `none`.
+const MEMORY_PROVIDER_ENV: &str = "DAEMON_MEMORY_PROVIDER";
+/// The snapshot file the `file` memory provider serves as its frozen memory (when selected).
+const MEMORY_FILE_ENV: &str = "DAEMON_MEMORY_FILE";
 /// Selects the model provider implementation: `mock` (default), `openai`, or `anthropic`.
 const MODEL_PROVIDER_ENV: &str = "DAEMON_MODEL_PROVIDER";
 /// Overrides the provider API base URL (defaults per provider).
@@ -81,6 +87,27 @@ pub enum ProviderKind {
     LlamaCpp,
     /// A local mistral.rs model via the supervised `daemon-infer` worker.
     MistralRs,
+}
+
+/// Which default context engine (§10) the node wires into every engine it builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextEngineKind {
+    /// The native LCM port (`daemon-context-lcm`) — the default.
+    Lcm,
+    /// The in-core [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) (drop-oldest); also
+    /// selected by `none`/`default`. Leaves the engine on its built-in fallback (no extra crate).
+    Budgeted,
+}
+
+/// Which default memory provider (§11) the node wires into every engine it builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryProviderKind {
+    /// The native Mnemosyne port (`daemon-mnemosyne`) — the default.
+    Mnemosyne,
+    /// The in-core [`FileMemory`](daemon_core::FileMemory) over a frozen snapshot file.
+    File,
+    /// No memory provider (memory off).
+    None,
 }
 
 /// Tuning for the local-inference [`daemon-infer`] worker (used only for the local provider kinds).
@@ -167,6 +194,12 @@ pub struct NodeConfig {
     pub scan_interval: Duration,
     /// The model provider + credential profile name (selects the registered provider builder).
     pub profile: String,
+    /// The default context engine (§10) wired into every engine (`lcm` default).
+    pub context_engine: ContextEngineKind,
+    /// The default memory provider (§11) wired into every engine (`mnemosyne` default).
+    pub memory_provider: MemoryProviderKind,
+    /// The snapshot file the `file` memory provider serves (when `memory_provider = file`).
+    pub memory_file: Option<PathBuf>,
     /// Which model provider implementation to use (mock|openai|anthropic).
     pub provider_kind: ProviderKind,
     /// An optional provider API base-URL override. `None` uses the provider's default endpoint (the
@@ -201,6 +234,9 @@ struct FileConfig {
     dispatch_interval_ms: Option<u64>,
     scan_interval_ms: Option<u64>,
     profile: Option<String>,
+    context_engine: Option<String>,
+    memory_provider: Option<String>,
+    memory_file: Option<PathBuf>,
     model_provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
@@ -319,6 +355,35 @@ impl NodeConfig {
             .or(file.profile)
             .unwrap_or_else(|| "openai".to_string());
 
+        let context_engine = match env_string(CONTEXT_ENGINE_ENV)
+            .or(file.context_engine)
+            .unwrap_or_else(|| "lcm".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "lcm" => ContextEngineKind::Lcm,
+            "budgeted" | "none" | "default" => ContextEngineKind::Budgeted,
+            other => anyhow::bail!("unknown context engine {other:?} (expected lcm|budgeted|none)"),
+        };
+
+        let memory_provider = match env_string(MEMORY_PROVIDER_ENV)
+            .or(file.memory_provider)
+            .unwrap_or_else(|| "mnemosyne".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mnemosyne" => MemoryProviderKind::Mnemosyne,
+            "file" => MemoryProviderKind::File,
+            "none" | "off" => MemoryProviderKind::None,
+            other => {
+                anyhow::bail!("unknown memory provider {other:?} (expected mnemosyne|file|none)")
+            }
+        };
+
+        let memory_file = env_string(MEMORY_FILE_ENV)
+            .map(PathBuf::from)
+            .or(file.memory_file);
+
         let provider_kind = match env_string(MODEL_PROVIDER_ENV)
             .or(file.model_provider)
             .unwrap_or_else(|| "mock".to_string())
@@ -371,6 +436,9 @@ impl NodeConfig {
             dispatch_interval,
             scan_interval,
             profile,
+            context_engine,
+            memory_provider,
+            memory_file,
             provider_kind,
             base_url,
             model,
