@@ -1299,26 +1299,38 @@ default stays fully ephemeral).
 
 ## 15. Implementation milestones
 
-**Status (this branch): M1–M4 + M8 implemented.** The store (lossless `messages` + summary DAG +
+**Status (this branch): M1–M4 + M6 + M8 implemented.** The store (lossless `messages` + summary DAG +
 FTS5 + lifecycle frontier), `tiktoken`-rs token counting + `on_model` threshold, the 3-level
-escalation summarizer over a host-injected aux `Provider`, and the compaction engine
-(`[system]+[summary]+[fresh tail]`) are live and unit-tested; the binary threads the agent's default
-provider in as the LCM aux provider. M5 (protection), M6 (`lcm_*` tools + search), and M7
-(routing/presets) remain open.
+escalation summarizer over a host-injected aux `Provider`, the compaction engine
+(`[system]+[summary]+[fresh tail]`), full per-turn transcript ingest, the search stack, and all seven
+`lcm_*` drill-down tools are live and unit-tested; the binary threads the agent's default provider in
+as the LCM aux provider and registers the `lcm_*` tools (session-resolved through a shared
+`LcmBanks`, mirroring `MnemosyneBanks`). M5 (protection) and M7 (routing/presets) remain open.
 
-Two deliberate deviations from the literal milestone text below, both within the milestone's intent:
+Three deliberate deviations from the literal milestone text below, all within the milestone's intent:
 
-1. **Ingest is driven from `compact()`** over exactly the region being summarized (so each D0 node
-   references real `store_id`s), rather than per-turn in `before_turn` with an `ingest_cursor`. Since
-   `compact()`'s result *replaces* the durable conversation (`CORE:engine.rs`), the in-memory cursor
-   wouldn't survive rehydration and turns carry no stable identity, so per-turn ingest would duplicate
-   rows across incarnations. Full per-turn transcript ingest (needed by `lcm_grep`/`lcm_expand`) lands
-   with M6, which requires the whole transcript, not just compacted spans.
-2. **The proactive-compaction gate now triggers on the context engine's effective budget**
+1. **Full per-turn transcript ingest drives `before_turn`** (M6), not `compact()` (the M4-era stopgap).
+   Each live turn flattens into `messages` rows behind a per-turn `turn_store_ids` index; `compact()`
+   reads that index for a D0 node's `source_ids` rather than re-ingesting. Because `compact()`'s result
+   *replaces* the durable conversation and turns carry no stable identity, a fresh incarnation
+   **reconciles** on its first ingest: it deletes the volatile tail (`store_id > frontier`) and
+   re-ingests the live non-scaffold turns, so a rehydrated session never duplicates rows. This gives
+   `lcm_grep`/`lcm_expand` the whole transcript, not just compacted spans.
+2. **The `lcm_*` tools read the durable store, not the live `Conversation`.** The spec's §10 `ToolCx`
+   carries `&Conversation` for current-session scope; here the full transcript is always in the store
+   (deviation 1), so the tools query the store directly and `store_id`/`node_id` recover exact content
+   regardless of what is currently in-context. This subsumes the Python host-capability sniff and makes
+   cross-session `lcm_expand(store_id)` uniform with current-session recovery.
+3. **The proactive-compaction gate triggers on the context engine's effective budget**
    (`Pressure::budget_tokens`) instead of only the host `context_budget_tokens` (`CORE:engine.rs`
    `prepare_turn_context`). This realizes §2.4 — LCM sizes its own `threshold_tokens` from the model
    window and `context_budget_tokens` is the host override. Backward-compatible for the budgeted
    default (which returns `budget_tokens == budget`).
+
+Smaller, noted divergences: the LIKE-fallback CJK/emoji/risky-ASCII detection uses direct Unicode
+range checks rather than a `regex` dependency; `lcm_doctor` runs the available checks
+(`database_integrity`, FTS sync, `orphaned_dag_nodes`) and skips the protection-dependent ones
+(M5: ingest-protection / sensitive-pattern / payload-storage), which it lists under `skipped`.
 
 Each milestone is independently testable; constants from §6/§7/§8 are carried verbatim.
 
@@ -1342,10 +1354,12 @@ Each milestone is independently testable; constants from §6/§7/§8 are carried
   guard, quarantine) + `externalize.rs` + `extraction.rs`. Acceptance: secrets redacted with correct
   digest length; oversized base64 externalized with recoverable ref; degenerate assistant output
   quarantined at the exact thresholds. (§8, §9)
-- **M6 — Tools + search.** `search.rs` (FTS5 sanitize, LIKE fallback, sort, directness) + the seven
-  `tools/*` + `schemas.rs`; `tools()`/`call_tool` dispatch. Acceptance: each tool's paged return
-  shape + cursor families match the schema; cross-session `lcm_grep` returns raw-only;
-  `lcm_expand(store_id)` recovers exact content. (§10, §11)
+- **M6 — Tools + search. (done)** `search.rs` (FTS5 sanitize, LIKE fallback, sort modes, directness,
+  snippets) + `tools/mod.rs` (the seven handlers) + `tools/schemas.rs`; full per-turn ingest +
+  rehydration reconcile; `tool_defs()`/`call_tool` dispatch on `LcmContextEngine`; binary `LcmBanks`
+  cache + `LcmTool` adapter register the tools alongside `mnemosyne_*`. Acceptance (met): each tool's
+  paged return shape + cursor families match the schema; cross-session `lcm_grep` returns raw-only;
+  `lcm_expand(store_id)` recovers exact content; reconcile never duplicates the tail. (§10, §11)
 - **M7 — Routing + presets + filters.** `model_routing.rs` shim, `presets.rs` metadata,
   `patterns.rs` (session globs + message regex). Acceptance: ignored/stateless sessions skip
   ingest/writes; preset suggestion by context window; glob colon-semantics. (§12.3–12.6)

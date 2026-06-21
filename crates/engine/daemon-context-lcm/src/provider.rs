@@ -6,15 +6,19 @@
 //! the fresh tail into the DAG and reassemble `[system] + [summary] + [fresh tail]`; the
 //! session-lifecycle hooks bind the conversation frontier.
 
-use crate::compaction::run_compaction;
+use crate::compaction::{leading_scaffold_count, run_compaction};
 use crate::config::LcmConfig;
 use crate::error::Result;
 use crate::escalation::SummaryCircuitBreaker;
+use crate::ingest::flatten_turns;
 use crate::store::Store;
 use crate::tokens::Tokenizer;
+use crate::tools::{ToolCx, TOOL_NAMES};
 use async_trait::async_trait;
 use daemon_common::SessionId;
+use daemon_core::tools::ToolDef;
 use daemon_core::{Conversation, ContextEngine, ModelInfo, Pressure, Provider};
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +40,15 @@ struct State {
     compaction_count: u64,
     /// When the last compaction was a no-op (for the boundary cooldown).
     last_noop_at: Option<Instant>,
+    /// The number of live conversation turns already ingested into `messages` this incarnation.
+    cursor: usize,
+    /// Per-turn ingest index: `turn_store_ids[i]` are the `store_id`s persisted for live turn `i`
+    /// (empty for a synthetic summary turn). Kept aligned with the live conversation so compaction
+    /// can attribute D0 `source_ids` without re-ingesting.
+    turn_store_ids: Vec<Vec<i64>>,
+    /// Whether this incarnation has reconciled its tail against the durable store yet (once per
+    /// incarnation, on the first ingest).
+    reconciled: bool,
 }
 
 impl Default for State {
@@ -47,6 +60,9 @@ impl Default for State {
             breaker: SummaryCircuitBreaker::new(),
             compaction_count: 0,
             last_noop_at: None,
+            cursor: 0,
+            turn_store_ids: Vec::new(),
+            reconciled: false,
         }
     }
 }
@@ -101,6 +117,37 @@ impl LcmContextEngine {
         Ok(engine)
     }
 
+    /// The §12 [`ToolDef`]s for the seven `lcm_*` drill-down tools (session-independent — the host
+    /// enumerates these once and registers an adapter per def that routes to [`Self::call_tool`]).
+    pub fn tool_defs(&self) -> Vec<ToolDef> {
+        crate::tools::tool_defs()
+    }
+
+    /// Dispatch one `lcm_*` tool by name against this engine's session/store, returning a JSON
+    /// string (§10.7). The tools read the durable store, so recovery works regardless of what is
+    /// currently in-context.
+    pub async fn call_tool(&self, name: &str, args: Value) -> String {
+        let (session_id, tokenizer, threshold_tokens, compaction_count) = {
+            let state = self.state.lock().expect("lcm state poisoned");
+            (
+                effective_session(&state.session_id),
+                state.tokenizer.clone(),
+                state.threshold_tokens,
+                state.compaction_count,
+            )
+        };
+        let cx = ToolCx {
+            store: &self.store,
+            config: &self.config,
+            tokenizer: &tokenizer,
+            aux: self.aux.as_ref(),
+            session_id: &session_id,
+            threshold_tokens,
+            compaction_count,
+        };
+        crate::tools::dispatch(&cx, name, args).await
+    }
+
     /// Test/diagnostic access to the underlying store.
     #[cfg(test)]
     pub(crate) fn store(&self) -> &Store {
@@ -112,6 +159,50 @@ impl LcmContextEngine {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0)
+    }
+
+    /// Mirror the live transcript into the `messages` store so the `lcm_*` tools (grep/expand) see
+    /// the whole conversation, not just compacted spans. Idempotent and incremental within an
+    /// incarnation (only `turns[cursor..]` are ingested); on the first call of an incarnation it
+    /// reconciles the volatile tail (`store_id > frontier`) against the replayed conversation by
+    /// deleting it and re-ingesting, so a rehydrated session never duplicates rows.
+    fn ingest_current(&self, conv: &Conversation) {
+        let now = Self::now();
+        let mut state = self.state.lock().expect("lcm state poisoned");
+        let session = effective_session(&state.session_id);
+        if !state.reconciled {
+            let frontier = self.store.get_frontier(&session).unwrap_or(0);
+            let _ = self.store.delete_messages_after(&session, frontier);
+            state.cursor = 0;
+            state.turn_store_ids.clear();
+            state.reconciled = true;
+        }
+        let scaffold = leading_scaffold_count(&conv.turns);
+        let tok = state.tokenizer.clone();
+        while state.cursor < conv.turns.len() {
+            let idx = state.cursor;
+            if idx < scaffold {
+                // A synthetic summary scaffold turn carries no real messages.
+                state.turn_store_ids.push(Vec::new());
+            } else {
+                let rows = flatten_turns(std::slice::from_ref(&conv.turns[idx]), &tok);
+                let ids = self
+                    .store
+                    .append_batch(&session, &rows, now)
+                    .unwrap_or_default();
+                state.turn_store_ids.push(ids);
+            }
+            state.cursor += 1;
+        }
+    }
+}
+
+/// Normalize an unset session id to a stable placeholder so store rows are attributable.
+fn effective_session(session_id: &str) -> String {
+    if session_id.is_empty() {
+        "unknown".to_string()
+    } else {
+        session_id.to_string()
     }
 }
 
@@ -126,6 +217,8 @@ impl ContextEngine for LcmContextEngine {
     }
 
     fn before_turn(&self, conv: &Conversation, budget: Option<usize>) -> Pressure {
+        // Keep the durable transcript current before measuring pressure (so the tools see this turn).
+        self.ingest_current(conv);
         let state = self.state.lock().expect("lcm state poisoned");
         let used_tokens = state.tokenizer.count_conversation(conv);
         // Boundary cooldown: after a no-op compaction, report no budget for a short window so the
@@ -143,25 +236,26 @@ impl ContextEngine for LcmContextEngine {
     }
 
     async fn compact(&self, conv: Conversation, _budget: usize) -> Conversation {
-        // Snapshot the bits compaction needs, then run it without holding the state lock across the
-        // aux-provider `await`s. The breaker is taken out and restored afterwards.
-        let (tokenizer, session_id, mut breaker, first_compaction) = {
+        // Catch up the ingest index to the live conversation (the ReAct loop may have appended turns
+        // since `before_turn`), then snapshot the bits compaction needs and run it without holding
+        // the state lock across the aux-provider `await`s. The breaker + index are taken out and
+        // restored afterwards.
+        self.ingest_current(&conv);
+        let (tokenizer, session_id, mut breaker, first_compaction, index) = {
             let mut state = self.state.lock().expect("lcm state poisoned");
             let breaker = std::mem::take(&mut state.breaker);
+            let index = std::mem::take(&mut state.turn_store_ids);
             (
                 state.tokenizer.clone(),
                 state.session_id.clone(),
                 breaker,
                 state.compaction_count == 0,
+                index,
             )
         };
-        let session = if session_id.is_empty() {
-            "unknown".to_string()
-        } else {
-            session_id
-        };
+        let session = effective_session(&session_id);
 
-        let (compacted, did_compact) = run_compaction(
+        let (compacted, did_compact, new_index) = run_compaction(
             &self.store,
             &tokenizer,
             &self.config,
@@ -169,6 +263,7 @@ impl ContextEngine for LcmContextEngine {
             &mut breaker,
             &session,
             first_compaction,
+            index,
             conv,
             Self::now(),
         )
@@ -176,6 +271,8 @@ impl ContextEngine for LcmContextEngine {
 
         let mut state = self.state.lock().expect("lcm state poisoned");
         state.breaker = breaker;
+        state.cursor = new_index.len();
+        state.turn_store_ids = new_index;
         if did_compact {
             state.compaction_count += 1;
             state.last_noop_at = None;
@@ -197,6 +294,12 @@ impl ContextEngine for LcmContextEngine {
     fn on_session_end(&self, session: &SessionId, _conv: &Conversation) {
         let count = self.store.summary_count(session.as_str()).unwrap_or(0);
         tracing::debug!(session = %session, summaries = count, "lcm: session ended");
+    }
+
+    /// The advisory names of the `lcm_*` tools this engine owns; the host registers their actual
+    /// dispatch through the §12 [`ToolRegistry`](daemon_core::tools) (see [`Self::tool_defs`]).
+    fn tools(&self) -> Vec<String> {
+        TOOL_NAMES.iter().map(|s| s.to_string()).collect()
     }
 }
 
@@ -300,6 +403,72 @@ mod tests {
             nodes_after_first,
             "no new summary node"
         );
+    }
+
+    #[tokio::test]
+    async fn before_turn_mirrors_full_transcript_without_compaction() {
+        let lcm = LcmContextEngine::open_in_memory(aux_with("s")).unwrap();
+        lcm.on_model(&model()); // threshold ~350 tokens; this short convo stays under it
+        lcm.on_session_start(&SessionId::new("s1"));
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..3 {
+            c.push_user(UserMsg::new(format!("u{i}")));
+            c.push_assistant(AssistantMsg::text(format!("a{i}")));
+        }
+        let pressure = lcm.before_turn(&c, None);
+        assert!(!pressure.over_budget(), "short convo is under threshold");
+        // Every turn was ingested even though no compaction happened.
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 6);
+        // A second before_turn with no new turns does not duplicate.
+        lcm.before_turn(&c, None);
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_fresh_tail_byte_equal() {
+        let lcm = LcmContextEngine::open_in_memory(aux_with("summary")).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let c = convo(50); // 100 turns; fresh tail keeps 32 from index 68
+        let original_tail = c.turns[68..].to_vec();
+        let compacted = lcm.compact(c, 100).await;
+        // turns[0] is the summary scaffold; the rest must equal the original fresh tail verbatim.
+        assert_eq!(&compacted.turns[1..], original_tail.as_slice());
+    }
+
+    #[tokio::test]
+    async fn rehydration_reconcile_does_not_duplicate_tail() {
+        let dir = std::env::temp_dir().join(format!("lcm-reconcile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1: compact a long conversation, then close.
+        let compacted = {
+            let lcm =
+                LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                    .unwrap();
+            lcm.on_model(&model());
+            let out = lcm.compact(convo(50), 100).await;
+            out
+        };
+        let count1 = {
+            let reader =
+                LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("probe"), aux_with("s"))
+                    .unwrap();
+            reader.store().message_count("s1").unwrap()
+        };
+        // Incarnation 2: rehydrate from the compacted snapshot and run before_turn -> reconcile.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        lcm2.before_turn(&compacted, None);
+        let count2 = lcm2.store().message_count("s1").unwrap();
+        assert_eq!(count2, count1, "reconcile rebuilt the tail without duplication");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

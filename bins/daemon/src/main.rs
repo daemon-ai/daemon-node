@@ -144,17 +144,31 @@ fn build_providers(
     providers
 }
 
-/// Build the default §10 context-engine *builder* the config selected. `Lcm` returns a per-session
-/// builder ([`ContextEngineBuilder`]) that opens a fresh [`LcmContextEngine`] bound to each session
-/// (so its per-session compaction state is never shared across concurrent sessions) over the shared
-/// profile-scoped `lcm.db`; `Budgeted` returns `None`, leaving the engine on the in-core
-/// [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) fallback.
-fn build_context_engine(
-    cfg: &NodeConfig,
-    aux: Arc<dyn Provider>,
-) -> Option<ContextEngineBuilder> {
+/// The default §10 context wiring: an optional per-session context-engine *builder* and the
+/// `lcm_*` drill-down tools registered on every role registry. Mirrors [`MemoryWiring`] — the
+/// `Budgeted` fallback yields neither.
+struct ContextWiring {
+    builder: Option<ContextEngineBuilder>,
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl ContextWiring {
+    fn off() -> Self {
+        Self {
+            builder: None,
+            tools: Vec::new(),
+        }
+    }
+}
+
+/// Build the default §10 context wiring the config selected. `Lcm` opens a shared [`LcmBanks`] cache
+/// so the per-session context builder and the registered `lcm_*` tools resolve the *same*
+/// [`LcmContextEngine`] instance for a given session (shared compaction state + store), exactly as
+/// [`MnemosyneBanks`] does for memory. `Budgeted` leaves the engine on the in-core
+/// [`BudgetedContextEngine`](daemon_core::BudgetedContextEngine) fallback with no tools.
+fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
     match cfg.context_engine {
-        ContextEngineKind::Budgeted => None,
+        ContextEngineKind::Budgeted => ContextWiring::off(),
         ContextEngineKind::Lcm => {
             let lcm_cfg = if cfg.persist_providers() {
                 LcmConfig {
@@ -165,18 +179,102 @@ fn build_context_engine(
             } else {
                 LcmConfig::in_memory()
             };
-            Some(Arc::new(move |id: &SessionId| {
-                match LcmContextEngine::open_for_session(lcm_cfg.clone(), id, aux.clone()) {
-                    Ok(lcm) => Arc::new(lcm) as Arc<dyn ContextEngine>,
-                    Err(e) => {
-                        tracing::warn!(error = %e, session = %id,
+            let banks = Arc::new(LcmBanks::new(lcm_cfg, aux));
+            // The `lcm_*` tool defs are session-independent; enumerate once.
+            let tools: Vec<Arc<dyn Tool>> = daemon_context_lcm::tools::tool_defs()
+                .into_iter()
+                .map(|def| {
+                    Arc::new(LcmTool {
+                        banks: banks.clone(),
+                        def,
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let builder: ContextEngineBuilder = {
+                let banks = banks.clone();
+                Arc::new(move |id: &SessionId| match banks.get_or_open(id) {
+                    Some(lcm) => lcm as Arc<dyn ContextEngine>,
+                    None => {
+                        tracing::warn!(session = %id,
                             "failed to open LCM context engine for session; using budgeted fallback");
                         Arc::new(daemon_core::BudgetedContextEngine::default())
                             as Arc<dyn ContextEngine>
                     }
-                }
-            }) as ContextEngineBuilder)
+                })
+            };
+            ContextWiring {
+                builder: Some(builder),
+                tools,
+            }
         }
+    }
+}
+
+/// A shared, agent-wide LCM bank cache: one per-session [`LcmContextEngine`] over the same profile
+/// `lcm.db` (or a per-session in-memory bank when ephemeral). The cache lets the §10 context builder
+/// and the `lcm_*` tools resolve the *same* instance for a session, so the tools observe that
+/// session's live compaction state and durable transcript.
+struct LcmBanks {
+    cfg: LcmConfig,
+    aux: Arc<dyn Provider>,
+    sessions: Mutex<HashMap<SessionId, Arc<LcmContextEngine>>>,
+}
+
+impl LcmBanks {
+    fn new(cfg: LcmConfig, aux: Arc<dyn Provider>) -> Self {
+        Self {
+            cfg,
+            aux,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Open (once) and cache the engine for `session`, bound to that session id over the shared bank.
+    fn get_or_open(&self, session: &SessionId) -> Option<Arc<LcmContextEngine>> {
+        let mut sessions = self.sessions.lock().expect("lcm banks poisoned");
+        if let Some(existing) = sessions.get(session) {
+            return Some(existing.clone());
+        }
+        match LcmContextEngine::open_for_session(self.cfg.clone(), session, self.aux.clone()) {
+            Ok(lcm) => {
+                let lcm = Arc::new(lcm);
+                sessions.insert(session.clone(), lcm.clone());
+                Some(lcm)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session, "failed to open LCM bank");
+                None
+            }
+        }
+    }
+}
+
+/// A §12 [`Tool`] adapter that dispatches an `lcm_*` call to the calling session's LCM engine,
+/// resolved from the shared [`LcmBanks`] by `cx.session_id` at run time (so the tool and the §10
+/// context hooks always operate on the same per-session instance).
+struct LcmTool {
+    banks: Arc<LcmBanks>,
+    def: ToolDef,
+}
+
+#[async_trait::async_trait]
+impl Tool for LcmTool {
+    fn name(&self) -> &str {
+        &self.def.name
+    }
+
+    fn schema(&self) -> &str {
+        &self.def.schema
+    }
+
+    async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
+        let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
+        let result = match self.banks.get_or_open(&cx.session_id) {
+            Some(lcm) => lcm.call_tool(&self.def.name, args).await,
+            None => serde_json::json!({"status": "error", "error": "lcm bank unavailable"})
+                .to_string(),
+        };
+        ToolOutcome::text(call.call_id.clone(), true, result)
     }
 }
 
@@ -639,11 +737,18 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         .builder_for(&cred_profile)
         .map(|b| b())
         .unwrap_or_else(|| Arc::new(MockProvider::completing("")) as Arc<dyn Provider>);
-    let context_builder = build_context_engine(&cfg, lcm_aux);
+    let context = build_context(&cfg, lcm_aux);
     // The optional embedding backend (Mnemosyne vector recall), reusing the shared `ModelManager`
     // for local-model acquisition. `Off` by default — recall stays keyword-only.
     let embedder = build_embedder(&cfg, &manager).await;
     let memory = build_memory(&cfg, embedder);
+    // Both context (`lcm_*`) and memory (`mnemosyne_*`) tools register on every role registry.
+    let extra_tools: Vec<Arc<dyn Tool>> = memory
+        .tools
+        .iter()
+        .cloned()
+        .chain(context.tools.iter().cloned())
+        .collect();
 
     let host_config = HostConfig {
         partition: cfg.partition,
@@ -663,10 +768,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         journal_seed: cfg.journal_seed,
         nesting_depth: cfg.nesting_depth,
         context: None,
-        context_builder,
+        context_builder: context.builder,
         memory: memory.shared,
         memory_builder: memory.builder,
-        extra_tools: memory.tools,
+        extra_tools,
         models: Some(manager.clone()),
     });
     tracing::info!("daemon host node started");

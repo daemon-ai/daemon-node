@@ -754,4 +754,47 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn lcm_tools_dispatch_through_the_shared_engine() {
+        // Mirror the binary's `LcmBanks`: the context builder and the `lcm_*` tools resolve the same
+        // per-session engine, so a tool call observes that session's live state + durable store.
+        let session = SessionId::new("lcm-tools");
+        let aux: Arc<dyn Provider> = Arc::new(MockProvider::completing("summary"));
+        let lcm = Arc::new(
+            LcmContextEngine::open_for_session(LcmConfig::in_memory(), &session, aux).expect("lcm"),
+        );
+
+        // The advisory names and the §12 tool defs both cover the seven tools.
+        assert_eq!(ContextEngine::tools(lcm.as_ref()).len(), 7);
+        assert_eq!(lcm.tool_defs().len(), 7);
+
+        // A §12 adapter (mirrors the binary's `LcmTool`) dispatches by name to the shared engine.
+        struct LcmStatusTool {
+            lcm: Arc<LcmContextEngine>,
+        }
+        #[async_trait]
+        impl Tool for LcmStatusTool {
+            fn name(&self) -> &str {
+                "lcm_status"
+            }
+            fn schema(&self) -> &str {
+                "{}"
+            }
+            async fn run(&self, call: &ToolCall, _cx: &daemon_core::TurnCx<'_>) -> ToolOutcome {
+                let out = self.lcm.call_tool("lcm_status", serde_json::Value::Null).await;
+                ToolOutcome::text(call.call_id.clone(), true, out)
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LcmStatusTool { lcm: lcm.clone() }) as Arc<dyn Tool>);
+        assert!(registry.get("lcm_status").is_some());
+
+        // Calling through the engine returns well-formed status JSON for this session.
+        let status: serde_json::Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", serde_json::json!({})).await)
+                .expect("lcm_status returns JSON");
+        assert_eq!(status["session_id"], "lcm-tools");
+        assert!(status["store"]["session_messages"].is_number());
+    }
 }
