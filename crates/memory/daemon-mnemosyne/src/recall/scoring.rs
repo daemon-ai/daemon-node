@@ -90,6 +90,25 @@ pub fn working_memory_score(
     base * (rc_share + (1.0 - rc_share) * decay)
 }
 
+/// Blend the FTS5 signal into lexical relevance (`beam.py` L5314): once a row clears the lexical
+/// floor, take `max(lexical, 0.75*lexical + 0.25*normalized_fts)` so a strong BM25 match can lift a
+/// thin token overlap. Below the floor the raw `lexical` is returned unchanged (the row only
+/// survives via the vector / FTS candidate gate, where `vec_sim` drives the score).
+pub fn blend_fts(lexical: f64, normalized_fts: f64, floor: f64) -> f64 {
+    if lexical >= floor {
+        lexical.max(0.75 * lexical + 0.25 * normalized_fts)
+    } else {
+        lexical
+    }
+}
+
+/// The episodic tier multiplier for a 1-based tier level (`T1=1.0, T2=0.5, T3=0.25`, `beam.py`
+/// L5931). Out-of-range levels clamp to the nearest defined tier.
+pub fn tier_weight(tier: i64) -> f64 {
+    let idx = (tier.max(1) as usize - 1).min(TIER_WEIGHTS.len() - 1);
+    TIER_WEIGHTS[idx]
+}
+
 /// Graph bonus `min(edge_count * 0.02, 0.08)` (`beam.py` L5779).
 pub fn graph_bonus(edge_count: usize) -> f64 {
     (edge_count as f64 * 0.02).min(0.08)
@@ -130,5 +149,26 @@ mod tests {
         // Strong lexical, weak hybrid -> max() picks the lexical*0.8 branch.
         let s = episodic_score(0.0, 0.0, 0.0, 1.0, 1.0, DEFAULT_WEIGHTS, 0.0, 0.0, 0.0);
         assert!((s - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fts_lifts_thin_lexical_above_floor() {
+        // Above the floor, a strong BM25 signal raises the blended relevance over raw lexical...
+        let blended = blend_fts(0.5, 1.0, 0.3);
+        assert!((blended - (0.75 * 0.5 + 0.25 * 1.0)).abs() < 1e-9);
+        assert!(blended > 0.5);
+        // ...but a row below the floor keeps its raw lexical (it only survives via vec/FTS gate).
+        assert_eq!(blend_fts(0.1, 1.0, 0.3), 0.1);
+        // A weak FTS signal never drags relevance below the raw lexical (max() guard).
+        assert_eq!(blend_fts(0.8, 0.0, 0.3), 0.8);
+    }
+
+    #[test]
+    fn tier_weight_clamps_to_table() {
+        assert_eq!(tier_weight(1), 1.0);
+        assert_eq!(tier_weight(2), 0.5);
+        assert_eq!(tier_weight(3), 0.25);
+        assert_eq!(tier_weight(0), 1.0); // clamp low
+        assert_eq!(tier_weight(9), 0.25); // clamp high
     }
 }

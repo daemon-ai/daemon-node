@@ -136,9 +136,11 @@ impl MemoryProvider for MnemosyneProvider {
     }
 
     async fn on_session_switch(&self, reason: SwitchReason) {
-        // TODO: consolidate via engine.sleep() on `End`/`Handoff`; reset prefetch on `Resume`.
-        // Deliberate no-op until the BEAM sleep/consolidation port lands (port-spec P1).
-        let _ = reason;
+        // Promote unconsolidated working memory into the episodic tier at session boundaries (a
+        // minimal slice of BEAM sleep/consolidation; full summarization/degradation is port-spec P1).
+        if matches!(reason, SwitchReason::End | SwitchReason::Handoff) {
+            let _ = self.engine.consolidate();
+        }
     }
 }
 
@@ -265,6 +267,32 @@ mod tests {
             !block.text.contains("pizza"),
             "the orthogonal distractor must not pass the vector gate; got: {}",
             block.text
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_promotes_working_memory_to_episodic() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine.clone());
+        let conv = Conversation::new(SystemPrompt::new(""));
+
+        provider
+            .after_turn(
+                &Turn::User(UserMsg::new("a memory worth keeping around")),
+                &conv,
+            )
+            .await;
+        assert!(
+            !engine.recall("memory keeping", 5).unwrap().is_empty(),
+            "the turn should have been stored"
+        );
+
+        // Ending the session should consolidate; a subsequent consolidate then finds nothing pending.
+        provider.on_session_switch(SwitchReason::End).await;
+        assert_eq!(
+            engine.consolidate().unwrap(),
+            0,
+            "on_session_switch(End) should have already promoted the row"
         );
     }
 }
