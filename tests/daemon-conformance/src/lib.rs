@@ -2669,6 +2669,7 @@ mod node_interface {
                         input: UserMsg::new("hello there"),
                         request_id: ReqId(1),
                     },
+                    origin: None,
                 })
                 .await
                 .unwrap(),
@@ -2686,6 +2687,7 @@ mod node_interface {
                 command: AgentCommand::Snapshot {
                     request_id: ReqId(2),
                 },
+                origin: None,
             })
             .await
             .unwrap();
@@ -2707,6 +2709,7 @@ mod node_interface {
                     text: "stay focused".into(),
                     request_id: ReqId(3),
                 },
+                origin: None,
             })
             .await
             .unwrap();
@@ -2723,6 +2726,7 @@ mod node_interface {
                     command: AgentCommand::Interrupt {
                         reason: Some("stop".into()),
                     },
+                    origin: None,
                 })
                 .await
                 .unwrap(),
@@ -2781,6 +2785,67 @@ mod node_interface {
             socket_view.turns, inproc_view.turns,
             "the snapshot projection must agree across transports"
         );
+
+        // --- §5.4 delivery targets + handover, and the transport/meta lever ---
+        {
+            use daemon_protocol::{
+                DeliveryTarget, Disposition, Origin, OriginScope, SessionPayload, SinkKind,
+                TransportId,
+            };
+
+            // Opening the in-proc session via `submit` (the generic `api` origin) seeded a single
+            // Primary reply sink.
+            let seeded = node.delivery_targets(inproc_session.clone()).await;
+            assert_eq!(seeded.len(), 1);
+            assert_eq!(seeded[0].kind, SinkKind::Primary);
+
+            // Handover re-points the Primary to a chat target; the prior Primary is demoted.
+            node.handover(
+                inproc_session.clone(),
+                DeliveryTarget::new("telegram", "chat-42", SinkKind::Primary),
+            )
+            .await
+            .unwrap();
+            let after = node.delivery_targets(inproc_session.clone()).await;
+            let primaries: Vec<_> = after
+                .iter()
+                .filter(|t| t.kind == SinkKind::Primary)
+                .collect();
+            assert_eq!(primaries.len(), 1, "exactly one Primary in force");
+            assert_eq!(primaries[0].transport, TransportId::new("telegram"));
+            assert_eq!(primaries[0].route.as_str(), "chat-42");
+            assert!(
+                after.iter().any(|t| t.kind == SinkKind::Spectator),
+                "the prior Primary is demoted to Spectator"
+            );
+
+            // record_meta lands on the live merged log as a Transport entry (observable), without
+            // entering the prompt/journal.
+            let before = node.log_after(inproc_session.clone(), 0, 0).await.unwrap();
+            node.record_meta(
+                inproc_session.clone(),
+                Origin::new(
+                    "gui",
+                    OriginScope::Api {
+                        key: "owner".into(),
+                    },
+                ),
+                "attach".into(),
+                vec![1, 2, 3],
+            )
+            .await
+            .unwrap();
+            let delta = node
+                .log_after(inproc_session.clone(), before.head_seq, 0)
+                .await
+                .unwrap();
+            let meta = delta
+                .entries
+                .iter()
+                .find(|e| matches!(&e.payload, SessionPayload::Meta { .. }))
+                .expect("the meta event is observable on the live log");
+            assert_eq!(meta.disposition, Disposition::Transport);
+        }
 
         server.abort();
         handle.shutdown().await;

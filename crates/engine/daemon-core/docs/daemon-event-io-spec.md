@@ -735,7 +735,13 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
 
 - **P0 — contracts.** The merged session event log (`SessionLogEntry`, `Direction`, `Disposition`),
   `Origin` + `session_id_for`, the `subscribe` surface, and `TurnTrigger::Scheduled` (protocol bump).
-  No transports yet.
+  No transports yet. *Done, including the formerly-deferred contract gaps:* `session_id_for` +
+  `IsolationPolicy` (§5.3 deterministic origin → `SessionId`); `Origin` threaded through submit
+  (`SessionApi::submit_from` + `ApiRequest::Submit { origin }`, recorded with per-event attribution on
+  the merged log); `DeliveryTarget`/`SinkKind`/`RouteAddr` with session-owned reply sinks +
+  `delivery_targets`/`handover` (§5.4, Primary seeded from the opening origin); and the
+  `record_meta` / `Disposition::Transport` lever (observability-only meta on the live log + broadcast,
+  never the prompt or journal). The actual *posting* to a `Primary` still awaits a chat transport (P5).
 - **P1 — HTTP surface.** `daemon-http` over `dispatch` (JSON request/response) + a streaming
   `subscribe` endpoint (SSE/WS). Proves the edge-as-`NodeApi`-client model and multi-surface
   observability end to end; directly usable by `daemon-app`.

@@ -583,6 +583,7 @@ async fn main() -> anyhow::Result<()> {
                         input: UserMsg::new(text),
                         request_id: ReqId(1),
                     },
+                    origin: None,
                 })
                 .await?,
         ),
@@ -714,6 +715,12 @@ fn render(resp: ApiResponse) {
                     "  - seq={} {:?} {} {:?}",
                     e.seq, e.direction, e.origin.transport.0, e.payload
                 );
+            }
+        }
+        ApiResponse::DeliveryTargets(targets) => {
+            println!("delivery_targets: {}", targets.len());
+            for t in targets {
+                println!("  - {} {} {:?}", t.transport.0, t.route.0, t.kind);
             }
         }
         ApiResponse::VerifyingKey(key) => match key {

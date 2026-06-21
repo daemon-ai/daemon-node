@@ -73,6 +73,10 @@ fn check_cddl() -> anyhow::Result<()> {
         "direction",
         "disposition",
         "origin",
+        // wire v2: outbound delivery targets + handover (§5.4).
+        "delivery-target",
+        "sink-kind",
+        "route-addr",
     ] {
         anyhow::ensure!(
             text.contains(rule),

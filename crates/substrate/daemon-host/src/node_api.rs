@@ -32,9 +32,9 @@ use daemon_common::{
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
-    AgentCommand, Direction, Disposition, HostRequest, HostRequestHandler, HostResponse,
-    HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, TranscriptBlock,
-    TransportId,
+    AgentCommand, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestHandler,
+    HostResponse, HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, SinkKind,
+    TranscriptBlock, TransportId,
 };
 use daemon_store::{SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -446,6 +446,16 @@ impl SessionApi for NodeApiImpl {
         self.live.submit(session, command).await
     }
 
+    async fn submit_from(
+        &self,
+        session: SessionId,
+        origin: Origin,
+        command: AgentCommand,
+    ) -> Result<(), ApiError> {
+        self.claim(&session, Lifecycle::Live)?;
+        self.live.submit_from(session, origin, command).await
+    }
+
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
         self.live.poll(&session, max)
     }
@@ -475,6 +485,24 @@ impl SessionApi for NodeApiImpl {
 
     async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
         Ok(self.live.subscribe(&session, after_seq))
+    }
+
+    async fn delivery_targets(&self, session: SessionId) -> Vec<DeliveryTarget> {
+        self.live.delivery_targets(&session)
+    }
+
+    async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
+        self.live.handover(&session, target)
+    }
+
+    async fn record_meta(
+        &self,
+        session: SessionId,
+        origin: Origin,
+        kind: String,
+        body: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        self.live.record_meta(&session, origin, kind, body)
     }
 }
 
@@ -611,6 +639,10 @@ impl NodeApiImpl {
 type Drain = Arc<Mutex<VecDeque<Outbound>>>;
 type Pending = Arc<Mutex<HashMap<ReqId, oneshot::Sender<HostResponse>>>>;
 type Merged = Arc<Mutex<MergedLog>>;
+/// A live session's outbound delivery targets (where its replies post). Seeded from the opening
+/// origin; re-pointed by `handover`. The actual posting to a Primary is a chat transport's job (P5);
+/// here it is the authoritative session-owned routing state.
+type Delivery = Arc<Mutex<Vec<DeliveryTarget>>>;
 
 /// The authoritative, **non-destructive** merged session event log for one live session: one
 /// `seq`-stamped timeline across both directions (inbound commands/responses, outbound events +
@@ -700,6 +732,8 @@ struct LiveSession {
     pending: Pending,
     /// The non-destructive merged event log (multi-surface observability).
     log: Merged,
+    /// Where this session's outbound replies post (the `Primary`) + passive `Spectator`s.
+    delivery: Delivery,
     /// The event pump task; aborted when the session is dropped.
     pump: JoinHandle<()>,
 }
@@ -739,6 +773,7 @@ impl LiveSessions {
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let log: Merged = Arc::new(Mutex::new(MergedLog::new()));
+        let delivery: Delivery = Arc::new(Mutex::new(Vec::new()));
         // A per-session journal feeder (keyed by SessionId), shared by the event pump and the
         // request handler so the live transcript is sealed per turn into the unified journal.
         let feeder: Option<Arc<JournalFeeder>> = self.journal.lock().unwrap().as_ref().map(|cfg| {
@@ -793,6 +828,7 @@ impl LiveSessions {
                 drain,
                 pending,
                 log,
+                delivery,
                 pump,
             },
         );
@@ -800,15 +836,30 @@ impl LiveSessions {
     }
 
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
+        // No external attribution supplied: default to the generic `api` origin.
+        self.submit_from(session, api_origin(), command).await
+    }
+
+    async fn submit_from(
+        &self,
+        session: SessionId,
+        origin: Origin,
+        command: AgentCommand,
+    ) -> Result<(), ApiError> {
         match command {
             AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
                 // (including the terminal `TurnFinished`) flow to the drain queue for `poll`.
                 let handle = self.ensure(&session);
+                // Seed the session's Primary reply sink from the opening origin (where replies post by
+                // default), unless one is already in force. Handover re-points it later.
+                self.seed_primary(&session, &origin);
                 // Record the inbound command on the merged log first, so an observer sees what was
-                // submitted ahead of the engine's replies (StartTurn enters the conversation).
+                // submitted ahead of the engine's replies (StartTurn enters the conversation),
+                // attributed to the submitting surface's `origin`.
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Context,
                     SessionPayload::Command(AgentCommand::StartTurn {
                         input: input.clone(),
@@ -824,6 +875,7 @@ impl LiveSessions {
                 let handle = self.existing(&session)?;
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Transport,
                     SessionPayload::Command(AgentCommand::Interrupt {
                         reason: reason.clone(),
@@ -835,6 +887,7 @@ impl LiveSessions {
             AgentCommand::Shutdown => {
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Transport,
                     SessionPayload::Command(AgentCommand::Shutdown),
                 );
@@ -849,6 +902,7 @@ impl LiveSessions {
                 let handle = self.ensure(&session);
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Context,
                     SessionPayload::Command(AgentCommand::Steer {
                         text: text.clone(),
@@ -862,6 +916,7 @@ impl LiveSessions {
                 let handle = self.existing(&session)?;
                 self.record_inbound(
                     &session,
+                    origin,
                     Disposition::Transport,
                     SessionPayload::Command(AgentCommand::Snapshot { request_id }),
                 );
@@ -872,11 +927,12 @@ impl LiveSessions {
         }
     }
 
-    /// Append an inbound entry to a live session's merged log (no-op if the session is gone). Tagged
-    /// with the generic api origin; surface-aware transports will thread real origins later.
+    /// Append an inbound entry to a live session's merged log (no-op if the session is gone),
+    /// attributed to `origin` so per-event provenance is preserved on the authoritative log.
     fn record_inbound(
         &self,
         session: &SessionId,
+        origin: Origin,
         disposition: Disposition,
         payload: SessionPayload,
     ) {
@@ -884,8 +940,72 @@ impl LiveSessions {
             s.log
                 .lock()
                 .unwrap()
-                .append(Direction::Inbound, api_origin(), disposition, payload);
+                .append(Direction::Inbound, origin, disposition, payload);
         }
+    }
+
+    /// Record an observability-only transport/meta event (`Disposition::Transport`) on the merged log
+    /// — the "GUI attached" / presence / receipt channel. It lands on the live log + broadcast only
+    /// (never the engine, never the journal), so it is cache-safe by construction.
+    fn record_meta(
+        &self,
+        session: &SessionId,
+        origin: Origin,
+        kind: String,
+        body: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        let s = self
+            .sessions
+            .get(session)
+            .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+        s.log.lock().unwrap().append(
+            Direction::Inbound,
+            origin,
+            Disposition::Transport,
+            SessionPayload::Meta { kind, body },
+        );
+        Ok(())
+    }
+
+    /// Seed the session's `Primary` reply sink from the opening origin if none is set yet.
+    fn seed_primary(&self, session: &SessionId, origin: &Origin) {
+        if let Some(s) = self.sessions.get(session) {
+            let mut targets = s.delivery.lock().unwrap();
+            if !targets.iter().any(|t| t.kind == SinkKind::Primary) {
+                targets.push(origin.primary_target());
+            }
+        }
+    }
+
+    /// The session's current delivery targets (empty if the session is gone).
+    fn delivery_targets(&self, session: &SessionId) -> Vec<DeliveryTarget> {
+        match self.sessions.get(session) {
+            Some(s) => s.delivery.lock().unwrap().clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-point the session's `Primary` to `target`: any prior `Primary` is demoted to `Spectator`,
+    /// any existing entry for the same transport+route is replaced, and `target` is installed as the
+    /// new `Primary`.
+    fn handover(&self, session: &SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
+        let s = self
+            .sessions
+            .get(session)
+            .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+        let mut targets = s.delivery.lock().unwrap();
+        for t in targets.iter_mut() {
+            if t.kind == SinkKind::Primary {
+                t.kind = SinkKind::Spectator;
+            }
+        }
+        targets.retain(|t| !(t.transport == target.transport && t.route == target.route));
+        targets.push(DeliveryTarget::new(
+            target.transport,
+            target.route.0,
+            SinkKind::Primary,
+        ));
+        Ok(())
     }
 
     /// Non-destructive cursor page of a live session's merged log (empty if the session is gone).

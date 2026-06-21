@@ -204,6 +204,13 @@ log-page-view = {
   head_seq: uint,
 }
 
+; ----- outbound delivery targets (§5.4: where a session's replies post) + handover -----
+; A session property (seeded from the opening origin), not caller state. Exactly one Primary is in
+; force at a time; `Handover` re-points it (demoting the prior Primary to Spectator).
+route-addr      = tstr                ; adapter-opaque route handle within a transport
+sink-kind       = "Primary" / "Spectator"
+delivery-target = { transport: transport-id, route: route-addr, kind: sink-kind }
+
 api-error = { "UnknownSession": tstr }
           / { "Unsupported": tstr }
           / { "Conflict": tstr }
@@ -323,7 +330,9 @@ gguf-info = {
 }
 
 ; ----- the request/response mirror (1:1 with the interface methods) -----
-api-request = { "Submit": { session: session-id, command: agent-command } }
+; `origin` is additive on the v2 wire: absent (old encodings) or null -> the host-local default;
+; a value routes through `submit_from` so per-event attribution is recorded on the merged log.
+api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null) } }
             / { "Poll": { session: session-id, max: uint } }
             / { "Respond": { session: session-id, response: host-response } }
             / "Health"
@@ -338,6 +347,9 @@ api-request = { "Submit": { session: session-id, command: agent-command } }
             / { "UnitOutbound": { unit: unit-id, max: uint } }   ; rich §17 drain -> Drained
             / { "SessionHistory": { session: session-id, after_cursor: uint, max: uint } }
             / { "Subscribe": { session: session-id, after_seq: uint, max: uint } }  ; merged-log cursor read -> LogPage
+            / { "DeliveryTargets": { session: session-id } }                        ; reply sinks -> DeliveryTargets
+            / { "Handover": { session: session-id, target: delivery-target } }      ; re-point Primary -> Ok
+            / { "RecordMeta": { session: session-id, origin: origin, kind: tstr, body: bstr } }  ; transport/meta -> Ok
             / { "UnitHistory": { unit: unit-id, after_cursor: uint, max: uint } }
             / { "Pause": { unit: unit-id } }
             / { "Resume": { unit: unit-id } }
@@ -370,6 +382,7 @@ api-response = "Ok"
              / { "UnitEvents": [* manage-event-view] }
              / { "Journal": journal-page-view }
              / { "LogPage": log-page-view }
+             / { "DeliveryTargets": [* delivery-target] }
              / { "VerifyingKey": (tstr / null) }
              / { "ModelSearch": search-page }
              / { "ModelFiles": [* model-file] }
