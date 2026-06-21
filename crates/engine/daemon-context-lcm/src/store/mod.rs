@@ -8,7 +8,8 @@
 pub mod schema;
 
 use crate::error::Result;
-use rusqlite::{params, Connection, Row};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, Row};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -119,6 +120,53 @@ pub struct MessageRow {
     pub timestamp: f64,
     /// The cached token estimate.
     pub token_estimate: i64,
+}
+
+/// Optional scoping/filter for a transcript search (§11). Defaults to "everything in the bank".
+#[derive(Clone, Debug, Default)]
+pub struct MessageFilter<'a> {
+    /// Restrict to one session (`None` = search every session in the bank).
+    pub session: Option<&'a str>,
+    /// Restrict to one role (`user` | `assistant` | `tool` | `system`).
+    pub role: Option<&'a str>,
+    /// Restrict to one platform/source.
+    pub source: Option<&'a str>,
+    /// Inclusive lower bound on `timestamp` (unix seconds).
+    pub time_from: Option<f64>,
+    /// Inclusive upper bound on `timestamp` (unix seconds).
+    pub time_to: Option<f64>,
+}
+
+/// A message search candidate: the row plus its FTS5 `rank` (lower = better; LIKE candidates use a
+/// synthesized rank from term-hit count).
+#[derive(Clone, Debug)]
+pub struct MessageHit {
+    /// The matched message row.
+    pub row: MessageRow,
+    /// The FTS5 rank (lower is a better match).
+    pub rank: f64,
+}
+
+/// A node search candidate: the summary node plus its FTS5 `rank` (lower = better).
+#[derive(Clone, Debug)]
+pub struct NodeHit {
+    /// The matched summary node.
+    pub node: SummaryNode,
+    /// The FTS5 rank (lower is a better match).
+    pub rank: f64,
+}
+
+/// Bank-wide row counts (base tables + their FTS shadows) for diagnostics (§10.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreCounts {
+    /// Rows in `messages`.
+    pub messages: i64,
+    /// Rows in the `messages_fts` shadow (should equal `messages`).
+    pub messages_fts: i64,
+    /// Rows in `summary_nodes`.
+    pub nodes: i64,
+    /// Rows in the `nodes_fts` shadow (should equal `nodes`).
+    pub nodes_fts: i64,
 }
 
 /// A message to append (`store_id`/`timestamp` assigned by the store).
@@ -248,6 +296,18 @@ impl Store {
         Ok(row)
     }
 
+    /// Delete the volatile, uncompacted tail (`store_id > after_store_id`) for a session — used by
+    /// the rehydration reconcile to rebuild the live tail from the replayed conversation without
+    /// duplicating rows. Messages at or below the frontier are immutable (referenced by D0 nodes).
+    pub fn delete_messages_after(&self, session_id: &str, after_store_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND store_id > ?2",
+            params![session_id, after_store_id],
+        )?;
+        Ok(())
+    }
+
     /// All messages for `session_id`, oldest first.
     pub fn session_messages(&self, session_id: &str) -> Result<Vec<MessageRow>> {
         let conn = self.conn.lock().expect("lcm store poisoned");
@@ -288,6 +348,168 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![sanitized, session_id, limit], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// FTS5 transcript search returning candidate rows + `rank` (lower = better), ordered by rank.
+    /// `match_query` must already be an FTS5-safe expression (see `search::sanitize_fts5_query`).
+    /// Filtering/final ordering/snippeting is the caller's job (`search.rs`).
+    pub fn search_messages_fts(
+        &self,
+        match_query: &str,
+        filter: &MessageFilter<'_>,
+        limit: i64,
+    ) -> Result<Vec<MessageHit>> {
+        let mut sql = String::from(
+            "SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id, \
+             m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, f.rank \
+             FROM messages_fts f JOIN messages m ON m.store_id = f.rowid \
+             WHERE f.content MATCH ?",
+        );
+        let mut args: Vec<Value> = vec![Value::Text(match_query.to_string())];
+        push_message_filters(&mut sql, &mut args, filter);
+        sql.push_str(" ORDER BY f.rank LIMIT ?");
+        args.push(Value::Integer(limit));
+
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(args), |r| {
+                Ok(MessageHit {
+                    row: map_message(r)?,
+                    rank: r.get::<_, f64>(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// LIKE-fallback transcript search (§11.2) for queries FTS5 can't safely handle (CJK/emoji/risky
+    /// ASCII). Returns rows matching ANY term (`content LIKE '%term%' ESCAPE '\'`); the caller scores.
+    pub fn search_messages_like(
+        &self,
+        like_terms: &[String],
+        filter: &MessageFilter<'_>,
+        limit: i64,
+    ) -> Result<Vec<MessageRow>> {
+        if like_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT store_id, session_id, source, role, content, tool_call_id, tool_calls, \
+             tool_name, timestamp, token_estimate FROM messages m WHERE (",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        for (i, term) in like_terms.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str("content LIKE ? ESCAPE '\\'");
+            args.push(Value::Text(format!("%{}%", like_escape(term))));
+        }
+        sql.push(')');
+        push_message_filters(&mut sql, &mut args, filter);
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        args.push(Value::Integer(limit));
+
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(args), map_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// FTS5 search over the summary DAG, returning nodes + `rank` (lower = better), ordered by rank.
+    pub fn search_nodes_fts(
+        &self,
+        match_query: &str,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<NodeHit>> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT n.node_id, n.session_id, n.depth, n.summary, n.token_count, \
+             n.source_token_count, n.source_ids, n.source_type, n.created_at, n.earliest_at, \
+             n.latest_at, n.expand_hint, f.rank \
+             FROM nodes_fts f JOIN summary_nodes n ON n.node_id = f.rowid \
+             WHERE f.summary MATCH ?1 AND n.session_id = ?2 ORDER BY f.rank LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![match_query, session_id, limit], |r| {
+                Ok(NodeHit {
+                    node: map_node(r)?,
+                    rank: r.get::<_, f64>(12)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A page of a session's transcript (oldest first), for `lcm_load_session` / `lcm_expand`.
+    pub fn messages_page(
+        &self,
+        session_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT store_id, session_id, source, role, content, tool_call_id, tool_calls, \
+             tool_name, timestamp, token_estimate FROM messages \
+             WHERE session_id = ?1 ORDER BY store_id ASC LIMIT ?3 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, offset, limit], map_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A `store_id`-cursored page of a session's transcript (oldest first, `store_id > after`), for
+    /// `lcm_load_session`. Pass `after = None` (or `0`) for the first page; fetch `limit + 1` to
+    /// detect `has_more` (§10.2).
+    pub fn load_session_page(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT store_id, session_id, source, role, content, tool_call_id, tool_calls, \
+             tool_name, timestamp, token_estimate FROM messages \
+             WHERE session_id = ?1 AND store_id > ?2 ORDER BY store_id ASC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, after.unwrap_or(0), limit], map_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch a set of messages by `store_id` (any session), returned in ascending `store_id` order —
+    /// the lossless recovery path for a D0 node's `source_ids` (`lcm_expand`).
+    pub fn get_messages(&self, store_ids: &[i64]) -> Result<Vec<MessageRow>> {
+        if store_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT store_id, session_id, source, role, content, tool_call_id, tool_calls, \
+             tool_name, timestamp, token_estimate FROM messages WHERE store_id IN (",
+        );
+        let mut args: Vec<Value> = Vec::with_capacity(store_ids.len());
+        for (i, id) in store_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            args.push(Value::Integer(*id));
+        }
+        sql.push_str(") ORDER BY store_id ASC");
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(args), map_message)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -424,6 +646,40 @@ impl Store {
         Ok(n)
     }
 
+    /// Bank-wide row counts for `lcm_status`/`lcm_doctor` (the base table + its FTS shadow, so an
+    /// out-of-sync FTS index is detectable).
+    pub fn table_counts(&self) -> Result<StoreCounts> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0));
+        Ok(StoreCounts {
+            messages: one("SELECT COUNT(*) FROM messages")?,
+            messages_fts: one("SELECT COUNT(*) FROM messages_fts")?,
+            nodes: one("SELECT COUNT(*) FROM summary_nodes")?,
+            nodes_fts: one("SELECT COUNT(*) FROM nodes_fts")?,
+        })
+    }
+
+    /// SQLite `PRAGMA integrity_check` first row (`"ok"` when healthy) — `lcm_doctor`.
+    pub fn integrity_check(&self) -> Result<String> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let s = conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))?;
+        Ok(s)
+    }
+
+    /// Count summary nodes whose `source_type='nodes'` reference a missing child node (orphans) —
+    /// `lcm_doctor`'s `orphaned_dag_nodes` check.
+    pub fn orphaned_node_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM summary_nodes p, json_each(p.source_ids) j \
+             WHERE p.source_type = 'nodes' \
+             AND NOT EXISTS (SELECT 1 FROM summary_nodes c WHERE c.node_id = CAST(j.value AS INTEGER))",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     // ---- LifecycleStateStore (§4.5) --------------------------------------------------------
 
     /// Bind the active session for a conversation (idempotent).
@@ -529,6 +785,38 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<MessageRow> {
         timestamp: row.get(8)?,
         token_estimate: row.get(9)?,
     })
+}
+
+/// Append the optional `MessageFilter` clauses (and their bind values) to a search query whose
+/// table alias is `m`. Filters use anonymous `?` placeholders bound in append order.
+fn push_message_filters(sql: &mut String, args: &mut Vec<Value>, filter: &MessageFilter<'_>) {
+    if let Some(session) = filter.session {
+        sql.push_str(" AND m.session_id = ?");
+        args.push(Value::Text(session.to_string()));
+    }
+    if let Some(role) = filter.role {
+        sql.push_str(" AND m.role = ?");
+        args.push(Value::Text(role.to_string()));
+    }
+    if let Some(source) = filter.source {
+        sql.push_str(" AND m.source = ?");
+        args.push(Value::Text(source.to_string()));
+    }
+    if let Some(from) = filter.time_from {
+        sql.push_str(" AND m.timestamp >= ?");
+        args.push(Value::Real(from));
+    }
+    if let Some(to) = filter.time_to {
+        sql.push_str(" AND m.timestamp <= ?");
+        args.push(Value::Real(to));
+    }
+}
+
+/// Escape LIKE wildcards in a literal term (`\` is the ESCAPE char in the LIKE queries above).
+fn like_escape(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Minimal FTS5 query sanitizer (§11.1): keep alphanumerics/CJK as terms, drop FTS operators by

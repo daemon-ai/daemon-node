@@ -11,7 +11,7 @@
 
 use crate::config::LcmConfig;
 use crate::escalation::{summarize_with_escalation, SummaryCircuitBreaker, SummaryRequest};
-use crate::ingest::{flatten_turns, render_turns};
+use crate::ingest::render_turns;
 use crate::store::{NewNode, SourceType, Store};
 use crate::tokens::Tokenizer;
 use daemon_core::conversation::AssistantMsg;
@@ -21,8 +21,13 @@ use std::time::Duration;
 /// The leading marker on a synthetic summary turn (so re-compaction skips it as scaffold — §6.4).
 pub(crate) const SUMMARY_SENTINEL: &str = "[LCM context summary]";
 
-/// Run one compaction pass. Returns the new conversation and whether anything was actually
-/// compacted (`false` => nothing eligible outside the fresh tail; the caller treats it as a no-op).
+/// Run one compaction pass. Returns the new conversation, whether anything was actually compacted
+/// (`false` => nothing eligible outside the fresh tail; the caller treats it as a no-op), and the
+/// rebuilt per-turn ingest index aligned with the returned conversation.
+///
+/// `turn_store_ids[i]` holds the `messages.store_id`s already persisted for `conv.turns[i]` (by the
+/// caller's `before_turn` ingest), so the D0 node's `source_ids` come from the index rather than a
+/// re-ingest (avoiding duplicate rows).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compaction(
     store: &Store,
@@ -32,9 +37,10 @@ pub(crate) async fn run_compaction(
     breaker: &mut SummaryCircuitBreaker,
     session_id: &str,
     first_compaction: bool,
+    turn_store_ids: Vec<Vec<i64>>,
     conv: Conversation,
     now: f64,
-) -> (Conversation, bool) {
+) -> (Conversation, bool, Vec<Vec<i64>>) {
     let Conversation { system, turns } = conv;
 
     // Region = turns[anchor .. fresh_tail_start). The anchor skips any leading synthetic summary
@@ -43,23 +49,19 @@ pub(crate) async fn run_compaction(
     let fresh_tail_start = turns.len().saturating_sub(cfg.fresh_tail_count);
     if fresh_tail_start <= anchor {
         // Everything outside the fresh tail is already summarized scaffold — nothing to do.
-        return (Conversation { system, turns }, false);
+        return (Conversation { system, turns }, false, turn_store_ids);
     }
     let region = &turns[anchor..fresh_tail_start];
     let source_tokens: usize = region.iter().map(|t| tok.count_turn(t)).sum();
     if source_tokens == 0 {
-        return (Conversation { system, turns }, false);
+        return (Conversation { system, turns }, false, turn_store_ids);
     }
 
-    // Persist the region as messages so the D0 node references real `store_id`s (lossless lineage).
-    let rows = flatten_turns(region, tok);
-    let store_ids = match store.append_batch(session_id, &rows, now) {
-        Ok(ids) => ids,
-        Err(e) => {
-            tracing::warn!(error = %e, "lcm: failed to persist region messages; skipping compaction");
-            return (Conversation { system, turns }, false);
-        }
-    };
+    // The region's `store_id`s come from the precomputed ingest index (persisted by `before_turn`).
+    let store_ids: Vec<i64> = turn_store_ids
+        .get(anchor..fresh_tail_start)
+        .map(|groups| groups.iter().flatten().copied().collect())
+        .unwrap_or_default();
 
     // Summarize the leaf chunk: budget = max(2000, 20% of source) capped at 12000 (§6.5).
     let leaf_budget = (source_tokens * 20 / 100).clamp(2000, 12000);
@@ -97,7 +99,7 @@ pub(crate) async fn run_compaction(
     };
     if let Err(e) = store.add_node(&d0) {
         tracing::warn!(error = %e, "lcm: failed to persist D0 node; skipping compaction");
-        return (Conversation { system, turns }, false);
+        return (Conversation { system, turns }, false, turn_store_ids);
     }
     if let Some(max_id) = store_ids.iter().copied().max() {
         let _ = store.advance_frontier(session_id, max_id, now);
@@ -106,13 +108,18 @@ pub(crate) async fn run_compaction(
     // Condensation: climb depths while a level has >= fanin uncondensed siblings (§6.6).
     condense(store, tok, cfg, aux, breaker, session_id, now).await;
 
-    // Assemble: [system] + [summary turn over the DAG frontier] + [fresh tail].
+    // Assemble: [system] + [summary turn over the DAG frontier] + [fresh tail], rebuilding the
+    // ingest index in lockstep (the synthetic summary turn holds no store_ids; the tail keeps its).
     let summary_turn = assemble_summary_turn(store, session_id, first_compaction);
+    let tail_index: Vec<Vec<i64>> = turn_store_ids.into_iter().skip(fresh_tail_start).collect();
     let mut new_turns = Vec::with_capacity(1 + turns.len() - fresh_tail_start);
+    let mut new_index = Vec::with_capacity(1 + tail_index.len());
     if let Some(t) = summary_turn {
         new_turns.push(t);
+        new_index.push(Vec::new());
     }
     new_turns.extend(turns.into_iter().skip(fresh_tail_start));
+    new_index.extend(tail_index);
 
     (
         Conversation {
@@ -120,11 +127,12 @@ pub(crate) async fn run_compaction(
             turns: new_turns,
         },
         true,
+        new_index,
     )
 }
 
 /// Count leading synthetic-summary turns (the replayed scaffold to skip — §6.4).
-fn leading_scaffold_count(turns: &[Turn]) -> usize {
+pub(crate) fn leading_scaffold_count(turns: &[Turn]) -> usize {
     turns
         .iter()
         .take_while(|t| matches!(t, Turn::Assistant(a) if a.text.starts_with(SUMMARY_SENTINEL)))
