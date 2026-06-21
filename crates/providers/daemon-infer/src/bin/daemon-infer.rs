@@ -116,6 +116,41 @@ async fn main() {
                         let done_tx = done_tx.clone();
                         tokio::spawn(run_generation(backend, writer, req, cancel, done_tx));
                     }
+                    Command::Embed { request_id, texts } => {
+                        let Some(backend) = backend.clone() else {
+                            send_event(
+                                &writer,
+                                &Event::Error {
+                                    request_id: Some(request_id),
+                                    class: protocol::ErrorClass::Fatal,
+                                    message: "no model loaded".into(),
+                                },
+                            )
+                            .await;
+                            continue;
+                        };
+                        let writer = writer.clone();
+                        // Embeddings are a bounded request/response (no streaming, no cancel token):
+                        // run on a task so a slow embed does not block the command loop.
+                        tokio::spawn(async move {
+                            let event = match backend.embed(texts).await {
+                                Ok(vectors) => {
+                                    let dims = vectors.first().map(|v| v.len() as u32).unwrap_or(0);
+                                    Event::Embeddings {
+                                        request_id,
+                                        vectors,
+                                        dims,
+                                    }
+                                }
+                                Err(e) => Event::Error {
+                                    request_id: Some(request_id),
+                                    class: e.class,
+                                    message: e.message,
+                                },
+                            };
+                            send_event(&writer, &event).await;
+                        });
+                    }
                     Command::Cancel { request_id } => {
                         if let Some(token) = inflight.get(&request_id) {
                             token.cancel();

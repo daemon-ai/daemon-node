@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use daemon_core::{Failure, Provider, Request, RequestMsg, StreamEvent};
+use daemon_core::{EmbeddingProvider, Failure, Provider, Request, RequestMsg, StreamEvent};
 use daemon_infer::protocol::Engine;
-use daemon_providers::{LocalProvider, WorkerConfig};
+use daemon_providers::{LocalEmbedder, LocalProvider, WorkerConfig};
 use futures::StreamExt;
 
 /// The path to the scripted fake worker (built as a bin target of this crate).
@@ -145,6 +145,35 @@ async fn crash_loop_trips_meltdown_fatal() {
     assert!(
         matches!(last, Err(Failure::Fatal(_))),
         "expected meltdown Fatal, got {last:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_embedder_returns_deterministic_vectors() {
+    let state = temp_state("embed");
+    let embedder = LocalEmbedder::new(worker_config("stream", &state), 8, "fake-embed");
+    let vectors = embedder
+        .embed(&["hello world".to_string(), "foo".to_string()])
+        .await
+        .expect("embed ok");
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors[0].len(), 8);
+    assert_eq!(embedder.dimensions(), 8);
+    assert_eq!(embedder.model(), "fake-embed");
+
+    // The same text re-embeds to the same vector (deterministic worker).
+    let again = embedder.embed(&["hello world".to_string()]).await.unwrap();
+    assert_eq!(again[0], vectors[0]);
+}
+
+#[tokio::test]
+async fn local_embed_error_is_classified() {
+    let state = temp_state("embederr");
+    let embedder = LocalEmbedder::new(worker_config("embed-error", &state), 8, "fake-embed");
+    let result = embedder.embed(&["x".to_string()]).await;
+    assert!(
+        matches!(result, Err(Failure::Fatal(_))),
+        "expected fatal embed error, got {result:?}"
     );
 }
 

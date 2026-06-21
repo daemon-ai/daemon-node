@@ -9,9 +9,6 @@ description = "Native Rust port of the Mnemosyne BEAM memory engine as a daemon-
 
 [features]
 default = []
-# Local ONNX embeddings (BAAI/bge-small-en-v1.5, 384-dim) via fastembed. Off by default keeps the
-# crate free of the ONNX runtime; recall falls back to keyword-only mode (MNEMOSYNE_NO_EMBEDDINGS).
-embeddings = ["dep:fastembed"]
 # sqlite-vec vec0 virtual tables (float32/int8/bit + native distance fns). Off by default uses an
 # in-Rust cosine fallback over f32 BLOBs (mirrors Mnemosyne's numpy fallback).
 vec-ext = ["dep:sqlite-vec", "dep:zerocopy"]
@@ -34,7 +31,6 @@ unicode-normalization = "0.1"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 
 # optional / feature-gated
-fastembed = { version = "5", optional = true }
 sqlite-vec = { version = "0.1.6", optional = true }
 zerocopy = { version = "0.7", optional = true }
 reqwest = { workspace = true, optional = true }

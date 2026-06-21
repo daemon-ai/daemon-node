@@ -139,6 +139,15 @@ impl InferenceBackend for MistralRsBackend {
             output_tokens,
         })
     }
+
+    async fn embed(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, BackendError> {
+        // mistral.rs embeddings load a distinct `EmbeddingModelBuilder` model (not the
+        // `TextModelBuilder` this backend holds). The spec's preferred local-embeddings engine is
+        // llama-cpp-4; wiring the mistral.rs `EmbeddingModelBuilder` path is a follow-on.
+        Err(BackendError::fatal(
+            "local embeddings are served by the llama engine; mistral.rs embedding models are not wired yet",
+        ))
+    }
 }
 
 /// Translate our protocol request into a mistral.rs [`RequestBuilder`], applying the conversation,

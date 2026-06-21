@@ -77,6 +77,19 @@ const INFER_MAX_RESTARTS_ENV: &str = "DAEMON_INFER_MAX_RESTARTS";
 /// The sliding window (ms) over which restarts are counted for meltdown.
 const INFER_RESTART_WINDOW_MS_ENV: &str = "DAEMON_INFER_RESTART_WINDOW_MS";
 
+// --- Embeddings (`daemon-mnemosyne` vector recall) tuning (DAEMON_EMBED_*) --------------------
+/// Selects the embedding backend: `off` (default, keyword-only), `genai` (remote, OpenAI-compatible),
+/// or `local` (a `daemon-infer` embedding worker).
+const EMBED_PROVIDER_ENV: &str = "DAEMON_EMBED_PROVIDER";
+/// The embedding model: a `genai` model name (remote) or a model spec / GGUF path (local).
+const EMBED_MODEL_ENV: &str = "DAEMON_EMBED_MODEL";
+/// The embedding dimensionality (for store/index validation; `0` = unknown).
+const EMBED_DIMS_ENV: &str = "DAEMON_EMBED_DIMS";
+/// Remote embeddings: the OpenAI-compatible API base URL override (`None` = the provider default).
+const EMBED_BASE_URL_ENV: &str = "DAEMON_EMBED_BASE_URL";
+/// Local embeddings: the inference engine (`llama` default, or `mistralrs`).
+const EMBED_ENGINE_ENV: &str = "DAEMON_EMBED_ENGINE";
+
 // --- Model management (`daemon-models`) tuning (DAEMON_MODELS_*) ------------------------------
 /// The shared Hugging Face hub cache directory (default: the `HF_*`/XDG precedence).
 const MODELS_CACHE_DIR_ENV: &str = "DAEMON_MODELS_CACHE_DIR";
@@ -178,6 +191,44 @@ fn default_worker_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("daemon-infer"))
 }
 
+/// Which embedding backend Mnemosyne uses for vector recall (selected by config).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedKind {
+    /// No embeddings — recall is keyword-only (the zero-config default).
+    Off,
+    /// A remote, OpenAI-compatible embeddings API via `genai`.
+    Genai,
+    /// A local embedding model via a supervised `daemon-infer` worker.
+    Local,
+}
+
+/// Tuning for the embeddings backend (`DAEMON_EMBED_*`). `kind = Off` keeps recall keyword-only.
+#[derive(Clone, Debug)]
+pub struct EmbedConfig {
+    /// Which backend to use (off|genai|local).
+    pub kind: EmbedKind,
+    /// The embedding model: a `genai` model name (remote) or a model spec / GGUF path (local).
+    pub model: String,
+    /// The embedding dimensionality (`0` = unknown).
+    pub dims: usize,
+    /// Remote: the OpenAI-compatible API base URL override (`None` = provider default).
+    pub base_url: Option<String>,
+    /// Local: the inference engine identifier (`llama` default, or `mistralrs`).
+    pub engine: String,
+}
+
+impl Default for EmbedConfig {
+    fn default() -> Self {
+        Self {
+            kind: EmbedKind::Off,
+            model: String::new(),
+            dims: 0,
+            base_url: None,
+            engine: "llama".to_string(),
+        }
+    }
+}
+
 /// Tuning for the `daemon-models` model-management facade (shared cache + catalog + Hub endpoint).
 #[derive(Clone, Debug, Default)]
 pub struct ModelsConfig {
@@ -238,6 +289,8 @@ pub struct NodeConfig {
     pub local: LocalConfig,
     /// Model-management (search/download/cache/catalog) tuning.
     pub models: ModelsConfig,
+    /// Embeddings backend tuning (Mnemosyne vector recall; `Off` by default).
+    pub embed: EmbedConfig,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -277,6 +330,18 @@ struct FileConfig {
     nesting_depth: Option<usize>,
     local: Option<FileLocalConfig>,
     models: Option<FileModelsConfig>,
+    embed: Option<FileEmbedConfig>,
+}
+
+/// The `[embed]` TOML table — embeddings tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileEmbedConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    dims: Option<usize>,
+    base_url: Option<String>,
+    engine: Option<String>,
 }
 
 /// The `[models]` TOML table — model-management tuning (every field optional; env wins).
@@ -496,6 +561,7 @@ impl NodeConfig {
 
         let local = Self::resolve_local(file.local.unwrap_or_default())?;
         let models = Self::resolve_models(file.models.unwrap_or_default());
+        let embed = Self::resolve_embed(file.embed.unwrap_or_default())?;
 
         Ok(Self {
             partition,
@@ -513,10 +579,46 @@ impl NodeConfig {
             model,
             local,
             models,
+            embed,
             credential_key,
             engine,
             journal_seed,
             nesting_depth,
+        })
+    }
+
+    /// Resolve embeddings tuning (env overriding the `[embed]` TOML table).
+    fn resolve_embed(file: FileEmbedConfig) -> anyhow::Result<EmbedConfig> {
+        let kind = match env_string(EMBED_PROVIDER_ENV)
+            .or(file.provider)
+            .unwrap_or_else(|| "off".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" | "none" => EmbedKind::Off,
+            "genai" | "remote" | "openai" => EmbedKind::Genai,
+            "local" | "daemon-infer" => EmbedKind::Local,
+            other => {
+                anyhow::bail!("unknown embed provider {other:?} (expected off|genai|local)")
+            }
+        };
+        let model = env_string(EMBED_MODEL_ENV)
+            .or(file.model)
+            .unwrap_or_default();
+        let dims = match env_string(EMBED_DIMS_ENV) {
+            Some(s) => s.parse().context("DAEMON_EMBED_DIMS must be a usize")?,
+            None => file.dims.unwrap_or(0),
+        };
+        let base_url = env_string(EMBED_BASE_URL_ENV).or(file.base_url);
+        let engine = env_string(EMBED_ENGINE_ENV)
+            .or(file.engine)
+            .unwrap_or_else(|| "llama".to_string());
+        Ok(EmbedConfig {
+            kind,
+            model,
+            dims,
+            base_url,
+            engine,
         })
     }
 

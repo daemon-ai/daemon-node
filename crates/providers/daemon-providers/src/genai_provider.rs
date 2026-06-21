@@ -4,7 +4,8 @@ use crate::{classify_genai_error, finalize_output, RawToolCall};
 use async_trait::async_trait;
 use daemon_common::UsageDelta;
 use daemon_core::{
-    Capabilities, Failure, ModelOutput, Provider, Request, RequestMsg, StreamEvent, ToolCallFormat,
+    Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestMsg,
+    StreamEvent, ToolCallFormat,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -13,6 +14,7 @@ use genai::chat::{
     ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamEvent, ContentPart,
     MessageContent, StreamEnd, Tool, ToolCall as GenToolCall, ToolResponse,
 };
+use genai::embed::{EmbedOptions, EmbedRequest};
 use genai::resolver::{AuthData, Endpoint};
 use genai::{Client, ModelIden, ServiceTarget};
 
@@ -96,6 +98,91 @@ impl GenAiProvider {
             chat = chat.with_tools(tools);
         }
         chat
+    }
+}
+
+/// An [`EmbeddingProvider`] backed by [`genai`]'s embeddings API.
+///
+/// Mirrors [`GenAiProvider`]: one adapter serves any `genai`-supported embedding model; the lease
+/// secret (`with_auth`) is applied per call via the resolved [`ServiceTarget`], and an optional
+/// `endpoint` override points at a custom base URL (the wire tests use a mock). The embedding model
+/// is a *separate* model from any chat model (e.g. `text-embedding-3-small`).
+pub struct GenAiEmbedder {
+    client: Client,
+    adapter: AdapterKind,
+    model: String,
+    endpoint: Option<String>,
+    auth: Option<String>,
+    dims: usize,
+}
+
+impl GenAiEmbedder {
+    /// An embedder for `adapter`/`model` using `genai`'s default endpoint.
+    pub fn new(adapter: AdapterKind, model: impl Into<String>) -> Self {
+        Self {
+            client: Client::default(),
+            adapter,
+            model: model.into(),
+            endpoint: None,
+            auth: None,
+            dims: 0,
+        }
+    }
+
+    /// The OpenAI embeddings provider for `model` (e.g. `text-embedding-3-small`).
+    pub fn openai(model: impl Into<String>) -> Self {
+        Self::new(AdapterKind::OpenAI, model)
+    }
+
+    /// Override the API base URL (the wire tests point this at a mock server).
+    pub fn with_endpoint(mut self, base_url: impl Into<String>) -> Self {
+        self.endpoint = Some(base_url.into());
+        self
+    }
+
+    /// Set the bearer credential (the §7 lease secret) applied to each call.
+    pub fn with_auth(mut self, auth: impl Into<String>) -> Self {
+        self.auth = Some(auth.into());
+        self
+    }
+
+    /// Declare the embedding dimensionality (for store/index validation; `0` = unknown).
+    pub fn with_dimensions(mut self, dims: usize) -> Self {
+        self.dims = dims;
+        self
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for GenAiEmbedder {
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Failure> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = resolve_target(
+            &self.client,
+            self.adapter,
+            &self.model,
+            self.endpoint.as_deref(),
+            self.auth.as_deref(),
+        )
+        .await?;
+        let req = EmbedRequest::from_texts(texts.to_vec());
+        let opts = EmbedOptions::default().with_capture_usage(true);
+        let resp = self
+            .client
+            .exec_embed(target, req, Some(&opts))
+            .await
+            .map_err(classify_genai_error)?;
+        Ok(resp.into_vectors())
     }
 }
 

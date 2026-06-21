@@ -81,6 +81,9 @@ pub struct ModelParams {
     pub flash_attn: bool,
     /// In-situ quantization spec for mistral.rs (e.g. `"Q8_0"`); `None` = load as-is.
     pub isq: Option<String>,
+    /// Load the model in **embedding mode** (a pooled-embedding context) rather than for generation.
+    /// A worker loaded this way answers [`Command::Embed`] and refuses [`Command::Generate`].
+    pub embeddings: bool,
 }
 
 /// Token-sampling parameters for one [`Command::Generate`].
@@ -197,6 +200,14 @@ pub enum Command {
         /// The output-token cap (`0` = the worker's default).
         max_tokens: u32,
     },
+    /// Embed a batch of texts against an embedding-mode model (loaded with
+    /// [`ModelParams::embeddings`]). The worker answers [`Event::Embeddings`] or [`Event::Error`].
+    Embed {
+        /// Correlates the [`Event::Embeddings`]/[`Event::Error`] reply with this request.
+        request_id: u64,
+        /// The texts to embed (one vector is returned per text, in order).
+        texts: Vec<String>,
+    },
     /// Cancel an in-flight generation cooperatively.
     Cancel {
         /// The request to cancel.
@@ -243,6 +254,15 @@ pub enum Event {
         request_id: u64,
         /// Token usage for the generation.
         usage: Usage,
+    },
+    /// The embeddings for a [`Command::Embed`] — one vector per input text, in order.
+    Embeddings {
+        /// The embed request these vectors answer.
+        request_id: u64,
+        /// One embedding vector per input text.
+        vectors: Vec<Vec<f32>>,
+        /// The embedding dimensionality (length of each vector).
+        dims: u32,
     },
     /// A classified failure. `request_id` is `None` for load/worker-level errors.
     Error {
@@ -316,6 +336,7 @@ mod tests {
                 n_threads: Some(8),
                 flash_attn: true,
                 isq: None,
+                embeddings: false,
             },
         });
         round_trip_command(Command::Generate {
@@ -350,6 +371,10 @@ mod tests {
             }],
             sampling: Sampling::default(),
             max_tokens: 512,
+        });
+        round_trip_command(Command::Embed {
+            request_id: 9,
+            texts: vec!["hello".into(), "world".into()],
         });
         round_trip_command(Command::Cancel { request_id: 7 });
         round_trip_command(Command::Shutdown);
@@ -388,6 +413,11 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 20,
             },
+        });
+        round_trip_event(Event::Embeddings {
+            request_id: 1,
+            vectors: vec![vec![0.5, -0.25, 0.0], vec![0.125, 0.75, -1.0]],
+            dims: 3,
         });
         for class in [
             ErrorClass::ContextOverflow,
