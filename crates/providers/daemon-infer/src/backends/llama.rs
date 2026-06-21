@@ -14,7 +14,7 @@
 use std::num::NonZeroU32;
 use std::sync::mpsc as std_mpsc;
 
-use llama_cpp_4::context::params::LlamaContextParams;
+use llama_cpp_4::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_4::llama_backend::LlamaBackend;
 use llama_cpp_4::llama_batch::LlamaBatch;
 use llama_cpp_4::model::params::LlamaModelParams;
@@ -40,16 +40,28 @@ struct Job {
     done: oneshot::Sender<Result<Usage, BackendError>>,
 }
 
-/// A loaded llama.cpp model whose generations run on a dedicated thread.
+/// One embed request handed to the dedicated llama thread.
+struct EmbedJob {
+    texts: Vec<String>,
+    done: oneshot::Sender<Result<Vec<Vec<f32>>, BackendError>>,
+}
+
+/// Work for the dedicated llama thread: a streaming generation or a batched embed.
+enum Task {
+    Generate(Job),
+    Embed(EmbedJob),
+}
+
+/// A loaded llama.cpp model whose generations/embeds run on a dedicated thread.
 pub struct LlamaCppBackend {
-    jobs: std_mpsc::Sender<Job>,
+    jobs: std_mpsc::Sender<Task>,
     capabilities: Capabilities,
 }
 
 impl LlamaCppBackend {
     /// Spawn the engine thread, load `model_path`, and block until it reports ready (or fails).
     pub fn load(model_path: &str, params: &ModelParams) -> Result<Self, BackendError> {
-        let (jobs_tx, jobs_rx) = std_mpsc::channel::<Job>();
+        let (jobs_tx, jobs_rx) = std_mpsc::channel::<Task>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<Capabilities, BackendError>>();
         let model_path = model_path.to_string();
         let params = params.clone();
@@ -90,11 +102,24 @@ impl InferenceBackend for LlamaCppBackend {
             done: done_tx,
         };
         self.jobs
-            .send(job)
+            .send(Task::Generate(job))
             .map_err(|_| BackendError::fatal("llama worker thread is gone"))?;
         done_rx
             .await
             .map_err(|_| BackendError::transient("llama worker dropped the job"))?
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, BackendError> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.jobs
+            .send(Task::Embed(EmbedJob {
+                texts,
+                done: done_tx,
+            }))
+            .map_err(|_| BackendError::fatal("llama worker thread is gone"))?;
+        done_rx
+            .await
+            .map_err(|_| BackendError::transient("llama worker dropped the embed job"))?
     }
 }
 
@@ -139,16 +164,89 @@ fn worker_thread(
     }
     drop(ready_tx);
 
-    while let Ok(job) = jobs_rx.recv() {
-        let result = run_generation(
-            &backend,
-            &model,
-            &params,
-            &job.req,
-            &job.chunks,
-            &job.cancel,
-        );
-        let _ = job.done.send(result);
+    while let Ok(task) = jobs_rx.recv() {
+        match task {
+            Task::Generate(job) => {
+                let result = run_generation(
+                    &backend,
+                    &model,
+                    &params,
+                    &job.req,
+                    &job.chunks,
+                    &job.cancel,
+                );
+                let _ = job.done.send(result);
+            }
+            Task::Embed(job) => {
+                let result = run_embed(&backend, &model, &params, &job.texts);
+                let _ = job.done.send(result);
+            }
+        }
+    }
+}
+
+/// Embed each text into a pooled, L2-normalized vector. A fresh embedding-mode context is created
+/// per text (mean pooling) so sequences never share KV state; the model stays loaded across calls.
+fn run_embed(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    params: &ModelParams,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    let n_ctx = if params.n_ctx > 0 {
+        params.n_ctx
+    } else {
+        model.n_ctx_train()
+    }
+    .max(8);
+
+    let mut out = Vec::with_capacity(texts.len());
+    for text in texts {
+        let mut ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_embeddings(true)
+            .with_pooling_type(LlamaPoolingType::Mean);
+        if let Some(threads) = params.n_threads {
+            ctx_params = ctx_params.with_n_threads(threads as i32);
+        }
+        let mut ctx = model
+            .new_context(backend, ctx_params)
+            .map_err(|e| BackendError::out_of_memory(format!("create embedding context: {e}")))?;
+
+        let mut tokens = model
+            .str_to_token(text, AddBos::Always)
+            .map_err(|e| BackendError::transient(format!("tokenize: {e}")))?;
+        // Over-long inputs are clipped rather than failing the whole batch (embeddings tolerate it).
+        if tokens.len() as u32 > n_ctx {
+            tokens.truncate(n_ctx as usize);
+        }
+
+        let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+        for (i, token) in tokens.iter().enumerate() {
+            // All tokens contribute to the pooled embedding, so each is marked an output.
+            batch
+                .add(*token, i as i32, &[0], true)
+                .map_err(|e| BackendError::transient(format!("batch add: {e}")))?;
+        }
+        ctx.decode(&mut batch).map_err(classify_decode)?;
+
+        let emb = ctx
+            .embeddings_seq_ith(0)
+            .map_err(|e| BackendError::transient(format!("read embeddings: {e}")))?;
+        let mut v = emb.to_vec();
+        l2_normalize(&mut v);
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// L2-normalize in place (a no-op for the zero vector). Keeps cosine similarity a plain dot product.
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
     }
 }
 

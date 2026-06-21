@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use daemon_common::{ModelRef, ModelSource, SessionId, UsageDelta};
 use daemon_core::{
-    Capabilities, Failure, ModelOutput, Provider, Request, RequestMsg, StreamEvent, ToolCallFormat,
+    Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestMsg,
+    StreamEvent, ToolCallFormat,
 };
 use daemon_infer::protocol::{self, Command, Engine, Event, ModelParams, Sampling};
 use daemon_models::{ActiveModels, ModelManager};
@@ -140,6 +141,119 @@ impl Provider for LocalProvider {
             }
         });
         Box::pin(rx)
+    }
+}
+
+/// An [`EmbeddingProvider`] over a supervised `daemon-infer` worker loaded in **embedding mode**.
+///
+/// It reuses the same [`Worker`] plumbing as [`LocalProvider`] (lazy spawn, shared cut, classified
+/// failures) but loads the model with [`ModelParams::embeddings`] set and drives [`Command::Embed`]
+/// instead of `Generate`. Embeddings are serialized on the single worker behind a mutex.
+pub struct LocalEmbedder {
+    inner: Arc<EmbedInner>,
+}
+
+struct EmbedInner {
+    cfg: WorkerConfig,
+    dims: usize,
+    model: String,
+    worker: Mutex<Option<Worker>>,
+}
+
+impl LocalEmbedder {
+    /// Build an embedder over `cfg` (the worker is spawned lazily on the first embed). `cfg.model`
+    /// should already be a resolved on-disk path (see the daemon's `ModelManager` wiring); `dims`
+    /// is the embedding dimensionality (`0` if unknown), and `model` is the identifier persisted
+    /// alongside stored vectors. Forces `params.embeddings = true`.
+    pub fn new(mut cfg: WorkerConfig, dims: usize, model: impl Into<String>) -> Self {
+        cfg.params.embeddings = true;
+        Self {
+            inner: Arc::new(EmbedInner {
+                cfg,
+                dims,
+                model: model.into(),
+                worker: Mutex::new(None),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for LocalEmbedder {
+    fn dimensions(&self) -> usize {
+        self.inner.dims
+    }
+
+    fn model(&self) -> &str {
+        &self.inner.model
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Failure> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.inner.worker.lock().await;
+        if guard.is_none() {
+            *guard = Some(Worker::spawn(&self.inner.cfg).await?);
+        }
+        let worker = guard.as_mut().expect("worker present after spawn");
+        let result = drive_embed(worker, &self.inner.cfg, texts).await;
+        if let Err(ref failure) = result {
+            if should_replace_worker(failure) {
+                if let Some(mut dead) = guard.take() {
+                    dead.shutdown().await;
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Send one [`Command::Embed`] and await the matching [`Event::Embeddings`] (or a classified error),
+/// bounded by the worker's load timeout.
+async fn drive_embed(
+    worker: &mut Worker,
+    cfg: &WorkerConfig,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, Failure> {
+    let request_id = worker.next_request_id;
+    worker.next_request_id += 1;
+    let cmd = Command::Embed {
+        request_id,
+        texts: texts.to_vec(),
+    };
+    worker
+        .send(&cmd)
+        .await
+        .map_err(|e| Failure::TransientTransport(format!("send embed: {e}")))?;
+    loop {
+        match tokio::time::timeout(cfg.load_timeout, worker.events.recv()).await {
+            Err(_) => {
+                return Err(Failure::TransientTransport(format!(
+                    "embed watchdog: no reply within {:?}",
+                    cfg.load_timeout
+                )))
+            }
+            Ok(None) => {
+                return Err(Failure::TransientTransport(
+                    "worker exited during embed".into(),
+                ))
+            }
+            Ok(Some(Event::Embeddings {
+                request_id: rid,
+                vectors,
+                ..
+            })) if rid == request_id => return Ok(vectors),
+            Ok(Some(Event::Error {
+                request_id: rid,
+                class,
+                message,
+            })) if rid.is_none() || rid == Some(request_id) => {
+                return Err(class_to_failure(class, message))
+            }
+            // A stale frame from a prior request — ignore and keep waiting.
+            Ok(Some(_)) => {}
+        }
     }
 }
 

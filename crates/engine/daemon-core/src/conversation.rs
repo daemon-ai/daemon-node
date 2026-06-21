@@ -5,7 +5,7 @@
 //! live together inside a [`ToolTurn`], so an orphaned tool result is unrepresentable and
 //! compaction operating on `Turn`s cannot split a pair (§5).
 
-use daemon_protocol::UserMsg;
+pub use daemon_protocol::UserMsg;
 use serde::{Deserialize, Serialize};
 
 /// The system prompt that opens every model context.

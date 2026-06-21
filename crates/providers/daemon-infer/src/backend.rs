@@ -110,6 +110,18 @@ pub trait InferenceBackend: Send + Sync {
         tx: UnboundedSender<BackendChunk>,
         cancel: CancellationToken,
     ) -> Result<Usage, BackendError>;
+
+    /// Embed a batch of texts, returning one vector per input (same order).
+    ///
+    /// The default rejects embedding: only a backend loaded in embedding mode
+    /// ([`crate::protocol::ModelParams::embeddings`]) overrides this. A generation-mode backend
+    /// reports [`ErrorClass::Fatal`] so the daemon surfaces a clear "this model can't embed".
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, BackendError> {
+        let _ = texts;
+        Err(BackendError::fatal(
+            "this backend was not loaded for embeddings (load with ModelParams.embeddings = true)",
+        ))
+    }
 }
 
 /// The fallback backend compiled when no engine feature is enabled (the default workspace gate).

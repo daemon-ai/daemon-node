@@ -5,8 +5,8 @@
 //! The mock matches `POST` only (genai appends the adapter's path to our `with_endpoint` base, so we
 //! don't pin the exact path) and returns provider-shaped bodies that `genai` decodes.
 
-use daemon_core::{Failure, Provider, Request, RequestMsg, StreamEvent, ToolDef};
-use daemon_providers::GenAiProvider;
+use daemon_core::{EmbeddingProvider, Failure, Provider, Request, RequestMsg, StreamEvent, ToolDef};
+use daemon_providers::{GenAiEmbedder, GenAiProvider};
 use futures::StreamExt;
 use std::time::Duration;
 use wiremock::matchers::method;
@@ -143,6 +143,60 @@ async fn openai_400_context_overflow_classified() {
         provider.chat(req()).await,
         Err(Failure::ContextOverflow(_))
     ));
+}
+
+#[tokio::test]
+async fn openai_embed_batch_decodes_vectors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]},
+                {"object": "embedding", "index": 1, "embedding": [0.4, 0.5, 0.6]}
+            ],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 4, "total_tokens": 4}
+        })))
+        .mount(&server)
+        .await;
+
+    let embedder = GenAiEmbedder::openai("text-embedding-3-small")
+        .with_endpoint(endpoint(&server))
+        .with_auth("sk-test")
+        .with_dimensions(3);
+    let vectors = embedder
+        .embed(&["hello".to_string(), "world".to_string()])
+        .await
+        .expect("embed succeeds");
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(embedder.dimensions(), 3);
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+    assert!(close(vectors[0][0], 0.1) && close(vectors[0][2], 0.3));
+    assert!(close(vectors[1][0], 0.4) && close(vectors[1][2], 0.6));
+}
+
+#[tokio::test]
+async fn openai_embed_429_classifies_as_rate_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "12")
+                .set_body_string("slow down"),
+        )
+        .mount(&server)
+        .await;
+
+    let embedder = GenAiEmbedder::openai("text-embedding-3-small")
+        .with_endpoint(endpoint(&server))
+        .with_auth("sk-test");
+    match embedder.embed(&["hi".to_string()]).await {
+        Err(Failure::RateLimit { retry_after, .. }) => {
+            assert_eq!(retry_after, Some(Duration::from_secs(12)));
+        }
+        other => panic!("expected RateLimit, got {other:?}"),
+    }
 }
 
 #[tokio::test]

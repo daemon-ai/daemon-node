@@ -64,6 +64,9 @@ async fn main() {
             Command::Generate { request_id, .. } => {
                 run_generate(&writer, &scenario, spawn_index, request_id).await;
             }
+            Command::Embed { request_id, texts } => {
+                run_embed(&writer, &scenario, request_id, &texts).await;
+            }
             Command::Cancel { .. } => {}
             Command::Ping => send(&writer, &Event::Pong).await,
             Command::Shutdown => break,
@@ -108,6 +111,55 @@ async fn run_generate(writer: &CutWriter, scenario: &str, spawn_index: u64, requ
             send_done(writer, request_id).await;
         }
     }
+}
+
+/// The fake embedding dimensionality.
+const FAKE_DIM: usize = 8;
+
+/// Answer an embed request with deterministic per-text vectors (or an error under `embed-error`).
+async fn run_embed(writer: &CutWriter, scenario: &str, request_id: u64, texts: &[String]) {
+    if scenario == "embed-error" {
+        send(
+            writer,
+            &Event::Error {
+                request_id: Some(request_id),
+                class: ErrorClass::Fatal,
+                message: "fake: embeddings unavailable".into(),
+            },
+        )
+        .await;
+        return;
+    }
+    let vectors: Vec<Vec<f32>> = texts.iter().map(|t| fake_embed(t)).collect();
+    send(
+        writer,
+        &Event::Embeddings {
+            request_id,
+            vectors,
+            dims: FAKE_DIM as u32,
+        },
+    )
+    .await;
+}
+
+/// A stable bag-of-words hash embedding (so shared tokens produce similar vectors), L2-normalized.
+fn fake_embed(text: &str) -> Vec<f32> {
+    let mut v = vec![0.0f32; FAKE_DIM];
+    for token in text.split_whitespace() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in token.to_ascii_lowercase().as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        v[(h % FAKE_DIM as u64) as usize] += 1.0;
+    }
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+    v
 }
 
 async fn send_text(writer: &CutWriter, request_id: u64, text: &str) {

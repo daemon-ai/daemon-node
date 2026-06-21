@@ -24,6 +24,7 @@ pub mod context;
 pub mod control;
 pub mod conversation;
 pub mod credentials;
+pub mod embed;
 pub mod engine;
 pub mod events;
 pub mod exec;
@@ -45,9 +46,10 @@ pub use context::{
 };
 pub use control::{SteerReq, TurnControl};
 pub use conversation::{
-    AssistantMsg, Conversation, SystemPrompt, ToolCall, ToolResult, ToolTurn, Turn,
+    AssistantMsg, Conversation, SystemPrompt, ToolCall, ToolResult, ToolTurn, Turn, UserMsg,
 };
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
+pub use embed::{cosine, EmbeddingProvider, MockEmbedder};
 pub use engine::{Completion, Engine, Suspension, TurnOutcome};
 pub use events::{EventSink, SessionLog};
 pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};

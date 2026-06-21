@@ -22,9 +22,9 @@ use daemon_common::{
 };
 use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
-    ContextEngine, ContextEngineBuilder, CredentialBuilder, CredentialProvider, EngineProfile,
-    FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider, ProviderRegistry,
-    SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
+    ContextEngine, ContextEngineBuilder, CredentialBuilder, CredentialProvider, EmbeddingProvider,
+    EngineProfile, FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider,
+    ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolRegistry, TurnCx,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
 use daemon_host::{
@@ -36,13 +36,17 @@ use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
 use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
-use daemon_providers::{GenAiProvider, SwitchableLocalProvider, WorkerConfig};
+use daemon_providers::{
+    GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider, WorkerConfig,
+};
 use daemon_provision::CutChannel;
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
 use daemon_transport::RemoteHost;
 
-use config::{ContextEngineKind, MemoryProviderKind, NodeConfig, ProviderKind, StoreBackend};
+use config::{
+    ContextEngineKind, EmbedKind, MemoryProviderKind, NodeConfig, ProviderKind, StoreBackend,
+};
 
 /// The environment variable that selects the placed-child role.
 const PLACED_CHILD_ENV: &str = "DAEMON_PLACED_CHILD";
@@ -198,7 +202,10 @@ impl MemoryWiring {
 /// `session_id` row scoping), and both the per-session memory builder and the registered
 /// `mnemosyne_*` tools resolve the *same* per-session instance from it. On any open failure memory
 /// is simply left off (the node still runs).
-fn build_memory(cfg: &NodeConfig) -> MemoryWiring {
+fn build_memory(
+    cfg: &NodeConfig,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+) -> MemoryWiring {
     match cfg.memory_provider {
         MemoryProviderKind::None => MemoryWiring::off(),
         MemoryProviderKind::File => match &cfg.memory_file {
@@ -221,7 +228,7 @@ fn build_memory(cfg: &NodeConfig) -> MemoryWiring {
             } else {
                 MnemosyneConfig::default()
             };
-            let banks = Arc::new(MnemosyneBanks::new(base, cfg.persist_providers()));
+            let banks = Arc::new(MnemosyneBanks::new(base, cfg.persist_providers(), embedder));
             // The `mnemosyne_*` tool defs are session-independent; enumerate them once from a probe
             // instance (its bank is shared, so this is cheap and discarded).
             let tool_defs = match banks.probe_tool_defs() {
@@ -264,14 +271,20 @@ fn build_memory(cfg: &NodeConfig) -> MemoryWiring {
 struct MnemosyneBanks {
     base: MnemosyneConfig,
     persist: bool,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
     sessions: Mutex<HashMap<SessionId, Arc<MnemosyneProvider>>>,
 }
 
 impl MnemosyneBanks {
-    fn new(base: MnemosyneConfig, persist: bool) -> Self {
+    fn new(
+        base: MnemosyneConfig,
+        persist: bool,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
         Self {
             base,
             persist,
+            embedder,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -286,11 +299,14 @@ impl MnemosyneBanks {
         let mut cfg = self.base.clone();
         cfg.session_id = session.as_str().to_string();
         let provider = if self.persist {
-            MnemosyneProvider::open(cfg)
+            match &self.embedder {
+                Some(embedder) => MnemosyneProvider::open_with_embedder(cfg, embedder.clone()),
+                None => MnemosyneProvider::open(cfg),
+            }
         } else {
             // Ephemeral node: a private in-memory bank per session (no cross-session sharing, which
             // is acceptable when the session store itself is non-durable).
-            crate::ephemeral_mnemosyne(cfg)
+            crate::ephemeral_mnemosyne(cfg, self.embedder.clone())
         };
         match provider {
             Ok(p) => {
@@ -317,12 +333,17 @@ impl MnemosyneBanks {
     }
 }
 
-/// Open an in-memory Mnemosyne provider for an ephemeral node.
-fn ephemeral_mnemosyne(cfg: MnemosyneConfig) -> daemon_mnemosyne::Result<MnemosyneProvider> {
+/// Open an in-memory Mnemosyne provider for an ephemeral node, with an optional embedder.
+fn ephemeral_mnemosyne(
+    cfg: MnemosyneConfig,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+) -> daemon_mnemosyne::Result<MnemosyneProvider> {
     use daemon_mnemosyne::Engine;
-    Ok(MnemosyneProvider::new(Arc::new(Engine::open_in_memory(
-        cfg,
-    )?)))
+    let engine = Arc::new(Engine::open_in_memory(cfg)?);
+    Ok(match embedder {
+        Some(embedder) => MnemosyneProvider::with_embedder(engine, embedder),
+        None => MnemosyneProvider::new(engine),
+    })
 }
 
 /// A §12 [`Tool`] adapter that dispatches a `mnemosyne_*` call to the calling session's bank,
@@ -407,6 +428,7 @@ fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
         n_threads: local.n_threads,
         flash_attn: local.flash_attn,
         isq: local.isq.clone(),
+        embeddings: false,
     };
     wc.max_tokens = local.max_tokens;
     wc.load_timeout = local.load_timeout;
@@ -415,6 +437,131 @@ fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
     wc.max_restarts = local.max_restarts;
     wc.restart_window = local.restart_window;
     wc
+}
+
+/// Parse the configured embedding `model` string into a [`ModelRef`] for a local engine (mirrors
+/// [`parse_model_ref`] but keyed by [`ModelEngine`] directly): an existing local path becomes a
+/// [`ModelSource::Local`], `org/name/file.gguf` a fetched GGUF (llama), else a bare HF repo.
+fn parse_embed_model_ref(engine: ModelEngine, s: &str) -> Option<ModelRef> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(s);
+    if path.exists() {
+        return Some(ModelRef::new(
+            engine,
+            ModelSource::Local {
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    match engine {
+        ModelEngine::Llama => {
+            if s.to_ascii_lowercase().ends_with(".gguf") {
+                let segs: Vec<&str> = s.splitn(3, '/').collect();
+                match segs.as_slice() {
+                    [org, name, file] => Some(ModelRef::new(
+                        engine,
+                        ModelSource::hf_file(format!("{org}/{name}"), *file),
+                    )),
+                    _ => None,
+                }
+            } else {
+                Some(ModelRef::new(engine, ModelSource::hf(s)))
+            }
+        }
+        ModelEngine::MistralRs => Some(ModelRef::new(engine, ModelSource::hf(s))),
+    }
+}
+
+/// Build the optional embedding provider the config selected (`None` keeps recall keyword-only).
+///
+/// Remote (`genai`) embedders apply the configured credential as the bearer secret and accept a
+/// base-URL override (any OpenAI-compatible endpoint). Local embedders resolve their model through
+/// the shared [`ModelManager`] (downloading into the warmed cache on first use) and run in a
+/// dedicated embedding-mode `daemon-infer` worker. Any failure leaves embeddings off (recall still
+/// works, keyword-only).
+async fn build_embedder(
+    cfg: &NodeConfig,
+    manager: &Arc<ModelManager>,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    match cfg.embed.kind {
+        EmbedKind::Off => None,
+        EmbedKind::Genai => {
+            if cfg.embed.model.is_empty() {
+                tracing::warn!(
+                    "embed provider=genai but DAEMON_EMBED_MODEL is unset; embeddings off"
+                );
+                return None;
+            }
+            let mut embedder =
+                GenAiEmbedder::openai(cfg.embed.model.clone()).with_auth(cfg.credential_key.clone());
+            if let Some(base) = &cfg.embed.base_url {
+                embedder = embedder.with_endpoint(base.clone());
+            }
+            if cfg.embed.dims > 0 {
+                embedder = embedder.with_dimensions(cfg.embed.dims);
+            }
+            Some(Arc::new(embedder) as Arc<dyn EmbeddingProvider>)
+        }
+        EmbedKind::Local => {
+            if cfg.embed.model.is_empty() {
+                tracing::warn!(
+                    "embed provider=local but DAEMON_EMBED_MODEL is unset; embeddings off"
+                );
+                return None;
+            }
+            let engine = match cfg.embed.engine.to_ascii_lowercase().as_str() {
+                "mistralrs" | "mistral-rs" | "mistral.rs" => ModelEngine::MistralRs,
+                _ => ModelEngine::Llama,
+            };
+            let model_ref = match parse_embed_model_ref(engine, &cfg.embed.model) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        model = %cfg.embed.model,
+                        "could not parse DAEMON_EMBED_MODEL; embeddings off"
+                    );
+                    return None;
+                }
+            };
+            let artifact = match manager.resolve(&model_ref).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to resolve embedding model; embeddings off");
+                    return None;
+                }
+            };
+            let infer_engine = match engine {
+                ModelEngine::MistralRs => Engine::MistralRs,
+                ModelEngine::Llama => Engine::Llama,
+            };
+            let mut wc = WorkerConfig::new(
+                cfg.local.worker_bin.clone(),
+                infer_engine,
+                artifact.local_path.to_string_lossy().into_owned(),
+            );
+            wc.params = ModelParams {
+                n_gpu_layers: cfg.local.n_gpu_layers,
+                n_ctx: cfg.local.n_ctx,
+                n_threads: cfg.local.n_threads,
+                flash_attn: cfg.local.flash_attn,
+                isq: None,
+                embeddings: true,
+            };
+            // Load from the warmed cache offline (the daemon owns acquisition).
+            wc.env.extend(manager.cache().sidecar_env());
+            wc.load_timeout = cfg.local.load_timeout;
+            wc.max_restarts = cfg.local.max_restarts;
+            wc.restart_window = cfg.local.restart_window;
+            Some(Arc::new(LocalEmbedder::new(
+                wc,
+                cfg.embed.dims,
+                cfg.embed.model.clone(),
+            )) as Arc<dyn EmbeddingProvider>)
+        }
+    }
 }
 
 /// Build the durable store backend the config selected.
@@ -484,7 +631,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // are per-session builders (LCM keeps per-session compaction state; Mnemosyne scopes by
     // `session_id`), so concurrent sessions never share mutable provider state.
     let context_builder = build_context_engine(&cfg);
-    let memory = build_memory(&cfg);
+    // The optional embedding backend (Mnemosyne vector recall), reusing the shared `ModelManager`
+    // for local-model acquisition. `Off` by default — recall stays keyword-only.
+    let embedder = build_embedder(&cfg, &manager).await;
+    let memory = build_memory(&cfg, embedder);
 
     let host_config = HostConfig {
         partition: cfg.partition,
@@ -552,7 +702,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 fn build_owner_broker(profile: &str, key: &str) -> Arc<dyn CredentialBroker> {
     let signer = Arc::new(CapabilitySigner::generate());
     let source = Arc::new(StubCredentialSource::minting(profile, key));
-    let scope = CredScope::new([profile], ["chat"], Some(1_000));
+    let scope = CredScope::new([profile], ["chat", "embed"], Some(1_000));
     let authority = Arc::new(CredentialAuthority::new(
         scope,
         CredMode::Native,

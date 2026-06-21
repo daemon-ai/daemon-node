@@ -13,6 +13,11 @@ use crate::recall::scoring;
 use crate::store::Store;
 use crate::{sanitize, util};
 use rusqlite::params;
+use std::collections::HashMap;
+
+/// The vector-similarity floor that lets a vector-only hit survive the lexical gate (mirrors the
+/// episodic candidate-drop rule `lexical < floor && sim < 0.65 -> drop`, `beam.py` L5720+).
+const VEC_SIM_FLOOR: f64 = 0.65;
 
 /// Which BEAM tier a row lives in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,9 +100,25 @@ impl Engine {
         &self.config.session_id
     }
 
-    /// Store a memory in the working tier (`beam.py` `remember` L2836). Scaffold: sanitize +
-    /// classify + insert (dedup, embedding, and knowledge ingestion are TODO).
+    /// Store a memory in the working tier (`beam.py` `remember` L2836), keyword-only (no vector).
+    /// Equivalent to [`Engine::remember_with_vector`] with no embedding.
     pub fn remember(&self, content: &str, args: &RememberArgs) -> Result<String> {
+        self.remember_with_vector(content, args, None, "")
+    }
+
+    /// Store a memory in the working tier, optionally persisting a precomputed embedding into
+    /// `memory_embeddings` (the f32-BLOB-as-JSON fallback store).
+    ///
+    /// The embedding is computed by the caller (the async [`MnemosyneProvider`] hooks) and passed in,
+    /// so the synchronous engine never blocks on a model call. Scaffold: sanitize + classify +
+    /// insert + vector write (dedup and knowledge ingestion remain TODO).
+    pub fn remember_with_vector(
+        &self,
+        content: &str,
+        args: &RememberArgs,
+        vector: Option<&[f32]>,
+        model: &str,
+    ) -> Result<String> {
         let (content, _meta) = sanitize::sanitize_content(content);
         let id = util::memory_id(&format!("{}:{}", self.config.session_id, content));
         let memory_type = typed_memory::classify(&content).as_str();
@@ -120,6 +141,14 @@ impl Engine {
                 args.scope,
             ],
         )?;
+        if let Some(vector) = vector {
+            let embedding_json = serde_json::to_string(vector)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) \
+                 VALUES (?1, ?2, ?3)",
+                params![id, embedding_json, model],
+            )?;
+        }
         Ok(id)
     }
 
@@ -152,11 +181,26 @@ impl Engine {
         Ok(rows)
     }
 
-    /// Linear-hybrid recall over working memory (`beam.py` `recall` L5027). Scaffold: candidate rows
-    /// are fetched by scope/validity, scored with the working-memory formula
-    /// ([`scoring::working_memory_score`]) using in-Rust lexical relevance, then ranked. The vector
-    /// path, episodic tier, and bonuses are TODO.
+    /// Linear-hybrid recall over working memory (`beam.py` `recall` L5027), keyword-only. Equivalent
+    /// to [`Engine::recall_with_vector`] with no query vector.
     pub fn recall(&self, query: &str, top_k: usize) -> Result<Vec<MemoryRow>> {
+        self.recall_with_vector(query, top_k, None)
+    }
+
+    /// Hybrid lexical + vector recall over working memory (`beam.py` `recall` L5027).
+    ///
+    /// Candidate rows are fetched by scope/validity, then scored with the working-memory formula
+    /// ([`scoring::working_memory_score`]) blending in-Rust lexical relevance with the cosine
+    /// similarity of `query_vector` against each row's stored embedding (when both are present). A
+    /// row survives the candidate gate if it clears the lexical floor **or** its vector similarity
+    /// clears [`VEC_SIM_FLOOR`] — so a semantically-relevant row a lexical query misses still
+    /// surfaces. With `query_vector = None` this is pure lexical recall (the prior behaviour).
+    pub fn recall_with_vector(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_vector: Option<&[f32]>,
+    ) -> Result<Vec<MemoryRow>> {
         let candidates = self.get_context(2000)?;
         let q_tokens: Vec<String> = query
             .to_lowercase()
@@ -166,14 +210,25 @@ impl Engine {
         let floor = scoring::lexical_floor(q_tokens.len());
         let (_vw, _fw, iw) = scoring::DEFAULT_WEIGHTS;
 
+        // Load stored vectors for the candidate ids in one pass (only when we have a query vector).
+        let stored = match query_vector {
+            Some(_) => self.load_embeddings(&candidates)?,
+            None => HashMap::new(),
+        };
+
         let mut scored: Vec<MemoryRow> = Vec::new();
         for mut row in candidates {
             let relevance = lexical_relevance(&q_tokens, &row.content);
-            if relevance < floor {
+            let vec_sim = match (query_vector, stored.get(&row.id)) {
+                (Some(q), Some(v)) => daemon_core::cosine(q, v) as f64,
+                _ => 0.0,
+            };
+            // Keep a row that clears the lexical floor OR is a strong vector match.
+            if relevance < floor && vec_sim < VEC_SIM_FLOOR {
                 continue;
             }
             let decay = scoring::recency_decay(age_hours(&row.timestamp));
-            let base = scoring::working_memory_score(relevance, row.importance, iw, 0.0, decay);
+            let base = scoring::working_memory_score(relevance, row.importance, iw, vec_sim, decay);
             row.score = base * scoring::veracity_multiplier(&row.veracity);
             scored.push(row);
         }
@@ -184,6 +239,27 @@ impl Engine {
         });
         scored.truncate(top_k);
         Ok(scored)
+    }
+
+    /// Load the stored f32 embeddings (`memory_embeddings.embedding_json`) for the given candidate
+    /// rows, keyed by memory id. Rows without a stored vector are simply absent from the map.
+    fn load_embeddings(&self, candidates: &[MemoryRow]) -> Result<HashMap<String, Vec<f32>>> {
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT memory_id, embedding_json FROM memory_embeddings")?;
+        let mut map = HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, json) = row?;
+            if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&json) {
+                map.insert(id, vec);
+            }
+        }
+        Ok(map)
     }
 }
 
@@ -283,6 +359,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vector_recall_surfaces_semantic_match_lexical_misses() {
+        let e = engine();
+        // A query vector, one near-parallel memory vector (cos ~0.96) and one orthogonal — with
+        // content that shares NO tokens with the query, so lexical recall finds nothing.
+        let q = [1.0f32, 0.0, 0.0];
+        let near = [0.96f32, 0.28, 0.0];
+        let far = [0.0f32, 0.0, 1.0];
+        e.remember_with_vector("alpha apple", &RememberArgs::default(), Some(&near), "mock")
+            .unwrap();
+        e.remember_with_vector("beta banana", &RememberArgs::default(), Some(&far), "mock")
+            .unwrap();
+
+        // Lexical-only recall for a disjoint query returns nothing.
+        assert!(e.recall("zzz", 5).unwrap().is_empty());
+
+        // Vector recall surfaces the semantically-close memory and ranks it first.
+        let hits = e.recall_with_vector("zzz", 5, Some(&q)).unwrap();
+        assert!(!hits.is_empty(), "vector recall should surface a match");
+        assert_eq!(hits[0].content, "alpha apple");
+        assert!(
+            hits.iter().all(|h| h.content != "beta banana"),
+            "orthogonal memory must not pass the vector gate"
+        );
     }
 
     #[test]

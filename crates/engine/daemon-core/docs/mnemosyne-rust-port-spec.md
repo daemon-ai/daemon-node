@@ -96,11 +96,18 @@ the tool dispatch always hit the *same* instance for a session. (Contrast LCM: s
 
 Hook order (spec §11): `recall -> before_turn -> before_compact -> compact -> assemble -> after_turn`.
 
-**Embeddings (as-built):** the default build is **keyword-only** (the `Embedder` returns `None`), so
-the wired-in default provider runs without any embedding model. The preferred GGUF-embeddings path is
-still blocked on a `daemon-infer` `Embed` command + an `embeddings` method on `InferenceBackend`
-(local-inference-spec §10); until that lands, embeddings are opt-in via the `embeddings` feature
-(fastembed/ONNX) and never on the default path.
+**Embeddings (as-built):** the engine consumes a host-injected
+[`EmbeddingProvider`](../src/embed.rs) (the `daemon-core` seam) rather than owning an embedding
+runtime. With no provider injected the default build is **keyword-only** (the `Embedder` wrapper
+returns `None`), so the zero-config default still runs without any embedding model. When a provider
+*is* injected, the async [`MnemosyneProvider`] hooks embed at the seam (`recall`/`after_turn`/
+`call_tool`) and pass the precomputed vectors into the synchronous engine
+(`remember_with_vector`/`recall_with_vector`), which persists f32 vectors to `memory_embeddings` and
+blends cosine similarity into the working-memory score (a vector-only hit clears the lexical gate at
+sim ≥ 0.65). Two providers ship: a remote `genai` embedder and a local `daemon-infer` GGUF embedder,
+both in `daemon-providers`; the `fastembed`/ONNX path has been removed in favour of this seam. See
+[`local-inference-spec.md`](../../../../docs/specs/local-inference-spec.md) §10 for the
+`Command::Embed` protocol + `InferenceBackend::embed` worker path.
 
 The provider binds to the engine's existing typed shapes:
 
@@ -151,7 +158,7 @@ New crate `crates/memory/daemon-mnemosyne` (auto-included by the `crates/*/*` wo
 | `store/mod.rs` | `beam.py` connection (L404-L443), `banks.py` | — | `Mutex<Connection>` + WAL; per-bank file |
 | `engine.rs` | `beam.py` `BeamMemory` | 8326 | remember/recall/get_context/sleep/scratchpad |
 | `facade.rs` | `memory.py` `Mnemosyne` | 987 | public API + legacy dual-write (optional) |
-| `embeddings.rs` | `embeddings.py` | 254 | `fastembed` feature; keyword-only fallback |
+| `embeddings.rs` | `embeddings.py` | 254 | adapts an injected `daemon-core::EmbeddingProvider`; keyword-only when `None` |
 | `binary_vectors.rs` | `binary_vectors.py` | 372 | MIB sign binarization + Hamming |
 | `recall/mmr.rs` | `mmr.py` | 95 | λ=0.7 MMR |
 | `recall/polyphonic.rs` | `polyphonic_recall.py` | 878 | 4-voice RRF |
@@ -205,25 +212,24 @@ Default dependencies (light; no native ML stack):
   SQLite with FTS5** (`SQLITE_ENABLE_FTS5`), so full-text search works out of the box. Verify in CI.
 - `serde` / `serde_json`, `regex`, `sha2`, `unicode-normalization` (NFC for `fact_id`), `async-trait`,
   `thiserror`, `tracing`, `chrono` (ISO timestamps / age math).
-- `daemon-core` (path dep) for the `MemoryProvider` trait + `Provider` + conversation types.
+- `daemon-core` (path dep) for the `MemoryProvider` trait + `Provider` + `EmbeddingProvider` +
+  conversation types.
+
+**Embeddings (as-built):** embeddings are sourced through the `daemon-core`
+[`EmbeddingProvider`](../src/embed.rs) seam — **not** an in-crate runtime and **not** a feature flag.
+The `embeddings`/`fastembed`/ONNX feature has been **removed**. The host injects one of the
+`daemon-providers` implementations and Mnemosyne adapts it via its [`Embedder`](../../../memory/daemon-mnemosyne/src/embeddings.rs)
+wrapper (keyword-only when `None`):
+- **PREFERRED: GGUF embeddings via the `daemon-infer` worker (`llama-cpp-4`).** A GGUF embedding
+  model (e.g. `nomic-embed-text`, `bge-*-gguf`) is embedded through the *same* supervised worker the
+  chat providers already build — `llama-cpp-4` exposes native embeddings (`LlamaContextParams`
+  `with_embeddings(true)` + `LlamaContext::embeddings_seq_ith`). Zero new ML dependency tree: it
+  reuses the crash-isolated worker, its build matrix, and the shared model cache. Realized by
+  `Command::Embed` + `InferenceBackend::embed` (`daemon-providers::LocalEmbedder`).
+- **REMOTE: `genai` embeddings** (`daemon-providers::GenAiEmbedder`, OpenAI-compatible
+  `embed_batch`) for deployments that prefer a hosted embedding model.
 
 Feature-gated (off by default, to keep the engine light and network-free):
-- `embeddings` — two interchangeable backends behind the same `Embedder` seam; **keyword-only mode**
-  when neither is enabled (mirrors `MNEMOSYNE_NO_EMBEDDINGS`, `embeddings.py` L190):
-  - **PREFERRED: GGUF embeddings via the `daemon-infer` worker (`llama-cpp-4`).** A GGUF embedding
-    model (e.g. `nomic-embed-text`, `bge-*-gguf`) is embedded through the *same* supervised worker the
-    chat providers already build — `llama-cpp-4` exposes native embeddings (`LlamaContextParams`
-    `with_embeddings(true)` + `LlamaContext::embeddings_seq_ith`). This adds **zero new ML dependency
-    tree**: no `ort`/ONNX runtime, no `fastembed`, no second model-acquisition path — it reuses the
-    crash-isolated worker, its build matrix (CUDA/Vulkan/Metal/ROCm), and the shared model cache. This
-    is the recommended path now that the worker is in-tree (see
-    [`local-inference-spec.md`](../../../../docs/specs/local-inference-spec.md)). Realizing it needs an
-    embeddings method on the `InferenceBackend` seam + an `Embed` protocol command (a documented
-    follow-up; the chat path ships first).
-  - **ALTERNATIVE: `fastembed = "5"`** (default model `EmbeddingModel::BGESmallENV15`, 384-dim; uses
-    `ort`/ONNX; **no Tokio dep**). Self-contained and simple to wire, but pulls the `ort`/ONNX runtime
-    and a separate model download — kept as the documented alternative for deployments that do not run
-    a local `llama-cpp-4` worker (e.g. remote-only chat providers that still want local memory recall).
 - `vec-ext` -> `sqlite-vec` crate + `zerocopy`. Registers `sqlite3_vec_init` via
   `rusqlite::auto_extension::register_auto_extension` (a `RawAutoExtension` transmute — the only
   `unsafe` in the crate, isolated to one function). Provides `vec0` virtual tables and native
@@ -238,10 +244,10 @@ Feature-gated (off by default, to keep the engine light and network-free):
   (`llama-cpp-4` / `mistral.rs`), reachable via `daemon_core::Provider`/`MemoryProvider`, so this
   crate no longer needs its own in-process engine backend.
 
-> Design rule: `daemon-core` itself never depends on `fastembed`/`ort`; the heavy stack is confined
-> to this crate behind features, mirroring how `reqwest` is confined to `daemon-providers`. The
-> PREFERRED embeddings path goes one step further and avoids `ort`/`fastembed` entirely by reusing the
-> `daemon-infer` worker's `llama-cpp-4` GGUF embeddings.
+> Design rule: `daemon-core` defines only the `EmbeddingProvider` *seam*; no embedding runtime lives
+> in `daemon-core` or this crate. The heavy stack (`llama-cpp-4`, `genai`) is confined to
+> `daemon-providers`/`daemon-infer`, mirroring how `reqwest` is confined to `daemon-providers`. There
+> is no `ort`/`fastembed` dependency anywhere in the tree.
 
 ---
 
@@ -368,17 +374,19 @@ Two stores live in their own files and must **not** be co-located into the bank 
 
 ### 5.1 Embeddings — `embeddings.py`
 
-- Default model `BAAI/bge-small-en-v1.5`, **384-dim** (`embeddings.py` L52, L88; fallback dim 384 at
-  L122). Rust: `fastembed::EmbeddingModel::BGESmallENV15`.
-- `embed_query(text) -> Option<Vec<f32>>` (L206, LRU `maxsize=512`); `embed(texts) ->
-  Option<Vec<Vec<f32>>>` (L225). Single-text calls delegate to `embed_query` (L234-L238).
-- **No L2 normalization at source** (raw f32). Consumers normalize at the cosine/Hamming use site
-  (polyphonic L214-L217, SHMR L84-L88). The Rust `Embedder` returns raw vectors; recall normalizes.
-- API path (`MNEMOSYNE_EMBEDDINGS_VIA_API`, `_is_api_model` L57-L76): POST `{base}/embeddings`,
-  3 retries with `2**attempt` backoff (L164-L182). Port as an optional reqwest path under the
-  `sync`/`embeddings-api` feature.
-- Keyword-only mode (`MNEMOSYNE_NO_EMBEDDINGS`, L190): `embed*` return `None`; recall falls back to
-  FTS5 + lexical scoring only.
+- Original Python default model `BAAI/bge-small-en-v1.5`, **384-dim** (`embeddings.py` L52, L88). In
+  the Rust port the *model* is the injected provider's concern, not this crate's: the chosen model
+  and its dimensionality are configured at the host (`DAEMON_EMBED_*`).
+- As-built: the `Embedder` wrapper is `Option<Arc<dyn EmbeddingProvider>>`. `embed_query(text) ->
+  Option<Vec<f32>>` and `embed(texts) -> Option<Vec<Vec<f32>>>` are **async** (real backends call out
+  to a model); they return `None` in keyword-only mode (no provider) or on backend error.
+- Normalization: the shipped providers (`LocalEmbedder` llama path, `GenAiEmbedder`) and the
+  `MockEmbedder` return L2-normalized vectors; recall's `daemon_core::cosine` is order-invariant
+  regardless, so unnormalized providers still score correctly.
+- Both remote (`genai`) and local (`daemon-infer` GGUF) backends are realized; the legacy
+  `MNEMOSYNE_EMBEDDINGS_VIA_API` reqwest path is superseded by `GenAiEmbedder`.
+- Keyword-only mode (no injected provider): `embed*` return `None`; recall falls back to lexical
+  scoring only.
 
 ### 5.2 MIB (Maximally Informative Binarization) — `binary_vectors.py`
 
@@ -805,7 +813,8 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
 3. **Vector search:** sqlite-vec is feature-gated (`vec-ext`); the default build uses an f32-BLOB +
    in-Rust cosine fallback (mirrors Python's numpy fallback), keeping the default crate free of C
    compilation and ONNX.
-4. **Embeddings:** `fastembed` feature-gated; keyword-only by default.
+4. **Embeddings:** sourced via the injected `daemon-core::EmbeddingProvider` seam (remote `genai` or
+   a local `daemon-infer` GGUF worker); keyword-only when no provider is injected.
 5. **SHMR:** opt-in background pass (Python never wires it into sleep).
 6. **Polyphonic voice weights:** RRF-only fusion preserved (weights are metadata, as in Python).
 7. **Legacy `memories` dual-write** (`memory.py` L356-L375) is **dropped** — it exists only for

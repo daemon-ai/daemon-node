@@ -268,10 +268,15 @@ step in CI.
 
 - **Phase 2 `mistralrs-depth`** — native `Tool`/`ToolChoice` decode, exact token usage, paged-attn,
   CUDA/Metal + flash-attn perf tuning, full `ModelParams` honoring.
-- **Embeddings** — add an embeddings method to `InferenceBackend` + an `Embed` protocol command to
-  realize the PREFERRED GGUF-embeddings path for Mnemosyne (reuses this worker; no `ort`/`fastembed`).
-  See [`mnemosyne-rust-port-spec.md`](../../crates/engine/daemon-core/docs/mnemosyne-rust-port-spec.md)
-  §3.
+- **Embeddings (DONE for llama; mistral.rs deferred)** — the protocol now carries `Command::Embed` /
+  `Event::Embeddings` and `ModelParams.embeddings`; `InferenceBackend::embed` has a default (reject)
+  with the **llama** backend implementing pooled GGUF embeddings (`LlamaContextParams`
+  `with_embeddings(true)` + `with_pooling_type(Mean)` + `embeddings_seq_ith`, L2-normalized). The
+  worker bin dispatches `Embed` on a task; `daemon-providers::LocalEmbedder` drives it and Mnemosyne
+  consumes it via the `daemon-core::EmbeddingProvider` seam (no `ort`/`fastembed`). **Remaining:** the
+  mistral.rs backend's `embed` currently returns a clear error — wiring its `EmbeddingModelBuilder`
+  path is the follow-on. See
+  [`mnemosyne-rust-port-spec.md`](../../crates/engine/daemon-core/docs/mnemosyne-rust-port-spec.md) §3.
 - **Model acquisition** — owned by the model-management work
   ([`model-management-spec.md`](model-management-spec.md)); `Command::Load` consumes its resolved
   output.

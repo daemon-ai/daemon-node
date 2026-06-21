@@ -8,9 +8,10 @@
 //! `docs/research/hermes/mnemosyne-rust-port-spec.md` for the full architecture spec with the
 //! authoritative Python `file:line` references each module ports.
 //!
-//! Default build is light (no ONNX, no C vector extension): embeddings are keyword-only and vectors
-//! score with an in-Rust cosine fallback. The `embeddings`, `vec-ext`, and `sync` features add the
-//! heavier capabilities.
+//! Default build is light (no C vector extension): embeddings come from a host-injected
+//! [`EmbeddingProvider`](daemon_core::EmbeddingProvider) (remote or a local `daemon-infer` worker),
+//! and vectors score with an in-Rust cosine fallback over f32 BLOBs. With no provider, recall is
+//! keyword-only. The `vec-ext` and `sync` features add the heavier capabilities.
 
 // The only `unsafe` in the crate is the sqlite-vec auto-extension registration (one transmute,
 // behind `vec-ext`); the default build is fully safe.
