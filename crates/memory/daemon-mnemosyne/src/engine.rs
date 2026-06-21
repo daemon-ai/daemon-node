@@ -12,11 +12,16 @@
 use crate::config::MnemosyneConfig;
 use crate::dynamics::typed_memory;
 use crate::error::Result;
+use crate::knowledge::{annotations, entities, episodic_graph, veracity};
 use crate::recall::{mmr, scoring};
 use crate::store::Store;
 use crate::{binary_vectors, sanitize, util};
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
+
+/// Max co-occurrence edges drawn per shared entity at ingest, bounding the proactive-link fan-out
+/// (`beam.py` `_proactively_link` is similarly capped).
+const MAX_COOCCURRENCE_EDGES_PER_ENTITY: usize = 10;
 
 /// The vector-similarity floor that lets a vector-only hit survive the lexical gate (mirrors the
 /// episodic candidate-drop rule `lexical < floor && sim < 0.65 -> drop`, `beam.py` L5720+).
@@ -154,7 +159,64 @@ impl Engine {
                 params![id, embedding_json, model],
             )?;
         }
+        self.ingest_knowledge(&conn, &id, &content, &args.veracity)?;
         Ok(id)
+    }
+
+    /// Deterministic knowledge ingestion for a freshly-stored memory (`beam.py` write-path
+    /// extraction L3300+): regex entities become `mentions` annotations, regex SPO triples become
+    /// `facts` + `consolidated_facts`, and shared-entity co-occurrence draws `references` edges to
+    /// prior memories (bounded fan-out). All keyed by `memory_id`. No LLM extraction (P2).
+    fn ingest_knowledge(
+        &self,
+        conn: &Connection,
+        memory_id: &str,
+        content: &str,
+        veracity: &str,
+    ) -> Result<()> {
+        let entity_list = entities::extract_entities_regex(content);
+        if !entity_list.is_empty() {
+            annotations::add_many(conn, memory_id, "mentions", &entity_list, "regex", 1.0)?;
+        }
+
+        for fact in episodic_graph::extract_facts(content, memory_id) {
+            episodic_graph::store_fact(conn, &fact, memory_id, &self.config.session_id)?;
+            // Regex facts are inferred unless the memory itself was stated/tool/imported.
+            let fact_veracity = if veracity == "unknown" { "inferred" } else { veracity };
+            veracity::consolidate_fact(
+                conn,
+                &fact.subject,
+                &fact.predicate,
+                &fact.object,
+                fact_veracity,
+                memory_id,
+            )?;
+        }
+
+        // Proactive linking: connect this memory to earlier ones that mention a shared entity.
+        for entity in &entity_list {
+            let mentions = annotations::query_by_kind(conn, "mentions", Some(entity), false)?;
+            let mut linked = 0usize;
+            for other in mentions {
+                if other.memory_id == memory_id {
+                    continue;
+                }
+                episodic_graph::add_edge(
+                    conn,
+                    &episodic_graph::GraphEdge {
+                        source: memory_id.to_string(),
+                        target: other.memory_id,
+                        edge_type: "references".to_string(),
+                        weight: 0.8,
+                    },
+                )?;
+                linked += 1;
+                if linked >= MAX_COOCCURRENCE_EDGES_PER_ENTITY {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Auto-inject context: global then session-local working memory ordered by importance/recency
@@ -211,12 +273,20 @@ impl Engine {
         query_vector: Option<&[f32]>,
     ) -> Result<Vec<MemoryRow>> {
         let q_tokens = tokenize(query);
+        let q_entities = entities::extract_entities_regex(query);
         let floor = scoring::lexical_floor(q_tokens.len());
         let conn = self.store.conn.lock().unwrap();
 
-        let mut scored = self.gather_working(&conn, &q_tokens, top_k, floor, query_vector)?;
-        let episodic = self.gather_episodic(&conn, &q_tokens, top_k, floor, query_vector)?;
+        let mut scored = self.gather_working(&conn, &q_tokens, &q_entities, top_k, floor, query_vector)?;
+        let episodic =
+            self.gather_episodic(&conn, &q_tokens, &q_entities, top_k, floor, query_vector)?;
         scored.extend(episodic);
+
+        // Graph expansion: pull in memories that mention a query entity (or sit within two graph
+        // hops of one) but were missed by the lexical/FTS/vector gates (`beam.py` L5760-L5793).
+        let present: HashSet<String> = scored.iter().map(|r| r.id.clone()).collect();
+        let injected = self.inject_entity_candidates(&conn, &q_entities, &present)?;
+        scored.extend(injected);
 
         // Cross-tier dedup by normalized content, keeping the higher-scoring row (`beam.py` L6003).
         dedup_by_content(&mut scored);
@@ -243,11 +313,13 @@ impl Engine {
         Ok(selected)
     }
 
-    /// Gather + score working-memory candidates (FTS5 ∪ vector ∪ recency fallback).
+    /// Gather + score working-memory candidates (FTS5 ∪ vector ∪ recency fallback), with the
+    /// knowledge-layer graph/fact bonuses and entity/fact multipliers (`beam.py` L5760-L5793).
     fn gather_working(
         &self,
         conn: &Connection,
         q_tokens: &[String],
+        q_entities: &[String],
         top_k: usize,
         floor: f64,
         query_vector: Option<&[f32]>,
@@ -290,7 +362,10 @@ impl Engine {
             }
             let relevance = scoring::blend_fts(lexical, nfts, floor);
             let decay = scoring::recency_decay(age_hours(&row.timestamp));
-            let base = scoring::working_memory_score(relevance, row.importance, iw, vec_sim, decay);
+            let bonuses = self.knowledge_bonuses(conn, &row.id, q_entities)?;
+            let mut base = scoring::working_memory_score(relevance, row.importance, iw, vec_sim, decay);
+            base += bonuses.graph_bonus + bonuses.fact_bonus;
+            base = bonuses.apply_multipliers(base);
             row.score = base * scoring::veracity_multiplier(&row.veracity);
             scored.push(row);
         }
@@ -303,6 +378,7 @@ impl Engine {
         &self,
         conn: &Connection,
         q_tokens: &[String],
+        q_entities: &[String],
         top_k: usize,
         floor: f64,
         query_vector: Option<&[f32]>,
@@ -356,7 +432,7 @@ impl Engine {
                 _ => 0.0,
             };
             let decay = scoring::recency_decay(age_hours(&row.timestamp));
-            // Graph/fact bonuses are 0 until the knowledge layer lands (P1); threaded for parity.
+            let bonuses = self.knowledge_bonuses(conn, &row.id, q_entities)?;
             let base = scoring::episodic_score(
                 sim,
                 nfts,
@@ -364,10 +440,11 @@ impl Engine {
                 lexical,
                 decay,
                 weights,
-                0.0,
-                0.0,
+                bonuses.graph_bonus,
+                bonuses.fact_bonus,
                 binary_bonus,
             );
+            let base = bonuses.apply_multipliers(base);
             row.score = base
                 * scoring::tier_weight(row.tier_level)
                 * scoring::veracity_multiplier(&row.veracity);
@@ -446,6 +523,9 @@ impl Engine {
                 "UPDATE working_memory SET consolidated_at = ?2 WHERE id = ?1",
                 params![seed.wm_id, now],
             )?;
+            // Mirror the deterministic knowledge layer onto the episodic id so the episodic recall
+            // tier carries its own entity/fact/graph signals.
+            self.ingest_knowledge(&conn, &ep_id, &seed.content, &seed.veracity)?;
             count += 1;
         }
         let preview: String = pending
@@ -584,6 +664,123 @@ impl Engine {
             )?;
         }
         Ok(())
+    }
+
+    /// Compute the knowledge-layer recall signals for a candidate keyed by `row_id`: the additive
+    /// `graph_bonus` (incident `graph_edges`) and `fact_bonus` (query entities appearing in the
+    /// row's `facts`), plus the entity (`*1.3`, capped) and fact (`*1.2`) post-multiplier flags
+    /// (`beam.py` L5779-L5793). With no query entities all signals are inert.
+    fn knowledge_bonuses(
+        &self,
+        conn: &Connection,
+        row_id: &str,
+        q_entities: &[String],
+    ) -> Result<KnowledgeBonuses> {
+        let edges = episodic_graph::edge_count(conn, row_id)?;
+        let graph_bonus = scoring::graph_bonus(edges);
+        if q_entities.is_empty() {
+            return Ok(KnowledgeBonuses {
+                graph_bonus,
+                fact_bonus: 0.0,
+                entity_match: false,
+                fact_match: false,
+            });
+        }
+
+        let mentions = annotations::query_by_memory(conn, row_id, Some("mentions"))?;
+        let entity_match = q_entities.iter().any(|e| {
+            mentions
+                .iter()
+                .any(|m| m.value.eq_ignore_ascii_case(e.as_str()))
+        });
+
+        let mut stmt =
+            conn.prepare("SELECT subject, object FROM facts WHERE source_msg_id = ?1")?;
+        let fact_terms: Vec<(String, String)> = stmt
+            .query_map(params![row_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let fact_match_count = q_entities
+            .iter()
+            .filter(|e| {
+                fact_terms.iter().any(|(s, o)| {
+                    s.eq_ignore_ascii_case(e.as_str()) || o.eq_ignore_ascii_case(e.as_str())
+                })
+            })
+            .count();
+
+        Ok(KnowledgeBonuses {
+            graph_bonus,
+            fact_bonus: scoring::fact_bonus(fact_match_count),
+            entity_match,
+            fact_match: fact_match_count > 0,
+        })
+    }
+
+    /// Inject working candidates that mention a query entity (or sit within two graph hops of one)
+    /// but were missed by the lexical/FTS/vector gates (`beam.py` L5760-L5793). New candidates are
+    /// scored with the entity-recall floor `(0.6 + 0.2*imp) * (0.7 + 0.3*decay) * veracity`.
+    fn inject_entity_candidates(
+        &self,
+        conn: &Connection,
+        q_entities: &[String],
+        present: &HashSet<String>,
+    ) -> Result<Vec<MemoryRow>> {
+        if q_entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seeds: HashSet<String> = HashSet::new();
+        for entity in q_entities {
+            for ann in annotations::query_by_kind(conn, "mentions", Some(entity), false)? {
+                seeds.insert(ann.memory_id);
+            }
+        }
+        // One graph expansion (depth 2) from the directly-mentioning seeds.
+        let mut expanded: HashSet<String> = HashSet::new();
+        for seed in &seeds {
+            for rel in episodic_graph::find_related_memories(conn, seed, 2, "", 0.0)? {
+                expanded.insert(rel.memory_id);
+            }
+        }
+        seeds.extend(expanded);
+
+        let mut out = Vec::new();
+        for id in seeds {
+            if present.contains(&id) {
+                continue;
+            }
+            if let Some(mut row) = self.fetch_working(conn, &id)? {
+                let decay = scoring::recency_decay(age_hours(&row.timestamp));
+                let base = (0.6 + 0.2 * row.importance) * (0.7 + 0.3 * decay);
+                row.score = base * scoring::veracity_multiplier(&row.veracity);
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The knowledge-layer recall signals for a single candidate.
+struct KnowledgeBonuses {
+    graph_bonus: f64,
+    fact_bonus: f64,
+    entity_match: bool,
+    fact_match: bool,
+}
+
+impl KnowledgeBonuses {
+    /// Apply the entity (`*1.3`, capped at 1.0) and fact (`*1.2`) multipliers to a base score
+    /// (`beam.py` L5785-L5793).
+    fn apply_multipliers(&self, base: f64) -> f64 {
+        let mut s = base;
+        if self.entity_match {
+            s = (s * 1.3).min(1.0);
+        }
+        if self.fact_match {
+            s *= 1.2;
+        }
+        s
     }
 }
 
@@ -978,6 +1175,81 @@ mod tests {
         assert!(
             hits.iter().all(|h| h.content != "beta banana"),
             "the orthogonal memory must not pass the vector gate"
+        );
+    }
+
+    #[test]
+    fn remember_extracts_entities_and_facts() {
+        let e = engine();
+        let id = e
+            .remember("Maya works at Acme and uses Postgres", &RememberArgs::default())
+            .unwrap();
+        let c = e.store.conn.lock().unwrap();
+
+        // Entities became `mentions` annotations.
+        let mentions = annotations::query_by_memory(&c, &id, Some("mentions")).unwrap();
+        assert!(
+            mentions.iter().any(|m| m.value == "Maya"),
+            "expected a Maya mention, got {mentions:?}"
+        );
+
+        // SPO triples landed in `facts` and were consolidated.
+        let fact_rows: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE source_msg_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fact_rows >= 1, "expected at least one extracted fact");
+        let works_at: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM consolidated_facts \
+                 WHERE subject = 'Maya' AND predicate = 'works_at' AND object = 'Acme'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(works_at, 1, "Maya works_at Acme should be consolidated");
+    }
+
+    #[test]
+    fn entity_and_fact_match_reorders_recall() {
+        let e = engine();
+        // The entity-/fact-bearing memory (capitalized "Acme" -> entity + `works_at` fact)...
+        e.remember("Maya works at Acme on infrastructure", &RememberArgs::default())
+            .unwrap();
+        // ...and a lexical-only distractor that mentions "acme" lowercase (no entity extracted).
+        e.remember("the acme deadline is approaching", &RememberArgs::default())
+            .unwrap();
+
+        // A capitalized-entity query: both rows match lexically, but the entity/fact multipliers
+        // must lift the structured memory to the top.
+        let hits = e.recall("Acme", 5).unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].content.contains("Maya"),
+            "entity+fact match should rank first, got {:?}",
+            hits.iter().map(|h| (&h.content, h.score)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cooccurrence_links_memories_sharing_an_entity() {
+        let e = engine();
+        let a = e
+            .remember("Maya leads the Phoenix team", &RememberArgs::default())
+            .unwrap();
+        let b = e
+            .remember("Maya approved the Phoenix budget", &RememberArgs::default())
+            .unwrap();
+        let c = e.store.conn.lock().unwrap();
+        // The two memories share the "Maya"/"Phoenix" entities -> a `references` edge was drawn.
+        assert!(episodic_graph::edge_count(&c, &a).unwrap() >= 1);
+        let related = episodic_graph::find_related_memories(&c, &a, 2, "", 0.0).unwrap();
+        assert!(
+            related.iter().any(|r| r.memory_id == b),
+            "graph should relate the two Maya/Phoenix memories"
         );
     }
 }

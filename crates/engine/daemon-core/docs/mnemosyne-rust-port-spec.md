@@ -522,8 +522,13 @@ gathers WM **and** EM candidates from FTS5 BM25 (`fts_working` / `fts_episodes`,
 `raw/(1+raw)` and blended with lexical per §7.4 in [`scoring::blend_fts`]), the stored embeddings
 (cosine), and the recency fallback scan (limit 2000), under the always-on validity + scope filters.
 WM rows score with `working_memory_score`; EM rows with `episodic_score` plus the MIB `binary_bonus`
-and the `tier_weight` / `veracity_multiplier` post-multipliers (graph/fact bonuses pass `0` until the
-knowledge layer lands — P1). Results are content-deduped (keeping the higher score), MMR-diversified
+and the `tier_weight` / `veracity_multiplier` post-multipliers. Both tiers now thread the live
+knowledge-layer signals (§10 as-built): `Engine::knowledge_bonuses` supplies the additive
+`graph_bonus` (incident `graph_edges`) and `fact_bonus` (query entities matched in the row's
+`facts`), plus the entity (`*1.3`, capped) / fact (`*1.2`) post-multipliers keyed on the query
+entities from `extract_entities_regex`; `Engine::inject_entity_candidates` adds entity-mentioning
+(and depth-2 graph-related) rows missed by the lexical/FTS/vector gates at the §7.6 new-candidate
+floor. Results are content-deduped (keeping the higher score), MMR-diversified
 for >=4-token queries ([`mmr::mmr_rerank`]), sliced to `top_k`, and have `recall_count` /
 `last_recalled` bumped. The synonym `+0.75` partial, MEMORIA supplement, and `channel_id`/`author_*`
 scope widening remain TODO. Episodic rows are produced by [`Engine::consolidate`] (a minimal
@@ -621,6 +626,20 @@ logic; P3 priority.
 ---
 
 ## 10. The knowledge layer
+
+**As-built (K1, deterministic — [`knowledge/`](../../../memory/daemon-mnemosyne/src/knowledge/)):**
+the SQLite-backed stores are live over their schema tables (§4.6): `triples::{add, end, query}`
+(temporal SPO chains, supersession + `as_of`), `annotations::{add, add_many, query_by_memory,
+query_by_kind}` (`INSERT OR IGNORE`, `mentions` read-time noise filter), `canonical::{remember,
+forget}` (versioned identity cards), `episodic_graph::{extract_facts, store_fact, add_edge,
+edge_count, find_related_memories}` (regex SPO + `graph_edges` BFS), and `veracity::{consolidate_fact,
+record_conflict, run_consolidation_pass}` (`consolidated_facts` upsert with Bayesian confidence,
+`(S,P)` contradiction → `conflicts`, higher-confidence-wins pass). Extraction is deterministic only:
+`entities::extract_entities_regex` (real) feeds `mentions`, and `extract_facts` feeds `facts` +
+`consolidated_facts`. `Engine::ingest_knowledge` runs this on every `remember` (and per episodic id at
+`consolidate`), also drawing bounded entity co-occurrence `references` edges; the recall path consumes
+the graph/fact signals (§7.8). LLM-based extraction (§11), the tier-2 LLM conflict detector (§10.7),
+rule-based gists, temporal parsing (§10.5 `parse_nl_date`), and the E6 legacy migration remain TODO.
 
 ### 10.1 TripleStore — `triples.py`
 
@@ -848,9 +867,12 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
   MMR), `remember`/`get_context`, a minimal WM->episodic promotion ([`Engine::consolidate`]), and
   `MemoryProvider::{prompt_block, recall, after_turn, on_session_switch}`. Result: a working
   SQLite-backed memory provider daemon-core can register.
-- **P1 — depth:** full `sleep`/consolidation (LLM summarization + tier degradation atop the minimal
-  promotion), dynamics (`typed_memory`, `weibull`), the knowledge layer
-  (triples/annotations/canonical/graph/veracity bonuses), and the full tool surface.
+- **P1 — depth:** the deterministic knowledge layer is **done** (K1, §10 as-built): the
+  triples/annotations/canonical/episodic-graph/veracity stores, deterministic regex extraction wired
+  into `remember`/`consolidate`, and the live graph/fact/entity recall bonuses. Still open: full
+  `sleep`/consolidation (LLM summarization + tier degradation atop the minimal promotion), dynamics
+  (`typed_memory`, `weibull`), LLM-based knowledge extraction + tier-2 conflict detection, temporal
+  parsing / rule-based gists, and the full tool surface.
 - **P2 — quality:** enhanced + polyphonic recall, `query_intent`/`query_cache`/`synonyms`, MIB binary
   bonus, plugins, and LLM extraction via Provider.
 - **P3 — ecosystem:** sync/streaming, SHMR, patterns, local-GGUF fallback.
