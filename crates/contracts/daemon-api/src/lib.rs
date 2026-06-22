@@ -38,9 +38,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod profile;
 pub use profile::{
-    BudgetSpec, ConfigField, ConfigPatch, ConfigSchema, ContextEngineSel, CredentialInfo,
-    Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
-    ProviderSelector,
+    BudgetSpec, ContextEngineSel, CredentialInfo, Distribution, EngineTunables, MemoryProviderSel,
+    ModelDescriptor, ProfileInfo, ProfileSpec, ProviderSelector, SessionOverlay, ToolsOverride,
 };
 
 /// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
@@ -212,12 +211,13 @@ pub trait SessionApi: Send + Sync {
         Ok(())
     }
 
-    /// Switch a **live** session's model (and optionally its provider) in place — a transient,
-    /// per-session model switch (the bound profile is not mutated, mirroring hermes
-    /// `set_session_model`). The host rebuilds a provider for the new model from the session's
-    /// profile and swaps it on the running engine; it takes effect at the next turn boundary so an
-    /// in-flight turn's prompt cache is preserved. Default: unsupported (a transport with no live
-    /// model factory). `provider = None` keeps the profile's current provider.
+    /// Switch a session's model (and optionally its provider) — a per-session override recorded on
+    /// the session's [`SessionOverlay`] (the bound profile is not mutated). The override is
+    /// **persisted** as host-level session metadata and applied to the running engine in place when
+    /// the session is resident (swapped at the next turn boundary so an in-flight turn's prompt
+    /// cache is preserved); a non-resident/durable session picks it up at its next (re)hydration,
+    /// so the switch survives a restart. Default: unsupported. `provider = None` keeps the profile's
+    /// current provider. A convenience wrapper over [`set_session_overlay`](Self::set_session_overlay).
     async fn set_session_model(
         &self,
         _session: SessionId,
@@ -227,18 +227,34 @@ pub trait SessionApi: Send + Sync {
         Err(ApiError::Unsupported("set_session_model".into()))
     }
 
-    /// Set a **live** session's edit-approval [`ApprovalMode`] (the §12 session mode) in place — a
-    /// transient, per-session switch (the bound profile is not mutated, mirroring hermes
-    /// `set_session_mode`). It governs how a gated tool action (an fs edit, a dangerous shell
-    /// command) is serviced: auto-allow, deny, or ask (the host parks for a human on the live path
-    /// or suspends the turn on the durable path). Takes effect at the next gated action. Default:
-    /// unsupported (a transport with no live session policy store).
+    /// Set a session's edit-approval [`ApprovalMode`] (the §12 session mode) — a per-session override
+    /// recorded on the session's [`SessionOverlay`] (the bound profile is not mutated). It governs
+    /// how a gated tool action (an fs edit, a dangerous shell command) is serviced: auto-allow,
+    /// deny, or ask (the host parks for a human on the live path or suspends the turn on the durable
+    /// path). **Persisted** + applied in place when resident; restored on rehydration. Default:
+    /// unsupported. A convenience wrapper over [`set_session_overlay`](Self::set_session_overlay).
     async fn set_session_mode(
         &self,
         _session: SessionId,
         _mode: ApprovalMode,
     ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("set_session_mode".into()))
+    }
+
+    /// Replace a session's whole [`SessionOverlay`] — the unified per-session override surface
+    /// (model / provider / tool allowlist / approval mode) layered on top of the bound profile. The
+    /// overlay is **persisted** as host-level session metadata, so every override is restored on
+    /// rehydration rather than lost on restart. What can be applied to a resident actor in place
+    /// (model/provider/approval) is; a tool-allowlist change takes effect at the next (re)hydration
+    /// (the live tool registry is fixed for an actor's lifetime). [`set_session_model`](Self::set_session_model)
+    /// and [`set_session_mode`](Self::set_session_mode) are field-scoped conveniences over this.
+    /// Default: unsupported (a transport with no live session overlay store).
+    async fn set_session_overlay(
+        &self,
+        _session: SessionId,
+        _overlay: SessionOverlay,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("set_session_overlay".into()))
     }
 }
 
@@ -478,12 +494,13 @@ pub trait ModelApi: Send + Sync {
     }
 }
 
-/// The profile / runtime-config sub-surface: create, inspect, edit, and select the agent
-/// configuration bundles ([`ProfileSpec`]) a session binds to, plus the dynamically-settable
-/// runtime config (`DAEMON_MODEL`/`DAEMON_MODEL_PROVIDER`/persona/credential-ref) the GUI drives
-/// without restarting the node. Every method defaults to [`ApiError::Unsupported`] / empty so a
-/// transport that hosts no profile store (the session-only FFI, test stubs) inherits the surface;
-/// the node's [`NodeApi`] binds the real implementation (backed by a `ProfileStore`).
+/// The profile sub-surface: create, inspect, edit, and select the agent configuration bundles
+/// ([`ProfileSpec`]) a session binds to. A profile is the single durable configuration unit; it is
+/// edited in full via `profile_update` (no separate partial-config surface), and a live session is
+/// adjusted via a `SessionOverlay` ([`SessionApi::set_session_overlay`]). Every method defaults to
+/// [`ApiError::Unsupported`] / empty so a transport that hosts no profile store (the session-only
+/// FFI, test stubs) inherits the surface; the node's [`NodeApi`] binds the real implementation
+/// (backed by a `ProfileStore`).
 #[async_trait]
 pub trait ProfileApi: Send + Sync {
     /// All known profiles (listing view, with the active default marked).
@@ -514,25 +531,6 @@ pub trait ProfileApi: Send + Sync {
     /// Select the active default profile (new sessions bind to it unless overridden).
     async fn profile_select(&self, _id: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("profile_select".into()))
-    }
-
-    /// The resolved effective config for `profile` (`None` = the active default).
-    async fn config_get(&self, _profile: Option<String>) -> Result<Option<ProfileSpec>, ApiError> {
-        Err(ApiError::Unsupported("config_get".into()))
-    }
-
-    /// Apply a runtime-config patch to `profile` (`None` = the active default).
-    async fn config_set(
-        &self,
-        _profile: Option<String>,
-        _patch: ConfigPatch,
-    ) -> Result<(), ApiError> {
-        Err(ApiError::Unsupported("config_set".into()))
-    }
-
-    /// The settable-config schema (a GUI renders it as a settings form). Default: the built-in schema.
-    async fn config_schema(&self) -> ConfigSchema {
-        ConfigSchema::builtin()
     }
 
     /// Clone `source` into a new profile `new_id` (a local copy; starts a fresh revision history).
@@ -1080,20 +1078,6 @@ pub enum ApiRequest {
         /// The profile id to make the active default.
         id: String,
     },
-    /// [`ProfileApi::config_get`].
-    ConfigGet {
-        /// The profile to resolve (`None` = the active default).
-        profile: Option<String>,
-    },
-    /// [`ProfileApi::config_set`].
-    ConfigSet {
-        /// The profile to patch (`None` = the active default).
-        profile: Option<String>,
-        /// The partial config update.
-        patch: ConfigPatch,
-    },
-    /// [`ProfileApi::config_schema`].
-    ConfigSchema,
     /// [`ProfileApi::profile_clone`].
     ProfileClone {
         /// The source profile to copy.
@@ -1190,6 +1174,13 @@ pub enum ApiRequest {
         /// The new edit-approval session mode.
         mode: ApprovalMode,
     },
+    /// [`SessionApi::set_session_overlay`].
+    SetSessionOverlay {
+        /// The session whose per-session overlay to replace.
+        session: SessionId,
+        /// The new overlay (model / provider / tool allowlist / approval mode).
+        overlay: SessionOverlay,
+    },
     /// [`ControlApi::approvals_pending`].
     ApprovalsPending {
         /// Filter to one session, or `None` for the node-wide HITL inbox.
@@ -1265,10 +1256,8 @@ pub enum ApiResponse {
     ModelInspect(GgufInfo),
     /// A profile listing (the active default marked).
     Profiles(Vec<ProfileInfo>),
-    /// One profile's full spec, or `None` if unknown / no active default (profile_get/config_get).
+    /// One profile's full spec, or `None` if unknown / no active default (profile_get).
     Profile(Option<ProfileSpec>),
-    /// The settable-config schema.
-    ConfigSchema(ConfigSchema),
     /// A redacted credential listing.
     Credentials(Vec<CredentialInfo>),
     /// A discoverable model catalog (cloud + local).
@@ -1372,6 +1361,9 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
         } => unit_or_err(api.set_session_model(session, model, provider).await),
         ApiRequest::SetSessionMode { session, mode } => {
             unit_or_err(api.set_session_mode(session, mode).await)
+        }
+        ApiRequest::SetSessionOverlay { session, overlay } => {
+            unit_or_err(api.set_session_overlay(session, overlay).await)
         }
         _ => return None,
     })
@@ -1480,14 +1472,6 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::ProfileUpdate { spec } => unit_or_err(api.profile_update(spec).await),
         ApiRequest::ProfileDelete { id } => unit_or_err(api.profile_delete(id).await),
         ApiRequest::ProfileSelect { id } => unit_or_err(api.profile_select(id).await),
-        ApiRequest::ConfigGet { profile } => match api.config_get(profile).await {
-            Ok(spec) => ApiResponse::Profile(spec),
-            Err(e) => ApiResponse::Error(e),
-        },
-        ApiRequest::ConfigSet { profile, patch } => {
-            unit_or_err(api.config_set(profile, patch).await)
-        }
-        ApiRequest::ConfigSchema => ApiResponse::ConfigSchema(api.config_schema().await),
         ApiRequest::ProfileClone { source, new_id } => {
             unit_or_err(api.profile_clone(source, new_id).await)
         }
@@ -1540,7 +1524,8 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         | ApiRequest::Handover { .. }
         | ApiRequest::RecordMeta { .. }
         | ApiRequest::SetSessionModel { .. }
-        | ApiRequest::SetSessionMode { .. } => {
+        | ApiRequest::SetSessionMode { .. }
+        | ApiRequest::SetSessionOverlay { .. } => {
             unreachable!("session variants handled above")
         }
     }

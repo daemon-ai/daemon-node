@@ -220,12 +220,12 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Capability | Hermes anchor | Required Daemon surface | Daemon state + gap |
 |---|---|---|---|
 | Session lifecycle | `acp_adapter/server.py:1109-1303` | `Submit`/`Poll`/`Respond`/`Subscribe`/`Sessions`/`Cancel`/`SessionHistory` | DONE — [daemon-api/src/lib.rs](../../crates/contracts/daemon-api/src/lib.rs):504-599,801-845. No fork/list-with-cwd. |
-| Profile CRUD (runtime) | `hermes_cli/profiles.py:716,784,1073,1414,1742`; `web_server.py:9011-9357` | `Profile{List,Get,Create,Update,Delete,Select}` ApiRequest variants | **DONE** — `Profile{List,Get,Create,Update,Delete,Select}` + partial-patch `ConfigSet`/`ConfigPatch` over a durable `ProfileStore` ([node_api.rs](../../crates/substrate/daemon-host/src/node_api.rs)). Daemon goes beyond hermes (which is clone-only): a profile is **editable** in place. §5.1 |
+| Profile CRUD (runtime) | `hermes_cli/profiles.py:716,784,1073,1414,1742`; `web_server.py:9011-9357` | `Profile{List,Get,Create,Update,Delete,Select}` ApiRequest variants | **DONE** — `Profile{List,Get,Create,Update,Delete,Select}` over a durable `ProfileStore` ([node_api.rs](../../crates/substrate/daemon-host/src/node_api.rs)); `ProfileUpdate` is the **sole** durable editor (the separate runtime `Config` surface was collapsed in wire v9). Daemon goes beyond hermes (which is clone-only): a profile is **editable** in place. §5.1 |
 | Profile distributions (clone/export/import) | `hermes_cli/profiles.py` clone/export/import | `ProfileClone`/`ProfileExport`/`ProfileImport` + `Distribution` | **DONE** — a distribution = the `ProfileSpec` + the profile's **local** skills (bundled reconstituted on import) + manifest; `credential_ref` kept (a name, not a secret). Wire v6 ([daemon-api/src/lib.rs](../../crates/contracts/daemon-api/src/lib.rs); [node_api.rs](../../crates/substrate/daemon-host/src/node_api.rs)). |
 | Profile + skill version history (USER-FLAGGED) | hermes profiles are **not** git repos (flat dirs + `distribution.yaml`) | `Profile{History,At,Revert}` / `Skill{History,At,Revert}` over a native revision log | **DONE** — native append-only, content-addressed `RevisionLog` ([daemon-common](../../crates/contracts/daemon-common/src/lib.rs); `FileRevisionLog` [revision.rs](../../crates/substrate/daemon-host/src/revision.rs)) shared by profiles + skills; non-destructive revert ⇒ roll-forward; first-class `Author` provenance (operator vs `agent:skill_manage`). See [host-spec §7.2](daemon-host-spec.md). |
-| Config get/set (runtime) | `hermes_cli/config.py:5279,5541,6242`; `web_server.py:3040-3055,3606` | `Config{Get,Set,Schema}` | **MISSING** — config is construction-time `NodeConfig` ([config.rs:323-378](../../bins/daemon/src/config.rs)). §5.1 |
-| Model select per session | `acp_adapter/server.py:1989` | `SetSessionModel` / per-session provider override | **DONE** — `SetSessionModel` live in-memory provider swap on the running actor (`Engine::set_provider` + `ActorMsg::SetProvider`), per-session model override; `ModelActivate` still covers local installed models. §5.2 |
-| Modes / edit-approval policy | `acp_adapter/server.py:2023` | session mode + `HostRequest` approval prompts | **DONE** — `ApprovalPolicy` (`Ask`/`AcceptEdits`/`AutoAllow`/`Deny`) per-session on `Snapshot`/`Config` with an `is_sensitive_path` carve-out; fs + shell edit gates; `SetSessionMode`/`ApprovalMode`; live `ParkingHandler` consults the policy (auto-allow/deny vs park). Autonomous durable engines default `AutoAllow`. |
+| Config get/set (runtime) | `hermes_cli/config.py:5279,5541,6242`; `web_server.py:3040-3055,3606` | `Config{Get,Set,Schema}` | **REMOVED (folded)** — the runtime `Config` surface was a thin facade over the profile store and is gone (wire v9). Durable edits go through `ProfileUpdate`; transient per-session tweaks go through the new `SetSessionOverlay` (model/provider/tools/approval). §5.1 |
+| Model select per session | `acp_adapter/server.py:1989` | `SetSessionModel` / per-session provider override | **DONE** — `SetSessionModel` is now an overlay write: it **persists** the model/provider override on the session's `SessionOverlay` (host-level metadata) and swaps the live actor's provider in place (`Engine::set_provider` + `ActorMsg::SetProvider`). The override is **restored on rehydration** rather than lost on restart. §5.2 |
+| Modes / edit-approval policy | `acp_adapter/server.py:2023` | session mode + `HostRequest` approval prompts | **DONE** — `ApprovalPolicy` (`Ask`/`AcceptEdits`/`AutoAllow`/`Deny`) per-session with an `is_sensitive_path` carve-out; fs + shell edit gates; `SetSessionMode`/`ApprovalMode` now **persist** on the `SessionOverlay` and apply to the live `ParkingHandler` (auto-allow/deny vs park), restored on rehydration. Autonomous durable engines default `AutoAllow`. |
 | Auth / credential registration | `agent/anthropic_adapter.py:1162-1203`; `acp_adapter/server.py:895`, `acp_adapter/auth.py:41` | `Credential{Set,List,Remove}` + lease | PARTIAL — lease→`Request.auth` ([engine.rs:357](../../crates/engine/daemon-core/src/engine.rs)); host source is stub ([source.rs](../../crates/substrate/daemon-credentials/src/source.rs)); no register API. §5.2 |
 | Advertise commands | `acp_adapter/server.py:1692` | push `AvailableCommands` event | MISSING. |
 
@@ -397,7 +397,10 @@ read/write is `load_config`/`save_config`/`set_config_value` with a typed schema
 1. New `ApiRequest`/`ApiResponse` families and a `ProfileApi` trait:
    - `ProfileList`, `ProfileGet { name }`, `ProfileCreate { name, base?, spec }`,
      `ProfileUpdate { name, spec }`, `ProfileDelete { name }`, `ProfileSelect { session?, name }`.
-   - `ConfigGet { profile }`, `ConfigSet { profile, patch }`, `ConfigSchema`.
+   - `SetSessionOverlay { session, overlay }` for transient per-session tweaks (model / provider /
+     tool allowlist / approval mode). *(The earlier `ConfigGet`/`ConfigSet`/`ConfigSchema` runtime
+     surface was collapsed in wire v9: it duplicated the profile store. `ProfileUpdate` is the sole
+     durable editor; the persisted `SessionOverlay` carries the per-session, non-durable overrides.)*
    A `ProfileSpec` mirrors the union of `NodeConfig` provider/model/credential fields plus the
    engine `Config` tunables and a system-prompt/persona slot (the analogue of `SOUL.md`, replacing
    the hardcoded prompts in `assemble`, [daemon-node:167-228](../../crates/node/daemon-node/src/lib.rs)).
@@ -409,8 +412,8 @@ read/write is `load_config`/`save_config`/`set_config_value` with a typed schema
    [main.rs:176-184](../../bins/daemon/src/main.rs)), so they survive restarts like `HERMES_HOME`.
 4. Credentials register through the same surface (see §5.2) keyed by profile.
 
-**Minimal D0 slice.** `ProfileCreate` + `ProfileSelect`-at-open + `ConfigSet{model, provider}` —
-enough for the GUI to make an Anthropic/Opus profile and open a session on it.
+**Minimal D0 slice.** `ProfileCreate` + `ProfileSelect`-at-open + `SetSessionOverlay{model, provider}`
+— enough for the GUI to make an Anthropic/Opus profile and open a session on it.
 
 ### 5.2 Dynamic model discovery (cloud + local, unified)
 

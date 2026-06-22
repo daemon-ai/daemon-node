@@ -13,13 +13,13 @@
 
 use crate::{
     Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, ParkedApproval, SessionSearchHit, SessionStatus, SessionStore, StoreError,
-    StoreStats, TraceEntry, TraceSegment,
+    JournalPage, ParkedApproval, SessionMeta, SessionSearchHit, SessionStatus, SessionStore,
+    StoreError, StoreStats, TraceEntry, TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
     ContentHash, DaemonError, Epoch, FenceToken, JobId, JournalStreamId, MerkleRoot, PartitionId,
-    SessionId, SnapshotBlob, UsageDelta,
+    ProfileRef, SessionId, SnapshotBlob, UsageDelta,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -100,6 +100,17 @@ CREATE TABLE IF NOT EXISTS background_edges (
     parent_session TEXT NOT NULL,
     work_label     TEXT NOT NULL,
     origin         TEXT NOT NULL DEFAULT 'background'
+);
+
+-- Host-level per-session metadata: the profile a session resolves its engine from plus an opaque
+-- overlay blob (the host's CBOR `SessionOverlay`). The store treats `overlay` as opaque bytes
+-- (protocol-free). Read by the resolver at engine construction, so a live override is restored on
+-- rehydration. A sidecar table (not columns on `session_record`) so it never touches the hot
+-- checkpoint/fence row logic.
+CREATE TABLE IF NOT EXISTS session_meta (
+    session_id    TEXT PRIMARY KEY,
+    bound_profile TEXT,
+    overlay       BLOB
 );
 
 CREATE TABLE IF NOT EXISTS session_usage (
@@ -916,6 +927,37 @@ impl SessionStore for SqliteStore {
         .ok()
         .flatten()
         .map(SnapshotBlob::new)
+    }
+
+    async fn set_session_meta(&self, id: &SessionId, meta: SessionMeta) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let bound = meta.bound_profile.as_ref().map(|p| p.as_str());
+        conn.execute(
+            "INSERT INTO session_meta (session_id, bound_profile, overlay) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3",
+            params![id.as_str(), bound, meta.overlay],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT bound_profile, overlay FROM session_meta WHERE session_id = ?1",
+            params![id.as_str()],
+            |row| {
+                let bound: Option<String> = row.get(0)?;
+                let overlay: Vec<u8> = row.get(1)?;
+                Ok(SessionMeta {
+                    bound_profile: bound.map(ProfileRef::new),
+                    overlay,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {

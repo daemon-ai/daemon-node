@@ -23,11 +23,11 @@ use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
 use crate::routing::RoutingRegistry;
 use daemon_api::{
-    ApiError, ApprovalInfo, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo,
+    ApiError, ApprovalInfo, ApprovalMode, ControlApi, CredentialApi, CredentialInfo,
     Distribution, FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
     LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
     ProfileInfo, ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionInfo,
-    SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
+    SessionOverlay, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -75,8 +75,38 @@ fn api_origin() -> Origin {
 /// Builds a fresh live [`Engine`] for an interactive session id (the session sub-surface's engine
 /// seam — the binary supplies the provider/tools/system). The optional [`ProfileRef`] selects which
 /// profile bundle the engine is materialized from (host routing's agent-selection degree of freedom);
-/// `None` resolves the node's active default, preserving the legacy single-profile behavior.
-pub type SessionEngineBuilder = Arc<dyn Fn(SessionId, Option<ProfileRef>) -> Engine + Send + Sync>;
+/// `None` resolves the node's active default. The [`SessionOverlay`] is the session's persisted
+/// per-session override (model/provider/tools/approval), applied on top of the bound profile at
+/// build time, so a live override is **restored** when the actor is (re)spawned.
+pub type SessionEngineBuilder =
+    Arc<dyn Fn(SessionId, Option<ProfileRef>, &SessionOverlay) -> Engine + Send + Sync>;
+
+/// Resolve a session's effective [`EngineProfile`] from its bound profile ref + persisted overlay —
+/// the durable-path counterpart of [`SessionEngineBuilder`], injected into [`CoreEngineFactory`] by
+/// the node (which owns the profile store + resolution rules). Returns `None` when no profile store
+/// is configured or the bound profile is absent, so the durable path falls back to the factory's
+/// default (orchestrator) profile. This is the seam that makes durable rehydration re-resolve from
+/// the profile store + overlay instead of pinning the factory's fixed profile.
+pub type DurableProfileResolver = Arc<
+    dyn Fn(Option<ProfileRef>, &SessionOverlay) -> Option<daemon_core::EngineProfile> + Send + Sync,
+>;
+
+/// Encode a [`SessionOverlay`] to the opaque CBOR blob the store persists (host-level metadata).
+pub fn encode_overlay(overlay: &SessionOverlay) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // A SessionOverlay is always serializable; a failure here is a bug, not a runtime condition.
+    ciborium::into_writer(overlay, &mut buf).expect("encode SessionOverlay");
+    buf
+}
+
+/// Decode a [`SessionOverlay`] from its persisted blob; an empty/malformed blob is the empty
+/// (all-inherit) overlay, so a session with no recorded override resolves straight from its profile.
+pub fn decode_overlay(bytes: &[u8]) -> SessionOverlay {
+    if bytes.is_empty() {
+        return SessionOverlay::default();
+    }
+    ciborium::from_reader(bytes).unwrap_or_default()
+}
 
 /// Builds a fresh model [`Provider`] from a (model-overridden) [`ProfileSpec`] — the seam a live
 /// [`SessionApi::set_session_model`](daemon_api::SessionApi::set_session_model) uses to rebuild a
@@ -181,13 +211,18 @@ impl NodeApiImpl {
     ) -> Self {
         let session_modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>> =
             Arc::new(DashMap::new());
+        let live = Arc::new(LiveSessions::new(
+            engine_builder,
+            session_modes.clone(),
+            store.clone(),
+        ));
         Self {
             supervisor,
             store,
             manager,
             fleet,
             partition,
-            live: Arc::new(LiveSessions::new(engine_builder, session_modes.clone())),
+            live,
             owners: Arc::new(DashMap::new()),
             verifier: None,
             models: None,
@@ -309,6 +344,67 @@ impl NodeApiImpl {
             Some(id) => store.get(&id).map_err(profile_err),
             None => Ok(None),
         }
+    }
+
+    /// Resolve the [`ProfileSpec`] a session resolves its engine from: the session's persisted
+    /// bound profile, falling back to the node's active default. The base for a live override apply.
+    async fn session_spec(&self, session: &SessionId) -> Result<Option<ProfileSpec>, ApiError> {
+        let bound = self
+            .store
+            .session_meta(session)
+            .await
+            .and_then(|m| m.bound_profile);
+        match bound {
+            Some(r) => self.resolve_profile(Some(r.as_str().to_string())),
+            None => self.resolve_profile(None),
+        }
+    }
+
+    /// Read-modify-write a session's persisted [`SessionOverlay`] (preserving its bound profile),
+    /// returning the updated overlay. This is the single persistence path for every per-session
+    /// override (model/provider/tools/approval), so an override is restored on rehydration.
+    async fn update_overlay<F: FnOnce(&mut SessionOverlay)>(
+        &self,
+        session: &SessionId,
+        f: F,
+    ) -> SessionOverlay {
+        let mut meta = self.store.session_meta(session).await.unwrap_or_default();
+        let mut overlay = decode_overlay(&meta.overlay);
+        f(&mut overlay);
+        meta.overlay = encode_overlay(&overlay);
+        let _ = self.store.set_session_meta(session, meta).await;
+        overlay
+    }
+
+    /// Apply a session's overlay to a live (resident) actor in place: rebuild the provider for a
+    /// model/provider override and switch the edit-approval policy for a mode override. A
+    /// non-resident (durable) session is a no-op here — it picks the overlay up at its next
+    /// (re)hydration. Tool-allowlist overrides are *not* hot-applied (the live registry is fixed for
+    /// the actor's lifetime); they take effect on the next (re)hydration.
+    async fn apply_overlay_live(
+        &self,
+        session: &SessionId,
+        overlay: &SessionOverlay,
+    ) -> Result<(), ApiError> {
+        let Some(handle) = self.live.handle_if_live(session) else {
+            return Ok(());
+        };
+        if overlay.model.is_some() || overlay.provider.is_some() {
+            let factory = self.model_factory.as_ref().ok_or_else(|| {
+                ApiError::Unsupported("per-session model switch is not available".into())
+            })?;
+            let mut spec = self.session_spec(session).await?.ok_or_else(|| {
+                ApiError::Unsupported("no profile to derive a provider from".into())
+            })?;
+            overlay.apply_to(&mut spec);
+            handle.set_provider((factory)(&spec)).await;
+        }
+        if let Some(mode) = overlay.approval_mode {
+            let policy = approval_mode_to_policy(mode);
+            handle.set_approval_policy(policy).await;
+            self.session_modes.insert(session.clone(), policy);
+        }
+        Ok(())
     }
 
     /// The revision log, or [`ApiError::Unsupported`] when this node hosts no versioning.
@@ -729,7 +825,9 @@ impl SessionApi for NodeApiImpl {
                 | AgentCommand::Steer { .. }
                 | AgentCommand::Observe { .. }
         ) {
-            self.live.ensure(&resolved.session, resolved.profile.clone());
+            self.live
+                .ensure(&resolved.session, resolved.profile.clone())
+                .await;
             self.live
                 .seed_primary_target(&resolved.session, resolved.delivery.clone());
         }
@@ -794,26 +892,18 @@ impl SessionApi for NodeApiImpl {
         model: String,
         provider: Option<ProviderSelector>,
     ) -> Result<(), ApiError> {
-        let factory = self.model_factory.as_ref().ok_or_else(|| {
-            ApiError::Unsupported("per-session model switch is not available".into())
-        })?;
-        // Only a resident (live-actor) session can have its provider swapped in place; a durable
-        // session re-resolves its model from the profile on rehydration.
-        let handle = self
-            .live
-            .handle_if_live(&session)
-            .ok_or_else(|| ApiError::UnknownSession(session.as_str().to_string()))?;
-        // Derive the new provider from the session's bound profile (the active default), overriding
-        // the model (and optionally the provider). The profile itself is left unmodified.
-        let mut spec = self.resolve_profile(None)?.ok_or_else(|| {
-            ApiError::Unsupported("no active profile to derive a provider from".into())
-        })?;
-        spec.model = model.clone();
-        if let Some(p) = provider {
-            spec.provider = p;
-        }
-        let new_provider = (factory)(&spec);
-        handle.set_provider(new_provider).await;
+        // Persist the model/provider override on the session overlay (durable host-level metadata),
+        // then apply it to the live actor in place when resident. A non-resident session picks it up
+        // at its next (re)hydration via the overlay — so a switch is no longer lost on restart.
+        let overlay = self
+            .update_overlay(&session, |o| {
+                o.model = Some(model.clone());
+                if let Some(p) = provider {
+                    o.provider = Some(p);
+                }
+            })
+            .await;
+        self.apply_overlay_live(&session, &overlay).await?;
         self.session_models.insert(session, model);
         Ok(())
     }
@@ -821,18 +911,34 @@ impl SessionApi for NodeApiImpl {
     async fn set_session_mode(
         &self,
         session: SessionId,
-        mode: daemon_api::ApprovalMode,
+        mode: ApprovalMode,
     ) -> Result<(), ApiError> {
-        let policy = approval_mode_to_policy(mode);
-        // Only a resident (live-actor) session can have its mode switched in place; a durable
-        // session re-resolves its policy from the engine config / snapshot on rehydration.
-        let handle = self
-            .live
-            .handle_if_live(&session)
-            .ok_or_else(|| ApiError::UnknownSession(session.as_str().to_string()))?;
-        handle.set_approval_policy(policy).await;
-        // Record the live mode so the live ParkingHandler can consult it (auto-allow vs park).
-        self.session_modes.insert(session, policy);
+        // Persist the edit-approval override on the overlay, then switch the live actor's policy in
+        // place when resident (the live ParkingHandler reads `session_modes` to auto-allow vs park).
+        let overlay = self.update_overlay(&session, |o| o.approval_mode = Some(mode)).await;
+        self.apply_overlay_live(&session, &overlay).await?;
+        // Keep the live mode cache populated even when not resident, so a freshly-resident actor's
+        // ParkingHandler sees the persisted policy until `apply_overlay_live` refreshes it.
+        self.session_modes
+            .insert(session, approval_mode_to_policy(mode));
+        Ok(())
+    }
+
+    async fn set_session_overlay(
+        &self,
+        session: SessionId,
+        overlay: SessionOverlay,
+    ) -> Result<(), ApiError> {
+        // The unified per-session override write: persist the whole overlay, then apply what can be
+        // hot-applied to a resident actor (model/provider/approval). A tool-allowlist change takes
+        // effect on the next (re)hydration (the live registry is fixed for an actor's lifetime).
+        let persisted = self
+            .update_overlay(&session, |o| *o = overlay.clone())
+            .await;
+        self.apply_overlay_live(&session, &persisted).await?;
+        if let Some(model) = &persisted.model {
+            self.session_models.insert(session, model.clone());
+        }
         Ok(())
     }
 }
@@ -1093,37 +1199,6 @@ impl ProfileApi for NodeApiImpl {
 
     async fn profile_select(&self, id: String) -> Result<(), ApiError> {
         self.profile_store()?.set_active(&id).map_err(profile_err)
-    }
-
-    async fn config_get(&self, profile: Option<String>) -> Result<Option<ProfileSpec>, ApiError> {
-        self.resolve_profile(profile)
-    }
-
-    async fn config_set(
-        &self,
-        profile: Option<String>,
-        patch: ConfigPatch,
-    ) -> Result<(), ApiError> {
-        let store = self.profile_store()?;
-        let id = match profile {
-            Some(id) => id,
-            None => store
-                .active()
-                .map_err(profile_err)?
-                .ok_or_else(|| ApiError::Other("no active profile to patch".into()))?,
-        };
-        let mut spec = store
-            .get(&id)
-            .map_err(profile_err)?
-            .ok_or_else(|| ApiError::UnknownSession(id.clone()))?;
-        patch.apply(&mut spec);
-        store.update(spec).map_err(profile_err)?;
-        self.record_profile(&id, daemon_common::Author::Operator, "config_set");
-        Ok(())
-    }
-
-    async fn config_schema(&self) -> ConfigSchema {
-        ConfigSchema::builtin()
     }
 
     async fn profile_clone(&self, source: String, new_id: String) -> Result<(), ApiError> {
@@ -1413,6 +1488,9 @@ impl Drop for LiveSession {
 struct LiveSessions {
     sessions: DashMap<SessionId, LiveSession>,
     builder: SessionEngineBuilder,
+    /// The durable session store: read at `ensure` to restore a session's persisted overlay (so a
+    /// live model/tools/mode override survives an actor respawn) and to record its bound profile.
+    store: Arc<dyn SessionStore>,
     /// The verifiable-journal store + signer, when journaling is enabled for live sessions.
     journal: Mutex<Option<JournalConfig>>,
     /// The §4.3 background-spawn materializer, when configured: lets a live session's `Effect::Spawn`
@@ -1427,10 +1505,12 @@ impl LiveSessions {
     fn new(
         builder: SessionEngineBuilder,
         modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
+        store: Arc<dyn SessionStore>,
     ) -> Self {
         Self {
             sessions: DashMap::new(),
             builder,
+            store,
             journal: Mutex::new(None),
             background: Mutex::new(None),
             modes,
@@ -1453,11 +1533,25 @@ impl LiveSessions {
     /// Spawn (or reuse) the actor for `session`, returning its handle. The `profile` selects which
     /// profile bundle a *new* session's engine is built from (the routing agent-selection seam); a
     /// resident session ignores it (the first `ensure` binds the profile — bindings are sticky).
-    fn ensure(&self, session: &SessionId, profile: Option<ProfileRef>) -> AgentHandle {
+    ///
+    /// The session's persisted [`SessionOverlay`] is read from the store and applied on top of the
+    /// bound profile at build time, so a live model/tools/approval override is **restored** when the
+    /// actor is (re)spawned (e.g. after a host restart). The first `ensure` also records the bound
+    /// profile in the store metadata, so the durable path can later re-resolve the same profile.
+    async fn ensure(&self, session: &SessionId, profile: Option<ProfileRef>) -> AgentHandle {
         if let Some(s) = self.sessions.get(session) {
             return s.handle.clone();
         }
-        let engine = (self.builder)(session.clone(), profile);
+        // Read (and, for a new session, establish) the host-level session metadata: the bound
+        // profile + persisted overlay. A read-modify-write keeps the overlay intact when we are only
+        // stamping the bound profile for the first time.
+        let mut meta = self.store.session_meta(session).await.unwrap_or_default();
+        if meta.bound_profile.is_none() && profile.is_some() {
+            meta.bound_profile = profile.clone();
+            let _ = self.store.set_session_meta(session, meta.clone()).await;
+        }
+        let overlay = decode_overlay(&meta.overlay);
+        let engine = (self.builder)(session.clone(), profile, &overlay);
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let log: Merged = Arc::new(Mutex::new(MergedLog::new()));
@@ -1541,7 +1635,7 @@ impl LiveSessions {
             AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
                 // (including the terminal `TurnFinished`) flow to the drain queue for `poll`.
-                let handle = self.ensure(&session, None);
+                let handle = self.ensure(&session, None).await;
                 // Seed the session's Primary reply sink from the opening origin (where replies post by
                 // default), unless one is already in force. Handover re-points it later.
                 self.seed_primary(&session, &origin);
@@ -1590,7 +1684,7 @@ impl LiveSessions {
             AgentCommand::Steer { text, request_id } => {
                 // Steer-when-idle opens a fresh turn; mid-turn it is drained at a phase boundary.
                 // Either way the ack + any turn events flow to the drain queue via the pump.
-                let handle = self.ensure(&session, None);
+                let handle = self.ensure(&session, None).await;
                 self.record_inbound(
                     &session,
                     origin,
@@ -1607,7 +1701,7 @@ impl LiveSessions {
                 // Context-only append (no turn): spawn-if-absent so the chatter has a conversation to
                 // land in, record it as context, then hand it to the actor — which folds it in when
                 // idle or queues it for the following turn when busy (event-io §5.9). No turn starts.
-                let handle = self.ensure(&session, None);
+                let handle = self.ensure(&session, None).await;
                 self.record_inbound(
                     &session,
                     origin,

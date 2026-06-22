@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use daemon_api::{EngineTunables, FleetReport, ProfileSpec};
+use daemon_api::{
+    ApprovalMode, ContextEngineSel, EngineTunables, FleetReport, MemoryProviderSel, ProfileSpec,
+    SessionOverlay,
+};
 use daemon_common::{Budget, JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     ApprovalPolicy, Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile,
@@ -27,10 +30,10 @@ use daemon_core::{
 };
 use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
-    CodecSession, CoreEngineFactory, CredentialStore, EngineUnit, FleetControl, Host, HostConfig,
-    JobWorker, JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl,
-    ProcessAgentUnit, ProfileStore, RoutingRegistry, ServiceError, SessionEngineBuilder,
-    StreamJsonCodec, SupervisorHandle,
+    CodecSession, CoreEngineFactory, CredentialStore, DurableProfileResolver, EngineUnit,
+    FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink,
+    ModelProviderFactory, NodeApiImpl, ProcessAgentUnit, ProfileStore, RoutingRegistry,
+    ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -345,8 +348,15 @@ struct SessionFactoryCtx {
 }
 
 impl SessionFactoryCtx {
-    /// Materialize a per-session engine profile from a profile bundle.
-    fn profile_from_spec(&self, spec: &ProfileSpec) -> EngineProfile {
+    /// Materialize a per-session engine profile by resolving the **bound profile** overlaid with the
+    /// session's **overlay** — the one resolution path shared by the live surface and the durable
+    /// rehydration path. The overlay's model/provider/tool-allowlist are applied to the spec; its
+    /// approval-mode override is baked into the engine config. Unset overlay fields fall through to
+    /// the profile, so an empty overlay resolves straight from the profile bundle.
+    fn resolve_effective(&self, base: &ProfileSpec, overlay: &SessionOverlay) -> EngineProfile {
+        let mut spec = base.clone();
+        overlay.apply_to(&mut spec);
+        let spec = &spec;
         let provider = (self.resolver)(spec);
         let registry = session_tool_registry(&self.extra_tools, spec.tool_allowlist.as_deref());
         let persona = if spec.system_prompt.trim().is_empty() {
@@ -354,8 +364,14 @@ impl SessionFactoryCtx {
         } else {
             spec.system_prompt.clone()
         };
+        // The §20 tunables config, with the overlay's edit-approval override (if any) baked in so a
+        // per-session mode switch is honored by both the live actor and a rehydrated durable engine.
+        let mut config = merged_config(self.engine_config, &spec.tunables);
+        if let Some(mode) = overlay.approval_mode {
+            config.approval_policy = approval_mode_to_policy(mode);
+        }
         let mut profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new(persona))
-            .with_config(merged_config(self.engine_config, &spec.tunables))
+            .with_config(config)
             // Scope the §10/§11 subsystem stores to the profile's own id (its on-disk key), so two
             // rooms routed to two profiles get isolated context/memory banks under their own homes.
             .with_profile_ref(ProfileRef::new(&spec.id));
@@ -365,15 +381,37 @@ impl SessionFactoryCtx {
                 wall_ms: spec.budget.wall_ms,
             });
         }
-        if let Some(builder) = &self.context_builder {
-            profile = profile.with_context_engine_builder(builder.clone());
-        } else if let Some(context) = &self.context {
-            profile = profile.with_context_engine(context.clone());
+        // Honor the profile's §10 context-engine selector. `Budgeted` is the in-core
+        // `BudgetedContextEngine` default (attach nothing); `Lcm` wires the node's LCM builder when
+        // the node configured one.
+        match spec.context_engine {
+            ContextEngineSel::Lcm => {
+                if let Some(builder) = &self.context_builder {
+                    profile = profile.with_context_engine_builder(builder.clone());
+                } else if let Some(context) = &self.context {
+                    profile = profile.with_context_engine(context.clone());
+                }
+            }
+            ContextEngineSel::Budgeted => {}
         }
-        if let Some(builder) = &self.memory_builder {
-            profile = profile.with_memory_builder(builder.clone());
-        } else if !self.memory.is_empty() {
-            profile = profile.with_memory(self.memory.clone());
+        // Honor the profile's §11 memory-provider selector. `None` attaches no memory; `Mnemosyne`
+        // wires the node's session-scoped builder (the default); `File` uses the node's shared
+        // frozen `FileMemory` providers. When the node didn't wire the requested backend, fall back
+        // to whatever memory it does carry (we currently ship one default each — LCM + Mnemosyne).
+        match spec.memory_provider {
+            MemoryProviderSel::Mnemosyne => {
+                if let Some(builder) = &self.memory_builder {
+                    profile = profile.with_memory_builder(builder.clone());
+                } else if !self.memory.is_empty() {
+                    profile = profile.with_memory(self.memory.clone());
+                }
+            }
+            MemoryProviderSel::File => {
+                if !self.memory.is_empty() {
+                    profile = profile.with_memory(self.memory.clone());
+                }
+            }
+            MemoryProviderSel::None => {}
         }
         for source in &self.prompt_sources {
             profile = profile.with_prompt_block(source.clone());
@@ -388,6 +426,17 @@ impl SessionFactoryCtx {
             }
         }
         profile
+    }
+}
+
+/// Map a wire-level [`ApprovalMode`] onto the engine's [`ApprovalPolicy`] (the §12 session mode),
+/// for baking a session overlay's approval override into the resolved engine config.
+fn approval_mode_to_policy(mode: ApprovalMode) -> ApprovalPolicy {
+    match mode {
+        ApprovalMode::Ask => ApprovalPolicy::Ask,
+        ApprovalMode::AcceptEdits => ApprovalPolicy::AcceptEdits,
+        ApprovalMode::AutoAllow => ApprovalPolicy::AutoAllow,
+        ApprovalMode::Deny => ApprovalPolicy::Deny,
     }
 }
 
@@ -492,11 +541,49 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         background_registry(&a),
     ));
 
+    // The one per-session resolution context, shared by the live session builder and the durable
+    // rehydration resolver so both paths resolve a session's engine identically (bound profile +
+    // overlay). Present only when the node carries a profile store + provider resolver; otherwise
+    // sessions fall back to the single fixed `session_profile` (legacy single-profile behavior).
+    let session_ctx: Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)> =
+        match (a.profiles.clone(), a.provider_resolver.clone()) {
+            (Some(store), Some(resolver)) => {
+                let ctx = Arc::new(SessionFactoryCtx {
+                    resolver,
+                    extra_tools: a.extra_tools.clone(),
+                    engine_config: a.engine_config,
+                    credentials: a.credentials.clone(),
+                    context: a.context.clone(),
+                    context_builder: a.context_builder.clone(),
+                    memory: a.memory.clone(),
+                    memory_builder: a.memory_builder.clone(),
+                    prompt_sources: a.prompt_sources.clone(),
+                });
+                Some((store, ctx))
+            }
+            _ => None,
+        };
+
     // The durable path journals too: replace the discarding sink with one sealing per turn into the
-    // shared store, keyed by the durable `SessionId`.
-    let factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
+    // shared store, keyed by the durable `SessionId`. When per-session resolution is available, the
+    // factory also re-resolves a durable session's engine from its recorded bound profile + overlay
+    // on rehydration (the unified resolution path), instead of always using the orchestrator profile.
+    let mut factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
         .with_journal(a.store.clone(), signer.clone())
         .with_background(background.clone());
+    if let Some((store, ctx)) = &session_ctx {
+        let store = store.clone();
+        let ctx = ctx.clone();
+        // Re-resolve a durable session from its bound profile + overlay; no recorded binding (e.g. a
+        // delegated orchestrator child) yields `None`, so the factory keeps its orchestrator profile.
+        let resolver: DurableProfileResolver =
+            Arc::new(move |bound: Option<ProfileRef>, overlay: &SessionOverlay| {
+                let bound = bound?;
+                let spec = store.get(bound.as_str()).ok().flatten()?;
+                Some(ctx.resolve_effective(&spec, overlay))
+            });
+        factory = factory.with_session_resolver(resolver);
+    }
 
     // One durable job worker for the whole node: every delegation (top or nested) materializes a
     // parent-bound durable child session seeded from the same orchestrator profile.
@@ -517,25 +604,16 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &a,
     );
     // Profile-aware interactive session builder: when the node carries a profile store + provider
-    // resolver, each session resolves the *active* profile bundle at open and materializes its
-    // engine (provider/persona/tools/budget/credentials) from it, so a GUI can switch model/provider
-    // live. Otherwise sessions are built from the single fixed `session_profile` (legacy behavior).
-    let session_builder: SessionEngineBuilder =
-        match (a.profiles.clone(), a.provider_resolver.clone()) {
-            (Some(store), Some(resolver)) => {
-                let ctx = SessionFactoryCtx {
-                    resolver,
-                    extra_tools: a.extra_tools.clone(),
-                    engine_config: a.engine_config,
-                    credentials: a.credentials.clone(),
-                    context: a.context.clone(),
-                    context_builder: a.context_builder.clone(),
-                    memory: a.memory.clone(),
-                    memory_builder: a.memory_builder.clone(),
-                    prompt_sources: a.prompt_sources.clone(),
-                };
-                let fallback = session_profile;
-                Arc::new(move |id: SessionId, requested: Option<ProfileRef>| {
+    // resolver, each session resolves its bound profile bundle at open, applies the persisted
+    // session overlay, and materializes its engine from the result (the same `resolve_effective` the
+    // durable path uses). Otherwise sessions are built from the single fixed `session_profile`.
+    let session_builder: SessionEngineBuilder = match &session_ctx {
+        Some((store, ctx)) => {
+            let store = store.clone();
+            let ctx = ctx.clone();
+            let fallback = session_profile;
+            Arc::new(
+                move |id: SessionId, requested: Option<ProfileRef>, overlay: &SessionOverlay| {
                     // Routing's agent-selection seam: build from the explicitly-requested profile when
                     // one is supplied, else the node's active default (the legacy single-profile path).
                     let spec = match requested {
@@ -547,16 +625,21 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
                             .and_then(|active| store.get(&active).ok().flatten()),
                     };
                     match spec {
-                        Some(spec) => ctx.profile_from_spec(&spec).fresh(id),
+                        Some(spec) => ctx.resolve_effective(&spec, overlay).fresh(id),
                         None => fallback.fresh(id),
                     }
-                })
-            }
-            _ => {
-                let profile = session_profile;
-                Arc::new(move |id: SessionId, _requested: Option<ProfileRef>| profile.fresh(id))
-            }
-        };
+                },
+            )
+        }
+        None => {
+            let profile = session_profile;
+            Arc::new(
+                move |id: SessionId, _requested: Option<ProfileRef>, _overlay: &SessionOverlay| {
+                    profile.fresh(id)
+                },
+            )
+        }
+    };
 
     let mut node_api = NodeApiImpl::new(
         handle.observer(),
@@ -1060,6 +1143,58 @@ mod tests {
             let out = provider.call_tool(&self.def.name, args).await;
             ToolOutcome::text(call.call_id.clone(), true, out)
         }
+    }
+
+    /// The session overlay is applied to the bound profile *before* the provider/registry are
+    /// resolved: the resolver observes the overridden model, and the tool registry is narrowed to the
+    /// overlay's allowlist. This is the one resolution path shared by the live and durable surfaces,
+    /// so proving it here proves both.
+    #[test]
+    fn resolve_effective_applies_overlay_before_resolution() {
+        use daemon_api::{ProviderSelector, ToolsOverride};
+        use std::sync::Mutex as StdMutex;
+
+        // Capture the spec the provider resolver is handed, to assert the overlay was applied first.
+        type Captured = Arc<StdMutex<Option<(String, Option<Vec<String>>)>>>;
+        let seen: Captured = Arc::new(StdMutex::new(None));
+        let seen2 = seen.clone();
+        let resolver: ProviderResolver = Arc::new(move |spec: &ProfileSpec| {
+            *seen2.lock().unwrap() = Some((spec.model.clone(), spec.tool_allowlist.clone()));
+            Arc::new(|| Arc::new(MockProvider::completing("ok")) as Arc<dyn Provider>)
+                as ProviderBuilder
+        });
+        let ctx = SessionFactoryCtx {
+            resolver,
+            extra_tools: Vec::new(),
+            engine_config: Config::default(),
+            credentials: None,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            prompt_sources: Vec::new(),
+        };
+
+        let base = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");
+        let overlay = SessionOverlay {
+            model: Some("override-model".to_string()),
+            provider: None,
+            tool_allowlist: ToolsOverride::Allowlist(vec!["fs".to_string()]),
+            approval_mode: Some(ApprovalMode::AutoAllow),
+        };
+        let _profile = ctx.resolve_effective(&base, &overlay);
+
+        let (model, allow) = seen.lock().unwrap().clone().expect("resolver ran");
+        assert_eq!(model, "override-model", "overlay model override is applied");
+        assert_eq!(
+            allow,
+            Some(vec!["fs".to_string()]),
+            "overlay tool allowlist is applied before the registry is built"
+        );
+
+        // An empty overlay is a pure inherit: the resolver sees the profile's own model untouched.
+        let _ = ctx.resolve_effective(&base, &SessionOverlay::default());
+        assert_eq!(seen.lock().unwrap().clone().unwrap().0, "base-model");
     }
 
     #[tokio::test]

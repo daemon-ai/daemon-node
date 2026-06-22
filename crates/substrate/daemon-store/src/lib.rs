@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use daemon_common::{
     ContentHash, DaemonError, Epoch, FenceToken, JobId, JournalStreamId, MerkleRoot, PartitionId,
-    SessionId, SnapshotBlob, UsageDelta,
+    ProfileRef, SessionId, SnapshotBlob, UsageDelta,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -60,6 +60,20 @@ pub struct SessionRecord {
     pub snapshot: SnapshotBlob,
     /// The current (highest) fencing token granted for this session.
     pub fence: FenceToken,
+}
+
+/// Host-level per-session metadata kept beside the snapshot: which profile the session resolves its
+/// engine from (`bound_profile`) and an opaque per-session overlay blob (the host's CBOR-encoded
+/// `SessionOverlay` — model/provider/tools/approval overrides). The store treats the overlay as
+/// opaque bytes (it never parses the protocol), so this stays protocol-free. The resolver reads it
+/// at engine construction, so a live override is **restored on rehydration** rather than lost on
+/// restart.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    /// The profile this session binds its engine to (`None` = the node's active default).
+    pub bound_profile: Option<ProfileRef>,
+    /// Opaque CBOR of the host's `SessionOverlay` (empty = no overlay recorded).
+    pub overlay: Vec<u8>,
 }
 
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).
@@ -511,6 +525,19 @@ pub trait SessionStore: Send + Sync {
         None
     }
 
+    /// Upsert a session's host-level [`SessionMeta`] (bound profile + opaque overlay blob). Called
+    /// when a session's profile binding is first established and whenever its overlay changes. The
+    /// resolver reads it back at engine construction so a live override survives restart. Default:
+    /// no-op (a non-authoritative proxy store).
+    async fn set_session_meta(&self, _id: &SessionId, _meta: SessionMeta) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Read a session's host-level [`SessionMeta`] (`None` if none recorded). Default: `None`.
+    async fn session_meta(&self, _id: &SessionId) -> Option<SessionMeta> {
+        None
+    }
+
     /// List every durable session id with its current status (the node control surface's
     /// `sessions` projection). Defaults to empty so a non-authoritative store (the brokered child
     /// proxy) need not implement it; an authoritative backend overrides it.
@@ -611,6 +638,9 @@ struct Inner {
     /// Per-session indexed search text `(title, body)` — the in-memory analogue of the SQLite
     /// `session_fts` index, searched by case-insensitive substring.
     session_text: HashMap<SessionId, (String, String)>,
+    /// Per-session host-level metadata: bound profile + opaque overlay blob (the in-memory analogue
+    /// of the SQLite `session_meta` table).
+    session_meta: HashMap<SessionId, SessionMeta>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
     journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
@@ -1039,6 +1069,19 @@ impl SessionStore for InMemoryStore {
             .map(|rec| rec.snapshot.clone())
     }
 
+    async fn set_session_meta(&self, id: &SessionId, meta: SessionMeta) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .session_meta
+            .insert(id.clone(), meta);
+        Ok(())
+    }
+
+    async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
+        self.inner.lock().unwrap().session_meta.get(id).cloned()
+    }
+
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {
         self.inner
             .lock()
@@ -1340,5 +1383,53 @@ mod journal_tests {
         );
         // And nothing was committed.
         assert!(store.load_trace_segment(&stream, 0).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_meta_tests {
+    //! Host-level [`SessionMeta`] persistence (bound profile + opaque overlay blob), proven against
+    //! both backends so a per-session override is restored on rehydration regardless of store.
+
+    use super::*;
+
+    fn sample() -> SessionMeta {
+        SessionMeta {
+            bound_profile: Some(ProfileRef::new("opus")),
+            overlay: vec![0xCB, 0x01, 0x02, 0x03],
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_meta_round_trips_and_upserts() {
+        let store = InMemoryStore::new();
+        let id = SessionId::new("s1");
+        // Absent until written.
+        assert!(store.session_meta(&id).await.is_none());
+        store.set_session_meta(&id, sample()).await.unwrap();
+        assert_eq!(store.session_meta(&id).await.unwrap(), sample());
+        // Upsert overwrites (e.g. an overlay change preserving the bound profile).
+        let updated = SessionMeta {
+            bound_profile: Some(ProfileRef::new("opus")),
+            overlay: vec![0xFF],
+        };
+        store.set_session_meta(&id, updated.clone()).await.unwrap();
+        assert_eq!(store.session_meta(&id).await.unwrap(), updated);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_meta_round_trips_and_upserts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let id = SessionId::new("s1");
+        assert!(store.session_meta(&id).await.is_none());
+        store.set_session_meta(&id, sample()).await.unwrap();
+        assert_eq!(store.session_meta(&id).await.unwrap(), sample());
+        let updated = SessionMeta {
+            bound_profile: None,
+            overlay: Vec::new(),
+        };
+        store.set_session_meta(&id, updated.clone()).await.unwrap();
+        assert_eq!(store.session_meta(&id).await.unwrap(), updated);
     }
 }

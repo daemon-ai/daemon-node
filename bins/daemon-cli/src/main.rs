@@ -920,17 +920,6 @@ fn render(resp: ApiResponse) {
             }
             None => println!("profile: none"),
         },
-        ApiResponse::ConfigSchema(schema) => {
-            println!("config schema: {} field(s)", schema.fields.len());
-            for f in schema.fields {
-                let opts = if f.options.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", f.options.join("|"))
-                };
-                println!("  - {} ({}){}: {}", f.key, f.kind, opts, f.description);
-            }
-        }
         ApiResponse::Credentials(creds) => {
             println!("credentials: {}", creds.len());
             for c in creds {

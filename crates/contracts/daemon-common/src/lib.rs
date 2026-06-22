@@ -360,7 +360,14 @@ impl WireVersion {
     /// inbound context to the conversation **without** opening a turn (the multi-party accumulation
     /// seam, event-io §5.9): chatter folds in while idle and lands in the following turn while busy,
     /// so a shared room can feed the agent context it sees on its next mention-gated turn.
-    pub const CURRENT: Self = Self(8);
+    ///
+    /// v9 (profiles + session overlay): collapses the runtime **Config** surface (`ConfigGet`/`Set`/
+    /// `Schema` and the `ConfigPatch`/`ConfigField`/`ConfigSchema` types are removed — `ProfileUpdate`
+    /// is the sole durable editor) and adds the unified per-session override: `SetSessionOverlay`
+    /// (with `SessionOverlay` = model / provider / tool allowlist / approval mode), persisted as
+    /// host-level session metadata so a switch is restored on rehydration. `set_session_model` /
+    /// `set_session_mode` become field-scoped conveniences over the overlay.
+    pub const CURRENT: Self = Self(9);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

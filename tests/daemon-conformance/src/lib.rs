@@ -2601,7 +2601,7 @@ mod node_interface {
     /// restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn profile_and_skill_versioning_and_distribution() {
-        use daemon_api::{ConfigPatch, ProfileApi, ProfileSpec, ProviderSelector};
+        use daemon_api::{ProfileApi, ProfileSpec, ProviderSelector};
 
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -2618,17 +2618,12 @@ mod node_interface {
         node.profile_create(spec).await.expect("create p1");
         assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 1);
 
-        node.config_set(
-            Some("p1".into()),
-            ConfigPatch {
-                model: Some("claude-3-5-sonnet-latest".into()),
-                ..ConfigPatch::default()
-            },
-        )
-        .await
-        .expect("patch model");
+        // Edit the profile in full via `profile_update` (the only durable editor; Config removed).
+        let mut edited = node.profile_get("p1".into()).await.unwrap().unwrap();
+        edited.model = "claude-3-5-sonnet-latest".into();
+        node.profile_update(edited).await.expect("update model");
         let hist = node.profile_history("p1".into()).await.unwrap();
-        assert_eq!(hist.len(), 2, "create + config_set = 2 revisions");
+        assert_eq!(hist.len(), 2, "create + update = 2 revisions");
         assert_eq!(hist[0].author, daemon_common::Author::Operator);
         assert_eq!(
             node.profile_get("p1".into()).await.unwrap().unwrap().model,
@@ -3113,6 +3108,160 @@ mod node_interface {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PROFILES + SESSION OVERLAY: a per-session model override is **persisted** on the session's
+    /// `SessionOverlay` (host-level metadata) and **restored** when the live actor is respawned —
+    /// the unified resolution path means the engine is rebuilt from `bound profile + overlay`, not
+    /// from the bare profile. We drive it through the public `SetSessionModel`, observe the persisted
+    /// overlay in the store, then shut the live actor down and reopen the same routed session and
+    /// observe that the provider is resolved for the *overridden* model (the restore), not the
+    /// profile's default — proving the override survives a (live) respawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_overlay_persists_and_restores_on_respawn() {
+        use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_host::{decode_overlay, MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
+        use daemon_protocol::{AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg};
+        use std::sync::Mutex;
+
+        // A resolver that records every model id it is asked to build a provider for — our window
+        // into which (profile, overlay)-resolved model each engine construction saw.
+        type Seen = Arc<Mutex<Vec<String>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let resolver: daemon_node::ProviderResolver = Arc::new(move |spec: &ProfileSpec| {
+            seen2.lock().unwrap().push(spec.model.clone());
+            let reply = spec.model.clone();
+            let builder: daemon_core::ProviderBuilder =
+                Arc::new(move || Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>);
+            builder
+        });
+
+        let pstore = Arc::new(MemProfileStore::new());
+        pstore
+            .create(ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a"))
+            .expect("create profile");
+        pstore.set_active("alpha").expect("set active");
+
+        let routing = RoutingRegistry::new()
+            .bind_instance(TransportId::new("matrix/@a:hs"), ProfileRef::new("alpha"));
+
+        let store = Arc::new(InMemoryStore::new());
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: store.clone(),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x66; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(pstore),
+            provider_resolver: Some(resolver),
+            credential_store: Some(Arc::new(MemCredentialStore::new())),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: Some(routing),
+        });
+
+        let origin = Origin::new(
+            TransportId::new("matrix/@a:hs"),
+            OriginScope::Group {
+                chat: "#general".into(),
+                thread: None,
+            },
+        );
+
+        // Open the session (binds it to `alpha`; builds its engine from the bare profile -> model-a).
+        let session = node
+            .submit_routed(
+                origin.clone(),
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: ReqId(1),
+                },
+            )
+            .await
+            .expect("routed submit opens the session");
+        assert_eq!(
+            seen.lock().unwrap().first().map(String::as_str),
+            Some("model-a"),
+            "the first engine build resolves the profile's own model"
+        );
+
+        // Override the model for this session. This persists the overlay AND swaps the live provider.
+        node.set_session_model(session.clone(), "model-x".to_string(), None)
+            .await
+            .expect("set_session_model");
+
+        // The override is durably recorded as host-level session metadata (bound profile + overlay).
+        let meta = store.session_meta(&session).await.expect("session meta recorded");
+        assert_eq!(
+            meta.bound_profile.as_ref().map(|p| p.as_str()),
+            Some("alpha"),
+            "the session's bound profile is recorded"
+        );
+        let overlay = decode_overlay(&meta.overlay);
+        assert_eq!(
+            overlay.model.as_deref(),
+            Some("model-x"),
+            "the model override is persisted on the overlay"
+        );
+
+        // Tear the live actor down, then reopen the same routed session: `ensure` reads the persisted
+        // overlay and rebuilds the engine from `alpha + {model: model-x}` — the restore.
+        node.submit(session.clone(), AgentCommand::Shutdown)
+            .await
+            .expect("shutdown the live actor");
+        let reopened = node
+            .submit_routed(
+                origin,
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("again"),
+                    request_id: ReqId(2),
+                },
+            )
+            .await
+            .expect("reopen the routed session");
+        assert_eq!(reopened, session, "the same origin resolves the same session");
+
+        // Drive the reopened turn to completion so we know the rebuild happened.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut finished = false;
+        while Instant::now() < deadline && !finished {
+            for item in node.poll(session.clone(), 0).await.expect("poll") {
+                if let Outbound::Event(AgentEvent::TurnFinished { .. }) = item {
+                    finished = true;
+                }
+            }
+            if !finished {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(finished, "the reopened turn ran to completion");
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded.last().map(String::as_str),
+            Some("model-x"),
+            "the respawned engine resolved the *restored* overridden model, not the profile default: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().filter(|m| m.as_str() == "model-x").count() >= 2,
+            "model-x was resolved both at override time and again on respawn: {recorded:?}"
+        );
+
+        handle.shutdown().await;
     }
 
     /// FOUNDATION: `AgentCommand::Observe` appends context **without** running a turn (the multi-party

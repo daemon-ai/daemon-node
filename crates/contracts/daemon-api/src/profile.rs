@@ -1,12 +1,12 @@
-//! Profile and config contract types: the serializable bundle a GUI creates/edits to configure an
-//! agent, plus the runtime config surface.
+//! Profile contract types: the serializable bundle a GUI creates/edits to configure an agent.
 //!
 //! A [`ProfileSpec`] is the full configuration bundle for an agent (the analogue of a hermes
 //! `HERMES_HOME` `config.yaml`): which provider + model it talks to, its persona, the tools it may
 //! use, its budget/engine tunables, its context/memory backends, and the credential it acquires
 //! capabilities from. The host resolves a `ProfileSpec` into an engine-construction `EngineProfile`
 //! at session open (`daemon-host`), so a GUI can create/select/edit a profile without restarting
-//! the node.
+//! the node. There is no separate runtime-config surface: a profile is edited in full via
+//! `ProfileUpdate`, and a live session is adjusted via a `SessionOverlay`.
 //!
 //! These are *contract* types: serializable primitives only (no `daemon-core` types), so the
 //! surface never drags the engine's concrete construction types into the wire protocol.
@@ -230,70 +230,64 @@ impl ProfileInfo {
     }
 }
 
-/// A partial update to a profile's runtime-settable config: the dynamically tunable surface a GUI
-/// drives (`DAEMON_MODEL`, `DAEMON_MODEL_PROVIDER`, base URL, persona, credential). Every field is
-/// optional; `None` leaves the existing value unchanged.
+/// How a [`SessionOverlay`] overrides the bound profile's `tool_allowlist`. A tri-state so the
+/// overlay can distinguish "leave the profile's allowlist alone" from "override to the full node
+/// toolset" from "override to this explicit list".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsOverride {
+    /// Inherit the bound profile's `tool_allowlist` (no session-level override).
+    #[default]
+    Inherit,
+    /// Override to the full node toolset (the profile's allowlist is ignored for this session).
+    FullToolset,
+    /// Override to exactly these tool names (a session-level allowlist).
+    Allowlist(Vec<String>),
+}
+
+/// A per-session override layered on top of the session's bound [`ProfileSpec`] at engine
+/// construction. This is the single per-session adjustment surface (it subsumes the older
+/// per-session model switch and edit-approval mode): the profile is the durable base, the overlay
+/// is the live tweak. It is persisted as host-level session metadata, so it is **restored on
+/// rehydration** rather than lost on restart. Every field is optional / inherit; unset fields fall
+/// through to the bound profile.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ConfigPatch {
-    /// Re-bind the provider implementation.
-    pub provider: Option<ProviderSelector>,
-    /// Set the model name.
+pub struct SessionOverlay {
+    /// Override the model id (`None` = inherit the profile's model).
     pub model: Option<String>,
-    /// Set the provider API base URL (empty string clears the override back to the default).
-    pub base_url: Option<String>,
-    /// Set the persona / system prompt.
-    pub system_prompt: Option<String>,
-    /// Set the credential reference (empty string clears it back to the profile id).
-    pub credential_ref: Option<String>,
-    /// Override engine tunables (merged field-wise).
-    pub tunables: Option<EngineTunables>,
+    /// Override the provider implementation (`None` = inherit the profile's provider).
+    pub provider: Option<ProviderSelector>,
+    /// Override the tool allowlist (see [`ToolsOverride`]).
+    pub tool_allowlist: ToolsOverride,
+    /// Override the edit-approval mode (`None` = inherit the profile/engine default).
+    pub approval_mode: Option<crate::ApprovalMode>,
 }
 
-impl ConfigPatch {
-    /// Apply this patch onto a spec in place, returning whether anything changed.
-    pub fn apply(&self, spec: &mut ProfileSpec) -> bool {
-        let mut changed = false;
-        if let Some(p) = self.provider {
-            spec.provider = p;
-            changed = true;
-        }
-        if let Some(m) = &self.model {
-            spec.model = m.clone();
-            changed = true;
-        }
-        if let Some(b) = &self.base_url {
-            spec.base_url = if b.is_empty() { None } else { Some(b.clone()) };
-            changed = true;
-        }
-        if let Some(s) = &self.system_prompt {
-            spec.system_prompt = s.clone();
-            changed = true;
-        }
-        if let Some(c) = &self.credential_ref {
-            spec.credential_ref = if c.is_empty() { None } else { Some(c.clone()) };
-            changed = true;
-        }
-        if let Some(t) = self.tunables {
-            spec.tunables = t;
-            changed = true;
-        }
-        changed
+impl SessionOverlay {
+    /// Whether this overlay is a pure no-op (every field inherits the profile).
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.provider.is_none()
+            && matches!(self.tool_allowlist, ToolsOverride::Inherit)
+            && self.approval_mode.is_none()
     }
-}
 
-/// One settable config field, as the `ConfigSchema` advertises it to a GUI building a settings form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigField {
-    /// The field key (matches a `ConfigPatch` field / `DAEMON_*` knob).
-    pub key: String,
-    /// A short value-kind hint (`"string"`, `"enum"`, `"u32"`, ...).
-    pub kind: String,
-    /// Human-readable description.
-    pub description: String,
-    /// For `enum` kinds, the permitted values.
-    #[serde(default)]
-    pub options: Vec<String>,
+    /// Apply the model/provider/tool-allowlist overrides onto a profile spec in place. The
+    /// `approval_mode` is applied to the engine separately (it is not a `ProfileSpec` field).
+    pub fn apply_to(&self, spec: &mut ProfileSpec) {
+        if let Some(model) = &self.model {
+            spec.model = model.clone();
+        }
+        if let Some(provider) = self.provider {
+            spec.provider = provider;
+        }
+        match &self.tool_allowlist {
+            ToolsOverride::Inherit => {}
+            ToolsOverride::FullToolset => spec.tool_allowlist = None,
+            ToolsOverride::Allowlist(list) => spec.tool_allowlist = Some(list.clone()),
+        }
+    }
 }
 
 /// A discoverable model entry: what a GUI's model picker renders. Merges cloud-provider catalog
@@ -421,44 +415,64 @@ impl CredentialInfo {
     }
 }
 
-/// The settable-config schema a GUI renders as a settings form. Static for v1.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigSchema {
-    /// The settable fields.
-    pub fields: Vec<ConfigField>,
-}
-
-impl ConfigSchema {
-    /// The built-in schema describing the dynamically-settable profile config surface.
-    pub fn builtin() -> Self {
-        let field = |key: &str, kind: &str, description: &str, options: &[&str]| ConfigField {
-            key: key.to_string(),
-            kind: kind.to_string(),
-            description: description.to_string(),
-            options: options.iter().map(|s| s.to_string()).collect(),
-        };
-        Self {
-            fields: vec![
-                field(
-                    "provider",
-                    "enum",
-                    "Model provider implementation",
-                    &["mock", "genai", "llama_cpp", "mistral_rs"],
-                ),
-                field("model", "string", "Model name / id (e.g. claude-opus-4-8)", &[]),
-                field("base_url", "string", "Provider API base URL override (empty = default)", &[]),
-                field("system_prompt", "string", "Persona / system prompt", &[]),
-                field("credential_ref", "string", "Credential profile this engine acquires from", &[]),
-                field("context_budget_tokens", "u32", "Soft context-token budget hint", &[]),
-                field("max_iterations", "u32", "Per-turn ReAct round cap", &[]),
-            ],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_overlay_inherits_the_profile() {
+        let overlay = SessionOverlay::default();
+        assert!(overlay.is_empty());
+        let mut spec = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");
+        spec.tool_allowlist = Some(vec!["fs".to_string()]);
+        let before = spec.clone();
+        overlay.apply_to(&mut spec);
+        // An all-inherit overlay is a pure no-op: every field falls through to the profile.
+        assert_eq!(spec, before);
+    }
+
+    #[test]
+    fn overlay_overrides_model_provider_and_tools() {
+        let overlay = SessionOverlay {
+            model: Some("override-model".to_string()),
+            provider: Some(ProviderSelector::Mock),
+            tool_allowlist: ToolsOverride::Allowlist(vec!["fs".to_string()]),
+            approval_mode: Some(crate::ApprovalMode::AutoAllow),
+        };
+        assert!(!overlay.is_empty());
+        let mut spec = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");
+        overlay.apply_to(&mut spec);
+        assert_eq!(spec.model, "override-model");
+        assert_eq!(spec.provider, ProviderSelector::Mock);
+        assert_eq!(spec.tool_allowlist, Some(vec!["fs".to_string()]));
+    }
+
+    #[test]
+    fn tools_override_full_toolset_clears_the_allowlist() {
+        // `FullToolset` overrides a profile that pinned an allowlist back to the full node toolset.
+        let overlay = SessionOverlay {
+            tool_allowlist: ToolsOverride::FullToolset,
+            ..SessionOverlay::default()
+        };
+        let mut spec = ProfileSpec::new("p", ProviderSelector::GenAi, "m");
+        spec.tool_allowlist = Some(vec!["fs".to_string()]);
+        overlay.apply_to(&mut spec);
+        assert_eq!(spec.tool_allowlist, None);
+    }
+
+    #[test]
+    fn overlay_cbor_round_trips() {
+        let overlay = SessionOverlay {
+            model: Some("m".to_string()),
+            provider: Some(ProviderSelector::GenAi),
+            tool_allowlist: ToolsOverride::Allowlist(vec!["a".into(), "b".into()]),
+            approval_mode: Some(crate::ApprovalMode::Deny),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&overlay, &mut buf).unwrap();
+        let back: SessionOverlay = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(overlay, back);
+    }
 
     #[test]
     fn selector_locality_and_serde_form() {

@@ -420,13 +420,22 @@ trait Provisioner: Send + Sync {
 The node surface exposes two **runtime-control** capabilities a GUI/operator drives on a running
 session (wire v5).
 
-**Live model switch (`SetSessionModel`).** A session holds one `Provider`, built at open; `Request`
-carries no model, so a switch is a provider swap on the live actor. `SetSessionModel { session,
-model, provider? }` resolves the session's `ProfileSpec`, clones it with the new model/provider,
-builds a provider, and sends `ActorMsg::SetProvider` to the running actor (`Engine::set_provider`,
-applied at the next turn boundary so an in-flight turn's prompt cache is never invalidated). It is
-transient (the bound profile is not mutated); a per-session model override feeds `model_current`. A
-durable session re-resolves its model from the profile on rehydration.
+**Per-session overlay (`SetSessionOverlay`, and the `SetSessionModel`/`SetSessionMode` conveniences).**
+The single per-session adjustment surface is a `SessionOverlay` (model / provider / tool allowlist /
+approval mode) layered on top of the session's **bound profile** at engine construction. Unlike the
+durable profile (edited via `ProfileUpdate`), the overlay is the *live tweak* — but it is **persisted
+as host-level session metadata** (`SessionStore::set_session_meta`, alongside the bound profile ref),
+so it is **restored on rehydration** rather than lost on restart. `SetSessionModel { session, model,
+provider? }` and `SetSessionMode { session, mode }` are field-scoped writes over the same overlay.
+Resolution is unified: one `resolve_effective(bound profile, overlay)` builds the `EngineProfile` for
+both the live surface (`LiveSessions::ensure` reads the persisted overlay when (re)spawning the actor)
+and the durable path (`CoreIncarnation::hydrate` re-resolves from the `ProfileStore` + overlay instead
+of pinning the factory's fixed profile). What can be hot-applied to a resident actor is — a
+model/provider override sends `ActorMsg::SetProvider` (`Engine::set_provider`, applied at the next
+turn boundary so an in-flight turn's prompt cache is never invalidated) and a mode override switches
+the live `ParkingHandler` policy; a tool-allowlist override takes effect at the next (re)hydration
+(the live tool registry is fixed for an actor's lifetime). A per-session model override feeds
+`model_current`.
 
 **Edit-approval session modes (`SetSessionMode`/`ApprovalMode`).** Each session carries an
 `ApprovalPolicy` (`Ask` | `AcceptEdits` | `AutoAllow` | `Deny`, mirroring hermes' Default / Accept-Edits
@@ -471,7 +480,7 @@ revision log** — never a vendored git repo. One mechanism (`daemon_common::Rev
   `blobs/<sha256>.bin` content-addressed snapshot store (identical content dedupes). The blob is the
   full snapshot — a `ProfileSpec` (CBOR) or a `SkillBundle` (the `SKILL.md` + support files).
 - **Provenance is first-class.** `Author` is `Operator` (a NodeApi call) or `Agent(label)` (a tool
-  write, e.g. `skill_manage`). Profile mutations (`ProfileCreate`/`ProfileUpdate`/`ConfigSet`/clone/
+  write, e.g. `skill_manage`). Profile mutations (`ProfileCreate`/`ProfileUpdate`/clone/
   import/revert) record `Operator`; skill writes through the store record the agent, so the curator's
   self-edits are attributable.
 - **Revert is non-destructive.** `Profile{History,At,Revert}` and `Skill{History,At,Revert}`: a revert

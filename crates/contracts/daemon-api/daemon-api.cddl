@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 8)
+wire_version = uint                 ; daemon-common WireVersion (current = 9)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -112,6 +112,20 @@ fleet-report = {
 ; ApprovalPolicy. A parked approval (durable HITL) is listed via ApprovalsPending and answered via
 ; ApprovalDecide; `request_id` is the opaque parked-request handle.
 approval-mode = "ask" / "accept_edits" / "auto_allow" / "deny"
+
+; ----- per-session overlay (profiles + session overlay, wire v9) -----
+; The unified per-session override layered on the bound profile at engine construction. Persisted as
+; host-level session metadata, so a switch is restored on rehydration. Unset fields inherit the
+; profile. `tool_allowlist` is a tri-state: inherit the profile's allowlist, override to the full
+; node toolset, or override to an explicit list. `provider` is the opaque provider-selector.
+tools-override = "inherit" / "full_toolset" / { "allowlist": [* tstr] }
+
+session-overlay = {
+  ? model: (tstr / null),
+  ? provider: (any / null),
+  ? tool_allowlist: tools-override,
+  ? approval_mode: (approval-mode / null),
+}
 
 approval-info = {
   session: session-id,
@@ -396,8 +410,9 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "Scale": { unit: unit-id, n: uint } }
             / "VerifyingKey"
             ; ----- runtime control (wire v5): live model switch + §12 edit-approval -----
-            / { "SetSessionModel": { session: session-id, model: tstr, ? provider: (any / null) } }   ; live provider swap -> Ok
-            / { "SetSessionMode": { session: session-id, mode: approval-mode } }                       ; live session mode -> Ok
+            / { "SetSessionModel": { session: session-id, model: tstr, ? provider: (any / null) } }   ; model override (overlay) -> Ok
+            / { "SetSessionMode": { session: session-id, mode: approval-mode } }                       ; approval override (overlay) -> Ok
+            / { "SetSessionOverlay": { session: session-id, overlay: session-overlay } }               ; full per-session overlay -> Ok
             / { "ApprovalsPending": { ? session: (session-id / null) } }                               ; HITL inbox -> Approvals
             / { "ApprovalDecide": { session: session-id, request_id: tstr, allow: bool } }             ; answer + wake -> Ok
             ; ----- profile distributions + versioning (wire v6) -----

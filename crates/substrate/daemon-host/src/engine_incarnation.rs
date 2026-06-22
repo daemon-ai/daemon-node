@@ -13,6 +13,7 @@
 
 use crate::background::BackgroundSpawner;
 use crate::journal::{JournalFeeder, JournalSink};
+use crate::node_api::{decode_overlay, DurableProfileResolver};
 use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
 use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, SessionId};
@@ -51,6 +52,11 @@ pub struct CoreEngineFactory {
     /// (a) `Effect::Spawn` host requests materialize attached non-joining children, and (b) a
     /// background child session hydrates under its constrained review profile instead of `profile`.
     background: Option<Arc<BackgroundSpawner>>,
+    /// The per-session profile resolver (bound profile ref + persisted overlay -> `EngineProfile`),
+    /// injected by the node. When set, a durable session with a recorded bound profile rehydrates
+    /// from *its own* profile + overlay (the unified resolution path) instead of pinning this
+    /// factory's fixed `profile`; `None` (or no recorded binding) falls back to `profile`.
+    resolver: Option<DurableProfileResolver>,
 }
 
 impl CoreEngineFactory {
@@ -70,6 +76,7 @@ impl CoreEngineFactory {
             profile,
             journal: None,
             background: None,
+            resolver: None,
         }
     }
 
@@ -83,6 +90,7 @@ impl CoreEngineFactory {
             profile: EngineProfile::new(provider, registry, system),
             journal: None,
             background: None,
+            resolver: None,
         }
     }
 
@@ -92,6 +100,7 @@ impl CoreEngineFactory {
             profile,
             journal: None,
             background: None,
+            resolver: None,
         }
     }
 
@@ -106,6 +115,14 @@ impl CoreEngineFactory {
     /// attached, non-joining review children and hydrate them under their constrained profile.
     pub fn with_background(mut self, background: Arc<BackgroundSpawner>) -> Self {
         self.background = Some(background);
+        self
+    }
+
+    /// Inject the per-session profile resolver so durable sessions rehydrate from their own bound
+    /// profile + persisted overlay (unified live/durable resolution) instead of this factory's fixed
+    /// profile. Requires the journal store (the source of the session metadata) to be set too.
+    pub fn with_session_resolver(mut self, resolver: DurableProfileResolver) -> Self {
+        self.resolver = Some(resolver);
         self
     }
 
@@ -124,6 +141,7 @@ impl EngineFactory for CoreEngineFactory {
             engine: None,
             journal: self.journal.clone(),
             background: self.background.clone(),
+            resolver: self.resolver.clone(),
         })
     }
 }
@@ -136,10 +154,30 @@ pub struct CoreIncarnation {
     /// The §4.3 background-spawn materializer (when configured): drives `Effect::Spawn` requests and
     /// selects the constrained review profile when *this* incarnation is itself a background child.
     background: Option<Arc<BackgroundSpawner>>,
+    /// The per-session profile resolver (when configured): re-resolves this session's `EngineProfile`
+    /// from its bound profile + persisted overlay at hydrate, so a durable session honors its own
+    /// profile + restored session override instead of the factory's fixed profile.
+    resolver: Option<DurableProfileResolver>,
 }
 
 fn map_failure(failure: Failure) -> EngineError {
     EngineError::Other(failure.to_string())
+}
+
+impl CoreIncarnation {
+    /// Re-resolve `session`'s effective [`EngineProfile`] from its host-level metadata (the bound
+    /// profile plus the persisted overlay) via the injected resolver. Returns `None` when no
+    /// resolver/journal store is wired or no profile binding is recorded, so the caller then falls
+    /// back to the factory's default profile. This is the durable half of the one resolution path
+    /// shared with the live surface, so a durable session honors its own profile and restored
+    /// session override.
+    async fn resolve_session_profile(&self, session: &SessionId) -> Option<EngineProfile> {
+        let resolver = self.resolver.as_ref()?;
+        let store = self.journal.as_ref().map(|cfg| &cfg.store)?;
+        let meta = store.session_meta(session).await.unwrap_or_default();
+        let overlay = decode_overlay(&meta.overlay);
+        resolver(meta.bound_profile, &overlay)
+    }
 }
 
 #[async_trait]
@@ -156,13 +194,22 @@ impl Incarnation for CoreIncarnation {
         }
         let snap = Snapshot::decode(&snapshot)?;
         // A background child (§4.3) hydrates under its constrained review profile (skills-only /
-        // memory-only tools + bounded budget + nudges off), not the parent's full profile; every
-        // other session uses the factory's profile.
-        let profile = self
+        // memory-only tools + bounded budget + nudges off), not the parent's full profile. Otherwise,
+        // when a per-session resolver + journal store are wired, re-resolve this session's profile
+        // from its persisted bound profile + overlay (unified resolution: a durable session honors
+        // its own model/tools/approval override, restored on rehydration). Falls back to the
+        // factory's fixed profile when no binding is recorded (e.g. delegated orchestrator children).
+        let profile = if let Some(bg_profile) = self
             .background
             .as_ref()
             .and_then(|bg| bg.profile_for(&snap.session_id))
-            .unwrap_or_else(|| self.profile.clone());
+        {
+            bg_profile
+        } else if let Some(resolved) = self.resolve_session_profile(&snap.session_id).await {
+            resolved
+        } else {
+            self.profile.clone()
+        };
         let mut engine = profile.from_snapshot(snap);
         let completions = unapplied
             .into_iter()
