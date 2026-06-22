@@ -248,6 +248,12 @@ Recommended UX: a `daemon-matrix login --homeserver <url> [--profile <p>]` subco
 once per account. It performs SSO and **writes the resulting session into the credential store** under
 the profile's Matrix credential-ref.
 
+> **Client-driven / remote login** (a decoupled GUI on another host) is the generalization of the
+> `get_sso_login_url` + `login_token` path above: it is specified separately in
+> [`daemon-interactive-auth-spec.md`](./daemon-interactive-auth-spec.md) as a transport-agnostic,
+> wire-exposed `AuthApi` (`auth_begin` → browser → `auth_complete`) that this Matrix family plugs into
+> and that also covers OAuth2/OIDC. The CLI above becomes the same-host degenerate case of that seam.
+
 ### 6.2 Credential model — the credential subsystem is the system of record (decided)
 
 The Matrix **login material** — homeserver URL, `user_id`, `device_id`, access token, refresh
