@@ -917,6 +917,18 @@ pub struct SessionInfo {
     pub session: SessionId,
     /// Its durable lifecycle state.
     pub state: SessionState,
+    /// Whether the session supports conversation rewind (`AgentCommand::RewindTo`, conversation-rewind
+    /// spec). `true` for daemon-core-backed sessions (the daemon owns the conversation state and can
+    /// truncate it); `false` for foreign backends (e.g. ACP) whose protocol has no truncate-at-anchor
+    /// primitive. A GUI/TUI reads this to hide rewind for non-rewindable sessions.
+    #[serde(default = "default_rewindable")]
+    pub rewindable: bool,
+}
+
+/// `serde` default for [`SessionInfo::rewindable`] on older wire payloads that predate the field:
+/// daemon-core sessions are rewindable, so the safe default is `true`.
+fn default_rewindable() -> bool {
+    true
 }
 
 /// A parked §12 edit-approval request awaiting an operator decision — the transport-stable mirror of
@@ -1044,6 +1056,13 @@ pub struct JournalPageView {
     pub next_cursor: u64,
     /// The highest cursor currently stored for the stream (how far a reader can scroll).
     pub head_cursor: u64,
+    /// The active conversation-rewind seal cursor, when the session has been rewound (conversation
+    /// rewind spec §6). `Some(c)` means a rewind occurred at stream cursor `c`: the journal remains a
+    /// complete audit log, but a reconnecting client should reconcile its view against the engine's
+    /// truncated conversation (the authoritative `Snapshot`/`ConvView`) rather than replaying the raw
+    /// post-`c` audit tail verbatim. `None` when the session has never been rewound.
+    #[serde(default)]
+    pub sealed_after: Option<u64>,
 }
 
 /// A page of a session's **merged live event log**: the [`SessionLogEntry`] items past a cursor plus

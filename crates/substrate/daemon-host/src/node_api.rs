@@ -266,7 +266,10 @@ impl NodeApiImpl {
     /// points and restore the workspace. Call during assembly with the same store wired into the
     /// engines (so a checkpoint recorded by a turn is visible + rewindable here).
     pub fn with_checkpoints(mut self, checkpoints: Arc<dyn daemon_core::CheckpointStore>) -> Self {
-        self.checkpoints = Some(checkpoints);
+        self.checkpoints = Some(checkpoints.clone());
+        // Share it with the live-session layer too, so a `RewindTo` rolls the workspace back to the
+        // sealed-off range's earliest pre-mutation checkpoint (conversation-rewind spec §6).
+        self.live.set_checkpoints(checkpoints);
         self
     }
 
@@ -580,10 +583,17 @@ impl NodeApiImpl {
             })
             .collect();
 
+        let sealed_after = self
+            .store
+            .active_journal_seal(&stream)
+            .await
+            .map(|seal| seal.seal_cursor);
+
         JournalPageView {
             entries,
             next_cursor: page.next_cursor,
             head_cursor: page.head_cursor,
+            sealed_after,
         }
     }
 
@@ -727,6 +737,11 @@ impl ControlApi for NodeApiImpl {
             .map(|(session, status)| SessionInfo {
                 session,
                 state: map_state(status),
+                // Durable store sessions are daemon-core-backed engines: the daemon owns the
+                // conversation state and can truncate it, so they are rewindable. Foreign ACP agents
+                // are managed units (surfaced via the fleet/unit API, queryable as
+                // `AgentUnit::rewindable`), not durable store sessions, so they never appear here.
+                rewindable: true,
             })
             .collect()
     }
@@ -1905,6 +1920,9 @@ struct LiveSessions {
     store: Arc<dyn SessionStore>,
     /// The verifiable-journal store + signer, when journaling is enabled for live sessions.
     journal: Mutex<Option<JournalConfig>>,
+    /// The §12 workspace-checkpoint store, when wired: a `RewindTo` rolls the filesystem back to the
+    /// sealed-off range's earliest pre-mutation checkpoint (conversation-rewind spec §6).
+    checkpoints: Mutex<Option<Arc<dyn daemon_core::CheckpointStore>>>,
     /// The §4.3 background-spawn materializer, when configured: lets a live session's `Effect::Spawn`
     /// materialize an attached non-joining review child without parking (fire-and-forget).
     background: Mutex<Option<Arc<crate::background::BackgroundSpawner>>>,
@@ -1929,6 +1947,7 @@ impl LiveSessions {
             builder,
             store,
             journal: Mutex::new(None),
+            checkpoints: Mutex::new(None),
             background: Mutex::new(None),
             modes,
             sinks: Arc::new(DashMap::new()),
@@ -1937,6 +1956,10 @@ impl LiveSessions {
 
     fn set_journal(&self, cfg: JournalConfig) {
         *self.journal.lock().unwrap() = Some(cfg);
+    }
+
+    fn set_checkpoints(&self, checkpoints: Arc<dyn daemon_core::CheckpointStore>) {
+        *self.checkpoints.lock().unwrap() = Some(checkpoints);
     }
 
     fn set_background(&self, background: Arc<crate::background::BackgroundSpawner>) {
@@ -2170,7 +2193,86 @@ impl LiveSessions {
                 handle.snapshot(request_id).await;
                 Ok(())
             }
+            AgentCommand::RewindTo { anchor, request_id } => {
+                // Conversation rewind (spec §4): the engine interrupts any live turn, truncates +
+                // reconstructs + bumps epoch + emits `Rewound`; the host then seals the durable
+                // journal and rolls the workspace back to the sealed-off range's earliest checkpoint.
+                let handle = self.existing(&session)?;
+                self.record_inbound(
+                    &session,
+                    origin,
+                    Disposition::Transport,
+                    SessionPayload::Command(AgentCommand::RewindTo {
+                        anchor: anchor.clone(),
+                        request_id,
+                    }),
+                );
+                let outcome = handle
+                    .rewind_to(request_id, anchor)
+                    .await
+                    .map_err(|e| ApiError::Other(e.to_string()))?;
+                self.seal_after_rewind(&session, &outcome).await;
+                self.rollback_workspace_after_rewind(&session, &outcome).await;
+                Ok(())
+            }
             _ => Err(ApiError::Unsupported("unknown agent command".into())),
+        }
+    }
+
+    /// Record the durable conversation-rewind seal against the session's journal stream (spec §6).
+    /// The journal stays a complete audit log; the seal surfaces as `JournalPageView::sealed_after`.
+    async fn seal_after_rewind(&self, session: &SessionId, outcome: &daemon_core::RewindOutcome) {
+        // Only meaningful when this session is journaled (otherwise there is no durable history).
+        if self.journal.lock().unwrap().is_none() {
+            return;
+        }
+        let stream = JournalStreamId::session(session);
+        let head = self.store.load_journal(&stream, u64::MAX, 1).await.head_cursor;
+        let recorded_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = self
+            .store
+            .record_journal_seal(
+                &stream,
+                daemon_store::JournalSeal {
+                    seal_cursor: head,
+                    retained_turns: outcome.retained_turns as u64,
+                    epoch: outcome.epoch.0,
+                    recorded_unix,
+                },
+            )
+            .await;
+    }
+
+    /// Roll the workspace back to the sealed-off range's earliest pre-mutation checkpoint (spec §6):
+    /// restoring the earliest checkpoint among the dropped tool calls undoes every later mutation in
+    /// the sealed range. A read-only rewound range (no checkpoints) leaves the filesystem untouched.
+    async fn rollback_workspace_after_rewind(
+        &self,
+        session: &SessionId,
+        outcome: &daemon_core::RewindOutcome,
+    ) {
+        if outcome.dropped_call_ids.is_empty() {
+            return;
+        }
+        let store = match self.checkpoints.lock().unwrap().clone() {
+            Some(store) => store,
+            None => return,
+        };
+        let dropped: std::collections::HashSet<&str> =
+            outcome.dropped_call_ids.iter().map(|s| s.as_str()).collect();
+        // The checkpoints captured before the dropped tools ran, oldest first.
+        let mut matching: Vec<_> = store
+            .list(Some(session.as_str()))
+            .await
+            .into_iter()
+            .filter(|r| dropped.contains(r.call_id.as_str()))
+            .collect();
+        matching.sort_by_key(|r| r.created_unix);
+        if let Some(earliest) = matching.first() {
+            let _ = store.restore(earliest).await;
         }
     }
 

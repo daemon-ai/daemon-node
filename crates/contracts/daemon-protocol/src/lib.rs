@@ -73,8 +73,47 @@ pub enum AgentCommand {
         /// Correlation id for the snapshot request.
         request_id: ReqId,
     },
+    /// Rewind the conversation to a prior point, sealing/truncating everything after `anchor` and
+    /// reconstructing the engine state for that point so a subsequent `StartTurn` replays from there
+    /// (conversation-rewind spec). Interrupt-first: if a turn is live the engine interrupts it before
+    /// truncating, then bumps the [`Epoch`](daemon_common::Epoch) to fence late arrivals from the
+    /// abandoned turn. Only supported by `daemon-core`-backed sessions; foreign agents (ACP) reject
+    /// it (their conversation state is not daemon-owned and ACP has no truncate-at-anchor primitive).
+    RewindTo {
+        /// Where to rewind to.
+        anchor: RewindAnchor,
+        /// Correlation id (echoed on [`AgentEvent::Rewound`]).
+        request_id: ReqId,
+    },
     /// Drain and shut the engine down.
     Shutdown,
+}
+
+/// A durable, replay-stable address of a conversation-rewind point (conversation-rewind spec §2).
+///
+/// `ordinal` variants index into the live conversation turns — the same 0-based index a client sees
+/// in [`ConvView::turns`] — so a client addresses what it can see. `Cursor` addresses by the durable
+/// journal cursor (the §17 `session_history` cursor) for reconnect-stable addressing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RewindAnchor {
+    /// Seal off the user turn at `ordinal` and everything after it (the restore/edit case): the
+    /// truncation keeps turns `[0, ordinal)`, so the next `StartTurn` re-runs from that user turn.
+    UserTurn {
+        /// 0-based index of the user turn (a [`ConvView::turns`] index).
+        ordinal: u64,
+    },
+    /// Keep the user turn at `ordinal` but seal off the assistant reply that followed it (the
+    /// regenerate case): the truncation keeps turns `[0, ordinal]`.
+    ReplyAfter {
+        /// 0-based index of the user turn whose reply is being regenerated.
+        ordinal: u64,
+    },
+    /// A raw durable journal cursor (the §17 `session_history` cursor) for clients that address by
+    /// cursor rather than ordinal.
+    Cursor {
+        /// The journal cursor to truncate to (everything after it is sealed off).
+        seq: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +399,23 @@ pub enum AgentEvent {
         /// The consistent conversation projection.
         view: ConvView,
     },
+    /// The conversation was rewound (conversation-rewind spec §3). A live client drops every turn it
+    /// holds with ordinal `>= to_cursor` the moment this arrives, so the UI matches the engine before
+    /// the replayed `TurnStarted { trigger: User }` streams in; a reconnecting client reconciles via
+    /// `session_history` (which stops at / flags the durable seal — see `JournalPageView::sealed_after`).
+    Rewound {
+        /// Monotonic event sequence number.
+        seq: u64,
+        /// Correlation id echoed from [`AgentCommand::RewindTo`].
+        request_id: ReqId,
+        /// The retained conversation length in turns — the new tail ordinal. The truncation keeps
+        /// turns `[0, to_cursor)`; a live client drops every turn it holds with ordinal `>= to_cursor`.
+        /// (The engine addresses turns by ordinal; the durable journal seal cursor is surfaced
+        /// separately by `session_history` as `JournalPageView::sealed_after`.)
+        to_cursor: u64,
+        /// The new incarnation epoch fencing stale commits/events from the abandoned turn.
+        epoch: u64,
+    },
 }
 
 impl AgentEvent {
@@ -378,7 +434,8 @@ impl AgentEvent {
             | AgentEvent::TurnFinished { seq, .. }
             | AgentEvent::Error { seq, .. }
             | AgentEvent::Steered { seq, .. }
-            | AgentEvent::Snapshot { seq, .. } => *seq,
+            | AgentEvent::Snapshot { seq, .. }
+            | AgentEvent::Rewound { seq, .. } => *seq,
         }
     }
 }

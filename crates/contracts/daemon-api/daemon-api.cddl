@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 13)
+wire_version = uint                 ; daemon-common WireVersion (current = 14)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -29,7 +29,13 @@ agent-command = { "StartTurn": { input: user-msg, request_id: req-id } }
               / { "Observe": { input: user-msg, request_id: req-id } }   ; wire v8 (context-only append, no turn)
               / { "Interrupt": { reason: (tstr / null) } }
               / { "Snapshot": { request_id: req-id } }
+              / { "RewindTo": { anchor: rewind-anchor, request_id: req-id } }  ; wire v14 (conversation rewind)
               / "Shutdown"
+
+; ----- conversation-rewind anchor (daemon-protocol RewindAnchor; wire v13) -----
+rewind-anchor = { "UserTurn": { ordinal: uint } }
+              / { "ReplyAfter": { ordinal: uint } }
+              / { "Cursor": { seq: uint } }
 
 ; ----- read-only conversation projection (Snapshot event body) -----
 conv-turn-view = {
@@ -64,6 +70,7 @@ agent-event = { "TurnStarted": { seq: uint, trigger: any } }
             / { "Error": { seq: uint, failure: tstr } }
             / { "Steered": { seq: uint, request_id: req-id, accepted: bool } }
             / { "Snapshot": { seq: uint, request_id: req-id, view: conv-view } }
+            / { "Rewound": { seq: uint, request_id: req-id, to_cursor: uint, epoch: uint } }  ; wire v14 (conversation rewind)
 
 host-request  = { request_id: req-id, kind: any }
 host-response = { request_id: req-id, body: any }

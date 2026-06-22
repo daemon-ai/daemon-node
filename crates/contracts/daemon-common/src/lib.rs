@@ -394,7 +394,14 @@ impl WireVersion {
     /// (`begin` mints an authorization URL against a client-owned `redirect_uri`, the client captures
     /// the redirect and relays it to `complete`); the daemon parks the pending flow and writes the
     /// resulting credential through the existing `CredentialStore`.
-    pub const CURRENT: Self = Self(13);
+    ///
+    /// v14 (conversation rewind): adds the conversation-rewind primitive — the submit-path
+    /// `AgentCommand::RewindTo { anchor, request_id }` (with `RewindAnchor` = user-turn / reply-after
+    /// ordinal or durable journal cursor) and the `AgentEvent::Rewound { to_cursor, epoch }` event,
+    /// both riding the existing `Submit` / event stream (no new op). Seals the durable journal at the
+    /// rewound cursor (`JournalPageView::sealed_after`) and marks `daemon-core` sessions
+    /// `SessionInfo::rewindable` (foreign ACP sessions report `false`).
+    pub const CURRENT: Self = Self(14);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
