@@ -112,6 +112,23 @@ pub trait Tool: Send + Sync {
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
     }
+
+    /// Whether this tool belongs to the **deferrable** (dynamic / long-tail) set rather than the
+    /// always-offered core. Deferrable tools (MCP + Python proxies) are hidden behind the
+    /// `tool_search` bridge once their summed schema exceeds the engine's threshold, so a large
+    /// external tool surface never blows the prompt budget. Built-in tools default to `false` (core).
+    fn deferrable(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool **mutates** the workspace (an fs write/edit or a shell command). The §12
+    /// pipeline records a [`CheckpointStore`](crate::checkpoint::CheckpointStore) checkpoint before a
+    /// mutating tool runs, so an operator can rewind. Defaults to `false` (read-only / pure tools);
+    /// `fs` write/edit and `shell` opt in. Distinct from [`concurrency`](Tool::concurrency), which is
+    /// about batch parallelism.
+    fn mutates(&self) -> bool {
+        false
+    }
 }
 
 /// A boxed, thread-safe error from a [`ToolProvider`] (kept opaque so `daemon-core` stays free of
@@ -135,44 +152,134 @@ pub trait ToolProvider: Send + Sync {
     async fn discover(&self) -> Result<Vec<Arc<dyn Tool>>, ToolProviderError>;
 }
 
+/// The `tool_search` bridge name: takes `{ "query": "..." }`, returns matching deferrable tools.
+pub const TOOL_SEARCH: &str = "tool_search";
+/// The `tool_describe` bridge name: takes `{ "name": "..." }`, returns that tool's full schema.
+pub const TOOL_DESCRIBE: &str = "tool_describe";
+/// The `tool_call` bridge name: takes `{ "name": "...", "arguments": { ... } }`, invokes a
+/// deferrable tool by name (the indirection the model uses once the long tail is collapsed).
+pub const TOOL_CALL: &str = "tool_call";
+
 /// The tool registry: resolves a call name to its handler (§12 `tools.rs`).
+///
+/// Tools are split into a **core** set (always offered to the model) and a **deferrable** set (the
+/// dynamic long tail — MCP + Python proxies, classified by [`Tool::deferrable`]). When the deferrable
+/// schema is small it is offered inline; once it exceeds the engine's threshold the registry offers
+/// the `tool_search`/`tool_describe`/`tool_call` bridge instead (progressive disclosure). Resolution
+/// ([`get`](ToolRegistry::get)) always spans both sets, so a collapsed tool is still callable.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    core: HashMap<String, Arc<dyn Tool>>,
+    deferrable: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            core: HashMap::new(),
+            deferrable: HashMap::new(),
         }
     }
 
-    /// Register a tool under its declared name.
+    /// Register a tool under its declared name, routing it to the core or deferrable set per
+    /// [`Tool::deferrable`]. Existing call sites are unaffected — a built-in lands in core as before.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_owned(), tool);
+        if tool.deferrable() {
+            self.deferrable.insert(tool.name().to_owned(), tool);
+        } else {
+            self.core.insert(tool.name().to_owned(), tool);
+        }
     }
 
-    /// Resolve a tool by name.
+    /// Force-register a tool into the deferrable set regardless of its [`Tool::deferrable`] hint.
+    pub fn register_deferrable(&mut self, tool: Arc<dyn Tool>) {
+        self.deferrable.insert(tool.name().to_owned(), tool);
+    }
+
+    /// Resolve a tool by name across both the core and deferrable sets.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.core
+            .get(name)
+            .or_else(|| self.deferrable.get(name))
+            .cloned()
     }
 
-    /// The names of all registered tools (offered to the model each turn).
+    /// The names of all registered tools (core + deferrable).
     pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.core.keys().chain(self.deferrable.keys()).cloned().collect()
     }
 
-    /// The static descriptions of all registered tools.
+    /// The static descriptions of all registered tools (core + deferrable).
     pub fn defs(&self) -> Vec<ToolDef> {
-        self.tools
+        self.core
             .values()
-            .map(|t| ToolDef {
-                name: t.name().to_owned(),
-                schema: t.schema().to_owned(),
-            })
+            .chain(self.deferrable.values())
+            .map(def_of)
             .collect()
+    }
+
+    /// The core (always-offered) tool descriptions.
+    pub fn core_defs(&self) -> Vec<ToolDef> {
+        self.core.values().map(def_of).collect()
+    }
+
+    /// The deferrable (long-tail) tool descriptions.
+    pub fn deferrable_defs(&self) -> Vec<ToolDef> {
+        self.deferrable.values().map(def_of).collect()
+    }
+
+    /// The summed byte length of every deferrable tool's schema — the quantity compared against the
+    /// engine's `tool_search_threshold_bytes`.
+    pub fn deferrable_schema_bytes(&self) -> usize {
+        self.deferrable.values().map(|t| t.schema().len()).sum()
+    }
+
+    /// Whether there are any deferrable tools registered.
+    pub fn has_deferrable(&self) -> bool {
+        !self.deferrable.is_empty()
+    }
+
+    /// The static descriptions of the three bridge tools (offered when the long tail is collapsed).
+    pub fn bridge_defs(&self) -> Vec<ToolDef> {
+        vec![
+            ToolDef {
+                name: TOOL_SEARCH.to_owned(),
+                schema: r#"{"type":"object","properties":{"query":{"type":"string","description":"keywords to find a tool by name or schema"}},"required":["query"]}"#.to_owned(),
+            },
+            ToolDef {
+                name: TOOL_DESCRIBE.to_owned(),
+                schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"the exact tool name to describe"}},"required":["name"]}"#.to_owned(),
+            },
+            ToolDef {
+                name: TOOL_CALL.to_owned(),
+                schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"the exact tool name to invoke"},"arguments":{"type":"object","description":"the tool's arguments"}},"required":["name"]}"#.to_owned(),
+            },
+        ]
+    }
+
+    /// The tool descriptions offered to the model this turn: always the core set, plus *either* every
+    /// deferrable schema (when small / threshold disabled) *or* the three bridge tools (when the
+    /// deferrable schema exceeds `threshold_bytes`). Progressive disclosure for tools.
+    pub fn offered_defs(&self, threshold_bytes: usize) -> Vec<ToolDef> {
+        let mut defs = self.core_defs();
+        let collapse = threshold_bytes > 0
+            && self.has_deferrable()
+            && self.deferrable_schema_bytes() > threshold_bytes;
+        if collapse {
+            defs.extend(self.bridge_defs());
+        } else {
+            defs.extend(self.deferrable_defs());
+        }
+        defs
+    }
+}
+
+/// The static description of a tool.
+fn def_of(t: &Arc<dyn Tool>) -> ToolDef {
+    ToolDef {
+        name: t.name().to_owned(),
+        schema: t.schema().to_owned(),
     }
 }
 

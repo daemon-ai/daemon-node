@@ -1,0 +1,33 @@
+[package]
+name = "daemon-mcp-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The `Tool`/`ToolProvider` trait the proxy + provider implement, and the `ToolOutcome` it maps
+# MCP results onto. No rmcp type leaks across this boundary — the host sees only `daemon_core`.
+daemon-core = { workspace = true }
+daemon-common = { workspace = true }
+# The official MCP SDK (client only: stdio child-process + streamable-HTTP transports).
+rmcp = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# An in-process MCP *server* (the `server` feature, dev-only) for the hermetic client<->server
+# roundtrip conformance test — discover -> register -> run_tool over a real rmcp duplex transport.
+rmcp = { version = "1.7", default-features = false, features = ["client", "server", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# The engine scaffolding the roundtrip drives a tool through (registry + pipeline + TurnCx).
+daemon-core = { workspace = true }
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+tokio-util = { workspace = true }

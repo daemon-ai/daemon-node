@@ -102,6 +102,13 @@ impl Tool for FsTool {
         r#"{"type":"object","properties":{"op":{"type":"string","enum":["read","write","list","edit"]},"path":{"type":"string"},"content":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["op"]}"#
     }
 
+    fn mutates(&self) -> bool {
+        // The `write`/`edit` ops mutate the workspace; the pipeline checkpoints before this tool runs
+        // (read/list are harmless, but the hint is per-tool, so the conservative choice is to
+        // checkpoint any `fs` call — a redundant checkpoint is cheap and best-effort).
+        true
+    }
+
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         let args: FsArgs = match serde_json::from_str(&call.args) {
             Ok(args) => args,
@@ -237,6 +244,7 @@ mod tests {
             tool_result_budget: 0,
             approval_policy: ApprovalPolicy::AutoAllow,
             pre_approved: false,
+            checkpoints: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),

@@ -682,6 +682,15 @@ fn render(resp: ApiResponse) {
                 );
             }
         }
+        ApiResponse::Checkpoints(list) => {
+            println!("checkpoints: {}", list.len());
+            for info in list {
+                println!(
+                    "  - {} session={} tool={} created={}",
+                    info.id, info.session, info.tool, info.created_unix
+                );
+            }
+        }
         ApiResponse::Fleet(f) => {
             println!(
                 "fleet: children={} usage(in={} out={} api_calls={})",

@@ -360,7 +360,13 @@ impl WireVersion {
     /// inbound context to the conversation **without** opening a turn (the multi-party accumulation
     /// seam, event-io §5.9): chatter folds in while idle and lands in the following turn while busy,
     /// so a shared room can feed the agent context it sees on its next mention-gated turn.
-    pub const CURRENT: Self = Self(8);
+    ///
+    /// v9 (tool checkpoints): adds the §12 tool-safety surface — the `Checkpoint{List,Rewind}` control
+    /// ops (`CheckpointList`/`CheckpointRewind` -> `ApiResponse::Checkpoints`, `CheckpointInfo`) over a
+    /// best-effort workspace checkpoint recorded before each mutating tool runs, so an operator/GUI can
+    /// rewind autonomous edits. (Also lands the MCP-client tool breadth + tool-search progressive
+    /// disclosure, which ride the existing `ToolProvider`/offer seams and need no new wire surface.)
+    pub const CURRENT: Self = Self(9);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
