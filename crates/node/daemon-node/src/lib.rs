@@ -672,10 +672,28 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     if let Some(skills) = a.skills.clone() {
         node_api = node_api.with_skills(skills);
     }
-    // Install the host routing registry (§5.9) when configured, so routed submits select the
-    // session's profile + delivery from the inbound origin.
-    if let Some(routing) = a.routing.clone() {
-        node_api = node_api.with_routing(routing);
+    // Install the host routing registry (§5.9) so routed submits select the session's profile +
+    // delivery from the inbound origin. The account→profile baseline (precedence step 2) is derived
+    // here from every profile's `bound_accounts` (§5.9.4): profile-declared instance bindings fill
+    // the registry's `instance_profiles`, while any explicit config `[[routing.instance_profile]]`
+    // already present wins (operator override). A registry is installed when configured *or* when a
+    // profile contributes a binding, even if the config route table was empty.
+    {
+        let profile_specs = a
+            .profiles
+            .as_ref()
+            .and_then(|p| p.list().ok())
+            .unwrap_or_default();
+        let routing = match a.routing.clone() {
+            Some(reg) => Some(reg.bind_instances_from_profiles(&profile_specs)),
+            None => {
+                let reg = RoutingRegistry::new().bind_instances_from_profiles(&profile_specs);
+                (!reg.is_empty()).then_some(reg)
+            }
+        };
+        if let Some(routing) = routing {
+            node_api = node_api.with_routing(routing);
+        }
     }
     // Bind the live cloud-model discovery hook when the binary provided one.
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {
