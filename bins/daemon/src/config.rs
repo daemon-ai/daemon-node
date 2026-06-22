@@ -859,7 +859,20 @@ impl NodeConfig {
     /// The profile-scoped data home (`<data_dir>/<profile>/`) rooting this node's §10/§11 subsystem
     /// databases. Mirrors hermes' per-profile layout so different profiles never share a memory bank.
     pub fn profile_home(&self) -> PathBuf {
-        self.data_dir.join(&self.profile)
+        self.profile_home_for(&self.profile)
+    }
+
+    /// The data home for an arbitrary `profile` (`<data_dir>/<profile>/`). The §5.9 routed/identity
+    /// profile keys the LCM/Mnemosyne bank caches here, so a session routed to a non-default profile
+    /// gets its own isolated subsystem stores rather than sharing the launch profile's home.
+    pub fn profile_home_for(&self, profile: &str) -> PathBuf {
+        self.data_dir.join(profile)
+    }
+
+    /// The data-dir root that profile homes hang off (`<data_dir>`); the bank caches join the
+    /// resolved profile id onto this to compute each profile's home.
+    pub fn data_root(&self) -> PathBuf {
+        self.data_dir.clone()
     }
 
     /// Whether the §10/§11 providers persist to disk. Durability follows the store backend: an

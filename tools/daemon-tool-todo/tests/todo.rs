@@ -28,6 +28,7 @@ async fn run(tool: &dyn Tool, session: &str, args: &str) -> ToolOutcome {
         events: &events,
         host: &host,
         session_id: SessionId::new(session),
+        profile: None,
         budget: Budget::unlimited(),
         exec: &exec,
         tool_result_budget: 0,

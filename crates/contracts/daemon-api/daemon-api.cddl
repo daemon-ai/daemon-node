@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 7)
+wire_version = uint                 ; daemon-common WireVersion (current = 8)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -26,6 +26,7 @@ user-msg = { text: tstr }
 
 agent-command = { "StartTurn": { input: user-msg, request_id: req-id } }
               / { "Steer": { text: tstr, request_id: req-id } }
+              / { "Observe": { input: user-msg, request_id: req-id } }   ; wire v8 (context-only append, no turn)
               / { "Interrupt": { reason: (tstr / null) } }
               / { "Snapshot": { request_id: req-id } }
               / "Shutdown"

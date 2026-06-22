@@ -355,7 +355,12 @@ impl WireVersion {
     /// `ApiResponse::Routed { session }`), the seam a transport uses to hand the host an `Origin` and
     /// let the §5.9 routing capability resolve the session + profile + delivery (rather than deriving
     /// the `SessionId` itself).
-    pub const CURRENT: Self = Self(7);
+    ///
+    /// v8 (observe): adds the context-only `AgentCommand::Observe { input, request_id }` — appends
+    /// inbound context to the conversation **without** opening a turn (the multi-party accumulation
+    /// seam, event-io §5.9): chatter folds in while idle and lands in the following turn while busy,
+    /// so a shared room can feed the agent context it sees on its next mention-gated turn.
+    pub const CURRENT: Self = Self(8);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

@@ -33,6 +33,10 @@ impl AgentSession for LiveAgentSession {
                 });
             }
             AgentCommand::Steer { text, request_id } => self.handle.steer(request_id, text).await,
+            // Context-only append (no turn): folds in when idle, lands in the following turn if busy.
+            AgentCommand::Observe { input, request_id } => {
+                self.handle.observe(request_id, input).await
+            }
             AgentCommand::Snapshot { request_id } => self.handle.snapshot(request_id).await,
             AgentCommand::Interrupt { reason } => self.handle.interrupt(reason).await,
             AgentCommand::Shutdown => self.handle.shutdown().await,

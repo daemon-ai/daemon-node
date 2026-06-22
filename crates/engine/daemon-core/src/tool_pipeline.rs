@@ -114,6 +114,7 @@ mod tests {
             events: &events,
             host: &NoopHost,
             session_id: SessionId::new("s"),
+            profile: None,
             budget: Budget::unlimited(),
             exec: &exec,
             tool_result_budget: 0,

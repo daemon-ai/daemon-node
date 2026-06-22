@@ -2939,6 +2939,420 @@ mod node_interface {
         handle.shutdown().await;
     }
 
+    /// FOUNDATION: profile-scoped §11 memory under per-room routing. M1 made provider/persona/tools
+    /// profile-aware per session, but §10 context and §11 memory were wired once from the launch
+    /// profile's home — so two rooms routed to two profiles shared one bank. This proves the resolved
+    /// `ProfileRef` now threads all the way into memory construction: routing two accounts to two
+    /// profiles opens two banks under distinct `<data_dir>/<profile>/` homes on disk, while a
+    /// profile-less (legacy) engine resolves the shared default home (the pre-routing behavior).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routed_profiles_get_isolated_memory_banks() {
+        use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_core::{EngineProfile, MemoryBuilder, MemoryProvider, SystemPrompt, ToolRegistry};
+        use daemon_host::{MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
+        use daemon_protocol::{
+            AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg,
+        };
+        use std::sync::Mutex;
+
+        // A recording memory builder: each construction roots a real per-profile bank dir under a
+        // tmp root (the on-disk isolation we assert) and records the (profile, session, dir) it saw.
+        let root = std::env::temp_dir().join(format!("daemon-mc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        type Calls = Arc<Mutex<Vec<(Option<String>, String, std::path::PathBuf)>>>;
+        let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+        let make_builder = |calls: Calls, root: std::path::PathBuf| -> MemoryBuilder {
+            Arc::new(move |profile: Option<&ProfileRef>, session: &SessionId| {
+                let pname = profile.map(|p| p.as_str().to_string());
+                let dir = root.join(pname.clone().unwrap_or_else(|| "default".to_string()));
+                std::fs::create_dir_all(&dir).expect("create per-profile bank dir");
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((pname, session.as_str().to_string(), dir));
+                Vec::<Arc<dyn MemoryProvider>>::new()
+            })
+        };
+
+        // Two accounts bound to two profiles.
+        let store = Arc::new(MemProfileStore::new());
+        for (id, model) in [("alpha", "model-a"), ("beta", "model-b")] {
+            let mut spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
+            spec.system_prompt = format!("You are {id}.");
+            store.create(spec).expect("create profile");
+        }
+        store.set_active("alpha").expect("set active");
+
+        let resolver: daemon_node::ProviderResolver = Arc::new(|spec: &ProfileSpec| {
+            let reply = format!("[{}]", spec.id);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
+            builder
+        });
+
+        let routing = RoutingRegistry::new()
+            .bind_instance(TransportId::new("matrix/@a:hs"), ProfileRef::new("alpha"))
+            .bind_instance(TransportId::new("matrix/@b:hs"), ProfileRef::new("beta"));
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: Some(make_builder(calls.clone(), root.clone())),
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(store),
+            provider_resolver: Some(resolver),
+            credential_store: Some(Arc::new(MemCredentialStore::new())),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: Some(routing),
+        });
+
+        async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {
+            let session = node
+                .submit_routed(
+                    origin,
+                    AgentCommand::StartTurn {
+                        input: UserMsg::new("hi"),
+                        request_id: ReqId(1),
+                    },
+                )
+                .await
+                .expect("routed submit");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut finished = false;
+            while Instant::now() < deadline && !finished {
+                for item in node.poll(session.clone(), 0).await.expect("poll") {
+                    if let Outbound::Event(AgentEvent::TurnFinished { .. }) = item {
+                        finished = true;
+                    }
+                }
+                if !finished {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            assert!(finished, "routed turn never reached TurnFinished");
+        }
+
+        let origin_a = Origin::new(
+            TransportId::new("matrix/@a:hs"),
+            OriginScope::Group {
+                chat: "#general".into(),
+                thread: None,
+            },
+        );
+        let origin_b = Origin::new(
+            TransportId::new("matrix/@b:hs"),
+            OriginScope::Group {
+                chat: "#general".into(),
+                thread: None,
+            },
+        );
+        route(&node, origin_a).await;
+        route(&node, origin_b).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        let alpha_dir = root.join("alpha");
+        let beta_dir = root.join("beta");
+        assert!(
+            recorded
+                .iter()
+                .any(|(p, _, d)| p.as_deref() == Some("alpha") && d == &alpha_dir),
+            "the alpha-routed session built its memory under its own home: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(p, _, d)| p.as_deref() == Some("beta") && d == &beta_dir),
+            "the beta-routed session built its memory under its own home: {recorded:?}"
+        );
+        assert!(
+            alpha_dir.is_dir() && beta_dir.is_dir(),
+            "both per-profile bank dirs exist on disk"
+        );
+        assert_ne!(alpha_dir, beta_dir, "two routed profiles -> two isolated banks");
+
+        handle.shutdown().await;
+
+        // None/legacy: an `EngineProfile` with no profile ref resolves the builder with `None`, so
+        // two such engines share the default home (the pre-routing single-profile behavior).
+        let legacy = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("ok")) as Arc<dyn Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("legacy"),
+        )
+        .with_memory_builder(make_builder(calls.clone(), root.clone()));
+        let _ = legacy.fresh(SessionId::new("s1"));
+        let _ = legacy.fresh(SessionId::new("s2"));
+        let default_dir = root.join("default");
+        let legacy_calls: Vec<_> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| p.is_none())
+            .cloned()
+            .collect();
+        assert_eq!(legacy_calls.len(), 2, "two legacy engines built memory");
+        assert!(
+            legacy_calls.iter().all(|(_, _, d)| d == &default_dir),
+            "profile-less engines share the default home: {legacy_calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FOUNDATION: `AgentCommand::Observe` appends context **without** running a turn (the multi-party
+    /// accumulation seam, event-io §5.9). Idle: an Observe emits no `TurnStarted` and folds into the
+    /// conversation the next `StartTurn` runs on. Busy: an Observe injected mid-turn starts no turn of
+    /// its own and lands in the conversation (drained at the phase boundary) for the following turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observe_appends_context_without_starting_a_turn() {
+        use async_trait::async_trait;
+        use daemon_api::{Outbound, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_core::{Tool, ToolCall, ToolOutcome, TurnCx};
+        use daemon_protocol::{AgentCommand, AgentEvent, ConvView, UserMsg};
+
+        // Collect every drained event for `window` (used to assert presence/absence of `TurnStarted`).
+        async fn collect_for(
+            node: &Arc<NodeApiImpl>,
+            session: &SessionId,
+            window: Duration,
+        ) -> Vec<AgentEvent> {
+            let deadline = Instant::now() + window;
+            let mut events = Vec::new();
+            while Instant::now() < deadline {
+                for item in node.poll(session.clone(), 0).await.expect("poll") {
+                    if let Outbound::Event(ev) = item {
+                        events.push(ev);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            events
+        }
+
+        // Drain into `events` until one matches `pred`.
+        async fn drain_until(
+            node: &Arc<NodeApiImpl>,
+            session: &SessionId,
+            events: &mut Vec<AgentEvent>,
+            pred: impl Fn(&AgentEvent) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for item in node.poll(session.clone(), 0).await.expect("poll") {
+                    if let Outbound::Event(ev) = item {
+                        events.push(ev);
+                    }
+                }
+                if events.iter().any(&pred) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never saw the expected event");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn snapshot_view(events: &[AgentEvent], request_id: ReqId) -> ConvView {
+            events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::Snapshot {
+                        request_id: id,
+                        view,
+                        ..
+                    } if *id == request_id => Some(view.clone()),
+                    _ => None,
+                })
+                .expect("a Snapshot event is present")
+        }
+
+        let conv_has = |view: &ConvView, needle: &str| -> bool {
+            view.turns.iter().any(|t| t.text.contains(needle))
+        };
+        let started_count =
+            |events: &[AgentEvent]| events.iter().filter(|e| matches!(e, AgentEvent::TurnStarted { .. })).count();
+
+        // ---------------------------- idle ----------------------------
+        let (node, handle) = assemble();
+        let idle = SessionId::new("obs-idle");
+
+        node.submit(
+            idle.clone(),
+            AgentCommand::Observe {
+                input: UserMsg::new("[alice] the launch code is 4242"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("idle observe");
+        let idle_window = collect_for(&node, &idle, Duration::from_millis(300)).await;
+        assert_eq!(
+            started_count(&idle_window),
+            0,
+            "an idle Observe must not start a turn: {idle_window:?}"
+        );
+
+        node.submit(
+            idle.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("what is the code?"),
+                request_id: ReqId(2),
+            },
+        )
+        .await
+        .expect("start turn");
+        let mut idle_events = Vec::new();
+        drain_until(&node, &idle, &mut idle_events, |e| {
+            matches!(e, AgentEvent::TurnFinished { .. })
+        })
+        .await;
+        assert_eq!(
+            started_count(&idle_events),
+            1,
+            "exactly one turn ran (the StartTurn, not the prior Observe)"
+        );
+
+        node.submit(idle.clone(), AgentCommand::Snapshot { request_id: ReqId(3) })
+            .await
+            .expect("snapshot");
+        drain_until(&node, &idle, &mut idle_events, |e| {
+            matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(3))
+        })
+        .await;
+        let view = snapshot_view(&idle_events, ReqId(3));
+        assert!(
+            conv_has(&view, "launch code is 4242"),
+            "the idle Observe folded into the conversation the next turn ran on: {view:?}"
+        );
+        assert!(
+            conv_has(&view, "what is the code?"),
+            "the StartTurn input shares that same conversation"
+        );
+        handle.shutdown().await;
+
+        // ---------------------------- busy ----------------------------
+        // A tool that blocks until the test releases it, so we can inject an Observe while a turn is
+        // genuinely in flight (the engine sits inside this tool awaiting the gate).
+        struct GateTool {
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl Tool for GateTool {
+            fn name(&self) -> &str {
+                "gate"
+            }
+            fn schema(&self) -> &str {
+                "{}"
+            }
+            async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {
+                self.release.notified().await;
+                ToolOutcome::text(call.call_id.clone(), true, "released")
+            }
+        }
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut providers = ProviderRegistry::new();
+        providers.set_default(Arc::new(|| {
+            Arc::new(MockProvider::delegating("gate", "turn-one-done")) as Arc<dyn Provider>
+        }));
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers,
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x33; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: vec![Arc::new(GateTool {
+                release: release.clone(),
+            }) as Arc<dyn Tool>],
+            models: None,
+            profiles: None,
+            provider_resolver: None,
+            credential_store: None,
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: None,
+        });
+        let busy = SessionId::new("obs-busy");
+
+        node.submit(
+            busy.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("go"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("start busy turn");
+        let mut busy_events = Vec::new();
+        // Wait until the gate tool is in flight: turn one is genuinely busy.
+        drain_until(&node, &busy, &mut busy_events, |e| {
+            matches!(e, AgentEvent::ToolStarted { .. })
+        })
+        .await;
+        // Inject an Observe mid-turn, give the actor a moment to fold it onto the control queue, then
+        // release the gate so the turn finalizes (draining the observe at the boundary).
+        node.submit(
+            busy.clone(),
+            AgentCommand::Observe {
+                input: UserMsg::new("[bob] mid-turn fact: the sky is green"),
+                request_id: ReqId(2),
+            },
+        )
+        .await
+        .expect("busy observe");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.notify_one();
+        drain_until(&node, &busy, &mut busy_events, |e| {
+            matches!(e, AgentEvent::TurnFinished { .. })
+        })
+        .await;
+        assert_eq!(
+            started_count(&busy_events),
+            1,
+            "the mid-turn Observe started no turn of its own: {busy_events:?}"
+        );
+
+        node.submit(busy.clone(), AgentCommand::Snapshot { request_id: ReqId(3) })
+            .await
+            .expect("snapshot");
+        drain_until(&node, &busy, &mut busy_events, |e| {
+            matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(3))
+        })
+        .await;
+        let view = snapshot_view(&busy_events, ReqId(3));
+        assert!(
+            conv_has(&view, "the sky is green"),
+            "the busy Observe landed in the conversation (drained at the boundary) for the following turn: {view:?}"
+        );
+        handle.shutdown().await;
+    }
+
     /// THE THREAD-C GATE: reconnect + scroll-back through durable, verified history. After an
     /// interactive turn seals into the unified verifiable journal, the session's history is read
     /// back through the (non-destructive) `session_history` surface — independent of the live drain,
@@ -4026,6 +4440,7 @@ mod web_tools {
             events: &events,
             host: &host,
             session_id: SessionId::new("s"),
+            profile: None,
             budget: Budget::unlimited(),
             exec: &exec,
             tool_result_budget: 0,
@@ -4162,6 +4577,7 @@ mod tool_provider {
             events: &events,
             host: &host,
             session_id: SessionId::new("s"),
+            profile: None,
             budget: Budget::unlimited(),
             exec: &exec,
             tool_result_budget: 0,

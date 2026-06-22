@@ -8,6 +8,7 @@
 //! borrow conflict.
 
 use daemon_common::ReqId;
+use daemon_protocol::UserMsg;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,10 @@ pub struct SteerReq {
 pub struct TurnControl {
     cancel: Arc<Mutex<CancellationToken>>,
     steer: Arc<Mutex<VecDeque<SteerReq>>>,
+    /// Context-only inbound (`AgentCommand::Observe`) that arrived mid-turn: appended to the
+    /// conversation at the next phase boundary as plain user context (no steer marker / `Steered`
+    /// ack / re-prompt), so it folds into the following turn the agent runs.
+    observe: Arc<Mutex<VecDeque<UserMsg>>>,
     snapshot_req: Arc<Mutex<Vec<ReqId>>>,
 }
 
@@ -64,6 +69,16 @@ impl TurnControl {
     /// Drain all queued steer requests in arrival order.
     pub fn drain_steer(&self) -> Vec<SteerReq> {
         self.steer.lock().unwrap().drain(..).collect()
+    }
+
+    /// Enqueue a context-only observe (drained at the next phase boundary as plain user context).
+    pub fn push_observe(&self, input: UserMsg) {
+        self.observe.lock().unwrap().push_back(input);
+    }
+
+    /// Drain all queued observe inputs in arrival order.
+    pub fn drain_observe(&self) -> Vec<UserMsg> {
+        self.observe.lock().unwrap().drain(..).collect()
     }
 
     /// Record a pending snapshot request (served at the next phase boundary or immediately if idle).

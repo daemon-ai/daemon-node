@@ -52,6 +52,17 @@ pub enum AgentCommand {
         /// Correlation id for this steer request (echoed on [`AgentEvent::Steered`]).
         request_id: ReqId,
     },
+    /// Append context-only input to the conversation **without** opening a turn (the multi-party
+    /// accumulation seam, event-io §5.9): in a shared room the host feeds chatter the agent should
+    /// see on its next mention-gated turn, but that must not itself trigger the engine. Folds into
+    /// the conversation when idle, and lands in the following turn when busy (drained at the phase
+    /// boundary). Attribution (who spoke) rides inside the [`UserMsg`] text, adapter-formatted.
+    Observe {
+        /// The context-only input to append (no turn is started).
+        input: UserMsg,
+        /// Correlation id for this observe request.
+        request_id: ReqId,
+    },
     /// Interrupt the current turn.
     Interrupt {
         /// Optional human-readable reason.

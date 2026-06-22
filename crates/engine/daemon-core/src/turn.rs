@@ -9,7 +9,7 @@ use crate::approval::{ApprovalPolicy, Decision};
 use crate::conversation::{ToolCall, Turn};
 use crate::events::EventSink;
 use crate::exec::ExecutionEnvironment;
-use daemon_common::{Budget, JobId, SessionId};
+use daemon_common::{Budget, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponseBody, SpawnSpec,
 };
@@ -26,6 +26,10 @@ pub struct TurnCx<'a> {
     pub host: &'a dyn HostRequestHandler,
     /// The session this turn belongs to.
     pub session_id: SessionId,
+    /// The owning *identity* profile (§5.9 routed profile) of the engine running this turn, or `None`
+    /// for the node default. A profile-scoped tool (e.g. `lcm_*` / `mnemosyne_*`) resolves its bank by
+    /// `(profile, session_id)` so two rooms routed to two profiles never share a context/memory store.
+    pub profile: Option<ProfileRef>,
     /// The budget governing this turn's work.
     pub budget: Budget,
     /// The contained execution environment (§13) a tool reads/writes files and runs commands in.

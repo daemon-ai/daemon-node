@@ -626,6 +626,7 @@ async fn main() -> anyhow::Result<()> {
 fn render(resp: ApiResponse) {
     match resp {
         ApiResponse::Ok => println!("ok"),
+        ApiResponse::Routed { session } => println!("routed: session={session}"),
         ApiResponse::Health(h) => {
             println!("health: all_ok={}", h.all_ok);
             for s in h.services {
