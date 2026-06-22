@@ -26,6 +26,7 @@ daemon-skills = { workspace = true }
 daemon-node = { workspace = true }
 daemon-acp = { workspace = true }
 daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
 agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

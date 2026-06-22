@@ -1876,6 +1876,7 @@ dependencies = [
  "daemon-credentials",
  "daemon-delivery",
  "daemon-host",
+ "daemon-ingest",
  "daemon-node",
  "daemon-orchestration",
  "daemon-protocol",
@@ -2045,6 +2046,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "daemon-ingest"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-common",
+ "daemon-protocol",
+ "tokio",
 ]
 
 [[package]]
