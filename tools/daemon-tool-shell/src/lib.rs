@@ -81,6 +81,11 @@ impl Tool for ShellTool {
         r#"{"type":"object","properties":{"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["command"]}"#
     }
 
+    fn mutates(&self) -> bool {
+        // A shell command may write anywhere in the workspace; checkpoint before it runs.
+        true
+    }
+
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         let parsed: ShellArgs = match serde_json::from_str(&call.args) {
             Ok(args) => args,
@@ -205,6 +210,7 @@ mod tests {
             tool_result_budget: 0,
             approval_policy: ApprovalPolicy::Ask,
             pre_approved: false,
+            checkpoints: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),

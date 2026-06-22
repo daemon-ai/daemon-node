@@ -72,8 +72,8 @@ pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, 
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use node_api::{
-    decode_overlay, encode_overlay, CloudCatalog, DurableProfileResolver, ModelProviderFactory,
-    NodeApiImpl, SessionEngineBuilder,
+    decode_overlay, encode_overlay, CloudCatalog, DeliveryHost, DurableProfileResolver,
+    ModelProviderFactory, NodeApiImpl, SessionEngineBuilder,
 };
 pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};

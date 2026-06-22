@@ -49,6 +49,8 @@ const CONTEXT_BUDGET_TOKENS_ENV: &str = "DAEMON_CONTEXT_BUDGET_TOKENS";
 const MAX_ITERATIONS_ENV: &str = "DAEMON_MAX_ITERATIONS";
 /// Overrides the engine's `tool_result_budget` (per-tool result-byte cap) tunable.
 const TOOL_RESULT_BUDGET_ENV: &str = "DAEMON_TOOL_RESULT_BUDGET";
+/// Overrides the engine's `tool_search_threshold_bytes` (deferrable-schema collapse threshold; 0 off).
+const TOOL_SEARCH_THRESHOLD_ENV: &str = "DAEMON_TOOL_SEARCH_THRESHOLD_BYTES";
 /// Overrides the engine's `skill_review_interval` (post-turn skill-review nudge cadence; 0 disables).
 const SKILL_REVIEW_INTERVAL_ENV: &str = "DAEMON_SKILL_REVIEW_INTERVAL";
 /// Overrides the engine's `memory_review_interval` (post-turn memory-review nudge cadence; 0 disables).
@@ -361,6 +363,47 @@ impl Default for PythonToolsConfig {
     }
 }
 
+/// MCP-client tuning: the external Model-Context-Protocol servers the daemon connects to and
+/// surfaces tools from (through the same [`ToolProvider`](daemon_core::ToolProvider) seam as the
+/// Python worker). Empty by default — every server is opt-in via `[[mcp.servers]]`.
+#[derive(Clone, Debug, Default)]
+pub struct McpConfig {
+    /// The configured servers (each contributes `mcp__{name}__{tool}` tools when reachable).
+    pub servers: Vec<McpServerEntry>,
+}
+
+/// One configured MCP server.
+#[derive(Clone, Debug)]
+pub struct McpServerEntry {
+    /// A short, stable name used for tool namespacing + diagnostics.
+    pub name: String,
+    /// Whether to connect to + register this server's tools.
+    pub enable: bool,
+    /// How to reach the server.
+    pub transport: McpTransportEntry,
+    /// Per-operation timeout (discovery / a tool call).
+    pub op_timeout: Duration,
+}
+
+/// How a [`McpServerEntry`] reaches its server.
+#[derive(Clone, Debug)]
+pub enum McpTransportEntry {
+    /// Spawn a local server binary and speak MCP over its stdio.
+    Stdio {
+        /// The program to exec.
+        command: String,
+        /// Arguments passed to the program.
+        args: Vec<String>,
+        /// Extra environment variables set on the child.
+        env: Vec<(String, String)>,
+    },
+    /// Connect to a remote server over streamable HTTP.
+    Http {
+        /// The base MCP endpoint.
+        url: String,
+    },
+}
+
 /// Tuning for the web tools (`daemon-tool-web`). `enable = false` keeps `web_search`/`web_extract`
 /// unregistered (the default). The Tavily/Firecrawl keys are read live from the `CredentialStore`
 /// under [`WebConfig::tavily_key_id`]/[`WebConfig::firecrawl_key_id`], so a GUI-set key applies
@@ -604,6 +647,8 @@ pub struct NodeConfig {
     pub metta: MettaConfig,
     /// Python-tools tuning (`enable = false` by default — the `daemon_pytool` worker is opt-in).
     pub python: PythonToolsConfig,
+    /// MCP-client tuning (no servers by default — each `[[mcp.servers]]` entry is opt-in).
+    pub mcp: McpConfig,
     /// Web-tool tuning (`enable = false` by default — `web_search`/`web_extract` are opt-in).
     pub web: WebConfig,
     /// Browser-tool tuning (`enable = false` by default — also requires the `browser` build feature).
@@ -649,6 +694,7 @@ struct FileConfig {
     context_budget_tokens: Option<u32>,
     max_iterations: Option<u32>,
     tool_result_budget: Option<usize>,
+    tool_search_threshold_bytes: Option<usize>,
     skill_review_interval: Option<u32>,
     memory_review_interval: Option<u32>,
     journal_seed: Option<String>,
@@ -658,6 +704,7 @@ struct FileConfig {
     embed: Option<FileEmbedConfig>,
     metta: Option<FileMettaConfig>,
     python: Option<FilePythonConfig>,
+    mcp: Option<FileMcpConfig>,
     web: Option<FileWebConfig>,
     browser: Option<FileBrowserConfig>,
     skills: Option<FileSkillsConfig>,
@@ -715,6 +762,56 @@ struct FilePythonConfig {
     spawn_timeout_ms: Option<u64>,
     max_restarts: Option<u32>,
     restart_window_ms: Option<u64>,
+}
+
+/// The `[mcp]` TOML table — MCP-client tuning (the `[[mcp.servers]]` array; every field optional).
+///
+/// Each `[[mcp.servers]]` entry registers an external MCP server whose tools are surfaced to the
+/// agent under namespaced names `mcp__{name}__{tool}` (untrusted-fenced; gateable by
+/// `ProfileSpec.tool_allowlist`). A server that fails to start logs a warning and contributes no
+/// tools. No servers are configured by default. Example:
+///
+/// ```toml
+/// # A local stdio server the daemon spawns and owns (MCP over the child's stdio):
+/// [[mcp.servers]]
+/// name = "github"
+/// transport = "stdio"             # default; may be omitted
+/// command = "npx"
+/// args = ["-y", "@modelcontextprotocol/server-github"]
+/// env = { GITHUB_TOKEN = "ghp_..." }
+/// op_timeout_ms = 60000           # per-call/discovery timeout (default 60s)
+///
+/// # A remote server the daemon connects to over streamable HTTP:
+/// [[mcp.servers]]
+/// name = "docs"
+/// transport = "http"
+/// url = "http://127.0.0.1:8000/mcp"
+///
+/// # A temporarily disabled server (kept in config, contributes no tools):
+/// [[mcp.servers]]
+/// name = "scratch"
+/// enable = false
+/// command = "my-mcp-server"
+/// ```
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMcpConfig {
+    servers: Vec<FileMcpServer>,
+}
+
+/// A `[[mcp.servers]]` entry — one external MCP server.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMcpServer {
+    name: Option<String>,
+    enable: Option<bool>,
+    /// `"stdio"` (default) or `"http"`.
+    transport: Option<String>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<std::collections::HashMap<String, String>>,
+    url: Option<String>,
+    op_timeout_ms: Option<u64>,
 }
 
 /// The `[metta]` TOML table — symbolic-coprocessor tuning (every field optional; env wins).
@@ -996,6 +1093,7 @@ impl NodeConfig {
         let embed = Self::resolve_embed(file.embed.unwrap_or_default())?;
         let metta = Self::resolve_metta(file.metta.unwrap_or_default())?;
         let python = Self::resolve_python(file.python.unwrap_or_default())?;
+        let mcp = Self::resolve_mcp(file.mcp.unwrap_or_default())?;
         let web = Self::resolve_web(file.web.unwrap_or_default());
         let browser = Self::resolve_browser(file.browser.unwrap_or_default())?;
         let skills = Self::resolve_skills(file.skills.unwrap_or_default())?;
@@ -1021,6 +1119,7 @@ impl NodeConfig {
             embed,
             metta,
             python,
+            mcp,
             web,
             browser,
             skills,
@@ -1170,6 +1269,51 @@ impl NodeConfig {
             METTA_RESTART_WINDOW_MS_ENV,
         )?;
         Ok(metta)
+    }
+
+    /// Resolve the `[mcp]` table into the MCP-client config (file-only; per-server). Each entry must
+    /// name a transport; `stdio` requires `command`, `http` requires `url`.
+    fn resolve_mcp(file: FileMcpConfig) -> anyhow::Result<McpConfig> {
+        let mut servers = Vec::new();
+        for s in file.servers {
+            let name = s
+                .name
+                .ok_or_else(|| anyhow::anyhow!("[[mcp.servers]] requires `name`"))?;
+            let enable = s.enable.unwrap_or(true);
+            let transport = match s.transport.as_deref().unwrap_or("stdio") {
+                "stdio" => {
+                    let command = s.command.ok_or_else(|| {
+                        anyhow::anyhow!("[[mcp.servers]] `{name}` (stdio) requires `command`")
+                    })?;
+                    let env = s
+                        .env
+                        .map(|m| m.into_iter().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    McpTransportEntry::Stdio {
+                        command,
+                        args: s.args.unwrap_or_default(),
+                        env,
+                    }
+                }
+                "http" => {
+                    let url = s.url.ok_or_else(|| {
+                        anyhow::anyhow!("[[mcp.servers]] `{name}` (http) requires `url`")
+                    })?;
+                    McpTransportEntry::Http { url }
+                }
+                other => anyhow::bail!(
+                    "[[mcp.servers]] `{name}` has unknown transport `{other}` (use `stdio` or `http`)"
+                ),
+            };
+            let op_timeout = Duration::from_millis(s.op_timeout_ms.unwrap_or(60_000));
+            servers.push(McpServerEntry {
+                name,
+                enable,
+                transport,
+                op_timeout,
+            });
+        }
+        Ok(McpConfig { servers })
     }
 
     /// Resolve Python-tools tuning (env overriding the `[python]` TOML table overriding defaults).
@@ -1426,6 +1570,14 @@ impl NodeConfig {
             engine.tool_result_budget = s
                 .parse()
                 .context("DAEMON_TOOL_RESULT_BUDGET must be a usize")?;
+        }
+        if let Some(n) = file.tool_search_threshold_bytes {
+            engine.tool_search_threshold_bytes = n;
+        }
+        if let Some(s) = env_string(TOOL_SEARCH_THRESHOLD_ENV) {
+            engine.tool_search_threshold_bytes = s
+                .parse()
+                .context("DAEMON_TOOL_SEARCH_THRESHOLD_BYTES must be a usize")?;
         }
         if let Some(n) = file.skill_review_interval {
             engine.skill_review_interval = n;

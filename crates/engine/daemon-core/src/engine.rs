@@ -85,6 +85,9 @@ pub struct Engine {
     /// The contained execution environment (§13) tools run in; the host injects a per-session
     /// workspace-rooted one via [`crate::EngineProfile`], else the default sandbox.
     exec: Arc<dyn ExecutionEnvironment>,
+    /// The checkpoint store (§12 safety): when set, the pipeline checkpoints the workspace before a
+    /// mutating tool runs (rewind via the `Checkpoint{List,Rewind}` control surface). `None` => off.
+    checkpoints: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
     /// The context engine (§10): prompt assembly, budget pressure, and compaction. Defaults to the
     /// cheap [`BudgetedContextEngine`] (drop-oldest).
     context: Arc<dyn ContextEngine>,
@@ -129,6 +132,7 @@ impl Engine {
             subsystem_profile: None,
             config: Config::default(),
             exec,
+            checkpoints: None,
             context: Arc::new(BudgetedContextEngine::default()),
             assembler: PromptAssembler::default(),
             memory: Vec::new(),
@@ -166,6 +170,16 @@ impl Engine {
     /// workspace-rooted [`LocalEnvironment`], or a host-routed env).
     pub fn with_exec(mut self, exec: Arc<dyn ExecutionEnvironment>) -> Self {
         self.exec = exec;
+        self
+    }
+
+    /// Inject the checkpoint store (§12 safety): the pipeline will record a workspace checkpoint
+    /// before each [`mutates`](crate::tools::Tool::mutates) tool runs. Without it, checkpointing is off.
+    pub fn with_checkpoints(
+        mut self,
+        checkpoints: Arc<dyn crate::checkpoint::CheckpointStore>,
+    ) -> Self {
+        self.checkpoints = Some(checkpoints);
         self
     }
 
@@ -377,9 +391,12 @@ impl Engine {
         self.snapshot.epoch
     }
 
-    /// The registered tool definitions (name + JSON-Schema) offered to the model each turn.
+    /// The tool definitions offered to the model each turn: the core set plus either the deferrable
+    /// long tail (inline) or the `tool_search` bridge (collapsed), per the §12 progressive-disclosure
+    /// threshold. Resolution still spans every tool, so a collapsed tool stays callable via `tool_call`.
     fn tool_defs(&self) -> Vec<crate::tools::ToolDef> {
-        self.registry.defs()
+        self.registry
+            .offered_defs(self.config.tool_search_threshold_bytes)
     }
 
     /// `call_model` phase (§4.2) wrapped in §8 recovery: acquire a scoped credential, thread its
@@ -775,6 +792,7 @@ impl Engine {
         // (durable suspension). The iteration budget is the hard stop. The loop runs fully
         // in-process within one durable turn; only `Effect::Delegate` crosses the suspension boundary.
         let exec = self.exec.clone();
+        let checkpoints = self.checkpoints.clone();
         let registry = self.registry.clone();
         let tool_result_budget = self.config.tool_result_budget;
         let effective_policy = self.effective_policy();
@@ -835,6 +853,7 @@ impl Engine {
                 tool_result_budget,
                 approval_policy: effective_policy,
                 pre_approved: false,
+                checkpoints: checkpoints.as_deref(),
             };
 
             // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
@@ -1092,6 +1111,7 @@ impl Engine {
         control: &TurnControl,
     ) {
         let exec = self.exec.clone();
+        let checkpoints = self.checkpoints.clone();
         let registry = self.registry.clone();
         let budget = self.budget;
         let tool_result_budget = self.config.tool_result_budget;
@@ -1124,6 +1144,7 @@ impl Engine {
                             tool_result_budget,
                             approval_policy: policy,
                             pre_approved: true,
+                            checkpoints: checkpoints.as_deref(),
                         };
                         let outcome = run_tool(&approval.call, &registry, &cx).await;
                         (outcome.result.ok, outcome.result.content)

@@ -20,6 +20,7 @@
 
 pub mod actor;
 pub mod approval;
+pub mod checkpoint;
 pub mod config;
 pub mod context;
 pub mod control;
@@ -42,6 +43,7 @@ pub mod turn;
 
 pub use actor::{spawn_agent_session, AgentHandle};
 pub use approval::{is_sensitive_path, ApprovalPolicy, Decision};
+pub use checkpoint::{CheckpointKind, CheckpointRecord, CheckpointStore, LocalCheckpointStore};
 pub use config::Config;
 pub use context::{
     estimate_tokens, BudgetedContextEngine, ContextEngine, ContextStrategy, ModelInfo, Pressure,

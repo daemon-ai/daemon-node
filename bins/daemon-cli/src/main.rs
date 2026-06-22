@@ -682,6 +682,15 @@ fn render(resp: ApiResponse) {
                 );
             }
         }
+        ApiResponse::Checkpoints(list) => {
+            println!("checkpoints: {}", list.len());
+            for info in list {
+                println!(
+                    "  - {} session={} tool={} created={}",
+                    info.id, info.session, info.tool, info.created_unix
+                );
+            }
+        }
         ApiResponse::Fleet(f) => {
             println!(
                 "fleet: children={} usage(in={} out={} api_calls={})",
@@ -760,6 +769,12 @@ fn render(resp: ApiResponse) {
             println!("delivery_targets: {}", targets.len());
             for t in targets {
                 println!("  - {} {} {:?}", t.transport.0, t.route.0, t.kind);
+            }
+        }
+        ApiResponse::DeliverySessions(sessions) => {
+            println!("delivery_sessions: {}", sessions.len());
+            for s in sessions {
+                println!("  - {s}");
             }
         }
         ApiResponse::VerifyingKey(key) => match key {

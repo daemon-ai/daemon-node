@@ -34,6 +34,7 @@ async fn run(tool: &dyn Tool, session: &str, args: &str) -> ToolOutcome {
         tool_result_budget: 0,
         approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
         pre_approved: false,
+        checkpoints: None,
     };
     let call = ToolCall {
         call_id: "c1".into(),

@@ -28,7 +28,7 @@ use daemon_common::{
 };
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
-    TranscriptBlock,
+    TranscriptBlock, TransportId,
 };
 pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
@@ -94,6 +94,24 @@ impl ApprovalMode {
         ApprovalMode::AutoAllow,
         ApprovalMode::Deny,
     ];
+}
+
+/// An **in-process** outbound delivery sink: where the host pushes a session's outbound entries for
+/// a transport instance to *post* (daemon-event-io-spec §5.9.3, the push half of the subscriber
+/// model). A transport registers one keyed by its instance [`TransportId`] with the host; the host's
+/// per-session event pump resolves the session's current [`DeliveryTarget`]s and calls
+/// [`deliver`](DeliverySink::deliver) on the sink owning each — so a demoted `Primary` stops
+/// receiving and a new one starts, with no work in the adapter.
+///
+/// This is deliberately **not** part of the wire [`ApiRequest`] surface: a sink is a live trait
+/// object that cannot cross a process boundary, so cross-process transports use the pull path
+/// instead ([`SessionApi::delivery_sessions`] + [`SessionApi::subscribe`]). Projection of the rich
+/// [`SessionLogEntry`] stream down to a concrete message stays the sink's job (adapter-owned policy).
+#[async_trait]
+pub trait DeliverySink: Send + Sync {
+    /// Post one outbound `entry` to `target` (the sink's transport instance). Called from the
+    /// session's pump task, so a slow sink backs up only its own session's delivery.
+    async fn deliver(&self, target: DeliveryTarget, entry: SessionLogEntry);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +205,16 @@ pub trait SessionApi: Send + Sync {
     /// authoritative source for "who receives the reply." Default: empty (a transport that does not
     /// track delivery targets).
     async fn delivery_targets(&self, _session: SessionId) -> Vec<DeliveryTarget> {
+        Vec::new()
+    }
+
+    /// The live sessions a transport *instance* currently owns for delivery — every session whose
+    /// `Primary` [`DeliveryTarget`] names `transport` (daemon-event-io-spec §5.9.3). This is the
+    /// owned-session discovery primitive a transport calls on (re)connect to find which sessions it
+    /// must resume posting for, without having tracked their ids itself (the reconnect-safe seam the
+    /// `submit_routed`-returns-an-id path alone cannot cover after a restart). Default: empty (a
+    /// transport with no live delivery state).
+    async fn delivery_sessions(&self, _transport: TransportId) -> Vec<SessionId> {
         Vec::new()
     }
 
@@ -375,6 +403,23 @@ pub trait ControlApi: Send + Sync {
     /// journal signer. Default: `None`.
     async fn verifying_key(&self) -> Option<String> {
         None
+    }
+
+    /// List recorded §12 tool checkpoints (workspace snapshots taken before a mutating tool ran),
+    /// newest first — for one `session` when given, else node-wide. Default: empty (a node with no
+    /// checkpoint store). The GUI renders these as rewind points.
+    async fn checkpoints(&self, _session: Option<SessionId>) -> Vec<CheckpointInfo> {
+        Vec::new()
+    }
+
+    /// Rewind the workspace to a recorded checkpoint (`checkpoint_id` from [`Self::checkpoints`]).
+    /// Best-effort restore of the captured workspace state. Default: unsupported (no checkpoint store).
+    async fn checkpoint_rewind(
+        &self,
+        _session: SessionId,
+        _checkpoint_id: String,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("checkpoint_rewind".into()))
     }
 }
 
@@ -711,6 +756,21 @@ pub struct ApprovalInfo {
     pub path: Option<String>,
 }
 
+/// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`
+/// `CheckpointRecord`, surfaced by [`ControlApi::checkpoints`] so a GUI/operator can render the
+/// rewind points and restore one with [`ControlApi::checkpoint_rewind`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    /// The opaque checkpoint id to pass back to [`ControlApi::checkpoint_rewind`].
+    pub id: String,
+    /// The session whose turn produced the checkpoint.
+    pub session: SessionId,
+    /// The mutating tool whose run was checkpointed (e.g. `fs` / `shell`).
+    pub tool: String,
+    /// Unix seconds at capture.
+    pub created_unix: u64,
+}
+
 /// A transport-stable mirror of the durable session lifecycle (decoupled from `daemon-store`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
@@ -926,6 +986,11 @@ pub enum ApiRequest {
     DeliveryTargets {
         /// The session whose delivery targets to read.
         session: SessionId,
+    },
+    /// [`SessionApi::delivery_sessions`] — the live sessions a transport instance owns for delivery.
+    DeliverySessions {
+        /// The transport instance whose owned sessions to enumerate.
+        transport: TransportId,
     },
     /// [`SessionApi::handover`].
     Handover {
@@ -1197,6 +1262,19 @@ pub enum ApiRequest {
         /// The operator's decision (allow / deny).
         allow: bool,
     },
+    /// [`ControlApi::checkpoints`].
+    CheckpointList {
+        /// Filter to one session, or `None` for the node-wide checkpoint list.
+        #[serde(default)]
+        session: Option<SessionId>,
+    },
+    /// [`ControlApi::checkpoint_rewind`].
+    CheckpointRewind {
+        /// The session the checkpoint belongs to.
+        session: SessionId,
+        /// The opaque checkpoint id (from [`CheckpointInfo`]).
+        checkpoint_id: String,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -1221,6 +1299,8 @@ pub enum ApiResponse {
     Sessions(Vec<SessionInfo>),
     /// A list of parked §12 edit-approval requests awaiting an operator decision.
     Approvals(Vec<ApprovalInfo>),
+    /// A list of recorded §12 tool checkpoints (rewind points), newest first.
+    Checkpoints(Vec<CheckpointInfo>),
     /// A fleet report.
     Fleet(FleetReport),
     /// A tree report.
@@ -1235,6 +1315,8 @@ pub enum ApiResponse {
     LogPage(LogPageView),
     /// A session's outbound delivery targets (the reply sinks of `delivery_targets`).
     DeliveryTargets(Vec<DeliveryTarget>),
+    /// The live sessions a transport instance owns for delivery (`delivery_sessions`).
+    DeliverySessions(Vec<SessionId>),
     /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
     VerifyingKey(Option<String>),
     /// A page of model search results.
@@ -1346,6 +1428,9 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
         ApiRequest::DeliveryTargets { session } => {
             ApiResponse::DeliveryTargets(api.delivery_targets(session).await)
         }
+        ApiRequest::DeliverySessions { transport } => {
+            ApiResponse::DeliverySessions(api.delivery_sessions(transport).await)
+        }
         ApiRequest::Handover { session, target } => {
             unit_or_err(api.handover(session, target).await)
         }
@@ -1389,6 +1474,13 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             request_id,
             allow,
         } => unit_or_err(api.approval_decide(session, request_id, allow).await),
+        ApiRequest::CheckpointList { session } => {
+            ApiResponse::Checkpoints(api.checkpoints(session).await)
+        }
+        ApiRequest::CheckpointRewind {
+            session,
+            checkpoint_id,
+        } => unit_or_err(api.checkpoint_rewind(session, checkpoint_id).await),
         ApiRequest::Assign { session } => unit_or_err(api.assign(session).await),
         ApiRequest::Cancel { session } => unit_or_err(api.cancel(session).await),
         ApiRequest::Fleet => ApiResponse::Fleet(api.fleet().await),
@@ -1522,6 +1614,7 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         | ApiRequest::SessionHistory { .. }
         | ApiRequest::Subscribe { .. }
         | ApiRequest::DeliveryTargets { .. }
+        | ApiRequest::DeliverySessions { .. }
         | ApiRequest::Handover { .. }
         | ApiRequest::RecordMeta { .. }
         | ApiRequest::SetSessionModel { .. }

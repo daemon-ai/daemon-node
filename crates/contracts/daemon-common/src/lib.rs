@@ -361,13 +361,25 @@ impl WireVersion {
     /// seam, event-io §5.9): chatter folds in while idle and lands in the following turn while busy,
     /// so a shared room can feed the agent context it sees on its next mention-gated turn.
     ///
-    /// v9 (profiles + session overlay): collapses the runtime **Config** surface (`ConfigGet`/`Set`/
+    /// v9 (tool checkpoints): adds the §12 tool-safety surface — the `Checkpoint{List,Rewind}` control
+    /// ops (`CheckpointList`/`CheckpointRewind` -> `ApiResponse::Checkpoints`, `CheckpointInfo`) over a
+    /// best-effort workspace checkpoint recorded before each mutating tool runs, so an operator/GUI can
+    /// rewind autonomous edits. (Also lands the MCP-client tool breadth + tool-search progressive
+    /// disclosure, which ride the existing `ToolProvider`/offer seams and need no new wire surface.)
+    ///
+    /// v10 (delivery sessions): adds owned-session discovery (`DeliverySessions { transport }` ->
+    /// `ApiResponse::DeliverySessions([session-id])`), the outbound-symmetry seam a transport calls on
+    /// (re)connect to enumerate the sessions whose `Primary` it owns and resume delivery (event-io
+    /// §5.9.3). The in-process `DeliverySink` push path is a live trait object and does not cross the
+    /// wire, so it adds no op.
+    ///
+    /// v11 (profiles + session overlay): collapses the runtime **Config** surface (`ConfigGet`/`Set`/
     /// `Schema` and the `ConfigPatch`/`ConfigField`/`ConfigSchema` types are removed — `ProfileUpdate`
     /// is the sole durable editor) and adds the unified per-session override: `SetSessionOverlay`
     /// (with `SessionOverlay` = model / provider / tool allowlist / approval mode), persisted as
     /// host-level session metadata so a switch is restored on rehydration. `set_session_model` /
     /// `set_session_mode` become field-scoped conveniences over the overlay.
-    pub const CURRENT: Self = Self(9);
+    pub const CURRENT: Self = Self(11);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

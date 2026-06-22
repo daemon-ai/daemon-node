@@ -30,6 +30,14 @@ pub const DEFAULT_MODEL_BACKOFF_MAX_MS: u64 = 120_000;
 /// classified as a transient transport failure and recovered (180s).
 pub const DEFAULT_MODEL_STREAM_WATCHDOG_MS: u64 = 180_000;
 
+/// The default tool-search activation threshold (bytes of *deferrable* tool schema): when the summed
+/// schema of the dynamic/long-tail tools (MCP + Python) exceeds this, the engine offers only the
+/// `tool_search`/`tool_describe`/`tool_call` bridge instead of every deferrable schema, keeping the
+/// prompt budget bounded (hermes' `tool_search` activates similarly). Core/built-in tools are always
+/// offered. `0` disables collapsing (every tool is always offered). The default is generous enough
+/// that a handful of dynamic tools stay inline; a large MCP fleet collapses behind search.
+pub const DEFAULT_TOOL_SEARCH_THRESHOLD_BYTES: usize = 16 * 1024;
+
 /// The default post-turn background-review nudge interval: `0` disables the engine-native trigger,
 /// the conservative core default (the host opts in, e.g. hermes' `creation_nudge_interval` of 10).
 /// When enabled, the engine emits an [`Effect::Spawn`](crate::turn::Effect::Spawn) for the matching
@@ -52,6 +60,10 @@ pub struct Config {
     pub max_iterations: u32,
     /// The per-tool result-byte budget (?12 sanitize+budget); `0` disables truncation.
     pub tool_result_budget: usize,
+    /// The tool-search activation threshold (bytes of deferrable tool schema). When the summed
+    /// deferrable schema exceeds this, the engine offers the `tool_search`/`tool_describe`/`tool_call`
+    /// bridge in place of every deferrable schema. `0` disables collapsing (offer all tools always).
+    pub tool_search_threshold_bytes: usize,
     /// The ?8 recovery budget: how many times one `call_model` retries a *recoverable* model
     /// failure (rate-limit/transport/overload/format) before giving up.
     pub model_max_retries: u32,
@@ -88,6 +100,7 @@ impl Default for Config {
             context_budget_tokens: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             tool_result_budget: DEFAULT_TOOL_RESULT_BUDGET,
+            tool_search_threshold_bytes: DEFAULT_TOOL_SEARCH_THRESHOLD_BYTES,
             model_max_retries: DEFAULT_MODEL_MAX_RETRIES,
             model_backoff_base_ms: DEFAULT_MODEL_BACKOFF_BASE_MS,
             model_backoff_max_ms: DEFAULT_MODEL_BACKOFF_MAX_MS,

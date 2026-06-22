@@ -549,6 +549,11 @@ impl Tool for PyToolProxy {
         &self.manifest.schema
     }
 
+    fn deferrable(&self) -> bool {
+        // Python tools are dynamic breadth too: part of the searchable long tail, not the core set.
+        true
+    }
+
     fn concurrency(&self) -> ToolConcurrency {
         // Map the worker's declared concurrency class onto the engine's §12 batch policy: a Python
         // tool authored as `concurrency="parallel"` joins a concurrent batch (the host + worker

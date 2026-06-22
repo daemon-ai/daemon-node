@@ -554,13 +554,28 @@ bespoke store.
 
 ### 5.6 MCP as adapter (both roles)
 
-- **MCP client (tool breadth).** A `ToolProvider` adapter that connects to configured external MCP
-  servers (stdio / streamable-HTTP / SSE via `rmcp`), discovers their tools, and registers them into
-  the engine `ToolRegistry` under a namespaced toolset (`mcp:{server}`), reusing the existing
-  `check_fn`-style gating so a server that fails to connect simply contributes no tools. This is the
-  daemon analogue of `tools/mcp_tool.py`, isolated to its own crate (proposed `daemon-mcp-client`)
-  so `rmcp` never leaks into `daemon-core`. It is the sanctioned breadth mechanism
-  (`daemon-core-redesign.md`: "in-process breadth → out-of-process via MCP").
+- **MCP client (tool breadth).** *Implemented as [`daemon-mcp-client`](../../../adapters/daemon-mcp-client/src/lib.rs).* A `ToolProvider` adapter (`McpClientProvider`) that connects to configured external MCP
+  servers (stdio child-process and streamable-HTTP via `rmcp` 1.7) and, on `discover()`, lists their
+  tools and returns one `McpToolProxy` (`impl Tool`) each, which register into the ordinary
+  `ToolRegistry` so the engine never knows they are remote. As-built details:
+  - **Namespacing.** Engine-facing names are `mcp__{server}__{tool}` (double-underscore, *not*
+    `mcp:{server}:{tool}`) because provider tool-name grammars are typically `^[a-zA-Z0-9_-]+$`, so a
+    colon would be rejected by Anthropic/OpenAI. The provider's diagnostic `label()` keeps the
+    human-readable `mcp:{server}` form.
+  - **Trust boundary.** MCP results are external content, so a proxy's `run()` always emits
+    `ToolOutcome::untrusted_text` — the §12 pipeline fences it before budgeting so the model reads it
+    as inert data, never as instructions.
+  - **Breadth → tool-search.** Proxies report `deferrable() == true`, so a large MCP surface collapses
+    behind the `tool_search`/`tool_describe`/`tool_call` bridge tools once the summed deferrable schema
+    bytes cross the configured threshold (`Engine::tool_defs`).
+  - **Lifecycle + degradation.** `McpClient` owns one connection per server with lazy connect +
+    reconnect-on-fault (mirroring `PyToolHost`); a server that fails to start logs a warning and
+    contributes no tools. Servers are declared in the host `[mcp]` config block and folded into
+    `extra_tools` next to the Python provider, so `ProfileSpec.tool_allowlist` gates MCP tools by name
+    with no new code.
+  This is the daemon analogue of `tools/mcp_tool.py`, isolated to its own crate so `rmcp` never leaks
+  into `daemon-core`. It is the sanctioned breadth mechanism (`daemon-core-redesign.md`: "in-process
+  breadth → out-of-process via MCP"). *(The MCP **server** role below remains deferred to P4.)*
 - **MCP server (expose daemon).** A host adapter (proposed `daemon-mcp-server`) over `NodeApi` that
   exposes daemon to external MCP hosts as tools+resources. It embeds no runtime policy; it is pure
   translation of the `NodeApi` surface, exactly like the surface-mapping table in
@@ -720,21 +735,35 @@ reply address, captured at session open). So "reply to the chat it came from" ne
 and **multi-account demux is free** — the Primary names the account-instance `TransportId` + the chat
 `RouteAddr`. Four rules the primitive leaves implicit, now stated:
 
-- **Dispatch ownership — subscriber model (v1).** Delivery is a *subscriber set* (§5.4): the transport
-  instance named in the Primary `subscribe()`s its sessions and posts; the host only **stores**
-  `DeliveryTarget`s, it does not push. (Previously only implied; now the rule.)
-- **Central dispatcher (documented upgrade path).** For centralized / cross-process delivery
-  guarantees, transports register a `DeliverySink` keyed by transport-instance and a host outbound
-  dispatcher pushes each session's outbound stream to the owning sink. Adds a sink-registration
-  contract + cross-process semantics; specify as the evolution, not v1.
+- **Dispatch ownership — subscriber model (v1), now backed by reusable infrastructure.** Delivery is a
+  *subscriber set* (§5.4): the transport instance named in the Primary discovers its sessions and posts.
+  The host still **stores** `DeliveryTarget`s, but no longer leaves discovery + the delivery loop to
+  each adapter. **Landed:** `SessionApi::delivery_sessions(transport) -> Vec<SessionId>` (wire op,
+  `WireVersion` v10) is the owned-session discovery primitive a transport calls on (re)connect — an
+  on-demand scan of the live table for sessions whose `Primary` names the instance (no maintained
+  reverse index; O(live sessions), called per connect not per event). The reusable pull subscriber
+  `daemon-delivery::serve_delivery(api, transport, projector)` stitches `delivery_sessions` +
+  `subscribe` + handover-stop into one loop, so an adapter does not re-implement discovery/fan-in
+  (`daemon-http`'s `GET /tenants/{tenant}/delivery` demonstrates the reconnect-safe path over the wire).
+- **In-process push dispatcher (was the "documented upgrade path", now landed in-process).** For
+  in-process / low-latency delivery, a transport registers an `daemon_api::DeliverySink` keyed by its
+  transport-instance via the host-side `daemon_host::DeliveryHost` handle; the **per-session event
+  pump** (not a separate dispatcher task) re-reads the session's *current* `Primary` after each frame
+  and pushes the just-recorded `SessionLogEntry` to the owning sink. Riding the pump gives per-session
+  backpressure isolation and handover-honoring for free. A `DeliverySink` is a live trait object and
+  does **not** cross a process boundary, so the cross-process boundary still uses **pull** (subscribe
+  over the socket); a central cross-process `DeliverySink` RPC remains a future evolution, not v1.
 - **Where vs what.** `DeliveryTarget` answers *where*; it does not say *what*. Projecting the rich
   outbound `AgentEvent` stream (deltas / tool / reasoning) down to a chat message (final text, optional
   tool summaries) is per-transport **projection policy** — the exact mirror of inbound addressing
-  policy, and adapter-owned.
+  policy, and adapter-owned (the `serve_delivery` `Projector` callback and the `DeliverySink` impl are
+  where it lives; the host carries zero transport/projection deps).
 - **Spectator fan-out + handover honoring.** Multiple targets across transports (a GUI watching a chat)
   work because each subscriber self-selects the targets it owns; events are not individually
-  target-tagged. After `handover` re-points the Primary, an adapter must consult `delivery_targets` and
-  **stop** posting once demoted to `Spectator` (never assume it is still Primary).
+  target-tagged. After `handover` re-points the Primary, both halves honor it automatically: the push
+  pump pushes only to the *current* `Primary` (a demoted instance stops, the new one starts), and the
+  pull `serve_delivery` re-checks `delivery_targets` and **stops** a session's stream once demoted to
+  `Spectator` (the rule "never assume it is still Primary" is now enforced by the reusable helper).
 
 #### 5.9.4 Placement and definitions
 
@@ -835,8 +864,10 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
     instance-qualified `TransportId`s (`matrix/@bot:hs.org`) by **convention** — no protocol change —
     with a structural `Origin.instance` field as a later upgrade. Profile precedence is *route override
     > instance's bound profile > node default*. Outbound delivery is the **subscriber model** (the
-    instance named in the Primary subscribes and posts; the host stores but does not push), with a
-    central `DeliverySink` dispatcher as the cross-process upgrade. The one invasive consequence:
+    instance named in the Primary subscribes and posts), now backed by reusable infrastructure (§5.9.3):
+    `delivery_sessions` owned-session discovery (wire v10) + the `daemon-delivery` pull subscriber for
+    the cross-process path, and an in-process `DeliverySink` push pump for low-latency in-process
+    delivery (cross-process push remains a future evolution). The one invasive consequence:
     `LiveSessions::ensure`/`SessionEngineBuilder` must become **profile-aware**
     (`ensure(session, ProfileRef)`), and per-session profiles thread through the §10/§11 context/memory
     builders.
@@ -874,6 +905,9 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
   `LiveSessions::ensure(session, ProfileRef)` + the transport-instance convention + the explicit
   outbound subscriber-ownership rule. The reusable foundation that P5 chat transports consume;
   testable without any chat transport (e.g. HTTP-key → profile, reply on the same connection).
+  *Outbound half landed:* `delivery_sessions` discovery (wire v10), the in-process `DeliverySink` push
+  pump (`daemon_host::DeliveryHost`), and the reusable `daemon-delivery` pull subscriber, all proven
+  via a mock sink + `daemon-http`'s tenant delivery endpoint (no `matrix-sdk` dependency).
 - **P5 — chat transports.** Out-of-process adapters against `daemon-http`/the socket; in-tree only
   if explicitly required. The first such transport (Matrix, SSO + E2EE) is specified in
   `daemon-matrix-transport-spec.md`, which instantiates the §5.9 routing capability end-to-end.

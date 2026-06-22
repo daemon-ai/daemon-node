@@ -23,7 +23,7 @@ use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
 use crate::routing::RoutingRegistry;
 use daemon_api::{
-    ApiError, ApprovalInfo, ApprovalMode, ControlApi, CredentialApi, CredentialInfo,
+    ApiError, ApprovalInfo, ApprovalMode, ControlApi, CredentialApi, CredentialInfo, DeliverySink,
     Distribution, FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
     LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
     ProfileInfo, ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionInfo,
@@ -193,6 +193,9 @@ pub struct NodeApiImpl {
     /// to resolve an inbound `Origin` to (session, profile, delivery). Empty by default — a pure
     /// passthrough: `PerThread` naming, node active-default profile, origin-seeded delivery.
     routing: Arc<RoutingRegistry>,
+    /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
+    /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
+    checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
 }
 
 impl NodeApiImpl {
@@ -237,6 +240,7 @@ impl NodeApiImpl {
             revisions: None,
             skills: None,
             routing: Arc::new(RoutingRegistry::new()),
+            checkpoints: None,
         }
     }
 
@@ -245,6 +249,14 @@ impl NodeApiImpl {
     /// `PerThread` naming with the node's active default profile.
     pub fn with_routing(mut self, routing: RoutingRegistry) -> Self {
         self.routing = Arc::new(routing);
+        self
+    }
+
+    /// Attach the §12 tool-checkpoint store so the `Checkpoint{List,Rewind}` ops can list rewind
+    /// points and restore the workspace. Call during assembly with the same store wired into the
+    /// engines (so a checkpoint recorded by a turn is visible + rewindable here).
+    pub fn with_checkpoints(mut self, checkpoints: Arc<dyn daemon_core::CheckpointStore>) -> Self {
+        self.checkpoints = Some(checkpoints);
         self
     }
 
@@ -787,6 +799,43 @@ impl ControlApi for NodeApiImpl {
     async fn verifying_key(&self) -> Option<String> {
         self.verifier.as_ref().map(|s| s.verifying_key().to_hex())
     }
+
+    async fn checkpoints(&self, session: Option<SessionId>) -> Vec<daemon_api::CheckpointInfo> {
+        let Some(store) = &self.checkpoints else {
+            return Vec::new();
+        };
+        let filter = session.as_ref().map(|s| s.to_string());
+        store
+            .list(filter.as_deref())
+            .await
+            .into_iter()
+            .map(|r| daemon_api::CheckpointInfo {
+                id: r.id,
+                session: SessionId::new(r.session),
+                tool: r.tool,
+                created_unix: r.created_unix,
+            })
+            .collect()
+    }
+
+    async fn checkpoint_rewind(
+        &self,
+        _session: SessionId,
+        checkpoint_id: String,
+    ) -> Result<(), ApiError> {
+        let store = self
+            .checkpoints
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("checkpoint_rewind".into()))?;
+        let record = store
+            .get(&checkpoint_id)
+            .await
+            .ok_or_else(|| ApiError::Other(format!("unknown checkpoint: {checkpoint_id}")))?;
+        store
+            .restore(&record)
+            .await
+            .map_err(|e| ApiError::Other(format!("rewind failed: {e}")))
+    }
 }
 
 #[async_trait]
@@ -872,6 +921,10 @@ impl SessionApi for NodeApiImpl {
         self.live.delivery_targets(&session)
     }
 
+    async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
+        self.live.delivery_sessions(&transport)
+    }
+
     async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
         self.live.handover(&session, target)
     }
@@ -940,6 +993,29 @@ impl SessionApi for NodeApiImpl {
             self.session_models.insert(session, model.clone());
         }
         Ok(())
+    }
+}
+
+/// The **in-process** outbound push-registration surface (daemon-event-io-spec §5.9.3): an embedder
+/// that holds the live [`NodeApiImpl`] hands the host a [`DeliverySink`] keyed by transport instance
+/// so the per-session pump pushes outbound entries straight to it. This is deliberately *not* part
+/// of the wire [`daemon_api::NodeApi`] surface — a sink is a live trait object that cannot cross a
+/// process boundary, so cross-process transports use the pull path (`delivery_sessions` +
+/// `subscribe`) instead. Registration is a live handle, not a wire op.
+pub trait DeliveryHost: Send + Sync {
+    /// Register (or replace) the push sink for `transport`; takes effect on the next pumped event.
+    fn register_delivery_sink(&self, transport: TransportId, sink: Arc<dyn DeliverySink>);
+    /// Drop the push sink for `transport` (its sessions revert to pull-only delivery).
+    fn unregister_delivery_sink(&self, transport: &TransportId);
+}
+
+impl DeliveryHost for NodeApiImpl {
+    fn register_delivery_sink(&self, transport: TransportId, sink: Arc<dyn DeliverySink>) {
+        self.live.register_delivery_sink(transport, sink);
+    }
+
+    fn unregister_delivery_sink(&self, transport: &TransportId) {
+        self.live.unregister_delivery_sink(transport);
     }
 }
 
@@ -1411,14 +1487,15 @@ impl MergedLog {
         }
     }
 
-    /// Stamp the next `seq`, record the entry, and fan it out to live subscribers.
+    /// Stamp the next `seq`, record the entry, fan it out to live subscribers, and return the
+    /// stamped entry (so an in-process pusher delivers exactly what subscribers see).
     fn append(
         &mut self,
         direction: Direction,
         origin: Origin,
         disposition: Disposition,
         payload: SessionPayload,
-    ) {
+    ) -> SessionLogEntry {
         let seq = self.next_seq;
         self.next_seq += 1;
         let entry = SessionLogEntry {
@@ -1430,7 +1507,8 @@ impl MergedLog {
         };
         self.entries.push(entry.clone());
         // A send error only means there are no live subscribers; the history retains the entry.
-        let _ = self.tx.send(entry);
+        let _ = self.tx.send(entry.clone());
+        entry
     }
 
     /// A non-destructive page of entries with `seq > after_seq` (up to `max`, 0 = all).
@@ -1499,6 +1577,11 @@ struct LiveSessions {
     /// The per-session live edit-approval policy (shared with `NodeApiImpl::session_modes`), read by
     /// each session's [`ParkingHandler`] to auto-allow / deny without parking a human.
     modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
+    /// In-process outbound push sinks keyed by transport instance (daemon-event-io-spec §5.9.3): a
+    /// registered sink receives every outbound entry of every session whose `Primary` it owns,
+    /// resolved live by the per-session pump (so handover demotion stops/starts delivery for free).
+    /// Shared with each pump task; a missing instance simply means no in-process push (pull-only).
+    sinks: Arc<DashMap<TransportId, Arc<dyn DeliverySink>>>,
 }
 
 impl LiveSessions {
@@ -1514,6 +1597,7 @@ impl LiveSessions {
             journal: Mutex::new(None),
             background: Mutex::new(None),
             modes,
+            sinks: Arc::new(DashMap::new()),
         }
     }
 
@@ -1584,11 +1668,18 @@ impl LiveSessions {
         let pump_drain = drain.clone();
         let pump_log = log.clone();
         let pump_journal = feeder.clone();
+        // Clones for the in-process push path (§5.9.3): the pump re-reads the session's *current*
+        // delivery targets per event and pushes the just-recorded entry to any registered sink owning
+        // a target, so handover (a demoted `Primary`) silently stops one sink and starts the next.
+        let pump_delivery = delivery.clone();
+        let pump_sinks = self.sinks.clone();
         let pump = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
-                        pump_log.lock().unwrap().append(
+                        // Stamp + record on the merged log, capturing the freshly-stamped entry so the
+                        // push path delivers exactly what subscribers see (one seq, one shape).
+                        let entry = pump_log.lock().unwrap().append(
                             Direction::Outbound,
                             engine_origin(),
                             Disposition::Context,
@@ -1598,6 +1689,26 @@ impl LiveSessions {
                         pump_drain.lock().unwrap().push_back(frame.clone());
                         if let Some(feeder) = &pump_journal {
                             feeder.feed(&frame).await;
+                        }
+                        // In-process push: replies post to where the *current* `Primary` points, so
+                        // snapshot the live targets (dropping the lock before any await) and push the
+                        // just-recorded entry to the registered sink owning each `Primary`. Re-reading
+                        // the targets every event is what makes handover free: a demoted matrix
+                        // `Primary` falls to `Spectator` (stops receiving) and the new GUI `Primary`
+                        // starts, with no work here. Passive `Spectator`s observe via the pull path
+                        // (`subscribe`); pull subscribers are unaffected by this additive push.
+                        let primaries: Vec<DeliveryTarget> = pump_delivery
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|t| t.kind == SinkKind::Primary)
+                            .cloned()
+                            .collect();
+                        for target in primaries {
+                            if let Some(sink) = pump_sinks.get(&target.transport) {
+                                let sink = sink.clone();
+                                sink.deliver(target, entry.clone()).await;
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1796,6 +1907,34 @@ impl LiveSessions {
             Some(s) => s.delivery.lock().unwrap().clone(),
             None => Vec::new(),
         }
+    }
+
+    /// The live sessions a transport instance owns for delivery (daemon-event-io-spec §5.9.3): every
+    /// resident session whose `Primary` [`DeliveryTarget`] names `transport`. An on-demand scan of
+    /// the live table (called on (re)connect, not per-event), so O(live sessions) is acceptable.
+    fn delivery_sessions(&self, transport: &TransportId) -> Vec<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.delivery
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.kind == SinkKind::Primary && &t.transport == transport)
+            })
+            .map(|s| s.key().clone())
+            .collect()
+    }
+
+    /// Register an in-process push [`DeliverySink`] for `transport` (a live handle, replacing any
+    /// prior sink for the instance). The per-session pump picks it up on the next event.
+    fn register_delivery_sink(&self, transport: TransportId, sink: Arc<dyn DeliverySink>) {
+        self.sinks.insert(transport, sink);
+    }
+
+    /// Drop the in-process push sink for `transport` (delivery for that instance reverts to pull).
+    fn unregister_delivery_sink(&self, transport: &TransportId) {
+        self.sinks.remove(transport);
     }
 
     /// Re-point the session's `Primary` to `target`: any prior `Primary` is demoted to `Spectator`,
