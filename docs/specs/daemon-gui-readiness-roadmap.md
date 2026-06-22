@@ -49,6 +49,7 @@ Tiers:
 - [`daemon-core-spec.md`](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §22 "Phased roadmap" (line 1666) — engine roadmap on the same tiers.
 - [`daemon-core-host-interface.md`](../../crates/engine/daemon-core/docs/daemon-core-host-interface.md) — typed §17 host boundary.
 - [`model-management-spec.md`](model-management-spec.md) — local-model (HF/GGUF) management parity bar.
+- [`daemon-interactive-auth-spec.md`](../../crates/engine/daemon-core/docs/daemon-interactive-auth-spec.md) — the client-driven SSO/OAuth login seam (`AuthApi`: `auth_begin` → browser → `auth_complete`) a remote GUI uses to add accounts.
 
 ---
 

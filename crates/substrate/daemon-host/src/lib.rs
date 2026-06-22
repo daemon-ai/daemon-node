@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_session;
+pub mod auth;
 pub mod background;
 pub mod config;
 pub mod credentials;
@@ -52,6 +53,9 @@ pub mod unit;
 
 pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
+pub use auth::{
+    AuthFlowFactory, AuthOutcome, PendingAuthFlow, PendingAuthFlows, DEFAULT_FLOW_TTL_SECS,
+};
 pub use background::{
     background_child_id, background_kind_of, BackgroundProfile, BackgroundProfileRegistry,
     BackgroundSpawner,

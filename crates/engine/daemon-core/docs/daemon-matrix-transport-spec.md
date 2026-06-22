@@ -1,6 +1,8 @@
 # Matrix transport (SSO + E2EE) — design, feasibility & phased plan
 
-Status: design / feasibility. **Documentation only — no code yet.** Companion to
+Status: design / feasibility + **M2–M4 core landed** (the `crates/adapters/daemon-matrix` adapter:
+multi-account SSO `login` + restore, inbound projection through `daemon-ingest`, and final-text
+outbound through a `daemon-delivery` `Projector`; see §10 for what is landed vs deferred). Companion to
 [`daemon-event-io-spec.md`](./daemon-event-io-spec.md); this doc is the concrete **P5 chat transport**
 that spec deferred, and the first real consumer of its §5.9 bidirectional-routing capability.
 
@@ -246,6 +248,12 @@ Recommended UX: a `daemon-matrix login --homeserver <url> [--profile <p>]` subco
 once per account. It performs SSO and **writes the resulting session into the credential store** under
 the profile's Matrix credential-ref.
 
+> **Client-driven / remote login** (a decoupled GUI on another host) is the generalization of the
+> `get_sso_login_url` + `login_token` path above: it is specified separately in
+> [`daemon-interactive-auth-spec.md`](./daemon-interactive-auth-spec.md) as a transport-agnostic,
+> wire-exposed `AuthApi` (`auth_begin` → browser → `auth_complete`) that this Matrix family plugs into
+> and that also covers OAuth2/OIDC. The CLI above becomes the same-host degenerate case of that seam.
+
 ### 6.2 Credential model — the credential subsystem is the system of record (decided)
 
 The Matrix **login material** — homeserver URL, `user_id`, `device_id`, access token, refresh
@@ -303,34 +311,48 @@ Add `MatrixConfig` + `FileMatrixConfig` (+ `DAEMON_MATRIX_*` env), shaped like `
 ```toml
 [matrix]
 enabled       = true
-store_root    = "matrix"          # under profile_home; per-account subdir <instance>/
+store_root    = "matrix"          # resolved under data_dir; per-account subdir <credential_ref>/
 
 # the route table = the config surface of the routing registry (5.9.1).
 # NO account secrets here — accounts/tokens come from the credential subsystem,
 # bound to profiles; the adapter enumerates them at bring-up.
 [[matrix.route]]
-account       = "@ops:hs.org"     # optional; omit to match any account
-room_glob     = "#secops*"        # or: dm = true / space = "..."
-profile       = "secops-agent"    # OPTIONAL per-room override (precedence step 1)
-isolation     = "per_thread"
-mention_gating = true
+account        = "@ops:hs.org"     # optional; omit to match any account
+room_glob      = "#secops*"        # tiny `*`/`?` glob over the room id/alias
+dm_only        = false             # restrict the route to direct-message rooms
+mention_gating = true              # only turn on mention / DM / `!command`
 ```
 
-`profile` is the optional override; the default profile for an account comes from its credential
-binding (§6.2), never from config.
+**Landed surface (as implemented):** a route narrows *which* rooms engage (`account` / `room_glob` /
+`dm_only`) and *how addressing is classified* (`mention_gating`). The earlier sketch's per-route
+`profile` / `isolation` overrides are **not** in the landed config: profile selection and session
+isolation stay host-owned (via `ProfileSpec.bound_accounts` + the `[routing]` registry), so the
+gate's derived `SessionId` always matches the id the host resolves (`PerThread`) — the invariant the
+outbound busy-tracking relies on. Per-route profile override moves to M5 if needed.
 
 ### 7.2 Spawn — [`bins/daemon/src/main.rs`](../../../../bins/daemon/src/main.rs) `run_as_host`
 
-A conditional `tokio::spawn(daemon_matrix::serve(node.clone(), cfg.matrix))` next to the `http_server`
-block ([`main.rs`](../../../../bins/daemon/src/main.rs):1205), aborted on ctrl_c alongside the HTTP
-server (:1223).
+A conditional `tokio::spawn(daemon_matrix::serve(api, provisioning, cfg.matrix))` next to the
+`http_server` block, where both `api: Arc<dyn NodeApi>` and `provisioning: Arc<dyn AccountProvisioning>`
+are the *same* concrete `node` (the host's in-process seam — enumeration/secret-resolution never cross
+the wire); aborted on ctrl_c alongside the HTTP server. The one-shot operator flow is the
+`daemon matrix login --homeserver <url> --credential-ref <key>` subcommand dispatched in `main()`.
 
-### 7.3 Workspace deps — [`Cargo.toml`](../../../../Cargo.toml) `[workspace.dependencies]`
+### 7.3 Workspace deps — [`Cargo.toml`](../../../../Cargo.toml) `[workspace.dependencies]` *(landed)*
 
-- `matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "sso-login"] }`
-- `matrix-sdk-ui = "0.18"` (SyncService + Timeline; UI-friendly observable room/timeline state)
-- **Bump workspace `rust-version` to 1.93** (matrix-sdk 0.18 MSRV). All matrix types confined to the
-  adapter crate.
+- `matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "bundled-sqlite", "sso-login"] }`
+  (default TLS — an explicit `rustls-tls` feature does not exist in 0.18). `bundled-sqlite` vendors
+  SQLite so there's no system-lib dependency.
+- **`matrix-sdk-ui` was dropped.** Native `Client::sync` + `add_event_handler` cover the v1 inbound
+  path without the sliding-sync homeserver requirement; `Client::sync`'s deeply-nested instrumented
+  future needs `#![recursion_limit = "512"]` in the adapter crate.
+- **Workspace `rust-version` bumped 1.79 → 1.93** (matrix-sdk 0.18 MSRV; the flake's fenix `stable`
+  toolchain, 1.96, satisfies it).
+- **`rusqlite` unified 0.32 → 0.37** across `daemon-store` / `daemon-mnemosyne` / `daemon-context-lcm`
+  so the whole workspace links one `libsqlite3-sys` (matrix-sdk-sqlite pins 0.37); the upgrade was
+  source-compatible (no API changes needed).
+- All `matrix-sdk` / `ruma` types stay confined to the adapter crate (verified: no `matrix_sdk` import
+  outside `crates/adapters/daemon-matrix`).
 
 ---
 
@@ -385,18 +407,33 @@ whole point of the merged-log paradigm.
   `daemon-ingest` (`Ingestor` + `Reception`, the addressing/busy/Observe command selection over
   `submit_routed`) — the symmetric counterpart to `daemon-delivery` the M3 inbound path plugs into.
   All testable without Matrix.
-- **M2 — `daemon-matrix` skeleton + per-account `login`.** SSO writes the session into `CredentialStore`
-  via `AccountProvisioning::store_account_credential` under the account's credential-ref; the adapter
-  restores from there (`account_credential`) and opens the per-account E2EE store; refresh write-back.
-  Feasibility proof.
-- **M3 — inbound projection.** Enumerate credential-bound accounts per profile (`bound_accounts("matrix")`); SyncService/Timeline →
-  the adapter classifies addressing and hands a `Reception` to the `daemon-ingest` gate (which owns
-  busy/Observe command selection over `submit_routed`, account→profile default + room override);
-  final-text reply to the per-account `Primary`. The gate's busy state is fed from the M4 outbound
-  stream's `TurnStarted`/`TurnFinished`.
-- **M4 — outbound richness.** Outbound delivery via the `daemon-delivery` subscriber (or an in-process
-  `DeliverySink`) with a Matrix `Projector`; `HostRequest` → reaction-approval → `respond`;
-  typing/receipt → `record_meta`; streaming-edit replies.
-- **M5 — hardening.** E2EE cross-signing/SAS verification; `handover` (GUI co-attach); optional
+- **M2 — `daemon-matrix` skeleton + per-account `login`.** *(Landed.)* The `daemon matrix login`
+  subcommand runs the SSO flow and writes the `MatrixSession` blob into `CredentialStore` under the
+  account's credential-ref; `serve` restores from there (`account_credential`), opens the per-account
+  on-disk E2EE store (`sqlite_store`, keyed by credential-ref so `login`/`serve` share one device),
+  and persists refreshed tokens back via `store_account_credential` (a 30s write-back poll over
+  `matrix_auth().session()`, since the client is built with `handle_refresh_tokens`).
+- **M3 — inbound projection.** *(Landed, native sync.)* `Client::sync` + an `m.room.message` handler:
+  the adapter classifies addressing (`mention` / DM / `!command`, per the route's `mention_gating`)
+  and hands a `Reception` to the `daemon-ingest` gate (which owns busy/Observe command selection over
+  `submit_routed`); every room (incl. DMs) maps to `OriginScope::Group { chat: room_id }`, so the
+  reply route is just the room id. The gate's busy state is fed from the M4 outbound stream's
+  `TurnStarted`/`TurnFinished`.
+- **M4 — outbound (final-text) landed; richness deferred.** *(Landed:)* a `daemon-delivery` `Projector`
+  (`MatrixProjector`) posts `TurnFinished.final_text` to the session's `Primary` room and drives the
+  gate's busy state; because a chat transport creates sessions at runtime, the one-shot
+  `serve_delivery` discovery is wrapped by an incremental, dedup'd `DeliveryManager` that subscribes
+  each newly-opened session (backfilling from seq 0, so a reply is never missed; at-least-once re-post
+  on reconnect is the documented tradeoff). `HostRequest`s are surfaced as a prompt message.
+  *(Deferred to M5:)* reaction-approval → `respond` round-trip, typing/receipt → `record_meta`, and
+  streaming-edit (`m.replace`) replies.
+- **M5 — hardening.** Reaction-driven `HostResponse`; inbound meta (`record_meta`); streaming edits;
+  E2EE cross-signing/SAS verification (v1 relies on the persisted device + recovery, deferring
+  interactive verification); per-route profile override; `handover` (GUI co-attach); optional
   out-of-process bin. (Profile-scoped memory/context under per-room binding landed early — see
   Foundation hardening above.)
+
+**Tests (landed):** `crates/adapters/daemon-matrix/tests/matrix.rs` drives a wiremock-backed
+`MatrixMockServer` end-to-end — session-blob round-trip, an inbound `m.room.message` → `StartTurn`
+through the real handler, a `TurnFinished` → real `m.room.message` send, and the `DeliveryManager`
+dedup — plus pure-function unit tests for routing/addressing/glob/store-keying.

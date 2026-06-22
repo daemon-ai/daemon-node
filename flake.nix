@@ -85,7 +85,18 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        # crane's `cleanCargoSource` keeps only Rust/Cargo files, which drops the non-`.rs` grammar
+        # assets `daemon-infer` embeds via `include_str!` (`metta.gbnf` / `metta.lark`) — a from-source
+        # `nix build` then fails to compile that crate. Extend the Cargo-source filter to also retain
+        # those extensions so the sandbox build sees them. Keep this in lockstep with any new
+        # `include_str!`/`include_bytes!` of non-Rust assets in the workspace.
+        src = lib.cleanSourceWith {
+          src = ./.;
+          name = "source";
+          filter =
+            path: type:
+            (craneLib.filterCargoSources path type) || (builtins.match ".*\\.(gbnf|lark)$" path != null);
+        };
 
         # hyperon (MeTTa) is a *git* dependency (no crates.io release). crane's default vendoring would
         # re-fetch it with a `fetchgit` hash we don't have; instead (vendoring "Option A") we pin the

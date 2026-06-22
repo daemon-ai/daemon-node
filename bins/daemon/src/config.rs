@@ -119,6 +119,13 @@ const WEB_TAVILY_KEY_ENV: &str = "DAEMON_WEB_TAVILY_KEY_ID";
 /// The credential-profile id the Firecrawl scraper key is read from (default `firecrawl`).
 const WEB_FIRECRAWL_KEY_ENV: &str = "DAEMON_WEB_FIRECRAWL_KEY_ID";
 
+// --- Matrix transport (`daemon-matrix`) tuning (DAEMON_MATRIX_*) -------------------------------
+/// Spawn the Matrix chat transport (`false` by default — opt-in, like `web`/`mcp`). Accounts come
+/// from `bound_accounts` + the credential store, never from this config.
+const MATRIX_ENABLE_ENV: &str = "DAEMON_MATRIX_ENABLE";
+/// The per-account store root, relative to `data_dir` (default `matrix`).
+const MATRIX_STORE_ROOT_ENV: &str = "DAEMON_MATRIX_STORE_ROOT";
+
 // --- Python tools (`daemon-pytool`) tuning (DAEMON_PYTHON_*) -----------------------------------
 /// Register Python tools discovered from the `daemon_pytool` worker (`false` by default — opt-in,
 /// like `metta`/`web`).
@@ -668,6 +675,9 @@ pub struct NodeConfig {
     /// The general host routing table (§5.9) consumed into the routing registry at assembly. Empty
     /// by default (no agent-selection routing — routed submits use the active default profile).
     pub routing: RoutingConfig,
+    /// The Matrix chat transport (`daemon-matrix`) config (`enabled = false` by default — opt-in).
+    /// Accounts/sessions come from `bound_accounts` + the credential store, not from here.
+    pub matrix: daemon_matrix::MatrixConfig,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -709,6 +719,27 @@ struct FileConfig {
     browser: Option<FileBrowserConfig>,
     skills: Option<FileSkillsConfig>,
     routing: Option<FileRoutingConfig>,
+    matrix: Option<FileMatrixConfig>,
+}
+
+/// The `[matrix]` TOML table — the Matrix transport surface (every field optional). Carries **no**
+/// account secrets: accounts/sessions live in `bound_accounts` + the credential store.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMatrixConfig {
+    enabled: Option<bool>,
+    store_root: Option<String>,
+    route: Vec<FileMatrixRoute>,
+}
+
+/// A `[[matrix.route]]` entry — which rooms to engage + how addressing is classified.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMatrixRoute {
+    account: Option<String>,
+    room_glob: Option<String>,
+    dm_only: Option<bool>,
+    mention_gating: Option<bool>,
 }
 
 /// The `[routing]` TOML table — the general host routing table (§5.9; every field optional).
@@ -1098,6 +1129,7 @@ impl NodeConfig {
         let browser = Self::resolve_browser(file.browser.unwrap_or_default())?;
         let skills = Self::resolve_skills(file.skills.unwrap_or_default())?;
         let routing = Self::resolve_routing(file.routing.unwrap_or_default())?;
+        let matrix = Self::resolve_matrix(file.matrix.unwrap_or_default(), &data_dir);
 
         Ok(Self {
             partition,
@@ -1128,7 +1160,38 @@ impl NodeConfig {
             journal_seed,
             nesting_depth,
             routing,
+            matrix,
         })
+    }
+
+    /// Resolve the `[matrix]` table (env overriding TOML overriding defaults). `store_root` is made
+    /// absolute under `data_dir`; the route table maps directly onto the adapter's `MatrixRoute`.
+    fn resolve_matrix(
+        file: FileMatrixConfig,
+        data_dir: &std::path::Path,
+    ) -> daemon_matrix::MatrixConfig {
+        let mut enabled = file.enabled.unwrap_or(false);
+        if let Some(s) = env_string(MATRIX_ENABLE_ENV) {
+            enabled = parse_bool(&s);
+        }
+        let store_root_rel = env_string(MATRIX_STORE_ROOT_ENV)
+            .or(file.store_root)
+            .unwrap_or_else(|| "matrix".to_string());
+        let routes = file
+            .route
+            .into_iter()
+            .map(|r| daemon_matrix::MatrixRoute {
+                account: r.account,
+                room_glob: r.room_glob,
+                dm_only: r.dm_only.unwrap_or(false),
+                mention_gating: r.mention_gating.unwrap_or(true),
+            })
+            .collect();
+        daemon_matrix::MatrixConfig {
+            enabled,
+            store_root: data_dir.join(store_root_rel),
+            routes,
+        }
     }
 
     /// Resolve the `[routing]` table into the general host routing config (§5.9). File-only (no env);

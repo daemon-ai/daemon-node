@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 11)
+wire_version = uint                 ; daemon-common WireVersion (current = 13)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -384,6 +384,35 @@ distribution = {
   ? source: (tstr / null),
 }
 
+; ----- interactive auth (SSO / OAuth2), wire v13 (daemon-interactive-auth-spec) -----
+; the client-driven, browser-redirect login seam. The client owns the browser + the redirect_uri; the
+; daemon parks a pending flow between begin and complete and writes the credential via CredentialStore.
+auth-flow-kind = "MatrixSso" / "OAuth2Pkce"
+auth-param-field = { key: tstr, label: tstr, required: bool }
+auth-provider-info = { family: tstr, flow_kind: auth-flow-kind, display_name: tstr, params_schema: [* auth-param-field] }
+; optionally bind the freshly-authenticated account to a profile on success.
+auth-bind-request = { profile: tstr, transport_instance: (transport-id / null), credential_ref: (tstr / null) }
+auth-begin-request = {
+  family: tstr,
+  params: { * tstr => tstr },        ; family-specific (matrix: homeserver, ? idp_id)
+  redirect_uri: tstr,                ; the client-owned capture URI (loopback or custom-scheme)
+  ? bind: (auth-bind-request / null),
+}
+auth-begin-response = {
+  flow_id: tstr,
+  authorization_url: tstr,
+  redirect_uri: tstr,
+  expires_at: uint,                  ; flow TTL (unix seconds)
+  flow_kind: auth-flow-kind,
+}
+auth-complete-request = { flow_id: tstr, callback: tstr }   ; callback: full redirect URL or its query
+auth-complete-response = {
+  credential_ref: tstr,
+  account_label: tstr,
+  transport_instance: transport-id,
+  bound_profile: (tstr / null),
+}
+
 api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null) } }
             ; routing (wire v7): submit by origin; the host resolves session + profile + delivery -> Routed
             / { "SubmitRouted": { origin: origin, command: agent-command } }
@@ -441,6 +470,11 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "ModelQuantize": { repo: tstr, revision: (tstr / null), target_quant: tstr, source_file: (tstr / null) } }
             / "ModelQuantizes"
             / { "ModelInspect": { id: model-id } }
+            ; ----- interactive auth (AuthApi), wire v13 -----
+            / { "AuthBegin": auth-begin-request }      ; mint authorization URL + park flow -> AuthBegun
+            / { "AuthComplete": auth-complete-request } ; finish from captured redirect -> AuthCompleted
+            / { "AuthCancel": { flow_id: tstr } }       ; drop a pending flow (idempotent) -> Ok
+            / "AuthProviders"                           ; capability discovery -> AuthProviders
 
 api-response = "Ok"
              / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v7)
@@ -472,4 +506,8 @@ api-response = "Ok"
              / { "ProfileId": tstr }
              / { "Revisions": [* revision] }
              / { "SkillBundle": skill-bundle }
+             ; ----- interactive auth (AuthApi), wire v13 -----
+             / { "AuthBegun": auth-begin-response }
+             / { "AuthCompleted": auth-complete-response }
+             / { "AuthProviders": [* auth-provider-info] }
              / { "Error": api-error }

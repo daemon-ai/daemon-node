@@ -108,6 +108,7 @@ impl daemon_api::ProfileApi for MockApi {}
 
 // All `CredentialApi` methods carry defaults; the mock exposes no credential management.
 impl daemon_api::CredentialApi for MockApi {}
+impl daemon_api::AuthApi for MockApi {}
 
 async fn spawn_server() -> String {
     let api: Arc<dyn NodeApi> = Arc::new(MockApi);

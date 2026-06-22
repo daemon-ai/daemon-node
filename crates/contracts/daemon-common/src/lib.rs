@@ -385,7 +385,16 @@ impl WireVersion {
     /// surface — `Curator{List,Pin,Unpin,Archive,Restore,Run}` -> `ApiResponse::CuratorSkills` /
     /// `CuratorRun`, with `CuratorEntry`/`CuratorChange` views over the `SkillUsage`/`SkillState`
     /// lifecycle (stale/archive/reactivate, pin-protect, agent-created provenance).
-    pub const CURRENT: Self = Self(12);
+    ///
+    /// v13 (interactive auth): adds the client-driven login seam (`daemon-interactive-auth-spec`):
+    /// `AuthBegin`/`AuthComplete`/`AuthCancel`/`AuthProviders` requests with `AuthBegun`/
+    /// `AuthCompleted`/`AuthProviders` responses (and the `AuthBeginRequest`/`AuthBeginResponse`/
+    /// `AuthCompleteRequest`/`AuthCompleteResponse`/`AuthBindRequest`/`AuthProviderInfo`/
+    /// `AuthParamField`/`AuthFlowKind` DTOs). A decoupled client drives a browser-redirect login
+    /// (`begin` mints an authorization URL against a client-owned `redirect_uri`, the client captures
+    /// the redirect and relays it to `complete`); the daemon parks the pending flow and writes the
+    /// resulting credential through the existing `CredentialStore`.
+    pub const CURRENT: Self = Self(13);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
