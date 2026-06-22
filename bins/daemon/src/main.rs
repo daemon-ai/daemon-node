@@ -290,6 +290,7 @@ fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
         memory_provider,
         credential_ref: None,
         fallback_credential_ref: None,
+        bound_accounts: Vec::new(),
     }
 }
 

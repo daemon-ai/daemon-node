@@ -3,4 +3,6 @@
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
-research/
+# Anchored to the repo root: a top-level scratch dir, NOT the bundled skill
+# `crates/skills/daemon-skills/bundled/research` (which must stay tracked so worktrees seed it).
+/research/

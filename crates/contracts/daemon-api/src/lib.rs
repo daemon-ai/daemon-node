@@ -38,9 +38,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod profile;
 pub use profile::{
-    BudgetSpec, ConfigField, ConfigPatch, ConfigSchema, ContextEngineSel, CredentialInfo,
-    Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
-    ProviderSelector,
+    BoundAccount, BudgetSpec, ConfigField, ConfigPatch, ConfigSchema, ContextEngineSel,
+    CredentialInfo, Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo,
+    ProfileSpec, ProviderSelector,
 };
 
 /// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
