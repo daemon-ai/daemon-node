@@ -60,8 +60,13 @@ pub struct Request {
     /// unconstrained. A provider that cannot constrain generation ignores it.
     pub constraint: Option<GrammarConstraint>,
     /// Whether to mark the system prompt as a prompt-cache breakpoint (§ prompt caching). Set by the
-    /// engine's cache policy; a provider that supports prefix caching (e.g. Anthropic via
-    /// `cache_control`) caches the tools+system prefix, and a provider without it ignores the hint.
+    /// engine's cache policy. These are *explicit-breakpoint* hints for providers that require them:
+    /// Anthropic caches the tools+system prefix via `cache_control`. Providers that cache
+    /// automatically (OpenAI, DeepSeek) need no hint and ignore it — their savings are still
+    /// observed, decoded from the response's cached-token counts into
+    /// [`UsageDelta::cache_read_tokens`](daemon_common::UsageDelta). Local engines reuse the KV
+    /// prefix on their own (mistral.rs prefix cache; the llama worker's persistent context) and also
+    /// ignore the hint.
     pub cache_system: bool,
 }
 
@@ -112,8 +117,9 @@ pub struct RequestMsg {
     pub tool_call_id: Option<String>,
     /// A prompt-cache breakpoint marker (§ prompt caching): when set, the stable prefix up to and
     /// including this message should be cached. The engine's cache policy marks the last message of
-    /// the request so the growing conversation reuses the cached prefix across turns; a provider
-    /// without prefix caching ignores it.
+    /// the request so the growing conversation reuses the cached prefix across turns. This is an
+    /// explicit-breakpoint hint (Anthropic `cache_control`); providers that cache automatically or
+    /// reuse the KV prefix themselves (OpenAI/DeepSeek, local engines) ignore it.
     pub cache_breakpoint: bool,
 }
 

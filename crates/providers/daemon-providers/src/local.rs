@@ -496,6 +496,10 @@ async fn drive_generation(
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
                     api_calls: 1,
+                    // Prompt tokens served from the worker's reused KV-cache prefix. Local reuse is
+                    // compute-only, so `cost_micros` stays 0; this feeds the session usage store and
+                    // the context HUD like a cloud prompt-cache read.
+                    cache_read_tokens: u.cache_read_tokens,
                     ..Default::default()
                 };
                 break;

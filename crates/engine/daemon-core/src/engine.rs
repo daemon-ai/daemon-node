@@ -76,6 +76,11 @@ pub struct Engine {
     /// The single fallback profile the §8 recovery loop hops to when the active profile cannot
     /// recover (persistent auth/billing/content-policy). `None` disables the hop (the default).
     fallback_profile: Option<ProfileRef>,
+    /// The owning *identity* profile (§5.9 routed profile) this engine's §10/§11 stores are scoped
+    /// under — surfaced to tools via [`TurnCx::profile`](crate::turn::TurnCx) so an `lcm_*`/`mnemosyne_*`
+    /// tool resolves the same profile-rooted bank as the engine's context/memory hooks. Distinct from
+    /// [`Self::profile`] (the credential profile, which mutates on a fallback hop). `None` => node default.
+    subsystem_profile: Option<ProfileRef>,
     config: Config,
     /// The contained execution environment (§13) tools run in; the host injects a per-session
     /// workspace-rooted one via [`crate::EngineProfile`], else the default sandbox.
@@ -121,6 +126,7 @@ impl Engine {
             credentials: Arc::new(EmbeddedCredentialPool::single_key()),
             profile: ProfileRef::new("default"),
             fallback_profile: None,
+            subsystem_profile: None,
             config: Config::default(),
             exec,
             context: Arc::new(BudgetedContextEngine::default()),
@@ -202,6 +208,13 @@ impl Engine {
         self
     }
 
+    /// Bind the owning *identity* profile (§5.9) this engine's §10/§11 stores are scoped under and
+    /// that is surfaced to tools via [`TurnCx::profile`](crate::turn::TurnCx). `None` => node default.
+    pub fn with_subsystem_profile(mut self, profile: Option<ProfileRef>) -> Self {
+        self.subsystem_profile = profile;
+        self
+    }
+
     /// Stash background-job completions to be applied (idempotently) before the next turn runs.
     pub fn apply_completions(&mut self, completions: Vec<Completion>) {
         self.pending.extend(completions);
@@ -227,6 +240,14 @@ impl Engine {
 
     /// Append a user message that opens the next turn.
     pub fn push_user(&mut self, input: UserMsg) {
+        self.snapshot.conversation.push_user(input);
+    }
+
+    /// Append context-only input (`AgentCommand::Observe`) into the conversation **without** opening
+    /// a turn: unlike [`push_user`](Self::push_user)/[`push_steer_marker`](Self::push_steer_marker) it
+    /// sets no `next_trigger` and emits no ack, so the appended chatter simply folds into the model
+    /// context of the next turn the agent actually runs (the multi-party accumulation seam, §5.9).
+    pub fn push_observe(&mut self, input: UserMsg) {
         self.snapshot.conversation.push_user(input);
     }
 
@@ -299,6 +320,11 @@ impl Engine {
     /// report whether cancellation has been requested.
     fn boundary(&mut self, control: &TurnControl, events: &EventSink) -> bool {
         self.serve_snapshots(control, events);
+        // Context-only observes that arrived mid-turn fold in as plain user context (no marker, no
+        // ack, no trigger): they become part of the model context the next turn assembles.
+        for input in control.drain_observe() {
+            self.push_observe(input);
+        }
         for steer in control.drain_steer() {
             self.push_steer_marker(&steer);
             let request_id = steer.request_id;
@@ -803,6 +829,7 @@ impl Engine {
                 events,
                 host,
                 session_id: self.snapshot.session_id.clone(),
+                profile: self.subsystem_profile.clone(),
                 budget: self.budget,
                 exec: &*exec,
                 tool_result_budget,
@@ -1070,6 +1097,7 @@ impl Engine {
         let tool_result_budget = self.config.tool_result_budget;
         let policy = self.effective_policy();
         let session_id = self.snapshot.session_id.clone();
+        let subsystem_profile = self.subsystem_profile.clone();
         let cancel = control.cancel_token();
         let pending = std::mem::take(&mut self.pending);
         let mut rest = Vec::new();
@@ -1090,6 +1118,7 @@ impl Engine {
                             events,
                             host,
                             session_id: session_id.clone(),
+                            profile: subsystem_profile.clone(),
                             budget,
                             exec: &*exec,
                             tool_result_budget,

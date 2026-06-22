@@ -45,6 +45,7 @@ async fn run(tool: &dyn Tool, host: &dyn HostRequestHandler, args: &str) -> Tool
         events: &events,
         host,
         session_id: SessionId::new("s"),
+        profile: None,
         budget: Budget::unlimited(),
         exec: &exec,
         tool_result_budget: 0,

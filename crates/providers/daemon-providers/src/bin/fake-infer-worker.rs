@@ -181,6 +181,7 @@ async fn send_done(writer: &CutWriter, request_id: u64) {
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 2,
+                cache_read_tokens: 0,
             },
         },
     )

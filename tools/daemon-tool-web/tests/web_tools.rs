@@ -163,6 +163,7 @@ async fn run_tool(tool: &dyn Tool, args: &str) -> daemon_core::ToolOutcome {
         events: &events,
         host: &host,
         session_id: SessionId::new("s"),
+        profile: None,
         budget: Budget::unlimited(),
         exec: &exec,
         tool_result_budget: 0,

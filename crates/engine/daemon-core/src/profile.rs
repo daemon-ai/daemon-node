@@ -39,17 +39,22 @@ pub type CredentialBuilder = Arc<dyn Fn() -> Arc<dyn CredentialProvider> + Send 
 /// fs/exec to a host-owned/remote env). The default builds a per-session [`LocalEnvironment`] sandbox.
 pub type ExecEnvBuilder = Arc<dyn Fn(&SessionId) -> Arc<dyn ExecutionEnvironment> + Send + Sync>;
 
-/// Builds the §10 [`ContextEngine`] for one engine, keyed by its [`SessionId`]. A stateful engine
+/// Builds the §10 [`ContextEngine`] for one engine, keyed by its owning [`ProfileRef`] (the §5.9
+/// routed/identity profile, `None` => the node default) and its [`SessionId`]. A stateful engine
 /// (e.g. LCM, which tracks per-session compaction state) needs a *fresh instance per session* so
-/// concurrent sessions never share mutable state; this builder is the seam that gives each one its
-/// own, while all instances target the same agent-wide store. Prefer over
-/// [`EngineProfile::with_context_engine`] for any engine that is not stateless.
-pub type ContextEngineBuilder = Arc<dyn Fn(&SessionId) -> Arc<dyn ContextEngine> + Send + Sync>;
+/// concurrent sessions never share mutable state; the profile key additionally roots each session's
+/// store under that profile's home, so two rooms routed to two profiles never share a context bank.
+/// Prefer over [`EngineProfile::with_context_engine`] for any engine that is not stateless.
+pub type ContextEngineBuilder =
+    Arc<dyn Fn(Option<&ProfileRef>, &SessionId) -> Arc<dyn ContextEngine> + Send + Sync>;
 
-/// Builds the §11 [`MemoryProvider`] set for one engine, keyed by its [`SessionId`] — so a backend
-/// scoped by session (e.g. Mnemosyne's `session_id` row column over a shared bank) is constructed
-/// per-session. Prefer over [`EngineProfile::with_memory`] for any session-scoped backend.
-pub type MemoryBuilder = Arc<dyn Fn(&SessionId) -> Vec<Arc<dyn MemoryProvider>> + Send + Sync>;
+/// Builds the §11 [`MemoryProvider`] set for one engine, keyed by its owning [`ProfileRef`] (the
+/// §5.9 routed/identity profile, `None` => the node default) and its [`SessionId`] — so a backend
+/// scoped by session (e.g. Mnemosyne's `session_id` row column) is constructed per-session, and the
+/// bank itself is rooted under the resolved profile's home (per-profile memory isolation under
+/// per-room binding). Prefer over [`EngineProfile::with_memory`] for any session-scoped backend.
+pub type MemoryBuilder =
+    Arc<dyn Fn(Option<&ProfileRef>, &SessionId) -> Vec<Arc<dyn MemoryProvider>> + Send + Sync>;
 
 /// The engine's construction environment, shared by every construction site (durable factory, live
 /// session builder, fleet child spawner).
@@ -62,6 +67,11 @@ pub struct EngineProfile {
     /// The credential profile to fall back to when the primary credential profile is exhausted
     /// (the `Recovery::Fallback` hop). `None` => no fallback (a single-profile engine).
     fallback_profile: Option<ProfileRef>,
+    /// The owning *identity* profile (the §5.9 routed profile), used to scope this engine's §10/§11
+    /// subsystem stores (LCM/Mnemosyne banks under `<data_dir>/<profile>/`) and surfaced to tools via
+    /// [`TurnCx::profile`](crate::turn::TurnCx). Distinct from the credential profile (which mutates on
+    /// a fallback hop); `None` => the node default profile (legacy single-profile behavior).
+    profile: Option<ProfileRef>,
     budget: Budget,
     config: Config,
     exec: Option<ExecEnvBuilder>,
@@ -88,6 +98,7 @@ impl EngineProfile {
             system,
             credentials: None,
             fallback_profile: None,
+            profile: None,
             budget: Budget::unlimited(),
             config: Config::default(),
             exec: None,
@@ -113,6 +124,14 @@ impl EngineProfile {
     /// cross-credential failover chain on top of the per-profile multi-key pool.
     pub fn with_fallback_profile(mut self, profile: ProfileRef) -> Self {
         self.fallback_profile = Some(profile);
+        self
+    }
+
+    /// Bind the owning *identity* profile (the §5.9 routed profile) that scopes every engine this
+    /// profile builds: its §10/§11 subsystem stores are rooted under that profile's home and the
+    /// builders/tools resolve the profile-keyed bank. Distinct from the credential profile.
+    pub fn with_profile_ref(mut self, profile: ProfileRef) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -206,20 +225,23 @@ impl EngineProfile {
         if let Some(fallback) = &self.fallback_profile {
             engine = engine.with_fallback_profile(fallback.clone());
         }
+        // The owning identity profile (for §10/§11 store scoping + tool resolution via `TurnCx`).
+        engine = engine.with_subsystem_profile(self.profile.clone());
         if let Some(build) = &self.exec {
             let exec = build(&engine.snapshot().session_id);
             engine = engine.with_exec(exec);
         }
         // Context/memory: a per-session builder (for stateful/session-scoped backends) takes
-        // precedence over a shared instance; both are keyed on the engine's own session id.
+        // precedence over a shared instance; both are keyed on the engine's owning profile + session
+        // id, so two sessions routed to two profiles never share a context/memory bank.
         if let Some(build) = &self.context_builder {
-            let context = build(&engine.snapshot().session_id);
+            let context = build(self.profile.as_ref(), &engine.snapshot().session_id);
             engine = engine.with_context_engine(context);
         } else if let Some(context) = &self.context {
             engine = engine.with_context_engine(context.clone());
         }
         if let Some(build) = &self.memory_builder {
-            let memory = build(&engine.snapshot().session_id);
+            let memory = build(self.profile.as_ref(), &engine.snapshot().session_id);
             if !memory.is_empty() {
                 engine = engine.with_memory(memory);
             }

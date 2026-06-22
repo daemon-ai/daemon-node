@@ -185,7 +185,11 @@ fn dress_with_credential(
     a: &NodeAssembly,
     cred_profile: ProfileRef,
 ) -> EngineProfile {
-    let mut profile = profile.with_config(a.engine_config);
+    let mut profile = profile
+        .with_config(a.engine_config)
+        // Scope §10/§11 subsystem stores to the node's launch profile (the legacy single-profile
+        // home), so the durable/orchestrator/fixed-session engines share one bank as before.
+        .with_profile_ref(a.profile.clone());
     // Per-session builders (stateful/session-scoped backends) take precedence over shared instances.
     if let Some(builder) = &a.context_builder {
         profile = profile.with_context_engine_builder(builder.clone());
@@ -351,7 +355,10 @@ impl SessionFactoryCtx {
             spec.system_prompt.clone()
         };
         let mut profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new(persona))
-            .with_config(merged_config(self.engine_config, &spec.tunables));
+            .with_config(merged_config(self.engine_config, &spec.tunables))
+            // Scope the §10/§11 subsystem stores to the profile's own id (its on-disk key), so two
+            // rooms routed to two profiles get isolated context/memory banks under their own homes.
+            .with_profile_ref(ProfileRef::new(&spec.id));
         if spec.budget.tokens.is_some() || spec.budget.wall_ms.is_some() {
             profile = profile.with_budget(Budget {
                 tokens: spec.budget.tokens,
@@ -1078,14 +1085,18 @@ mod tests {
 
         // Per-session builders, exactly as [`dress`] wires them from [`NodeAssembly`]: LCM gets a
         // fresh instance per session; Mnemosyne resolves the session's bank from the shared cache.
-        let context_builder: ContextEngineBuilder = Arc::new(|id: &SessionId| {
-            let aux: Arc<dyn Provider> = Arc::new(MockProvider::completing("summary"));
-            Arc::new(LcmContextEngine::open_for_session(LcmConfig::in_memory(), id, aux).expect("lcm"))
-                as Arc<dyn ContextEngine>
-        });
+        let context_builder: ContextEngineBuilder =
+            Arc::new(|_profile: Option<&ProfileRef>, id: &SessionId| {
+                let aux: Arc<dyn Provider> = Arc::new(MockProvider::completing("summary"));
+                Arc::new(
+                    LcmContextEngine::open_for_session(LcmConfig::in_memory(), id, aux).expect("lcm"),
+                ) as Arc<dyn ContextEngine>
+            });
         let memory_builder: MemoryBuilder = {
             let banks = banks.clone();
-            Arc::new(move |id: &SessionId| vec![banks.get_or_open(id) as Arc<dyn MemoryProvider>])
+            Arc::new(move |_profile: Option<&ProfileRef>, id: &SessionId| {
+                vec![banks.get_or_open(id) as Arc<dyn MemoryProvider>]
+            })
         };
 
         let profile = EngineProfile::new(

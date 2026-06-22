@@ -27,6 +27,13 @@ pub struct MistralRsBackend {
 impl MistralRsBackend {
     /// Build a text model from `model` (an HF repo id or local path). Phase-1 seam: ISQ in-situ
     /// quantization is applied when requested; deeper builder options arrive in Phase 2.
+    ///
+    /// Prompt caching is engine-managed here: mistral.rs enables prefix caching by default
+    /// (`prefix_cache_n = 16`) — block-level when PagedAttention is on, sequence-level otherwise —
+    /// and this one [`MistralRsBackend`] holds a persistent [`mistralrs::Model`] for the worker's
+    /// lifetime, so a shared prefix (system prompt + prior turns) is reused across generations for
+    /// lower TTFT. We deliberately pass no cache-disabling builder flag; do not add
+    /// `with_prefix_cache_n(None)`/`no_kv_cache` unless prefix reuse must be turned off.
     pub async fn load(model: &str, params: &ModelParams) -> Result<Self, BackendError> {
         let mut builder = TextModelBuilder::new(model.to_string());
         if let Some(isq) = params.isq.as_deref().and_then(parse_isq) {
@@ -137,6 +144,10 @@ impl InferenceBackend for MistralRsBackend {
         Ok(Usage {
             input_tokens,
             output_tokens,
+            // mistral.rs manages its own block-/sequence-level prefix cache internally and does not
+            // surface a reused-prefix count on the streaming chunk usage, so report 0 here. The
+            // engine still benefits from the reuse (lower TTFT); it is just not separately metered.
+            cache_read_tokens: 0,
         })
     }
 

@@ -57,6 +57,75 @@ async fn openai_chat_decodes_text_and_usage() {
     assert_eq!(out.usage.output_tokens, 4);
 }
 
+/// OpenAI caches prompt prefixes automatically and exposes the hit count under
+/// `usage.prompt_tokens_details.cached_tokens`; genai decodes it, which we map onto
+/// `UsageDelta::cache_read_tokens` — so cloud cache savings are observed without any explicit
+/// breakpoint markers (unlike Anthropic).
+#[tokio::test]
+async fn openai_cached_tokens_decode_to_cache_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-3", "object": "chat.completion", "model": "gpt-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GenAiProvider::openai("gpt-test").with_endpoint(endpoint(&server));
+    let out = provider.chat(req()).await.expect("chat succeeds");
+    assert_eq!(out.usage.input_tokens, 100);
+    assert_eq!(out.usage.cache_read_tokens, 80);
+}
+
+/// Every request carries a conversation-stable `prompt_cache_key` (derived from the system + tools
+/// prefix) so OpenAI keeps a conversation routed to the same cache-warm backend. The same request
+/// prefix yields the same key across turns.
+#[tokio::test]
+async fn openai_request_carries_stable_prompt_cache_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-4", "object": "chat.completion", "model": "gpt-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GenAiProvider::openai("gpt-test").with_endpoint(endpoint(&server));
+    provider.chat(req()).await.expect("first call succeeds");
+    provider.chat(req()).await.expect("second call succeeds");
+
+    let received = server.received_requests().await.expect("captured requests");
+    let keys: Vec<String> = received
+        .iter()
+        .map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("json body");
+            body["prompt_cache_key"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        keys[0].starts_with("daemon-"),
+        "prompt_cache_key should be sent on the OpenAI wire: {keys:?}"
+    );
+    assert_eq!(
+        keys[0], keys[1],
+        "the same request prefix must yield a stable key across turns"
+    );
+}
+
 #[tokio::test]
 async fn openai_chat_decodes_tool_call() {
     let server = MockServer::start().await;

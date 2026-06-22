@@ -725,7 +725,9 @@ impl SessionApi for NodeApiImpl {
         // commands act on an already-open session whose profile/Primary were bound when it opened.
         if matches!(
             command,
-            AgentCommand::StartTurn { .. } | AgentCommand::Steer { .. }
+            AgentCommand::StartTurn { .. }
+                | AgentCommand::Steer { .. }
+                | AgentCommand::Observe { .. }
         ) {
             self.live.ensure(&resolved.session, resolved.profile.clone());
             self.live
@@ -1599,6 +1601,23 @@ impl LiveSessions {
                     }),
                 );
                 handle.steer(request_id, text).await;
+                Ok(())
+            }
+            AgentCommand::Observe { input, request_id } => {
+                // Context-only append (no turn): spawn-if-absent so the chatter has a conversation to
+                // land in, record it as context, then hand it to the actor — which folds it in when
+                // idle or queues it for the following turn when busy (event-io §5.9). No turn starts.
+                let handle = self.ensure(&session, None);
+                self.record_inbound(
+                    &session,
+                    origin,
+                    Disposition::Context,
+                    SessionPayload::Command(AgentCommand::Observe {
+                        input: input.clone(),
+                        request_id,
+                    }),
+                );
+                handle.observe(request_id, input).await;
                 Ok(())
             }
             AgentCommand::Snapshot { request_id } => {
