@@ -105,7 +105,12 @@ room has no threads) yields the deterministic `SessionId`.
 
 The adapter `subscribe`s the sessions whose Primary names one of its account instances (subscriber
 model, §5.9.3) and projects the outbound `AgentEvent` stream down to chat messages — projection policy
-is adapter-owned (the mirror of inbound addressing):
+is adapter-owned (the mirror of inbound addressing). The discovery + subscribe + handover-stop loop is
+**not** hand-rolled per adapter: the reusable `daemon-delivery` crate (`serve_delivery(api, transport,
+projector)`, built on `delivery_sessions` wire v10) is the M3/M4 outbound substrate the matrix adapter
+plugs its Matrix-message `Projector` into; an in-process deployment can instead register a
+`daemon_api::DeliverySink` via `daemon_host::DeliveryHost` for push delivery (see event-io §5.9.3). The
+event → action projection table stays adapter-owned:
 
 | Outbound event | Matrix action |
 | --- | --- |
@@ -351,14 +356,18 @@ whole point of the merged-log paradigm.
   and the foundation is cleaner with them in: profile-scoped §10/§11 memory/context (isolated banks
   per routed profile), `AgentCommand::Observe` (the §3.3 context-append, wire v8), and the
   account→profile binding as profile data (`ProfileSpec.bound_accounts` → `instance_profiles`,
-  precedence step 2). All testable without Matrix.
+  precedence step 2); and the **outbound delivery foundation** (§5.9.3 made reusable):
+  `delivery_sessions` owned-session discovery (wire v10), the in-process `DeliverySink` push pump
+  (`daemon_host::DeliveryHost`), and the reusable `daemon-delivery` pull subscriber (the M3/M4 outbound
+  substrate this adapter plugs its `Projector` into). All testable without Matrix.
 - **M2 — `daemon-matrix` skeleton + per-account `login`.** SSO writes the session into `CredentialStore`
   under the profile's Matrix credential-ref; the adapter restores from there and opens the per-account
   E2EE store; refresh write-back. Feasibility proof.
 - **M3 — inbound projection.** Enumerate credential-bound accounts per profile; SyncService/Timeline →
   router (account→profile default + room override) → `submit_from`; mention/busy policy; final-text
   reply to the per-account `Primary`.
-- **M4 — outbound richness.** `subscribe` stream; `HostRequest` → reaction-approval → `respond`;
+- **M4 — outbound richness.** Outbound delivery via the `daemon-delivery` subscriber (or an in-process
+  `DeliverySink`) with a Matrix `Projector`; `HostRequest` → reaction-approval → `respond`;
   typing/receipt → `record_meta`; streaming-edit replies.
 - **M5 — hardening.** E2EE cross-signing/SAS verification; `handover` (GUI co-attach); optional
   out-of-process bin. (Profile-scoped memory/context under per-room binding landed early — see

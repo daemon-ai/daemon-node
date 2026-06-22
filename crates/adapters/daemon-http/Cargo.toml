@@ -13,6 +13,7 @@ license.workspace = true
 daemon-api = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
+daemon-delivery = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -21,7 +22,7 @@ tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 reqwest = { workspace = true }

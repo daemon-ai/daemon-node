@@ -735,21 +735,35 @@ reply address, captured at session open). So "reply to the chat it came from" ne
 and **multi-account demux is free** — the Primary names the account-instance `TransportId` + the chat
 `RouteAddr`. Four rules the primitive leaves implicit, now stated:
 
-- **Dispatch ownership — subscriber model (v1).** Delivery is a *subscriber set* (§5.4): the transport
-  instance named in the Primary `subscribe()`s its sessions and posts; the host only **stores**
-  `DeliveryTarget`s, it does not push. (Previously only implied; now the rule.)
-- **Central dispatcher (documented upgrade path).** For centralized / cross-process delivery
-  guarantees, transports register a `DeliverySink` keyed by transport-instance and a host outbound
-  dispatcher pushes each session's outbound stream to the owning sink. Adds a sink-registration
-  contract + cross-process semantics; specify as the evolution, not v1.
+- **Dispatch ownership — subscriber model (v1), now backed by reusable infrastructure.** Delivery is a
+  *subscriber set* (§5.4): the transport instance named in the Primary discovers its sessions and posts.
+  The host still **stores** `DeliveryTarget`s, but no longer leaves discovery + the delivery loop to
+  each adapter. **Landed:** `SessionApi::delivery_sessions(transport) -> Vec<SessionId>` (wire op,
+  `WireVersion` v10) is the owned-session discovery primitive a transport calls on (re)connect — an
+  on-demand scan of the live table for sessions whose `Primary` names the instance (no maintained
+  reverse index; O(live sessions), called per connect not per event). The reusable pull subscriber
+  `daemon-delivery::serve_delivery(api, transport, projector)` stitches `delivery_sessions` +
+  `subscribe` + handover-stop into one loop, so an adapter does not re-implement discovery/fan-in
+  (`daemon-http`'s `GET /tenants/{tenant}/delivery` demonstrates the reconnect-safe path over the wire).
+- **In-process push dispatcher (was the "documented upgrade path", now landed in-process).** For
+  in-process / low-latency delivery, a transport registers an `daemon_api::DeliverySink` keyed by its
+  transport-instance via the host-side `daemon_host::DeliveryHost` handle; the **per-session event
+  pump** (not a separate dispatcher task) re-reads the session's *current* `Primary` after each frame
+  and pushes the just-recorded `SessionLogEntry` to the owning sink. Riding the pump gives per-session
+  backpressure isolation and handover-honoring for free. A `DeliverySink` is a live trait object and
+  does **not** cross a process boundary, so the cross-process boundary still uses **pull** (subscribe
+  over the socket); a central cross-process `DeliverySink` RPC remains a future evolution, not v1.
 - **Where vs what.** `DeliveryTarget` answers *where*; it does not say *what*. Projecting the rich
   outbound `AgentEvent` stream (deltas / tool / reasoning) down to a chat message (final text, optional
   tool summaries) is per-transport **projection policy** — the exact mirror of inbound addressing
-  policy, and adapter-owned.
+  policy, and adapter-owned (the `serve_delivery` `Projector` callback and the `DeliverySink` impl are
+  where it lives; the host carries zero transport/projection deps).
 - **Spectator fan-out + handover honoring.** Multiple targets across transports (a GUI watching a chat)
   work because each subscriber self-selects the targets it owns; events are not individually
-  target-tagged. After `handover` re-points the Primary, an adapter must consult `delivery_targets` and
-  **stop** posting once demoted to `Spectator` (never assume it is still Primary).
+  target-tagged. After `handover` re-points the Primary, both halves honor it automatically: the push
+  pump pushes only to the *current* `Primary` (a demoted instance stops, the new one starts), and the
+  pull `serve_delivery` re-checks `delivery_targets` and **stops** a session's stream once demoted to
+  `Spectator` (the rule "never assume it is still Primary" is now enforced by the reusable helper).
 
 #### 5.9.4 Placement and definitions
 
@@ -850,8 +864,10 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
     instance-qualified `TransportId`s (`matrix/@bot:hs.org`) by **convention** — no protocol change —
     with a structural `Origin.instance` field as a later upgrade. Profile precedence is *route override
     > instance's bound profile > node default*. Outbound delivery is the **subscriber model** (the
-    instance named in the Primary subscribes and posts; the host stores but does not push), with a
-    central `DeliverySink` dispatcher as the cross-process upgrade. The one invasive consequence:
+    instance named in the Primary subscribes and posts), now backed by reusable infrastructure (§5.9.3):
+    `delivery_sessions` owned-session discovery (wire v10) + the `daemon-delivery` pull subscriber for
+    the cross-process path, and an in-process `DeliverySink` push pump for low-latency in-process
+    delivery (cross-process push remains a future evolution). The one invasive consequence:
     `LiveSessions::ensure`/`SessionEngineBuilder` must become **profile-aware**
     (`ensure(session, ProfileRef)`), and per-session profiles thread through the §10/§11 context/memory
     builders.
@@ -889,6 +905,9 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
   `LiveSessions::ensure(session, ProfileRef)` + the transport-instance convention + the explicit
   outbound subscriber-ownership rule. The reusable foundation that P5 chat transports consume;
   testable without any chat transport (e.g. HTTP-key → profile, reply on the same connection).
+  *Outbound half landed:* `delivery_sessions` discovery (wire v10), the in-process `DeliverySink` push
+  pump (`daemon_host::DeliveryHost`), and the reusable `daemon-delivery` pull subscriber, all proven
+  via a mock sink + `daemon-http`'s tenant delivery endpoint (no `matrix-sdk` dependency).
 - **P5 — chat transports.** Out-of-process adapters against `daemon-http`/the socket; in-tree only
   if explicitly required. The first such transport (Matrix, SSO + E2EE) is specified in
   `daemon-matrix-transport-spec.md`, which instantiates the §5.9 routing capability end-to-end.

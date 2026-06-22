@@ -1,0 +1,22 @@
+[package]
+name = "daemon-delivery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Reusable, transport-agnostic outbound *pull* delivery helper (daemon-event-io-spec §5.9.3): the
+# cross-process / reconnect-safe path any adapter uses to (re)discover the sessions its transport
+# instance owns (`delivery_sessions`), subscribe to each merged log, project entries down to its own
+# message shape, and stop once handed over (demoted to `Spectator`). Depends only on the contracts +
+# async runtime, so it carries no host or substrate types and can be used by any transport adapter.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

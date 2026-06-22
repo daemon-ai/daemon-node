@@ -771,6 +771,12 @@ fn render(resp: ApiResponse) {
                 println!("  - {} {} {:?}", t.transport.0, t.route.0, t.kind);
             }
         }
+        ApiResponse::DeliverySessions(sessions) => {
+            println!("delivery_sessions: {}", sessions.len());
+            for s in sessions {
+                println!("  - {s}");
+            }
+        }
         ApiResponse::VerifyingKey(key) => match key {
             Some(hex) => println!("verifying_key: {hex}"),
             None => println!("verifying_key: none (node exposes no journal signer)"),

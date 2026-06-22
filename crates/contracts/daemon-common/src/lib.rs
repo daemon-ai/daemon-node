@@ -366,7 +366,13 @@ impl WireVersion {
     /// best-effort workspace checkpoint recorded before each mutating tool runs, so an operator/GUI can
     /// rewind autonomous edits. (Also lands the MCP-client tool breadth + tool-search progressive
     /// disclosure, which ride the existing `ToolProvider`/offer seams and need no new wire surface.)
-    pub const CURRENT: Self = Self(9);
+    ///
+    /// v10 (delivery sessions): adds owned-session discovery (`DeliverySessions { transport }` ->
+    /// `ApiResponse::DeliverySessions([session-id])`), the outbound-symmetry seam a transport calls on
+    /// (re)connect to enumerate the sessions whose `Primary` it owns and resume delivery (event-io
+    /// §5.9.3). The in-process `DeliverySink` push path is a live trait object and does not cross the
+    /// wire, so it adds no op.
+    pub const CURRENT: Self = Self(10);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

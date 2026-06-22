@@ -388,6 +388,7 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "SessionHistory": { session: session-id, after_cursor: uint, max: uint } }
             / { "Subscribe": { session: session-id, after_seq: uint, max: uint } }  ; merged-log cursor read -> LogPage
             / { "DeliveryTargets": { session: session-id } }                        ; reply sinks -> DeliveryTargets
+            / { "DeliverySessions": { transport: transport-id } }                    ; owned-session discovery -> DeliverySessions (wire v10)
             / { "Handover": { session: session-id, target: delivery-target } }      ; re-point Primary -> Ok
             / { "RecordMeta": { session: session-id, origin: origin, kind: tstr, body: bstr } }  ; transport/meta -> Ok
             / { "UnitHistory": { unit: unit-id, after_cursor: uint, max: uint } }
@@ -440,6 +441,7 @@ api-response = "Ok"
              / { "Journal": journal-page-view }
              / { "LogPage": log-page-view }
              / { "DeliveryTargets": [* delivery-target] }
+             / { "DeliverySessions": [* session-id] }   ; owned sessions of a transport instance (wire v10)
              / { "VerifyingKey": (tstr / null) }
              / { "ModelSearch": search-page }
              / { "ModelFiles": [* model-file] }
