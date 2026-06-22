@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS delegations (
     payload        BLOB NOT NULL
 );
 
+-- §4.3 attached, non-joining edges (background spawn): parent->child tree edge for audit, but no
+-- bound parent job — so `mark_completed` (which only reads `delegations`) never wakes the parent and
+-- the child self-closes. `origin` marks the edge family for the tree projection.
+CREATE TABLE IF NOT EXISTS background_edges (
+    rowseq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    child          TEXT NOT NULL UNIQUE,
+    parent_session TEXT NOT NULL,
+    work_label     TEXT NOT NULL,
+    origin         TEXT NOT NULL DEFAULT 'background'
+);
+
 CREATE TABLE IF NOT EXISTS session_usage (
     session_id          TEXT PRIMARY KEY,
     input_tokens        INTEGER NOT NULL,
@@ -454,20 +465,44 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn record_child_edge(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        work_label: String,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Deliberately *not* an INSERT into `delegations`: no parent job is bound, so the child's
+        // terminal `mark_completed` finds nothing to fulfill and never wakes the parent (self-close).
+        conn.execute(
+            "INSERT OR IGNORE INTO background_edges (child, parent_session, work_label) \
+             VALUES (?1, ?2, ?3)",
+            params![child.as_str(), parent.as_str(), work_label],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn children_of(&self, parent: &SessionId) -> Vec<SessionId> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn
-            .prepare("SELECT child FROM delegations WHERE parent_session = ?1 ORDER BY rowseq")
-        {
-            Ok(stmt) => stmt,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt
-            .query_map(params![parent.as_str()], |row| {
+        // Both edge families are tree-visible (audit): delegation children (delegation order) then
+        // attached background children. Only the former can wake the parent (see `mark_completed`).
+        let read = |sql: &str| -> Vec<SessionId> {
+            let mut stmt = match conn.prepare(sql) {
+                Ok(stmt) => stmt,
+                Err(_) => return Vec::new(),
+            };
+            stmt.query_map(params![parent.as_str()], |row| {
                 Ok(SessionId::new(row.get::<_, String>(0)?))
             })
-            .and_then(|r| r.collect::<Result<Vec<_>, _>>());
-        rows.unwrap_or_default()
+            .and_then(|r| r.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default()
+        };
+        let mut children =
+            read("SELECT child FROM delegations WHERE parent_session = ?1 ORDER BY rowseq");
+        children
+            .extend(read("SELECT child FROM background_edges WHERE parent_session = ?1 ORDER BY rowseq"));
+        children
     }
 
     async fn enqueue_wake(&self, id: SessionId) {
@@ -480,15 +515,27 @@ impl SessionStore for SqliteStore {
 
     async fn delegation_work(&self, child: &SessionId) -> Option<String> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT payload FROM delegations WHERE child = ?1",
-            params![child.as_str()],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        let delegated = conn
+            .query_row(
+                "SELECT payload FROM delegations WHERE child = ?1",
+                params![child.as_str()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        // Fall back to the attached non-joining edge label (§4.3 background spawn).
+        delegated.or_else(|| {
+            conn.query_row(
+                "SELECT work_label FROM background_edges WHERE child = ?1",
+                params![child.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
     }
 
     async fn record_usage(&self, id: &SessionId, delta: UsageDelta) {
@@ -694,6 +741,19 @@ impl SessionStore for SqliteStore {
         conn.execute("DELETE FROM wake_outbox WHERE rowseq = ?1", params![rowseq])
             .ok()?;
         Some(id)
+    }
+
+    async fn peek_snapshot(&self, id: &SessionId) -> Option<SnapshotBlob> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT snapshot FROM session_record WHERE session_id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(SnapshotBlob::new)
     }
 
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {

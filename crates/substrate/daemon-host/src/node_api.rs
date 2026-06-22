@@ -37,8 +37,8 @@ use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestHandler,
-    HostResponse, HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, SinkKind,
-    TranscriptBlock, TransportId,
+    HostRequestKind, HostResponse, HostResponseBody, Origin, OriginScope, SessionLogEntry,
+    SessionPayload, SinkKind, TranscriptBlock, TransportId,
 };
 use daemon_store::{SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -180,6 +180,13 @@ impl NodeApiImpl {
     /// `models()` lists cloud models for adapters that have a resolvable key. Call during assembly.
     pub fn with_cloud_catalog(mut self, cloud_catalog: Arc<dyn CloudCatalog>) -> Self {
         self.cloud_catalog = Some(cloud_catalog);
+        self
+    }
+
+    /// Attach the §4.3 background-spawn materializer so a live session's `Effect::Spawn` raises an
+    /// attached, non-joining review child (skill/memory review) without parking. Call during assembly.
+    pub fn with_background(self, background: Arc<crate::background::BackgroundSpawner>) -> Self {
+        self.live.set_background(background);
         self
     }
 
@@ -1026,6 +1033,9 @@ struct LiveSessions {
     builder: SessionEngineBuilder,
     /// The verifiable-journal store + signer, when journaling is enabled for live sessions.
     journal: Mutex<Option<JournalConfig>>,
+    /// The §4.3 background-spawn materializer, when configured: lets a live session's `Effect::Spawn`
+    /// materialize an attached non-joining review child without parking (fire-and-forget).
+    background: Mutex<Option<Arc<crate::background::BackgroundSpawner>>>,
 }
 
 impl LiveSessions {
@@ -1034,11 +1044,16 @@ impl LiveSessions {
             sessions: DashMap::new(),
             builder,
             journal: Mutex::new(None),
+            background: Mutex::new(None),
         }
     }
 
     fn set_journal(&self, cfg: JournalConfig) {
         *self.journal.lock().unwrap() = Some(cfg);
+    }
+
+    fn set_background(&self, background: Arc<crate::background::BackgroundSpawner>) {
+        *self.background.lock().unwrap() = Some(background);
     }
 
     /// Spawn (or reuse) the actor for `session`, returning its handle.
@@ -1066,6 +1081,8 @@ impl LiveSessions {
             pending: pending.clone(),
             log: log.clone(),
             journal: feeder.clone(),
+            session: session.clone(),
+            background: self.background.lock().unwrap().clone(),
         });
         let handle = spawn_agent_session(engine, host);
 
@@ -1368,11 +1385,30 @@ struct ParkingHandler {
     log: Merged,
     /// The per-session journal feeder, so a raised request graduates into a durable request block.
     journal: Option<Arc<JournalFeeder>>,
+    /// This session's id (the parent of any background spawn it raises).
+    session: SessionId,
+    /// The §4.3 background-spawn materializer, when configured.
+    background: Option<Arc<crate::background::BackgroundSpawner>>,
 }
 
 #[async_trait]
 impl HostRequestHandler for ParkingHandler {
     async fn request(&self, req: HostRequest) -> HostResponse {
+        // §4.3 fire-and-forget spawn: materialize the attached non-joining child immediately and
+        // return — never park (parking would block the parent turn, defeating fire-and-forget).
+        if let HostRequestKind::Spawn { spec } = &req.kind {
+            let child = match &self.background {
+                Some(bg) => bg
+                    .spawn(&self.session, daemon_common::Epoch::ZERO, spec, None)
+                    .await
+                    .unwrap_or_else(|| self.session.clone()),
+                None => self.session.clone(),
+            };
+            return HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Spawned(child),
+            };
+        }
         let (tx, rx) = oneshot::channel();
         let request_id = req.request_id;
         self.pending.lock().unwrap().insert(request_id, tx);

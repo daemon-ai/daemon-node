@@ -415,6 +415,37 @@ pub enum HostRequestKind {
         /// The budget allotted to the delegated work.
         budget: Budget,
     },
+    /// Ask the host to spawn an **attached, non-joining, self-closing** background child (§4.3):
+    /// the child is recorded under the parent in the durable tree for audit, but binds no parent
+    /// job, so the parent neither suspends nor is woken — the child runs bounded turns against a
+    /// constrained background profile and reaches a terminal state on its own. This is the general
+    /// post-turn self-improvement seam (background skill review / memory write). Fire-and-forget:
+    /// the host returns a [`HostResponseBody::Spawned`] child id immediately.
+    Spawn {
+        /// The spawn request: which background profile to run and how to seed it.
+        spec: SpawnSpec,
+    },
+}
+
+/// A request to spawn an attached, non-joining background child ([`HostRequestKind::Spawn`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnSpec {
+    /// The background-profile kind the host materializes the child from (e.g. `"skill_review"`,
+    /// `"memory_review"`). The host owns the kind -> constrained-toolset + review-prompt mapping; an
+    /// unknown kind is a no-op (the engine stays free of the side-store/tool specifics).
+    pub kind: String,
+    /// How the child's conversation is seeded.
+    pub seed: SpawnSeed,
+}
+
+/// How a spawned background child's conversation is seeded ([`SpawnSpec::seed`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SpawnSeed {
+    /// Seed the child with a read-only copy of the parent's conversation at spawn time, so the
+    /// review agent sees exactly what just happened. The host reads the parent's durable snapshot.
+    #[default]
+    FromConversation,
 }
 
 /// The host's correlated reply to a [`HostRequest`].
@@ -438,6 +469,9 @@ pub enum HostResponseBody {
     Chosen(usize),
     /// The id assigned to delegated work.
     Delegated(JobId),
+    /// The id of the attached background child a [`HostRequestKind::Spawn`] materialized. Purely
+    /// informational (audit/reference): the parent does not wait on it.
+    Spawned(SessionId),
 }
 
 /// The trait the host implements so an engine can raise blocking requests (§17).

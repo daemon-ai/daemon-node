@@ -336,7 +336,11 @@ impl WireVersion {
     /// v3 (genai-native providers): collapses `ProviderSelector` to `mock | genai | llama_cpp |
     /// mistral_rs` (the genai adapter is inferred from the model id; legacy per-provider names
     /// deserialize to `genai` via serde aliases) and lists networked models live from genai.
-    pub const CURRENT: Self = Self(3);
+    ///
+    /// v4 (background spawn): adds the fire-and-forget `HostRequestKind::Spawn { SpawnSpec }` host
+    /// request (engine-native `Effect::Spawn`) materializing an attached, self-closing background
+    /// child (skill/memory review) that records a child edge without suspending or waking the parent.
+    pub const CURRENT: Self = Self(4);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

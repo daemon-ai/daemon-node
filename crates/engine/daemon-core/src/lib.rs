@@ -43,7 +43,7 @@ pub use actor::{spawn_agent_session, AgentHandle};
 pub use config::Config;
 pub use context::{
     estimate_tokens, BudgetedContextEngine, ContextEngine, ContextStrategy, ModelInfo, Pressure,
-    PromptAssembler,
+    PromptAssembler, StablePromptSource,
 };
 pub use control::{SteerReq, TurnControl};
 pub use conversation::{

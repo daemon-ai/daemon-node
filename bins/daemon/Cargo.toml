@@ -40,6 +40,9 @@ daemon-tool-web = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.
 daemon-tool-todo = { workspace = true }
 daemon-tool-clarify = { workspace = true }
+# The skills subsystem: the store/index (`daemon-skills`) + the `skill_*` tools (`daemon-tool-skill`).
+daemon-skills = { workspace = true }
+daemon-tool-skill = { workspace = true }
 # The `browser` tool; gated behind the `browser` feature so the default build never compiles the
 # heavy chromiumoxide CDP bindings.
 daemon-tool-browser = { workspace = true, optional = true }

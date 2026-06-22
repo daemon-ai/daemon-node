@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 2)
+wire_version = uint                 ; daemon-common WireVersion (current = 4)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr

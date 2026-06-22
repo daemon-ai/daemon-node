@@ -285,10 +285,42 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 
 | Capability | Hermes anchor | Daemon state + gap |
 |---|---|---|
-| SKILL.md discovery + progressive-disclosure index | `agent/skill_utils.py`; `agent/prompt_builder.py:1127` | MISSING — skills index is a P2 roadmap bullet in [daemon-core-spec](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §10/§11 only. |
-| `skill_manage` (create/edit/patch/delete) | `tools/skill_manager_tool.py:1217` | MISSING. P2. |
-| Background review fork | `agent/background_review.py:675` | MISSING. P2. |
-| Curator lifecycle | `agent/curator.py:198`; `tools/skill_usage.py` | MISSING. P3. |
+| SKILL.md discovery + progressive-disclosure index | `agent/skill_utils.py`; `agent/prompt_builder.py:1127` | DONE — `daemon-skills` (`SkillStore::discover`/`render_index`) + `SkillsPromptSource` folds the cache-stable index into the stable system-prompt tier via `EngineProfile::with_prompt_block` ([daemon-skills/src/lib.rs](../../crates/skills/daemon-skills/src/lib.rs)). |
+| `skill_view` (full body + linked files) | `tools/skills_tool.py` | DONE — `skill_view(name, file_path?)` ([daemon-tool-skill/src/lib.rs](../../tools/daemon-tool-skill/src/lib.rs)). |
+| `skills_list` | `tools/skills_tool.py` | DONE — `skills_list`. |
+| `skill_manage` (create/edit/patch/delete/write_file/remove_file) | `tools/skill_manager_tool.py:1217` | DONE — `skill_manage` (all six actions) writing the local skills dir, invalidating the index cache on write. |
+| Background review fork | `agent/background_review.py:675` | DONE — engine-native `Effect::Spawn` → attached, self-closing `skill_review` background child (counter-triggered via `skill_review_interval`); see [daemon-core-spec](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §4.6 + [daemon-host-spec](daemon-host-spec.md) §7. Opt-in (interval `0` by default). |
+| Bundled default skills | `skills/` (73, auto-synced by `tools/skills_sync.py`); `get_bundled_skills_dir` | PARTIAL (curated) — daemon embeds + seeds a **portable subset** on first run (see *Bundled-skills delta* below). |
+| Curator lifecycle (usage telemetry, archival, provenance) | `agent/curator.py:198`; `tools/skill_usage.py`; `tools/skill_provenance.py` | MISSING. P3 — no `.usage.json` view/use/patch counters, no `created_by` provenance, no stale/archive curation. |
+| Hub install + slash-commands + `--skills` preload + skill bundles | `tools/skills_hub.py`; `agent/skill_commands.py`; `agent/skill_bundles.py` | MISSING. P3 — no remote hub, `/skill` slash, CLI preload, or YAML skill-bundles. |
+| Conditional/environment/platform gating + external dirs | `agent/skill_utils.py:128-269,478-492` | MISSING — daemon renders the index unconditionally (no `platforms`/`environments`/`requires_toolsets` filtering, no `skills.external_dirs`). P3. |
+
+**Bundled-skills delta (what daemon ships vs hermes' 73).** Hermes auto-syncs **all 73** skills under
+`skills/` into the active profile and offers ~100 more under `optional-skills/` via the hub. Daemon
+deliberately bundles only a **curated, tool-agnostic subset** (`crates/skills/daemon-skills/bundled/`,
+embedded via `include_dir` and seeded by `SkillStore::seed_bundled`, ~412 KB), because most hermes
+bundled skills are integrations against tools daemon does not host. What daemon ships today:
+
+- **software-development** (methodology, no tool deps): `plan`, `systematic-debugging`,
+  `test-driven-development`, `spike`, `simplify-code`, `requesting-code-review`.
+- **creative**: `design-md` (+ `templates/starter.md`).
+- **research**: `research-paper-writing` (SKILL.md + `references/` only — the heavy LaTeX/PDF
+  `templates/` are dropped).
+
+Excluded (and why), tracked here so the gap is explicit:
+
+- **Tool-bound integrations** (~50 skills): `apple/*` (notes, imessage, findmy, macos-computer-use),
+  `email/himalaya`, `github/*`, `productivity/*` (notion, airtable, google-workspace, powerpoint…),
+  `note-taking/obsidian`, `smart-home/openhue`, `social-media/xurl`, `media/*`, `mlops/*` — each
+  needs a CLI/MCP/credential that daemon does not yet wire. Re-bundle per-skill as the matching tool
+  lands.
+- **Hermes-internal** skills: `devops/kanban-*`, `dogfood`, `yuanbao`, `autonomous-ai-agents/*`,
+  `software-development/hermes-agent-skill-authoring` (hardcodes `/home/bb/hermes-agent` paths) — not
+  portable; a daemon-native skill-authoring guide should replace the last one.
+- **All `optional-skills/`** (~100): out of scope by hermes' own design (hub-install only, never
+  auto-synced).
+- **Heavy assets**: `research-paper-writing/templates/` (LaTeX + PDFs, ~1.4 MB) and
+  `productivity/powerpoint` OOXML schemas are excluded to keep the embedded bundle small.
 
 ### Domain H — Sessions & persistence
 
@@ -503,7 +535,10 @@ the parity-map. Use this as the long-horizon backlog after the D0 demo.
 
 **P2 — ecosystem breadth:**
 - Provider breadth + credential pool + fallback (Domain C) — MISSING.
-- Skills subsystem: discovery, index, `skill_manage`, background review (Domains F/G) — MISSING.
+- Skills subsystem: discovery, index, `skill_view`/`skills_list`/`skill_manage`, background review,
+  curated bundled-skill seeding (Domains F/G) — DONE (`daemon-skills` + `daemon-tool-skill` +
+  engine-native `Effect::Spawn`); curator telemetry / hub / slash-commands / conditional gating remain
+  P3 (see Domain G).
 - Profiles-as-environments: clone/export/distributions (Domain A) — MISSING beyond §5.1 core.
 
 **P3 — long tail:**

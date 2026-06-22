@@ -14,7 +14,7 @@
 //! same `EngineProfile`.
 
 use crate::config::Config;
-use crate::context::ContextEngine;
+use crate::context::{ContextEngine, StablePromptSource};
 use crate::conversation::SystemPrompt;
 use crate::credentials::CredentialProvider;
 use crate::engine::Engine;
@@ -69,6 +69,8 @@ pub struct EngineProfile {
     context_builder: Option<ContextEngineBuilder>,
     memory: Vec<Arc<dyn MemoryProvider>>,
     memory_builder: Option<MemoryBuilder>,
+    /// Generic stable-tier prompt sources (§10), e.g. the skills index — independent of memory.
+    prompt_sources: Vec<Arc<dyn StablePromptSource>>,
 }
 
 impl EngineProfile {
@@ -93,6 +95,7 @@ impl EngineProfile {
             context_builder: None,
             memory: Vec::new(),
             memory_builder: None,
+            prompt_sources: Vec::new(),
         }
     }
 
@@ -163,6 +166,27 @@ impl EngineProfile {
         self
     }
 
+    /// Register a generic stable-tier prompt source (§10) folded into the system prompt of every
+    /// engine this profile builds — the seam the skills *index* uses (cache-stable; full bodies load
+    /// on demand via `skill_view`). Independent of memory.
+    pub fn with_prompt_block(mut self, source: Arc<dyn StablePromptSource>) -> Self {
+        self.prompt_sources.push(source);
+        self
+    }
+
+    /// Replace the tool registry every engine this profile builds is constructed with (e.g. to
+    /// constrain a background-review child to a skills-only / memory-only toolset).
+    pub fn with_registry(mut self, registry: Arc<ToolRegistry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Replace the system prompt every engine this profile builds opens with (e.g. a review persona).
+    pub fn with_system(mut self, system: SystemPrompt) -> Self {
+        self.system = system;
+        self
+    }
+
     /// The tool registry shared by engines this profile builds.
     pub fn registry(&self) -> Arc<ToolRegistry> {
         self.registry.clone()
@@ -201,6 +225,9 @@ impl EngineProfile {
             }
         } else if !self.memory.is_empty() {
             engine = engine.with_memory(self.memory.clone());
+        }
+        if !self.prompt_sources.is_empty() {
+            engine = engine.with_prompt_sources(self.prompt_sources.clone());
         }
         engine.with_budget(self.budget).with_config(self.config)
     }

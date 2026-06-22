@@ -1,0 +1,18 @@
+[package]
+name = "daemon-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+# Embeds the curated bundled-skills tree (`bundled/`) into the binary so a deployed daemon can seed
+# the profile's skills dir with no repo/filesystem dependency (parity with hermes' wheel-data bundle).
+include_dir = "0.7"
+
+[dev-dependencies]
+tempfile = "3"

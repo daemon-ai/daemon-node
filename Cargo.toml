@@ -62,6 +62,9 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 gguf-rs = "0.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# SKILL.md frontmatter parsing (the skills subsystem): a delimited YAML block at the top of each
+# bundle. Isolated to `daemon-skills`; `serde_yaml` is a small pure-Rust parser over `unsafe-libyaml`.
+serde_yaml = "0.9"
 # optional in-process HTTP/WS surface (the daemon-http adapter): JSON dispatch + SSE/WS over the
 # merged session event log. Isolated to the `daemon-http` adapter crate so axum never leaks into the
 # host/core; toggled on like MCP at launch.
@@ -127,6 +130,8 @@ daemon-tool-web = { path = "tools/daemon-tool-web" }
 daemon-tool-browser = { path = "tools/daemon-tool-browser" }
 daemon-tool-todo = { path = "tools/daemon-tool-todo" }
 daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
+daemon-skills = { path = "crates/skills/daemon-skills" }
+daemon-tool-skill = { path = "tools/daemon-tool-skill" }
 
 [profile.release]
 panic = "unwind"   # catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)

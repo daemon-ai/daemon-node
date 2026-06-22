@@ -7,7 +7,7 @@
 //! deterministic phase boundary (lifecycle §3.1).
 
 use crate::config::Config;
-use crate::context::{BudgetedContextEngine, ContextEngine, PromptAssembler};
+use crate::context::{BudgetedContextEngine, ContextEngine, PromptAssembler, StablePromptSource};
 use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
 use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
@@ -22,11 +22,12 @@ use crate::tools::ToolRegistry;
 use crate::turn::{Effect, TurnCx};
 use crate::Failure;
 use daemon_common::{
-    Budget, CredScope, Epoch, JobId, ProfileRef, RateLimitSnapshot, SessionId, UsageDelta,
+    Budget, CredScope, Epoch, JobId, ProfileRef, RateLimitSnapshot, ReqId, SessionId, UsageDelta,
 };
 use daemon_protocol::{
-    AgentEvent, CompletionSource, ContextStatus, ConvTurnView, ConvView, EndReason,
-    HostRequestHandler, ToolCallView, ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
+    AgentEvent, CompletionSource, ContextStatus, ConvTurnView, ConvView, EndReason, HostRequest,
+    HostRequestHandler, HostRequestKind, SpawnSeed, SpawnSpec, ToolCallView, ToolDetail,
+    ToolResultView, TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +85,9 @@ pub struct Engine {
     /// The registered memory providers (§11). Empty by default — memory is opt-in; the engine drives
     /// their hook order (`recall -> prompt_block -> before_compact -> after_turn`) around each turn.
     memory: Vec<Arc<dyn MemoryProvider>>,
+    /// Generic stable-tier prompt sources (§10), independent of memory — e.g. the skills index.
+    /// Folded into `assembler.stable` each turn; expected to be cache-stable across a conversation.
+    prompt_sources: Vec<Arc<dyn StablePromptSource>>,
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
     next_trigger: Option<TurnTrigger>,
@@ -118,6 +122,7 @@ impl Engine {
             context: Arc::new(BudgetedContextEngine::default()),
             assembler: PromptAssembler::default(),
             memory: Vec::new(),
+            prompt_sources: Vec::new(),
             next_trigger: None,
             lifecycle_started: false,
         }
@@ -164,6 +169,13 @@ impl Engine {
     /// Register the memory providers (§11) this engine consults around each turn (default empty).
     pub fn with_memory(mut self, memory: Vec<Arc<dyn MemoryProvider>>) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Register generic stable-tier prompt sources (§10) folded into the system prompt each turn
+    /// (e.g. the skills index). Independent of memory; expected to be cache-stable.
+    pub fn with_prompt_sources(mut self, sources: Vec<Arc<dyn StablePromptSource>>) -> Self {
+        self.prompt_sources = sources;
         self
     }
 
@@ -529,6 +541,15 @@ impl Engine {
     async fn prepare_turn_context(&mut self, events: &EventSink) {
         self.assembler.reset_turn();
         self.gather_memory().await;
+        // §10 generic stable-tier blocks (e.g. the skills index), folded after memory blocks. Each
+        // source is expected to be cache-stable so the system prompt stays byte-stable across turns.
+        for source in &self.prompt_sources {
+            if let Some(block) = source.block() {
+                if !block.is_empty() {
+                    self.assembler.stable.push(block);
+                }
+            }
+        }
         let budget = self.config.context_budget_tokens.map(|b| b as usize);
         let pressure = self
             .context
@@ -684,6 +705,12 @@ impl Engine {
         // Accumulated usage across every model call this turn makes (each round + the final summary
         // call), so `TurnSummary.usage` is the turn total, not just the last call's delta.
         let mut turn_usage = UsageDelta::default();
+        // Engine-native post-turn review nudge bookkeeping (§4.3): tool-executing rounds this turn,
+        // and whether a skill/memory tool ran (resets the corresponding cadence counter, mirroring
+        // hermes `tool_executor.py` resetting `_iters_since_skill` on `skill_manage`).
+        let mut tool_rounds: u32 = 0;
+        let mut used_skill_tool = false;
+        let mut used_memory_tool = false;
 
         let cancel = control.cancel_token();
         loop {
@@ -713,6 +740,10 @@ impl Engine {
                 self.finalize_text(&out, events);
                 self.after_turn_memory().await;
                 self.context.after_response(&out.usage);
+                // §4.3 engine-native post-turn trigger: advance the review cadence counters and, on
+                // a threshold, fire-and-forget a background-review child (no suspend).
+                self.maybe_emit_reviews(host, tool_rounds, used_skill_tool, used_memory_tool)
+                    .await;
                 return Ok(self.complete(out, events, turn_usage));
             }
 
@@ -755,6 +786,16 @@ impl Engine {
             let mut calls = Vec::new();
             let mut effects: Vec<Effect> = Vec::new();
             let mut interrupted = false;
+
+            // Count this tool-executing round and note skill/memory tool use for the review nudges.
+            tool_rounds = tool_rounds.saturating_add(1);
+            for c in &out.tool_calls {
+                if c.name.starts_with("skill_manage") {
+                    used_skill_tool = true;
+                } else if c.name.starts_with("mnemosyne_") {
+                    used_memory_tool = true;
+                }
+            }
 
             let parallel = out.tool_calls.len() > 1
                 && out.tool_calls.iter().all(|c| {
@@ -819,11 +860,18 @@ impl Engine {
                 calls,
             }));
             let mut delegated: Option<JobId> = None;
+            let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
             for effect in effects {
                 match effect {
                     Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
                     Effect::Delegate(job_id) => delegated = Some(job_id),
+                    Effect::Spawn(spec) => spawns.push(spec),
                 }
+            }
+            // Fire-and-forget: issue each spawn as a non-joining host request and keep running. The
+            // parent never enters `waiting_for` and never suspends for these (cf. `Delegate` below).
+            for spec in spawns {
+                self.issue_spawn(host, spec).await;
             }
 
             // An interrupt at a tool boundary finalizes the turn before it would suspend/loop.
@@ -902,6 +950,70 @@ impl Engine {
             epoch: self.snapshot.epoch,
             payload: b"delegated-work".to_vec(),
         })
+    }
+
+    /// Advance the post-turn review cadence counters and emit background-review spawns on threshold
+    /// (§4.3). Skill review is paced in tool iterations (reset on `skill_manage` use); memory review
+    /// in completed turns (reset on a memory write). A `0` interval disables that review. Counters
+    /// live in the durable [`Snapshot`] so the cadence survives suspension. Mirrors hermes'
+    /// `turn_finalizer.py:375-401` nudge gates without forking on the parent's thread.
+    async fn maybe_emit_reviews(
+        &mut self,
+        host: &dyn HostRequestHandler,
+        tool_rounds: u32,
+        used_skill_tool: bool,
+        used_memory_tool: bool,
+    ) {
+        let mut spawns: Vec<SpawnSpec> = Vec::new();
+
+        // Skill review: count this turn's tool iterations, but a `skill_manage` use this turn resets
+        // the cadence (the agent just curated skills — no nudge needed).
+        self.snapshot.iters_since_skill = self
+            .snapshot
+            .iters_since_skill
+            .saturating_add(tool_rounds);
+        if used_skill_tool {
+            self.snapshot.iters_since_skill = 0;
+        } else if self.config.skill_review_interval > 0
+            && self.snapshot.iters_since_skill >= self.config.skill_review_interval
+        {
+            self.snapshot.iters_since_skill = 0;
+            spawns.push(SpawnSpec {
+                kind: "skill_review".to_owned(),
+                seed: SpawnSeed::FromConversation,
+            });
+        }
+
+        // Memory review: one completed turn, reset by a memory write this turn.
+        self.snapshot.turns_since_memory = self.snapshot.turns_since_memory.saturating_add(1);
+        if used_memory_tool {
+            self.snapshot.turns_since_memory = 0;
+        } else if self.config.memory_review_interval > 0
+            && self.snapshot.turns_since_memory >= self.config.memory_review_interval
+        {
+            self.snapshot.turns_since_memory = 0;
+            spawns.push(SpawnSpec {
+                kind: "memory_review".to_owned(),
+                seed: SpawnSeed::FromConversation,
+            });
+        }
+
+        for spec in spawns {
+            self.issue_spawn(host, spec).await;
+        }
+    }
+
+    /// Issue a fire-and-forget [`HostRequestKind::Spawn`] for an attached, non-joining background
+    /// child (§4.3). Unlike a delegation this does **not** touch `waiting_for` or suspend: the host
+    /// records the parent->child edge for audit and runs the child to its own terminal state. The
+    /// returned child id is purely informational; an unknown `kind` is a host-side no-op.
+    async fn issue_spawn(&self, host: &dyn HostRequestHandler, spec: SpawnSpec) {
+        let _ = host
+            .request(HostRequest {
+                request_id: ReqId(0),
+                kind: HostRequestKind::Spawn { spec },
+            })
+            .await;
     }
 }
 
@@ -989,6 +1101,157 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Completed(_)));
         assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "retried once");
         assert_eq!(pool.live_count(), 1, "the rotated key is cooling down");
+    }
+
+    /// A provider that always completes with plain final text (no tool calls).
+    struct TextProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for TextProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+            Ok(ModelOutput {
+                text: "ok".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: UsageDelta::default(),
+            })
+        }
+    }
+
+    /// A provider that records the system prompt of the request it receives, then completes.
+    struct SystemRecordingProvider {
+        seen: std::sync::Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SystemRecordingProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+            *self.seen.lock().unwrap() = req.system.clone();
+            Ok(ModelOutput {
+                text: "ok".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: UsageDelta::default(),
+            })
+        }
+    }
+
+    /// A stable-tier source emitting a fixed block.
+    struct FixedBlock(&'static str);
+    impl crate::context::StablePromptSource for FixedBlock {
+        fn block(&self) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    /// A registered [`StablePromptSource`] is folded into the request's system preamble each turn.
+    #[tokio::test]
+    async fn prompt_source_block_is_injected_into_system() {
+        let provider = Arc::new(SystemRecordingProvider {
+            seen: std::sync::Mutex::new(String::new()),
+        });
+        let mut engine = Engine::fresh(
+            SessionId::new("ps"),
+            SystemPrompt::new("base system"),
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_prompt_sources(vec![Arc::new(FixedBlock("<available_skills>\n  x\n</available_skills>"))]);
+        engine.push_user(UserMsg::new("hi"));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        let seen = provider.seen.lock().unwrap().clone();
+        assert!(seen.contains("base system"), "keeps the base system prompt");
+        assert!(seen.contains("<available_skills>"), "folds the stable block in");
+    }
+
+    /// A host that records every spawn `kind` it is asked to materialize.
+    #[derive(Default)]
+    struct SpawnRecordingHost {
+        spawns: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostRequestHandler for SpawnRecordingHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            if let HostRequestKind::Spawn { spec } = &req.kind {
+                self.spawns.lock().unwrap().push(spec.kind.clone());
+                return HostResponse {
+                    request_id: req.request_id,
+                    body: HostResponseBody::Spawned(SessionId::new("child")),
+                };
+            }
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved(true),
+            }
+        }
+    }
+
+    /// With `memory_review_interval = 1`, a completed turn (no memory write) fires exactly one
+    /// fire-and-forget `memory_review` spawn and the turn still completes normally (no suspend).
+    #[tokio::test]
+    async fn memory_review_nudge_emits_spawn_on_threshold() {
+        let host = SpawnRecordingHost::default();
+        let mut engine = Engine::fresh(
+            SessionId::new("nudge"),
+            SystemPrompt::new("test"),
+            Arc::new(TextProvider),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_config(Config {
+            memory_review_interval: 1,
+            ..Config::default()
+        });
+        engine.push_user(UserMsg::new("hi"));
+
+        let outcome = engine
+            .run_turn(&host, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .expect("turn completes");
+        assert!(matches!(outcome, TurnOutcome::Completed(_)));
+        assert!(engine.snapshot().waiting_for.is_empty(), "spawn does not suspend");
+        assert_eq!(
+            *host.spawns.lock().unwrap(),
+            vec!["memory_review".to_string()],
+        );
+        assert_eq!(engine.snapshot().turns_since_memory, 0, "counter reset");
+    }
+
+    /// The default `0` intervals disable the engine-native trigger entirely.
+    #[tokio::test]
+    async fn review_nudges_disabled_by_default() {
+        let host = SpawnRecordingHost::default();
+        let mut engine = Engine::fresh(
+            SessionId::new("no-nudge"),
+            SystemPrompt::new("test"),
+            Arc::new(TextProvider),
+            Arc::new(ToolRegistry::new()),
+        );
+        engine.push_user(UserMsg::new("hi"));
+        engine
+            .run_turn(&host, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .expect("turn completes");
+        assert!(host.spawns.lock().unwrap().is_empty(), "no spawns when disabled");
     }
 
     /// A credential provider serving two profiles with distinct secrets, recording each acquisition

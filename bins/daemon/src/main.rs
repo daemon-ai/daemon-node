@@ -1099,6 +1099,34 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     extra_tools.push(Arc::new(TodoTool::new()) as Arc<dyn Tool>);
     extra_tools.push(Arc::new(ClarifyTool::new()) as Arc<dyn Tool>);
 
+    // The skills subsystem (opt-out via `[skills].enable = false`): the `skill_*` tools join every
+    // role registry, and the progressive-disclosure index is folded into the stable system-prompt
+    // tier (`prompt_sources`). The background `skill_review` curator activates only when the engine's
+    // `skill_review_interval` is non-zero (see `[engine]`/`DAEMON_SKILL_REVIEW_INTERVAL`).
+    let mut prompt_sources: Vec<Arc<dyn daemon_core::StablePromptSource>> = Vec::new();
+    if cfg.skills.enable {
+        let skills_dir = cfg
+            .skills
+            .dir
+            .clone()
+            .unwrap_or_else(|| cfg.profile_home().join("skills"));
+        let skill_store = Arc::new(daemon_skills::SkillStore::new(skills_dir));
+        // Seed the curated, tool-agnostic bundled skills into the profile on first run (skipping any
+        // the user already has) — parity with hermes' bundled-skills sync. Best-effort: a seed
+        // failure must not block node startup.
+        match skill_store.seed_bundled() {
+            Ok(seeded) if !seeded.is_empty() => {
+                tracing::info!(skills = ?seeded, "seeded bundled skills into profile")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "seeding bundled skills failed"),
+        }
+        extra_tools.extend(daemon_tool_skill::skill_tools(skill_store.clone()));
+        prompt_sources.push(Arc::new(
+            daemon_skills::SkillsPromptSource::new(skill_store).enabled(true),
+        ) as Arc<dyn daemon_core::StablePromptSource>);
+    }
+
     // The optional web tools (`web_search`/`web_extract`, opt-in). Keys are read live from the
     // credential store, so a GUI-set Tavily/Firecrawl key applies without a restart.
     extra_tools.extend(build_web_tools(&cfg, credential_store.clone()));
@@ -1160,6 +1188,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         provider_resolver: Some(provider_resolver),
         credential_store: Some(credential_store),
         cloud_catalog: Some(Arc::new(GenAiCloudCatalog)),
+        prompt_sources,
     });
     tracing::info!("daemon host node started");
 

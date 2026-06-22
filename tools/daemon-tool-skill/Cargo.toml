@@ -1,0 +1,20 @@
+[package]
+name = "daemon-tool-skill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-skills = { workspace = true }
+daemon-protocol = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+daemon-common = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = "3"

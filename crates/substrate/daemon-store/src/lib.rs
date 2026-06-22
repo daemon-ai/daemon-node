@@ -374,6 +374,23 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// Record an **attached, non-joining** parent->child edge for audit (§4.3): the child appears
+    /// under `parent` in the tree projection labeled `work_label`, but — unlike [`bind_delegation`]
+    /// — binds *no* parent job. So when the child reaches a terminal state ([`Self::mark_completed`])
+    /// the store finds no delegation to fulfill and never wakes the parent: the child self-closes.
+    /// This is the durable edge behind the engine-native background spawn (skill/memory review).
+    /// Default: a no-op (a non-authoritative proxy store).
+    ///
+    /// [`bind_delegation`]: Self::bind_delegation
+    async fn record_child_edge(
+        &self,
+        _parent: SessionId,
+        _child: SessionId,
+        _work_label: String,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// The child sessions `parent` delegated, in delegation order — the durable parent->child edge
     /// the management-tree projection walks. Default: empty (a non-authoritative proxy store).
     async fn children_of(&self, _parent: &SessionId) -> Vec<SessionId> {
@@ -427,6 +444,14 @@ pub trait SessionStore: Send + Sync {
 
     /// Read the current durable status of a session (test/observability helper).
     async fn status(&self, id: &SessionId) -> Option<SessionStatus>;
+
+    /// A non-fencing read of a session's last persisted snapshot blob (`None` if unknown). Used to
+    /// seed an attached background child from its parent's conversation (§4.3 `SpawnSeed`) without
+    /// acquiring an activation lease — a read-only audit/seed peek, not an activation. Default:
+    /// `None` (a non-authoritative proxy store).
+    async fn peek_snapshot(&self, _id: &SessionId) -> Option<SnapshotBlob> {
+        None
+    }
 
     /// List every durable session id with its current status (the node control surface's
     /// `sessions` projection). Defaults to empty so a non-authoritative store (the brokered child
@@ -516,6 +541,10 @@ struct Inner {
     delegations: HashMap<SessionId, JobCommand>,
     /// parent session -> its delegated children in order (reverse index for the tree projection).
     child_index: HashMap<SessionId, Vec<SessionId>>,
+    /// child session -> its attached non-joining edge label (§4.3 background spawn). Recorded by
+    /// [`SessionStore::record_child_edge`] *without* a `delegations` entry, so the child self-closes
+    /// (no parent wake); surfaces as the node's `work` label in the tree projection.
+    background_edges: HashMap<SessionId, String>,
     /// Per-session folded usage total (the durable usage surface the tree projection reads).
     usage: HashMap<SessionId, UsageDelta>,
     /// Per-session indexed search text `(title, body)` — the in-memory analogue of the SQLite
@@ -740,6 +769,20 @@ impl SessionStore for InMemoryStore {
         Ok(())
     }
 
+    async fn record_child_edge(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        work_label: String,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // The reverse index drives the tree projection (audit), but we deliberately do *not* write a
+        // `delegations` entry: `mark_completed` finds no job, so the child self-closes (no wake).
+        inner.child_index.entry(parent).or_default().push(child.clone());
+        inner.background_edges.insert(child, work_label);
+        Ok(())
+    }
+
     async fn children_of(&self, parent: &SessionId) -> Vec<SessionId> {
         self.inner
             .lock()
@@ -755,12 +798,13 @@ impl SessionStore for InMemoryStore {
     }
 
     async fn delegation_work(&self, child: &SessionId) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap()
+        let inner = self.inner.lock().unwrap();
+        inner
             .delegations
             .get(child)
             .map(|job| String::from_utf8_lossy(&job.payload).into_owned())
+            // Fall back to the attached non-joining edge label (§4.3 background spawn).
+            .or_else(|| inner.background_edges.get(child).cloned())
     }
 
     async fn record_usage(&self, id: &SessionId, delta: UsageDelta) {
@@ -832,6 +876,15 @@ impl SessionStore for InMemoryStore {
 
     async fn dequeue_wake(&self) -> Option<SessionId> {
         self.inner.lock().unwrap().wake_outbox.pop_front()
+    }
+
+    async fn peek_snapshot(&self, id: &SessionId) -> Option<SnapshotBlob> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .map(|rec| rec.snapshot.clone())
     }
 
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {

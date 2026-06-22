@@ -11,13 +11,14 @@
 //! — the live management-protocol escalation path is the actor-backed `EngineUnit` (see
 //! [`crate::unit`]).
 
+use crate::background::BackgroundSpawner;
 use crate::journal::{JournalFeeder, JournalSink};
 use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
 use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, SessionId};
 use daemon_core::{
-    Completion, DelegateTool, Engine, EngineProfile, EventSink, Failure, MockProvider, Provider,
-    Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
+    Completion, Conversation, DelegateTool, Engine, EngineProfile, EventSink, Failure, MockProvider,
+    Provider, Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
 };
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, Outbound,
@@ -46,6 +47,10 @@ pub use daemon_core::{CredentialBuilder, ProviderBuilder};
 pub struct CoreEngineFactory {
     profile: EngineProfile,
     journal: Option<JournalConfig>,
+    /// The §4.3 background-spawn materializer, when configured. Threaded into every incarnation so
+    /// (a) `Effect::Spawn` host requests materialize attached non-joining children, and (b) a
+    /// background child session hydrates under its constrained review profile instead of `profile`.
+    background: Option<Arc<BackgroundSpawner>>,
 }
 
 impl CoreEngineFactory {
@@ -64,6 +69,7 @@ impl CoreEngineFactory {
         Self {
             profile,
             journal: None,
+            background: None,
         }
     }
 
@@ -76,6 +82,7 @@ impl CoreEngineFactory {
         Self {
             profile: EngineProfile::new(provider, registry, system),
             journal: None,
+            background: None,
         }
     }
 
@@ -84,6 +91,7 @@ impl CoreEngineFactory {
         Self {
             profile,
             journal: None,
+            background: None,
         }
     }
 
@@ -91,6 +99,13 @@ impl CoreEngineFactory {
     /// seals its turn into the unified journal (the durable production journaling path).
     pub fn with_journal(mut self, store: Arc<dyn SessionStore>, signer: Arc<TraceSigner>) -> Self {
         self.journal = Some(JournalConfig { store, signer });
+        self
+    }
+
+    /// Inject the §4.3 background-spawn materializer so this factory's incarnations can spawn
+    /// attached, non-joining review children and hydrate them under their constrained profile.
+    pub fn with_background(mut self, background: Arc<BackgroundSpawner>) -> Self {
+        self.background = Some(background);
         self
     }
 
@@ -108,6 +123,7 @@ impl EngineFactory for CoreEngineFactory {
             profile: self.profile.clone(),
             engine: None,
             journal: self.journal.clone(),
+            background: self.background.clone(),
         })
     }
 }
@@ -117,6 +133,9 @@ pub struct CoreIncarnation {
     profile: EngineProfile,
     engine: Option<Engine>,
     journal: Option<JournalConfig>,
+    /// The §4.3 background-spawn materializer (when configured): drives `Effect::Spawn` requests and
+    /// selects the constrained review profile when *this* incarnation is itself a background child.
+    background: Option<Arc<BackgroundSpawner>>,
 }
 
 fn map_failure(failure: Failure) -> EngineError {
@@ -136,7 +155,15 @@ impl Incarnation for CoreIncarnation {
             ));
         }
         let snap = Snapshot::decode(&snapshot)?;
-        let mut engine = self.profile.from_snapshot(snap);
+        // A background child (§4.3) hydrates under its constrained review profile (skills-only /
+        // memory-only tools + bounded budget + nudges off), not the parent's full profile; every
+        // other session uses the factory's profile.
+        let profile = self
+            .background
+            .as_ref()
+            .and_then(|bg| bg.profile_for(&snap.session_id))
+            .unwrap_or_else(|| self.profile.clone());
+        let mut engine = profile.from_snapshot(snap);
         let completions = unapplied
             .into_iter()
             .map(|c| Completion {
@@ -156,9 +183,17 @@ impl Incarnation for CoreIncarnation {
             .ok_or_else(|| EngineError::Other("run before hydrate".into()))?;
         let session_id = engine.snapshot().session_id.clone();
         let segment = engine.epoch().0;
+        // When background spawn is enabled, capture a clone of the parent's live conversation so a
+        // mid-turn `Effect::Spawn` can seed the review child `FromConversation` without a store read.
+        let seed_conversation = self
+            .background
+            .as_ref()
+            .map(|_| engine.snapshot().conversation.clone());
         let host = DelegateResolver {
             session_id: session_id.clone(),
             epoch: engine.epoch(),
+            background: self.background.clone(),
+            seed_conversation,
         };
         // When journaling, capture the engine's events so they can be coalesced into finished blocks
         // and sealed after the turn, and so the turn's token usage can be folded into the durable
@@ -247,10 +282,17 @@ impl Incarnation for CoreIncarnation {
 }
 
 /// The substrate-path host handler: resolves a delegation to the deterministic durable `JobId` the
-/// activation outbox dedupes on, and trivially answers the other §17 request kinds.
+/// activation outbox dedupes on, materializes an attached non-joining background child for a
+/// `Spawn` (§4.3, fire-and-forget — never suspends the parent), and trivially answers the other §17
+/// request kinds.
 struct DelegateResolver {
     session_id: SessionId,
     epoch: Epoch,
+    /// The §4.3 background-spawn materializer, when configured.
+    background: Option<Arc<BackgroundSpawner>>,
+    /// The parent's live conversation snapshot, captured before the turn so a `Spawn` seeds the
+    /// review child `FromConversation` without a store round-trip (only `Some` when spawn is on).
+    seed_conversation: Option<Conversation>,
 }
 
 #[async_trait]
@@ -261,6 +303,23 @@ impl HostRequestHandler for DelegateResolver {
                 // Deterministic per (session, post-bump epoch) so a recovery re-enqueue dedupes.
                 let job_id = JobId::new(format!("{}:{}:job", self.session_id, self.epoch.next().0));
                 HostResponseBody::Delegated(job_id)
+            }
+            HostRequestKind::Spawn { spec } => {
+                // Fire-and-forget: materialize the attached non-joining child now and return its id;
+                // the parent neither suspends nor waits. Unknown kind / no spawner -> no-op.
+                let child = match &self.background {
+                    Some(bg) => bg
+                        .spawn(
+                            &self.session_id,
+                            self.epoch,
+                            &spec,
+                            self.seed_conversation.clone(),
+                        )
+                        .await
+                        .unwrap_or_else(|| self.session_id.clone()),
+                    None => self.session_id.clone(),
+                };
+                HostResponseBody::Spawned(child)
             }
             HostRequestKind::Approval { .. } => HostResponseBody::Approved(true),
             HostRequestKind::Input { .. } => HostResponseBody::Input(String::new()),

@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_session;
+pub mod background;
 pub mod config;
 pub mod credentials;
 pub mod credstore;
@@ -49,6 +50,10 @@ pub mod unit;
 
 pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
+pub use background::{
+    background_child_id, background_kind_of, BackgroundProfile, BackgroundProfileRegistry,
+    BackgroundSpawner,
+};
 pub use config::HostConfig;
 pub use credentials::{
     BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,

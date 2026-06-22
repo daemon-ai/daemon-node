@@ -49,6 +49,14 @@ const CONTEXT_BUDGET_TOKENS_ENV: &str = "DAEMON_CONTEXT_BUDGET_TOKENS";
 const MAX_ITERATIONS_ENV: &str = "DAEMON_MAX_ITERATIONS";
 /// Overrides the engine's `tool_result_budget` (per-tool result-byte cap) tunable.
 const TOOL_RESULT_BUDGET_ENV: &str = "DAEMON_TOOL_RESULT_BUDGET";
+/// Overrides the engine's `skill_review_interval` (post-turn skill-review nudge cadence; 0 disables).
+const SKILL_REVIEW_INTERVAL_ENV: &str = "DAEMON_SKILL_REVIEW_INTERVAL";
+/// Overrides the engine's `memory_review_interval` (post-turn memory-review nudge cadence; 0 disables).
+const MEMORY_REVIEW_INTERVAL_ENV: &str = "DAEMON_MEMORY_REVIEW_INTERVAL";
+/// Toggles the skills subsystem (index + `skill_*` tools + background curation).
+const SKILLS_ENABLE_ENV: &str = "DAEMON_SKILLS_ENABLE";
+/// Overrides the skills directory (defaults to `<profile_home>/skills`).
+const SKILLS_DIR_ENV: &str = "DAEMON_SKILLS_DIR";
 /// The 32-byte verifiable-journal signer seed, hex-encoded (64 hex chars).
 const JOURNAL_SEED_ENV: &str = "DAEMON_JOURNAL_SEED";
 /// How many orchestrator levels the top fleet materializes before its leaves (fleets-of-fleets).
@@ -415,6 +423,27 @@ impl Default for BrowserConfig {
     }
 }
 
+/// Tuning for the skills subsystem (`daemon-skills` + `daemon-tool-skill`). `enable = true` registers
+/// the `skills_list`/`skill_view`/`skill_manage` tools, injects the progressive-disclosure index into
+/// every engine's stable system-prompt tier, and (when the engine's review nudge intervals are
+/// non-zero) lets the post-turn trigger spawn the `skill_review` background curator.
+#[derive(Clone, Debug)]
+pub struct SkillsConfig {
+    /// Whether the skills subsystem is active.
+    pub enable: bool,
+    /// The skills root directory (`None` => `<profile_home>/skills`).
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            dir: None,
+        }
+    }
+}
+
 /// Which embedding backend Mnemosyne uses for vector recall (selected by config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbedKind {
@@ -527,6 +556,8 @@ pub struct NodeConfig {
     pub web: WebConfig,
     /// Browser-tool tuning (`enable = false` by default — also requires the `browser` build feature).
     pub browser: BrowserConfig,
+    /// Skills-subsystem tuning (`enable = true` by default — the index + `skill_*` tools).
+    pub skills: SkillsConfig,
     /// The (stub) credential key the owner authority mints for that profile.
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
@@ -563,6 +594,8 @@ struct FileConfig {
     context_budget_tokens: Option<u32>,
     max_iterations: Option<u32>,
     tool_result_budget: Option<usize>,
+    skill_review_interval: Option<u32>,
+    memory_review_interval: Option<u32>,
     journal_seed: Option<String>,
     nesting_depth: Option<usize>,
     local: Option<FileLocalConfig>,
@@ -572,6 +605,15 @@ struct FileConfig {
     python: Option<FilePythonConfig>,
     web: Option<FileWebConfig>,
     browser: Option<FileBrowserConfig>,
+    skills: Option<FileSkillsConfig>,
+}
+
+/// The `[skills]` TOML table — skills-subsystem tuning (every field optional; env wins).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileSkillsConfig {
+    enable: Option<bool>,
+    dir: Option<PathBuf>,
 }
 
 /// The `[python]` TOML table — Python-tools tuning (every field optional; env wins).
@@ -858,6 +900,7 @@ impl NodeConfig {
         let python = Self::resolve_python(file.python.unwrap_or_default())?;
         let web = Self::resolve_web(file.web.unwrap_or_default());
         let browser = Self::resolve_browser(file.browser.unwrap_or_default())?;
+        let skills = Self::resolve_skills(file.skills.unwrap_or_default())?;
 
         Ok(Self {
             partition,
@@ -881,11 +924,30 @@ impl NodeConfig {
             python,
             web,
             browser,
+            skills,
             credential_key,
             engine,
             journal_seed,
             nesting_depth,
         })
+    }
+
+    /// Resolve skills-subsystem tuning (env overriding the `[skills]` TOML table overriding defaults).
+    fn resolve_skills(file: FileSkillsConfig) -> anyhow::Result<SkillsConfig> {
+        let mut skills = SkillsConfig::default();
+        if let Some(b) = file.enable {
+            skills.enable = b;
+        }
+        if let Some(s) = env_string(SKILLS_ENABLE_ENV) {
+            skills.enable = parse_bool(&s);
+        }
+        if let Some(d) = file.dir {
+            skills.dir = Some(d);
+        }
+        if let Some(s) = env_string(SKILLS_DIR_ENV) {
+            skills.dir = Some(PathBuf::from(s));
+        }
+        Ok(skills)
     }
 
     /// Resolve embeddings tuning (env overriding the `[embed]` TOML table).
@@ -1227,6 +1289,22 @@ impl NodeConfig {
             engine.tool_result_budget = s
                 .parse()
                 .context("DAEMON_TOOL_RESULT_BUDGET must be a usize")?;
+        }
+        if let Some(n) = file.skill_review_interval {
+            engine.skill_review_interval = n;
+        }
+        if let Some(s) = env_string(SKILL_REVIEW_INTERVAL_ENV) {
+            engine.skill_review_interval = s
+                .parse()
+                .context("DAEMON_SKILL_REVIEW_INTERVAL must be a u32")?;
+        }
+        if let Some(n) = file.memory_review_interval {
+            engine.memory_review_interval = n;
+        }
+        if let Some(s) = env_string(MEMORY_REVIEW_INTERVAL_ENV) {
+            engine.memory_review_interval = s
+                .parse()
+                .context("DAEMON_MEMORY_REVIEW_INTERVAL must be a u32")?;
         }
         Ok(engine)
     }

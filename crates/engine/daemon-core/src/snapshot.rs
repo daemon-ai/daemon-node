@@ -50,6 +50,16 @@ pub struct Snapshot {
     pub references: References,
     /// Outstanding background work this incarnation suspended for.
     pub waiting_for: Vec<JobId>,
+    /// Tool iterations accumulated since the last skill review / `skill_manage` use. Drives the
+    /// engine-native skill-review nudge ([`Config::skill_review_interval`](crate::Config)); durable
+    /// so the cadence survives suspension. `#[serde(default)]` keeps pre-existing snapshots decodable.
+    #[serde(default)]
+    pub iters_since_skill: u32,
+    /// Completed turns since the last memory review / memory write. Drives the engine-native
+    /// memory-review nudge ([`Config::memory_review_interval`](crate::Config)); durable across
+    /// suspension. `#[serde(default)]` keeps pre-existing snapshots decodable.
+    #[serde(default)]
+    pub turns_since_memory: u32,
 }
 
 impl Snapshot {
@@ -61,6 +71,8 @@ impl Snapshot {
             conversation: Conversation::default(),
             references: References::default(),
             waiting_for: Vec::new(),
+            iters_since_skill: 0,
+            turns_since_memory: 0,
         }
     }
 

@@ -346,6 +346,38 @@ policy; `daemon-host` itself stays free of `daemon-orchestration`.
 > models continue to come from the `ModelManager` catalog. Legacy per-provider profile names migrate
 > to `genai` via serde aliases.
 
+**Background spawn — attached, fire-and-forget self-improvement.** `daemon-core` emits
+`Effect::Spawn(SpawnSpec)` (→ `HostRequestKind::Spawn`, §4.6 of the core spec) for post-turn
+skill/memory review. Unlike `Delegate`, it does **not** suspend the parent and is **not** routed
+through the `JobOutboxDispatcher` (a job dispatch assumes a suspended parent waiting on a
+`BackgroundCompletion`). Instead a `BackgroundSpawner` (held by both the durable `CoreEngineFactory`
+incarnation and the live `NodeApiImpl`) materializes the child **synchronously and out-of-band**:
+
+- It resolves `spec.kind` against a `BackgroundProfileRegistry` (kind → constrained `EngineProfile` +
+  review prompt). `skill_review` is constrained to the `skill_*` toolset; `memory_review` to the
+  `mnemosyne_*` toolset; both run with a bounded `max_iterations` (16) and review nudges disabled (no
+  recursion). An unknown kind is a **no-op**.
+- It seeds the child conversation `FromConversation` — from the parent's live conversation when raised
+  mid-turn, else from the parent's last durable snapshot (`SessionStore::peek_snapshot`) — preserving
+  the parent's system prompt + history, then appends the review prompt.
+- It records a **child edge** (`SessionStore::record_child_edge`, not `bind_delegation`): the child is
+  *tree-visible* (`children_of` folds it in, labeled by kind, so a GUI shows the review ran) but
+  closes **without waking the parent** (no delegation work row → no `BackgroundCompletion`). The spawn
+  is idempotent on the namespaced child id, so a recovered/duplicate spawn returns the existing child.
+
+So a background reviewer is *attached* for audit but *fire-and-forget* for control flow — the
+engine-native realization of hermes' `agent/background_review.py` daemon-thread fork. The registry is
+built in `assemble()` from the node's tools and is inert (spawn no-ops) unless skills/memory tools are
+present **and** the engine's review intervals are non-zero (opt-in).
+
+**Skills subsystem (stable-tier index + tools).** When skills are enabled, `assemble()` builds a
+`daemon_skills::SkillStore` over `<profile_home>/skills/`, registers the `skills_list` / `skill_view`
+/ `skill_manage` tools on every role registry, and folds the progressive-disclosure *index* into the
+stable system-prompt tier via a `StablePromptSource` (`SkillsPromptSource`). The index is
+cache-stable (names + short descriptions only); full bodies load on demand through `skill_view` tool
+results — the prompt-caching invariant hermes preserves. Writes through `skill_manage` invalidate the
+store's memoized index so the next turn's stable block reflects the change.
+
 **One-lifecycle-owner invariant.** The durable and live lifecycles are intentionally distinct: a
 durable session runs its engine dormant-between-turns through the activation seam (control surface,
 `assign`), while a live session keeps it resident in the §17 actor (session surface, `submit`). A

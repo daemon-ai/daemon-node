@@ -9,7 +9,7 @@ use crate::conversation::Turn;
 use crate::events::EventSink;
 use crate::exec::ExecutionEnvironment;
 use daemon_common::{Budget, JobId, SessionId};
-use daemon_protocol::HostRequestHandler;
+use daemon_protocol::{HostRequestHandler, SpawnSpec};
 use tokio_util::sync::CancellationToken;
 
 /// The ambient context handed to phases and tools during a turn (§4.2).
@@ -39,4 +39,9 @@ pub enum Effect {
     Persist(Turn),
     /// The engine delegated background work and now waits on `JobId` — drives suspension.
     Delegate(JobId),
+    /// Spawn an attached, non-joining, self-closing background child (§4.3): the applier issues a
+    /// fire-and-forget [`HostRequestKind::Spawn`](daemon_protocol::HostRequestKind::Spawn) and keeps
+    /// running — unlike [`Effect::Delegate`], it never enters `waiting_for` and never suspends the
+    /// parent. The general post-turn self-improvement seam (background skill review / memory write).
+    Spawn(SpawnSpec),
 }

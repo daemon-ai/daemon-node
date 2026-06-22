@@ -22,13 +22,14 @@ use daemon_api::{EngineTunables, FleetReport, ProfileSpec};
 use daemon_common::{Budget, JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile, MemoryBuilder,
-    MemoryProvider, ProviderBuilder, ProviderRegistry, SystemPrompt, Tool, ToolRegistry,
+    MemoryProvider, ProviderBuilder, ProviderRegistry, StablePromptSource, SystemPrompt, Tool,
+    ToolRegistry,
 };
 use daemon_host::{
-    AgentSession, AgentUnit, CodecSession, CoreEngineFactory, CredentialStore, EngineUnit,
-    FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink,
-    NodeApiImpl, ProcessAgentUnit, ProfileStore, ServiceError, SessionEngineBuilder,
-    StreamJsonCodec, SupervisorHandle,
+    AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
+    CodecSession, CoreEngineFactory, CredentialStore, EngineUnit, FleetControl, Host, HostConfig,
+    JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit,
+    ProfileStore, ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -40,6 +41,32 @@ use daemon_telemetry::TraceSigner;
 const ORCHESTRATOR_PROFILE: &str = "orchestrator";
 /// The provider-registry profile name the (legacy synchronous) fleet-child engine resolves to.
 const CHILD_PROFILE: &str = "child";
+
+/// The skills toolset names a `skill_review` background child is constrained to (hermes' skills-only
+/// review whitelist). Kept in sync with `daemon_tool_skill::SKILL_TOOL_NAMES`.
+const SKILL_TOOL_NAMES: [&str; 3] = ["skills_list", "skill_view", "skill_manage"];
+/// The name prefix of Mnemosyne memory tools a `memory_review` background child is constrained to.
+const MEMORY_TOOL_PREFIX: &str = "mnemosyne_";
+/// The bounded iteration cap for a background-review child (hermes `max_iterations=16`).
+const BACKGROUND_MAX_ITERATIONS: u32 = 16;
+
+/// The `skill_review` background child's seeding instruction (a condensed port of hermes'
+/// `_SKILL_REVIEW_PROMPT`): curate skills from what just happened, preferring to patch existing
+/// umbrella skills, never editing bundled/hub skills, and writing only to the local skills dir.
+const SKILL_REVIEW_PROMPT: &str = "\
+You are a background skill curator reviewing the conversation that just completed. Identify any \
+durable, reusable procedure, preference, or pitfall worth capturing as a skill. Prefer `patch`ing \
+an existing, loaded skill over creating a new one; create a new skill only for a genuinely new, \
+class-level capability. Do not edit bundled or hub-installed skills. Keep skills concise and \
+general. If nothing is worth saving, do nothing and finish. Use only the skills tools.";
+
+/// The `memory_review` background child's seeding instruction: persist durable facts/preferences from
+/// the conversation into long-term memory.
+const MEMORY_REVIEW_PROMPT: &str = "\
+You are a background memory curator reviewing the conversation that just completed. Persist any \
+durable facts, user preferences, or decisions worth remembering into long-term memory using the \
+memory tools. Be precise and avoid duplicating what is already stored. If nothing is worth saving, \
+do nothing and finish.";
 
 /// Resolves a [`ProviderBuilder`] for a profile bundle — the seam letting the binary map a
 /// [`ProfileSpec`]'s `provider`/`model`/`base_url` onto a concrete provider client without
@@ -111,6 +138,12 @@ pub struct NodeAssembly {
     /// `genai`-backed catalog; the host never links `genai`). `None` lists only the static cloud
     /// catalog + local models.
     pub cloud_catalog: Option<Arc<dyn daemon_host::CloudCatalog>>,
+    /// Generic stable-tier prompt sources (§10) folded into every engine's system prompt — e.g. the
+    /// skills *index* ([`daemon_skills::SkillsPromptSource`](https://docs.rs)). Empty keeps the
+    /// system prompt unchanged. The §4.3 background-review spawner is derived automatically from the
+    /// skills/memory tools in [`Self::extra_tools`] and is inert unless the engine's review nudge
+    /// intervals (`engine_config.skill_review_interval` / `memory_review_interval`) are non-zero.
+    pub prompt_sources: Vec<Arc<dyn StablePromptSource>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -150,10 +183,90 @@ fn dress_with_credential(
     } else if !a.memory.is_empty() {
         profile = profile.with_memory(a.memory.clone());
     }
+    for source in &a.prompt_sources {
+        profile = profile.with_prompt_block(source.clone());
+    }
     match &a.credentials {
         Some(credentials) => profile.with_credentials(credentials.clone(), cred_profile),
         None => profile,
     }
+}
+
+/// Whether `tool` belongs in a background child's constrained toolset: its name matches `names`
+/// exactly or (when set) starts with `prefix`.
+fn tool_matches(tool: &Arc<dyn Tool>, names: &[&str], prefix: Option<&str>) -> bool {
+    let name = tool.name();
+    names.contains(&name) || prefix.is_some_and(|p| name.starts_with(p))
+}
+
+/// Build a [`ToolRegistry`] holding only the tools in `extra` matching `names`/`prefix` — the
+/// constrained toolset of a background-review child.
+fn constrained_registry(
+    extra: &[Arc<dyn Tool>],
+    names: &[&str],
+    prefix: Option<&str>,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for tool in extra {
+        if tool_matches(tool, names, prefix) {
+            registry.register(tool.clone());
+        }
+    }
+    registry
+}
+
+/// Build the §4.3 background-review profile registry from the node's tools: a `skill_review` child
+/// constrained to the skills tools, and a `memory_review` child constrained to the Mnemosyne memory
+/// tools. Each runs under a bounded iteration cap with review nudges disabled (no recursion) and
+/// inherits the node's provider + credentials, but starts from a clean base (no memory/context/index
+/// — the reviewer drives its tools directly). A kind is registered only when its tools are present;
+/// the returned registry may be empty (spawn is then a no-op).
+fn background_registry(a: &NodeAssembly) -> BackgroundProfileRegistry {
+    let mut registry = BackgroundProfileRegistry::new();
+    let bg_config = Config {
+        max_iterations: BACKGROUND_MAX_ITERATIONS,
+        skill_review_interval: 0,
+        memory_review_interval: 0,
+        ..a.engine_config
+    };
+    // A clean base carrying only the node's provider (orchestrator selection) + brokered credentials.
+    let base = |names: &[&str], prefix: Option<&str>, persona: &str| -> EngineProfile {
+        let profile = EngineProfile::new(
+            provider_for(&a.providers, ORCHESTRATOR_PROFILE),
+            Arc::new(constrained_registry(&a.extra_tools, names, prefix)),
+            SystemPrompt::new(persona),
+        )
+        .with_config(bg_config);
+        match &a.credentials {
+            Some(c) => profile.with_credentials(c.clone(), a.profile.clone()),
+            None => profile,
+        }
+    };
+
+    if a
+        .extra_tools
+        .iter()
+        .any(|t| tool_matches(t, &SKILL_TOOL_NAMES, None))
+    {
+        registry = registry.with(
+            "skill_review",
+            BackgroundProfile::new(base(&SKILL_TOOL_NAMES, None, "skill curator"), SKILL_REVIEW_PROMPT),
+        );
+    }
+    if a
+        .extra_tools
+        .iter()
+        .any(|t| tool_matches(t, &[], Some(MEMORY_TOOL_PREFIX)))
+    {
+        registry = registry.with(
+            "memory_review",
+            BackgroundProfile::new(
+                base(&[], Some(MEMORY_TOOL_PREFIX), "memory curator"),
+                MEMORY_REVIEW_PROMPT,
+            ),
+        );
+    }
+    registry
 }
 
 /// Overlay a [`ProfileSpec`]'s engine-tunable overrides onto the node's base [`Config`].
@@ -207,6 +320,7 @@ struct SessionFactoryCtx {
     context_builder: Option<ContextEngineBuilder>,
     memory: Vec<Arc<dyn MemoryProvider>>,
     memory_builder: Option<MemoryBuilder>,
+    prompt_sources: Vec<Arc<dyn StablePromptSource>>,
 }
 
 impl SessionFactoryCtx {
@@ -236,6 +350,9 @@ impl SessionFactoryCtx {
             profile = profile.with_memory_builder(builder.clone());
         } else if !self.memory.is_empty() {
             profile = profile.with_memory(self.memory.clone());
+        }
+        for source in &self.prompt_sources {
+            profile = profile.with_prompt_block(source.clone());
         }
         if let Some(credentials) = &self.credentials {
             profile =
@@ -331,10 +448,21 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         ),
         &a,
     );
+    // The §4.3 background-review spawner: shared by the durable factory (so a review child raised
+    // mid-turn resolves its constrained profile during hydrate) and the live surface (so a `Spawn`
+    // host request from an interactive session is materialized fire-and-forget). Inert when the
+    // registry is empty (no skills/memory tools) — `Effect::Spawn` then no-ops.
+    let background = Arc::new(BackgroundSpawner::new(
+        a.store.clone(),
+        a.partition,
+        background_registry(&a),
+    ));
+
     // The durable path journals too: replace the discarding sink with one sealing per turn into the
     // shared store, keyed by the durable `SessionId`.
     let factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
-        .with_journal(a.store.clone(), signer.clone());
+        .with_journal(a.store.clone(), signer.clone())
+        .with_background(background.clone());
 
     // One durable job worker for the whole node: every delegation (top or nested) materializes a
     // parent-bound durable child session seeded from the same orchestrator profile.
@@ -370,6 +498,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
                     context_builder: a.context_builder.clone(),
                     memory: a.memory.clone(),
                     memory_builder: a.memory_builder.clone(),
+                    prompt_sources: a.prompt_sources.clone(),
                 };
                 let fallback = session_profile;
                 Arc::new(move |id: SessionId| {
@@ -418,6 +547,8 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {
         node_api = node_api.with_cloud_catalog(cloud_catalog);
     }
+    // Bind the background-review spawner so live sessions materialize `Spawn` requests fire-and-forget.
+    node_api = node_api.with_background(background.clone());
     let node = Arc::new(node_api);
 
     AssembledNode {

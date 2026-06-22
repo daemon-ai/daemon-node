@@ -409,6 +409,7 @@ enum Effect {
     MemoryWrite(Fact),
     ExternalizePayload { ref_id: String, bytes: Vec<u8> },
     Delegate(Vec<DelegationSpec>),   // async sub-agent request; orchestrator runs it (§16.2)
+    Spawn(SpawnSpec),                // fire-and-forget background child (review); never suspends (§4.6)
 }
 
 struct ToolOutcome { result: ToolResult, effects: Vec<Effect> }
@@ -463,6 +464,31 @@ flowchart LR
   APPLIER -->|AgentEvent| SINK[EventSink] --> HOST
   AGENT -->|calls, returns values| SVC[Arc dyn Services]
 ```
+
+### 4.6 Background spawn — fire-and-forget self-improvement (`Effect::Spawn`)
+
+`Effect::Spawn(SpawnSpec { kind, seed })` is the engine-native primitive for **fire-and-forget**
+background work (hermes' post-turn skill/memory review fork, `agent/background_review.py`). Unlike
+`Effect::Delegate`, it **never suspends** the parent and sets no `waiting_for`: the parent finalizes
+its turn normally; the host materializes the child out-of-band (§host-spec) and records a *child
+edge* (not a delegation), so the child self-closes without waking the parent. `seed` is
+`SpawnSeed::FromConversation` — the child inherits the parent's system prompt + history so the
+reviewer sees exactly what happened, then a review prompt is appended.
+
+The trigger is engine-native and counter-based (porting hermes' `_iters_since_skill` /
+`_skill_nudge_interval`, `agent/turn_finalizer.py:375-401`):
+
+- `Snapshot` carries `iters_since_skill` / `turns_since_memory` counters (`#[serde(default)]`).
+- `Config` carries `skill_review_interval` / `memory_review_interval` thresholds (§20). `0` disables
+  that review entirely (the default — opt-in).
+- After `finalize_text`, `maybe_emit_reviews` increments each counter, and on threshold emits
+  `Effect::Spawn { kind: "skill_review" | "memory_review" }` and resets that counter. Using the
+  corresponding tool during the turn (any `skill_*` tool / any `mnemosyne_*` tool) also resets its
+  counter, so a turn that already curated does not immediately re-nudge.
+
+The `kind` string is resolved host-side to a *constrained* `EngineProfile` (skills-only / memory-only
+toolset, bounded `max_iterations`, review prompt) via a `BackgroundProfileRegistry`; an unknown kind
+is a no-op. The engine knows nothing of the profile — it only emits the typed request.
 
 ---
 
@@ -1279,9 +1305,13 @@ struct DelegationSpec {
 enum DelegationMode { Blocking, Background }
 
 // core REQUESTS delegation across the protocol; it does NOT run the children:
-enum HostRequestKind { /* Approval/Input/Choice ...; */ Delegate(Vec<DelegationSpec>) } // sync -> summaries
-enum Effect          { /* Persist/Emit/... ;        */ Delegate(Vec<DelegationSpec>) } // async -> later turn
+enum HostRequestKind { /* Approval/Input/Choice ...; */ Delegate(Vec<DelegationSpec>), Spawn(SpawnSpec) } // sync summaries | fire-and-forget
+enum Effect          { /* Persist/Emit/... ;        */ Delegate(Vec<DelegationSpec>), Spawn(SpawnSpec) } // async later-turn | fire-and-forget
 ```
+
+`Spawn` (§4.6) is the fire-and-forget sibling: an attached background child (skill/memory review)
+that records a *child edge* and self-closes without ever waking the parent — no completion is spliced
+back. It is the engine-native form of hermes' background-review fork.
 
 - a `delegate` tool exposed to the model **only when the host advertises a delegation capability**;
 - **spec building** (`delegation.rs`): child toolset intersected with the parent's plus the default
@@ -1383,8 +1413,8 @@ enum CompletionSource { Process(ProcId), Delegation(DelegationId) }
 
 // Blocking, correlated host requests (human-in-the-loop + delegation):
 struct HostRequest  { request_id: ReqId, kind: HostRequestKind }
-enum  HostRequestKind { Approval(ApprovalReq), Input(InputReq), Choice(ChoiceReq), Delegate(Vec<DelegationSpec>) }
-struct HostResponse { request_id: ReqId, body: HostResponseBody }   // typed per-kind
+enum  HostRequestKind { Approval(ApprovalReq), Input(InputReq), Choice(ChoiceReq), Delegate(Vec<DelegationSpec>), Spawn(SpawnSpec) }
+struct HostResponse { request_id: ReqId, body: HostResponseBody }   // typed per-kind (Spawn -> Ack)
 
 #[async_trait]
 trait HostRequestHandler: Send + Sync {
@@ -1618,6 +1648,7 @@ overrides) grouping:
 | Context | budget thresholds, `protect_first_n` (3), `protect_last_n` (6), anti-thrash min-savings (10%) |
 | Budget | iteration budget (parent 90 / subagent 50), result byte budget, spillover threshold |
 | Delegation (core) | child deny-set defaults, child budget hint (50), whether the `delegate` tool is exposed |
+| Background review (§4.6) | `skill_review_interval` / `memory_review_interval` post-turn nudge thresholds (`0` disables; opt-in) |
 | Approval | hardline deny patterns, interactive policy, decision cache |
 | Checkpoint | enable, backend (git/copy), rewind retention |
 | Provider profiles | profile registry, credential pool, fallback chain |

@@ -62,6 +62,19 @@ impl Pressure {
     }
 }
 
+/// A source of a persistent **stable-tier** system-prompt block (§10), independent of memory (§11).
+///
+/// The generic seam for any subsystem that wants an always-on block in the system prompt without
+/// being a [`MemoryProvider`](crate::memory::MemoryProvider) — e.g. the skills *index*. The engine
+/// folds each source's block into `assembler.stable` every turn. The block **must be cache-stable**
+/// across a conversation (it should change only on an explicit, infrequent invalidation), so the
+/// system prompt stays byte-stable and prompt caching holds; volatile content belongs in tool
+/// results, not here.
+pub trait StablePromptSource: Send + Sync {
+    /// The block to inject this turn (`None` = nothing). Cheap: called once per turn.
+    fn block(&self) -> Option<String>;
+}
+
 /// The tiered prompt assembler (§10): persistent `stable` blocks, memory `blocks`, per-turn
 /// `recalled` context, and the conversation `body`. Memory (§11) populates the non-body tiers; the
 /// assembler folds them into the request's system preamble ahead of the flattened body.
