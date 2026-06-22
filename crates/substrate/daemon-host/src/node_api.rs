@@ -22,18 +22,18 @@ use daemon_activation::ActivationManager;
 use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
 use daemon_api::{
-    ApiError, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo, FleetReport,
-    HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView, LogStream,
-    ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo, ProfileSpec,
-    ProviderSelector, ServiceHealth, SessionApi, SessionInfo, SessionState, StatsReport,
-    TelemetryDump, TreeReport, UnitNode,
+    ApiError, ApprovalInfo, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo,
+    FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView,
+    LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo,
+    ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionInfo, SessionState,
+    StatsReport, TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
-    ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JournalStreamId,
+    ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
     ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, QuantRecommendation, QuantizeId,
     QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
 };
-use daemon_core::{spawn_agent_session, AgentHandle, Engine, Snapshot};
+use daemon_core::{spawn_agent_session, AgentHandle, Engine, Provider, Snapshot};
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestHandler,
@@ -74,6 +74,11 @@ fn api_origin() -> Origin {
 /// Builds a fresh live [`Engine`] for an interactive session id (the session sub-surface's engine
 /// seam — the binary supplies the provider/tools/system).
 pub type SessionEngineBuilder = Arc<dyn Fn(SessionId) -> Engine + Send + Sync>;
+
+/// Builds a fresh model [`Provider`] from a (model-overridden) [`ProfileSpec`] — the seam a live
+/// [`SessionApi::set_session_model`](daemon_api::SessionApi::set_session_model) uses to rebuild a
+/// running session's provider without `daemon-host` linking the provider crate.
+pub type ModelProviderFactory = Arc<dyn Fn(&ProfileSpec) -> Arc<dyn Provider> + Send + Sync>;
 
 /// Which lifecycle owns a `SessionId`. The durable and live lifecycles are intentionally distinct
 /// (one runs an engine dormant-between-turns through the activation seam, the other keeps it
@@ -135,6 +140,16 @@ pub struct NodeApiImpl {
     /// The live networked-model discovery hook injected by the binary (the host never links
     /// `genai`). `None` => `models()` lists only the static cloud catalog + local models.
     cloud_catalog: Option<Arc<dyn CloudCatalog>>,
+    /// The live model-provider factory backing `set_session_model`. `None` => per-session model
+    /// switching resolves to [`ApiError::Unsupported`] (needs the profile store + provider resolver).
+    model_factory: Option<ModelProviderFactory>,
+    /// The per-session live model override set by `set_session_model` (transient; not persisted to
+    /// the profile). Read by `model_current` when a session is being inspected.
+    session_models: Arc<DashMap<SessionId, String>>,
+    /// The per-session live edit-approval policy set by `set_session_mode` (transient). Read by the
+    /// live [`ParkingHandler`] to decide auto-allow vs park, in lockstep with the engine's snapshot
+    /// policy (both updated by the same op).
+    session_modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
 }
 
 impl NodeApiImpl {
@@ -151,13 +166,15 @@ impl NodeApiImpl {
         engine_builder: SessionEngineBuilder,
         fleet: Option<Arc<dyn FleetControl>>,
     ) -> Self {
+        let session_modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>> =
+            Arc::new(DashMap::new());
         Self {
             supervisor,
             store,
             manager,
             fleet,
             partition,
-            live: Arc::new(LiveSessions::new(engine_builder)),
+            live: Arc::new(LiveSessions::new(engine_builder, session_modes.clone())),
             owners: Arc::new(DashMap::new()),
             verifier: None,
             models: None,
@@ -166,7 +183,18 @@ impl NodeApiImpl {
             credentials: None,
             metrics: None,
             cloud_catalog: None,
+            model_factory: None,
+            session_models: Arc::new(DashMap::new()),
+            session_modes,
         }
+    }
+
+    /// Attach the live model-provider factory so [`SessionApi::set_session_model`] can rebuild a
+    /// running session's provider for a new model id. Call during assembly (needs the profile store
+    /// + provider resolver to derive the provider from the session's profile bundle).
+    pub fn with_model_factory(mut self, factory: ModelProviderFactory) -> Self {
+        self.model_factory = Some(factory);
+        self
     }
 
     /// Attach the resident telemetry aggregator so the `telemetry` control op surfaces the node's
@@ -459,6 +487,45 @@ impl ControlApi for NodeApiImpl {
             .collect()
     }
 
+    async fn approvals_pending(&self, session: Option<SessionId>) -> Vec<ApprovalInfo> {
+        self.store
+            .pending_approvals_of(session.as_ref())
+            .await
+            .into_iter()
+            .map(|p| ApprovalInfo {
+                session: p.session_id,
+                request_id: p.job_id.as_str().to_string(),
+                prompt: p.prompt,
+                path: p.path,
+            })
+            .collect()
+    }
+
+    async fn approval_decide(
+        &self,
+        session: SessionId,
+        request_id: String,
+        allow: bool,
+    ) -> Result<(), ApiError> {
+        // Record the decision + enqueue the wake durably (one transaction in the store), then nudge
+        // the activation manager so the dormant session rehydrates promptly and resolves the gated
+        // tool call (allow -> runs it; deny -> injects a tool error). Idempotent in the store.
+        let answered = self
+            .store
+            .answer_approval(&session, &JobId::new(request_id.clone()), allow)
+            .await
+            .map_err(|e| ApiError::Other(format!("answer approval: {e}")))?;
+        if !answered {
+            return Err(ApiError::Other(format!(
+                "no pending approval {request_id} on session {session}"
+            )));
+        }
+        self.manager
+            .wake(session)
+            .await
+            .map_err(|e| ApiError::Other(format!("wake: {e}")))
+    }
+
     async fn assign(&self, session: SessionId) -> Result<(), ApiError> {
         // Guard-rail: a session driven through the durable control surface must not also be a live
         // interactive session (two divergent engine instances for one id).
@@ -623,6 +690,65 @@ impl SessionApi for NodeApiImpl {
         body: Vec<u8>,
     ) -> Result<(), ApiError> {
         self.live.record_meta(&session, origin, kind, body)
+    }
+
+    async fn set_session_model(
+        &self,
+        session: SessionId,
+        model: String,
+        provider: Option<ProviderSelector>,
+    ) -> Result<(), ApiError> {
+        let factory = self.model_factory.as_ref().ok_or_else(|| {
+            ApiError::Unsupported("per-session model switch is not available".into())
+        })?;
+        // Only a resident (live-actor) session can have its provider swapped in place; a durable
+        // session re-resolves its model from the profile on rehydration.
+        let handle = self
+            .live
+            .handle_if_live(&session)
+            .ok_or_else(|| ApiError::UnknownSession(session.as_str().to_string()))?;
+        // Derive the new provider from the session's bound profile (the active default), overriding
+        // the model (and optionally the provider). The profile itself is left unmodified.
+        let mut spec = self.resolve_profile(None)?.ok_or_else(|| {
+            ApiError::Unsupported("no active profile to derive a provider from".into())
+        })?;
+        spec.model = model.clone();
+        if let Some(p) = provider {
+            spec.provider = p;
+        }
+        let new_provider = (factory)(&spec);
+        handle.set_provider(new_provider).await;
+        self.session_models.insert(session, model);
+        Ok(())
+    }
+
+    async fn set_session_mode(
+        &self,
+        session: SessionId,
+        mode: daemon_api::ApprovalMode,
+    ) -> Result<(), ApiError> {
+        let policy = approval_mode_to_policy(mode);
+        // Only a resident (live-actor) session can have its mode switched in place; a durable
+        // session re-resolves its policy from the engine config / snapshot on rehydration.
+        let handle = self
+            .live
+            .handle_if_live(&session)
+            .ok_or_else(|| ApiError::UnknownSession(session.as_str().to_string()))?;
+        handle.set_approval_policy(policy).await;
+        // Record the live mode so the live ParkingHandler can consult it (auto-allow vs park).
+        self.session_modes.insert(session, policy);
+        Ok(())
+    }
+}
+
+/// Translate a wire-level [`daemon_api::ApprovalMode`] into the engine's
+/// [`daemon_core::ApprovalPolicy`].
+fn approval_mode_to_policy(mode: daemon_api::ApprovalMode) -> daemon_core::ApprovalPolicy {
+    match mode {
+        daemon_api::ApprovalMode::Ask => daemon_core::ApprovalPolicy::Ask,
+        daemon_api::ApprovalMode::AcceptEdits => daemon_core::ApprovalPolicy::AcceptEdits,
+        daemon_api::ApprovalMode::AutoAllow => daemon_core::ApprovalPolicy::AutoAllow,
+        daemon_api::ApprovalMode::Deny => daemon_core::ApprovalPolicy::Deny,
     }
 }
 
@@ -1036,15 +1162,22 @@ struct LiveSessions {
     /// The §4.3 background-spawn materializer, when configured: lets a live session's `Effect::Spawn`
     /// materialize an attached non-joining review child without parking (fire-and-forget).
     background: Mutex<Option<Arc<crate::background::BackgroundSpawner>>>,
+    /// The per-session live edit-approval policy (shared with `NodeApiImpl::session_modes`), read by
+    /// each session's [`ParkingHandler`] to auto-allow / deny without parking a human.
+    modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
 }
 
 impl LiveSessions {
-    fn new(builder: SessionEngineBuilder) -> Self {
+    fn new(
+        builder: SessionEngineBuilder,
+        modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
+    ) -> Self {
         Self {
             sessions: DashMap::new(),
             builder,
             journal: Mutex::new(None),
             background: Mutex::new(None),
+            modes,
         }
     }
 
@@ -1054,6 +1187,11 @@ impl LiveSessions {
 
     fn set_background(&self, background: Arc<crate::background::BackgroundSpawner>) {
         *self.background.lock().unwrap() = Some(background);
+    }
+
+    /// The handle for `session` only if it is already resident (does not spawn a new actor).
+    fn handle_if_live(&self, session: &SessionId) -> Option<AgentHandle> {
+        self.sessions.get(session).map(|s| s.handle.clone())
     }
 
     /// Spawn (or reuse) the actor for `session`, returning its handle.
@@ -1083,6 +1221,7 @@ impl LiveSessions {
             journal: feeder.clone(),
             session: session.clone(),
             background: self.background.lock().unwrap().clone(),
+            modes: self.modes.clone(),
         });
         let handle = spawn_agent_session(engine, host);
 
@@ -1389,6 +1528,9 @@ struct ParkingHandler {
     session: SessionId,
     /// The §4.3 background-spawn materializer, when configured.
     background: Option<Arc<crate::background::BackgroundSpawner>>,
+    /// The shared per-session live edit-approval policy, consulted on an `Approval` request to
+    /// auto-allow / deny without parking a human (in lockstep with the engine's snapshot policy).
+    modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
 }
 
 #[async_trait]
@@ -1408,6 +1550,27 @@ impl HostRequestHandler for ParkingHandler {
                 request_id: req.request_id,
                 body: HostResponseBody::Spawned(child),
             };
+        }
+        // Live edit-approval gate: an `Approval` reaching the host has already cleared the engine's
+        // policy gate as `Ask`, but consult the live session policy as the host-side authority so a
+        // GUI auto-allow / deny mode answers inline without parking a human (mirrors hermes' ACP
+        // adapter resolving the mode in-process). `Ask`/`AcceptEdits` fall through to parking.
+        if let HostRequestKind::Approval { .. } = &req.kind {
+            match self.modes.get(&self.session).map(|p| *p) {
+                Some(daemon_core::ApprovalPolicy::AutoAllow) => {
+                    return HostResponse {
+                        request_id: req.request_id,
+                        body: HostResponseBody::Approved(true),
+                    };
+                }
+                Some(daemon_core::ApprovalPolicy::Deny) => {
+                    return HostResponse {
+                        request_id: req.request_id,
+                        body: HostResponseBody::Approved(false),
+                    };
+                }
+                _ => {}
+            }
         }
         let (tx, rx) = oneshot::channel();
         let request_id = req.request_id;

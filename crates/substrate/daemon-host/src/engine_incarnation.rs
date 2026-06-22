@@ -23,7 +23,7 @@ use daemon_core::{
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, Outbound,
 };
-use daemon_store::{JobCommand, JobCompletion, SessionStore};
+use daemon_store::{JobCommand, JobCompletion, ParkedApproval, SessionStore};
 use daemon_telemetry::{TraceSigner, GENESIS_ROOT};
 use std::sync::{Arc, Mutex};
 
@@ -194,6 +194,7 @@ impl Incarnation for CoreIncarnation {
             epoch: engine.epoch(),
             background: self.background.clone(),
             seed_conversation,
+            approval_seq: Mutex::new(0),
         };
         // When journaling, capture the engine's events so they can be coalesced into finished blocks
         // and sealed after the turn, and so the turn's token usage can be folded into the durable
@@ -257,6 +258,27 @@ impl Incarnation for CoreIncarnation {
 
         match outcome {
             TurnOutcome::Completed(_) => Ok(Step::Completed),
+            // §12 HITL: an approval park records its parked rows for the operator surface and enqueues
+            // no runnable job (the activation layer routes it to `park_approval`). The snapshot keeps
+            // the typed `PendingApproval`s (with the deferred `ToolCall`); these are the store rows.
+            TurnOutcome::Suspended(suspension)
+                if suspension.payload == daemon_core::APPROVAL_SUSPEND_PAYLOAD =>
+            {
+                let approvals = engine
+                    .snapshot()
+                    .pending_approvals
+                    .iter()
+                    .map(|p| ParkedApproval {
+                        session_id: session_id.clone(),
+                        job_id: p.job_id.clone(),
+                        epoch: suspension.epoch,
+                        prompt: p.prompt.clone(),
+                        path: p.path.clone(),
+                        decision: None,
+                    })
+                    .collect();
+                Ok(Step::ParkApproval { approvals })
+            }
             TurnOutcome::Suspended(suspension) => Ok(Step::Suspended {
                 job: JobCommand {
                     job_id: suspension.job_id,
@@ -293,6 +315,10 @@ struct DelegateResolver {
     /// The parent's live conversation snapshot, captured before the turn so a `Spawn` seeds the
     /// review child `FromConversation` without a store round-trip (only `Some` when spawn is on).
     seed_conversation: Option<Conversation>,
+    /// A per-run counter minting a deterministic `JobId` for each §12 edit-approval ask in turn
+    /// order, so a gated tool on the durable path defers to a parked operator decision. Deterministic
+    /// per `(session, post-bump epoch, ordinal)` so a recovery re-park reuses the same id (dedupe).
+    approval_seq: Mutex<u32>,
 }
 
 #[async_trait]
@@ -321,7 +347,21 @@ impl HostRequestHandler for DelegateResolver {
                 };
                 HostResponseBody::Spawned(child)
             }
-            HostRequestKind::Approval { .. } => HostResponseBody::Approved(true),
+            HostRequestKind::Approval { .. } => {
+                // §12 durable HITL: a gated tool on the durable path asks only when its policy is
+                // `Ask` (the engine already auto-allowed/denied otherwise). There is no synchronous
+                // operator on this headless path, so defer: mint the deterministic parked `JobId` the
+                // engine records + suspends on, to be answered later by `ApprovalDecide`.
+                let mut seq = self.approval_seq.lock().unwrap();
+                let job_id = JobId::new(format!(
+                    "{}:{}:approval:{}",
+                    self.session_id,
+                    self.epoch.next().0,
+                    *seq
+                ));
+                *seq += 1;
+                HostResponseBody::Deferred(job_id)
+            }
             HostRequestKind::Input { .. } => HostResponseBody::Input(String::new()),
             HostRequestKind::Choice { .. } => HostResponseBody::Chosen(0),
             _ => HostResponseBody::Approved(true),

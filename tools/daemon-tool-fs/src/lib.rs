@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use daemon_core::{Tool, ToolCall, ToolOutcome, TurnCx};
+use daemon_core::{approve_path, Effect, Gate, Tool, ToolCall, ToolOutcome, TurnCx};
 use daemon_protocol::ToolDetail;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -65,6 +65,31 @@ impl FsTool {
             body,
         }
     }
+
+    /// The §12 edit-approval gate for a file-mutating op. `Ok(())` proceeds; `Err(outcome)` is the
+    /// early-return result — a policy/operator rejection, or a durable-HITL defer that suspends the
+    /// turn (carrying an [`Effect::AwaitDecision`] so the engine re-runs this call on approval).
+    async fn gate(call: &ToolCall, cx: &TurnCx<'_>, path: &str, prompt: String) -> Result<(), ToolOutcome> {
+        match approve_path(cx, path, prompt.clone()).await {
+            Gate::Proceed => Ok(()),
+            Gate::Reject(reason) => Err(ToolOutcome::text(
+                call.call_id.clone(),
+                false,
+                format!("fs: {reason}"),
+            )),
+            Gate::Defer(job_id) => Err(ToolOutcome::text(
+                call.call_id.clone(),
+                false,
+                format!("awaiting-approval:{job_id}"),
+            )
+            .with_effects(vec![Effect::AwaitDecision {
+                job_id,
+                call: call.clone(),
+                prompt,
+                path: Some(path.to_string()),
+            }])),
+        }
+    }
 }
 
 #[async_trait]
@@ -100,6 +125,10 @@ impl Tool for FsTool {
                 Err(e) => ToolOutcome::text(call.call_id.clone(), false, format!("fs read: {e}")),
             },
             FsArgs::Write { path, content } => {
+                let prompt = format!("approve write to {path} ({} bytes)", content.len());
+                if let Err(out) = Self::gate(call, cx, &path, prompt).await {
+                    return out;
+                }
                 match cx.exec.write(Path::new(&path), content.as_bytes()).await {
                     Ok(()) => ToolOutcome::text(
                         call.call_id.clone(),
@@ -144,6 +173,11 @@ impl Tool for FsTool {
                     );
                 }
                 let edited = original.replacen(&find, &replace, 1);
+                let prompt =
+                    format!("approve edit to {path}: replace {find:?} with {replace:?} (1 occurrence)");
+                if let Err(out) = Self::gate(call, cx, &path, prompt).await {
+                    return out;
+                }
                 match cx.exec.write(Path::new(&path), edited.as_bytes()).await {
                     Ok(()) => {
                         ToolOutcome::text(call.call_id.clone(), true, format!("edited {path}"))
@@ -164,7 +198,7 @@ impl Tool for FsTool {
 mod tests {
     use super::*;
     use daemon_common::{Budget, SessionId};
-    use daemon_core::{EventSink, LocalEnvironment};
+    use daemon_core::{ApprovalPolicy, EventSink, LocalEnvironment};
     use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
     use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
@@ -200,6 +234,8 @@ mod tests {
             budget: Budget::unlimited(),
             exec: env,
             tool_result_budget: 0,
+            approval_policy: ApprovalPolicy::AutoAllow,
+            pre_approved: false,
         };
         let call = ToolCall {
             call_id: "c1".into(),

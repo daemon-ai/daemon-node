@@ -472,6 +472,12 @@ pub enum HostResponseBody {
     /// The id of the attached background child a [`HostRequestKind::Spawn`] materialized. Purely
     /// informational (audit/reference): the parent does not wait on it.
     Spawned(SessionId),
+    /// An [`Approval`](HostRequestKind::Approval) the host parked **durably** for an operator
+    /// (the headless/durable HITL path): the engine must suspend the turn and resume on the
+    /// operator's decision (delivered as the wake completion keyed by this id), rather than
+    /// proceeding inline. The live path never returns this — it parks for a synchronous human
+    /// answer and returns [`Approved`](Self::Approved) instead.
+    Deferred(JobId),
 }
 
 /// The trait the host implements so an engine can raise blocking requests (§17).

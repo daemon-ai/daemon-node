@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actor;
+pub mod approval;
 pub mod config;
 pub mod context;
 pub mod control;
@@ -40,6 +41,7 @@ pub mod tools;
 pub mod turn;
 
 pub use actor::{spawn_agent_session, AgentHandle};
+pub use approval::{is_sensitive_path, ApprovalPolicy, Decision};
 pub use config::Config;
 pub use context::{
     estimate_tokens, BudgetedContextEngine, ContextEngine, ContextStrategy, ModelInfo, Pressure,
@@ -51,7 +53,7 @@ pub use conversation::{
 };
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use embed::{cosine, EmbeddingProvider, MockEmbedder};
-pub use engine::{Completion, Engine, Suspension, TurnOutcome};
+pub use engine::{Completion, Engine, Suspension, TurnOutcome, APPROVAL_SUSPEND_PAYLOAD};
 pub use events::{EventSink, SessionLog};
 pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
 pub use memory::{
@@ -71,10 +73,10 @@ pub use repair::{
     wrap_untrusted_tool_result, ArgRepair, NameRepairError, ScrubChunk, StreamingThinkScrubber,
 };
 pub use safety::{check_url, CheckedUrl, UrlReject};
-pub use snapshot::{ProcHandle, References, Snapshot, ToolBinding};
+pub use snapshot::{PendingApproval, ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;
 pub use tools::{
     DelegateTool, Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError,
     ToolRegistry,
 };
-pub use turn::{Effect, TurnCx};
+pub use turn::{approve_command, approve_path, Effect, Gate, TurnCx};

@@ -1880,6 +1880,7 @@ dependencies = [
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
+ "daemon-tool-fs",
  "daemon-tool-orchestrate",
  "daemon-tool-web",
  "serde_json",

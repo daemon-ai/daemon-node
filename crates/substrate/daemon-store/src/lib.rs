@@ -113,6 +113,28 @@ pub struct Checkpoint {
     pub snapshot: SnapshotBlob,
 }
 
+/// A durable parked edit-approval request (§12 HITL): a gated tool action (an fs edit, a dangerous
+/// shell command) that a headless/dormant session suspended on, awaiting an operator decision. It
+/// is the store-side mirror of the engine's `Snapshot::pending_approvals` entry, kept as its own
+/// durable row so the operator can *list* what is pending ([`SessionStore::pending_approvals_of`])
+/// and *answer* it ([`SessionStore::answer_approval`]) across restarts. Analogous to a `delegations`
+/// edge, but its completion is supplied by an operator decision, not a child's terminal state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedApproval {
+    /// The session that parked the request.
+    pub session_id: SessionId,
+    /// The request id (matches the engine's `PendingApproval.job_id`; the completion fulfills it).
+    pub job_id: JobId,
+    /// The epoch the session suspended at (the completion's idempotency epoch).
+    pub epoch: Epoch,
+    /// A human-readable summary of the proposed action (the approval prompt).
+    pub prompt: String,
+    /// The target path, when the action is a file edit (`None` for a non-path action).
+    pub path: Option<String>,
+    /// The operator's decision once answered (`None` while still pending; `Some(true)` = allow).
+    pub decision: Option<bool>,
+}
+
 /// Errors surfaced by a [`SessionStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -402,6 +424,42 @@ pub trait SessionStore: Send + Sync {
     /// non-authoritative proxy store relies on its authoritative peer's dispatcher).
     async fn enqueue_wake(&self, _id: SessionId) {}
 
+    /// Atomically checkpoint a session suspended on a §12 edit-approval decision and durably record
+    /// its parked approval row(s) — **without** enqueuing a runnable background job (unlike
+    /// [`checkpoint_and_enqueue`]). The session goes `Suspended` on the first approval's `job_id` and
+    /// stays dormant until an operator [`answer_approval`](Self::answer_approval) wakes it. Fenced.
+    /// Default: a no-op (a non-authoritative proxy store).
+    ///
+    /// [`checkpoint_and_enqueue`]: Self::checkpoint_and_enqueue
+    async fn park_approval(
+        &self,
+        _checkpoint: Checkpoint,
+        _approvals: Vec<ParkedApproval>,
+        _fence: FenceToken,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Record an operator's decision for a parked approval and wake the session in one transaction:
+    /// stamp the parked row's `decision`, record a [`JobCompletion`] for its `job_id` (payload
+    /// `allow`/`deny`) so the rehydrated engine resolves the gated tool call, and publish a wake.
+    /// Idempotent per `(session, epoch, job)` (a redelivered answer is a no-op). Returns `true` if a
+    /// matching pending approval was found and answered. Default: `false` (no such row).
+    async fn answer_approval(
+        &self,
+        _session: &SessionId,
+        _job_id: &JobId,
+        _allow: bool,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    /// List the still-pending (unanswered) parked approvals — for one `session` when given, else
+    /// across all sessions — backing the operator-facing `ApprovalsPending` surface. Default: empty.
+    async fn pending_approvals_of(&self, _session: Option<&SessionId>) -> Vec<ParkedApproval> {
+        Vec::new()
+    }
+
     /// The work label `child` was delegated with (the parent job's payload as text), for the tree
     /// projection's per-node `work`. `None` for a top (parentless) session. Default: `None`.
     async fn delegation_work(&self, _child: &SessionId) -> Option<String> {
@@ -539,6 +597,9 @@ struct Inner {
     wake_outbox: VecDeque<SessionId>,
     /// child session -> the parent job its terminal completion fulfills (the durable tree edge).
     delegations: HashMap<SessionId, JobCommand>,
+    /// Per-session parked §12 edit-approval requests, in park order. An unanswered row keeps the
+    /// session dormant; [`SessionStore::answer_approval`] stamps its decision and wakes the session.
+    pending_approvals: HashMap<SessionId, Vec<ParkedApproval>>,
     /// parent session -> its delegated children in order (reverse index for the tree projection).
     child_index: HashMap<SessionId, Vec<SessionId>>,
     /// child session -> its attached non-joining edge label (§4.3 background spawn). Recorded by
@@ -795,6 +856,97 @@ impl SessionStore for InMemoryStore {
 
     async fn enqueue_wake(&self, id: SessionId) {
         self.inner.lock().unwrap().wake_outbox.push_back(id);
+    }
+
+    async fn park_approval(
+        &self,
+        checkpoint: Checkpoint,
+        approvals: Vec<ParkedApproval>,
+        fence: FenceToken,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        {
+            let rec = inner
+                .sessions
+                .get(&checkpoint.session_id)
+                .ok_or_else(|| StoreError::NotFound(checkpoint.session_id.clone()))?;
+            Self::check_fence(rec, fence)?;
+        }
+        Self::take_fault(&mut inner, FaultPoint::BeforeSnapshot)?;
+        // Atomic commit: snapshot + epoch + Suspended status + parked rows land together. No job is
+        // enqueued — the session stays dormant until an operator decision wakes it.
+        let suspend_job = approvals.first().map(|a| a.job_id.clone());
+        let rec = inner.sessions.get_mut(&checkpoint.session_id).unwrap();
+        rec.snapshot = checkpoint.snapshot;
+        rec.epoch = checkpoint.epoch;
+        if let Some(job_id) = suspend_job {
+            rec.status = SessionStatus::Suspended { job_id };
+        }
+        let rows = inner
+            .pending_approvals
+            .entry(checkpoint.session_id.clone())
+            .or_default();
+        for approval in approvals {
+            // Dedupe a re-parked row on deterministic recovery (same session + job).
+            if !rows.iter().any(|r| r.job_id == approval.job_id) {
+                rows.push(approval);
+            }
+        }
+        Ok(())
+    }
+
+    async fn answer_approval(
+        &self,
+        session: &SessionId,
+        job_id: &JobId,
+        allow: bool,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let epoch = match inner.pending_approvals.get_mut(session) {
+            Some(rows) => match rows.iter_mut().find(|r| &r.job_id == job_id) {
+                // Already answered: idempotent no-op (a redelivered decision).
+                Some(row) if row.decision.is_some() => return Ok(true),
+                Some(row) => {
+                    row.decision = Some(allow);
+                    row.epoch
+                }
+                None => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+        let completion = JobCompletion {
+            session_id: session.clone(),
+            epoch,
+            job_id: job_id.clone(),
+            payload: if allow { b"allow".to_vec() } else { b"deny".to_vec() },
+        };
+        // Completion durable + session Ready, then publish the wake (one transaction).
+        if Self::apply_completion_locked(&mut inner, &completion) {
+            inner.wake_outbox.push_back(session.clone());
+        }
+        Ok(true)
+    }
+
+    async fn pending_approvals_of(&self, session: Option<&SessionId>) -> Vec<ParkedApproval> {
+        let inner = self.inner.lock().unwrap();
+        let unanswered = |rows: &Vec<ParkedApproval>| -> Vec<ParkedApproval> {
+            rows.iter()
+                .filter(|r| r.decision.is_none())
+                .cloned()
+                .collect()
+        };
+        match session {
+            Some(id) => inner
+                .pending_approvals
+                .get(id)
+                .map(unanswered)
+                .unwrap_or_default(),
+            None => inner
+                .pending_approvals
+                .values()
+                .flat_map(|rows| unanswered(rows))
+                .collect(),
+        }
     }
 
     async fn delegation_work(&self, child: &SessionId) -> Option<String> {

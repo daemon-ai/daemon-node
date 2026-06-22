@@ -59,6 +59,12 @@ impl ToolOutcome {
         self
     }
 
+    /// Attach effects produced by the tool, applied by the single-owner applier (§4.3).
+    pub fn with_effects(mut self, effects: Vec<Effect>) -> Self {
+        self.effects = effects;
+        self
+    }
+
     /// Mark this outcome's content as untrusted external data (the §12 wrap-untrusted stage).
     pub fn mark_untrusted(mut self) -> Self {
         self.untrusted = true;

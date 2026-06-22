@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use daemon_common::{DaemonError, Epoch, FenceToken, PartitionId, SessionId};
 use daemon_store::{
-    Checkpoint, JobCommand, JobCompletion, SessionStatus, SessionStore, StoreError,
+    Checkpoint, JobCommand, JobCompletion, ParkedApproval, SessionStatus, SessionStore, StoreError,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -31,6 +31,14 @@ pub enum Step {
     Suspended {
         /// The durable job to enqueue on the outbox.
         job: JobCommand,
+    },
+    /// The engine suspended on a §12 edit-approval decision (HITL): the session parks dormant until
+    /// an operator answers. Unlike [`Suspended`](Step::Suspended) **no** runnable job is enqueued —
+    /// the wake comes from `answer_approval`, not a background worker.
+    ParkApproval {
+        /// The parked approval request(s) recorded this suspension (the snapshot already holds the
+        /// typed `PendingApproval`s; these are the store-side rows for the operator-facing surface).
+        approvals: Vec<ParkedApproval>,
     },
 }
 
@@ -137,6 +145,20 @@ impl ManagerInner {
                 };
                 self.store
                     .checkpoint_and_enqueue(checkpoint, job, fence)
+                    .await?;
+            }
+            Step::ParkApproval { approvals } => {
+                // §12 HITL park: checkpoint the suspended snapshot + record the parked approval rows
+                // in one transaction, but enqueue *no* runnable job — the session stays dormant until
+                // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
+                let snapshot = inc.checkpoint()?;
+                let checkpoint = Checkpoint {
+                    session_id: id.clone(),
+                    epoch: inc.epoch(),
+                    snapshot,
+                };
+                self.store
+                    .park_approval(checkpoint, approvals, fence)
                     .await?;
             }
             Step::Completed => {

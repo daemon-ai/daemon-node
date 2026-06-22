@@ -15,6 +15,7 @@
 use crate::control::{SteerReq, TurnControl};
 use crate::engine::{Engine, TurnOutcome};
 use crate::events::SessionLog;
+use crate::provider::Provider;
 use crate::Failure;
 use daemon_common::ReqId;
 use daemon_protocol::{
@@ -59,6 +60,18 @@ enum ActorMsg {
         reason: Option<String>,
         origin: Origin,
     },
+    /// Live per-session model switch: swap the engine's provider. Applied at a turn boundary so an
+    /// in-flight turn's prompt cache is never invalidated mid-conversation.
+    SetProvider {
+        provider: Arc<dyn Provider>,
+        origin: Origin,
+    },
+    /// Live per-session edit-approval mode switch: set the engine's [`ApprovalPolicy`]. Applied at a
+    /// turn boundary; consulted by the next gated tool action.
+    SetApprovalPolicy {
+        policy: crate::approval::ApprovalPolicy,
+        origin: Origin,
+    },
     Shutdown {
         origin: Origin,
     },
@@ -71,6 +84,8 @@ impl ActorMsg {
             | ActorMsg::Steer { origin, .. }
             | ActorMsg::Snapshot { origin, .. }
             | ActorMsg::Interrupt { origin, .. }
+            | ActorMsg::SetProvider { origin, .. }
+            | ActorMsg::SetApprovalPolicy { origin, .. }
             | ActorMsg::Shutdown { origin } => origin,
         }
     }
@@ -107,6 +122,22 @@ impl ActorMsg {
                 SessionPayload::Command(AgentCommand::Interrupt {
                     reason: reason.clone(),
                 }),
+                Disposition::Transport,
+            ),
+            // Observability-only: a model switch is not a wire command. Surface it as a meta marker.
+            ActorMsg::SetProvider { .. } => (
+                SessionPayload::Meta {
+                    kind: "model.set".to_string(),
+                    body: Vec::new(),
+                },
+                Disposition::Transport,
+            ),
+            // Observability-only: an edit-approval mode switch is not a wire command.
+            ActorMsg::SetApprovalPolicy { policy, .. } => (
+                SessionPayload::Meta {
+                    kind: "mode.set".to_string(),
+                    body: format!("{policy:?}").into_bytes(),
+                },
                 Disposition::Transport,
             ),
             ActorMsg::Shutdown { .. } => (
@@ -204,6 +235,30 @@ impl AgentHandle {
             .await;
     }
 
+    /// Swap the model provider for this session (a live model switch). Applied at the next turn
+    /// boundary; an in-flight turn finishes on the old provider to preserve prompt caching.
+    pub async fn set_provider(&self, provider: Arc<dyn Provider>) {
+        let _ = self
+            .tx
+            .send(ActorMsg::SetProvider {
+                provider,
+                origin: local_origin(),
+            })
+            .await;
+    }
+
+    /// Set this session's edit-approval mode (a live §12 session-mode switch). Applied at the next
+    /// turn boundary and consulted by the next gated tool action.
+    pub async fn set_approval_policy(&self, policy: crate::approval::ApprovalPolicy) {
+        let _ = self
+            .tx
+            .send(ActorMsg::SetApprovalPolicy {
+                policy,
+                origin: local_origin(),
+            })
+            .await;
+    }
+
     /// Drain and shut the engine actor down.
     pub async fn shutdown(&self) {
         let _ = self
@@ -260,9 +315,23 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
         );
         let mut pending_starts: VecDeque<(UserMsg, oneshot::Sender<Result<TurnSummary, Failure>>)> =
             VecDeque::new();
+        // A live model switch requested while a turn was running (or while idle): applied here at the
+        // turn boundary so it never invalidates an in-flight turn's prompt cache.
+        let mut pending_provider: Option<Arc<dyn Provider>> = None;
+        // A live edit-approval mode switch requested while a turn was running (or while idle):
+        // applied at the turn boundary alongside the provider switch.
+        let mut pending_policy: Option<crate::approval::ApprovalPolicy> = None;
         let mut shutting_down = false;
 
         loop {
+            // Apply any pending live model switch before deciding/driving the next turn.
+            if let Some(provider) = pending_provider.take() {
+                engine.set_provider(provider);
+            }
+            // Apply any pending live edit-approval mode switch.
+            if let Some(policy) = pending_policy.take() {
+                engine.set_approval_policy(policy);
+            }
             // ---- idle servicing: snapshots first (consistent read), then steer/queued starts ----
             for request_id in control.drain_snapshot() {
                 let view = engine.conv_view();
@@ -312,6 +381,12 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                     ActorMsg::Snapshot { request_id, .. } => control.push_snapshot(request_id),
                     // Idle: there is no in-flight turn to interrupt.
                     ActorMsg::Interrupt { .. } => {}
+                    ActorMsg::SetProvider { provider, .. } => {
+                        pending_provider = Some(provider);
+                    }
+                    ActorMsg::SetApprovalPolicy { policy, .. } => {
+                        pending_policy = Some(policy);
+                    }
                     ActorMsg::Shutdown { .. } => break,
                 }
                 continue;
@@ -337,6 +412,12 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                                     }
                                     ActorMsg::StartTurn { input, reply, .. } => {
                                         pending_starts.push_back((input, reply));
+                                    }
+                                    ActorMsg::SetProvider { provider, .. } => {
+                                        pending_provider = Some(provider);
+                                    }
+                                    ActorMsg::SetApprovalPolicy { policy, .. } => {
+                                        pending_policy = Some(policy);
                                     }
                                     ActorMsg::Shutdown { .. } => {
                                         control.cancel();
@@ -551,6 +632,52 @@ mod tests {
             }
             _ => unreachable!(),
         }
+        handle.shutdown().await;
+    }
+
+    /// A live model switch (`SetSessionModel` → `set_provider`) swaps the provider on the running
+    /// actor at the next turn boundary: the first turn uses the original provider, and the turn after
+    /// the swap streams text from the new provider — with no session rebuild.
+    #[tokio::test]
+    async fn set_provider_swaps_model_at_next_turn() {
+        async fn turn_text(
+            handle: &AgentHandle,
+            rx: &mut broadcast::Receiver<AgentEvent>,
+        ) -> String {
+            let driver = handle.clone();
+            tokio::spawn(async move {
+                let _ = driver.start_turn(UserMsg::new("hi")).await;
+            });
+            let mut text = String::new();
+            loop {
+                let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("timed out")
+                    .expect("stream closed");
+                match ev {
+                    AgentEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                    AgentEvent::TurnFinished { .. } => return text,
+                    _ => {}
+                }
+            }
+        }
+
+        let engine = Engine::fresh(
+            SessionId::new("swap"),
+            SystemPrompt::new("test"),
+            Arc::new(MockProvider::completing("first")),
+            Arc::new(ToolRegistry::new()),
+        );
+        let handle = spawn_agent_session(engine, Arc::new(NoopHost));
+        let mut rx = handle.subscribe();
+
+        assert_eq!(turn_text(&handle, &mut rx).await, "first");
+
+        handle
+            .set_provider(Arc::new(MockProvider::completing("second")))
+            .await;
+
+        assert_eq!(turn_text(&handle, &mut rx).await, "second");
         handle.shutdown().await;
     }
 }

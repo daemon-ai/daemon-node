@@ -5,7 +5,8 @@
 //! the outstanding background work it suspended for. Persisted as opaque CBOR
 //! ([`SnapshotBlob`](daemon_common::SnapshotBlob)) so the durable substrate stays engine-agnostic.
 
-use crate::conversation::Conversation;
+use crate::approval::ApprovalPolicy;
+use crate::conversation::{Conversation, ToolCall};
 use daemon_common::{DaemonError, Epoch, JobId, SessionId, SnapshotBlob};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,35 @@ pub struct Snapshot {
     /// suspension. `#[serde(default)]` keeps pre-existing snapshots decodable.
     #[serde(default)]
     pub turns_since_memory: u32,
+    /// The session's explicit edit-approval policy (§12 session mode), set via `SetSessionMode`.
+    /// `None` falls back to the engine [`Config::approval_policy`](crate::Config). Durable so a
+    /// supervised session's mode survives suspension/restart. `#[serde(default)]` keeps pre-existing
+    /// snapshots decodable.
+    #[serde(default)]
+    pub approval_policy: Option<ApprovalPolicy>,
+    /// Gated tool calls this incarnation suspended on, awaiting a durable operator decision (§12
+    /// HITL). Each carries the original [`ToolCall`] so the engine can re-run it verbatim on
+    /// approval (allow -> execute, deny -> tool-error). Durable so a parked approval survives
+    /// restart; cleared as each is resolved. `#[serde(default)]` keeps pre-existing snapshots
+    /// decodable.
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingApproval>,
+}
+
+/// A gated tool call parked for a durable human-in-the-loop decision (§12). Persisted on the
+/// [`Snapshot`] so the engine can re-run the exact call once the operator answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingApproval {
+    /// The decision's correlation id (the suspension job id); the operator answers by this id and
+    /// the completion that wakes the session carries it.
+    pub job_id: JobId,
+    /// The original tool call to re-run verbatim on approval.
+    pub call: ToolCall,
+    /// The human-readable approval prompt (diff summary / command), surfaced to the operator.
+    pub prompt: String,
+    /// The target path for an fs edit (used for the sensitive-path carve-out + display), if any.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 impl Snapshot {
@@ -73,6 +103,8 @@ impl Snapshot {
             waiting_for: Vec::new(),
             iters_since_skill: 0,
             turns_since_memory: 0,
+            approval_policy: None,
+            pending_approvals: Vec::new(),
         }
     }
 

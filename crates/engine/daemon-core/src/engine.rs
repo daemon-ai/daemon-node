@@ -42,6 +42,10 @@ pub struct Completion {
     pub payload: Vec<u8>,
 }
 
+/// The suspension payload marking an **approval park** (§12 HITL) rather than a delegation: the
+/// host parks it for an operator decision instead of enqueuing a runnable background job.
+pub const APPROVAL_SUSPEND_PAYLOAD: &[u8] = b"await-approval";
+
 /// What one turn resolved to.
 pub enum TurnOutcome {
     /// The turn reached a terminal state.
@@ -201,6 +205,24 @@ impl Engine {
     /// Stash background-job completions to be applied (idempotently) before the next turn runs.
     pub fn apply_completions(&mut self, completions: Vec<Completion>) {
         self.pending.extend(completions);
+    }
+
+    /// Swap the model provider this engine calls — a live, per-session model switch. Refreshes the
+    /// §10 context-window denominator from the new provider's [`Capabilities`](crate::provider::Capabilities).
+    /// Intended to take effect at a turn boundary (the actor applies it between turns) so an
+    /// in-flight turn's prompt cache is never invalidated mid-conversation.
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+        let info = self.model_info();
+        self.context.on_model(&info);
+    }
+
+    /// Set this session's edit-approval [`ApprovalPolicy`](crate::approval::ApprovalPolicy) (the §12
+    /// session mode) in place — a live, per-session switch. Recorded on the durable
+    /// [`Snapshot`](crate::Snapshot) so it survives suspend/rehydrate, and consulted by the next
+    /// gated tool action (it does not affect an in-flight gate already decided this turn).
+    pub fn set_approval_policy(&mut self, policy: crate::approval::ApprovalPolicy) {
+        self.snapshot.approval_policy = Some(policy);
     }
 
     /// Append a user message that opens the next turn.
@@ -494,6 +516,14 @@ impl Engine {
         }
     }
 
+    /// The effective edit-approval policy (§12) for this session: the explicit per-session override
+    /// on the snapshot, else the engine [`Config`] default.
+    fn effective_policy(&self) -> crate::approval::ApprovalPolicy {
+        self.snapshot
+            .approval_policy
+            .unwrap_or(self.config.approval_policy)
+    }
+
     /// A best-effort description of the active model for the §10 [`on_model`](ContextEngine::on_model)
     /// hook: the profile label plus the provider's declared context window (if any).
     fn model_info(&self) -> crate::context::ModelInfo {
@@ -675,15 +705,35 @@ impl Engine {
         }
 
         if resuming {
-            // Resume path: a background completion arrived — apply it idempotently and bump the epoch,
-            // then fall into the ReAct loop so the model sees the resolved tool result(s) and can
-            // either finalize or take further tool steps.
+            // Resume path: a background completion arrived. First resolve any parked **approval**
+            // decisions (§12 HITL) — re-running the approved tool call (allow) or injecting a
+            // tool-error (deny) — taking those completions out of the pending set; then apply the
+            // remaining delegation completions and fall into the ReAct loop so the model sees the
+            // resolved tool result(s).
+            if !self.snapshot.pending_approvals.is_empty() {
+                self.resolve_approvals(host, events, control).await;
+            }
             self.resolve_pending();
+            if let Some(next) = self.snapshot.pending_approvals.first().map(|a| a.job_id.clone()) {
+                // Not every parked approval was answered yet: re-suspend deterministically on a
+                // remaining one (the operator answers them one at a time).
+                self.snapshot.waiting_for = self
+                    .snapshot
+                    .pending_approvals
+                    .iter()
+                    .map(|a| a.job_id.clone())
+                    .collect();
+                return Ok(self.suspend_for_approval(next, events, false));
+            }
             self.snapshot.waiting_for.clear();
             self.snapshot.epoch = self.snapshot.epoch.next();
         } else if let Some(job_id) = self.snapshot.waiting_for.first().cloned() {
             // Re-activated while still suspended (e.g. recovery before the worker ran): re-suspend the
-            // same job deterministically; the durable outbox dedupes the re-enqueue.
+            // same job deterministically; the durable outbox dedupes the re-enqueue. An unanswered
+            // approval park re-parks (no enqueue), everything else re-enqueues the background job.
+            if !self.snapshot.pending_approvals.is_empty() {
+                return Ok(self.suspend_for_approval(job_id, events, false));
+            }
             return Ok(self.suspend(job_id, events, false));
         }
 
@@ -701,6 +751,7 @@ impl Engine {
         let exec = self.exec.clone();
         let registry = self.registry.clone();
         let tool_result_budget = self.config.tool_result_budget;
+        let effective_policy = self.effective_policy();
         let mut rounds_left = self.config.max_iterations;
         // Accumulated usage across every model call this turn makes (each round + the final summary
         // call), so `TurnSummary.usage` is the turn total, not just the last call's delta.
@@ -755,6 +806,8 @@ impl Engine {
                 budget: self.budget,
                 exec: &*exec,
                 tool_result_budget,
+                approval_policy: effective_policy,
+                pre_approved: false,
             };
 
             // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
@@ -861,11 +914,23 @@ impl Engine {
             }));
             let mut delegated: Option<JobId> = None;
             let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
+            let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
             for effect in effects {
                 match effect {
                     Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
                     Effect::Delegate(job_id) => delegated = Some(job_id),
                     Effect::Spawn(spec) => spawns.push(spec),
+                    Effect::AwaitDecision {
+                        job_id,
+                        call,
+                        prompt,
+                        path,
+                    } => awaiting.push(crate::snapshot::PendingApproval {
+                        job_id,
+                        call,
+                        prompt,
+                        path,
+                    }),
                 }
             }
             // Fire-and-forget: issue each spawn as a non-joining host request and keep running. The
@@ -877,6 +942,20 @@ impl Engine {
             // An interrupt at a tool boundary finalizes the turn before it would suspend/loop.
             if interrupted {
                 return Ok(self.finish_interrupted(events));
+            }
+
+            if !awaiting.is_empty() {
+                // A gated tool needs a durable operator decision (§12 HITL): record the parked
+                // approvals on the snapshot and suspend, waiting on the operator's answer (delivered
+                // as a wake completion). Mirrors delegation suspension, but the wake source is an
+                // operator (`ApprovalDecide`), not a background worker.
+                self.notify_session_switch(SwitchReason::Handoff).await;
+                let first = awaiting[0].job_id.clone();
+                for a in &awaiting {
+                    self.snapshot.waiting_for.push(a.job_id.clone());
+                }
+                self.snapshot.pending_approvals.extend(awaiting);
+                return Ok(self.suspend_for_approval(first, events, true));
             }
 
             if let Some(job_id) = delegated {
@@ -950,6 +1029,104 @@ impl Engine {
             epoch: self.snapshot.epoch,
             payload: b"delegated-work".to_vec(),
         })
+    }
+
+    /// Suspend the turn awaiting a durable operator approval decision (§12 HITL). Like [`suspend`]
+    /// it emits the suspending `TurnFinished` (bumping the epoch on a fresh park, not on a
+    /// deterministic recovery re-park), but the payload marks it an approval park (`await-approval`)
+    /// so the host parks it for an operator — never enqueuing a runnable background job.
+    fn suspend_for_approval(
+        &mut self,
+        job_id: JobId,
+        events: &EventSink,
+        bump_epoch: bool,
+    ) -> TurnOutcome {
+        if bump_epoch {
+            self.snapshot.epoch = self.snapshot.epoch.next();
+        }
+        let summary = TurnSummary::ended(EndReason::Suspended);
+        events.emit(|seq| AgentEvent::TurnFinished { seq, summary });
+        TurnOutcome::Suspended(Suspension {
+            job_id,
+            epoch: self.snapshot.epoch,
+            payload: APPROVAL_SUSPEND_PAYLOAD.to_vec(),
+        })
+    }
+
+    /// Resolve parked §12 approval decisions on resume: for each unapplied completion whose `job_id`
+    /// matches a [`PendingApproval`](crate::snapshot::PendingApproval), re-run the approved tool call
+    /// (allow — performs the side effect, with `pre_approved` set so the tool skips its gate) or
+    /// inject a tool-error (deny), then splice the result into the parked `awaiting-approval` slot.
+    /// Approval completions are taken out of `self.pending` so the delegation resolver ignores them.
+    async fn resolve_approvals(
+        &mut self,
+        host: &dyn HostRequestHandler,
+        events: &EventSink,
+        control: &TurnControl,
+    ) {
+        let exec = self.exec.clone();
+        let registry = self.registry.clone();
+        let budget = self.budget;
+        let tool_result_budget = self.config.tool_result_budget;
+        let policy = self.effective_policy();
+        let session_id = self.snapshot.session_id.clone();
+        let cancel = control.cancel_token();
+        let pending = std::mem::take(&mut self.pending);
+        let mut rest = Vec::new();
+        for completion in pending {
+            match self
+                .snapshot
+                .pending_approvals
+                .iter()
+                .position(|p| p.job_id == completion.job_id)
+            {
+                Some(i) => {
+                    let approval = self.snapshot.pending_approvals.remove(i);
+                    let decision = String::from_utf8_lossy(&completion.payload);
+                    let allow = decision.starts_with("allow");
+                    let (ok, content) = if allow {
+                        let cx = TurnCx {
+                            cancel: cancel.clone(),
+                            events,
+                            host,
+                            session_id: session_id.clone(),
+                            budget,
+                            exec: &*exec,
+                            tool_result_budget,
+                            approval_policy: policy,
+                            pre_approved: true,
+                        };
+                        let outcome = run_tool(&approval.call, &registry, &cx).await;
+                        (outcome.result.ok, outcome.result.content)
+                    } else {
+                        (
+                            false,
+                            format!("operator denied this action (request {})", approval.job_id),
+                        )
+                    };
+                    self.replace_awaiting_result(&approval.job_id, ok, content);
+                }
+                None => rest.push(completion),
+            }
+        }
+        self.pending = rest;
+    }
+
+    /// Splice a resolved approval result into the conversation slot the parked tool call left behind
+    /// (its content is the `awaiting-approval:{job_id}` marker).
+    fn replace_awaiting_result(&mut self, job_id: &JobId, ok: bool, content: String) {
+        let marker = format!("awaiting-approval:{job_id}");
+        for turn in self.snapshot.conversation.turns.iter_mut() {
+            if let Turn::Tool(tool_turn) = turn {
+                for (_call, result) in tool_turn.calls.iter_mut() {
+                    if result.content.contains(&marker) {
+                        result.ok = ok;
+                        result.content = content;
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// Advance the post-turn review cadence counters and emit background-review spawns on threshold

@@ -222,8 +222,8 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Session lifecycle | `acp_adapter/server.py:1109-1303` | `Submit`/`Poll`/`Respond`/`Subscribe`/`Sessions`/`Cancel`/`SessionHistory` | DONE — [daemon-api/src/lib.rs](../../crates/contracts/daemon-api/src/lib.rs):504-599,801-845. No fork/list-with-cwd. |
 | Profile CRUD (runtime) | `hermes_cli/profiles.py:716,784,1073,1414,1742`; `web_server.py:9011-9357` | `Profile{List,Get,Create,Update,Delete,Select}` ApiRequest variants | **MISSING** — no variant in `ApiRequest` ([:504-718](../../crates/contracts/daemon-api/src/lib.rs)); registry frozen ([main.rs:81-147](../../bins/daemon/src/main.rs)). §5.1 |
 | Config get/set (runtime) | `hermes_cli/config.py:5279,5541,6242`; `web_server.py:3040-3055,3606` | `Config{Get,Set,Schema}` | **MISSING** — config is construction-time `NodeConfig` ([config.rs:323-378](../../bins/daemon/src/config.rs)). §5.1 |
-| Model select per session | `acp_adapter/server.py:1989` | `SetSessionModel` / per-session provider override | **MISSING** for cloud; only `ModelActivate` for local installed models ([:683-688](../../crates/contracts/daemon-api/src/lib.rs)). §5.2 |
-| Modes / edit-approval policy | `acp_adapter/server.py:2023` | session mode + `HostRequest` approval prompts | PARTIAL — parking exists ([node_api.rs:729-822](../../crates/substrate/daemon-host/src/node_api.rs)) but `DelegateResolver` auto-approves ([engine_incarnation.rs:265](../../crates/substrate/daemon-host/src/engine_incarnation.rs)). |
+| Model select per session | `acp_adapter/server.py:1989` | `SetSessionModel` / per-session provider override | **DONE** — `SetSessionModel` live in-memory provider swap on the running actor (`Engine::set_provider` + `ActorMsg::SetProvider`), per-session model override; `ModelActivate` still covers local installed models. §5.2 |
+| Modes / edit-approval policy | `acp_adapter/server.py:2023` | session mode + `HostRequest` approval prompts | **DONE** — `ApprovalPolicy` (`Ask`/`AcceptEdits`/`AutoAllow`/`Deny`) per-session on `Snapshot`/`Config` with an `is_sensitive_path` carve-out; fs + shell edit gates; `SetSessionMode`/`ApprovalMode`; live `ParkingHandler` consults the policy (auto-allow/deny vs park). Autonomous durable engines default `AutoAllow`. |
 | Auth / credential registration | `agent/anthropic_adapter.py:1162-1203`; `acp_adapter/server.py:895`, `acp_adapter/auth.py:41` | `Credential{Set,List,Remove}` + lease | PARTIAL — lease→`Request.auth` ([engine.rs:357](../../crates/engine/daemon-core/src/engine.rs)); host source is stub ([source.rs](../../crates/substrate/daemon-credentials/src/source.rs)); no register API. §5.2 |
 | Advertise commands | `acp_adapter/server.py:1692` | push `AvailableCommands` event | MISSING. |
 
@@ -270,7 +270,7 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Loop guardrails | `agent/tool_guardrails.py:224` | MISSING — no duplicate-call guardrail. |
 | Core tools (fs/shell) | `tools/file_tools.py`; `tools/terminal_tool.py` | DONE — `fs`/`shell` with workspace containment ([daemon-tool-fs](../../tools/daemon-tool-fs/src/lib.rs):71-161; [daemon-tool-shell](../../tools/daemon-tool-shell/src/lib.rs):74-151). |
 | Web / browser / vision / todo / clarify | `tools/web_tools.py`, `browser_tool.py`, `vision_tools.py`, `todo_tool.py`, `clarify_tool.py` | MISSING — no web_search/web_extract/browser/vision/todo/clarify. `tkx` is a STUB ([daemon-tool-tkx:5](../../tools/daemon-tool-tkx/src/lib.rs)). P1–P3. |
-| Approval + checkpoints + tool-search | `tools/approval.py`; `tools/checkpoint_manager.py`; `tools/tool_search.py` | PARTIAL — shell approval DONE; checkpoints/rewind + tool-search MISSING. |
+| Approval + checkpoints + tool-search | `tools/approval.py`; `tools/checkpoint_manager.py`; `tools/tool_search.py` | PARTIAL — shell + fs edit approval DONE (policy-gated, with durable HITL park→decide→resume); checkpoints/rewind + tool-search MISSING. |
 | Delegation tool | `tools/delegate_tool.py:3086` | DONE — `orchestrate` ([daemon-tool-orchestrate](../../tools/daemon-tool-orchestrate/src/lib.rs):103-158). |
 
 ### Domain F — Context & memory
@@ -334,7 +334,7 @@ Excluded (and why), tracked here so the gap is explicit:
 
 | Capability | Hermes anchor | Daemon state + gap |
 |---|---|---|
-| Subagent delegation (sync/parallel, depth) | `tools/delegate_tool.py:3086` | DONE/PARTIAL — `orchestrate` tool + durable fleet (`FleetJobWorker`, [daemon-node:449-476](../../crates/node/daemon-node/src/lib.rs)); HITL on durable path auto-approved ([engine_incarnation.rs:265](../../crates/substrate/daemon-host/src/engine_incarnation.rs)). |
+| Subagent delegation (sync/parallel, depth) | `tools/delegate_tool.py:3086` | DONE/PARTIAL — `orchestrate` tool + durable fleet (`FleetJobWorker`, [daemon-node:449-476](../../crates/node/daemon-node/src/lib.rs)); durable HITL now parks an `Ask` edit-approval (`DelegateResolver` returns `Deferred`, the activation layer routes `Step::ParkApproval` to `park_approval`, `ApprovalDecide` wakes it). |
 | Fleet tree / supervision | n/a (Hermes flat) | DONE+ (beyond Hermes) — `Tree`/`Fleet`/`Unit` ([daemon-api:547-568](../../crates/contracts/daemon-api/src/lib.rs)). |
 
 ### Domain J — Out-of-core ecosystem (SCOPED OUT, documented)

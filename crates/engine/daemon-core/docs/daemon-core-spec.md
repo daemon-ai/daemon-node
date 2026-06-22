@@ -410,6 +410,7 @@ enum Effect {
     ExternalizePayload { ref_id: String, bytes: Vec<u8> },
     Delegate(Vec<DelegationSpec>),   // async sub-agent request; orchestrator runs it (§16.2)
     Spawn(SpawnSpec),                // fire-and-forget background child (review); never suspends (§4.6)
+    AwaitDecision(PendingApproval),  // durable edit-approval HITL; suspends until an operator answers (§12.1)
 }
 
 struct ToolOutcome { result: ToolResult, effects: Vec<Effect> }
@@ -1062,8 +1063,11 @@ async fn run_tool(call: ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
   spliced by a tool. Overlap detection uses the canonical-path form (§6).
 - `path_security.rs`: deny-list precedence over allow-list, symlink-escape resolution,
   workspace-root containment.
-- `approval.rs`: `ApprovalPolicy` (hardline deny patterns; interactive prompts raised as a blocking
-  `HostRequest::Approval` (§17), not stdin); decision cache per session.
+- `approval.rs`: `ApprovalPolicy` (`Ask` | `AcceptEdits` | `AutoAllow` | `Deny`) per session, plus a
+  shared `is_sensitive_path` carve-out (`.git`/`.ssh`, dotenv, private keys always ask). Hardline deny
+  patterns are unconditional; otherwise the gate yields `Decision::{Allow,Deny,Ask}`. An `Ask` raises a
+  `HostRequest::Approval` (§17) — synchronous on a live session, **suspending** on a durable one
+  (§12.1) — never stdin.
 - `tool_guardrails.rs`: repeated identical-call detection, oscillation detection, escalating
   nudges/blocks.
 - `checkpoint.rs`: pre-mutation snapshots (git-backed where available, copy-on-write fallback)
@@ -1079,6 +1083,42 @@ interactive approval via `HostRequest`, checkpoint/rewind, guardrail loop detect
 **Acceptance.** A write outside the workspace root is denied; a destructive edit is checkpointed and
 rewindable; an identical-call loop is interrupted; an oversized result is spilled with a preview;
 cancellation stops an in-flight tool.
+
+### 12.1 The suspending approval boundary (durable edit-approval HITL)
+
+A live session can answer an `Ask` with a synchronous `host.request(Approval).await`. A **durable**
+session cannot — it may dehydrate or restart while waiting hours for an operator — so the approval
+gate must be expressible as an **engine suspension**, exactly like delegation (§16.2), not only an
+inline host call. This is the key generalization: the same `ApprovalPolicy` gate resolves inline on a
+live actor and as a suspend/resume boundary on the durable path.
+
+A gated tool (an fs `write`/`edit`, a dangerous shell command) calls the shared `approve_path` /
+`approve_command` helpers, which evaluate the policy and `is_sensitive_path` and then `ask_host`. On a
+durable session the host returns `HostResponseBody::Deferred(job_id)` instead of an inline decision;
+the helper hands back `Gate::Defer`, and the tool returns its `ToolOutcome` carrying
+`Effect::AwaitDecision(PendingApproval { job_id, call, prompt, path })` — **no** side effect performed
+yet.
+
+```rust
+struct PendingApproval { job_id: JobId, call: ToolCall, prompt: String, path: Option<PathBuf> }
+```
+
+The turn loop, on `Effect::AwaitDecision`, records the `PendingApproval` on the `Snapshot`, adds
+`job_id` to `waiting_for`, and `suspend_for_approval` with the `await-approval` payload (the marker
+that distinguishes an approval suspension from a delegation one). The host parks it durably with **no**
+runnable job (host-spec §7.1); the session goes dormant.
+
+On rehydration after an operator answer, `resolve_approvals` matches each incoming `JobCompletion`
+against a parked `PendingApproval`:
+
+- **allow** → re-run the original `ToolCall` with `TurnCx.pre_approved = true` so it skips the gate and
+  performs the side effect, then `replace_awaiting_result` swaps the placeholder for the real result;
+- **deny** → inject a tool-error result (hermes' "denied by operator" string) so the model sees the
+  refusal and can adapt.
+
+The turn then continues normally. `TurnCx` therefore carries both `approval_policy` (the gate input)
+and `pre_approved` (set only on the post-decision re-run). Autonomous engines set the policy to
+`AutoAllow`, so this boundary is inert for them and a headless turn never stalls.
 
 ---
 

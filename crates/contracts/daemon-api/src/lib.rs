@@ -48,6 +48,49 @@ pub type LogStream = BoxStream<'static, SessionLogEntry>;
 /// The wire version of the api mirror (rides every framed request/response; governs evolution).
 pub const API_WIRE_VERSION: WireVersion = WireVersion::CURRENT;
 
+/// The per-session edit-approval **session mode** a caller selects ([`SessionApi::set_session_mode`]),
+/// the wire mirror of `daemon-core`'s `ApprovalPolicy`. Mirrors hermes' Default / Accept-Edits /
+/// Don't-Ask session modes (`acp_adapter/server.py` `_session_modes`) plus an explicit hard deny:
+///
+/// - [`Ask`](ApprovalMode::Ask): ask before every gated action (the host parks/suspends for a human);
+/// - [`AcceptEdits`](ApprovalMode::AcceptEdits): auto-allow ordinary workspace edits, still ask for
+///   *sensitive* paths and dangerous commands;
+/// - [`AutoAllow`](ApprovalMode::AutoAllow): auto-allow every gated action except sensitive paths;
+/// - [`Deny`](ApprovalMode::Deny): reject every gated action outright.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Ask before every gated action (hermes "Default").
+    #[default]
+    Ask,
+    /// Auto-allow workspace edits, still ask for sensitive paths / commands (hermes "Accept Edits").
+    AcceptEdits,
+    /// Auto-allow every gated action except sensitive paths (hermes "Don't Ask").
+    AutoAllow,
+    /// Reject every gated action outright.
+    Deny,
+}
+
+impl ApprovalMode {
+    /// The stable wire id for this mode (the value GUIs advertise / select).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalMode::Ask => "ask",
+            ApprovalMode::AcceptEdits => "accept_edits",
+            ApprovalMode::AutoAllow => "auto_allow",
+            ApprovalMode::Deny => "deny",
+        }
+    }
+
+    /// The full set of advertisable modes (for a GUI mode picker / session-state advertisement).
+    pub const ALL: [ApprovalMode; 4] = [
+        ApprovalMode::Ask,
+        ApprovalMode::AcceptEdits,
+        ApprovalMode::AutoAllow,
+        ApprovalMode::Deny,
+    ];
+}
+
 // ---------------------------------------------------------------------------
 // The interface (two sub-surfaces, one node surface)
 // ---------------------------------------------------------------------------
@@ -144,6 +187,35 @@ pub trait SessionApi: Send + Sync {
     ) -> Result<(), ApiError> {
         Ok(())
     }
+
+    /// Switch a **live** session's model (and optionally its provider) in place — a transient,
+    /// per-session model switch (the bound profile is not mutated, mirroring hermes
+    /// `set_session_model`). The host rebuilds a provider for the new model from the session's
+    /// profile and swaps it on the running engine; it takes effect at the next turn boundary so an
+    /// in-flight turn's prompt cache is preserved. Default: unsupported (a transport with no live
+    /// model factory). `provider = None` keeps the profile's current provider.
+    async fn set_session_model(
+        &self,
+        _session: SessionId,
+        _model: String,
+        _provider: Option<ProviderSelector>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("set_session_model".into()))
+    }
+
+    /// Set a **live** session's edit-approval [`ApprovalMode`] (the §12 session mode) in place — a
+    /// transient, per-session switch (the bound profile is not mutated, mirroring hermes
+    /// `set_session_mode`). It governs how a gated tool action (an fs edit, a dangerous shell
+    /// command) is serviced: auto-allow, deny, or ask (the host parks for a human on the live path
+    /// or suspends the turn on the durable path). Takes effect at the next gated action. Default:
+    /// unsupported (a transport with no live session policy store).
+    async fn set_session_mode(
+        &self,
+        _session: SessionId,
+        _mode: ApprovalMode,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("set_session_mode".into()))
+    }
 }
 
 /// The node/operator control surface: inspect and steer the running node.
@@ -235,6 +307,26 @@ pub trait ControlApi: Send + Sync {
     /// Scale a unit (an orchestrator sub-fleet) to `n` members. Default: unsupported.
     async fn scale(&self, _id: UnitId, _n: u32) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("scale".into()))
+    }
+
+    /// List parked §12 edit-approval requests awaiting an operator decision — for one `session` when
+    /// given, else across all sessions (the operator HITL inbox). Default: empty (a transport with no
+    /// durable approval store).
+    async fn approvals_pending(&self, _session: Option<SessionId>) -> Vec<ApprovalInfo> {
+        Vec::new()
+    }
+
+    /// Answer a parked §12 edit-approval request: record the operator's decision and wake the dormant
+    /// session so it resumes (allow -> the gated tool runs; deny -> the tool returns an error). The
+    /// `request_id` is the opaque id from [`Self::approvals_pending`]. Idempotent (a redelivered
+    /// decision is a no-op). Default: unsupported (a transport with no durable approval store).
+    async fn approval_decide(
+        &self,
+        _session: SessionId,
+        _request_id: String,
+        _allow: bool,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("approval_decide".into()))
     }
 
     /// The node's journal **verifying** key (hex-encoded dCBOR), so an auditor can independently
@@ -527,6 +619,22 @@ pub struct SessionInfo {
     pub session: SessionId,
     /// Its durable lifecycle state.
     pub state: SessionState,
+}
+
+/// A parked §12 edit-approval request awaiting an operator decision — the transport-stable mirror of
+/// a durable `pending_approvals` row, surfaced by [`ControlApi::approvals_pending`] so a GUI/operator
+/// can render the pending asks and answer them with [`ControlApi::approval_decide`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalInfo {
+    /// The session that parked the request (and resumes when it is answered).
+    pub session: SessionId,
+    /// The opaque request id to pass back to [`ControlApi::approval_decide`].
+    pub request_id: String,
+    /// A human-readable summary of the proposed action.
+    pub prompt: String,
+    /// The target path, when the action is a file edit (`None` for a non-path action).
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// A transport-stable mirror of the durable session lifecycle (decoupled from `daemon-store`).
@@ -924,6 +1032,38 @@ pub enum ApiRequest {
         /// The profile to resolve (`None` = the active default).
         profile: Option<String>,
     },
+    /// [`SessionApi::set_session_model`].
+    SetSessionModel {
+        /// The live session to switch.
+        session: SessionId,
+        /// The new model id.
+        model: String,
+        /// Optionally re-bind the provider (`None` = keep the session's current provider).
+        #[serde(default)]
+        provider: Option<ProviderSelector>,
+    },
+    /// [`SessionApi::set_session_mode`].
+    SetSessionMode {
+        /// The live session whose edit-approval mode to switch.
+        session: SessionId,
+        /// The new edit-approval session mode.
+        mode: ApprovalMode,
+    },
+    /// [`ControlApi::approvals_pending`].
+    ApprovalsPending {
+        /// Filter to one session, or `None` for the node-wide HITL inbox.
+        #[serde(default)]
+        session: Option<SessionId>,
+    },
+    /// [`ControlApi::approval_decide`].
+    ApprovalDecide {
+        /// The session that parked the request.
+        session: SessionId,
+        /// The opaque parked-request id (from [`ApprovalInfo`]).
+        request_id: String,
+        /// The operator's decision (allow / deny).
+        allow: bool,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -941,6 +1081,8 @@ pub enum ApiResponse {
     Telemetry(TelemetryDump),
     /// A session list.
     Sessions(Vec<SessionInfo>),
+    /// A list of parked §12 edit-approval requests awaiting an operator decision.
+    Approvals(Vec<ApprovalInfo>),
     /// A fleet report.
     Fleet(FleetReport),
     /// A tree report.
@@ -1063,6 +1205,14 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             kind,
             body,
         } => unit_or_err(api.record_meta(session, origin, kind, body).await),
+        ApiRequest::SetSessionModel {
+            session,
+            model,
+            provider,
+        } => unit_or_err(api.set_session_model(session, model, provider).await),
+        ApiRequest::SetSessionMode { session, mode } => {
+            unit_or_err(api.set_session_mode(session, mode).await)
+        }
         _ => return None,
     })
 }
@@ -1078,6 +1228,14 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::Stats => ApiResponse::Stats(api.stats().await),
         ApiRequest::Telemetry => ApiResponse::Telemetry(api.telemetry().await),
         ApiRequest::Sessions => ApiResponse::Sessions(api.sessions().await),
+        ApiRequest::ApprovalsPending { session } => {
+            ApiResponse::Approvals(api.approvals_pending(session).await)
+        }
+        ApiRequest::ApprovalDecide {
+            session,
+            request_id,
+            allow,
+        } => unit_or_err(api.approval_decide(session, request_id, allow).await),
         ApiRequest::Assign { session } => unit_or_err(api.assign(session).await),
         ApiRequest::Cancel { session } => unit_or_err(api.cancel(session).await),
         ApiRequest::Fleet => ApiResponse::Fleet(api.fleet().await),
@@ -1190,7 +1348,9 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         | ApiRequest::Subscribe { .. }
         | ApiRequest::DeliveryTargets { .. }
         | ApiRequest::Handover { .. }
-        | ApiRequest::RecordMeta { .. } => {
+        | ApiRequest::RecordMeta { .. }
+        | ApiRequest::SetSessionModel { .. }
+        | ApiRequest::SetSessionMode { .. } => {
             unreachable!("session variants handled above")
         }
     }

@@ -13,8 +13,8 @@
 
 use crate::{
     Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry,
-    TraceSegment,
+    JournalPage, ParkedApproval, SessionSearchHit, SessionStatus, SessionStore, StoreError,
+    StoreStats, TraceEntry, TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -75,6 +75,20 @@ CREATE TABLE IF NOT EXISTS delegations (
     parent_epoch   INTEGER NOT NULL,
     job_id         TEXT NOT NULL,
     payload        BLOB NOT NULL
+);
+
+-- §12 durable edit-approval HITL: a gated tool action a headless/dormant session suspended on,
+-- awaiting an operator decision. Unlike `delegations` its completion comes from an operator answer
+-- (`answer_approval`), not a child's terminal state. A NULL `decision` row keeps the session dormant.
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    job_id     TEXT NOT NULL,
+    epoch      INTEGER NOT NULL,
+    prompt     TEXT NOT NULL,
+    path       TEXT,
+    decision   INTEGER,
+    UNIQUE(session_id, job_id)
 );
 
 -- §4.3 attached, non-joining edges (background spawn): parent->child tree edge for audit, but no
@@ -511,6 +525,154 @@ impl SessionStore for SqliteStore {
             "INSERT INTO wake_outbox (session_id) VALUES (?1)",
             params![id.as_str()],
         );
+    }
+
+    async fn park_approval(
+        &self,
+        checkpoint: Checkpoint,
+        approvals: Vec<ParkedApproval>,
+        fence: FenceToken,
+    ) -> Result<(), StoreError> {
+        {
+            let conn = self.conn.lock().unwrap();
+            let current = Self::fence_of(&conn, &checkpoint.session_id)?;
+            if fence < current {
+                return Err(StoreError::Fenced {
+                    have: fence.0,
+                    current: current.0,
+                });
+            }
+        }
+        self.take_fault(FaultPoint::BeforeSnapshot)?;
+        // Atomic commit: snapshot + epoch + Suspended status + parked rows land together. No job is
+        // enqueued — the session stays dormant until an operator decision wakes it.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        if let Some(first) = approvals.first() {
+            tx.execute(
+                "UPDATE session_record \
+                 SET snapshot = ?2, epoch = ?3, status_kind = 'suspended', status_job = ?4 \
+                 WHERE session_id = ?1",
+                params![
+                    checkpoint.session_id.as_str(),
+                    checkpoint.snapshot.as_bytes(),
+                    checkpoint.epoch.0 as i64,
+                    first.job_id.as_str(),
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        for approval in &approvals {
+            // Dedupe a re-parked row on deterministic recovery (UNIQUE(session_id, job_id)).
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_approvals \
+                 (session_id, job_id, epoch, prompt, path, decision) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    approval.session_id.as_str(),
+                    approval.job_id.as_str(),
+                    approval.epoch.0 as i64,
+                    approval.prompt,
+                    approval.path,
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        tx.commit().map_err(sql_err)?;
+        self.take_fault(FaultPoint::AfterSnapshot)?;
+        Ok(())
+    }
+
+    async fn answer_approval(
+        &self,
+        session: &SessionId,
+        job_id: &JobId,
+        allow: bool,
+    ) -> Result<bool, StoreError> {
+        // Stamp the decision, record the completion, and publish the wake in one transaction.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT epoch, decision FROM pending_approvals WHERE session_id = ?1 AND job_id = ?2",
+                params![session.as_str(), job_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let epoch = match row {
+            // Already answered: idempotent no-op (a redelivered decision).
+            Some((_, Some(_))) => return Ok(true),
+            Some((epoch, None)) => epoch,
+            None => return Ok(false),
+        };
+        tx.execute(
+            "UPDATE pending_approvals SET decision = ?3 WHERE session_id = ?1 AND job_id = ?2",
+            params![session.as_str(), job_id.as_str(), allow as i64],
+        )
+        .map_err(sql_err)?;
+        let payload: &[u8] = if allow { b"allow" } else { b"deny" };
+        let fresh = tx
+            .execute(
+                "INSERT OR IGNORE INTO completion_inbox (session_id, epoch, job_id, payload) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session.as_str(), epoch, job_id.as_str(), payload],
+            )
+            .map_err(sql_err)?;
+        if fresh > 0 {
+            tx.execute(
+                "UPDATE session_record SET status_kind = 'ready' WHERE session_id = ?1",
+                params![session.as_str()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "INSERT INTO wake_outbox (session_id) VALUES (?1)",
+                params![session.as_str()],
+            )
+            .map_err(sql_err)?;
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(true)
+    }
+
+    async fn pending_approvals_of(&self, session: Option<&SessionId>) -> Vec<ParkedApproval> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ParkedApproval> {
+            Ok(ParkedApproval {
+                session_id: SessionId::new(r.get::<_, String>(0)?),
+                job_id: JobId::new(r.get::<_, String>(1)?),
+                epoch: Epoch(r.get::<_, i64>(2)? as u64),
+                prompt: r.get::<_, String>(3)?,
+                path: r.get::<_, Option<String>>(4)?,
+                decision: None,
+            })
+        };
+        match session {
+            Some(id) => {
+                let mut stmt = match conn.prepare(
+                    "SELECT session_id, job_id, epoch, prompt, path FROM pending_approvals \
+                     WHERE session_id = ?1 AND decision IS NULL ORDER BY rowseq",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                stmt.query_map(params![id.as_str()], map_row)
+                    .and_then(|r| r.collect::<Result<Vec<_>, _>>())
+                    .unwrap_or_default()
+            }
+            None => {
+                let mut stmt = match conn.prepare(
+                    "SELECT session_id, job_id, epoch, prompt, path FROM pending_approvals \
+                     WHERE decision IS NULL ORDER BY rowseq",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                stmt.query_map([], map_row)
+                    .and_then(|r| r.collect::<Result<Vec<_>, _>>())
+                    .unwrap_or_default()
+            }
+        }
     }
 
     async fn delegation_work(&self, child: &SessionId) -> Option<String> {

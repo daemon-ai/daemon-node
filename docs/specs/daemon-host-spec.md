@@ -114,6 +114,11 @@ A session task is the host's driver around one engine incarnation:
    (`TaskTracker` frees the memory). Persist-before-stop is mandatory.
 4. **Complete** — on `TurnFinished`/`Shutdown`, emit `ManageEvent::Finished { outcome }` and exit.
 
+A fifth boundary, **Park** (`Step::ParkApproval`), is the §12 durable edit-approval (HITL) variant of
+suspend: the engine suspended on an operator decision rather than background work. The activation
+layer checkpoints the snapshot and records the parked rows via `park_approval` in one transaction,
+but enqueues **no** runnable job — the session stays dormant until an operator answer wakes it (§7.1).
+
 Background work is **never a child of the session task**; it runs in a durable worker keyed by
 `JobId`, so the session can dehydrate while it runs.
 
@@ -131,6 +136,7 @@ same trait.
 | `completion_inbox` | durable background-job completions | `UNIQUE(session_id, epoch, job_id)` → idempotent apply |
 | `wake_outbox` | durable `Wake(SessionId)` hints | at-least-once delivery; consumer is idempotent |
 | `job_outbox` | durable background-job commands | at-least-once dispatch to workers |
+| `pending_approvals` | parked §12 edit-approval requests (HITL) | `UNIQUE(session_id, job_id)`; a `NULL decision` keeps the session dormant (§7.1) |
 | `activation_leases` | partition ownership + monotonic fencing token | only the highest fence may commit |
 | `journal_entries` | the verifiable journal's append-only entries (opaque CBOR + content hash) | `UNIQUE(stream, segment, seq)`; a monotonic `cursor` keys the non-destructive read (§5.1) |
 | `journal_roots` | per-segment sealed Merkle root + signature | one row per `(stream, segment)`; the rolling hash chain |
@@ -406,6 +412,50 @@ trait Provisioner: Send + Sync {
     async fn reclaim(&self, id: &SessionId);
 }
 ```
+
+---
+
+## 7.1 Runtime control — live model switch + edit-approval HITL
+
+The node surface exposes two **runtime-control** capabilities a GUI/operator drives on a running
+session (wire v5).
+
+**Live model switch (`SetSessionModel`).** A session holds one `Provider`, built at open; `Request`
+carries no model, so a switch is a provider swap on the live actor. `SetSessionModel { session,
+model, provider? }` resolves the session's `ProfileSpec`, clones it with the new model/provider,
+builds a provider, and sends `ActorMsg::SetProvider` to the running actor (`Engine::set_provider`,
+applied at the next turn boundary so an in-flight turn's prompt cache is never invalidated). It is
+transient (the bound profile is not mutated); a per-session model override feeds `model_current`. A
+durable session re-resolves its model from the profile on rehydration.
+
+**Edit-approval session modes (`SetSessionMode`/`ApprovalMode`).** Each session carries an
+`ApprovalPolicy` (`Ask` | `AcceptEdits` | `AutoAllow` | `Deny`, mirroring hermes' Default / Accept-Edits
+/ Don't-Ask plus an explicit deny), durable on the `Snapshot` and consulted by every gated tool
+action (an fs edit, a dangerous shell command). A shared `is_sensitive_path` carve-out (`.git`/`.ssh`,
+dotenv, private keys) always asks regardless of policy. Autonomous durable engines (orchestrator,
+delegated children, the fleet worker, background-review) default to `AutoAllow` so a headless turn
+never stalls; interactive sessions default to `Ask`, and a GUI selects the mode live.
+
+**Durable approval HITL (`ApprovalsPending`/`ApprovalDecide`).** A live session's `Ask` parks the
+prompt into the drain queue and the `ParkingHandler` answers it on `respond` (or auto-allows/denies
+when the live policy permits). A **durable** session cannot block a host future across restarts, so
+its `Ask` mirrors the delegation suspend/resume path:
+
+1. the gated tool asks the host; the durable `DelegateResolver` returns `HostResponseBody::Deferred(job_id)`
+   (a deterministic id per `(session, post-bump epoch, ordinal)`);
+2. the engine records a `PendingApproval` on its snapshot and suspends with the `await-approval`
+   payload (`Effect::AwaitDecision`), producing `Step::ParkApproval`;
+3. the activation layer `park_approval`s the snapshot + rows with **no** runnable job — the session
+   goes dormant;
+4. an operator lists parked asks (`ApprovalsPending`) and answers one (`ApprovalDecide { session,
+   request_id, allow }`); the store stamps the decision, records a completion (`allow`/`deny`), and
+   enqueues a wake — one transaction, idempotent per `(session, epoch, job)`;
+5. the woken engine resolves the parked decision: **allow** re-runs the tool call (`pre_approved`, so
+   it skips the gate and performs the side effect); **deny** injects a tool-error result. The turn
+   continues so the model sees the resolved tool result.
+
+A parked approval survives restart (it is durable in `pending_approvals` + the suspended snapshot)
+and the wake-on-decision dedupes like a delegation completion (deterministic epoch + the unique row).
 
 ---
 

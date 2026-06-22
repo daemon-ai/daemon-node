@@ -671,6 +671,16 @@ fn render(resp: ApiResponse) {
                 println!("  - {} {:?}", info.session, info.state);
             }
         }
+        ApiResponse::Approvals(list) => {
+            println!("pending approvals: {}", list.len());
+            for info in list {
+                let path = info.path.map(|p| format!(" path={p}")).unwrap_or_default();
+                println!(
+                    "  - {} req={}{} :: {}",
+                    info.session, info.request_id, path, info.prompt
+                );
+            }
+        }
         ApiResponse::Fleet(f) => {
             println!(
                 "fleet: children={} usage(in={} out={} api_calls={})",

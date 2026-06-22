@@ -10,9 +10,10 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use daemon_common::ReqId;
-use daemon_core::{Command, ExecCx, Tool, ToolCall, ToolOutcome, TurnCx};
-use daemon_protocol::{HostRequest, HostRequestKind, HostResponseBody, ToolDetail};
+use daemon_core::{
+    approve_command, Command, Effect, ExecCx, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
+};
+use daemon_protocol::ToolDetail;
 use serde::{Deserialize, Serialize};
 
 /// Catastrophic command fragments that are *always* denied, regardless of approval policy.
@@ -106,23 +107,33 @@ impl Tool for ShellTool {
             );
         }
 
-        // Tier 2 — dangerous: ask the host to approve before running.
+        // Tier 2 — dangerous: gate on the session's approval policy (§12). The live host answers
+        // inline; the headless/durable host parks the decision and the turn suspends.
         if needs_approval(&parsed.command, &line) {
-            let resp = cx
-                .host
-                .request(HostRequest {
-                    request_id: ReqId(0),
-                    kind: HostRequestKind::Approval {
-                        prompt: format!("approve command: {line}"),
-                    },
-                })
-                .await;
-            if !matches!(resp.body, HostResponseBody::Approved(true)) {
-                return ToolOutcome::text(
-                    call.call_id.clone(),
-                    false,
-                    format!("shell: denied by approval policy: {line}"),
-                );
+            let prompt = format!("approve command: {line}");
+            match approve_command(cx, prompt.clone()).await {
+                Gate::Proceed => {}
+                Gate::Reject(reason) => {
+                    return ToolOutcome::text(
+                        call.call_id.clone(),
+                        false,
+                        format!("shell: {reason}: {line}"),
+                    )
+                }
+                Gate::Defer(job_id) => {
+                    // Durable HITL: suspend awaiting the operator's decision; do not run the command.
+                    return ToolOutcome::text(
+                        call.call_id.clone(),
+                        false,
+                        format!("awaiting-approval:{job_id}"),
+                    )
+                    .with_effects(vec![Effect::AwaitDecision {
+                        job_id,
+                        call: call.clone(),
+                        prompt,
+                        path: None,
+                    }]);
+                }
             }
         }
 
@@ -155,8 +166,8 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
     use daemon_common::{Budget, SessionId};
-    use daemon_core::{EventSink, LocalEnvironment};
-    use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse};
+    use daemon_core::{ApprovalPolicy, EventSink, LocalEnvironment};
+    use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
     use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
 
@@ -191,6 +202,8 @@ mod tests {
             budget: Budget::unlimited(),
             exec: env,
             tool_result_budget: 0,
+            approval_policy: ApprovalPolicy::Ask,
+            pre_approved: false,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -240,7 +253,7 @@ mod tests {
         let host = FixedHost(false);
         let out = run(&env, &host, r#"{"command":"sudo","args":["ls"]}"#).await;
         assert!(!out.result.ok);
-        assert!(out.result.content.contains("denied by approval"));
+        assert!(out.result.content.contains("denied"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

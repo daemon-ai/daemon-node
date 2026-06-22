@@ -340,7 +340,11 @@ impl WireVersion {
     /// v4 (background spawn): adds the fire-and-forget `HostRequestKind::Spawn { SpawnSpec }` host
     /// request (engine-native `Effect::Spawn`) materializing an attached, self-closing background
     /// child (skill/memory review) that records a child edge without suspending or waking the parent.
-    pub const CURRENT: Self = Self(4);
+    ///
+    /// v5 (runtime control): adds the live per-session model switch (`SetSessionModel`), the §12
+    /// edit-approval session modes (`SetSessionMode` + `ApprovalMode`), and the durable HITL approval
+    /// surface (`HostResponseBody::Deferred`, `ApprovalsPending`/`ApprovalDecide`, `ApprovalInfo`).
+    pub const CURRENT: Self = Self(5);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

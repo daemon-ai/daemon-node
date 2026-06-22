@@ -166,6 +166,8 @@ async fn run_tool(tool: &dyn Tool, args: &str) -> daemon_core::ToolOutcome {
         budget: Budget::unlimited(),
         exec: &exec,
         tool_result_budget: 0,
+        approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
+        pre_approved: false,
     };
     let call = ToolCall {
         call_id: "c1".into(),

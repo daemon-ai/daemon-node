@@ -21,15 +21,16 @@ use async_trait::async_trait;
 use daemon_api::{EngineTunables, FleetReport, ProfileSpec};
 use daemon_common::{Budget, JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
-    Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile, MemoryBuilder,
-    MemoryProvider, ProviderBuilder, ProviderRegistry, StablePromptSource, SystemPrompt, Tool,
-    ToolRegistry,
+    ApprovalPolicy, Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile,
+    MemoryBuilder, MemoryProvider, ProviderBuilder, ProviderRegistry, StablePromptSource,
+    SystemPrompt, Tool, ToolRegistry,
 };
 use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
     CodecSession, CoreEngineFactory, CredentialStore, EngineUnit, FleetControl, Host, HostConfig,
-    JobWorker, JournalConfig, JournalFeeder, JournalSink, NodeApiImpl, ProcessAgentUnit,
-    ProfileStore, ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
+    JobWorker, JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl,
+    ProcessAgentUnit, ProfileStore, ServiceError, SessionEngineBuilder, StreamJsonCodec,
+    SupervisorHandle,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -227,6 +228,9 @@ fn background_registry(a: &NodeAssembly) -> BackgroundProfileRegistry {
         max_iterations: BACKGROUND_MAX_ITERATIONS,
         skill_review_interval: 0,
         memory_review_interval: 0,
+        // A background-review child runs autonomously (no operator attached): never gate its tool
+        // actions on a human, or the headless turn would suspend forever.
+        approval_policy: ApprovalPolicy::AutoAllow,
         ..a.engine_config
     };
     // A clean base carrying only the node's provider (orchestrator selection) + brokered credentials.
@@ -406,6 +410,14 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
 
     // The fleet child: one shared profile, driven as the real job worker so every child gets the same
     // provider + brokered credentials. Each child journals into the shared store keyed by its UnitId.
+    // Autonomous durable engines (the orchestrator, every delegated child, the fleet job worker)
+    // run headless with no operator to answer an edit-approval ask, so they must never gate on a
+    // human (an `Ask` would suspend the turn forever). Force `AutoAllow` for these roles; the
+    // *interactive* session path keeps the operator-selectable base policy (default `Ask`).
+    let autonomous_config = Config {
+        approval_policy: ApprovalPolicy::AutoAllow,
+        ..a.engine_config
+    };
     let child_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, CHILD_PROFILE),
@@ -413,7 +425,8 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             SystemPrompt::new("fleet child"),
         ),
         &a,
-    );
+    )
+    .with_config(autonomous_config);
     // The legacy synchronous placement seam (in-process live engine children + foreign agents). The
     // durable Core delegation path no longer uses this — it materializes children as durable
     // sessions through the shared activation manager (see `FleetJobWorker`) — so this spawner is
@@ -447,7 +460,8 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             SystemPrompt::new("daemon host node"),
         ),
         &a,
-    );
+    )
+    .with_config(autonomous_config);
     // The §4.3 background-review spawner: shared by the durable factory (so a review child raised
     // mid-turn resolves its constrained profile during hydrate) and the live surface (so a `Spawn`
     // host request from an interactive session is materialized fire-and-forget). Inert when the
@@ -546,6 +560,13 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // Bind the live cloud-model discovery hook when the binary provided one.
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {
         node_api = node_api.with_cloud_catalog(cloud_catalog);
+    }
+    // Bind the live model-switch factory when this node resolves per-session profiles: a
+    // `SetSessionModel` rebuilds a running session's provider for the new model id from the
+    // (model-overridden) profile bundle via the same provider resolver.
+    if let Some(resolver) = a.provider_resolver.clone() {
+        let factory: ModelProviderFactory = Arc::new(move |spec| (resolver)(spec)());
+        node_api = node_api.with_model_factory(factory);
     }
     // Bind the background-review spawner so live sessions materialize `Spawn` requests fire-and-forget.
     node_api = node_api.with_background(background.clone());

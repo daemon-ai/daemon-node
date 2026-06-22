@@ -5,6 +5,7 @@
 //! to the engine via [`EngineProfile::with_config`](crate::EngineProfile::with_config); the turn
 //! loop never reads env/files itself.
 
+use crate::approval::ApprovalPolicy;
 use serde::{Deserialize, Serialize};
 
 /// The default per-turn ReAct iteration cap (model rounds), mirroring hermes' `iteration_budget.py`
@@ -71,6 +72,13 @@ pub struct Config {
     /// `Effect::Spawn { kind: "memory_review" }` and resets the counter. `0` disables (default).
     /// Mirrors hermes' `_memory_nudge_interval`.
     pub memory_review_interval: u32,
+    /// The default edit-approval policy (?12 session mode) for a session that has not set an
+    /// explicit one. The engine threads the effective policy onto each turn so a gated tool (fs
+    /// edit / dangerous shell command) consults it. The default `Ask` makes the engine prompt for
+    /// approval (the live host parks for a human; the durable host suspends for an operator);
+    /// autonomous fleet engines are configured `AutoAllow` so they never stall.
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
 }
 
 impl Default for Config {
@@ -86,6 +94,7 @@ impl Default for Config {
             model_stream_watchdog_ms: DEFAULT_MODEL_STREAM_WATCHDOG_MS,
             skill_review_interval: DEFAULT_REVIEW_NUDGE_INTERVAL,
             memory_review_interval: DEFAULT_REVIEW_NUDGE_INTERVAL,
+            approval_policy: ApprovalPolicy::Ask,
         }
     }
 }
