@@ -2939,6 +2939,184 @@ mod node_interface {
         handle.shutdown().await;
     }
 
+    /// FOUNDATION (account->profile binding, daemon-event-io-spec §5.9.4): a profile *declares* the
+    /// transport-instance accounts bound to it (`ProfileSpec.bound_accounts`), and the host derives
+    /// the routing registry's `instance_profiles` baseline (precedence step 2) from that profile
+    /// data — not a route-table column. Proves, with no chat transport: (1) two profiles' bound
+    /// accounts route their instances to the right agent with an EMPTY config routing table; (2) an
+    /// explicit config instance binding overrides the profile-derived one (operator wins); (3) the
+    /// `CredentialStore` is the system-of-record for the opaque account blob a binding names — it
+    /// lists back redacted, the secret never returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_accounts_derive_instance_profile_binding() {
+        use daemon_api::{
+            BoundAccount, CredentialApi, Outbound, ProfileSpec, ProviderSelector, SessionApi,
+        };
+        use daemon_common::ReqId;
+        use daemon_host::{MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
+        use daemon_protocol::{AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg};
+
+        // An echoing resolver: the reply reveals which profile (agent) ran the session.
+        fn echo_resolver() -> daemon_node::ProviderResolver {
+            Arc::new(|spec: &ProfileSpec| {
+                let reply = format!("[{}]", spec.id);
+                let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                    Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+                });
+                builder
+            })
+        }
+
+        // Two profiles, each DECLARING its bound transport-instance account (+ the credential ref
+        // naming where its opaque session blob lives). No config route table is constructed.
+        fn profile_store() -> Arc<MemProfileStore> {
+            let store = Arc::new(MemProfileStore::new());
+            store
+                .create(
+                    ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a")
+                        .with_bound_accounts(vec![BoundAccount::new(
+                            "matrix/@a:hs",
+                            "matrix/alpha/a",
+                        )]),
+                )
+                .expect("create alpha");
+            store
+                .create(
+                    ProfileSpec::new("beta", ProviderSelector::GenAi, "model-b")
+                        .with_bound_accounts(vec![BoundAccount::new("matrix/@b:hs", "matrix/beta/b")]),
+                )
+                .expect("create beta");
+            store.set_active("alpha").expect("set active");
+            store
+        }
+
+        async fn route_text(node: &Arc<NodeApiImpl>, origin: Origin) -> String {
+            let session = node
+                .submit_routed(
+                    origin,
+                    AgentCommand::StartTurn {
+                        input: UserMsg::new("hi"),
+                        request_id: ReqId(1),
+                    },
+                )
+                .await
+                .expect("routed submit");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for item in node.poll(session.clone(), 0).await.expect("poll") {
+                    if let Outbound::Event(AgentEvent::TurnFinished { summary, .. }) = item {
+                        return summary.final_text.unwrap_or_default();
+                    }
+                }
+                assert!(Instant::now() < deadline, "routed turn never finished");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let origin = |account: &str| {
+            Origin::new(
+                TransportId::new(format!("matrix/{account}")),
+                OriginScope::Group {
+                    chat: "#general".into(),
+                    thread: None,
+                },
+            )
+        };
+
+        // 1. Derive instance->profile purely from profile data, with an EMPTY config routing table.
+        let creds = Arc::new(MemCredentialStore::new());
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(profile_store()),
+            provider_resolver: Some(echo_resolver()),
+            credential_store: Some(creds),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: None,
+        });
+
+        let text_a = route_text(&node, origin("@a:hs")).await;
+        let text_b = route_text(&node, origin("@b:hs")).await;
+        assert!(
+            text_a.contains("[alpha]"),
+            "@a:hs derived from alpha.bound_accounts, got {text_a:?}"
+        );
+        assert!(
+            text_b.contains("[beta]"),
+            "@b:hs derived from beta.bound_accounts, got {text_b:?}"
+        );
+
+        // 3. The CredentialStore is the system-of-record for the opaque account blob the binding
+        // names: set it under the credential ref and confirm it lists back redacted.
+        node.credential_set("matrix/alpha/a".into(), "mxsession-secret-blob-7f3c".into())
+            .await
+            .expect("store the opaque account session blob");
+        let listed = node.credential_list().await;
+        let acct = listed
+            .iter()
+            .find(|c| c.profile == "matrix/alpha/a")
+            .expect("the account blob is listed under its credential ref");
+        assert!(acct.present, "the stored account blob reports present");
+        assert_eq!(
+            acct.hint, "…7f3c",
+            "the account blob is redacted to a tail hint, never returned"
+        );
+
+        handle.shutdown().await;
+
+        // 2. An explicit config instance binding overrides the profile-derived one (operator wins):
+        // `bind_instance(@a:hs -> beta)` beats `alpha.bound_accounts` for that instance.
+        let routing = RoutingRegistry::new()
+            .bind_instance(TransportId::new("matrix/@a:hs"), ProfileRef::new("beta"));
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(profile_store()),
+            provider_resolver: Some(echo_resolver()),
+            credential_store: Some(Arc::new(MemCredentialStore::new())),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: Some(routing),
+        });
+        let text_override = route_text(&node, origin("@a:hs")).await;
+        assert!(
+            text_override.contains("[beta]"),
+            "config bind_instance(@a:hs -> beta) wins over profile-derived alpha, got {text_override:?}"
+        );
+        handle.shutdown().await;
+    }
+
     /// FOUNDATION: profile-scoped §11 memory under per-room routing. M1 made provider/persona/tools
     /// profile-aware per session, but §10 context and §11 memory were wired once from the launch
     /// profile's home — so two rooms routed to two profiles shared one bank. This proves the resolved

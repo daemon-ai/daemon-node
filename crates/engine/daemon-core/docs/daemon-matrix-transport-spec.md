@@ -27,8 +27,8 @@ chat transport needs.** Verified against the committed surface:
 | Observability-only meta (typing/receipts) | `record_meta` + `Disposition::Transport` | [`daemon-api/src/lib.rs`](../../../contracts/daemon-api/src/lib.rs):181 |
 | Human-in-the-loop approvals | `HostRequest`/`HostResponse` + `respond` | `HostRequestKind` protocol :393 |
 
-The only honest gap is multi-party context accumulation (§3.3). Everything else is adapter wiring plus
-the §5.9 routing capability.
+The one honest gap was multi-party context accumulation (§3.3) — since closed by `AgentCommand::Observe`.
+Everything else is adapter wiring plus the §5.9 routing capability.
 
 Out of scope: spaces/threads UI, voice/video, widgets, account registration. v1 targets text rooms +
 DMs with E2EE on.
@@ -128,12 +128,14 @@ context-bearing inbound (`StartTurn`/`Steer`) **runs the engine**. In a multi-us
 should *see* other humans' chatter as context but only *turn* on a mention / DM / command. There is no
 "append to conversation context without starting a turn." Two answers:
 
-- **v1 (no contract change, recommended):** the adapter **buffers** non-addressed messages (bounded
-  ring, cap ~32) and folds them, attributed, into the input of the next addressed `StartTurn`. The
-  merged log still records each as an inbound entry; only the *turn trigger* is mention-gated.
-- **future (small additive contract):** an `AgentCommand::Observe` (or context-append) variant that
-  appends to context without scheduling a turn. Flagged as a genuine paradigm extension the merged log
-  invites — not required for v1.
+- **v1 (no contract change):** the adapter **buffers** non-addressed messages (bounded ring, cap ~32)
+  and folds them, attributed, into the input of the next addressed `StartTurn`. The merged log still
+  records each as an inbound entry; only the *turn trigger* is mention-gated.
+- **landed (additive contract):** `AgentCommand::Observe { input, request_id }` appends inbound
+  context to the conversation **without** opening a turn (wire v8). Chatter folds in while the engine
+  is idle and lands in the following turn while busy — so the adapter can surface every room message
+  as context and still mention-gate the *turn*, without the buffer-and-fold workaround. Either
+  approach works; `Observe` is the cleaner one now that it exists.
 
 **Addressing / trigger + busy policy is pure adapter logic** (prior art: hermes `busy_input_mode`), no
 contract home needed:
@@ -242,12 +244,15 @@ store (§6.3).
   here at startup; matrix-sdk token **refreshes are written back** here — the credential store is
   **authoritative** over the SDK's own session copy (observe `Client` session changes via
   `set_session_callback` / save-session hook and persist on change).
-- **Account ↔ profile binding.** The profile names its Matrix account credential-ref(s), analogous to
-  `ProfileSpec.credential_ref` (the provider key, [`daemon-api/src/profile.rs`](../../../contracts/daemon-api/src/profile.rs):146).
-  Recommend a dedicated **`ProfileSpec.matrix_credential_refs: Vec<String>`** (since `credential_ref`
-  is already taken by the provider key); a ref-prefix convention (`matrix/<profile>/<instance>`) is the
-  no-schema-change alternative. A profile owns 1..N accounts; the adapter discovers accounts by
-  scanning profiles' Matrix refs and brings up one `Client` per account.
+- **Account ↔ profile binding — landed (generically).** The profile names its account(s) via the
+  transport-agnostic **`ProfileSpec.bound_accounts: Vec<BoundAccount { transport_instance, credential_ref }>`**
+  ([`daemon-api/src/profile.rs`](../../../contracts/daemon-api/src/profile.rs)), distinct from
+  `credential_ref` (the provider key). For Matrix, `transport_instance` is `matrix/@bot:hs.org` and
+  `credential_ref` names the session blob below. The host derives the routing registry's
+  `instance_profiles` baseline (precedence step 2) from every profile's `bound_accounts` at assembly
+  (`RoutingRegistry::bind_instances_from_profiles`); an explicit config instance binding overrides it.
+  A profile owns 1..N accounts; the adapter (M3) discovers them by scanning profiles' `bound_accounts`
+  and brings up one `Client` per account.
 
 ### 6.3 E2EE store stays matrix-sdk-owned (NOT in the credential store)
 
@@ -325,22 +330,28 @@ whole point of the merged-log paradigm.
   debounced `m.replace` edits.
 - **`matrix-sdk-ui` sliding sync** needs homeserver support (simplified sliding sync / MSC4186); fall
   back to `matrix-sdk` native `sync` if absent.
-- **Multi-party context gap** (§3.3) — v1 buffer-and-fold is a workaround, not a contract fix.
-- **Profile-aware live binding** is the one genuinely invasive host change: it touches
-  `LiveSessions` / `SessionEngineBuilder` (`ensure(session, ProfileRef)`), and per-room profiles imply
-  **profile-scoped memory/context** — `profile_home` is already per-profile, but the live §10/§11
-  context/memory builders are wired for one profile at assembly, so routing to different profiles means
-  threading the profile through them (or accepting shared banks in v1).
+- **Multi-party context gap** (§3.3) — *addressed:* `AgentCommand::Observe` (wire v8) appends context
+  without a turn; the v1 buffer-and-fold remains a valid no-contract alternative.
+- **Profile-aware live binding** was the one genuinely invasive host change — *landed:* `LiveSessions`
+  / `SessionEngineBuilder` are profile-aware (`ensure(session, ProfileRef)`), and the per-room
+  **profile-scoped memory/context** it implies is done — `profile_home` is per-profile and the live
+  §10/§11 context/memory builders thread the resolved `ProfileRef`, so two routed profiles get
+  isolated banks (no shared-bank compromise).
 
 ---
 
 ## 10. Phased implementation plan (M-series)
 
 - **M0 — docs.** This doc + the event-io §5.9 routing capability (decision 10 + P4.5 phasing). *(Done.)*
-- **M1 — general routing (both directions).** Host-level binding registry + profile-aware
+- **M1 — general routing (both directions).** *(Done.)* Host-level binding registry + profile-aware
   `LiveSessions::ensure(session, ProfileRef)` + the transport-instance convention + the explicit
   outbound dispatch-ownership rule (subscriber self-selects Primary, honors `handover`). The reusable
-  foundation; **testable without Matrix** (e.g. HTTP-key → profile, reply on the same connection).
+  foundation; **testable without Matrix** (HTTP-key → profile, reply on the same connection).
+- **Foundation hardening (landed ahead of M5).** Pulled forward because they are transport-agnostic
+  and the foundation is cleaner with them in: profile-scoped §10/§11 memory/context (isolated banks
+  per routed profile), `AgentCommand::Observe` (the §3.3 context-append, wire v8), and the
+  account→profile binding as profile data (`ProfileSpec.bound_accounts` → `instance_profiles`,
+  precedence step 2). All testable without Matrix.
 - **M2 — `daemon-matrix` skeleton + per-account `login`.** SSO writes the session into `CredentialStore`
   under the profile's Matrix credential-ref; the adapter restores from there and opens the per-account
   E2EE store; refresh write-back. Feasibility proof.
@@ -349,5 +360,6 @@ whole point of the merged-log paradigm.
   reply to the per-account `Primary`.
 - **M4 — outbound richness.** `subscribe` stream; `HostRequest` → reaction-approval → `respond`;
   typing/receipt → `record_meta`; streaming-edit replies.
-- **M5 — hardening.** E2EE cross-signing/SAS verification; `handover` (GUI co-attach); profile-scoped
-  memory/context under per-room binding; optional out-of-process bin.
+- **M5 — hardening.** E2EE cross-signing/SAS verification; `handover` (GUI co-attach); optional
+  out-of-process bin. (Profile-scoped memory/context under per-room binding landed early — see
+  Foundation hardening above.)
