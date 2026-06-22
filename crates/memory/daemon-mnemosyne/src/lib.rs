@@ -34,7 +34,7 @@ pub mod store;
 pub mod tokens;
 pub mod util;
 
-pub use config::MnemosyneConfig;
+pub use config::{MnemosyneConfig, RecallMode};
 pub use engine::{Engine, MemoryRow, RememberArgs, Tier};
 pub use error::{Error, Result};
 pub use provider::MnemosyneProvider;

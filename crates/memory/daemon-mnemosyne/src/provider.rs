@@ -204,6 +204,37 @@ impl MnemosyneProvider {
     /// the episodic summary; otherwise the engine falls back to the deterministic AAAK summary.
     async fn run_sleep(&self, force: bool) {
         let _ = crate::tools::run_sleep(&self.engine, &self.extractor, force).await;
+        self.validate_conflicts().await;
+    }
+
+    /// Tier-2 LLM conflict validation (`llm_conflict_detector.py`), layered atop the deterministic
+    /// `(subject, predicate)` contradictions recorded in `conflicts` during consolidation. Opt-in
+    /// (`MNEMOSYNE_LLM_CONFLICT_DETECTION`) and only when an LLM backend is injected: each unresolved
+    /// pair is validated, and a confirmed conflict marks the older fact superseded by the newer one.
+    async fn validate_conflicts(&self) {
+        if !self.engine.llm_conflict_detection() || !self.extractor.available() {
+            return;
+        }
+        let pending = match self.engine.pending_conflicts() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        for c in pending {
+            if let Some(verdict) = crate::knowledge::conflict::validate_conflict_pair(
+                &self.extractor,
+                &c.older_text,
+                &c.newer_text,
+            )
+            .await
+            {
+                let _ = self.engine.resolve_conflict(
+                    c.conflict_id,
+                    verdict.is_conflict,
+                    &c.newer_fact_id,
+                    &c.older_fact_id,
+                );
+            }
+        }
     }
 }
 

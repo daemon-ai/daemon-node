@@ -5,6 +5,20 @@
 
 use std::path::PathBuf;
 
+/// Which recall pipeline `Engine::recall` dispatches to (`beam.py` `recall` L5098 polyphonic reroute
+/// / `recall_enhanced` L6202 gate). Selected from the Mnemosyne env flags, defaulting to `Base`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RecallMode {
+    /// The base hybrid cross-tier recall (`recall`), default.
+    #[default]
+    Base,
+    /// Intent-weighted + synonym-expanded + Weibull-rescored + MMR pipeline (`recall_enhanced`,
+    /// `MNEMOSYNE_ENHANCED_RECALL=1`).
+    Enhanced,
+    /// Four-voice RRF recall (`_recall_polyphonic`, `MNEMOSYNE_POLYPHONIC_RECALL=1`).
+    Polyphonic,
+}
+
 /// Engine configuration.
 #[derive(Clone, Debug)]
 pub struct MnemosyneConfig {
@@ -18,6 +32,10 @@ pub struct MnemosyneConfig {
     pub recency_halflife_hours: f64,
     /// Working-memory TTL in hours (`WORKING_MEMORY_TTL_HOURS`, default 168).
     pub working_memory_ttl_hours: f64,
+    /// Which recall pipeline to use (default [`RecallMode::Base`]).
+    pub recall_mode: RecallMode,
+    /// Enable the opt-in tier-2 LLM conflict detector in sleep (`MNEMOSYNE_LLM_CONFLICT_DETECTION`).
+    pub llm_conflict_detection: bool,
 }
 
 impl Default for MnemosyneConfig {
@@ -36,7 +54,26 @@ impl Default for MnemosyneConfig {
             session_id: "default".to_string(),
             recency_halflife_hours: 168.0,
             working_memory_ttl_hours: 168.0,
+            recall_mode: recall_mode_from_env(),
+            llm_conflict_detection: env_flag("MNEMOSYNE_LLM_CONFLICT_DETECTION"),
         }
+    }
+}
+
+/// True if the named env var is set to `1` (the Mnemosyne flag convention).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| v == "1").unwrap_or(false)
+}
+
+/// Select the recall pipeline from the Mnemosyne env flags. Polyphonic takes precedence over
+/// enhanced (matching `recall`'s reroute order), both default off.
+fn recall_mode_from_env() -> RecallMode {
+    if env_flag("MNEMOSYNE_POLYPHONIC_RECALL") {
+        RecallMode::Polyphonic
+    } else if env_flag("MNEMOSYNE_ENHANCED_RECALL") {
+        RecallMode::Enhanced
+    } else {
+        RecallMode::Base
     }
 }
 

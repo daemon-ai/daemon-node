@@ -50,6 +50,18 @@ pub fn weibull_decay_factor(age_hours: f64, memory_type: &str) -> f64 {
     (-(age_hours / eta).powf(k)).exp()
 }
 
+/// Temporal boost from a memory's age (`weibull.py` `weibull_boost` L66-L154). Unlike
+/// [`weibull_decay_factor`], an **unknown** age (unparseable / missing timestamp) returns `0.0`
+/// (the row gets no temporal credit); a `Some(age)` defers to the survival function (future ages
+/// clamp to `1.0`). This is the form the enhanced-recall blend `score*0.7 + wb*0.3` uses
+/// (`beam.py` L6272).
+pub fn weibull_boost(age_hours: Option<f64>, memory_type: &str) -> f64 {
+    match age_hours {
+        Some(age) => weibull_decay_factor(age, memory_type),
+        None => 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +84,13 @@ mod tests {
     #[test]
     fn future_is_one() {
         assert_eq!(weibull_decay_factor(0.0, "event"), 1.0);
+    }
+
+    #[test]
+    fn boost_none_age_is_zero() {
+        assert_eq!(weibull_boost(None, "fact"), 0.0);
+        // A known age defers to the survival function.
+        assert_eq!(weibull_boost(Some(0.0), "event"), 1.0);
+        assert!((weibull_boost(Some(720.0), "fact") - weibull_decay_factor(720.0, "fact")).abs() < 1e-12);
     }
 }

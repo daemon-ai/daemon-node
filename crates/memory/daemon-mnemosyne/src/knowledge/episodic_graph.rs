@@ -55,6 +55,25 @@ pub struct Fact {
     pub confidence: f64,
 }
 
+/// A time-aware episode summary (`episodic_graph.py` `Gist` L53-L62).
+#[derive(Clone, Debug)]
+pub struct Gist {
+    /// Deterministic id (`gist_<memory_id>`).
+    pub id: String,
+    /// The concise episode summary (first sentence or first 100 chars).
+    pub text: String,
+    /// ISO timestamp.
+    pub timestamp: String,
+    /// Participant names + pronouns (capped at 5).
+    pub participants: Vec<String>,
+    /// Location reference, if any.
+    pub location: Option<String>,
+    /// Emotion class (`positive`/`negative`/`neutral`), if any.
+    pub emotion: Option<String>,
+    /// Temporal scope (`point_in_time`/`duration`/`range`), if any.
+    pub time_scope: Option<String>,
+}
+
 /// A neighbour discovered by [`find_related_memories`].
 #[derive(Clone, Debug)]
 pub struct Related {
@@ -185,6 +204,169 @@ pub fn store_fact(conn: &Connection, fact: &Fact, memory_id: &str, session_id: &
     Ok(())
 }
 
+/// Rule-based gist extraction (`episodic_graph.py` `extract_gist` L165-L275): participants
+/// (capitalized names + pronouns, cap 5), temporal scope, location, emotion, and a first-sentence
+/// summary. Zero LLM.
+pub fn extract_gist(content: &str, memory_id: &str) -> Gist {
+    Gist {
+        id: format!("gist_{memory_id}"),
+        text: create_summary(content),
+        timestamp: util::now_iso(),
+        participants: extract_participants(content),
+        location: extract_location(content),
+        emotion: extract_emotion(content),
+        time_scope: extract_temporal_scope(content),
+    }
+}
+
+struct GistPatterns {
+    name: Regex,
+    pronoun: Regex,
+    temporal: Vec<(Regex, &'static str)>,
+    location: Vec<Regex>,
+}
+
+fn gist_patterns() -> &'static GistPatterns {
+    static P: OnceLock<GistPatterns> = OnceLock::new();
+    P.get_or_init(|| GistPatterns {
+        name: Regex::new(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b").unwrap(),
+        pronoun: Regex::new(r"(?i)\b(I|you|we|they|he|she|it|me|us|them|him|her)\b").unwrap(),
+        temporal: vec![
+            (
+                Regex::new(r"(?i)\b(yesterday|today|tomorrow|now|soon|later|earlier)\b").unwrap(),
+                "point_in_time",
+            ),
+            (
+                Regex::new(r"(?i)\b(last\s+week|last\s+month|last\s+year|next\s+week)\b").unwrap(),
+                "point_in_time",
+            ),
+            (
+                Regex::new(r"(?i)\b(since|from|starting)\b.*\b(until|to|through|end)\b").unwrap(),
+                "duration",
+            ),
+            (Regex::new(r"(?i)\b(between|from)\b.*\b(and|to)\b").unwrap(), "range"),
+            (Regex::new(r"(?i)\b\d{1,2}:\d{2}\s*(AM|PM|am|pm)?\b").unwrap(), "point_in_time"),
+            (Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").unwrap(), "point_in_time"),
+        ],
+        location: vec![
+            Regex::new(
+                r"(?i)\b(at|in|from)\s+([A-Z][a-zA-Z\s]+?)(?:\s+(?:yesterday|today|tomorrow|now|last|next|on|at)\b|$)",
+            )
+            .unwrap(),
+            Regex::new(r"(?i)\b(office|home|work|school|hospital|store|restaurant|building|room)\b")
+                .unwrap(),
+        ],
+    })
+}
+
+/// Participant names + pronouns, deduped (order-preserving) and capped at 5 (`_extract_participants`
+/// L209-L221).
+fn extract_participants(content: &str) -> Vec<String> {
+    let p = gist_patterns();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let push = |s: String, seen: &mut HashSet<String>, out: &mut Vec<String>| {
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    };
+    for cap in p.name.captures_iter(content) {
+        push(cap[1].to_string(), &mut seen, &mut out);
+    }
+    for cap in p.pronoun.captures_iter(content) {
+        push(cap[1].to_string(), &mut seen, &mut out);
+    }
+    out.truncate(5);
+    out
+}
+
+/// Temporal scope class, or `None` (`_extract_temporal_scope` L223-L238).
+fn extract_temporal_scope(content: &str) -> Option<String> {
+    for (re, scope) in &gist_patterns().temporal {
+        if re.is_match(content) {
+            return Some((*scope).to_string());
+        }
+    }
+    None
+}
+
+/// Location reference, or `None` (`_extract_location` L240-L252): the prepositional-phrase pattern
+/// yields its capitalized place (group 2), the keyword pattern yields the matched word (group 1).
+fn extract_location(content: &str) -> Option<String> {
+    let pats = &gist_patterns().location;
+    if let Some(c) = pats[0].captures(content) {
+        if let Some(m) = c.get(2) {
+            return Some(m.as_str().trim().to_string());
+        }
+    }
+    if let Some(c) = pats[1].captures(content) {
+        if let Some(m) = c.get(1) {
+            return Some(m.as_str().to_string());
+        }
+    }
+    None
+}
+
+/// Emotion class, or `None` (`_extract_emotion` L254-L267). Order: positive, negative, neutral.
+fn extract_emotion(content: &str) -> Option<String> {
+    const POSITIVE: &[&str] =
+        &["happy", "excited", "great", "awesome", "love", "enjoy", "glad", "pleased"];
+    const NEGATIVE: &[&str] =
+        &["sad", "angry", "frustrated", "upset", "hate", "disappointed", "worried"];
+    const NEUTRAL: &[&str] = &["fine", "okay", "alright", "normal", "standard"];
+    let lower = content.to_lowercase();
+    for (class, words) in [("positive", POSITIVE), ("negative", NEGATIVE), ("neutral", NEUTRAL)] {
+        if words.iter().any(|w| lower.contains(w)) {
+            return Some(class.to_string());
+        }
+    }
+    None
+}
+
+/// First-sentence (or first-100-char) summary (`_create_summary` L269-L275).
+fn create_summary(content: &str) -> String {
+    let first = content.split(['.', '!', '?']).next().unwrap_or("");
+    if first.chars().count() > 10 {
+        return first.trim().chars().take(100).collect();
+    }
+    content.chars().take(100).collect::<String>().trim().to_string()
+}
+
+/// Store a gist (`episodic_graph.py` `store_gist` L376-L393).
+pub fn store_gist(conn: &Connection, gist: &Gist, memory_id: &str) -> Result<()> {
+    let participants_json = serde_json::to_string(&gist.participants).unwrap_or_else(|_| "[]".into());
+    conn.execute(
+        "INSERT OR REPLACE INTO gists \
+         (id, text, timestamp, participants_json, location, emotion, time_scope, memory_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            gist.id,
+            gist.text,
+            gist.timestamp,
+            participants_json,
+            gist.location,
+            gist.emotion,
+            gist.time_scope,
+            memory_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// `(memory_id, gist_text)` for gists whose `participants_json` contains `participant`
+/// (`episodic_graph.py` `find_gists_by_participant` L508-L529). Used by the polyphonic graph voice.
+pub fn find_gists_by_participant(conn: &Connection, participant: &str) -> Result<Vec<(String, String)>> {
+    let like = format!("%\"{participant}\"%");
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, text FROM gists \
+         WHERE participants_json LIKE ?1 ORDER BY timestamp DESC",
+    )?;
+    let rows = stmt.query_map(params![like], |r| {
+        Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, String>(1)?))
+    })?;
+    Ok(rows.flatten().filter(|(mid, _)| !mid.is_empty()).collect())
+}
+
 /// Add a graph edge (`episodic_graph.py` `add_edge` L414-L428), stamping the current time.
 pub fn add_edge(conn: &Connection, edge: &GraphEdge) -> Result<()> {
     conn.execute(
@@ -287,6 +469,17 @@ mod tests {
         );
         // "It is a thing" -> pronoun-led subject rejected.
         assert!(!facts.iter().any(|f| f.subject.eq_ignore_ascii_case("it")));
+    }
+
+    #[test]
+    fn extract_gist_pulls_participants_emotion_and_summary() {
+        let g = extract_gist("Alice was happy at the Office yesterday. We celebrated.", "m1");
+        assert_eq!(g.id, "gist_m1");
+        assert!(g.participants.iter().any(|p| p == "Alice"));
+        assert_eq!(g.emotion.as_deref(), Some("positive"));
+        assert_eq!(g.time_scope.as_deref(), Some("point_in_time"));
+        assert!(g.text.starts_with("Alice was happy"));
+        assert!(g.participants.len() <= 5);
     }
 
     #[test]

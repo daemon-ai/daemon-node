@@ -9,16 +9,18 @@
 //! [`Engine::consolidate`] is a minimal WM->episodic promotion (no LLM summarization/degradation).
 //! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain TODO (port-spec P1).
 
-use crate::config::MnemosyneConfig;
-use crate::dynamics::typed_memory;
+use crate::config::{MnemosyneConfig, RecallMode};
+use crate::dynamics::{typed_memory, weibull};
 use crate::error::Result;
 use crate::knowledge::{annotations, entities, episodic_graph, temporal, veracity};
-use crate::recall::{mmr, scoring};
+use crate::recall::query_cache::QueryCache;
+use crate::recall::{mmr, polyphonic, query_intent, scoring, synonyms};
 use crate::store::Store;
 use crate::{binary_vectors, sanitize, util};
 use rusqlite::{params, Connection};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 /// Max co-occurrence edges drawn per shared entity at ingest, bounding the proactive-link fan-out
 /// (`beam.py` `_proactively_link` is similarly capped).
@@ -117,7 +119,7 @@ pub struct SleepReport {
 }
 
 /// Which BEAM tier a row lives in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tier {
     /// Hot, recent, auto-injected context.
     Working,
@@ -126,7 +128,7 @@ pub enum Tier {
 }
 
 /// A recalled / stored memory row (the `recall` result shape, `beam.py` L5996+).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MemoryRow {
     /// Memory id.
     pub id: String,
@@ -148,6 +150,21 @@ pub struct MemoryRow {
     pub tier_level: i64,
     /// The recall score (0 for direct fetches).
     pub score: f64,
+}
+
+/// An unresolved `(subject, predicate)` contradiction awaiting LLM validation in sleep.
+#[derive(Clone, Debug)]
+pub struct PendingConflict {
+    /// The `conflicts` row id.
+    pub conflict_id: i64,
+    /// The newer fact's consolidated id (the one being inserted).
+    pub newer_fact_id: String,
+    /// The newer fact reconstructed as `subject predicate object`.
+    pub newer_text: String,
+    /// The older/existing fact's consolidated id.
+    pub older_fact_id: String,
+    /// The older fact reconstructed as `subject predicate object`.
+    pub older_text: String,
 }
 
 /// Arguments for [`Engine::remember`] (`beam.py` `remember` L2836).
@@ -179,24 +196,111 @@ impl Default for RememberArgs {
 pub struct Engine {
     store: Store,
     config: MnemosyneConfig,
+    /// Whether the bank is file-backed (enables the on-disk `query_cache.db`).
+    persistent: bool,
+    /// Lazily-opened 5-tier semantic query cache (enhanced recall only).
+    query_cache: OnceLock<QueryCache>,
 }
 
 impl Engine {
     /// Open the engine for the configured bank.
     pub fn open(config: MnemosyneConfig) -> Result<Self> {
         let store = Store::open(config.bank_db_path())?;
-        Ok(Self { store, config })
+        Ok(Self {
+            store,
+            config,
+            persistent: true,
+            query_cache: OnceLock::new(),
+        })
     }
 
     /// Open an ephemeral in-memory engine (tests).
     pub fn open_in_memory(config: MnemosyneConfig) -> Result<Self> {
         let store = Store::open_in_memory()?;
-        Ok(Self { store, config })
+        Ok(Self {
+            store,
+            config,
+            persistent: false,
+            query_cache: OnceLock::new(),
+        })
+    }
+
+    /// The lazily-opened query cache (`query_cache.db` next to the bank when persistent, else
+    /// memory-only). Used by [`Engine::recall_enhanced`].
+    fn query_cache(&self) -> &QueryCache {
+        self.query_cache.get_or_init(|| {
+            if self.persistent {
+                let cache_path = self
+                    .config
+                    .bank_db_path()
+                    .parent()
+                    .map(|p| p.join("query_cache.db"));
+                QueryCache::open(cache_path.as_deref())
+            } else {
+                QueryCache::open(None)
+            }
+        })
     }
 
     /// The active session id.
     pub fn session_id(&self) -> &str {
         &self.config.session_id
+    }
+
+    /// Whether the opt-in tier-2 LLM conflict detector is enabled (`MNEMOSYNE_LLM_CONFLICT_DETECTION`).
+    pub fn llm_conflict_detection(&self) -> bool {
+        self.config.llm_conflict_detection
+    }
+
+    /// Unresolved `(subject, predicate)` contradictions recorded during consolidation, each with the
+    /// reconstructed older/newer fact text for LLM validation (`fact_a` is the newer fact,
+    /// `fact_b` the existing/older one — see [`veracity::record_conflict`] call in `consolidate_fact`).
+    pub fn pending_conflicts(&self) -> Result<Vec<PendingConflict>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, a.id, a.subject || ' ' || a.predicate || ' ' || a.object, \
+                    b.id, b.subject || ' ' || b.predicate || ' ' || b.object \
+             FROM conflicts c \
+             JOIN consolidated_facts a ON a.id = c.fact_a_id \
+             JOIN consolidated_facts b ON b.id = c.fact_b_id \
+             WHERE c.resolution IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingConflict {
+                conflict_id: r.get::<_, i64>(0)?,
+                newer_fact_id: r.get::<_, String>(1)?,
+                newer_text: r.get::<_, String>(2)?,
+                older_fact_id: r.get::<_, String>(3)?,
+                older_text: r.get::<_, String>(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Resolve a recorded conflict (`veracity_consolidation.py` resolution path). On a confirmed
+    /// conflict the older fact is marked `superseded_by` the newer one; either way the `conflicts`
+    /// row is stamped with the LLM resolution + timestamp so it is not re-validated.
+    pub fn resolve_conflict(
+        &self,
+        conflict_id: i64,
+        confirmed: bool,
+        winner_fact_id: &str,
+        loser_fact_id: &str,
+    ) -> Result<()> {
+        let conn = self.store.conn.lock().unwrap();
+        let now = util::now_iso();
+        if confirmed {
+            conn.execute(
+                "UPDATE consolidated_facts SET superseded_by = ?1, updated_at = ?2 WHERE id = ?3",
+                params![winner_fact_id, now, loser_fact_id],
+            )?;
+        }
+        let resolution = if confirmed { "llm_confirmed" } else { "llm_rejected" };
+        conn.execute(
+            "UPDATE conflicts SET resolution = ?1, resolved_at = ?2 WHERE id = ?3",
+            params![resolution, now, conflict_id],
+        )?;
+        Ok(())
     }
 
     /// Store a memory in the working tier (`beam.py` `remember` L2836), keyword-only (no vector).
@@ -256,6 +360,11 @@ impl Engine {
             )?;
         }
         self.ingest_knowledge(&conn, &id, &content, &args.veracity)?;
+        // Invalidate the enhanced-recall query cache (`beam.py` L3041-L3043). Only touched when the
+        // cache was actually opened (enhanced recall used), so Base mode pays nothing.
+        if let Some(cache) = self.query_cache.get() {
+            cache.invalidate();
+        }
         Ok(id)
     }
 
@@ -274,6 +383,11 @@ impl Engine {
         if !entity_list.is_empty() {
             annotations::add_many(conn, memory_id, "mentions", &entity_list, "regex", 1.0)?;
         }
+
+        // Rule-based episode gist (participants/temporal/location/emotion) for the polyphonic graph
+        // voice (`episodic_graph.py` `extract_gist` L165-L275).
+        let gist = episodic_graph::extract_gist(content, memory_id);
+        episodic_graph::store_gist(conn, &gist, memory_id)?;
 
         for fact in episodic_graph::extract_facts(content, memory_id) {
             episodic_graph::store_fact(conn, &fact, memory_id, &self.config.session_id)?;
@@ -432,14 +546,31 @@ impl Engine {
         top_k: usize,
         query_vector: Option<&[f32]>,
     ) -> Result<Vec<MemoryRow>> {
+        match self.config.recall_mode {
+            RecallMode::Base => self.recall_base(query, top_k, query_vector, scoring::DEFAULT_WEIGHTS),
+            RecallMode::Enhanced => self.recall_enhanced(query, top_k, query_vector),
+            RecallMode::Polyphonic => self.recall_polyphonic(query, top_k, query_vector),
+        }
+    }
+
+    /// The base hybrid cross-tier recall with explicit `(vec, fts, importance)` weights. This is the
+    /// faithful port of `beam.py` `recall`; the enhanced/polyphonic pipelines build on it.
+    fn recall_base(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_vector: Option<&[f32]>,
+        weights: (f64, f64, f64),
+    ) -> Result<Vec<MemoryRow>> {
         let q_tokens = tokenize(query);
         let q_entities = entities::extract_entities_regex(query);
         let floor = scoring::lexical_floor(q_tokens.len());
         let conn = self.store.conn.lock().unwrap();
 
-        let mut scored = self.gather_working(&conn, &q_tokens, &q_entities, top_k, floor, query_vector)?;
-        let episodic =
-            self.gather_episodic(&conn, &q_tokens, &q_entities, top_k, floor, query_vector)?;
+        let mut scored =
+            self.gather_working(&conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights)?;
+        let episodic = self
+            .gather_episodic(&conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights)?;
         scored.extend(episodic);
 
         // Graph expansion: pull in memories that mention a query entity (or sit within two graph
@@ -473,8 +604,228 @@ impl Engine {
         Ok(selected)
     }
 
+    /// Enhanced recall (`beam.py` `recall_enhanced` L6177-L6328): classify the query intent and bias
+    /// the hybrid weights, synonym-expand the query, consult the 5-tier query cache, run base recall
+    /// over the expanded query, Weibull-rescore by memory type (`score*0.7 + wb*0.3`), MMR-diversify,
+    /// and cache the result. Associative graph expansion is off by default in Python, and base recall
+    /// already injects entity/graph candidates, so it is not re-run here.
+    fn recall_enhanced(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_vector: Option<&[f32]>,
+    ) -> Result<Vec<MemoryRow>> {
+        // 1. Intent classification -> weight bias.
+        let intent = query_intent::classify_intent(query);
+        let weights = if intent == query_intent::Intent::General {
+            scoring::DEFAULT_WEIGHTS
+        } else {
+            query_intent::adjust_weights(scoring::DEFAULT_WEIGHTS, intent)
+        };
+
+        // 2. Synonym expansion (broadens FTS/lexical candidate generation).
+        let expanded = synonyms::expand_query(query);
+
+        // 3. Query cache check (keyed on the original query).
+        if let Some(mut cached) = self.query_cache().get(query, query_vector) {
+            cached.truncate(top_k);
+            return Ok(cached);
+        }
+
+        // 4. Base recall over the expanded query, gathering a wider pool.
+        let mut results = self.recall_base(&expanded, top_k * 2, query_vector, weights)?;
+
+        // 5. Weibull re-scoring by memory type.
+        self.weibull_rescore(&mut results)?;
+
+        // 6-7. Sort, then MMR-diversify down to `top_k`.
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let final_results: Vec<MemoryRow> = if results.len() > 1 {
+            let items: Vec<(String, f64)> =
+                results.iter().map(|r| (r.content.clone(), r.score)).collect();
+            mmr::mmr_rerank(&items, mmr::DEFAULT_LAMBDA, top_k)
+                .into_iter()
+                .map(|i| results[i].clone())
+                .collect()
+        } else {
+            results.truncate(top_k);
+            results
+        };
+
+        // 8. Cache the result for next time.
+        self.query_cache().put(query, &final_results, query_vector);
+        Ok(final_results)
+    }
+
+    /// Blend the per-type Weibull temporal boost into each row's score (`beam.py` L6266-L6278):
+    /// `score = score*0.7 + weibull_boost*0.3`. The memory type is read from the row's tier table;
+    /// missing/`unknown` types fall back to `general`.
+    fn weibull_rescore(&self, rows: &mut [MemoryRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.store.conn.lock().unwrap();
+        for row in rows.iter_mut() {
+            let table = match row.tier {
+                Tier::Working => "working_memory",
+                Tier::Episodic => "episodic_memory",
+            };
+            let mt: Option<String> = conn
+                .query_row(
+                    &format!("SELECT memory_type FROM {table} WHERE id = ?1"),
+                    params![row.id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let mut memory_type = mt.unwrap_or_default();
+            if memory_type.is_empty() || memory_type == "unknown" {
+                memory_type = "general".to_string();
+            }
+            let wb = weibull::weibull_boost(age_hours(&row.timestamp), &memory_type);
+            row.score = row.score * 0.7 + wb * 0.3;
+        }
+        Ok(())
+    }
+
+    /// Four-voice polyphonic recall (`polyphonic_recall.py`, `MNEMOSYNE_POLYPHONIC_RECALL=1`):
+    /// gathers a **vector** voice (cosine normalized `(cos+1)/2`, top 20), a **graph** voice (query
+    /// entities seed `facts` subjects at `0.6`, then `ctx`-edge traversal at `0.4/depth`), a **fact**
+    /// voice (consolidated `facts` whose subject is a query word, `confidence >= 0.5`), and a
+    /// **temporal** voice (last-7-day working rows, `exp(-age_days/7)*importance`, only on temporal
+    /// keywords), then fuses them with RRF ([`polyphonic::fuse`]), diversity-reranks, and resolves
+    /// the surviving ids to rows. Voice weights stay metadata-only (fusion is pure RRF).
+    fn recall_polyphonic(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_vector: Option<&[f32]>,
+    ) -> Result<Vec<MemoryRow>> {
+        use polyphonic::VoiceHit;
+        let conn = self.store.conn.lock().unwrap();
+
+        // Voice 1: vector (cosine over stored embeddings, normalized to [0, 1], top 20).
+        let mut vector_hits: Vec<VoiceHit> = Vec::new();
+        if let Some(q) = query_vector {
+            let stored = load_embeddings(&conn)?;
+            let mut sims: Vec<(String, f64)> = stored
+                .iter()
+                .map(|(id, v)| (id.clone(), (daemon_core::cosine(q, v) as f64 + 1.0) / 2.0))
+                .collect();
+            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sims.truncate(20);
+            vector_hits = sims.into_iter().map(|(id, s)| VoiceHit { memory_id: id, score: s }).collect();
+        }
+
+        // Voice 2: graph (entity-seeded gists @0.6 + fact subjects @conf*0.5, then ctx-edge
+        // traversal @0.4/depth from all seeds).
+        let q_entities = entities::extract_entities_regex(query);
+        let mut graph_hits: Vec<VoiceHit> = Vec::new();
+        let mut seen_graph: HashSet<String> = HashSet::new();
+        let mut seed_ids: HashSet<String> = HashSet::new();
+        for ent in &q_entities {
+            for (mid, _text) in episodic_graph::find_gists_by_participant(&conn, ent)? {
+                if seen_graph.insert(mid.clone()) {
+                    graph_hits.push(VoiceHit { memory_id: mid.clone(), score: 0.6 });
+                }
+                seed_ids.insert(mid);
+            }
+            for (mid, conf) in self.facts_for_subject(&conn, ent, 0.0)? {
+                if seen_graph.insert(mid.clone()) {
+                    graph_hits.push(VoiceHit { memory_id: mid.clone(), score: conf * 0.5 });
+                }
+                seed_ids.insert(mid);
+            }
+        }
+        for seed in &seed_ids {
+            for rel in episodic_graph::find_related_memories(&conn, seed, 2, "ctx", 0.3)? {
+                if !seed_ids.contains(&rel.memory_id) && seen_graph.insert(rel.memory_id.clone()) {
+                    graph_hits.push(VoiceHit {
+                        memory_id: rel.memory_id,
+                        score: 0.4 / rel.depth as f64,
+                    });
+                }
+            }
+        }
+
+        // Voice 3: fact (query words matched against consolidated `facts` subjects).
+        let mut fact_hits: Vec<VoiceHit> = Vec::new();
+        let mut seen_fact: HashSet<String> = HashSet::new();
+        for word in tokenize(query) {
+            if word.chars().count() < 3 {
+                continue;
+            }
+            for (mid, conf) in self.facts_for_subject(&conn, &word, 0.5)? {
+                if seen_fact.insert(mid.clone()) {
+                    fact_hits.push(VoiceHit { memory_id: mid, score: conf });
+                }
+            }
+        }
+
+        // Voice 4: temporal (recent working rows, only when the query has a temporal cue).
+        let mut temporal_hits: Vec<VoiceHit> = Vec::new();
+        if has_temporal_keyword(query) {
+            let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+            let mut stmt = conn.prepare(
+                "SELECT id, timestamp, importance FROM working_memory \
+                 WHERE timestamp > ?1 AND superseded_by IS NULL \
+                   AND (session_id = ?2 OR scope = 'global') \
+                 ORDER BY timestamp DESC LIMIT 20",
+            )?;
+            let rows = stmt.query_map(params![week_ago, self.config.session_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+            })?;
+            for row in rows.flatten() {
+                let (id, ts, imp) = row;
+                let age_days = age_hours(&ts).unwrap_or(0.0) / 24.0;
+                let tscore = (-age_days / 7.0).exp() * imp;
+                temporal_hits.push(VoiceHit { memory_id: id, score: tscore });
+            }
+        }
+
+        let fused = polyphonic::fuse(&[
+            ("vector", vector_hits),
+            ("graph", graph_hits),
+            ("fact", fact_hits),
+            ("temporal", temporal_hits),
+        ]);
+        let diversified = polyphonic::diversity_rerank(fused, top_k);
+
+        let mut out: Vec<MemoryRow> = Vec::new();
+        for f in diversified {
+            let row = match self.fetch_working(&conn, &f.memory_id)? {
+                Some(r) => Some(r),
+                None => self.fetch_episodic(&conn, &f.memory_id)?,
+            };
+            if let Some(mut r) = row {
+                r.score = f.combined_score;
+                out.push(r);
+            }
+        }
+        self.bump_recall(&conn, &out)?;
+        Ok(out)
+    }
+
+    /// `(memory_id, confidence)` for `facts` whose subject matches `subject` at or above
+    /// `min_confidence` (the polyphonic fact voice).
+    fn facts_for_subject(
+        &self,
+        conn: &Connection,
+        subject: &str,
+        min_confidence: f64,
+    ) -> Result<Vec<(String, f64)>> {
+        let mut stmt = conn.prepare(
+            "SELECT source_msg_id, confidence FROM facts \
+             WHERE subject = ?1 COLLATE NOCASE AND confidence >= ?2 AND source_msg_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![subject, min_confidence], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Gather + score working-memory candidates (FTS5 ∪ vector ∪ recency fallback), with the
     /// knowledge-layer graph/fact bonuses and entity/fact multipliers (`beam.py` L5760-L5793).
+    #[allow(clippy::too_many_arguments)]
     fn gather_working(
         &self,
         conn: &Connection,
@@ -483,6 +834,7 @@ impl Engine {
         top_k: usize,
         floor: f64,
         query_vector: Option<&[f32]>,
+        weights: (f64, f64, f64),
     ) -> Result<Vec<MemoryRow>> {
         // Base candidates: the recency/importance fallback scan (limit 2000, `beam.py` L5262), plus
         // any FTS5 hits that fall outside that window.
@@ -507,7 +859,7 @@ impl Engine {
             Some(_) => load_embeddings(conn)?,
             None => HashMap::new(),
         };
-        let (_vw, _fw, iw) = scoring::DEFAULT_WEIGHTS;
+        let (_vw, _fw, iw) = weights;
 
         let mut scored = Vec::new();
         for mut row in rows {
@@ -534,6 +886,7 @@ impl Engine {
 
     /// Gather + score episodic candidates (FTS5 ∪ vector ∪ recency fallback), with the MIB binary
     /// bonus and the tier/veracity post-multipliers (`beam.py` L5720-L5976).
+    #[allow(clippy::too_many_arguments)]
     fn gather_episodic(
         &self,
         conn: &Connection,
@@ -542,6 +895,7 @@ impl Engine {
         top_k: usize,
         floor: f64,
         query_vector: Option<&[f32]>,
+        weights: (f64, f64, f64),
     ) -> Result<Vec<MemoryRow>> {
         let mut rows = self.scan_episodic(conn, 2000)?;
         let mut seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
@@ -570,7 +924,6 @@ impl Engine {
         };
         let binaries = self.load_binary_vectors(conn)?;
         let q_bin = query_vector.map(binary_vectors::maximally_informative_binarization);
-        let weights = scoring::DEFAULT_WEIGHTS;
 
         let mut scored = Vec::new();
         for mut row in rows {
@@ -1565,6 +1918,29 @@ impl Engine {
                 seeds.insert(ann.memory_id);
             }
         }
+
+        // Fuzzy entity matching (`entities.py` `find_similar_entities`, threshold 0.8): also seed
+        // memories that mention a *similar* entity ("Acme" vs "Acme Corp", typos), not just exact
+        // string equality. The known-entity universe is the deduped `mentions` annotation values.
+        let all_mentions = annotations::query_by_kind(conn, "mentions", None, true)?;
+        if !all_mentions.is_empty() {
+            let mut value_to_memories: HashMap<String, Vec<String>> = HashMap::new();
+            for ann in &all_mentions {
+                value_to_memories.entry(ann.value.clone()).or_default().push(ann.memory_id.clone());
+            }
+            let known: Vec<String> = value_to_memories.keys().cloned().collect();
+            for entity in q_entities {
+                for (matched, _score) in entities::find_similar_entities(entity, &known, 0.8) {
+                    if matched.eq_ignore_ascii_case(entity) {
+                        continue; // exact matches already seeded above
+                    }
+                    if let Some(ids) = value_to_memories.get(&matched) {
+                        seeds.extend(ids.iter().cloned());
+                    }
+                }
+            }
+        }
+
         // One graph expansion (depth 2) from the directly-mentioning seeds.
         let mut expanded: HashSet<String> = HashSet::new();
         for seed in &seeds {
@@ -1750,9 +2126,10 @@ fn dedup_by_content(rows: &mut Vec<MemoryRow>) {
     });
 }
 
-/// Lexical relevance (`beam.py` L1573-L1638): `(exact_token_hits + partial + full_match)/len`, where
-/// a `>=4`-char substring overlap adds `0.4` and a whole-query substring adds `1.0`. Clamped to
-/// `[0, 1]`. (Synonym `+0.75` matching is a `synonyms.rs` TODO — P2.)
+/// Lexical relevance (`beam.py` `_lexical_relevance` L1573-L1638): `(exact_token_hits + partial +
+/// full_match)/len`, where a query token absent from the content earns `+0.75` for a
+/// [`synonyms::recall_synonyms`] hit (beam's conservative `_RECALL_SYNONYMS` map, L1608-L1611), else
+/// `+0.4` for a `>=4`-char substring overlap; a whole-query substring adds `1.0`. Clamped to `[0, 1]`.
 fn lexical_relevance(query_tokens: &[String], content: &str) -> f64 {
     if query_tokens.is_empty() {
         return 0.0;
@@ -1763,7 +2140,14 @@ fn lexical_relevance(query_tokens: &[String], content: &str) -> f64 {
     for t in query_tokens {
         if content_tokens.contains(t) {
             num += 1.0;
-        } else if t.len() >= 4 && lc.contains(t.as_str()) {
+            continue;
+        }
+        let syns = synonyms::recall_synonyms(t);
+        if !syns.is_empty() && syns.iter().any(|s| content_tokens.contains(*s)) {
+            num += 0.75;
+            continue;
+        }
+        if t.len() >= 4 && lc.contains(t.as_str()) {
             num += 0.4;
         }
     }
@@ -1771,6 +2155,17 @@ fn lexical_relevance(query_tokens: &[String], content: &str) -> f64 {
         num += 1.0;
     }
     (num / query_tokens.len() as f64).min(1.0)
+}
+
+/// Temporal cue words that activate the polyphonic temporal voice (`polyphonic_recall.py`
+/// `_temporal_voice` L628-L633).
+fn has_temporal_keyword(query: &str) -> bool {
+    const TEMPORAL_KEYWORDS: &[&str] = &[
+        "yesterday", "today", "recent", "last", "latest", "this week", "this month", "ago",
+        "before",
+    ];
+    let lower = query.to_lowercase();
+    TEMPORAL_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
 /// Hours since an ISO timestamp (`None` if unparseable -> decay falls back to 0.5).
@@ -2302,5 +2697,60 @@ mod tests {
         assert_eq!(stats.working, 1);
         let diag = e.diagnose().unwrap();
         assert_eq!(diag.pending_consolidation, 1);
+    }
+
+    #[test]
+    fn enhanced_recall_uses_synonym_expansion() {
+        // Enhanced recall expands "db" -> the `database` synonym group, so a query that shares no
+        // surface token with the stored row still surfaces it (base recall alone would miss "db").
+        let cfg = MnemosyneConfig { recall_mode: RecallMode::Enhanced, ..MnemosyneConfig::default() };
+        let e = Engine::open_in_memory(cfg).unwrap();
+        e.remember("the database password rotation is monthly", &RememberArgs::default())
+            .unwrap();
+        e.remember("lunch was margherita pizza", &RememberArgs::default()).unwrap();
+
+        let hits = e.recall("db password", 5).unwrap();
+        assert!(!hits.is_empty(), "enhanced recall should surface via synonym expansion");
+        assert!(hits[0].content.contains("password"), "got: {}", hits[0].content);
+        // A second identical query is served from the cache and stays consistent.
+        let again = e.recall("db password", 5).unwrap();
+        assert_eq!(again[0].content, hits[0].content);
+    }
+
+    #[test]
+    fn base_recall_unchanged_when_flags_off() {
+        // The default (Base) mode must not synonym-expand: "db" shares no token with the row, so a
+        // base recall returns nothing (proving enhanced behavior is opt-in, no base regression).
+        let e = engine();
+        e.remember("the database password rotation is monthly", &RememberArgs::default())
+            .unwrap();
+        assert!(e.recall("db", 5).unwrap().is_empty(), "base recall must not expand synonyms");
+    }
+
+    #[test]
+    fn polyphonic_recall_fuses_voices() {
+        let cfg =
+            MnemosyneConfig { recall_mode: RecallMode::Polyphonic, ..MnemosyneConfig::default() };
+        let e = Engine::open_in_memory(cfg).unwrap();
+        let acme_vec = [1.0f32, 0.0, 0.0];
+        e.remember_with_vector(
+            "Acme is a company",
+            &RememberArgs::default(),
+            Some(&acme_vec),
+            "mock",
+        )
+        .unwrap();
+        e.remember_with_vector(
+            "unrelated note about pizza",
+            &RememberArgs::default(),
+            Some(&[0.0, 1.0, 0.0]),
+            "mock",
+        )
+        .unwrap();
+
+        // "Acme" hits the graph/fact voices (fact subject "Acme") and the vector voice (parallel
+        // query vector); RRF fusion should surface the Acme row.
+        let hits = e.recall_with_vector("Acme", 5, Some(&acme_vec)).unwrap();
+        assert!(hits.iter().any(|h| h.content == "Acme is a company"), "polyphonic fused result");
     }
 }

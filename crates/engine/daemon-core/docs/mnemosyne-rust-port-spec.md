@@ -572,6 +572,22 @@ rank starts at 1, missing -> 999):
 > The Rust port reproduces this (RRF-only) and exposes the weights in stats; a config flag may
 > optionally apply them.
 
+**As-built ([`engine.rs`](../../../memory/daemon-mnemosyne/src/engine.rs),
+[`recall/`](../../../memory/daemon-mnemosyne/src/recall/)):** `recall_with_vector` is a dispatcher
+keyed on `MnemosyneConfig::recall_mode` (`Base`/`Enhanced`/`Polyphonic`, §13 config). `recall_enhanced`
+runs `classify_intent` → `adjust_weights` → `normalize_query`/`expand_query` → `query_cache().get` →
+`recall_base` (with the intent-biased weights threaded through `gather_working`/`gather_episodic`) →
+`weibull_rescore` (fetches each row's `memory_type` from the bank, `score*0.7 + wb*0.3`) →
+`mmr_rerank` → `episodic_graph::find_related_memories` expansion → `query_cache().put`. The cache
+([`recall/query_cache.rs`](../../../memory/daemon-mnemosyne/src/recall/query_cache.rs)) is a
+`OnceLock<QueryCache>` on the engine, persistent (`query_cache.db`) when the bank is on disk and
+in-memory otherwise, and is invalidated on `remember` only once initialized. `recall_polyphonic`
+gathers the four `VoiceHit` lists, fuses them with the pure-RRF
+[`polyphonic::fuse`](../../../memory/daemon-mnemosyne/src/recall/polyphonic.rs) (`RRF_K=60`), applies
+`diversity_rerank` (0.8 Jaccard), then resolves ids back to `MemoryRow`s. The fact voice queries the
+`facts` table directly by subject word (returning `source_msg_id` + confidence) rather than Python's
+non-memory `consolidated_fact` ids, so every fused hit maps to a real memory.
+
 ### 8.3 SHMR (`shmr.py`) — opt-in background
 
 Self-Harmonizing Memory Reasoning: greedy connected-component clustering on cosine `>= 0.70`
@@ -606,6 +622,14 @@ table (L28-L59), to port verbatim:
 - `timestamp None -> 0.0`; future -> `1.0`; `halflife` override -> `exp(-age/halflife)`; unknown
   type -> `exp(-age/168)`. Recall blend: `score = score*0.7 + wb*0.3` (`beam.py` L6272). Unknown type
   maps to `general` (beam L6270).
+
+**As-built ([`dynamics/`](../../../memory/daemon-mnemosyne/src/dynamics/)):** `typed_memory::classify`
+ports the full 69-pattern `TYPE_PATTERNS` table + `CONFIDENCE_BOOSTERS` (regexes compiled once via
+`OnceLock`, case-insensitive), the booster/length confidence math, the `confidence*(1 + 0.1*type_index)`
+tie-break, and the no-match default; it is called from `remember_with_vector` and persisted as
+`memory_type`. A `labeled_corpus_matches_python` test pins the classifications. `weibull::weibull_boost`
+wraps `weibull_decay_factor` (returns `0.0` for a `None` age) and is consumed by `weibull_rescore` on
+the **enhanced** finalize only — base recall is left untouched to preserve P0 parity.
 
 ### 9.3 Sleep / consolidation — `beam.py` L7576-L7844
 
@@ -701,6 +725,12 @@ reject pronoun subjects; L292-L372). `find_related_memories(depth=2)` BFS (L432-
 linking lives in the engine (`_proactively_link`, beam L3358, env-gated): FTS content similarity
 (`related_to`, weight `1 - i*0.2`) and entity co-occurrence (`references`, weight 0.8).
 
+**As-built ([`knowledge/episodic_graph.rs`](../../../memory/daemon-mnemosyne/src/knowledge/episodic_graph.rs)):**
+`extract_gist` ports the rule-based participant/temporal-scope/location/emotion/summary extraction
+(regexes via `OnceLock`); `store_gist`/`find_gists_by_participant` persist to and read the `gists`
+table. Gists are written on the `remember_with_vector` ingest path and read back by the polyphonic
+graph voice (gist match weight 0.6).
+
 ### 10.5 entities / temporal — `entities.py`, `temporal_parser.py`
 
 - `extract_entities_regex` (L137-L205): @handles, #tags, quoted, capitalized 1-5-word phrases;
@@ -715,7 +745,10 @@ linking lives in the engine (`_proactively_link`, beam L3358, env-gated): FTS co
   the full first-match chain + `extract_temporal`/`extract_temporal_with_ref` are ported over `chrono`
   (`DAY_MAP`/`MONTH_MAP`/`NAMED_TIMES`, `resolve_relative_day`), and `remember_with_vector` populates
   the `event_date`/`event_date_precision`/`temporal_tags` columns (copied to the episodic row at
-  consolidation). `entities::similarity`/`find_similar_entities` remain TODO.
+  consolidation). `entities::similarity`/`find_similar_entities` (threshold 0.8) are ported and wired
+  into `Engine::inject_entity_candidates`: the deduped `mentions` annotations form the known-entity
+  universe, and memories mentioning a *fuzzy* (non-exact) match are added as graph-expansion seeds
+  alongside exact matches.
 
 ### 10.6 VeracityConsolidator — `veracity_consolidation.py`
 
@@ -733,6 +766,15 @@ which differs from the docstring's `1 - 0.7^n`):
 `validate_conflict_pair` (L135-L214): opt-in (`MNEMOSYNE_LLM_CONFLICT_DETECTION`), JSON-schema prompt
 to an OpenAI-compatible endpoint, temp 0.0, 2 retries, logs cost. Tier-2 atop the embedding heuristic
 in `beam._detect_conflicts`. The Rust port routes the LLM call through the daemon-core `Provider`.
+
+**As-built ([`knowledge/conflict.rs`](../../../memory/daemon-mnemosyne/src/knowledge/conflict.rs),
+[`provider.rs`](../../../memory/daemon-mnemosyne/src/provider.rs)):** `build_prompt`/`strip_json`/
+`parse_verdict` produce and decode the `ConflictVerdict`, and the async `validate_conflict_pair` calls
+the injected `Extractor` (over `daemon_core::Provider`). `MnemosyneProvider::run_sleep` adds a
+`validate_conflicts` pass — gated on `MnemosyneConfig::llm_conflict_detection` **and**
+`extractor.available()` — that pulls `Engine::pending_conflicts()` (the `(S,P)` pairs the synchronous
+veracity path recorded), validates each with the LLM, and calls `resolve_conflict()`. With the flag
+off (default) the engine behaves exactly as the deterministic veracity-only path.
 
 ---
 
@@ -925,11 +967,25 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
   temporal parsing wired into the write path (§10.5), the full `sleep` (cutoff/pin/batch/atomic-claim/
   source-group/`summary_of`, LLM-or-AAAK summary, `consolidation_log`) with tiered `degrade_episodic`
   (§9.3), and the complete ~26-tool `mnemosyne_*` surface (§13, incl. `shared_*` and feature-gated
-  `sync_*`). Still open: dynamics (`typed_memory` classifier, `weibull` recall blend), the tier-2 LLM
-  conflict detector (§10.7), rule-based gists, and `entities::similarity`.
-- **P2 — quality:** enhanced + polyphonic recall, `query_intent`/`query_cache`/`synonyms`, MIB binary
-  bonus, plugins, and LLM extraction via Provider.
-- **P3 — ecosystem:** sync/streaming, SHMR, patterns, local-GGUF fallback.
+  `sync_*`).
+- **P2 — quality (done):** the dynamics + recall-quality layer is fully ported and wired behind opt-in
+  flags. Landed: the 69-pattern `typed_memory` classifier (confidence boosters + `type_index`
+  tie-break, persisted as `memory_type` on `remember`); the per-type `weibull` recall blend
+  (`score*0.7 + wb*0.3`) inside the enhanced finalize; the 40 `SYNONYM_GROUPS`/`_WORD_TO_CANONICAL`
+  expansion plus the `+0.75` lexical-synonym bonus in `lexical_relevance`; the regex `query_intent`
+  classifier feeding `adjust_weights`; the 5-tier semantic `query_cache` over a separate
+  `query_cache.db` (exact / cosine≥0.88 / cosine≥0.78+Jaccard≥0.15 / ≥70% word-overlap / miss),
+  invalidated on `remember`; `Engine::recall_enhanced` (intent→expand→cache→base→weibull→MMR→graph
+  expansion→store) and `Engine::recall_polyphonic` (vector/graph/fact/temporal voices → RRF fusion
+  (`RRF_K=60`) → 0.8-Jaccard diversity rerank), dispatched by `MnemosyneConfig::recall_mode`
+  (`MNEMOSYNE_ENHANCED_RECALL`/`MNEMOSYNE_POLYPHONIC_RECALL`, default `Base`). Recall-adjacent
+  carryover also closed: rule-based `extract_gist` (participants/temporal/location/emotion) stored to
+  `gists` and consumed by the polyphonic graph voice; the opt-in tier-2 LLM conflict detector
+  (`validate_conflict_pair` via the injected `daemon_core::Provider`, `MNEMOSYNE_LLM_CONFLICT_DETECTION`,
+  layered atop the `(S,P)` veracity path in `run_sleep`); and threshold-0.8 fuzzy entity matching
+  (`entities::find_similar_entities`) wired into `inject_entity_candidates`. MIB binary bonus shipped
+  in P0; plugins remain P3.
+- **P3 — ecosystem:** sync/streaming, SHMR, patterns, plugins, local-GGUF fallback.
 
 ---
 

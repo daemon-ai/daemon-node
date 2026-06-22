@@ -280,7 +280,7 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Capability | Hermes anchor | Daemon state + gap |
 |---|---|---|
 | Context engine / compression | `agent/context_compressor.py:593` | PARTIAL/landed — LCM port `daemon-context-lcm`, 7 `lcm_*` tools ([tools/mod.rs:24-93](../../crates/engine/daemon-context-lcm/src/tools/mod.rs)). |
-| Long-term memory | `agent/memory_manager.py`; `tools/memory_tool.py:795` | PARTIAL — `daemon-mnemosyne` P0/P1 done, P2/P3 TODO ([engine.rs:10](../../crates/memory/daemon-mnemosyne/src/engine.rs)); ~20 `mnemosyne_*` tools ([tools.rs:28-170](../../crates/memory/daemon-mnemosyne/src/tools.rs)). |
+| Long-term memory | `agent/memory_manager.py`; `tools/memory_tool.py:795` | PARTIAL — `daemon-mnemosyne` P0/P1/**P2 done** (typed-memory classifier, Weibull recall blend, synonyms, query-intent, 5-tier query cache, opt-in enhanced + polyphonic recall, rule-based gists, tier-2 LLM conflict detector, fuzzy entity-similarity injection — [engine.rs](../../crates/memory/daemon-mnemosyne/src/engine.rs), [port-spec §15](../../crates/engine/daemon-core/docs/mnemosyne-rust-port-spec.md)); ~20 `mnemosyne_*` tools ([tools.rs:28-170](../../crates/memory/daemon-mnemosyne/src/tools.rs)). P3 ecosystem (sync/streaming, SHMR, patterns, plugins, local-GGUF) remains. |
 | Background memory write/review | `agent/background_review.py:675` | MISSING. P2. |
 
 ### Domain G — Skills
