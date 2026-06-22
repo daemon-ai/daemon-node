@@ -1368,6 +1368,18 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             cfg.data_dir.join("checkpoints"),
         )) as Arc<dyn daemon_core::CheckpointStore>);
 
+    // Register the interactive-auth families this node exposes over the wire `AuthApi` (the
+    // client-driven SSO/OAuth2 login seam). The Matrix SSO factory is registered whenever the matrix
+    // transport is enabled, so a decoupled GUI can drive `auth_begin`/`auth_complete` to mint and bind
+    // an account's session — keyed by the same per-account store root the transport's `serve` uses.
+    let auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>> = if cfg.matrix.enabled {
+        vec![Arc::new(daemon_matrix::MatrixAuthFlowFactory::new(
+            cfg.matrix.store_root.clone(),
+        ))]
+    } else {
+        vec![]
+    };
+
     let AssembledNode { node, handle, .. } = assemble(NodeAssembly {
         store,
         partition: cfg.partition,
@@ -1393,6 +1405,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         skills: skills_store,
         routing,
         checkpoints,
+        auth_factories,
     });
     tracing::info!("daemon host node started");
 

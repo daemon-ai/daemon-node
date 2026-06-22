@@ -942,6 +942,47 @@ fn render(resp: ApiResponse) {
                 println!("  - {} {}", c.profile, state);
             }
         }
+        ApiResponse::AuthBegun(b) => {
+            println!("auth begun: flow_id={} ({:?})", b.flow_id, b.flow_kind);
+            println!("  open this URL in a browser:\n    {}", b.authorization_url);
+            println!("  redirect_uri={} expires_at={}", b.redirect_uri, b.expires_at);
+        }
+        ApiResponse::AuthCompleted(c) => {
+            let bound = c
+                .bound_profile
+                .map(|p| format!(" bound_profile={p}"))
+                .unwrap_or_default();
+            println!(
+                "auth completed: account={} credential_ref={} instance={}{}",
+                c.account_label,
+                c.credential_ref,
+                c.transport_instance.as_str(),
+                bound
+            );
+        }
+        ApiResponse::AuthProviders(list) => {
+            println!("auth providers: {}", list.len());
+            for p in list {
+                let fields: Vec<String> = p
+                    .params_schema
+                    .iter()
+                    .map(|f| {
+                        if f.required {
+                            format!("{}*", f.key)
+                        } else {
+                            f.key.clone()
+                        }
+                    })
+                    .collect();
+                println!(
+                    "  - {} [{:?}] \"{}\" params=[{}]",
+                    p.family,
+                    p.flow_kind,
+                    p.display_name,
+                    fields.join(", ")
+                );
+            }
+        }
         ApiResponse::Models(models) => {
             println!("models: {}", models.len());
             for m in models {

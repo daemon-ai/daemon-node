@@ -14,6 +14,7 @@
 #![recursion_limit = "512"]
 
 mod account;
+mod auth;
 pub mod config;
 mod inbound;
 mod login;
@@ -32,6 +33,7 @@ use daemon_host::AccountProvisioning;
 use daemon_protocol::TransportId;
 
 pub use account::{Account, StoredSession};
+pub use auth::{sso_begin, sso_complete, MatrixAuthFlowFactory, MatrixLogin, SsoSession};
 pub use config::{MatrixConfig, MatrixRoute};
 pub use inbound::{on_room_message, InboundCtx};
 pub use login::login;
@@ -40,7 +42,7 @@ pub use outbound::{DeliveryManager, MatrixProjector};
 use account::{account_store_dir, bare_account, build_client};
 
 /// The transport family this adapter provisions (`AccountProvisioning::bound_accounts`).
-const FAMILY: &str = "matrix";
+pub(crate) const FAMILY: &str = "matrix";
 
 /// Persist refreshed session tokens back to the credential subsystem (spec §6.2: the credential
 /// store is authoritative over the SDK's session copy). matrix-sdk refreshes tokens in-memory (the

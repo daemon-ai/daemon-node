@@ -379,7 +379,16 @@ impl WireVersion {
     /// (with `SessionOverlay` = model / provider / tool allowlist / approval mode), persisted as
     /// host-level session metadata so a switch is restored on rehydration. `set_session_model` /
     /// `set_session_mode` become field-scoped conveniences over the overlay.
-    pub const CURRENT: Self = Self(11);
+    ///
+    /// v12 (interactive auth): adds the client-driven login seam (`daemon-interactive-auth-spec`):
+    /// `AuthBegin`/`AuthComplete`/`AuthCancel`/`AuthProviders` requests with `AuthBegun`/
+    /// `AuthCompleted`/`AuthProviders` responses (and the `AuthBeginRequest`/`AuthBeginResponse`/
+    /// `AuthCompleteRequest`/`AuthCompleteResponse`/`AuthBindRequest`/`AuthProviderInfo`/
+    /// `AuthParamField`/`AuthFlowKind` DTOs). A decoupled client drives a browser-redirect login
+    /// (`begin` mints an authorization URL against a client-owned `redirect_uri`, the client captures
+    /// the redirect and relays it to `complete`); the daemon parks the pending flow and writes the
+    /// resulting credential through the existing `CredentialStore`.
+    pub const CURRENT: Self = Self(12);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

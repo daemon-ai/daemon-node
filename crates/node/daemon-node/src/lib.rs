@@ -165,6 +165,12 @@ pub struct NodeAssembly {
     /// a mutating tool runs) and into the control surface (the `Checkpoint{List,Rewind}` ops).
     /// `None` builds a node without checkpointing (tests / read-only nodes).
     pub checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
+    /// The interactive-auth factories backing the node's `AuthApi` sub-surface (the client-driven
+    /// SSO/OAuth2 login seam, `daemon-interactive-auth-spec`). Each factory serves one transport/
+    /// provider family (e.g. the Matrix SSO factory). Empty (the default) builds a node whose
+    /// `auth_begin`/`auth_complete` resolve to `ApiError::Unsupported` and whose `auth_providers` is
+    /// empty. Completion writes through the same credential + profile stores wired above.
+    pub auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -671,6 +677,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // Bind the credential sub-surface when this node hosts credential management.
     if let Some(credentials) = a.credential_store.clone() {
         node_api = node_api.with_credential_store(credentials);
+    }
+    // Register the interactive-auth families (Matrix SSO, future OAuth2/OIDC) when any are supplied,
+    // so a decoupled client can drive a browser-redirect login over the wire `AuthApi`.
+    if !a.auth_factories.is_empty() {
+        node_api = node_api.with_auth_factories(a.auth_factories.clone());
     }
     // Bind the profile/skill versioning surface when this node hosts a revision log.
     if let Some(revisions) = a.revisions.clone() {

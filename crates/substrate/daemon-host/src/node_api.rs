@@ -19,15 +19,18 @@ use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
+use crate::auth::PendingAuthFlows;
 use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
 use crate::routing::RoutingRegistry;
 use daemon_api::{
-    ApiError, ApprovalInfo, ApprovalMode, ControlApi, CredentialApi, CredentialInfo, DeliverySink,
-    Distribution, FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
-    LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
-    ProfileInfo, ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionInfo,
-    SessionOverlay, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
+    ApiError, ApprovalInfo, ApprovalMode, AuthApi, AuthBeginRequest, AuthBeginResponse,
+    AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo, BoundAccount, ControlApi,
+    CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, HealthReport,
+    JournalPageView, JournalRecord, JournalRecordPayload, LogPageView, LogStream, ManageEventView,
+    ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo, ProfileSpec, ProviderSelector,
+    ServiceHealth, SessionApi, SessionInfo, SessionOverlay, SessionState, StatsReport,
+    TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -196,6 +199,10 @@ pub struct NodeApiImpl {
     /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
     /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
     checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
+    /// The interactive-auth registry backing the `AuthApi` sub-surface (the client-driven SSO/OAuth2
+    /// login seam). `None` (or an empty registry) => every `AuthApi` call resolves to
+    /// [`ApiError::Unsupported`] / an empty provider list.
+    auth_flows: Option<Arc<PendingAuthFlows>>,
 }
 
 impl NodeApiImpl {
@@ -241,6 +248,7 @@ impl NodeApiImpl {
             skills: None,
             routing: Arc::new(RoutingRegistry::new()),
             checkpoints: None,
+            auth_flows: None,
         }
     }
 
@@ -311,6 +319,23 @@ impl NodeApiImpl {
     /// assembly (the same store the node's credential authority provisions from).
     pub fn with_credential_store(mut self, credentials: Arc<dyn CredentialStore>) -> Self {
         self.credentials = Some(credentials);
+        self
+    }
+
+    /// Register the interactive-auth factories backing the `AuthApi` sub-surface (the client-driven
+    /// SSO/OAuth2 login seam). Each [`AuthFlowFactory`](crate::auth::AuthFlowFactory) serves one
+    /// transport/provider family; absent (or empty), `auth_begin`/`auth_complete` resolve to
+    /// [`ApiError::Unsupported`] and `auth_providers` is empty. The credential write + optional profile
+    /// bind on completion go through the same credential/profile stores wired above. Call during assembly.
+    pub fn with_auth_factories(
+        mut self,
+        factories: Vec<Arc<dyn crate::auth::AuthFlowFactory>>,
+    ) -> Self {
+        self.auth_flows = if factories.is_empty() {
+            None
+        } else {
+            Some(Arc::new(PendingAuthFlows::new(factories)))
+        };
         self
     }
 
@@ -1527,6 +1552,88 @@ impl CredentialApi for NodeApiImpl {
         store
             .remove(&profile)
             .map_err(|e| ApiError::Other(format!("credential remove: {e}")))
+    }
+}
+
+#[async_trait]
+impl AuthApi for NodeApiImpl {
+    async fn auth_begin(&self, req: AuthBeginRequest) -> Result<AuthBeginResponse, ApiError> {
+        let flows = self
+            .auth_flows
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("interactive auth not available".into()))?;
+        flows.begin(req).await
+    }
+
+    async fn auth_complete(
+        &self,
+        req: AuthCompleteRequest,
+    ) -> Result<AuthCompleteResponse, ApiError> {
+        let flows = self
+            .auth_flows
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("interactive auth not available".into()))?;
+        // Pull the parked flow out (and its bind request) *before* awaiting the family completion, so
+        // the registry lock is never held across the network round-trip the family performs.
+        let (flow, bind) = flows.take(&req.flow_id)?;
+        let outcome = flow.complete(&req.callback).await?;
+
+        // The credential ref: a bind-supplied override wins over the family-derived default, so an
+        // operator can pin where the blob lands; otherwise the family names it (e.g. by resolved user).
+        let credential_ref = bind
+            .as_ref()
+            .and_then(|b| b.credential_ref.clone())
+            .unwrap_or_else(|| outcome.credential_ref.clone());
+
+        let store = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
+        store
+            .set(&credential_ref, &outcome.credential_blob)
+            .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;
+
+        // Optional account→profile bind: attach (or replace) the BoundAccount on the target profile so
+        // the transport's account bring-up (`AccountProvisioning::bound_accounts`) discovers it.
+        let mut bound_profile = None;
+        if let Some(bind) = bind {
+            let profiles = self.profile_store()?;
+            let mut spec = profiles
+                .get(bind.profile.as_str())
+                .map_err(profile_err)?
+                .ok_or_else(|| ApiError::Other(format!("unknown profile: {}", bind.profile)))?;
+            let transport_instance = bind
+                .transport_instance
+                .clone()
+                .unwrap_or_else(|| outcome.transport_instance.clone());
+            spec.bound_accounts
+                .retain(|a| a.transport_instance != transport_instance.as_str());
+            spec.bound_accounts
+                .push(BoundAccount::new(transport_instance.as_str(), &credential_ref));
+            profiles.update(spec).map_err(profile_err)?;
+            bound_profile = Some(bind.profile.clone());
+        }
+
+        Ok(AuthCompleteResponse {
+            credential_ref,
+            account_label: outcome.account_label,
+            transport_instance: outcome.transport_instance,
+            bound_profile,
+        })
+    }
+
+    async fn auth_cancel(&self, flow_id: String) -> Result<(), ApiError> {
+        if let Some(flows) = self.auth_flows.as_ref() {
+            flows.cancel(&flow_id);
+        }
+        Ok(())
+    }
+
+    async fn auth_providers(&self) -> Vec<AuthProviderInfo> {
+        self.auth_flows
+            .as_ref()
+            .map(|f| f.providers())
+            .unwrap_or_default()
     }
 }
 

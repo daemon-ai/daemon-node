@@ -26,8 +26,8 @@ use daemon_protocol::{
     TransportId, TurnSummary,
 };
 
-use matrix_sdk::ruma::{event_id, room_id, user_id};
-use matrix_sdk::test_utils::mocks::MatrixMockServer;
+use matrix_sdk::ruma::{device_id, event_id, room_id, user_id};
+use matrix_sdk::test_utils::mocks::{LoginResponseTemplate200, MatrixMockServer};
 use matrix_sdk_test::event_factory::EventFactory;
 use matrix_sdk_test::JoinedRoomBuilder;
 
@@ -129,6 +129,7 @@ impl ControlApi for Recorder {
 impl ModelApi for Recorder {}
 impl daemon_api::ProfileApi for Recorder {}
 impl daemon_api::CredentialApi for Recorder {}
+impl daemon_api::AuthApi for Recorder {}
 
 fn perthread_policy() -> IngestPolicy {
     IngestPolicy {
@@ -262,6 +263,73 @@ async fn outbound_turn_finished_posts_reply() {
         }),
     };
     projector.project(SessionId::new("s1"), entry).await;
+}
+
+/// The two-step SSO seam (`daemon-interactive-auth-spec`, proven for the matrix family): `sso_begin`
+/// mints the homeserver authorization URL against the caller-owned redirect, and `sso_complete`
+/// finishes from the captured `loginToken`, producing the persistable session blob + identity. Both
+/// run against the wiremock homeserver (versions + login mocked); no live engine/host is involved.
+#[tokio::test]
+async fn sso_begin_mints_url_then_complete_persists_session() {
+    let server = MatrixMockServer::new().await;
+    server.mock_versions().ok().mount().await;
+    server
+        .mock_login()
+        .ok_with(LoginResponseTemplate200::new(
+            "sso-access-token",
+            device_id!("SSODEVICE"),
+            user_id!("@bot:localhost"),
+        ))
+        .mount()
+        .await;
+
+    let store_root = std::env::temp_dir().join(format!(
+        "daemon-matrix-sso-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let redirect_uri = "http://127.0.0.1:65000/cb";
+
+    // begin: build the on-disk client + mint the SSO authorization URL pointing at our redirect.
+    let session = daemon_matrix::sso_begin(
+        &store_root,
+        &server.uri(),
+        "matrix-bot",
+        redirect_uri,
+        None,
+    )
+    .await
+    .expect("sso_begin mints an authorization url");
+    assert!(
+        session
+            .authorization_url
+            .contains("/_matrix/client/v3/login/sso/redirect"),
+        "authorization url targets the homeserver SSO redirect: {}",
+        session.authorization_url
+    );
+    assert!(
+        session.authorization_url.contains("redirectUrl="),
+        "authorization url carries our redirect: {}",
+        session.authorization_url
+    );
+
+    // complete: finish from the captured `loginToken` (a full callback URL is accepted).
+    let callback = format!("{redirect_uri}?loginToken=secret-login-token");
+    let login = daemon_matrix::sso_complete(session, &callback)
+        .await
+        .expect("sso_complete exchanges the loginToken");
+
+    assert_eq!(login.user_id, "@bot:localhost");
+    assert_eq!(login.credential_ref, "matrix-bot");
+    assert_eq!(login.transport_instance.as_str(), "matrix/@bot:localhost");
+    let back = daemon_matrix::StoredSession::from_blob(&login.credential_blob)
+        .expect("the persisted blob round-trips");
+    assert_eq!(back.session.meta.user_id.as_str(), "@bot:localhost");
+
+    let _ = std::fs::remove_dir_all(&store_root);
 }
 
 #[tokio::test]

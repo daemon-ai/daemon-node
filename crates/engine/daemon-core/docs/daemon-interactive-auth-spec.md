@@ -1,6 +1,8 @@
 # Interactive auth (SSO / OAuth2) — a client-driven login seam
 
-Status: design / audit. **Documentation only — no code yet.** Companion to
+Status: design / audit + **A1 landed** (wire `AuthApi` v12 + host `PendingAuthFlows`/`AuthFlowFactory`
++ matrix SSO `begin`/`complete`, proven by a generic stub-factory conformance test and a
+`MatrixMockServer` SSO test). Companion to
 [`daemon-matrix-transport-spec.md`](./daemon-matrix-transport-spec.md) §6 (which introduced SSO as
 adapter bring-up) and [`daemon-event-io-spec.md`](./daemon-event-io-spec.md); consumed by the GUI
 story in [`daemon-gui-readiness-roadmap.md`](../../../../docs/specs/daemon-gui-readiness-roadmap.md).
@@ -330,13 +332,16 @@ Both use the same `NodeApi` / Unix-socket seam the app already plans to adopt fo
 
 ## 10. Phased implementation plan (M-series)
 
-- **A1 — wire `AuthApi` + matrix SSO begin/complete.** Add the `AuthApi` trait + `ApiRequest`/
+- **A1 — wire `AuthApi` + matrix SSO begin/complete. ✅ Landed.** Added the `AuthApi` trait + `ApiRequest`/
   `ApiResponse` variants + CDDL (wire v12); `PendingAuthFlows` + `AuthFlowFactory`/`PendingAuthFlow` in
-  `daemon-host`; `NodeApiImpl` impl writing through `CredentialStore` (+ optional profile bind); the
-  `daemon-matrix` `MatrixAuthFlowFactory` (refactor `login.rs` into `sso_begin`/`sso_complete`); rebase
-  the `daemon matrix login` CLI onto it. Conformance: a flow over the Unix socket against a
-  `MatrixMockServer`-backed homeserver (begin → simulate redirect → complete → credential present +
-  redacted on the wire).
+  `daemon-host`; the `NodeApiImpl` impl writing through `CredentialStore` (+ optional profile bind); the
+  `daemon-matrix` `MatrixAuthFlowFactory` (refactored `login.rs` into `sso_begin`/`sso_complete`) and
+  rebased the `daemon matrix login` CLI onto it over a local loopback. The factory is registered in the
+  node assembly (`NodeAssembly.auth_factories`) whenever the matrix transport is enabled. Proven by a
+  generic stub-factory conformance test (begin → complete → blob stored + redacted on the wire + profile
+  bound; cancel + consumed-flow rejection) and a `MatrixMockServer`-backed `sso_begin`/`sso_complete`
+  test. *Deferred within A1:* completion over the in-process surface is exercised directly; a transport
+  end-to-end over the Unix socket rides with the GUI wiring in A3.
 - **A2 — OAuth2/OIDC family.** A generic `OAuthAuthFlowFactory` (PKCE + state) and/or the matrix-sdk
   `oauth()` path for Matrix MAS; provider metadata in `auth_providers`.
 - **A3 — GUI wiring (`daemon-app`).** Desktop loopback sink + mobile deep-link sink; an "add account"

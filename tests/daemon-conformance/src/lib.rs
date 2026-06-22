@@ -1686,6 +1686,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         })
     }
 
@@ -1758,6 +1759,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
         (node, handle)
     }
@@ -2593,6 +2595,7 @@ mod node_interface {
             skills: Some(skills.clone()),
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
         (node, handle, skills)
     }
@@ -2838,6 +2841,7 @@ mod node_interface {
             skills: None,
             routing: Some(routing),
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -3049,6 +3053,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         let text_a = route_text(&node, origin("@a:hs")).await;
@@ -3109,12 +3114,222 @@ mod node_interface {
             skills: None,
             routing: Some(routing),
             checkpoints: None,
+            auth_factories: vec![],
         });
         let text_override = route_text(&node, origin("@a:hs")).await;
         assert!(
             text_override.contains("[beta]"),
             "config bind_instance(@a:hs -> beta) wins over profile-derived alpha, got {text_override:?}"
         );
+        handle.shutdown().await;
+    }
+
+    /// GENERIC INTERACTIVE-AUTH (daemon-interactive-auth-spec, the family-agnostic `AuthApi` seam): a
+    /// stub factory (standing in for a real SSO/OAuth2 family — no browser, no network) proves the
+    /// whole client-driven login orchestration through the node surface:
+    /// (1) `auth_providers` lists the registered family for client-side discovery;
+    /// (2) `auth_begin` parks a flow and returns the authorization URL minted against the
+    ///     *client-supplied* `redirect_uri`;
+    /// (3) `auth_complete` runs the family completion, writes the resulting blob through the node's
+    ///     `CredentialStore` (visible, redacted, via `credential_list`), and honors the optional
+    ///     profile bind (`bound_accounts` gains the account);
+    /// (4) a consumed `flow_id` cannot be completed twice, and a cancelled flow cannot complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_auth_generic_begin_complete_binds_and_lists() {
+        use async_trait::async_trait;
+        use daemon_api::{
+            ApiError, AuthApi, AuthBeginRequest, AuthBindRequest, AuthCompleteRequest, AuthFlowKind,
+            AuthParamField, AuthProviderInfo, CredentialApi, ProfileSpec, ProviderSelector,
+        };
+        use daemon_host::{
+            AuthFlowFactory, AuthOutcome, MemCredentialStore, MemProfileStore, PendingAuthFlow,
+            ProfileStore,
+        };
+        use daemon_protocol::TransportId;
+        use std::collections::BTreeMap;
+
+        // A parked flow: echoes the captured callback into the blob so the test can prove it flowed
+        // through, and reports a fixed identity (a real family derives these from the IdP response).
+        struct StubFlow {
+            url: String,
+        }
+        #[async_trait]
+        impl PendingAuthFlow for StubFlow {
+            fn authorization_url(&self) -> &str {
+                &self.url
+            }
+            fn flow_kind(&self) -> AuthFlowKind {
+                AuthFlowKind::OAuth2Pkce
+            }
+            async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError> {
+                Ok(AuthOutcome {
+                    credential_blob: format!("blob:{callback}"),
+                    credential_ref: "stub/acct".to_string(),
+                    account_label: "stub-user".to_string(),
+                    transport_instance: TransportId::new("stub/stub-user"),
+                })
+            }
+        }
+
+        struct StubFactory;
+        #[async_trait]
+        impl AuthFlowFactory for StubFactory {
+            fn family(&self) -> &str {
+                "stub"
+            }
+            fn provider_info(&self) -> AuthProviderInfo {
+                AuthProviderInfo {
+                    family: "stub".into(),
+                    flow_kind: AuthFlowKind::OAuth2Pkce,
+                    display_name: "Stub IdP".into(),
+                    params_schema: vec![AuthParamField {
+                        key: "homeserver".into(),
+                        label: "Homeserver".into(),
+                        required: true,
+                    }],
+                }
+            }
+            async fn begin(
+                &self,
+                params: &BTreeMap<String, String>,
+                redirect_uri: &str,
+            ) -> Result<Box<dyn PendingAuthFlow>, ApiError> {
+                let hs = params.get("homeserver").cloned().unwrap_or_default();
+                Ok(Box::new(StubFlow {
+                    url: format!("{hs}/authorize?redirect_uri={redirect_uri}"),
+                }))
+            }
+        }
+
+        let profiles = Arc::new(MemProfileStore::new());
+        profiles
+            .create(ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a"))
+            .expect("create alpha");
+        let creds = Arc::new(MemCredentialStore::new());
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(profiles.clone()),
+            provider_resolver: None,
+            credential_store: Some(creds),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: None,
+            checkpoints: None,
+            auth_factories: vec![Arc::new(StubFactory)],
+        });
+
+        // (1) discovery: the stub family is listed.
+        let providers_list = node.auth_providers().await;
+        assert_eq!(providers_list.len(), 1);
+        assert_eq!(providers_list[0].family, "stub");
+        assert_eq!(providers_list[0].flow_kind, AuthFlowKind::OAuth2Pkce);
+
+        // (2) begin: parks a flow, mints the URL against our redirect, with a bind to `alpha`.
+        let mut params = BTreeMap::new();
+        params.insert("homeserver".to_string(), "https://idp.example".to_string());
+        let begun = node
+            .auth_begin(AuthBeginRequest {
+                family: "stub".into(),
+                params,
+                redirect_uri: "http://127.0.0.1:7777/cb".into(),
+                bind: Some(AuthBindRequest {
+                    profile: ProfileRef::new("alpha"),
+                    transport_instance: None,
+                    credential_ref: None,
+                }),
+            })
+            .await
+            .expect("auth_begin");
+        assert!(
+            begun
+                .authorization_url
+                .contains("https://idp.example/authorize"),
+            "authorization url from the family: {}",
+            begun.authorization_url
+        );
+        assert!(
+            begun
+                .authorization_url
+                .contains("redirect_uri=http://127.0.0.1:7777/cb"),
+            "authorization url carries our redirect: {}",
+            begun.authorization_url
+        );
+
+        // (3) complete: stores the blob, binds the account, returns the identity.
+        let done = node
+            .auth_complete(AuthCompleteRequest {
+                flow_id: begun.flow_id.clone(),
+                callback: "http://127.0.0.1:7777/cb?code=abc&state=xyz".into(),
+            })
+            .await
+            .expect("auth_complete");
+        assert_eq!(done.credential_ref, "stub/acct");
+        assert_eq!(done.account_label, "stub-user");
+        assert_eq!(done.transport_instance.as_str(), "stub/stub-user");
+        assert_eq!(done.bound_profile.as_ref().map(|p| p.as_str()), Some("alpha"));
+
+        let listed = node.credential_list().await;
+        assert!(
+            listed.iter().any(|c| c.profile == "stub/acct" && c.present),
+            "the stored credential is listed (redacted): {listed:?}"
+        );
+
+        let alpha = profiles.get("alpha").unwrap().unwrap();
+        assert!(
+            alpha.bound_accounts.iter().any(|a| a.transport_instance
+                == "stub/stub-user"
+                && a.credential_ref == "stub/acct"),
+            "alpha gained the bound account: {:?}",
+            alpha.bound_accounts
+        );
+
+        // (4a) a consumed flow_id cannot be completed twice.
+        let reuse = node
+            .auth_complete(AuthCompleteRequest {
+                flow_id: begun.flow_id.clone(),
+                callback: "http://127.0.0.1:7777/cb?code=abc".into(),
+            })
+            .await;
+        assert!(reuse.is_err(), "a consumed flow_id cannot be completed twice");
+
+        // (4b) a cancelled flow cannot complete.
+        let begun2 = node
+            .auth_begin(AuthBeginRequest {
+                family: "stub".into(),
+                params: BTreeMap::new(),
+                redirect_uri: "http://127.0.0.1:7777/cb".into(),
+                bind: None,
+            })
+            .await
+            .expect("auth_begin 2");
+        node.auth_cancel(begun2.flow_id.clone())
+            .await
+            .expect("cancel is idempotent-ok");
+        let after_cancel = node
+            .auth_complete(AuthCompleteRequest {
+                flow_id: begun2.flow_id,
+                callback: "x".into(),
+            })
+            .await;
+        assert!(after_cancel.is_err(), "a cancelled flow cannot complete");
+
         handle.shutdown().await;
     }
 
@@ -3182,6 +3397,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.
@@ -3322,6 +3538,7 @@ mod node_interface {
             skills: None,
             routing: Some(routing),
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         // Register two in-process sinks: the matrix account and a GUI surface.
@@ -3516,6 +3733,7 @@ mod node_interface {
             skills: None,
             routing: Some(routing),
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         async fn drive_turn(node: &Arc<NodeApiImpl>, origin: Origin, req: u64) -> SessionId {
@@ -3716,6 +3934,7 @@ mod node_interface {
             skills: None,
             routing: Some(routing),
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {
@@ -3874,6 +4093,7 @@ mod node_interface {
             skills: None,
             routing: Some(routing),
             checkpoints: None,
+            auth_factories: vec![],
         });
 
         let origin = Origin::new(
@@ -4149,6 +4369,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
         let busy = SessionId::new("obs-busy");
 
@@ -4405,6 +4626,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
         let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
         let origin = Origin::new(
@@ -4537,6 +4759,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         });
         let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
 
@@ -4735,6 +4958,7 @@ mod node_interface {
             skills: None,
             routing: None,
             checkpoints: None,
+            auth_factories: vec![],
         })
     }
 

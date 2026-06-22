@@ -23,9 +23,10 @@
 use async_trait::async_trait;
 use daemon_common::{
     DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile, ModelId,
-    ModelRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage, SearchQuery, SessionId,
-    UnitId, UsageDelta, WireVersion,
+    ModelRef, ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage, SearchQuery,
+    SessionId, UnitId, UsageDelta, WireVersion,
 };
+use std::collections::BTreeMap;
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
     TranscriptBlock, TransportId,
@@ -654,10 +655,147 @@ pub trait CredentialApi: Send + Sync {
     }
 }
 
-/// The whole node surface: the session, control, model-management, profile/config, and credential
-/// sub-surfaces.
-pub trait NodeApi: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi {}
-impl<T: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi> NodeApi for T {}
+// ---------------------------------------------------------------------------
+// Interactive auth (SSO / OAuth2) — the client-driven login seam
+// ---------------------------------------------------------------------------
+//
+// See `daemon-interactive-auth-spec.md`. A decoupled (possibly remote) client drives a
+// browser-redirect login: `auth_begin` mints an authorization URL against a redirect_uri the *client*
+// owns, the client opens a browser and captures the redirect, then relays the callback to
+// `auth_complete`. The daemon never owns a browser or a loopback; it parks a pending flow between the
+// two calls and writes the resulting credential into the same `CredentialStore` as `CredentialApi`.
+
+/// The kind of interactive auth flow (informs the client how to capture the redirect).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthFlowKind {
+    /// Matrix SSO: the redirect carries a single-use `loginToken`.
+    MatrixSso,
+    /// OAuth2 / OIDC authorization-code + PKCE: the redirect carries `code` + `state`.
+    OAuth2Pkce,
+}
+
+/// Optionally bind the freshly-authenticated account to a profile on success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthBindRequest {
+    /// The profile to attach the account to (edits its `bound_accounts`).
+    pub profile: ProfileRef,
+    /// The instance-qualified transport id (e.g. `matrix/@bot:hs.org`); `None` when it is only known
+    /// after login (the family derives it in `auth_complete`).
+    pub transport_instance: Option<TransportId>,
+    /// The `CredentialStore` key to store the blob under; defaulted/derived if `None`.
+    pub credential_ref: Option<String>,
+}
+
+/// Begin an interactive auth flow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthBeginRequest {
+    /// Transport/provider family, e.g. `"matrix"`.
+    pub family: String,
+    /// Family-specific parameters (e.g. matrix: `homeserver`, optional `idp_id`).
+    pub params: BTreeMap<String, String>,
+    /// The redirect URI the client controls and will capture (loopback URL or custom-scheme deep link).
+    pub redirect_uri: String,
+    /// Optionally bind the resulting account to a profile on success.
+    pub bind: Option<AuthBindRequest>,
+}
+
+/// The parked-flow handle returned by `auth_begin`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthBeginResponse {
+    /// The single-use flow id to pass to `auth_complete` / `auth_cancel`.
+    pub flow_id: String,
+    /// The URL the client opens in a browser.
+    pub authorization_url: String,
+    /// The redirect URI the flow expects (echoed back).
+    pub redirect_uri: String,
+    /// Flow TTL (unix seconds); the flow is evicted after this.
+    pub expires_at: u64,
+    /// Which flow kind this is (how to capture the redirect).
+    pub flow_kind: AuthFlowKind,
+}
+
+/// Finish a flow from the captured redirect.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCompleteRequest {
+    /// The flow id from `auth_begin`.
+    pub flow_id: String,
+    /// The captured callback: the full redirect URL or just its query string (carries the
+    /// `loginToken`, or `code` + `state`).
+    pub callback: String,
+}
+
+/// The outcome of a completed flow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCompleteResponse {
+    /// The `CredentialStore` key the session blob was stored under.
+    pub credential_ref: String,
+    /// A human label for the account (e.g. the resolved `@user:hs.org`).
+    pub account_label: String,
+    /// The instance-qualified transport id the account resolves to.
+    pub transport_instance: TransportId,
+    /// The profile the account was bound to, if a bind was requested and honored.
+    pub bound_profile: Option<ProfileRef>,
+}
+
+/// One field of a family's `params` form (capability discovery).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthParamField {
+    /// The `params` key.
+    pub key: String,
+    /// A human label for the field.
+    pub label: String,
+    /// Whether the field is required.
+    pub required: bool,
+}
+
+/// A registered interactive-auth provider (capability discovery for the client).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProviderInfo {
+    /// The transport/provider family (`auth_begin.family`).
+    pub family: String,
+    /// The flow kind.
+    pub flow_kind: AuthFlowKind,
+    /// A human display name.
+    pub display_name: String,
+    /// The `params` fields the client should collect.
+    pub params_schema: Vec<AuthParamField>,
+}
+
+/// The interactive-auth sub-surface. Every method defaults to [`ApiError::Unsupported`] / empty so a
+/// transport that registers no auth factory inherits the surface; the node binds the real impl.
+#[async_trait]
+pub trait AuthApi: Send + Sync {
+    /// Begin a flow: mint the authorization URL against the client-supplied `redirect_uri` and park it.
+    async fn auth_begin(&self, _req: AuthBeginRequest) -> Result<AuthBeginResponse, ApiError> {
+        Err(ApiError::Unsupported("auth_begin".into()))
+    }
+
+    /// Finish a flow from the captured redirect; persist the credential and optionally bind a profile.
+    async fn auth_complete(
+        &self,
+        _req: AuthCompleteRequest,
+    ) -> Result<AuthCompleteResponse, ApiError> {
+        Err(ApiError::Unsupported("auth_complete".into()))
+    }
+
+    /// Drop a pending flow (user aborted / cleanup). Idempotent.
+    async fn auth_cancel(&self, _flow_id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("auth_cancel".into()))
+    }
+
+    /// The interactive-auth providers this node offers (for the client to render the right form).
+    async fn auth_providers(&self) -> Vec<AuthProviderInfo> {
+        Vec::new()
+    }
+}
+
+/// The whole node surface: the session, control, model-management, profile/config, credential, and
+/// interactive-auth sub-surfaces.
+pub trait NodeApi:
+    SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthApi
+{
+}
+impl<T: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthApi> NodeApi for T {}
 
 // ---------------------------------------------------------------------------
 // Outbound drain item (§17 events + raised host requests share one queue)
@@ -1216,6 +1354,17 @@ pub enum ApiRequest {
         /// The profile / credential-ref to clear.
         profile: String,
     },
+    /// [`AuthApi::auth_begin`].
+    AuthBegin(AuthBeginRequest),
+    /// [`AuthApi::auth_complete`].
+    AuthComplete(AuthCompleteRequest),
+    /// [`AuthApi::auth_cancel`].
+    AuthCancel {
+        /// The flow id to drop.
+        flow_id: String,
+    },
+    /// [`AuthApi::auth_providers`].
+    AuthProviders,
     /// [`ModelApi::models`].
     Models,
     /// [`ModelApi::model_current`].
@@ -1343,6 +1492,12 @@ pub enum ApiResponse {
     Profile(Option<ProfileSpec>),
     /// A redacted credential listing.
     Credentials(Vec<CredentialInfo>),
+    /// A begun interactive-auth flow handle (`auth_begin`).
+    AuthBegun(AuthBeginResponse),
+    /// A completed interactive-auth flow outcome (`auth_complete`).
+    AuthCompleted(AuthCompleteResponse),
+    /// The registered interactive-auth providers (`auth_providers`).
+    AuthProviders(Vec<AuthProviderInfo>),
     /// A discoverable model catalog (cloud + local).
     Models(Vec<ModelDescriptor>),
     /// The model a profile currently resolves to (`None` = none resolvable).
@@ -1601,6 +1756,16 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::CredentialRemove { profile } => {
             unit_or_err(api.credential_remove(profile).await)
         }
+        ApiRequest::AuthBegin(req) => match api.auth_begin(req).await {
+            Ok(r) => ApiResponse::AuthBegun(r),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::AuthComplete(req) => match api.auth_complete(req).await {
+            Ok(r) => ApiResponse::AuthCompleted(r),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::AuthCancel { flow_id } => unit_or_err(api.auth_cancel(flow_id).await),
+        ApiRequest::AuthProviders => ApiResponse::AuthProviders(api.auth_providers().await),
         ApiRequest::Models => ApiResponse::Models(api.models().await),
         ApiRequest::ModelCurrent { profile } => match api.model_current(profile).await {
             Ok(m) => ApiResponse::ModelCurrent(m),
