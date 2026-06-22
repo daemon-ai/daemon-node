@@ -360,7 +360,13 @@ impl WireVersion {
     /// inbound context to the conversation **without** opening a turn (the multi-party accumulation
     /// seam, event-io §5.9): chatter folds in while idle and lands in the following turn while busy,
     /// so a shared room can feed the agent context it sees on its next mention-gated turn.
-    pub const CURRENT: Self = Self(8);
+    ///
+    /// v9 (delivery sessions): adds owned-session discovery (`DeliverySessions { transport }` ->
+    /// `ApiResponse::DeliverySessions([session-id])`), the outbound-symmetry seam a transport calls on
+    /// (re)connect to enumerate the sessions whose `Primary` it owns and resume delivery (event-io
+    /// §5.9.3). The in-process `DeliverySink` push path is a live trait object and does not cross the
+    /// wire, so it adds no op.
+    pub const CURRENT: Self = Self(9);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

@@ -71,7 +71,9 @@ pub use cut::{
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
-pub use node_api::{CloudCatalog, ModelProviderFactory, NodeApiImpl, SessionEngineBuilder};
+pub use node_api::{
+    CloudCatalog, DeliveryHost, ModelProviderFactory, NodeApiImpl, SessionEngineBuilder,
+};
 pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use revision::FileRevisionLog;

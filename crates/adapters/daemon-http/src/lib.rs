@@ -29,11 +29,14 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use daemon_api::{dispatch, ApiRequest, ApiResponse, LogStream, NodeApi};
+use daemon_api::{dispatch, ApiRequest, ApiResponse, LogStream, NodeApi, SessionLogEntry};
 use daemon_common::SessionId;
+use daemon_delivery::{serve_delivery, Projector};
 use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -62,10 +65,15 @@ struct CursorQuery {
 ///   `Origin` (`transport: http/{tenant}`, `scope: Api{ key: tenant }`) and lets the host's §5.9
 ///   routing registry pick the session + profile + delivery. Demonstrates an external transport
 ///   routing by its own principal without deriving the `SessionId` itself.
+/// - `GET /tenants/{tenant}/delivery` — the *outbound* counterpart (§5.9.3): on (re)connect the
+///   adapter enumerates the `http/{tenant}` instance's owned sessions via `daemon-delivery` and
+///   multiplexes their merged-log subscriptions into one SSE stream. This is the reconnect-safe pull
+///   path — a reconnecting tenant rediscovers and resumes every session it owns without tracking ids.
 pub fn router(api: Arc<dyn NodeApi>) -> Router {
     Router::new()
         .route("/api", post(api_dispatch))
         .route("/tenants/{tenant}/submit", post(submit_routed_tenant))
+        .route("/tenants/{tenant}/delivery", get(tenant_delivery_sse))
         .route("/sessions/{session}/log", get(log_after))
         .route("/sessions/{session}/subscribe", get(subscribe_sse))
         .route("/sessions/{session}/ws", get(subscribe_ws))
@@ -110,6 +118,56 @@ async fn submit_routed_tenant(
         Ok(session) => Json(ApiResponse::Routed { session }),
         Err(e) => Json(ApiResponse::Error(e)),
     }
+}
+
+/// A [`Projector`] that forwards every projected `(session, entry)` into an mpsc channel — the
+/// fan-in side of the tenant SSE multiplex. Projection policy here is the trivial "emit each merged
+/// entry as-is"; a real transport would render/coalesce instead.
+struct ChannelProjector {
+    tx: mpsc::Sender<(SessionId, SessionLogEntry)>,
+}
+
+#[async_trait::async_trait]
+impl Projector for ChannelProjector {
+    async fn project(&self, session: SessionId, entry: SessionLogEntry) {
+        // A closed receiver (client disconnected) just drops the entry; the subscription is torn down
+        // when the response stream — which owns it — is dropped.
+        let _ = self.tx.send((session, entry)).await;
+    }
+}
+
+/// `GET /tenants/{tenant}/delivery` — the reconnect-safe outbound pull path (§5.9.3). Uses
+/// [`serve_delivery`] to enumerate the `http/{tenant}` instance's owned sessions, subscribe each
+/// merged log, and multiplex them into a single SSE stream (one event per `(session, entry)`). The
+/// returned [`daemon_delivery::DeliverySubscription`] is owned by the response stream, so it lives
+/// exactly as long as the client stays connected and each session falls off on handover demotion.
+async fn tenant_delivery_sse(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let transport = TransportId::new(format!("http/{tenant}"));
+    let (tx, rx) = mpsc::channel(256);
+    let projector = Arc::new(ChannelProjector { tx });
+    let subscription = serve_delivery(state.api.clone(), transport, projector).await;
+    // Carry the subscription in the stream state so it is dropped (aborting the per-session tasks)
+    // only when the SSE response is dropped — i.e. when the tenant disconnects.
+    let events = futures::stream::unfold(
+        (ReceiverStream::new(rx), subscription),
+        |(mut rx, subscription)| async move {
+            rx.next()
+                .await
+                .map(|(session, entry)| ((session, entry), (rx, subscription)))
+        },
+    )
+    .map(|(session, entry)| {
+        let event = Event::default()
+            .event("delivery")
+            .id(session.as_str())
+            .json_data(&entry)
+            .unwrap_or_else(|_| Event::default().data("serialize error"));
+        Ok::<_, Infallible>(event)
+    });
+    Sse::new(events).keep_alive(KeepAlive::default())
 }
 
 /// `GET /sessions/{session}/log` — the one-shot/long-poll cursor read of the merged session event

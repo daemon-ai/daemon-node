@@ -112,6 +112,7 @@ daemon-telemetry = { path = "crates/substrate/daemon-telemetry" }
 daemon-host = { path = "crates/substrate/daemon-host" }
 daemon-acp = { path = "crates/adapters/daemon-acp" }
 daemon-http = { path = "crates/adapters/daemon-http" }
+daemon-delivery = { path = "crates/adapters/daemon-delivery" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }

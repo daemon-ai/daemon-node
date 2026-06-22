@@ -28,7 +28,7 @@ use daemon_common::{
 };
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
-    TranscriptBlock,
+    TranscriptBlock, TransportId,
 };
 pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
@@ -94,6 +94,24 @@ impl ApprovalMode {
         ApprovalMode::AutoAllow,
         ApprovalMode::Deny,
     ];
+}
+
+/// An **in-process** outbound delivery sink: where the host pushes a session's outbound entries for
+/// a transport instance to *post* (daemon-event-io-spec §5.9.3, the push half of the subscriber
+/// model). A transport registers one keyed by its instance [`TransportId`] with the host; the host's
+/// per-session event pump resolves the session's current [`DeliveryTarget`]s and calls
+/// [`deliver`](DeliverySink::deliver) on the sink owning each — so a demoted `Primary` stops
+/// receiving and a new one starts, with no work in the adapter.
+///
+/// This is deliberately **not** part of the wire [`ApiRequest`] surface: a sink is a live trait
+/// object that cannot cross a process boundary, so cross-process transports use the pull path
+/// instead ([`SessionApi::delivery_sessions`] + [`SessionApi::subscribe`]). Projection of the rich
+/// [`SessionLogEntry`] stream down to a concrete message stays the sink's job (adapter-owned policy).
+#[async_trait]
+pub trait DeliverySink: Send + Sync {
+    /// Post one outbound `entry` to `target` (the sink's transport instance). Called from the
+    /// session's pump task, so a slow sink backs up only its own session's delivery.
+    async fn deliver(&self, target: DeliveryTarget, entry: SessionLogEntry);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +205,16 @@ pub trait SessionApi: Send + Sync {
     /// authoritative source for "who receives the reply." Default: empty (a transport that does not
     /// track delivery targets).
     async fn delivery_targets(&self, _session: SessionId) -> Vec<DeliveryTarget> {
+        Vec::new()
+    }
+
+    /// The live sessions a transport *instance* currently owns for delivery — every session whose
+    /// `Primary` [`DeliveryTarget`] names `transport` (daemon-event-io-spec §5.9.3). This is the
+    /// owned-session discovery primitive a transport calls on (re)connect to find which sessions it
+    /// must resume posting for, without having tracked their ids itself (the reconnect-safe seam the
+    /// `submit_routed`-returns-an-id path alone cannot cover after a restart). Default: empty (a
+    /// transport with no live delivery state).
+    async fn delivery_sessions(&self, _transport: TransportId) -> Vec<SessionId> {
         Vec::new()
     }
 
@@ -928,6 +956,11 @@ pub enum ApiRequest {
         /// The session whose delivery targets to read.
         session: SessionId,
     },
+    /// [`SessionApi::delivery_sessions`] — the live sessions a transport instance owns for delivery.
+    DeliverySessions {
+        /// The transport instance whose owned sessions to enumerate.
+        transport: TransportId,
+    },
     /// [`SessionApi::handover`].
     Handover {
         /// The session whose `Primary` reply sink to re-point.
@@ -1243,6 +1276,8 @@ pub enum ApiResponse {
     LogPage(LogPageView),
     /// A session's outbound delivery targets (the reply sinks of `delivery_targets`).
     DeliveryTargets(Vec<DeliveryTarget>),
+    /// The live sessions a transport instance owns for delivery (`delivery_sessions`).
+    DeliverySessions(Vec<SessionId>),
     /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
     VerifyingKey(Option<String>),
     /// A page of model search results.
@@ -1355,6 +1390,9 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
         },
         ApiRequest::DeliveryTargets { session } => {
             ApiResponse::DeliveryTargets(api.delivery_targets(session).await)
+        }
+        ApiRequest::DeliverySessions { transport } => {
+            ApiResponse::DeliverySessions(api.delivery_sessions(transport).await)
         }
         ApiRequest::Handover { session, target } => {
             unit_or_err(api.handover(session, target).await)
@@ -1537,6 +1575,7 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         | ApiRequest::SessionHistory { .. }
         | ApiRequest::Subscribe { .. }
         | ApiRequest::DeliveryTargets { .. }
+        | ApiRequest::DeliverySessions { .. }
         | ApiRequest::Handover { .. }
         | ApiRequest::RecordMeta { .. }
         | ApiRequest::SetSessionModel { .. }

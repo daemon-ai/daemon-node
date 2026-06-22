@@ -1873,6 +1873,7 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-credentials",
+ "daemon-delivery",
  "daemon-host",
  "daemon-node",
  "daemon-orchestration",
@@ -1955,6 +1956,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-delivery"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-common",
+ "daemon-protocol",
+ "futures",
+ "tokio",
+]
+
+[[package]]
 name = "daemon-ffi"
 version = "0.0.0"
 dependencies = [
@@ -2001,6 +2014,7 @@ dependencies = [
  "axum",
  "daemon-api",
  "daemon-common",
+ "daemon-delivery",
  "daemon-protocol",
  "futures",
  "reqwest 0.12.28",

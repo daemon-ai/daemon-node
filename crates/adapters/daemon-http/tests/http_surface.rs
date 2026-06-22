@@ -12,8 +12,8 @@ use daemon_api::{
 };
 use daemon_common::{SessionId, UnitId};
 use daemon_protocol::{
-    AgentCommand, Direction, Disposition, HostResponse, Origin, OriginScope, SessionLogEntry,
-    SessionPayload,
+    AgentCommand, DeliveryTarget, Direction, Disposition, HostResponse, Origin, OriginScope,
+    SessionLogEntry, SessionPayload, SinkKind, TransportId,
 };
 use futures::StreamExt;
 
@@ -57,6 +57,18 @@ impl SessionApi for MockApi {
     }
     async fn subscribe(&self, _: SessionId, _: u64) -> Result<LogStream, ApiError> {
         Ok(futures::stream::iter(vec![entry(1), entry(2)]).boxed())
+    }
+    async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
+        // The `http/t1` tenant owns exactly one session (the discovery the delivery endpoint runs).
+        if transport == TransportId::new("http/t1") {
+            vec![SessionId::new("s-http-t1")]
+        } else {
+            Vec::new()
+        }
+    }
+    async fn delivery_targets(&self, _: SessionId) -> Vec<DeliveryTarget> {
+        // The owned session's reply sink is the `http/t1` Primary, so the pull helper keeps delivering.
+        vec![DeliveryTarget::new("http/t1", "tenant", SinkKind::Primary)]
     }
 }
 
@@ -167,6 +179,41 @@ async fn get_log_returns_a_cursor_page() {
         }
         other => panic!("expected LogPage, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn tenant_delivery_multiplexes_owned_sessions() {
+    let base = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // The tenant delivery endpoint discovers `http/t1`'s owned sessions via `delivery_sessions` and
+    // multiplexes their merged-log subscriptions into one SSE stream (the reconnect-safe pull path).
+    let resp = client
+        .get(format!("{base}/tenants/t1/delivery"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let mut stream = resp.bytes_stream();
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("timed out waiting for delivery sse chunk")
+        .expect("stream ended")
+        .expect("chunk error");
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(
+        text.contains("event:delivery") || text.contains("event: delivery"),
+        "expected a delivery SSE event, got: {text}"
+    );
+    assert!(
+        text.contains("\"seq\""),
+        "expected a serialized log entry in the delivery stream: {text}"
+    );
+    assert!(
+        text.contains("s-http-t1"),
+        "expected the owned session id as the SSE event id: {text}"
+    );
 }
 
 #[tokio::test]
