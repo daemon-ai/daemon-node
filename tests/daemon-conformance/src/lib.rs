@@ -1684,6 +1684,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            routing: None,
         })
     }
 
@@ -1754,6 +1755,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            routing: None,
         });
         (node, handle)
     }
@@ -2587,6 +2589,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: Some(revisions),
             skills: Some(skills.clone()),
+            routing: None,
         });
         (node, handle, skills)
     }
@@ -2753,6 +2756,189 @@ mod node_interface {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// THE ROUTING GATE (daemon-event-io-spec §5.9): a routed submit hands the host only an `Origin`
+    /// and the host's routing registry resolves it to a session + profile + delivery. Proves, with no
+    /// chat transport at all: (1) the account->profile baseline (two transport instances bound to two
+    /// profiles run two different agents), (2) the per-room override beating the instance default
+    /// (precedence), (3) the `Primary` is auto-seeded as the inverse of the opening origin so a reply
+    /// leaves the right account, and (4) `handover` demotes the prior `Primary` to `Spectator`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routed_submit_resolves_profile_and_delivery_per_origin() {
+        use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_host::{
+            MemCredentialStore, MemProfileStore, OriginMatcher, ProfileStore, RoutingRegistry,
+            ScopePattern, SessionBinding, TransportPattern,
+        };
+        use daemon_protocol::{
+            AgentCommand, AgentEvent, DeliveryTarget, IsolationPolicy, Origin, OriginScope, SinkKind,
+            TransportId, UserMsg,
+        };
+
+        // Three profiles, each echoing its id+model through the mock provider so the reply reveals
+        // which agent ran the session.
+        let store = Arc::new(MemProfileStore::new());
+        for (id, model) in [
+            ("alpha", "model-a"),
+            ("beta", "model-b"),
+            ("secops", "model-s"),
+        ] {
+            let mut spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
+            spec.system_prompt = format!("You are {id}.");
+            store.create(spec).expect("create profile");
+        }
+        store.set_active("alpha").expect("set active");
+
+        let resolver: daemon_node::ProviderResolver = Arc::new(|spec: &ProfileSpec| {
+            let reply = format!("[{}] from {}", spec.id, spec.model);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
+            builder
+        });
+
+        // Two accounts bound to two profiles (the baseline); a per-room override on account A's
+        // #secops* rooms picks a third profile (precedence step 1 beats step 2).
+        let routing = RoutingRegistry::new()
+            .bind_instance(TransportId::new("matrix/@a:hs"), ProfileRef::new("alpha"))
+            .bind_instance(TransportId::new("matrix/@b:hs"), ProfileRef::new("beta"))
+            .with_binding(
+                SessionBinding::new(
+                    OriginMatcher {
+                        transport: TransportPattern::Exact(TransportId::new("matrix/@a:hs")),
+                        scope: ScopePattern::Group {
+                            chat_glob: "#secops*".into(),
+                        },
+                    },
+                    IsolationPolicy::PerChat,
+                )
+                .with_profile(ProfileRef::new("secops")),
+            );
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(store),
+            provider_resolver: Some(resolver),
+            credential_store: Some(Arc::new(MemCredentialStore::new())),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: Some(routing),
+        });
+
+        // Drive a routed submit for `origin` and return (resolved session, final text).
+        async fn route_and_drain(
+            node: &Arc<NodeApiImpl>,
+            origin: Origin,
+        ) -> (SessionId, String) {
+            let session = node
+                .submit_routed(
+                    origin,
+                    AgentCommand::StartTurn {
+                        input: UserMsg::new("hi"),
+                        request_id: ReqId(1),
+                    },
+                )
+                .await
+                .expect("routed submit");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut final_text = String::new();
+            let mut finished = false;
+            while Instant::now() < deadline && !finished {
+                for item in node.poll(session.clone(), 0).await.expect("poll") {
+                    if let Outbound::Event(AgentEvent::TurnFinished { summary, .. }) = item {
+                        finished = true;
+                        final_text = summary.final_text.unwrap_or_default();
+                    }
+                }
+                if !finished {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            assert!(finished, "routed turn never reached TurnFinished");
+            (session, final_text)
+        }
+
+        let origin_a = Origin::new(
+            TransportId::new("matrix/@a:hs"),
+            OriginScope::Group {
+                chat: "#general".into(),
+                thread: None,
+            },
+        );
+        let origin_b = Origin::new(
+            TransportId::new("matrix/@b:hs"),
+            OriginScope::Group {
+                chat: "#general".into(),
+                thread: None,
+            },
+        );
+        let origin_secops = Origin::new(
+            TransportId::new("matrix/@a:hs"),
+            OriginScope::Group {
+                chat: "#secops-alerts".into(),
+                thread: None,
+            },
+        );
+
+        let (session_a, text_a) = route_and_drain(&node, origin_a.clone()).await;
+        let (session_b, text_b) = route_and_drain(&node, origin_b.clone()).await;
+        let (session_secops, text_secops) = route_and_drain(&node, origin_secops.clone()).await;
+
+        // 1+2. Each origin ran the agent the registry selected (account baseline + room override).
+        assert!(text_a.contains("[alpha]"), "account A -> alpha, got {text_a:?}");
+        assert!(text_b.contains("[beta]"), "account B -> beta, got {text_b:?}");
+        assert!(
+            text_secops.contains("[secops]"),
+            "account A #secops -> override profile, got {text_secops:?}"
+        );
+        assert_ne!(session_a, session_b, "distinct accounts -> distinct sessions");
+        assert_ne!(session_a, session_secops, "override room is its own session");
+
+        // 3. The Primary is the inverse of the opening origin (reply leaves the right account/room).
+        let targets_a = node.delivery_targets(session_a.clone()).await;
+        let primary_a = targets_a
+            .iter()
+            .find(|t| t.kind == SinkKind::Primary)
+            .expect("session A has a Primary");
+        assert_eq!(primary_a, &origin_a.primary_target());
+        assert_eq!(primary_a.transport, TransportId::new("matrix/@a:hs"));
+
+        // 4. Handover re-points the Primary; the prior matrix Primary is demoted to Spectator.
+        let gui = DeliveryTarget::new("gui", "panel-1", SinkKind::Primary);
+        node.handover(session_a.clone(), gui.clone())
+            .await
+            .expect("handover");
+        let after = node.delivery_targets(session_a.clone()).await;
+        let primaries: Vec<_> = after.iter().filter(|t| t.kind == SinkKind::Primary).collect();
+        assert_eq!(primaries.len(), 1, "exactly one Primary after handover");
+        assert_eq!(primaries[0].transport, TransportId::new("gui"));
+        assert!(
+            after
+                .iter()
+                .any(|t| t.transport == TransportId::new("matrix/@a:hs")
+                    && t.kind == SinkKind::Spectator),
+            "the prior matrix Primary is demoted to Spectator, not dropped"
+        );
+
+        handle.shutdown().await;
+    }
+
     /// THE THREAD-C GATE: reconnect + scroll-back through durable, verified history. After an
     /// interactive turn seals into the unified verifiable journal, the session's history is read
     /// back through the (non-destructive) `session_history` surface — independent of the live drain,
@@ -2910,6 +3096,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            routing: None,
         })
     }
 

@@ -42,6 +42,7 @@ pub mod node_api;
 pub mod process_agent;
 pub mod profiles;
 pub mod revision;
+pub mod routing;
 pub mod services;
 pub mod socket;
 pub mod streamjson;
@@ -74,6 +75,10 @@ pub use node_api::{CloudCatalog, ModelProviderFactory, NodeApiImpl, SessionEngin
 pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use revision::FileRevisionLog;
+pub use routing::{
+    DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
+    TransportPattern,
+};
 pub use socket::{serve_api_unix, ApiClient};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{

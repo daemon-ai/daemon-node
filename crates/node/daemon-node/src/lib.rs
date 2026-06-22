@@ -29,8 +29,8 @@ use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
     CodecSession, CoreEngineFactory, CredentialStore, EngineUnit, FleetControl, Host, HostConfig,
     JobWorker, JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl,
-    ProcessAgentUnit, ProfileStore, ServiceError, SessionEngineBuilder, StreamJsonCodec,
-    SupervisorHandle,
+    ProcessAgentUnit, ProfileStore, RoutingRegistry, ServiceError, SessionEngineBuilder,
+    StreamJsonCodec, SupervisorHandle,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -153,6 +153,11 @@ pub struct NodeAssembly {
     /// `None` builds a node without skill versioning/distribution. Must be the same `Arc<SkillStore>`
     /// whose tools are in [`Self::extra_tools`].
     pub skills: Option<Arc<daemon_skills::SkillStore>>,
+    /// The host routing registry (daemon-event-io-spec §5.9): maps an inbound `Origin` to the
+    /// session + profile + delivery a routed submit (`SessionApi::submit_routed`) opens. `None` (the
+    /// default) installs an empty registry — routed submits then derive the session with `PerThread`
+    /// and run the node's active default profile (the legacy single-profile behavior).
+    pub routing: Option<RoutingRegistry>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -523,12 +528,17 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
                     prompt_sources: a.prompt_sources.clone(),
                 };
                 let fallback = session_profile;
-                Arc::new(move |id: SessionId| {
-                    let spec = store
-                        .active()
-                        .ok()
-                        .flatten()
-                        .and_then(|active| store.get(&active).ok().flatten());
+                Arc::new(move |id: SessionId, requested: Option<ProfileRef>| {
+                    // Routing's agent-selection seam: build from the explicitly-requested profile when
+                    // one is supplied, else the node's active default (the legacy single-profile path).
+                    let spec = match requested {
+                        Some(profile) => store.get(profile.as_str()).ok().flatten(),
+                        None => store
+                            .active()
+                            .ok()
+                            .flatten()
+                            .and_then(|active| store.get(&active).ok().flatten()),
+                    };
                     match spec {
                         Some(spec) => ctx.profile_from_spec(&spec).fresh(id),
                         None => fallback.fresh(id),
@@ -537,7 +547,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             }
             _ => {
                 let profile = session_profile;
-                Arc::new(move |id: SessionId| profile.fresh(id))
+                Arc::new(move |id: SessionId, _requested: Option<ProfileRef>| profile.fresh(id))
             }
         };
 
@@ -571,6 +581,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     }
     if let Some(skills) = a.skills.clone() {
         node_api = node_api.with_skills(skills);
+    }
+    // Install the host routing registry (§5.9) when configured, so routed submits select the
+    // session's profile + delivery from the inbound origin.
+    if let Some(routing) = a.routing.clone() {
+        node_api = node_api.with_routing(routing);
     }
     // Bind the live cloud-model discovery hook when the binary provided one.
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {

@@ -48,6 +48,9 @@ daemon-tool-skill = { workspace = true }
 daemon-tool-browser = { workspace = true, optional = true }
 daemon-models = { workspace = true }
 daemon-api = { workspace = true }
+# Protocol routing primitives (TransportId / IsolationPolicy) for building the §5.9 routing registry
+# from the `[routing]` config; already a transitive dep via daemon-host/daemon-api.
+daemon-protocol = { workspace = true }
 # Optional in-process HTTP/WS surface, toggled on at launch by a configured bind address.
 daemon-http = { workspace = true }
 daemon-credentials = { workspace = true }

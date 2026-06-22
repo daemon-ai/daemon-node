@@ -641,6 +641,108 @@ This replaces hermes's `api_server` (OpenAI-compatible HTTP + SSE). Because it i
 | skills (markdown playbooks) | same idea, out of scope here | Loaded into user message, cache-safe |
 | `HERMES_*` env / `ContextVars` | explicit `SessionId` / `TurnCx` / trace scope | No ambient global routing state |
 
+### 5.9 Bidirectional routing: scope → agent, multi-instance, and outbound delivery
+
+§5.3 settled *naming* (origin → `SessionId` via `session_id_for`) and §5.4 settled the *log* (one
+`seq`-stamped merged stream with `Origin`/`Disposition`/`DeliveryTarget`). Neither settled **routing**:
+*which agent* runs a derived session, how *multiple accounts of one transport family* stay distinct,
+and *who delivers* an outbound reply back to the originating chat. This section adds that — a single,
+**bidirectional** routing capability owned by the **host** (not by any adapter). It generalises
+hermes's scattered `build_session_key` + `DeliveryRouter` logic into one place, and it is the missing
+piece that lets different chats/rooms/channels map to different agents across many accounts.
+
+Motivating gap (verified against the current host): a live session's engine is built from a single
+node-wide builder — `LiveSessions` holds one `builder` and `ensure()` calls `(self.builder)(session)`
+with no per-session profile selection — and `Origin.transport` is a flat string with no
+account/instance dimension. So today every live session runs the node's one active-default profile,
+and two accounts of the same family collide. Routing closes both.
+
+#### 5.9.1 Inbound routing / session binding (which agent)
+
+A host-level **routing registry**: an ordered table of bindings, consulted when an inbound `Origin`
+first appears for a not-yet-resident session.
+
+```rust
+struct SessionBinding {
+    matcher: OriginMatcher,      // transport-instance + scope pattern (room glob / dm / api-key / *)
+    isolation: IsolationPolicy,  // reuse §5.3 — drives session_id_for
+    profile: Option<ProfileRef>, // explicit agent override for matched origins (None = fall through)
+    delivery: DeliveryPolicy,    // usually derive Primary from Origin (§5.9.3); overridable
+}
+```
+
+Resolution: first matching binding → `session_id_for(origin, binding.isolation)` for the **name** →
+choose the **profile**. `session_id_for` stays the naming primitive; the registry adds *agent
+selection* on top. Profile-resolution **precedence** (the resolved decision):
+
+1. an explicit per-row `binding.profile` (a route override),
+2. else the **transport-instance's bound profile** (the default — e.g. a chat *account* is bound to a
+   profile out-of-band, §5.9.4 / Matrix doc), so all of that account's scopes run that agent unless a
+   row overrides,
+3. else the node default profile (or drop, by config).
+
+This makes "different agents in different rooms" expressible two ways: bind different *accounts*
+(instances) to different profiles (the baseline), and/or add explicit per-scope override rows (a
+single account fanning multiple agents across its rooms). For non-chat transports (HTTP keys, Slack
+channels, the scheduler) the override row is the primary selector — same registry, same shape.
+
+**Contract gap this exposes (the one invasive host change):** the per-session engine build must
+become **profile-aware** — `LiveSessions::ensure(session, ProfileRef)` resolving the engine from that
+profile through the existing `provider_resolver` + `ProfileStore`, rather than the fixed node-assembly
+builder. The host (never the adapter) owns derivation: an adapter hands the host an `Origin`; a thin
+`route_inbound`/profile-resolving submit path turns it into `(SessionId, ProfileRef)` and binds the
+live session. Per-session profiles also imply **profile-scoped subsystem stores**: `profile_home` is
+already per-profile (`<data_dir>/<profile>/`), but the live §10/§11 context/memory *builders* are
+wired for one profile at assembly — routing sessions to different profiles means threading the profile
+through those builders (or accepting shared banks in v1).
+
+#### 5.9.2 Transport-instance identity (multiple accounts)
+
+A transport *family* (`"matrix"`, `"slack"`) can have many *instances* (accounts). Two ways to carry
+the instance, **recommend the convention**:
+
+- **Convention (recommended):** an instance-qualified `TransportId`, e.g.
+  `TransportId("matrix/@bot:hs.org")`. Zero protocol change — `TransportId` is an opaque interned
+  string the daemon never matches structurally on, `session_id_for` already namespaces sessions by it,
+  and `DeliveryTarget.transport` already carries it so a reply routes back out the *right* account.
+  The adapter keeps an internal `TransportId(instance) → client` map.
+- **Structural (upgrade path):** a first-class `Origin.instance` field. Cleaner family-vs-instance
+  matching in the registry (e.g. "*any* matrix account, room `#ops` → profile X") and instance
+  enumeration for a GUI, but a `WireVersion` bump + CDDL change. Adopt only when wildcard-by-family
+  matchers or instance listing are actually needed.
+
+#### 5.9.3 Outbound routing (the symmetric half — who delivers the reply)
+
+The common case is **already solved by construction**: `DeliveryTarget { transport, route, kind }` is
+the outbound route, **auto-seeded as the inverse of the opening `Origin`** (the Primary is the origin's
+reply address, captured at session open). So "reply to the chat it came from" needs no extra config,
+and **multi-account demux is free** — the Primary names the account-instance `TransportId` + the chat
+`RouteAddr`. Four rules the primitive leaves implicit, now stated:
+
+- **Dispatch ownership — subscriber model (v1).** Delivery is a *subscriber set* (§5.4): the transport
+  instance named in the Primary `subscribe()`s its sessions and posts; the host only **stores**
+  `DeliveryTarget`s, it does not push. (Previously only implied; now the rule.)
+- **Central dispatcher (documented upgrade path).** For centralized / cross-process delivery
+  guarantees, transports register a `DeliverySink` keyed by transport-instance and a host outbound
+  dispatcher pushes each session's outbound stream to the owning sink. Adds a sink-registration
+  contract + cross-process semantics; specify as the evolution, not v1.
+- **Where vs what.** `DeliveryTarget` answers *where*; it does not say *what*. Projecting the rich
+  outbound `AgentEvent` stream (deltas / tool / reasoning) down to a chat message (final text, optional
+  tool summaries) is per-transport **projection policy** — the exact mirror of inbound addressing
+  policy, and adapter-owned.
+- **Spectator fan-out + handover honoring.** Multiple targets across transports (a GUI watching a chat)
+  work because each subscriber self-selects the targets it owns; events are not individually
+  target-tagged. After `handover` re-points the Primary, an adapter must consult `delivery_targets` and
+  **stop** posting once demoted to `Spectator` (never assume it is still Primary).
+
+#### 5.9.4 Placement and definitions
+
+Registry + profile-aware live binding live at the **host** (beside `LiveSessions`), consistent with
+"the host owns session lifecycle." Route/binding *definitions* are configuration (a per-adapter route
+table), editable like profiles. Where an *account* is bound to a *profile* (chat transports), that
+binding is data in the profile/credential subsystem rather than a route-table column — the registry
+reads it as precedence step 2 above (see the Matrix doc for the concrete instantiation).
+
 ---
 
 ## 6. Recommended dependency crates
@@ -721,6 +823,17 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
    backed); FFI/one-shot *long-polls* the same cursor. `dispatch` stays one-shot; streaming is a
    transport capability, not an enum variant. Requires generalising the outbound-only `EventSink`
    into a single per-session sequencer across both directions.
+10. **Bidirectional routing is a host capability (§5.9).** A host-level routing registry maps
+    `(transport-instance, scope)` → `(IsolationPolicy, profile, DeliveryPolicy)`; it sits on top of
+    `session_id_for` (which keeps owning naming) and adds **agent selection**. Multiple accounts are
+    instance-qualified `TransportId`s (`matrix/@bot:hs.org`) by **convention** — no protocol change —
+    with a structural `Origin.instance` field as a later upgrade. Profile precedence is *route override
+    > instance's bound profile > node default*. Outbound delivery is the **subscriber model** (the
+    instance named in the Primary subscribes and posts; the host stores but does not push), with a
+    central `DeliverySink` dispatcher as the cross-process upgrade. The one invasive consequence:
+    `LiveSessions::ensure`/`SessionEngineBuilder` must become **profile-aware**
+    (`ensure(session, ProfileRef)`), and per-session profiles thread through the §10/§11 context/memory
+    builders.
 
 ### Open questions
 
@@ -751,8 +864,13 @@ adapter crate inherits one source of truth, exactly as the workspace already doe
   `Scheduled` trigger, isolated sessions, at-most-once + stale-miss fast-forward.
 - **P4 — MCP server.** `daemon-mcp-server` over `NodeApi` (session-bridge + scoped fleet-control),
   subscribing to the live log + journal.
+- **P4.5 — bidirectional routing (§5.9).** The host routing registry + profile-aware
+  `LiveSessions::ensure(session, ProfileRef)` + the transport-instance convention + the explicit
+  outbound subscriber-ownership rule. The reusable foundation that P5 chat transports consume;
+  testable without any chat transport (e.g. HTTP-key → profile, reply on the same connection).
 - **P5 — chat transports.** Out-of-process adapters against `daemon-http`/the socket; in-tree only
-  if explicitly required.
+  if explicitly required. The first such transport (Matrix, SSO + E2EE) is specified in
+  `daemon-matrix-transport-spec.md`, which instantiates the §5.9 routing capability end-to-end.
 
 Each phase is an independent adapter crate that depends only on `daemon-api`/`daemon-protocol`
 (plus its isolated transport dep), so none of them can regrow a `GatewayRunner` monolith.

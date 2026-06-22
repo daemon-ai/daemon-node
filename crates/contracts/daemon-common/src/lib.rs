@@ -350,7 +350,12 @@ impl WireVersion {
     /// skills, `credential_ref` kept) and a native append-only revision history shared by profiles
     /// and skills (`Profile{History,At,Revert}`, `Skill{History,At,Revert}`, `Revision`/`Author`,
     /// `SkillBundle`) with non-destructive revert / roll-forward.
-    pub const CURRENT: Self = Self(6);
+    ///
+    /// v7 (routing): adds the host-routed submit (`SubmitRouted { origin, command }` ->
+    /// `ApiResponse::Routed { session }`), the seam a transport uses to hand the host an `Origin` and
+    /// let the §5.9 routing capability resolve the session + profile + delivery (rather than deriving
+    /// the `SessionId` itself).
+    pub const CURRENT: Self = Self(7);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
