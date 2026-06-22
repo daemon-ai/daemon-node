@@ -38,10 +38,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod profile;
 pub use profile::{
-    BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, Distribution, EngineTunables,
-    MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec, ProviderSelector, SessionOverlay,
-    ToolsOverride,
+    BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
+    Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
+    ProviderSelector, SessionOverlay, ToolsOverride,
 };
+pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 
 /// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
 /// shape a streaming transport (in-process, socket, HTTP/WS) returns from [`SessionApi::subscribe`].
@@ -629,6 +630,46 @@ pub trait ProfileApi: Send + Sync {
     async fn skill_revert(&self, _name: String, _seq: u64) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("skill_revert".into()))
     }
+
+    /// List a profile's skill library with per-skill usage + lifecycle state (the curator view).
+    /// `profile` defaults to the node's active default.
+    async fn curator_list(&self, _profile: Option<String>) -> Result<Vec<CuratorEntry>, ApiError> {
+        Err(ApiError::Unsupported("curator_list".into()))
+    }
+
+    /// Pin a skill (protect it from automatic archiving).
+    async fn curator_pin(&self, _profile: Option<String>, _name: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("curator_pin".into()))
+    }
+
+    /// Unpin a skill (re-expose it to automatic curation).
+    async fn curator_unpin(&self, _profile: Option<String>, _name: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("curator_unpin".into()))
+    }
+
+    /// Archive a skill (move it out of discovery + the index into `.archive/`).
+    async fn curator_archive(
+        &self,
+        _profile: Option<String>,
+        _name: String,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("curator_archive".into()))
+    }
+
+    /// Restore an archived skill back into the live library.
+    async fn curator_restore(
+        &self,
+        _profile: Option<String>,
+        _name: String,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("curator_restore".into()))
+    }
+
+    /// Run the deterministic curator over a profile's library (stale/archive/reactivate), returning
+    /// the lifecycle changes applied.
+    async fn curator_run(&self, _profile: Option<String>) -> Result<Vec<CuratorChange>, ApiError> {
+        Err(ApiError::Unsupported("curator_run".into()))
+    }
 }
 
 /// The credential sub-surface: set / list (redacted) / remove the provider secrets the node's
@@ -1202,6 +1243,50 @@ pub enum ApiRequest {
         /// The revision sequence to revert to.
         seq: u64,
     },
+    /// [`ProfileApi::curator_list`].
+    CuratorList {
+        /// The profile whose skill library to list (`None` = the active default).
+        #[serde(default)]
+        profile: Option<String>,
+    },
+    /// [`ProfileApi::curator_pin`].
+    CuratorPin {
+        /// The profile owning the skill (`None` = the active default).
+        #[serde(default)]
+        profile: Option<String>,
+        /// The skill (bundle) name to pin (protect from auto-archiving).
+        name: String,
+    },
+    /// [`ProfileApi::curator_unpin`].
+    CuratorUnpin {
+        /// The profile owning the skill (`None` = the active default).
+        #[serde(default)]
+        profile: Option<String>,
+        /// The skill (bundle) name to unpin.
+        name: String,
+    },
+    /// [`ProfileApi::curator_archive`].
+    CuratorArchive {
+        /// The profile owning the skill (`None` = the active default).
+        #[serde(default)]
+        profile: Option<String>,
+        /// The skill (bundle) name to archive (move out of discovery).
+        name: String,
+    },
+    /// [`ProfileApi::curator_restore`].
+    CuratorRestore {
+        /// The profile owning the skill (`None` = the active default).
+        #[serde(default)]
+        profile: Option<String>,
+        /// The skill (bundle) name to restore from the archive.
+        name: String,
+    },
+    /// [`ProfileApi::curator_run`].
+    CuratorRun {
+        /// The profile whose library to curate (`None` = the active default).
+        #[serde(default)]
+        profile: Option<String>,
+    },
     /// [`CredentialApi::credential_set`].
     CredentialSet {
         /// The profile / credential-ref to key the secret by.
@@ -1355,6 +1440,10 @@ pub enum ApiResponse {
     Revisions(Vec<Revision>),
     /// A skill bundle as recorded at a revision (skill_at).
     SkillBundle(SkillBundle),
+    /// A profile's curator listing (curator_list): discovered + archived skills with usage.
+    CuratorSkills(Vec<CuratorEntry>),
+    /// The lifecycle changes a curator run applied (curator_run).
+    CuratorRun(Vec<CuratorChange>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -1594,6 +1683,26 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             Err(e) => ApiResponse::Error(e),
         },
         ApiRequest::SkillRevert { name, seq } => unit_or_err(api.skill_revert(name, seq).await),
+        ApiRequest::CuratorList { profile } => match api.curator_list(profile).await {
+            Ok(entries) => ApiResponse::CuratorSkills(entries),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::CuratorPin { profile, name } => {
+            unit_or_err(api.curator_pin(profile, name).await)
+        }
+        ApiRequest::CuratorUnpin { profile, name } => {
+            unit_or_err(api.curator_unpin(profile, name).await)
+        }
+        ApiRequest::CuratorArchive { profile, name } => {
+            unit_or_err(api.curator_archive(profile, name).await)
+        }
+        ApiRequest::CuratorRestore { profile, name } => {
+            unit_or_err(api.curator_restore(profile, name).await)
+        }
+        ApiRequest::CuratorRun { profile } => match api.curator_run(profile).await {
+            Ok(changes) => ApiResponse::CuratorRun(changes),
+            Err(e) => ApiResponse::Error(e),
+        },
         ApiRequest::CredentialSet { profile, secret } => {
             unit_or_err(api.credential_set(profile, secret).await)
         }

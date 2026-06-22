@@ -295,7 +295,8 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Background review fork | `agent/background_review.py:675` | DONE — engine-native `Effect::Spawn` → attached, self-closing `skill_review` background child (counter-triggered via `skill_review_interval`); see [daemon-core-spec](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §4.6 + [daemon-host-spec](daemon-host-spec.md) §7. Opt-in (interval `0` by default). |
 | Bundled default skills | `skills/` (73, auto-synced by `tools/skills_sync.py`); `get_bundled_skills_dir` | PARTIAL (curated) — daemon embeds + seeds a **portable subset** on first run (see *Bundled-skills delta* below). |
 | Skill version history + revert | (hermes has none — flat dirs) | `Skill{History,At,Revert}` over the shared revision log | **DONE** — every `skill_manage` write (incl. the agent's background-review edits) records a `SkillBundle` snapshot in the native `RevisionLog`; non-destructive revert + roll-forward; binary-bundled skills are read-only (revert rejected). Wire v6. See [host-spec §7.2](daemon-host-spec.md). |
-| Curator lifecycle (usage telemetry, archival, provenance) | `agent/curator.py:198`; `tools/skill_usage.py`; `tools/skill_provenance.py` | PARTIAL — **provenance DONE** via the revision log's `Author` (operator vs `agent:skill_manage`); usage counters (`.usage.json` view/use/patch) + stale/archive curation still MISSING. P3. |
+| Per-profile (per-agent) skill libraries | `agent/skill_utils.py` (per-agent skills dir) | **DONE** — skills are resolved *per profile* like memory/context, not built once over the launch agent: `SkillsProvider::for_profile(id)` yields each agent's `Arc<SkillStore>` rooted at `<data_dir>/<id>/skills` (seeded + revision-logged), and `daemon-node`'s `SkillsResolver` seam registers each session's own `skill_*` tools + index in `resolve_effective` (allowlist-gated). A profile distribution carries + reconstitutes that profile's own local skills. See [daemon-skills/src/lib.rs](../../crates/skills/daemon-skills/src/lib.rs). |
+| Curator lifecycle (usage telemetry, archival, provenance) | `agent/curator.py:198`; `tools/skill_usage.py`; `tools/skill_provenance.py` | **DONE** — provenance via the revision log's `Author` *and* the per-profile `.usage.json` sidecar (`SkillUsageLog`/`FileSkillUsageLog`: view/use/patch counts, `created_by` agent/user/bundled, `pinned`, lifecycle state). Deterministic curator (`apply_automatic_transitions`: idle→stale→archive, reactivate, skip pinned/user/bundled) + physical `archive`/`restore` to `.archive/` with revision provenance. Operator surface `Curator{List,Pin,Unpin,Archive,Restore,Run}` (per profile, `daemon-cli curator …`). Wire v12. LLM-consolidation fork remains P3. |
 | Hub install + slash-commands + `--skills` preload + skill bundles | `tools/skills_hub.py`; `agent/skill_commands.py`; `agent/skill_bundles.py` | MISSING. P3 — no remote hub, `/skill` slash, CLI preload, or YAML skill-bundles. |
 | Conditional/environment/platform gating + external dirs | `agent/skill_utils.py:128-269,478-492` | MISSING — daemon renders the index unconditionally (no `platforms`/`environments`/`requires_toolsets` filtering, no `skills.external_dirs`). P3. |
 
@@ -543,16 +544,19 @@ the parity-map. Use this as the long-horizon backlog after the D0 demo.
 **P2 — ecosystem breadth:**
 - Provider breadth + credential pool + fallback (Domain C) — MISSING.
 - Skills subsystem: discovery, index, `skill_view`/`skills_list`/`skill_manage`, background review,
-  curated bundled-skill seeding (Domains F/G) — DONE (`daemon-skills` + `daemon-tool-skill` +
-  engine-native `Effect::Spawn`); curator telemetry / hub / slash-commands / conditional gating remain
-  P3 (see Domain G).
+  curated bundled-skill seeding, **per-profile (per-agent) skill libraries**, and the **curator
+  lifecycle** (usage `.usage.json` sidecar, stale/archive/reactivate, pin, `Curator*` operator surface,
+  wire v12) (Domains F/G) — DONE (`daemon-skills` + `daemon-tool-skill` + the `SkillsProvider`/
+  `SkillsResolver` seam + engine-native `Effect::Spawn`); hub / slash-commands / conditional gating +
+  LLM-consolidation remain P3 (see Domain G).
 - Profiles-as-environments: clone/export/distributions + profile/skill version history (Domain A) —
   DONE (wire v6: `ProfileClone`/`ProfileExport`/`ProfileImport` + the native `RevisionLog` shared by
   profiles and skills; non-destructive revert / roll-forward; operator-vs-agent provenance).
 
 **P3 — long tail:**
-- Curator lifecycle (Domain G), titles/search/goals/recap (Domain H), gateway/cron/kanban/voice/
-  computer-use/image+video (Domain J) — MISSING / scoped out.
+- Curator *hub / slash-commands / conditional gating / LLM-consolidation* (Domain G — the deterministic
+  curator + usage + per-profile libraries landed in P2), titles/search/goals/recap (Domain H),
+  gateway/cron/kanban/voice/computer-use/image+video (Domain J) — MISSING / scoped out.
 
 Cross-references: [`hermes-agent-parity-map.md`](../research/hermes/hermes-agent-parity-map.md),
 [`daemon-core-spec.md`](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §22 (line 1666),

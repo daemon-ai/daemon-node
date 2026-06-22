@@ -137,6 +137,61 @@ enum Command {
         #[command(subcommand)]
         cmd: ModelCmd,
     },
+    /// Curate a profile's skill library (usage view, pin/archive, run the deterministic curator).
+    Curator {
+        #[command(subcommand)]
+        cmd: CuratorCmd,
+    },
+}
+
+/// Per-profile skill curation: inspect usage/lifecycle, pin/archive by hand, or run the
+/// deterministic curator (stale/archive/reactivate over the `.usage.json` sidecar).
+#[derive(Subcommand)]
+enum CuratorCmd {
+    /// List a profile's skills with usage counts + lifecycle state.
+    List {
+        /// The profile id (defaults to the node's active default).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Pin a skill (protect it from automatic archiving).
+    Pin {
+        /// The skill name.
+        name: String,
+        /// The profile id (defaults to the node's active default).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Unpin a skill (re-expose it to automatic curation).
+    Unpin {
+        /// The skill name.
+        name: String,
+        /// The profile id (defaults to the node's active default).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Archive a skill (move it out of discovery into `.archive/`).
+    Archive {
+        /// The skill name.
+        name: String,
+        /// The profile id (defaults to the node's active default).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Restore an archived skill back into the live library.
+    Restore {
+        /// The skill name.
+        name: String,
+        /// The profile id (defaults to the node's active default).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Run the deterministic curator (stale/archive/reactivate), printing the changes applied.
+    Run {
+        /// The profile id (defaults to the node's active default).
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 /// Parse an engine selector, defaulting to llama.
@@ -618,7 +673,22 @@ async fn main() -> anyhow::Result<()> {
         ),
         Command::VerifyingKey => render(client.call(ApiRequest::VerifyingKey).await?),
         Command::Model { cmd } => run_model(&client, cmd).await?,
+        Command::Curator { cmd } => run_curator(&client, cmd).await?,
     }
+    Ok(())
+}
+
+/// Dispatch a `curator` subcommand over the api mirror.
+async fn run_curator(client: &ApiClient, cmd: CuratorCmd) -> anyhow::Result<()> {
+    let req = match cmd {
+        CuratorCmd::List { profile } => ApiRequest::CuratorList { profile },
+        CuratorCmd::Pin { name, profile } => ApiRequest::CuratorPin { profile, name },
+        CuratorCmd::Unpin { name, profile } => ApiRequest::CuratorUnpin { profile, name },
+        CuratorCmd::Archive { name, profile } => ApiRequest::CuratorArchive { profile, name },
+        CuratorCmd::Restore { name, profile } => ApiRequest::CuratorRestore { profile, name },
+        CuratorCmd::Run { profile } => ApiRequest::CuratorRun { profile },
+    };
+    render(client.call(req).await?);
     Ok(())
 }
 
@@ -992,6 +1062,49 @@ fn render(resp: ApiResponse) {
             println!("skill: {} [{}] ({} file(s))", b.name, cat, b.files.len());
             for path in b.files.keys() {
                 println!("  - {path}");
+            }
+        }
+        ApiResponse::CuratorSkills(entries) => {
+            println!("skills: {}", entries.len());
+            for e in entries {
+                let u = &e.usage;
+                let cat = e.category.as_deref().unwrap_or("general");
+                let origin = match u.created_by {
+                    daemon_api::SkillCreator::Agent => "agent",
+                    daemon_api::SkillCreator::User => "user",
+                    daemon_api::SkillCreator::Bundled => "bundled",
+                };
+                let state = match u.state {
+                    daemon_api::SkillState::Active => "active",
+                    daemon_api::SkillState::Stale => "stale",
+                    daemon_api::SkillState::Archived => "archived",
+                };
+                let mut flags = Vec::new();
+                if u.pinned {
+                    flags.push("pinned");
+                }
+                if e.is_bundled {
+                    flags.push("bundled");
+                }
+                let flags = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", flags.join(","))
+                };
+                println!(
+                    "  - {} [{}] {}/{} views={} uses={} patches={}{}",
+                    e.name, cat, state, origin, u.view_count, u.use_count, u.patch_count, flags
+                );
+            }
+        }
+        ApiResponse::CuratorRun(changes) => {
+            if changes.is_empty() {
+                println!("curator: no changes");
+            } else {
+                println!("curator: {} change(s)", changes.len());
+                for c in changes {
+                    println!("  - {}: {:?} -> {:?}", c.name, c.from, c.to);
+                }
             }
         }
         ApiResponse::Error(e) => println!("error: {e}"),

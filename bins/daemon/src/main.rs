@@ -1232,37 +1232,43 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         None
     };
 
-    let mut prompt_sources: Vec<Arc<dyn daemon_core::StablePromptSource>> = Vec::new();
-    // Held out of the skills block so the node's api surface can bind it for skill versioning +
-    // the skill payload of a profile distribution.
-    let mut skills_store: Option<Arc<daemon_skills::SkillStore>> = None;
+    let prompt_sources: Vec<Arc<dyn daemon_core::StablePromptSource>> = Vec::new();
+    // The skills subsystem is now resolved **per profile (per agent)**, not built once over the
+    // launch agent and shared: a `SkillsProvider` yields an `Arc<SkillStore>` rooted at each agent's
+    // `<data_dir>/<id>/skills`, and the engine path resolves each session's own `skill_*` tools +
+    // index through `skills_resolver` keyed on the session's profile id. The provider is also bound
+    // into the node's api surface for skill versioning / distribution / curation.
+    let mut skills_provider: Option<Arc<daemon_skills::SkillsProvider>> = None;
+    let mut skills_resolver: Option<daemon_node::SkillsResolver> = None;
     if cfg.skills.enable {
-        let skills_dir = cfg
-            .skills
-            .dir
-            .clone()
-            .unwrap_or_else(|| cfg.profile_home().join("skills"));
-        let mut store = daemon_skills::SkillStore::new(skills_dir);
+        // `[skills].dir` (when set) is the legacy single-dir override shared by every profile; the
+        // default is per-profile (`<data_dir>/<id>/skills`), so two agents never share a library.
+        let mut provider = match &cfg.skills.dir {
+            Some(dir) => daemon_skills::SkillsProvider::fixed(dir.clone()),
+            None => daemon_skills::SkillsProvider::per_profile(cfg.data_root()),
+        };
         // Version skill writes (incl. the agent's own background-review edits) when versioning is on.
         if let Some(revisions) = &revisions {
-            store = store.with_revisions(revisions.clone());
+            provider = provider.with_revisions(revisions.clone());
         }
-        let skill_store = Arc::new(store);
-        // Seed the curated, tool-agnostic bundled skills into the profile on first run (skipping any
-        // the user already has) — parity with hermes' bundled-skills sync. Best-effort: a seed
-        // failure must not block node startup.
-        match skill_store.seed_bundled() {
-            Ok(seeded) if !seeded.is_empty() => {
-                tracing::info!(skills = ?seeded, "seeded bundled skills into profile")
+        // The per-profile `.usage.json` usage + lifecycle sidecar, co-located with each agent's
+        // skills dir (the curator's system of record).
+        provider = provider.with_usage(Arc::new(|root: &std::path::Path| {
+            Arc::new(daemon_skills::FileSkillUsageLog::open(root))
+                as Arc<dyn daemon_common::SkillUsageLog>
+        }));
+        let provider = Arc::new(provider);
+        // The engine-path resolver: each session's engine gets its own profile's tools + index.
+        let resolver_provider = provider.clone();
+        skills_resolver = Some(Arc::new(move |pref: &ProfileRef| {
+            let store = resolver_provider.for_profile(pref.as_str());
+            daemon_node::ResolvedSkills {
+                tools: daemon_tool_skill::skill_tools(store.clone()),
+                index: Arc::new(daemon_skills::SkillsPromptSource::new(store).enabled(true))
+                    as Arc<dyn daemon_core::StablePromptSource>,
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "seeding bundled skills failed"),
-        }
-        extra_tools.extend(daemon_tool_skill::skill_tools(skill_store.clone()));
-        prompt_sources.push(Arc::new(
-            daemon_skills::SkillsPromptSource::new(skill_store.clone()).enabled(true),
-        ) as Arc<dyn daemon_core::StablePromptSource>);
-        skills_store = Some(skill_store);
+        }) as daemon_node::SkillsResolver);
+        skills_provider = Some(provider);
     }
 
     // The optional web tools (`web_search`/`web_extract`, opt-in). Keys are read live from the
@@ -1343,7 +1349,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         cloud_catalog: Some(Arc::new(GenAiCloudCatalog)),
         prompt_sources,
         revisions,
-        skills: skills_store,
+        skills: skills_provider,
+        skills_resolver,
         routing,
         checkpoints,
     });

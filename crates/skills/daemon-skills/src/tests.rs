@@ -179,3 +179,86 @@ fn seed_bundled_materializes_curated_skills() {
     let again = store.seed_bundled().unwrap();
     assert!(again.is_empty(), "re-seed should be a no-op, got {again:?}");
 }
+
+#[test]
+fn usage_log_records_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("skills");
+    let usage: std::sync::Arc<dyn daemon_common::SkillUsageLog> =
+        std::sync::Arc::new(FileSkillUsageLog::open(&root));
+    let store = SkillStore::new(root.clone()).with_usage(usage);
+
+    store.create("arxiv", ARXIV, Some("research")).unwrap();
+    store.view("arxiv", None).unwrap();
+    store.view("arxiv", None).unwrap();
+    store
+        .patch("arxiv", "academic papers", "scholarly works", None, false)
+        .unwrap();
+
+    let rec = store.usage().unwrap().get("arxiv").expect("usage entry");
+    assert_eq!(rec.view_count, 2, "two skill_view");
+    assert_eq!(rec.use_count, 2);
+    assert_eq!(rec.patch_count, 1, "one patch");
+    // A bare store defaults to agent authorship (the agent's own write path) — curation-eligible.
+    assert_eq!(rec.created_by, daemon_common::SkillCreator::Agent);
+    assert_eq!(rec.state, daemon_common::SkillState::Active);
+
+    // The sidecar persists: a fresh log over the same root reads the same counts.
+    let reopened = FileSkillUsageLog::open(&root);
+    let rec2 = reopened.get("arxiv").expect("persisted entry");
+    assert_eq!(rec2.view_count, 2);
+    assert_eq!(rec2.patch_count, 1);
+}
+
+#[test]
+fn provider_isolates_skills_per_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = SkillsProvider::per_profile(dir.path().to_path_buf());
+
+    let a = provider.for_profile("alice");
+    let b = provider.for_profile("bob");
+    // Distinct on-disk roots (no shared library between agents).
+    assert_ne!(provider.root_for("alice"), provider.root_for("bob"));
+
+    a.create("arxiv", ARXIV, Some("research")).unwrap();
+    assert!(a.find("arxiv").is_ok(), "alice has her skill");
+    assert!(
+        b.find("arxiv").is_err(),
+        "bob's library is isolated from alice's"
+    );
+
+    // Re-resolving a profile returns the same cached store (read-mostly residency).
+    assert!(std::sync::Arc::ptr_eq(&a, &provider.for_profile("alice")));
+}
+
+#[test]
+fn archive_restore_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("skills");
+    let usage: std::sync::Arc<dyn daemon_common::SkillUsageLog> =
+        std::sync::Arc::new(FileSkillUsageLog::open(&root));
+    let store = SkillStore::new(root).with_usage(usage);
+    store.create("arxiv", ARXIV, Some("research")).unwrap();
+
+    store.archive("arxiv").unwrap();
+    assert!(store.discover().is_empty(), "archived leaves discovery");
+    assert_eq!(store.archived(), vec!["arxiv".to_string()]);
+    assert_eq!(
+        store.usage().unwrap().get("arxiv").unwrap().state,
+        daemon_common::SkillState::Archived
+    );
+
+    store.restore("arxiv").unwrap();
+    assert_eq!(store.discover().len(), 1, "restored returns to discovery");
+    assert!(store.archived().is_empty());
+    assert_eq!(
+        store.usage().unwrap().get("arxiv").unwrap().state,
+        daemon_common::SkillState::Active
+    );
+
+    // Binary-bundled skills are read-only: archiving is rejected.
+    assert!(matches!(
+        store.archive("plan"),
+        Err(SkillError::Invalid(_)) | Err(SkillError::NotFound(_))
+    ));
+}

@@ -80,6 +80,26 @@ do nothing and finish.";
 /// to a single fixed session profile.
 pub type ProviderResolver = Arc<dyn Fn(&ProfileSpec) -> ProviderBuilder + Send + Sync>;
 
+/// The per-agent skills trio resolved for one profile — the analogue of [`MemoryBuilder`] /
+/// [`ContextEngineBuilder`] for the skills subsystem. Skills were the one engine subsystem still
+/// built once at node startup over the launch agent's home and shared across every session; this
+/// makes them *resolved per agent* like memory and context. Carries the model-facing `skill_*`
+/// tools bound to that profile's [`SkillStore`](daemon_skills::SkillStore) plus the
+/// progressive-disclosure index ([`SkillsPromptSource`](daemon_skills::SkillsPromptSource)).
+pub struct ResolvedSkills {
+    /// The `skill_*` tools bound to the resolved profile's store (registered subject to the
+    /// session's `tool_allowlist`, like any other tool).
+    pub tools: Vec<Arc<dyn Tool>>,
+    /// The profile's progressive-disclosure index, folded into the stable system-prompt tier when
+    /// the profile actually carries skills tools (hermes' `valid_tool_names` gate).
+    pub index: Arc<dyn StablePromptSource>,
+}
+
+/// Resolve the per-profile skills trio for a routed/identity [`ProfileRef`]. The binary closes over
+/// the node's [`SkillsProvider`](daemon_skills::SkillsProvider) and `daemon_tool_skill::skill_tools`
+/// so `daemon-node` stays free of the concrete tool crate (mirrors [`ProviderResolver`]).
+pub type SkillsResolver = Arc<dyn Fn(&ProfileRef) -> ResolvedSkills + Send + Sync>;
+
 /// The policy inputs for [`assemble`]: everything that varies between a production node and a test
 /// node. The standard plumbing (role profiles, fleet, factory, host, session surface) is derived.
 pub struct NodeAssembly {
@@ -152,10 +172,14 @@ pub struct NodeAssembly {
     /// versioning (the history/revert ops resolve to `ApiError::Unsupported`). When set, it is the
     /// same log the [`Self::skills`] store records through, so operator + agent edits share a history.
     pub revisions: Option<Arc<dyn daemon_common::RevisionLog>>,
-    /// The skills store backing the node's skill versioning + the skill payload of a distribution.
-    /// `None` builds a node without skill versioning/distribution. Must be the same `Arc<SkillStore>`
-    /// whose tools are in [`Self::extra_tools`].
-    pub skills: Option<Arc<daemon_skills::SkillStore>>,
+    /// The per-profile skills provider backing the node's skill versioning, distribution, and
+    /// curation surface. Resolves an `Arc<SkillStore>` per profile id (rooted at that agent's home),
+    /// so skill ops act on the right agent's library. `None` builds a node without a skills subsystem.
+    pub skills: Option<Arc<daemon_skills::SkillsProvider>>,
+    /// The per-profile skills resolver wired into the engine path: each session's engine gets its
+    /// own profile's `skill_*` tools + index (resolved against `spec.id`), rather than a node-global
+    /// set baked at startup. `None` keeps skills out of the engine entirely. Pairs with [`Self::skills`].
+    pub skills_resolver: Option<SkillsResolver>,
     /// The host routing registry (daemon-event-io-spec §5.9): maps an inbound `Origin` to the
     /// session + profile + delivery a routed submit (`SessionApi::submit_routed`) opens. `None` (the
     /// default) installs an empty registry — routed submits then derive the session with `PerThread`
@@ -182,15 +206,22 @@ pub struct AssembledNode {
 
 /// Apply the engine tunables, the default context engine + memory providers (§10/§11), and the
 /// optional brokered credentials uniformly to a role profile (credentials bound to the node profile).
-fn dress(profile: EngineProfile, a: &NodeAssembly) -> EngineProfile {
-    dress_with_credential(profile, a, a.profile.clone())
+fn dress(
+    profile: EngineProfile,
+    a: &NodeAssembly,
+    skills_index: Option<&Arc<dyn StablePromptSource>>,
+) -> EngineProfile {
+    dress_with_credential(profile, a, a.profile.clone(), skills_index)
 }
 
 /// Like [`dress`] but binds credentials to an explicit profile ref (the per-session credential ref).
+/// `skills_index` is the launch agent's progressive-disclosure index (the role engines run as the
+/// launch agent), folded into the system prompt alongside the node's other stable prompt sources.
 fn dress_with_credential(
     profile: EngineProfile,
     a: &NodeAssembly,
     cred_profile: ProfileRef,
+    skills_index: Option<&Arc<dyn StablePromptSource>>,
 ) -> EngineProfile {
     let mut profile = profile
         .with_config(a.engine_config)
@@ -210,6 +241,9 @@ fn dress_with_credential(
     }
     for source in &a.prompt_sources {
         profile = profile.with_prompt_block(source.clone());
+    }
+    if let Some(index) = skills_index {
+        profile = profile.with_prompt_block(index.clone());
     }
     if let Some(checkpoints) = &a.checkpoints {
         profile = profile.with_checkpoints(checkpoints.clone());
@@ -249,7 +283,7 @@ fn constrained_registry(
 /// inherits the node's provider + credentials, but starts from a clean base (no memory/context/index
 /// — the reviewer drives its tools directly). A kind is registered only when its tools are present;
 /// the returned registry may be empty (spawn is then a no-op).
-fn background_registry(a: &NodeAssembly) -> BackgroundProfileRegistry {
+fn background_registry(a: &NodeAssembly, skill_tools: &[Arc<dyn Tool>]) -> BackgroundProfileRegistry {
     let mut registry = BackgroundProfileRegistry::new();
     let bg_config = Config {
         max_iterations: BACKGROUND_MAX_ITERATIONS,
@@ -260,11 +294,15 @@ fn background_registry(a: &NodeAssembly) -> BackgroundProfileRegistry {
         approval_policy: ApprovalPolicy::AutoAllow,
         ..a.engine_config
     };
+    // The skills review child curates the launch agent's own skills, so it draws its constrained
+    // toolset from the resolved per-profile skill tools (no longer node-global `extra_tools`); the
+    // memory review child still draws the `mnemosyne_*` tools from `extra_tools`.
+    let skill_pool: Vec<Arc<dyn Tool>> = skill_tools.to_vec();
     // A clean base carrying only the node's provider (orchestrator selection) + brokered credentials.
-    let base = |names: &[&str], prefix: Option<&str>, persona: &str| -> EngineProfile {
+    let base = |pool: &[Arc<dyn Tool>], names: &[&str], prefix: Option<&str>, persona: &str| -> EngineProfile {
         let profile = EngineProfile::new(
             provider_for(&a.providers, ORCHESTRATOR_PROFILE),
-            Arc::new(constrained_registry(&a.extra_tools, names, prefix)),
+            Arc::new(constrained_registry(pool, names, prefix)),
             SystemPrompt::new(persona),
         )
         .with_config(bg_config);
@@ -274,14 +312,16 @@ fn background_registry(a: &NodeAssembly) -> BackgroundProfileRegistry {
         }
     };
 
-    if a
-        .extra_tools
+    if skill_pool
         .iter()
         .any(|t| tool_matches(t, &SKILL_TOOL_NAMES, None))
     {
         registry = registry.with(
             "skill_review",
-            BackgroundProfile::new(base(&SKILL_TOOL_NAMES, None, "skill curator"), SKILL_REVIEW_PROMPT),
+            BackgroundProfile::new(
+                base(&skill_pool, &SKILL_TOOL_NAMES, None, "skill curator"),
+                SKILL_REVIEW_PROMPT,
+            ),
         );
     }
     if a
@@ -292,7 +332,7 @@ fn background_registry(a: &NodeAssembly) -> BackgroundProfileRegistry {
         registry = registry.with(
             "memory_review",
             BackgroundProfile::new(
-                base(&[], Some(MEMORY_TOOL_PREFIX), "memory curator"),
+                base(&a.extra_tools, &[], Some(MEMORY_TOOL_PREFIX), "memory curator"),
                 MEMORY_REVIEW_PROMPT,
             ),
         );
@@ -352,6 +392,7 @@ struct SessionFactoryCtx {
     memory: Vec<Arc<dyn MemoryProvider>>,
     memory_builder: Option<MemoryBuilder>,
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
+    skills_resolver: Option<SkillsResolver>,
 }
 
 impl SessionFactoryCtx {
@@ -365,7 +406,27 @@ impl SessionFactoryCtx {
         overlay.apply_to(&mut spec);
         let spec = &spec;
         let provider = (self.resolver)(spec);
-        let registry = session_tool_registry(&self.extra_tools, spec.tool_allowlist.as_deref());
+        let mut registry = session_tool_registry(&self.extra_tools, spec.tool_allowlist.as_deref());
+        // Resolve this agent's own skills (store + tools + index) keyed on its id — the per-profile
+        // analogue of the memory/context builders. The `skill_*` tools are registered subject to the
+        // same `tool_allowlist` as any other tool, and the index is attached only when the profile
+        // actually carries skills tools (hermes' `valid_tool_names` gate), so a profile that excludes
+        // them gets no skills block.
+        let skills_index = self.skills_resolver.as_ref().and_then(|resolve| {
+            let resolved = resolve(&ProfileRef::new(&spec.id));
+            let mut any = false;
+            for tool in resolved.tools {
+                let allowed = match spec.tool_allowlist.as_deref() {
+                    Some(list) => list.iter().any(|n| n == tool.name()),
+                    None => true,
+                };
+                if allowed {
+                    registry.register(tool);
+                    any = true;
+                }
+            }
+            any.then_some(resolved.index)
+        });
         let persona = if spec.system_prompt.trim().is_empty() {
             "interactive session".to_string()
         } else {
@@ -423,6 +484,9 @@ impl SessionFactoryCtx {
         for source in &self.prompt_sources {
             profile = profile.with_prompt_block(source.clone());
         }
+        if let Some(index) = skills_index {
+            profile = profile.with_prompt_block(index);
+        }
         if let Some(credentials) = &self.credentials {
             profile =
                 profile.with_credentials(credentials.clone(), ProfileRef::new(spec.credential_profile()));
@@ -467,6 +531,17 @@ fn core_tool_registry(extra: &[Arc<dyn Tool>]) -> ToolRegistry {
     registry
 }
 
+/// Like [`core_tool_registry`] but additionally registers the launch agent's resolved `skill_*`
+/// tools. The role engines (fleet child, orchestrator, fixed session) run as the launch agent, so
+/// they carry that agent's per-profile skills rather than a node-global set.
+fn core_tool_registry_with_skills(extra: &[Arc<dyn Tool>], skills: &[Arc<dyn Tool>]) -> ToolRegistry {
+    let mut registry = core_tool_registry(extra);
+    for tool in skills {
+        registry.register(tool.clone());
+    }
+    registry
+}
+
 /// Assemble and start the default host node: durable substrate + resident services, the
 /// orchestration fleet as the real job worker, the credential seam, and the live session surface,
 /// all built from one shared [`EngineProfile`] per role so the durable, live, and fleet-child paths
@@ -484,6 +559,17 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         signer: signer.clone(),
     };
 
+    // Resolve the launch agent's own skills once (store + tools + index), keyed on the node profile.
+    // The role engines (fleet child, orchestrator, fixed session) and the background skill_review
+    // child all run as the launch agent, so they share this resolution; per-session interactive /
+    // durable engines re-resolve per their own `spec.id` through the `SessionFactoryCtx`.
+    let launch_skills = a.skills_resolver.as_ref().map(|r| r(&a.profile));
+    let launch_index = launch_skills.as_ref().map(|s| &s.index);
+    let launch_skill_tools: Vec<Arc<dyn Tool>> = launch_skills
+        .as_ref()
+        .map(|s| s.tools.clone())
+        .unwrap_or_default();
+
     // The fleet child: one shared profile, driven as the real job worker so every child gets the same
     // provider + brokered credentials. Each child journals into the shared store keyed by its UnitId.
     // Autonomous durable engines (the orchestrator, every delegated child, the fleet job worker)
@@ -497,10 +583,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let child_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, CHILD_PROFILE),
-            Arc::new(core_tool_registry(&a.extra_tools)),
+            Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
             SystemPrompt::new("fleet child"),
         ),
         &a,
+        launch_index,
     )
     .with_config(autonomous_config);
     // The legacy synchronous placement seam (in-process live engine children + foreign agents). The
@@ -524,7 +611,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // (top -> leaf child), `n` allows `n + 1` levels of nested delegation.
     // The orchestrator-capable engine carries the core local toolset (fs + shell) *plus* orchestrate,
     // so a node can both do real local work and delegate.
-    let mut registry = core_tool_registry(&a.extra_tools);
+    let mut registry = core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools);
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
             .with_max_depth(a.nesting_depth + 1),
@@ -536,6 +623,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             SystemPrompt::new("daemon host node"),
         ),
         &a,
+        launch_index,
     )
     .with_config(autonomous_config);
     // The §4.3 background-review spawner: shared by the durable factory (so a review child raised
@@ -545,7 +633,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let background = Arc::new(BackgroundSpawner::new(
         a.store.clone(),
         a.partition,
-        background_registry(&a),
+        background_registry(&a, &launch_skill_tools),
     ));
 
     // The one per-session resolution context, shared by the live session builder and the durable
@@ -565,6 +653,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
                     memory: a.memory.clone(),
                     memory_builder: a.memory_builder.clone(),
                     prompt_sources: a.prompt_sources.clone(),
+                    skills_resolver: a.skills_resolver.clone(),
                 });
                 Some((store, ctx))
             }
@@ -605,10 +694,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let session_profile = dress(
         EngineProfile::new(
             provider_for(&a.providers, a.profile.as_str()),
-            Arc::new(core_tool_registry(&a.extra_tools)),
+            Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
             SystemPrompt::new("interactive session"),
         ),
         &a,
+        launch_index,
     );
     // Profile-aware interactive session builder: when the node carries a profile store + provider
     // resolver, each session resolves its bound profile bundle at open, applies the persisted
@@ -1203,6 +1293,7 @@ mod tests {
             memory: Vec::new(),
             memory_builder: None,
             prompt_sources: Vec::new(),
+            skills_resolver: None,
         };
 
         let base = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");

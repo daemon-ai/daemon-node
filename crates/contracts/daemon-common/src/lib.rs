@@ -379,7 +379,13 @@ impl WireVersion {
     /// (with `SessionOverlay` = model / provider / tool allowlist / approval mode), persisted as
     /// host-level session metadata so a switch is restored on rehydration. `set_session_model` /
     /// `set_session_mode` become field-scoped conveniences over the overlay.
-    pub const CURRENT: Self = Self(11);
+    ///
+    /// v12 (per-profile skills + curator): skills become profile-aware (each profile/agent owns its
+    /// own skills dir, index, tools, and `.usage.json` usage sidecar). Adds the per-profile curator
+    /// surface — `Curator{List,Pin,Unpin,Archive,Restore,Run}` -> `ApiResponse::CuratorSkills` /
+    /// `CuratorRun`, with `CuratorEntry`/`CuratorChange` views over the `SkillUsage`/`SkillState`
+    /// lifecycle (stale/archive/reactivate, pin-protect, agent-created provenance).
+    pub const CURRENT: Self = Self(12);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -1234,6 +1240,123 @@ impl fmt::Display for RevisionKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Who authored a skill — the provenance that gates curator eligibility. Only agent-created skills
+/// are auto-archived by the curator; user- and bundled-authored skills are protected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillCreator {
+    /// The agent authored it (a `skill_manage` create — including the background `skill_review` fork).
+    #[default]
+    Agent,
+    /// A human operator authored it (a profile import / operator-driven write).
+    User,
+    /// A binary-bundled skill seeded from the daemon binary (read-only; never auto-archived).
+    Bundled,
+}
+
+/// A skill's curator lifecycle state, tracked alongside its usage counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillState {
+    /// In active use (or recently used / patched).
+    #[default]
+    Active,
+    /// Unused past the stale threshold — a soft signal; the skill is still discovered/loaded.
+    Stale,
+    /// Archived (moved to `.archive/`, excluded from discovery + the prompt index).
+    Archived,
+}
+
+impl SkillState {
+    /// The lowercase slug for this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillState::Active => "active",
+            SkillState::Stale => "stale",
+            SkillState::Archived => "archived",
+        }
+    }
+}
+
+/// The per-skill usage + lifecycle record tracked in a profile's `.usage.json` sidecar (hermes'
+/// per-profile usage tracking). Co-located with the skill library so it travels with a profile.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUsage {
+    /// Authorship provenance (curation-eligibility gate).
+    #[serde(default)]
+    pub created_by: SkillCreator,
+    /// The curator lifecycle state.
+    #[serde(default)]
+    pub state: SkillState,
+    /// Pinned skills are never auto-archived (operator opt-out of curation).
+    #[serde(default)]
+    pub pinned: bool,
+    /// How many times the skill's full body was loaded for use (`skill_view`).
+    #[serde(default)]
+    pub use_count: u64,
+    /// How many times the skill appeared / was viewed (a superset of `use_count`).
+    #[serde(default)]
+    pub view_count: u64,
+    /// How many times the skill was edited/patched (the agent refined it).
+    #[serde(default)]
+    pub patch_count: u64,
+    /// Wall-clock ms since the Unix epoch the entry was first created.
+    #[serde(default)]
+    pub created_at_ms: u64,
+    /// Wall-clock ms of the most recent use, if any.
+    #[serde(default)]
+    pub last_used_ms: Option<u64>,
+    /// Wall-clock ms of the most recent view, if any.
+    #[serde(default)]
+    pub last_viewed_ms: Option<u64>,
+    /// Wall-clock ms of the most recent patch/edit, if any.
+    #[serde(default)]
+    pub last_patched_ms: Option<u64>,
+}
+
+impl SkillUsage {
+    /// The most recent activity timestamp across use/view/patch (or `created_at_ms` if never touched)
+    /// — the reference the curator measures staleness against.
+    pub fn last_activity_ms(&self) -> u64 {
+        [self.last_used_ms, self.last_viewed_ms, self.last_patched_ms]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(self.created_at_ms)
+    }
+}
+
+/// A per-profile skill usage + lifecycle sidecar — the curator's system of record (hermes
+/// `.usage.json`). Co-located with the profile's skills dir so it travels with profile distribution.
+/// All mutators are best-effort (a usage-bump failure must never fail a turn); the file-backed
+/// implementation lives in `daemon-skills` (analogous to `FileRevisionLog` for [`RevisionLog`]).
+pub trait SkillUsageLog: Send + Sync {
+    /// Record that `name` was created by `creator` (idempotent: an existing entry keeps its earliest
+    /// `created_at_ms` but adopts the creator if it was previously unknown/default).
+    fn record_create(&self, name: &str, creator: SkillCreator);
+
+    /// Bump the view (and use) counters for `name`, creating an entry if absent.
+    fn record_view(&self, name: &str);
+
+    /// Bump the patch counter for `name` (an edit/patch/support-file write).
+    fn record_patch(&self, name: &str);
+
+    /// Drop `name`'s usage entry (on delete).
+    fn forget(&self, name: &str);
+
+    /// Set `name`'s curator lifecycle state.
+    fn set_state(&self, name: &str, state: SkillState);
+
+    /// Pin/unpin `name` (pinned skills are never auto-archived).
+    fn set_pinned(&self, name: &str, pinned: bool);
+
+    /// The usage record for `name`, if tracked.
+    fn get(&self, name: &str) -> Option<SkillUsage>;
+
+    /// Every tracked skill's usage, keyed by name.
+    fn all(&self) -> std::collections::BTreeMap<String, SkillUsage>;
 }
 
 #[cfg(test)]

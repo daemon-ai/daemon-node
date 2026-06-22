@@ -245,6 +245,32 @@ pub struct Distribution {
     pub source: Option<String>,
 }
 
+/// One row of a profile's curator listing ([`crate::ProfileApi::curator_list`]): a discovered or
+/// archived skill with its usage + lifecycle record. The `usage` defaults (all-zero, `Active`) for a
+/// skill that has no `.usage.json` entry yet (e.g. a freshly-seeded bundled skill).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CuratorEntry {
+    /// The skill (bundle) name.
+    pub name: String,
+    /// The category path segment, if any.
+    pub category: Option<String>,
+    /// Whether this is a binary-bundled skill (protected from auto-curation).
+    pub is_bundled: bool,
+    /// The per-skill usage + lifecycle record (counts, state, pinned, provenance).
+    pub usage: daemon_common::SkillUsage,
+}
+
+/// One lifecycle change a curator run applied ([`crate::ProfileApi::curator_run`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CuratorChange {
+    /// The skill (bundle) name.
+    pub name: String,
+    /// The state it moved from.
+    pub from: daemon_common::SkillState,
+    /// The state it moved to.
+    pub to: daemon_common::SkillState,
+}
+
 /// A redacted view of a profile for listing (no secrets live in a profile, but this is the shape a
 /// GUI list renders).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
