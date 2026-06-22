@@ -104,6 +104,36 @@ pub struct BudgetSpec {
     pub wall_ms: Option<u64>,
 }
 
+/// A transport-instance account bound to this profile (event-io spec §5.9.4 / Matrix spec §6.2).
+///
+/// This is the **account → profile** binding declared as profile data (not a route-table column):
+/// the host derives the routing registry's `instance_profiles` map (precedence step 2 — the
+/// account's default agent for all its scopes) from every profile's `bound_accounts`. It is
+/// transport-agnostic — any chat/transport family reuses the same shape.
+///
+/// `transport_instance` is the instance-qualified [`TransportId`](daemon_common) string (e.g.
+/// `matrix/@bot:hs.org`); `credential_ref` names where the opaque account session blob lives in the
+/// `CredentialStore` (the system of record). Routing consumes only `transport_instance`;
+/// `credential_ref` is metadata a live transport (M2/M3) reads to restore the account's client. No
+/// secret ever lives here — `credential_ref` is a name, not the blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundAccount {
+    /// The instance-qualified transport id this account speaks as (e.g. `matrix/@bot:hs.org`).
+    pub transport_instance: String,
+    /// The credential ref naming the account's stored session blob (a name, never the secret).
+    pub credential_ref: String,
+}
+
+impl BoundAccount {
+    /// A binding of `transport_instance` to its stored `credential_ref`.
+    pub fn new(transport_instance: impl Into<String>, credential_ref: impl Into<String>) -> Self {
+        Self {
+            transport_instance: transport_instance.into(),
+            credential_ref: credential_ref.into(),
+        }
+    }
+}
+
 /// The full agent configuration bundle a GUI creates/edits and a session binds to.
 ///
 /// One profile is the unit a GUI manages: it names a provider + model, the persona system prompt,
@@ -150,6 +180,10 @@ pub struct ProfileSpec {
     /// chain on top of the per-profile multi-key pool. `None` = no fallback.
     #[serde(default)]
     pub fallback_credential_ref: Option<String>,
+    /// Transport-instance accounts bound to this profile (§5.9.4): the host derives the routing
+    /// registry's `instance_profiles` baseline (account → this profile) from these. Empty by default.
+    #[serde(default)]
+    pub bound_accounts: Vec<BoundAccount>,
 }
 
 impl ProfileSpec {
@@ -168,6 +202,7 @@ impl ProfileSpec {
             memory_provider: MemoryProviderSel::default(),
             credential_ref: None,
             fallback_credential_ref: None,
+            bound_accounts: Vec::new(),
         }
     }
 
@@ -179,6 +214,12 @@ impl ProfileSpec {
     /// The fallback credential profile, if configured (the `Recovery::Fallback` target).
     pub fn fallback_credential_profile(&self) -> Option<&str> {
         self.fallback_credential_ref.as_deref()
+    }
+
+    /// Declare the transport-instance accounts bound to this profile (§5.9.4 account → profile).
+    pub fn with_bound_accounts(mut self, accounts: Vec<BoundAccount>) -> Self {
+        self.bound_accounts = accounts;
+        self
     }
 }
 
@@ -216,6 +257,9 @@ pub struct ProfileInfo {
     pub model: String,
     /// Whether this profile is the active default.
     pub is_active: bool,
+    /// The transport-instance accounts bound to this profile (§5.9.4). Names only, never secrets.
+    #[serde(default)]
+    pub bound_accounts: Vec<BoundAccount>,
 }
 
 impl ProfileInfo {
@@ -226,6 +270,7 @@ impl ProfileInfo {
             provider: spec.provider,
             model: spec.model.clone(),
             is_active,
+            bound_accounts: spec.bound_accounts.clone(),
         }
     }
 }

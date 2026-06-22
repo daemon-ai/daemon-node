@@ -701,15 +701,16 @@ This makes "different agents in different rooms" expressible two ways: bind diff
 single account fanning multiple agents across its rooms). For non-chat transports (HTTP keys, Slack
 channels, the scheduler) the override row is the primary selector — same registry, same shape.
 
-**Contract gap this exposes (the one invasive host change):** the per-session engine build must
-become **profile-aware** — `LiveSessions::ensure(session, ProfileRef)` resolving the engine from that
+**Contract gap this exposes (the one invasive host change) — landed:** the per-session engine build
+is now **profile-aware** — `LiveSessions::ensure(session, ProfileRef)` resolves the engine from that
 profile through the existing `provider_resolver` + `ProfileStore`, rather than the fixed node-assembly
-builder. The host (never the adapter) owns derivation: an adapter hands the host an `Origin`; a thin
-`route_inbound`/profile-resolving submit path turns it into `(SessionId, ProfileRef)` and binds the
-live session. Per-session profiles also imply **profile-scoped subsystem stores**: `profile_home` is
-already per-profile (`<data_dir>/<profile>/`), but the live §10/§11 context/memory *builders* are
-wired for one profile at assembly — routing sessions to different profiles means threading the profile
-through those builders (or accepting shared banks in v1).
+builder. The host (never the adapter) owns derivation: an adapter hands the host an `Origin`; the
+`submit_routed` path turns it into `(SessionId, ProfileRef)` and binds the live session. Per-session
+profiles also imply **profile-scoped subsystem stores**, also landed: `profile_home` is per-profile
+(`<data_dir>/<profile>/`) and the live §10/§11 context/memory *builders* now thread the resolved
+`ProfileRef` (a profile-less/legacy engine still resolves the shared default home), so two scopes
+routed to two profiles get isolated banks. The `instance_profiles` baseline (precedence step 2) is
+itself derived from each profile's declared `bound_accounts` (§5.9.4).
 
 #### 5.9.2 Transport-instance identity (multiple accounts)
 
@@ -756,7 +757,12 @@ Registry + profile-aware live binding live at the **host** (beside `LiveSessions
 "the host owns session lifecycle." Route/binding *definitions* are configuration (a per-adapter route
 table), editable like profiles. Where an *account* is bound to a *profile* (chat transports), that
 binding is data in the profile/credential subsystem rather than a route-table column — the registry
-reads it as precedence step 2 above (see the Matrix doc for the concrete instantiation).
+reads it as precedence step 2 above. **Landed:** a profile declares its accounts via the
+transport-agnostic `ProfileSpec.bound_accounts: Vec<BoundAccount { transport_instance, credential_ref }>`,
+and the host derives the registry's `instance_profiles` from every profile's `bound_accounts` at
+assembly (`RoutingRegistry::bind_instances_from_profiles`); an explicit config instance binding wins
+over a profile-declared one. `credential_ref` names the opaque account session blob in the
+`CredentialStore` (the system of record), consumed by a live transport (M2/M3) to restore the client.
 
 ---
 

@@ -7,13 +7,16 @@
 //! Resolution precedence (event-io spec decision 10):
 //! 1. an explicit per-binding `profile` override,
 //! 2. else the transport-instance's bound profile (the account→profile baseline — the
-//!    [`instance_profiles`](RoutingRegistry) map, filled from credential bindings in a later phase),
+//!    [`instance_profiles`](RoutingRegistry) map, derived from each profile's `bound_accounts`
+//!    (§5.9.4) via [`RoutingRegistry::bind_instances_from_profiles`], with explicit config bindings
+//!    taking precedence),
 //! 3. else the node default profile (`None` resolves the node's active default at build time,
 //!    preserving the legacy single-profile behavior).
 //!
 //! Outbound is the symmetric half: the registry also answers *where* a matched session's replies post
 //! (its [`DeliveryTarget`]), auto-seeded as the inverse of the opening origin unless a binding pins it.
 
+use daemon_api::ProfileSpec;
 use daemon_common::{ProfileRef, SessionId};
 use daemon_protocol::{
     session_id_for, DeliveryTarget, IsolationPolicy, Origin, OriginScope, TransportId,
@@ -216,6 +219,22 @@ impl RoutingRegistry {
         self
     }
 
+    /// Derive the account→profile baseline (precedence step 2) from profile data (§5.9.4): for every
+    /// profile, each declared `bound_accounts` entry binds its transport instance to that profile.
+    /// Any instance binding already present (e.g. an explicit config `[[routing.instance_profile]]`,
+    /// installed via [`bind_instance`](Self::bind_instance)) is **kept** — the operator's config wins
+    /// over a profile-declared binding.
+    pub fn bind_instances_from_profiles(mut self, profiles: &[ProfileSpec]) -> Self {
+        for profile in profiles {
+            for account in &profile.bound_accounts {
+                self.instance_profiles
+                    .entry(TransportId::new(account.transport_instance.clone()))
+                    .or_insert_with(|| ProfileRef::new(&profile.id));
+            }
+        }
+        self
+    }
+
     /// Set the node default profile (precedence step 3).
     pub fn with_default_profile(mut self, profile: ProfileRef) -> Self {
         self.default_profile = Some(profile);
@@ -345,6 +364,40 @@ mod tests {
         assert_eq!(
             reg.resolve(&matrix("@b:hs", "#y")).profile,
             Some(ProfileRef::new("any-matrix"))
+        );
+    }
+
+    #[test]
+    fn instances_derived_from_profile_bound_accounts() {
+        use daemon_api::{BoundAccount, ProfileSpec, ProviderSelector};
+
+        let ops = ProfileSpec::new("ops-agent", ProviderSelector::Mock, "m").with_bound_accounts(
+            vec![BoundAccount::new("matrix/@ops:hs.org", "matrix/ops-agent/ops")],
+        );
+        let support = ProfileSpec::new("support", ProviderSelector::Mock, "m")
+            .with_bound_accounts(vec![BoundAccount::new("matrix/@help:hs.org", "cred-help")]);
+
+        // Profile-declared bindings fill the instance map (precedence step 2 from profile data).
+        let reg = RoutingRegistry::new().bind_instances_from_profiles(&[ops.clone(), support]);
+        assert_eq!(
+            reg.resolve(&matrix("@ops:hs.org", "#general")).profile,
+            Some(ProfileRef::new("ops-agent"))
+        );
+        assert_eq!(
+            reg.resolve(&matrix("@help:hs.org", "#general")).profile,
+            Some(ProfileRef::new("support"))
+        );
+
+        // An explicit config `bind_instance` for the same instance wins over the profile-derived one.
+        let reg = RoutingRegistry::new()
+            .bind_instance(
+                TransportId::new("matrix/@ops:hs.org"),
+                ProfileRef::new("config-override"),
+            )
+            .bind_instances_from_profiles(&[ops]);
+        assert_eq!(
+            reg.resolve(&matrix("@ops:hs.org", "#general")).profile,
+            Some(ProfileRef::new("config-override"))
         );
     }
 
