@@ -11,6 +11,7 @@
 //! These are *contract* types: serializable primitives only (no `daemon-core` types), so the
 //! surface never drags the engine's concrete construction types into the wire protocol.
 
+use daemon_common::{SkillBundle, WireVersion};
 use serde::{Deserialize, Serialize};
 
 /// Which model provider implementation a profile binds to. Mirrors the host's internal
@@ -179,6 +180,28 @@ impl ProfileSpec {
     pub fn fallback_credential_profile(&self) -> Option<&str> {
         self.fallback_credential_ref.as_deref()
     }
+}
+
+/// A portable, self-contained profile distribution: the unit you export from one node and import on
+/// another. It carries the [`ProfileSpec`] plus the profile's local skill bundles; `credential_ref`
+/// is **kept** (it is a name, not a secret — the importer registers the key via `CredentialSet`).
+/// Secrets never live in a profile, so nothing is stripped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Distribution {
+    /// The wire version this distribution was produced under (import validates compatibility).
+    pub wire_version: WireVersion,
+    /// The profile configuration bundle.
+    pub profile: ProfileSpec,
+    /// The profile's local (non-binary-bundled) skills, reconstituted on import.
+    #[serde(default)]
+    pub skills: Vec<SkillBundle>,
+    /// The profile's head revision sequence at export time, for provenance display (`None` if the
+    /// profile had no recorded history yet).
+    #[serde(default)]
+    pub head_seq: Option<u64>,
+    /// Optional free-form origin label (who/where it came from).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// A redacted view of a profile for listing (no secrets live in a profile, but this is the shape a

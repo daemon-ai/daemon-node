@@ -958,6 +958,37 @@ fn render(resp: ApiResponse) {
             }
             None => println!("current model: none"),
         },
+        ApiResponse::Distribution(d) => {
+            println!("distribution: {} (wire v{})", d.profile.id, d.wire_version.0);
+            println!("  provider: {:?}", d.profile.provider);
+            println!("  model: {}", d.profile.model);
+            println!("  credential_ref: {}", d.profile.credential_profile());
+            println!("  skills: {}", d.skills.len());
+            for s in &d.skills {
+                println!("    - {}", s.name);
+            }
+            if let Some(seq) = d.head_seq {
+                println!("  head revision: {seq}");
+            }
+        }
+        ApiResponse::ProfileId(id) => println!("imported profile: {id}"),
+        ApiResponse::Revisions(revs) => {
+            println!("revisions: {}", revs.len());
+            for r in revs {
+                let author = match &r.author {
+                    daemon_api::Author::Operator => "operator".to_string(),
+                    daemon_api::Author::Agent(label) => format!("agent:{label}"),
+                };
+                println!("  - #{} [{}] {} (parent {:?})", r.seq, author, r.reason, r.parent);
+            }
+        }
+        ApiResponse::SkillBundle(b) => {
+            let cat = b.category.as_deref().unwrap_or("general");
+            println!("skill: {} [{}] ({} file(s))", b.name, cat, b.files.len());
+            for path in b.files.keys() {
+                println!("  - {path}");
+            }
+        }
         ApiResponse::Error(e) => println!("error: {e}"),
     }
 }

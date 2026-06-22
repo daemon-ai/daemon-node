@@ -31,7 +31,7 @@ use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
     CloudCatalog, CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit,
-    FileCredentialStore, FileProfileStore, HostConfig, JournalFeeder, JournalSink,
+    FileCredentialStore, FileProfileStore, FileRevisionLog, HostConfig, JournalFeeder, JournalSink,
     MemCredentialStore, MemProfileStore, OwnerBroker, PooledStoreCredentialSource, ProfileStore,
 };
 use daemon_api::{
@@ -1103,14 +1103,36 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // role registry, and the progressive-disclosure index is folded into the stable system-prompt
     // tier (`prompt_sources`). The background `skill_review` curator activates only when the engine's
     // `skill_review_interval` is non-zero (see `[engine]`/`DAEMON_SKILL_REVIEW_INTERVAL`).
+    // The append-only revision log backing profile + skill versioning. Durable nodes persist it
+    // under the data dir (next to `profiles/` and `skills/`); ephemeral nodes run without history.
+    let revisions: Option<Arc<dyn daemon_common::RevisionLog>> = if cfg.persist_providers() {
+        match FileRevisionLog::open(cfg.data_dir.join("revisions")) {
+            Ok(log) => Some(Arc::new(log) as Arc<dyn daemon_common::RevisionLog>),
+            Err(e) => {
+                tracing::warn!(error = %e, "opening revision log failed; versioning disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut prompt_sources: Vec<Arc<dyn daemon_core::StablePromptSource>> = Vec::new();
+    // Held out of the skills block so the node's api surface can bind it for skill versioning +
+    // the skill payload of a profile distribution.
+    let mut skills_store: Option<Arc<daemon_skills::SkillStore>> = None;
     if cfg.skills.enable {
         let skills_dir = cfg
             .skills
             .dir
             .clone()
             .unwrap_or_else(|| cfg.profile_home().join("skills"));
-        let skill_store = Arc::new(daemon_skills::SkillStore::new(skills_dir));
+        let mut store = daemon_skills::SkillStore::new(skills_dir);
+        // Version skill writes (incl. the agent's own background-review edits) when versioning is on.
+        if let Some(revisions) = &revisions {
+            store = store.with_revisions(revisions.clone());
+        }
+        let skill_store = Arc::new(store);
         // Seed the curated, tool-agnostic bundled skills into the profile on first run (skipping any
         // the user already has) — parity with hermes' bundled-skills sync. Best-effort: a seed
         // failure must not block node startup.
@@ -1123,8 +1145,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         }
         extra_tools.extend(daemon_tool_skill::skill_tools(skill_store.clone()));
         prompt_sources.push(Arc::new(
-            daemon_skills::SkillsPromptSource::new(skill_store).enabled(true),
+            daemon_skills::SkillsPromptSource::new(skill_store.clone()).enabled(true),
         ) as Arc<dyn daemon_core::StablePromptSource>);
+        skills_store = Some(skill_store);
     }
 
     // The optional web tools (`web_search`/`web_extract`, opt-in). Keys are read live from the
@@ -1189,6 +1212,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         credential_store: Some(credential_store),
         cloud_catalog: Some(Arc::new(GenAiCloudCatalog)),
         prompt_sources,
+        revisions,
+        skills: skills_store,
     });
     tracing::info!("daemon host node started");
 

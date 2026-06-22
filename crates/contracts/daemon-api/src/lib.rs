@@ -27,6 +27,7 @@ use daemon_common::{
     UnitId, UsageDelta, WireVersion,
 };
 use daemon_protocol::{AgentCommand, DeliveryTarget, HostResponse, Origin, TranscriptBlock};
+pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -35,7 +36,8 @@ use serde::{Deserialize, Serialize};
 pub mod profile;
 pub use profile::{
     BudgetSpec, ConfigField, ConfigPatch, ConfigSchema, ContextEngineSel, CredentialInfo,
-    EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec, ProviderSelector,
+    Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
+    ProviderSelector,
 };
 
 /// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
@@ -509,6 +511,57 @@ pub trait ProfileApi: Send + Sync {
     /// The settable-config schema (a GUI renders it as a settings form). Default: the built-in schema.
     async fn config_schema(&self) -> ConfigSchema {
         ConfigSchema::builtin()
+    }
+
+    /// Clone `source` into a new profile `new_id` (a local copy; starts a fresh revision history).
+    async fn profile_clone(&self, _source: String, _new_id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("profile_clone".into()))
+    }
+
+    /// Export a profile as a portable [`Distribution`] (spec + its local skills + head revisions).
+    async fn profile_export(&self, _id: String) -> Result<Distribution, ApiError> {
+        Err(ApiError::Unsupported("profile_export".into()))
+    }
+
+    /// Import a [`Distribution`] as a new profile (defaults to the distribution's id; `new_id`
+    /// overrides). Returns the created profile id.
+    async fn profile_import(
+        &self,
+        _dist: Distribution,
+        _new_id: Option<String>,
+    ) -> Result<String, ApiError> {
+        Err(ApiError::Unsupported("profile_import".into()))
+    }
+
+    /// The revision history of a profile (oldest first).
+    async fn profile_history(&self, _id: String) -> Result<Vec<Revision>, ApiError> {
+        Err(ApiError::Unsupported("profile_history".into()))
+    }
+
+    /// The profile spec as recorded at revision `seq`.
+    async fn profile_at(&self, _id: String, _seq: u64) -> Result<ProfileSpec, ApiError> {
+        Err(ApiError::Unsupported("profile_at".into()))
+    }
+
+    /// Revert a profile to revision `seq` (non-destructive: appends a new head equal to that
+    /// revision, so roll-forward is reverting to a later `seq`).
+    async fn profile_revert(&self, _id: String, _seq: u64) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("profile_revert".into()))
+    }
+
+    /// The revision history of a skill (oldest first).
+    async fn skill_history(&self, _name: String) -> Result<Vec<Revision>, ApiError> {
+        Err(ApiError::Unsupported("skill_history".into()))
+    }
+
+    /// The skill bundle as recorded at revision `seq`.
+    async fn skill_at(&self, _name: String, _seq: u64) -> Result<SkillBundle, ApiError> {
+        Err(ApiError::Unsupported("skill_at".into()))
+    }
+
+    /// Revert a skill to revision `seq` (non-destructive; rejected for binary-bundled skills).
+    async fn skill_revert(&self, _name: String, _seq: u64) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("skill_revert".into()))
     }
 }
 
@@ -1011,6 +1064,64 @@ pub enum ApiRequest {
     },
     /// [`ProfileApi::config_schema`].
     ConfigSchema,
+    /// [`ProfileApi::profile_clone`].
+    ProfileClone {
+        /// The source profile to copy.
+        source: String,
+        /// The new profile id.
+        new_id: String,
+    },
+    /// [`ProfileApi::profile_export`].
+    ProfileExport {
+        /// The profile id to export as a distribution.
+        id: String,
+    },
+    /// [`ProfileApi::profile_import`].
+    ProfileImport {
+        /// The distribution to import.
+        dist: Distribution,
+        /// Optional id override (`None` = the distribution's own id).
+        #[serde(default)]
+        new_id: Option<String>,
+    },
+    /// [`ProfileApi::profile_history`].
+    ProfileHistory {
+        /// The profile id whose history to list.
+        id: String,
+    },
+    /// [`ProfileApi::profile_at`].
+    ProfileAt {
+        /// The profile id.
+        id: String,
+        /// The revision sequence.
+        seq: u64,
+    },
+    /// [`ProfileApi::profile_revert`].
+    ProfileRevert {
+        /// The profile id.
+        id: String,
+        /// The revision sequence to revert to.
+        seq: u64,
+    },
+    /// [`ProfileApi::skill_history`].
+    SkillHistory {
+        /// The skill (bundle) name whose history to list.
+        name: String,
+    },
+    /// [`ProfileApi::skill_at`].
+    SkillAt {
+        /// The skill (bundle) name.
+        name: String,
+        /// The revision sequence.
+        seq: u64,
+    },
+    /// [`ProfileApi::skill_revert`].
+    SkillRevert {
+        /// The skill (bundle) name.
+        name: String,
+        /// The revision sequence to revert to.
+        seq: u64,
+    },
     /// [`CredentialApi::credential_set`].
     CredentialSet {
         /// The profile / credential-ref to key the secret by.
@@ -1129,6 +1240,14 @@ pub enum ApiResponse {
     Models(Vec<ModelDescriptor>),
     /// The model a profile currently resolves to (`None` = none resolvable).
     ModelCurrent(Option<ModelDescriptor>),
+    /// A profile distribution (profile_export).
+    Distribution(Distribution),
+    /// A created profile id (profile_import).
+    ProfileId(String),
+    /// A revision history (profile_history / skill_history), oldest first.
+    Revisions(Vec<Revision>),
+    /// A skill bundle as recorded at a revision (skill_at).
+    SkillBundle(SkillBundle),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -1328,6 +1447,35 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             unit_or_err(api.config_set(profile, patch).await)
         }
         ApiRequest::ConfigSchema => ApiResponse::ConfigSchema(api.config_schema().await),
+        ApiRequest::ProfileClone { source, new_id } => {
+            unit_or_err(api.profile_clone(source, new_id).await)
+        }
+        ApiRequest::ProfileExport { id } => match api.profile_export(id).await {
+            Ok(dist) => ApiResponse::Distribution(dist),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ProfileImport { dist, new_id } => match api.profile_import(dist, new_id).await {
+            Ok(id) => ApiResponse::ProfileId(id),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ProfileHistory { id } => match api.profile_history(id).await {
+            Ok(revs) => ApiResponse::Revisions(revs),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ProfileAt { id, seq } => match api.profile_at(id, seq).await {
+            Ok(spec) => ApiResponse::Profile(Some(spec)),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ProfileRevert { id, seq } => unit_or_err(api.profile_revert(id, seq).await),
+        ApiRequest::SkillHistory { name } => match api.skill_history(name).await {
+            Ok(revs) => ApiResponse::Revisions(revs),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::SkillAt { name, seq } => match api.skill_at(name, seq).await {
+            Ok(bundle) => ApiResponse::SkillBundle(bundle),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::SkillRevert { name, seq } => unit_or_err(api.skill_revert(name, seq).await),
         ApiRequest::CredentialSet { profile, secret } => {
             unit_or_err(api.credential_set(profile, secret).await)
         }

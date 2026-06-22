@@ -23,10 +23,10 @@ use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
 use daemon_api::{
     ApiError, ApprovalInfo, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo,
-    FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView,
-    LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo,
-    ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionInfo, SessionState,
-    StatsReport, TelemetryDump, TreeReport, UnitNode,
+    Distribution, FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
+    LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
+    ProfileInfo, ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionInfo,
+    SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -150,6 +150,12 @@ pub struct NodeApiImpl {
     /// live [`ParkingHandler`] to decide auto-allow vs park, in lockstep with the engine's snapshot
     /// policy (both updated by the same op).
     session_modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
+    /// The append-only revision history backing profile + skill versioning. `None` => the versioning
+    /// ops (`profile_history`/`revert`, `skill_history`/`revert`) resolve to [`ApiError::Unsupported`].
+    revisions: Option<Arc<dyn daemon_common::RevisionLog>>,
+    /// The skills store backing the skill versioning + distribution ops. `None` => skill ops and the
+    /// skill payload of a distribution are unavailable.
+    skills: Option<Arc<daemon_skills::SkillStore>>,
 }
 
 impl NodeApiImpl {
@@ -186,6 +192,8 @@ impl NodeApiImpl {
             model_factory: None,
             session_models: Arc::new(DashMap::new()),
             session_modes,
+            revisions: None,
+            skills: None,
         }
     }
 
@@ -243,6 +251,20 @@ impl NodeApiImpl {
         self
     }
 
+    /// Attach the append-only revision log backing profile + skill versioning. Call during assembly
+    /// (the same log the skills store records through, so operator and agent edits share one history).
+    pub fn with_revisions(mut self, revisions: Arc<dyn daemon_common::RevisionLog>) -> Self {
+        self.revisions = Some(revisions);
+        self
+    }
+
+    /// Attach the skills store backing skill versioning + the skill payload of a distribution. Call
+    /// during assembly (the same `Arc<SkillStore>` the skill tools write through).
+    pub fn with_skills(mut self, skills: Arc<daemon_skills::SkillStore>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
     /// Fold the durable per-session usage totals across every known session — the node-wide
     /// accounting line (tokens, cache, reasoning, estimated `cost_micros`) reported on `stats`.
     async fn folded_usage(&self) -> UsageDelta {
@@ -270,6 +292,36 @@ impl NodeApiImpl {
         match id {
             Some(id) => store.get(&id).map_err(profile_err),
             None => Ok(None),
+        }
+    }
+
+    /// The revision log, or [`ApiError::Unsupported`] when this node hosts no versioning.
+    fn revision_log(&self) -> Result<&Arc<dyn daemon_common::RevisionLog>, ApiError> {
+        self.revisions
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("versioning not available".into()))
+    }
+
+    /// The skills store, or [`ApiError::Unsupported`] when this node hosts no skills.
+    fn skills_store(&self) -> Result<&Arc<daemon_skills::SkillStore>, ApiError> {
+        self.skills
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("skills not available".into()))
+    }
+
+    /// Record a profile revision of `id`'s current on-disk spec under `author`/`reason`. Best-effort:
+    /// only when both a profile store and a revision log are wired, and a revision-log hiccup never
+    /// fails the underlying profile mutation.
+    fn record_profile(&self, id: &str, author: daemon_common::Author, reason: &str) {
+        let (Some(store), Some(log)) = (self.profiles.as_ref(), self.revisions.as_ref()) else {
+            return;
+        };
+        let Ok(Some(spec)) = store.get(id) else {
+            return;
+        };
+        let mut blob = Vec::new();
+        if ciborium::into_writer(&spec, &mut blob).is_ok() {
+            let _ = log.append(daemon_common::RevisionKind::Profile, id, &blob, author, reason);
         }
     }
 
@@ -942,6 +994,17 @@ fn profile_err(e: crate::profiles::ProfileError) -> ApiError {
     }
 }
 
+/// Map a revision-log error onto the wire [`ApiError`].
+fn revision_err(e: daemon_common::RevisionError) -> ApiError {
+    use daemon_common::RevisionError;
+    match e {
+        RevisionError::NotFound { kind, id, seq } => {
+            ApiError::UnknownSession(format!("{kind}/{id}@{seq}"))
+        }
+        other => ApiError::Other(other.to_string()),
+    }
+}
+
 #[async_trait]
 impl ProfileApi for NodeApiImpl {
     async fn profile_list(&self) -> Vec<ProfileInfo> {
@@ -967,11 +1030,17 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
-        self.profile_store()?.create(spec).map_err(profile_err)
+        let id = spec.id.clone();
+        self.profile_store()?.create(spec).map_err(profile_err)?;
+        self.record_profile(&id, daemon_common::Author::Operator, "create");
+        Ok(())
     }
 
     async fn profile_update(&self, spec: ProfileSpec) -> Result<(), ApiError> {
-        self.profile_store()?.update(spec).map_err(profile_err)
+        let id = spec.id.clone();
+        self.profile_store()?.update(spec).map_err(profile_err)?;
+        self.record_profile(&id, daemon_common::Author::Operator, "update");
+        Ok(())
     }
 
     async fn profile_delete(&self, id: String) -> Result<(), ApiError> {
@@ -1004,11 +1073,154 @@ impl ProfileApi for NodeApiImpl {
             .map_err(profile_err)?
             .ok_or_else(|| ApiError::UnknownSession(id.clone()))?;
         patch.apply(&mut spec);
-        store.update(spec).map_err(profile_err)
+        store.update(spec).map_err(profile_err)?;
+        self.record_profile(&id, daemon_common::Author::Operator, "config_set");
+        Ok(())
     }
 
     async fn config_schema(&self) -> ConfigSchema {
         ConfigSchema::builtin()
+    }
+
+    async fn profile_clone(&self, source: String, new_id: String) -> Result<(), ApiError> {
+        let store = self.profile_store()?;
+        let mut spec = store
+            .get(&source)
+            .map_err(profile_err)?
+            .ok_or_else(|| ApiError::UnknownSession(source.clone()))?;
+        spec.id = new_id.clone();
+        store.create(spec).map_err(profile_err)?;
+        self.record_profile(
+            &new_id,
+            daemon_common::Author::Operator,
+            &format!("clone of {source}"),
+        );
+        Ok(())
+    }
+
+    async fn profile_export(&self, id: String) -> Result<Distribution, ApiError> {
+        let spec = self
+            .profile_store()?
+            .get(&id)
+            .map_err(profile_err)?
+            .ok_or_else(|| ApiError::UnknownSession(id.clone()))?;
+        // A profile distribution carries the profile's local (non-bundled) skills, when skills are
+        // hosted; otherwise just the spec. credential_ref is kept (a name, not a secret).
+        let skills = match self.skills.as_ref() {
+            Some(s) => s
+                .export_local()
+                .map_err(|e| ApiError::Other(format!("skill export: {e}")))?,
+            None => Vec::new(),
+        };
+        let head_seq = self
+            .revisions
+            .as_ref()
+            .and_then(|log| log.head(daemon_common::RevisionKind::Profile, &id).ok().flatten())
+            .map(|r| r.seq);
+        Ok(Distribution {
+            wire_version: daemon_common::WireVersion::CURRENT,
+            profile: spec,
+            skills,
+            head_seq,
+            source: None,
+        })
+    }
+
+    async fn profile_import(
+        &self,
+        dist: Distribution,
+        new_id: Option<String>,
+    ) -> Result<String, ApiError> {
+        if dist.wire_version != daemon_common::WireVersion::CURRENT {
+            return Err(ApiError::Other(format!(
+                "incompatible distribution wire version {} (node is {})",
+                dist.wire_version.0,
+                daemon_common::WireVersion::CURRENT.0
+            )));
+        }
+        let store = self.profile_store()?;
+        let mut spec = dist.profile;
+        if let Some(id) = new_id {
+            spec.id = id;
+        }
+        let id = spec.id.clone();
+        store.create(spec).map_err(profile_err)?;
+        self.record_profile(&id, daemon_common::Author::Operator, "import");
+        // Reconstitute the bundled skills (operator-authored, so attribute to the operator). A skill
+        // that already exists is left as-is rather than clobbered.
+        if let Some(skill_store) = self.skills.as_ref() {
+            for bundle in &dist.skills {
+                if skill_store.is_bundled(&bundle.name) {
+                    continue;
+                }
+                skill_store
+                    .import_bundle(bundle, daemon_common::Author::Operator, &format!("import via {id}"))
+                    .map_err(|e| ApiError::Other(format!("skill import: {e}")))?;
+            }
+        }
+        Ok(id)
+    }
+
+    async fn profile_history(&self, id: String) -> Result<Vec<daemon_common::Revision>, ApiError> {
+        self.revision_log()?
+            .history(daemon_common::RevisionKind::Profile, &id)
+            .map_err(revision_err)
+    }
+
+    async fn profile_at(&self, id: String, seq: u64) -> Result<ProfileSpec, ApiError> {
+        let blob = self
+            .revision_log()?
+            .get_at(daemon_common::RevisionKind::Profile, &id, seq)
+            .map_err(revision_err)?;
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| ApiError::Other(format!("decode profile revision: {e}")))
+    }
+
+    async fn profile_revert(&self, id: String, seq: u64) -> Result<(), ApiError> {
+        let spec = self.profile_at(id.clone(), seq).await?;
+        self.profile_store()?.update(spec).map_err(profile_err)?;
+        self.record_profile(
+            &id,
+            daemon_common::Author::Operator,
+            &format!("revert to {seq}"),
+        );
+        Ok(())
+    }
+
+    async fn skill_history(&self, name: String) -> Result<Vec<daemon_common::Revision>, ApiError> {
+        self.revision_log()?
+            .history(daemon_common::RevisionKind::Skill, &name)
+            .map_err(revision_err)
+    }
+
+    async fn skill_at(
+        &self,
+        name: String,
+        seq: u64,
+    ) -> Result<daemon_common::SkillBundle, ApiError> {
+        let blob = self
+            .revision_log()?
+            .get_at(daemon_common::RevisionKind::Skill, &name, seq)
+            .map_err(revision_err)?;
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| ApiError::Other(format!("decode skill revision: {e}")))
+    }
+
+    async fn skill_revert(&self, name: String, seq: u64) -> Result<(), ApiError> {
+        let skills = self.skills_store()?;
+        if skills.is_bundled(&name) {
+            return Err(ApiError::Conflict(format!(
+                "skill `{name}` is binary-bundled and cannot be reverted"
+            )));
+        }
+        let bundle = self.skill_at(name.clone(), seq).await?;
+        skills
+            .import_bundle(
+                &bundle,
+                daemon_common::Author::Operator,
+                &format!("revert to {seq}"),
+            )
+            .map_err(|e| ApiError::Other(format!("skill revert: {e}")))
     }
 }
 

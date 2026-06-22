@@ -26,6 +26,9 @@ daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }
 daemon-telemetry = { workspace = true }
 daemon-models = { workspace = true }
+# the skills store: the node threads it (with its revision log) into the api surface for skill
+# versioning + the skill payload of a profile distribution.
+daemon-skills = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]

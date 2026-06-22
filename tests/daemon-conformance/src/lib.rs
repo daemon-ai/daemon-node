@@ -1682,6 +1682,8 @@ mod node_interface {
             credential_store: None,
             cloud_catalog: None,
             prompt_sources: vec![],
+            revisions: None,
+            skills: None,
         })
     }
 
@@ -1750,6 +1752,8 @@ mod node_interface {
             credential_store: Some(Arc::new(MemCredentialStore::new())),
             cloud_catalog: None,
             prompt_sources: vec![],
+            revisions: None,
+            skills: None,
         });
         (node, handle)
     }
@@ -2536,6 +2540,219 @@ mod node_interface {
         handle.shutdown().await;
     }
 
+    /// A valid `SKILL.md` body (frontmatter `name` + `description` + a body) for versioning tests.
+    fn sample_skill_md(desc: &str) -> String {
+        format!("---\nname: mine\ndescription: {desc}\n---\nDo the thing.\n")
+    }
+
+    /// Assemble a node wired for **profile + skill versioning + distribution**: a file-backed profile
+    /// store, the append-only `FileRevisionLog`, and a `SkillStore` recording through that same log —
+    /// all under `dir`. Returns the surface, its handle, and the shared skills store.
+    fn assemble_versioning(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<NodeApiImpl>,
+        daemon_host::SupervisorHandle,
+        Arc<daemon_skills::SkillStore>,
+    ) {
+        use daemon_host::{FileProfileStore, FileRevisionLog, ProfileStore};
+        let profiles: Arc<dyn ProfileStore> =
+            Arc::new(FileProfileStore::open(dir.join("profiles")).unwrap());
+        let revisions: Arc<dyn daemon_common::RevisionLog> =
+            Arc::new(FileRevisionLog::open(dir.join("revisions")).unwrap());
+        let skills = Arc::new(
+            daemon_skills::SkillStore::new(dir.join("skills")).with_revisions(revisions.clone()),
+        );
+        skills.seed_bundled().expect("seed bundled skills");
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(profiles),
+            provider_resolver: None,
+            credential_store: None,
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: Some(revisions),
+            skills: Some(skills.clone()),
+        });
+        (node, handle, skills)
+    }
+
+    /// THE VERSIONING + DISTRIBUTION GATE: a profile's edits are versioned in a native append-only
+    /// history with non-destructive revert (and roll-forward), skills (incl. agent-authored ones)
+    /// share the same mechanism, binary-bundled skills are read-only, and a profile exports/imports
+    /// as a self-contained distribution (spec + local skills, `credential_ref` kept) that survives a
+    /// restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_and_skill_versioning_and_distribution() {
+        use daemon_api::{ConfigPatch, ProfileApi, ProfileSpec, ProviderSelector};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-versioning-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (node, handle, skills) = assemble_versioning(&dir);
+
+        // --- profile history + non-destructive revert + roll-forward ---
+        let mut spec = ProfileSpec::new("p1", ProviderSelector::GenAi, "claude-opus-4-8");
+        spec.credential_ref = Some("team-key".into());
+        node.profile_create(spec).await.expect("create p1");
+        assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 1);
+
+        node.config_set(
+            Some("p1".into()),
+            ConfigPatch {
+                model: Some("claude-3-5-sonnet-latest".into()),
+                ..ConfigPatch::default()
+            },
+        )
+        .await
+        .expect("patch model");
+        let hist = node.profile_history("p1".into()).await.unwrap();
+        assert_eq!(hist.len(), 2, "create + config_set = 2 revisions");
+        assert_eq!(hist[0].author, daemon_common::Author::Operator);
+        assert_eq!(
+            node.profile_get("p1".into()).await.unwrap().unwrap().model,
+            "claude-3-5-sonnet-latest"
+        );
+
+        // Revert to seq 1 (the original opus model): non-destructive — appends a new head.
+        node.profile_revert("p1".into(), 1).await.expect("revert");
+        assert_eq!(
+            node.profile_get("p1".into()).await.unwrap().unwrap().model,
+            "claude-opus-4-8"
+        );
+        assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 3);
+        // Roll-forward = revert to the later seq 2 (the sonnet model).
+        node.profile_revert("p1".into(), 2).await.expect("roll forward");
+        assert_eq!(
+            node.profile_get("p1".into()).await.unwrap().unwrap().model,
+            "claude-3-5-sonnet-latest"
+        );
+        assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 4);
+        // `profile_at` returns the recorded spec without mutating the live profile.
+        assert_eq!(
+            node.profile_at("p1".into(), 1).await.unwrap().model,
+            "claude-opus-4-8"
+        );
+
+        // --- clone (fresh history, credential_ref carried) ---
+        node.profile_clone("p1".into(), "p2".into())
+            .await
+            .expect("clone");
+        assert_eq!(node.profile_history("p2".into()).await.unwrap().len(), 1);
+        let p2 = node.profile_get("p2".into()).await.unwrap().unwrap();
+        assert_eq!(p2.model, "claude-3-5-sonnet-latest");
+        assert_eq!(p2.credential_ref.as_deref(), Some("team-key"));
+
+        // --- skill versioning (the agent's own write path records revisions) ---
+        skills
+            .create("mine", &sample_skill_md("v1"), None)
+            .expect("create skill");
+        skills
+            .edit("mine", &sample_skill_md("v2"))
+            .expect("edit skill");
+        let sk_hist = node.skill_history("mine".into()).await.unwrap();
+        assert_eq!(sk_hist.len(), 2, "create + edit = 2 skill revisions");
+        assert_eq!(
+            sk_hist[0].author,
+            daemon_common::Author::Agent("skill_manage".into()),
+            "tool writes are attributed to the agent"
+        );
+        // Revert the skill to its first revision (description v1).
+        node.skill_revert("mine".into(), 1).await.expect("skill revert");
+        assert!(skills
+            .view("mine", None)
+            .unwrap()
+            .contains("description: v1"));
+
+        // Binary-bundled skills are read-only: revert is rejected.
+        let bundled = daemon_skills::bundled_names();
+        let bundled_name = bundled.iter().next().expect("at least one bundled skill");
+        let err = node.skill_revert(bundled_name.clone(), 1).await.unwrap_err();
+        assert!(
+            matches!(err, daemon_api::ApiError::Conflict(_)),
+            "bundled skill revert should be rejected, got {err:?}"
+        );
+
+        // --- export -> import roundtrip (spec + local skills, credential_ref kept) ---
+        let dist = match node.profile_export("p1".into()).await {
+            Ok(d) => d,
+            Err(e) => panic!("export failed: {e}"),
+        };
+        assert_eq!(dist.profile.credential_ref.as_deref(), Some("team-key"));
+        assert!(
+            dist.skills.iter().any(|s| s.name == "mine"),
+            "the distribution carries the local skill"
+        );
+        assert!(
+            !dist.skills.iter().any(|s| &s.name == bundled_name),
+            "the distribution never ships binary-bundled skills"
+        );
+
+        handle.shutdown().await;
+
+        // Import into a *fresh* node over a *new* data root (a clean machine).
+        let dir2 = std::env::temp_dir().join(format!(
+            "daemon-versioning-import-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        let (node2, handle2, skills2) = assemble_versioning(&dir2);
+        let new_id = node2
+            .profile_import(dist, Some("imported".into()))
+            .await
+            .expect("import");
+        assert_eq!(new_id, "imported");
+        let imported = node2.profile_get("imported".into()).await.unwrap().unwrap();
+        assert_eq!(imported.credential_ref.as_deref(), Some("team-key"));
+        assert_eq!(imported.model, "claude-3-5-sonnet-latest");
+        assert!(
+            skills2.find("mine").is_ok(),
+            "the imported distribution reconstituted the local skill"
+        );
+        assert_eq!(
+            node2.profile_history("imported".into()).await.unwrap().len(),
+            1,
+            "an imported profile seeds a fresh history"
+        );
+        handle2.shutdown().await;
+
+        // --- restart survival: reopen the original data root; history is intact ---
+        let (node3, handle3, _skills3) = assemble_versioning(&dir);
+        assert_eq!(
+            node3.profile_history("p1".into()).await.unwrap().len(),
+            4,
+            "profile history survives a node restart (durable revision log)"
+        );
+        assert_eq!(
+            node3.skill_history("mine".into()).await.unwrap().len(),
+            3,
+            "skill history (create + edit + revert) survives a restart"
+        );
+        handle3.shutdown().await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// THE THREAD-C GATE: reconnect + scroll-back through durable, verified history. After an
     /// interactive turn seals into the unified verifiable journal, the session's history is read
     /// back through the (non-destructive) `session_history` surface — independent of the live drain,
@@ -2691,6 +2908,8 @@ mod node_interface {
             credential_store: None,
             cloud_catalog: None,
             prompt_sources: vec![],
+            revisions: None,
+            skills: None,
         })
     }
 

@@ -41,6 +41,7 @@ pub mod journal;
 pub mod node_api;
 pub mod process_agent;
 pub mod profiles;
+pub mod revision;
 pub mod services;
 pub mod socket;
 pub mod streamjson;
@@ -72,6 +73,7 @@ pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use node_api::{CloudCatalog, ModelProviderFactory, NodeApiImpl, SessionEngineBuilder};
 pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
+pub use revision::FileRevisionLog;
 pub use socket::{serve_api_unix, ApiClient};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{

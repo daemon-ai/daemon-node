@@ -1877,6 +1877,7 @@ dependencies = [
  "daemon-orchestration",
  "daemon-protocol",
  "daemon-provision",
+ "daemon-skills",
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
@@ -1975,6 +1976,7 @@ dependencies = [
  "daemon-models",
  "daemon-protocol",
  "daemon-provision",
+ "daemon-skills",
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
@@ -1982,6 +1984,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2118,6 +2121,7 @@ dependencies = [
  "daemon-orchestration",
  "daemon-protocol",
  "daemon-provision",
+ "daemon-skills",
  "daemon-store",
  "daemon-supervision",
  "daemon-telemetry",
@@ -2220,6 +2224,8 @@ dependencies = [
 name = "daemon-skills"
 version = "0.0.0"
 dependencies = [
+ "ciborium",
+ "daemon-common",
  "daemon-core",
  "include_dir",
  "serde",

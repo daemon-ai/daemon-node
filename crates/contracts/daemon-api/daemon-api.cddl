@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 5)
+wire_version = uint                 ; daemon-common WireVersion (current = 6)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -345,6 +345,30 @@ gguf-info = {
 ; ----- the request/response mirror (1:1 with the interface methods) -----
 ; `origin` is additive on the v2 wire: absent (old encodings) or null -> the host-local default;
 ; a value routes through `submit_from` so per-event attribution is recorded on the merged log.
+; ----- profile/skill versioning + distribution (wire v6) -----
+; `author` provenance: an operator (NodeApi call) or the agent itself (a tool write, labeled).
+author = "operator" / { "agent": tstr }
+; one revision in an artifact's append-only history (profiles + skills share the mechanism).
+revision = {
+  seq: uint,
+  parent: (uint / null),
+  content_hash: bstr,            ; 32-byte SHA-256 of the snapshot blob
+  author: author,
+  reason: tstr,
+  ts_ms: uint,
+}
+; a portable skill bundle: bundle-relative path -> file contents (text; includes SKILL.md).
+skill-bundle = { name: tstr, category: (tstr / null), files: { * tstr => tstr } }
+; a portable profile distribution: the spec (carried as `any` — the Rust ProfileSpec contract) plus
+; the profile's local skills; credential_ref is kept (a name, not a secret).
+distribution = {
+  wire_version: wire_version,
+  profile: any,
+  skills: [* skill-bundle],
+  ? head_seq: (uint / null),
+  ? source: (tstr / null),
+}
+
 api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null) } }
             / { "Poll": { session: session-id, max: uint } }
             / { "Respond": { session: session-id, response: host-response } }
@@ -373,6 +397,16 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "SetSessionMode": { session: session-id, mode: approval-mode } }                       ; live session mode -> Ok
             / { "ApprovalsPending": { ? session: (session-id / null) } }                               ; HITL inbox -> Approvals
             / { "ApprovalDecide": { session: session-id, request_id: tstr, allow: bool } }             ; answer + wake -> Ok
+            ; ----- profile distributions + versioning (wire v6) -----
+            / { "ProfileClone": { source: tstr, new_id: tstr } }                                       ; local copy -> Ok
+            / { "ProfileExport": { id: tstr } }                                                        ; -> Distribution
+            / { "ProfileImport": { dist: distribution, ? new_id: (tstr / null) } }                     ; -> ProfileId
+            / { "ProfileHistory": { id: tstr } }                                                       ; -> Revisions
+            / { "ProfileAt": { id: tstr, seq: uint } }                                                 ; -> Profile
+            / { "ProfileRevert": { id: tstr, seq: uint } }                                             ; non-destructive -> Ok
+            / { "SkillHistory": { name: tstr } }                                                       ; -> Revisions
+            / { "SkillAt": { name: tstr, seq: uint } }                                                 ; -> SkillBundle
+            / { "SkillRevert": { name: tstr, seq: uint } }                                             ; bundled rejected -> Ok
             ; ----- model management (ModelApi) -----
             / { "ModelSearch": { query: search-query } }
             / { "ModelFiles": { repo: tstr, revision: (tstr / null), engine: model-engine } }
@@ -412,4 +446,9 @@ api-response = "Ok"
              / { "ModelQuantizeStarted": quantize-id }
              / { "ModelQuantizes": [* quantize-status] }
              / { "ModelInspect": gguf-info }
+             ; ----- profile distributions + versioning (wire v6) -----
+             / { "Distribution": distribution }
+             / { "ProfileId": tstr }
+             / { "Revisions": [* revision] }
+             / { "SkillBundle": skill-bundle }
              / { "Error": api-error }

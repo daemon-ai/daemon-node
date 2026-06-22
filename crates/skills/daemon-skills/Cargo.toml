@@ -7,9 +7,14 @@ license.workspace = true
 
 [dependencies]
 daemon-core = { workspace = true }
+# the shared RevisionLog contract: skill writes (incl. the agent's background-review) record a
+# revision so skills are versioned with operator/agent provenance.
+daemon-common = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+# CBOR (de)serialization of a portable skill bundle (the snapshot blob + distribution payload).
+ciborium = { workspace = true }
 # Embeds the curated bundled-skills tree (`bundled/`) into the binary so a deployed daemon can seed
 # the profile's skills dir with no repo/filesystem dependency (parity with hermes' wheel-data bundle).
 include_dir = "0.7"

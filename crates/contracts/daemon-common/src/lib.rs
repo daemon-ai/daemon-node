@@ -344,7 +344,13 @@ impl WireVersion {
     /// v5 (runtime control): adds the live per-session model switch (`SetSessionModel`), the §12
     /// edit-approval session modes (`SetSessionMode` + `ApprovalMode`), and the durable HITL approval
     /// surface (`HostResponseBody::Deferred`, `ApprovalsPending`/`ApprovalDecide`, `ApprovalInfo`).
-    pub const CURRENT: Self = Self(5);
+    ///
+    /// v6 (profile distributions + versioning): adds profile clone/export/import
+    /// (`ProfileClone`/`ProfileExport`/`ProfileImport`, the `Distribution` bundle = spec + local
+    /// skills, `credential_ref` kept) and a native append-only revision history shared by profiles
+    /// and skills (`Profile{History,At,Revert}`, `Skill{History,At,Revert}`, `Revision`/`Author`,
+    /// `SkillBundle`) with non-destructive revert / roll-forward.
+    pub const CURRENT: Self = Self(6);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -1077,6 +1083,128 @@ pub struct GgufInfo {
     pub parameter_count: Option<u64>,
     /// The file size in bytes.
     pub size_bytes: u64,
+}
+
+/// A portable snapshot of one skill bundle: its identity plus every text file under the bundle dir
+/// (`SKILL.md` + support files), keyed by bundle-relative path. This is both the skill revision
+/// snapshot blob and the unit carried in a profile [distribution]. Text-only (skills are markdown +
+/// support docs); binary assets are out of scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillBundle {
+    /// The bundle (directory) name — the canonical skill name.
+    pub name: String,
+    /// The category path segment under the skills root (`None` for a top-level skill).
+    pub category: Option<String>,
+    /// Bundle-relative path -> file contents (includes `SKILL.md`).
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+/// Which versioned artifact a revision history tracks. One [`RevisionLog`] keys its history by
+/// `(kind, id)`, so profiles and skills share one append-only mechanism.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionKind {
+    /// A profile bundle (`ProfileSpec`).
+    Profile,
+    /// A skill bundle (`SKILL.md` + support files).
+    Skill,
+}
+
+impl RevisionKind {
+    /// The on-disk/segment slug for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevisionKind::Profile => "profile",
+            RevisionKind::Skill => "skill",
+        }
+    }
+}
+
+/// Who authored a revision — the provenance that matters when the agent edits its own
+/// profile/skills. Distinguishes a human operator (a NodeApi call) from the agent itself (a tool
+/// write, labeled by source, e.g. `skill_manage`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Author {
+    /// A human operator acting over the NodeApi control surface.
+    Operator,
+    /// The agent itself, labeled by the write source (e.g. `skill_manage`).
+    Agent(String),
+}
+
+/// One recorded revision of a versioned artifact. The full snapshot lives in a content-addressed
+/// blob (keyed by `content_hash`); this is the metadata row a `history` query returns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    /// The 1-based monotonic sequence within `(kind, id)`.
+    pub seq: u64,
+    /// The previous head's `seq` (`None` for the first revision).
+    pub parent: Option<u64>,
+    /// The content hash of this revision's snapshot blob (dedupe + integrity).
+    pub content_hash: ContentHash,
+    /// Who made the change.
+    pub author: Author,
+    /// A short human-readable reason (`create`, `update`, `revert to 3`, `import`, …).
+    pub reason: String,
+    /// Wall-clock milliseconds since the Unix epoch at append time.
+    pub ts_ms: u64,
+}
+
+/// Errors a [`RevisionLog`] can surface.
+#[derive(Debug, thiserror::Error)]
+pub enum RevisionError {
+    /// No revision with that `seq` exists for `(kind, id)`.
+    #[error("revision not found: {kind}/{id}@{seq}")]
+    NotFound {
+        /// The artifact kind slug.
+        kind: String,
+        /// The artifact id.
+        id: String,
+        /// The requested sequence.
+        seq: u64,
+    },
+    /// An underlying I/O failure.
+    #[error("revision log io: {0}")]
+    Io(String),
+    /// A (de)serialization failure of an index entry or blob.
+    #[error("revision log codec: {0}")]
+    Codec(String),
+}
+
+/// An append-only, content-addressed revision history shared by versioned artifacts (profiles and
+/// skills). Every mutation appends a revision capturing the full snapshot; **revert is
+/// non-destructive** — it appends a new head equal to an older revision's content, so nothing is
+/// ever lost and roll-forward is simply reverting to a later `seq`.
+///
+/// The trait is a storage contract (sync, opaque-byte blobs); the file-backed implementation lives
+/// in `daemon-host`. Profiles record through the NodeApi layer; skills record through the skill
+/// store so the agent's own background-review writes are versioned too.
+pub trait RevisionLog: Send + Sync {
+    /// Append a new revision of `(kind, id)` carrying `blob` (the full snapshot), returning the
+    /// recorded metadata. The new revision becomes the head.
+    fn append(
+        &self,
+        kind: RevisionKind,
+        id: &str,
+        blob: &[u8],
+        author: Author,
+        reason: &str,
+    ) -> Result<Revision, RevisionError>;
+
+    /// The full revision history of `(kind, id)`, oldest first. Empty if none recorded yet.
+    fn history(&self, kind: RevisionKind, id: &str) -> Result<Vec<Revision>, RevisionError>;
+
+    /// The snapshot blob recorded at `seq` for `(kind, id)`.
+    fn get_at(&self, kind: RevisionKind, id: &str, seq: u64) -> Result<Vec<u8>, RevisionError>;
+
+    /// The current head revision of `(kind, id)`, if any.
+    fn head(&self, kind: RevisionKind, id: &str) -> Result<Option<Revision>, RevisionError>;
+}
+
+impl fmt::Display for RevisionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[cfg(test)]

@@ -145,6 +145,14 @@ pub struct NodeAssembly {
     /// skills/memory tools in [`Self::extra_tools`] and is inert unless the engine's review nudge
     /// intervals (`engine_config.skill_review_interval` / `memory_review_interval`) are non-zero.
     pub prompt_sources: Vec<Arc<dyn StablePromptSource>>,
+    /// The append-only revision log backing profile + skill versioning. `None` builds a node without
+    /// versioning (the history/revert ops resolve to `ApiError::Unsupported`). When set, it is the
+    /// same log the [`Self::skills`] store records through, so operator + agent edits share a history.
+    pub revisions: Option<Arc<dyn daemon_common::RevisionLog>>,
+    /// The skills store backing the node's skill versioning + the skill payload of a distribution.
+    /// `None` builds a node without skill versioning/distribution. Must be the same `Arc<SkillStore>`
+    /// whose tools are in [`Self::extra_tools`].
+    pub skills: Option<Arc<daemon_skills::SkillStore>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -556,6 +564,13 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // Bind the credential sub-surface when this node hosts credential management.
     if let Some(credentials) = a.credential_store.clone() {
         node_api = node_api.with_credential_store(credentials);
+    }
+    // Bind the profile/skill versioning surface when this node hosts a revision log.
+    if let Some(revisions) = a.revisions.clone() {
+        node_api = node_api.with_revisions(revisions);
+    }
+    if let Some(skills) = a.skills.clone() {
+        node_api = node_api.with_skills(skills);
     }
     // Bind the live cloud-model discovery hook when the binary provided one.
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {

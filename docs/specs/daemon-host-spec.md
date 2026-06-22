@@ -459,6 +459,37 @@ and the wake-on-decision dedupes like a delegation completion (deterministic epo
 
 ---
 
+## 7.2 Profile distributions + profile/skill version history (wire v6)
+
+The agent edits its **own** profile and skills (the background `skill_review` curator writes through
+`skill_manage`), so both artifacts are versioned with a native, append-only, **content-addressed
+revision log** — never a vendored git repo. One mechanism (`daemon_common::RevisionLog`, file-backed
+`FileRevisionLog` in `daemon-host`) keys history by `(kind, id)` so profiles and skills share it.
+
+- **On disk** (under the data root, beside `profiles/` and `skills/`): `revisions/<kind>/<id>/` holds
+  an append-only `index.jsonl` (one `seq, parent, hash, author, reason, ts_ms` row per revision) and a
+  `blobs/<sha256>.bin` content-addressed snapshot store (identical content dedupes). The blob is the
+  full snapshot — a `ProfileSpec` (CBOR) or a `SkillBundle` (the `SKILL.md` + support files).
+- **Provenance is first-class.** `Author` is `Operator` (a NodeApi call) or `Agent(label)` (a tool
+  write, e.g. `skill_manage`). Profile mutations (`ProfileCreate`/`ProfileUpdate`/`ConfigSet`/clone/
+  import/revert) record `Operator`; skill writes through the store record the agent, so the curator's
+  self-edits are attributable.
+- **Revert is non-destructive.** `Profile{History,At,Revert}` and `Skill{History,At,Revert}`: a revert
+  re-materializes an older revision's snapshot into the live store, which records a **new head** equal
+  to that revision. History only grows, so **roll-forward is just reverting to a later `seq`**.
+  Binary-bundled skills are read-only (revert rejected) — the same rule the reviewer follows.
+- **Distributions.** A profile exports as a self-contained `Distribution { wire_version, profile,
+  skills, head_seq, source }`: the `ProfileSpec` plus the profile's **local** (non-bundled) skills.
+  `credential_ref` is **kept** — it is a name, not a secret (the importer registers the key via
+  `CredentialSet`). `ProfileImport` validates the wire version, applies an optional id override, and
+  safely extracts skills (the same path guard `write_file` uses), seeding a fresh `imported` history.
+  Bundled skills are never shipped; the importing node reconstitutes them from its own binary.
+
+The log is durable (survives restart) and wired only on durable nodes; an ephemeral node runs without
+history and the versioning ops resolve to `ApiError::Unsupported`.
+
+---
+
 ## 8. Live-resource ownership
 
 Per the §16.1 amendment, the host owns the **live** runtime resources so an engine can dehydrate

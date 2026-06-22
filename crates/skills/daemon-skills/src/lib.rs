@@ -19,9 +19,11 @@
 
 #![forbid(unsafe_code)]
 
+use daemon_common::{Author, RevisionKind, RevisionLog, SkillBundle};
 use daemon_core::StablePromptSource;
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -175,6 +177,12 @@ pub struct SkillStore {
     root: PathBuf,
     /// Memoized rendered index (the prompt-caching invariant); cleared on any write.
     index_cache: Mutex<Option<String>>,
+    /// Optional append-only revision history; when set, every write records a [`SkillBundle`]
+    /// snapshot so skills are versioned (incl. the agent's own background-review edits).
+    revisions: Option<Arc<dyn RevisionLog>>,
+    /// The author attributed to writes through the model-facing tool surface (the agent). Operator
+    /// writes (import / revert from the NodeApi) pass their author explicitly.
+    default_author: Author,
 }
 
 impl SkillStore {
@@ -183,7 +191,15 @@ impl SkillStore {
         Self {
             root: root.into(),
             index_cache: Mutex::new(None),
+            revisions: None,
+            default_author: Author::Agent("skill_manage".to_string()),
         }
+    }
+
+    /// Attach an append-only [`RevisionLog`] so every write records a versioned skill snapshot.
+    pub fn with_revisions(mut self, revisions: Arc<dyn RevisionLog>) -> Self {
+        self.revisions = Some(revisions);
+        self
     }
 
     /// The skills root directory.
@@ -299,6 +315,7 @@ impl SkillStore {
         let md = dir.join("SKILL.md");
         fs::write(&md, content)?;
         self.invalidate();
+        self.record(name, self.default_author.clone(), "create");
         Ok(md)
     }
 
@@ -308,6 +325,7 @@ impl SkillStore {
         let entry = self.find(name)?;
         fs::write(entry.skill_md(), content)?;
         self.invalidate();
+        self.record(name, self.default_author.clone(), "edit");
         Ok(entry.skill_md())
     }
 
@@ -338,6 +356,7 @@ impl SkillStore {
         };
         fs::write(&target, patched)?;
         self.invalidate();
+        self.record(name, self.default_author.clone(), "patch");
         Ok(target)
     }
 
@@ -358,6 +377,7 @@ impl SkillStore {
         }
         fs::remove_dir_all(&entry.dir)?;
         self.invalidate();
+        self.record(name, self.default_author.clone(), "delete");
         Ok(())
     }
 
@@ -376,6 +396,7 @@ impl SkillStore {
         }
         fs::write(&path, content)?;
         self.invalidate();
+        self.record(name, self.default_author.clone(), "write_file");
         Ok(path)
     }
 
@@ -385,7 +406,101 @@ impl SkillStore {
         let path = self.safe_support_path(&entry.dir, file_path)?;
         fs::remove_file(&path)?;
         self.invalidate();
+        self.record(name, self.default_author.clone(), "remove_file");
         Ok(())
+    }
+
+    // -- versioning + distribution ------------------------------------------------------------
+
+    /// Export one skill bundle as a portable [`SkillBundle`] (its `SKILL.md` + support files). Used
+    /// as the revision snapshot blob and the distribution payload.
+    pub fn export_bundle(&self, name: &str) -> Result<SkillBundle, SkillError> {
+        let entry = self.find(name)?;
+        let mut files = BTreeMap::new();
+        collect_bundle_files(&entry.dir, &entry.dir, &mut files)?;
+        Ok(SkillBundle {
+            name: entry.name,
+            category: entry.category,
+            files,
+        })
+    }
+
+    /// Every locally-authored (non-bundled) skill as a portable [`SkillBundle`] — the set a profile
+    /// distribution carries (bundled skills are reconstituted from the binary on import, never shipped).
+    pub fn export_local(&self) -> Result<Vec<SkillBundle>, SkillError> {
+        let bundled = bundled_names();
+        let mut out = Vec::new();
+        for entry in self.discover() {
+            if bundled.contains(&entry.name) {
+                continue;
+            }
+            out.push(self.export_bundle(&entry.name)?);
+        }
+        Ok(out)
+    }
+
+    /// Write a [`SkillBundle`] to disk (overwriting any existing bundle of that name), recording a
+    /// revision under `author`/`reason`. Used by import and revert; path-guarded to the store root.
+    pub fn import_bundle(
+        &self,
+        bundle: &SkillBundle,
+        author: Author,
+        reason: &str,
+    ) -> Result<(), SkillError> {
+        validate_name(&bundle.name)?;
+        let dir = match &bundle.category {
+            Some(cat) => {
+                validate_segment(cat)?;
+                self.root.join(cat).join(&bundle.name)
+            }
+            None => self.root.join(&bundle.name),
+        };
+        // Replace wholesale so a revert/import is the exact recorded snapshot (drops stray files).
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir_all(&dir)?;
+        for (rel, content) in &bundle.files {
+            let path = self.safe_support_path(&dir, rel)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, content)?;
+        }
+        // A bundle is malformed without a parseable SKILL.md; reject rather than persist a broken skill.
+        if let Some(md) = bundle.files.get("SKILL.md") {
+            validate_skill_md(md)?;
+        } else {
+            return Err(SkillError::Malformed(format!(
+                "bundle `{}` has no SKILL.md",
+                bundle.name
+            )));
+        }
+        self.invalidate();
+        self.record(&bundle.name, author, reason);
+        Ok(())
+    }
+
+    /// Whether `name` is one of the binary-bundled skills (read-only: not versioned/reverted/exported).
+    pub fn is_bundled(&self, name: &str) -> bool {
+        bundled_names().contains(name)
+    }
+
+    /// Record a revision of `name`'s current on-disk bundle (a tombstone when it was just deleted).
+    /// Best-effort: a revision-log hiccup never fails the underlying skill write.
+    fn record(&self, name: &str, author: Author, reason: &str) {
+        let Some(log) = &self.revisions else {
+            return;
+        };
+        let bundle = self.export_bundle(name).unwrap_or_else(|_| SkillBundle {
+            name: name.to_string(),
+            category: None,
+            files: BTreeMap::new(),
+        });
+        let mut blob = Vec::new();
+        if ciborium::into_writer(&bundle, &mut blob).is_ok() {
+            let _ = log.append(RevisionKind::Skill, name, &blob, author, reason);
+        }
     }
 
     /// One-shot bundled→user seed: copy any bundle present under `bundled_root` but absent under this
@@ -655,6 +770,54 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), SkillError> {
             copy_dir_all(&path, &dest)?;
         } else {
             fs::copy(&path, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// The set of binary-bundled skill names (the dir holding each `SKILL.md` in [`BUNDLED`]). Bundled
+/// skills are read-only for versioning/distribution: never reverted, never shipped in a distribution
+/// (the importer reconstitutes them from its own binary).
+pub fn bundled_names() -> std::collections::HashSet<String> {
+    embedded_skill_dirs(&BUNDLED)
+        .iter()
+        .filter_map(|d| {
+            d.path()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// Recursively collect a bundle's text files (relative to `base`), restricted to `SKILL.md` and the
+/// recognized support dirs — the same surface `write_file` permits, so an import is always writable.
+fn collect_bundle_files(
+    base: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, String>,
+) -> Result<(), SkillError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_bundle_files(base, &path, out)?;
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(base) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let allowed = rel == "SKILL.md"
+            || SUPPORT_DIRS.iter().any(|d| rel.starts_with(&format!("{d}/")));
+        if !allowed {
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                out.insert(rel, content);
+            }
+            // Skip non-UTF8 (binary) assets: a bundle is text-only (markdown + support docs).
+            Err(_) => continue,
         }
     }
     Ok(())
