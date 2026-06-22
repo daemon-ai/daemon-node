@@ -135,6 +135,12 @@ impl AgentSession for AcpSession {
     fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
     }
+
+    /// Foreign ACP agents are not rewindable: ACP has no truncate-at-anchor primitive and the agent
+    /// owns its own conversation state, so the daemon cannot make it forget post-anchor turns.
+    fn rewindable(&self) -> bool {
+        false
+    }
 }
 
 /// Drive the ACP connection for the lifetime of the session: initialize, open a session, then relay
@@ -247,6 +253,19 @@ async fn drive(
                     }
                     // No ACP analogue for a read-only snapshot; the live event stream is the view.
                     AgentCommand::Snapshot { .. } => {}
+                    // Conversation rewind is unsupported for foreign ACP agents: ACP has no
+                    // truncate-at-anchor primitive (session/load replays the full history,
+                    // session/fork is unstable and forks the whole context, session/resume does not
+                    // truncate), and the agent — not the daemon — owns the conversation state, so the
+                    // daemon cannot make it forget post-anchor turns. Sessions advertise this up front
+                    // via `SessionInfo::rewindable = false`, so a client never offers rewind here; if
+                    // one is submitted anyway it is dropped (no fake/partial rewind).
+                    AgentCommand::RewindTo { request_id, .. } => {
+                        tracing::warn!(
+                            request_id = request_id.0,
+                            "RewindTo is unsupported for a foreign ACP agent (not rewindable); dropping"
+                        );
+                    }
                     AgentCommand::Shutdown => break,
                     _ => {}
                 }
@@ -409,4 +428,37 @@ fn summarize(value: &serde_json::Value) -> String {
         s.push('…');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_protocol::{HostRequest, HostResponse, HostResponseBody};
+
+    struct NoopHost;
+
+    #[async_trait]
+    impl HostRequestHandler for NoopHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved(false),
+            }
+        }
+    }
+
+    /// A foreign ACP session is not rewindable: ACP has no truncate-at-anchor primitive, so the
+    /// capability is `false` (the GUI/TUI reads this — via `SessionInfo::rewindable` / the unit — to
+    /// hide rewind for ACP agents). Pure capability check; no agent process needs to speak ACP.
+    #[tokio::test]
+    async fn acp_session_is_not_rewindable() {
+        // `/nonexistent-acp-agent` never connects, but `rewindable()` is a static capability that
+        // does not depend on the connection, so the session object reports it immediately.
+        let launch = AcpLaunch::new("/nonexistent-acp-agent");
+        let session = AcpSession::connect(launch, Arc::new(NoopHost));
+        assert!(
+            !session.rewindable(),
+            "foreign ACP sessions must advertise rewindable=false"
+        );
+    }
 }

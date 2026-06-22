@@ -26,8 +26,8 @@ use daemon_common::{
 };
 use daemon_protocol::{
     AgentEvent, CompletionSource, ContextStatus, ConvTurnView, ConvView, EndReason, HostRequest,
-    HostRequestHandler, HostRequestKind, SpawnSeed, SpawnSpec, ToolCallView, ToolDetail,
-    ToolResultView, TurnSummary, TurnTrigger, UserMsg,
+    HostRequestHandler, HostRequestKind, RewindAnchor, SpawnSeed, SpawnSpec, ToolCallView,
+    ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -53,6 +53,44 @@ pub enum TurnOutcome {
     /// The turn suspended at a phase boundary, delegating background work.
     Suspended(Suspension),
 }
+
+/// The result of a successful [`Engine::rewind_to`]: the rewound point, the new epoch, and the tool
+/// call-ids in the sealed-off tail, so the caller (the host) can drive the durable journal seal and
+/// the matching workspace-checkpoint rollback (conversation-rewind spec §6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewindOutcome {
+    /// The number of conversation turns retained (turns `[0, retained_turns)` survive).
+    pub retained_turns: usize,
+    /// The new incarnation epoch after the rewind bump.
+    pub epoch: Epoch,
+    /// The `call_id`s of every tool call in the truncated tail, oldest first. The host maps these to
+    /// the §12 workspace checkpoints captured before those tools ran and rolls the filesystem back to
+    /// the earliest one (each checkpoint snapshots pre-mutation state, so restoring the earliest
+    /// undoes every later mutation in the sealed range).
+    pub dropped_call_ids: Vec<String>,
+}
+
+/// Why a [`RewindAnchor`](daemon_protocol::RewindAnchor) could not be resolved against the live
+/// conversation (conversation-rewind spec §2/§5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewindError {
+    /// The anchor addresses a turn outside the live conversation (out of range, or compacted away
+    /// below the live floor).
+    OutOfRange,
+    /// A `UserTurn`/`ReplyAfter` anchor pointed at a turn that is not a user turn.
+    NotAUserTurn,
+}
+
+impl std::fmt::Display for RewindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RewindError::OutOfRange => write!(f, "rewind anchor out of range"),
+            RewindError::NotAUserTurn => write!(f, "rewind anchor is not a user turn"),
+        }
+    }
+}
+
+impl std::error::Error for RewindError {}
 
 /// The durable handoff produced when a turn suspends: the job to enqueue and the post-bump epoch.
 pub struct Suspension {
@@ -230,8 +268,22 @@ impl Engine {
     }
 
     /// Stash background-job completions to be applied (idempotently) before the next turn runs.
+    ///
+    /// Epoch fence (conversation-rewind spec §6): only completions for a job still in `waiting_for`
+    /// are stashed. A `RewindTo` clears `waiting_for` (and drops the awaiting tool slots) and bumps
+    /// the epoch, so a delegation completion from the abandoned tail that arrives *after* a rewind is
+    /// no longer awaited and is dropped here rather than mutating the rewound conversation.
     pub fn apply_completions(&mut self, completions: Vec<Completion>) {
-        self.pending.extend(completions);
+        for completion in completions {
+            if self.snapshot.waiting_for.contains(&completion.job_id) {
+                self.pending.push(completion);
+            } else {
+                tracing::debug!(
+                    job = %completion.job_id,
+                    "dropping completion for an unawaited job (fenced by rewind/epoch)"
+                );
+            }
+        }
     }
 
     /// Swap the model provider this engine calls — a live, per-session model switch. Refreshes the
@@ -272,6 +324,107 @@ impl Engine {
             .conversation
             .push_user(UserMsg::new(format!("[steer] {}", steer.text)));
         self.next_trigger = Some(TurnTrigger::Steer);
+    }
+
+    /// Rewind the conversation to `anchor` (conversation-rewind spec §2/§4): truncate the turns after
+    /// the anchor, reconstruct the engine state for that point (clear transient/in-flight state), bump
+    /// the [`Epoch`] to fence late arrivals from the abandoned turn, and emit [`AgentEvent::Rewound`].
+    ///
+    /// No per-turn snapshots are stored, so the snapshot is *reconstructed* by truncating the live
+    /// conversation in place (the same vec compaction mutates) and resetting the derived/transient
+    /// fields that only make sense relative to the dropped tail. Returns the [`RewindOutcome`] (the
+    /// retained turn count + the new epoch) so the caller can drive the durable journal seal.
+    ///
+    /// Must be called when no turn is live (the actor interrupts first). Anchors that resolve outside
+    /// the live conversation (out of range, or compacted away below the live floor) are rejected.
+    pub fn rewind_to(
+        &mut self,
+        anchor: &RewindAnchor,
+        request_id: ReqId,
+        events: &EventSink,
+    ) -> Result<RewindOutcome, RewindError> {
+        let len = self.snapshot.conversation.turns.len();
+        let retained = self.resolve_anchor(anchor, len)?;
+
+        // Collect the tool call-ids in the sealed-off tail (oldest first) so the host can roll the
+        // workspace back via the §12 checkpoints captured before those tools ran.
+        let dropped_call_ids: Vec<String> = self.snapshot.conversation.turns[retained..]
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Tool(tt) => Some(tt),
+                _ => None,
+            })
+            .flat_map(|tt| tt.calls.iter().map(|(call, _)| call.call_id.clone()))
+            .collect();
+
+        // Reconstruct the snapshot for the rewound point: drop the sealed-off tail and reset every
+        // derived/transient field that described the now-abandoned suffix.
+        self.snapshot.conversation.turns.truncate(retained);
+        self.pending.clear();
+        self.next_trigger = None;
+        self.snapshot.waiting_for.clear();
+        self.snapshot.pending_approvals.clear();
+        // Cadence counters are relative to the dropped tail; reset so the rewound point starts clean.
+        self.snapshot.iters_since_skill = 0;
+        self.snapshot.turns_since_memory = 0;
+
+        // Bump the incarnation epoch so any in-flight commit/event from the interrupted turn that
+        // arrives late is fenced and dropped (mirrors the suspension epoch bump).
+        self.snapshot.epoch = self.snapshot.epoch.next();
+        let epoch = self.snapshot.epoch;
+        let to_cursor = retained as u64;
+
+        events.emit(|seq| AgentEvent::Rewound {
+            seq,
+            request_id,
+            to_cursor,
+            epoch: epoch.0,
+        });
+
+        Ok(RewindOutcome {
+            retained_turns: retained,
+            epoch,
+            dropped_call_ids,
+        })
+    }
+
+    /// Resolve a [`RewindAnchor`] to the number of turns to retain (`[0, retained)` survive). `len` is
+    /// the live conversation turn count.
+    fn resolve_anchor(&self, anchor: &RewindAnchor, len: usize) -> Result<usize, RewindError> {
+        match anchor {
+            // Seal off the user turn at `ordinal` and everything after: keep `[0, ordinal)`.
+            RewindAnchor::UserTurn { ordinal } => {
+                let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
+                if o >= len {
+                    return Err(RewindError::OutOfRange);
+                }
+                if !matches!(self.snapshot.conversation.turns.get(o), Some(Turn::User(_))) {
+                    return Err(RewindError::NotAUserTurn);
+                }
+                Ok(o)
+            }
+            // Keep the user turn at `ordinal`, seal off its reply: keep `[0, ordinal]`.
+            RewindAnchor::ReplyAfter { ordinal } => {
+                let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
+                if o >= len {
+                    return Err(RewindError::OutOfRange);
+                }
+                if !matches!(self.snapshot.conversation.turns.get(o), Some(Turn::User(_))) {
+                    return Err(RewindError::NotAUserTurn);
+                }
+                Ok(o + 1)
+            }
+            // A durable journal cursor maps 1:1 onto a retained turn count in this engine's
+            // coordinate space (each kept turn is one journal-addressable position). A cursor past
+            // the live conversation is out of range.
+            RewindAnchor::Cursor { seq } => {
+                let keep = usize::try_from(*seq).map_err(|_| RewindError::OutOfRange)?;
+                if keep > len {
+                    return Err(RewindError::OutOfRange);
+                }
+                Ok(keep)
+            }
+        }
     }
 
     /// The current snapshot (the only durable state).
@@ -2333,5 +2486,124 @@ mod tests {
                 "switch:end",
             ]
         );
+    }
+
+    // ---- conversation rewind (conversation-rewind spec) -----------------------------------------
+
+    use crate::conversation::ToolResult;
+
+    /// Build an engine whose conversation is `[User, Assistant, User, Tool(call_id=cp-1), Assistant]`.
+    fn rewind_engine() -> Engine {
+        let mut engine = completing_engine("rw");
+        let conv = &mut engine.snapshot.conversation;
+        conv.push_user(UserMsg::new("u0"));
+        conv.push_assistant(AssistantMsg::text("a1"));
+        conv.push_user(UserMsg::new("u2"));
+        conv.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("a3 (tool)"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "cp-1".into(),
+                    name: "write".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "cp-1".into(),
+                    ok: true,
+                    content: "ok".into(),
+                },
+            )],
+        });
+        conv.push_assistant(AssistantMsg::text("a4"));
+        engine
+    }
+
+    /// `UserTurn { ordinal }` keeps `[0, ordinal)`, bumps the epoch, and emits `Rewound`.
+    #[tokio::test]
+    async fn rewind_user_turn_truncates_and_bumps_epoch() {
+        let mut engine = rewind_engine();
+        let epoch_before = engine.epoch();
+        let (sink, log) = collecting();
+
+        let outcome = engine
+            .rewind_to(&RewindAnchor::UserTurn { ordinal: 2 }, ReqId(7), &sink)
+            .expect("user-turn rewind resolves");
+
+        assert_eq!(outcome.retained_turns, 2);
+        assert_eq!(engine.snapshot.conversation.turns.len(), 2);
+        assert_eq!(engine.epoch(), epoch_before.next());
+        // The sealed-off tail held one tool call.
+        assert_eq!(outcome.dropped_call_ids, vec!["cp-1".to_string()]);
+        let events = log.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Rewound { to_cursor, epoch, request_id, .. }
+                if *to_cursor == 2 && *epoch == engine.epoch().0 && *request_id == ReqId(7)
+        )));
+    }
+
+    /// `ReplyAfter { ordinal }` keeps the user turn and drops its reply: keeps `[0, ordinal]`.
+    #[tokio::test]
+    async fn rewind_reply_after_keeps_user_turn() {
+        let mut engine = rewind_engine();
+        let outcome = engine
+            .rewind_to(&RewindAnchor::ReplyAfter { ordinal: 2 }, ReqId(1), &EventSink::discarding())
+            .expect("reply-after rewind resolves");
+        assert_eq!(outcome.retained_turns, 3);
+        assert!(matches!(
+            engine.snapshot.conversation.turns.last(),
+            Some(Turn::User(u)) if u.text == "u2"
+        ));
+    }
+
+    /// `Cursor { seq }` maps 1:1 to a retained turn count.
+    #[tokio::test]
+    async fn rewind_cursor_truncates_to_count() {
+        let mut engine = rewind_engine();
+        let outcome = engine
+            .rewind_to(&RewindAnchor::Cursor { seq: 1 }, ReqId(1), &EventSink::discarding())
+            .expect("cursor rewind resolves");
+        assert_eq!(outcome.retained_turns, 1);
+        assert_eq!(engine.snapshot.conversation.turns.len(), 1);
+    }
+
+    /// An out-of-range anchor is rejected (the actor maps this to an error rather than truncating).
+    #[tokio::test]
+    async fn rewind_out_of_range_is_rejected() {
+        let mut engine = rewind_engine();
+        let err = engine
+            .rewind_to(&RewindAnchor::UserTurn { ordinal: 99 }, ReqId(1), &EventSink::discarding())
+            .unwrap_err();
+        assert_eq!(err, RewindError::OutOfRange);
+        // The conversation is untouched on rejection.
+        assert_eq!(engine.snapshot.conversation.turns.len(), 5);
+    }
+
+    /// A `UserTurn`/`ReplyAfter` anchor that does not point at a user turn is rejected.
+    #[tokio::test]
+    async fn rewind_non_user_anchor_is_rejected() {
+        let mut engine = rewind_engine();
+        // Ordinal 1 is the assistant turn `a1`.
+        let err = engine
+            .rewind_to(&RewindAnchor::UserTurn { ordinal: 1 }, ReqId(1), &EventSink::discarding())
+            .unwrap_err();
+        assert_eq!(err, RewindError::NotAUserTurn);
+    }
+
+    /// Rewind clears the awaited-job set, so a late completion for a now-unawaited job is fenced.
+    #[tokio::test]
+    async fn rewind_fences_late_completion() {
+        let mut engine = rewind_engine();
+        engine.snapshot.waiting_for.push(JobId::new("job-1"));
+        engine
+            .rewind_to(&RewindAnchor::UserTurn { ordinal: 0 }, ReqId(1), &EventSink::discarding())
+            .expect("rewind resolves");
+        assert!(engine.snapshot.waiting_for.is_empty());
+        // A completion for the abandoned job is dropped (not stashed) post-rewind.
+        engine.apply_completions(vec![Completion {
+            job_id: JobId::new("job-1"),
+            payload: b"late".to_vec(),
+        }]);
+        assert!(engine.pending.is_empty(), "late completion fenced by rewind");
     }
 }

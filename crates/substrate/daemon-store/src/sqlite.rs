@@ -13,8 +13,8 @@
 
 use crate::{
     Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, ParkedApproval, SessionMeta, SessionSearchHit, SessionStatus, SessionStore,
-    StoreError, StoreStats, TraceEntry, TraceSegment,
+    JournalPage, JournalSeal, ParkedApproval, SessionMeta, SessionSearchHit, SessionStatus,
+    SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -151,6 +151,17 @@ CREATE TABLE IF NOT EXISTS journal_roots (
     signature BLOB NOT NULL,
     PRIMARY KEY (stream, segment)
 );
+
+CREATE TABLE IF NOT EXISTS journal_seals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream         TEXT NOT NULL,
+    seal_cursor    INTEGER NOT NULL,
+    retained_turns INTEGER NOT NULL,
+    epoch          INTEGER NOT NULL,
+    recorded_unix  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS journal_seals_stream ON journal_seals (stream, id);
 "#;
 
 /// A durable, SQLite-backed [`SessionStore`].
@@ -1167,6 +1178,45 @@ impl SessionStore for SqliteStore {
             head_cursor,
         }
     }
+
+    async fn record_journal_seal(
+        &self,
+        stream: &JournalStreamId,
+        seal: JournalSeal,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO journal_seals (stream, seal_cursor, retained_turns, epoch, recorded_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stream.as_str(),
+                seal.seal_cursor as i64,
+                seal.retained_turns as i64,
+                seal.epoch as i64,
+                seal.recorded_unix as i64,
+            ],
+        )
+        .map_err(|e| StoreError::Common(DaemonError::Other(e.to_string())))?;
+        Ok(())
+    }
+
+    async fn active_journal_seal(&self, stream: &JournalStreamId) -> Option<JournalSeal> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT seal_cursor, retained_turns, epoch, recorded_unix FROM journal_seals \
+             WHERE stream = ?1 ORDER BY id DESC LIMIT 1",
+            params![stream.as_str()],
+            |row| {
+                Ok(JournalSeal {
+                    seal_cursor: row.get::<_, i64>(0)? as u64,
+                    retained_turns: row.get::<_, i64>(1)? as u64,
+                    epoch: row.get::<_, i64>(2)? as u64,
+                    recorded_unix: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .ok()
+    }
 }
 
 #[cfg(test)]
@@ -1222,5 +1272,46 @@ mod tests {
         assert_eq!(total.cache_write_tokens, 40);
         assert_eq!(total.reasoning_tokens, 20);
         assert_eq!(total.cost_micros, 2468);
+    }
+
+    /// Conversation-rewind seals are append-only; the latest seal for a stream is the active one.
+    #[tokio::test]
+    async fn journal_seal_round_trips_latest_active() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let stream = JournalStreamId::session(&SessionId::new("rw"));
+        assert!(store.active_journal_seal(&stream).await.is_none());
+
+        store
+            .record_journal_seal(
+                &stream,
+                JournalSeal {
+                    seal_cursor: 10,
+                    retained_turns: 2,
+                    epoch: 1,
+                    recorded_unix: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_journal_seal(
+                &stream,
+                JournalSeal {
+                    seal_cursor: 25,
+                    retained_turns: 1,
+                    epoch: 2,
+                    recorded_unix: 200,
+                },
+            )
+            .await
+            .unwrap();
+
+        let active = store.active_journal_seal(&stream).await.expect("seal");
+        assert_eq!(active.seal_cursor, 25);
+        assert_eq!(active.retained_turns, 1);
+        assert_eq!(active.epoch, 2);
+        // A different stream has no seal.
+        let other = JournalStreamId::session(&SessionId::new("other"));
+        assert!(store.active_journal_seal(&other).await.is_none());
     }
 }

@@ -385,7 +385,14 @@ impl WireVersion {
     /// surface — `Curator{List,Pin,Unpin,Archive,Restore,Run}` -> `ApiResponse::CuratorSkills` /
     /// `CuratorRun`, with `CuratorEntry`/`CuratorChange` views over the `SkillUsage`/`SkillState`
     /// lifecycle (stale/archive/reactivate, pin-protect, agent-created provenance).
-    pub const CURRENT: Self = Self(12);
+    ///
+    /// v13 (conversation rewind): adds the conversation-rewind primitive — the submit-path
+    /// `AgentCommand::RewindTo { anchor, request_id }` (with `RewindAnchor` = user-turn / reply-after
+    /// ordinal or durable journal cursor) and the `AgentEvent::Rewound { to_cursor, epoch }` event,
+    /// both riding the existing `Submit` / event stream (no new op). Seals the durable journal at the
+    /// rewound cursor (`JournalPageView::sealed_after`) and marks `daemon-core` sessions
+    /// `SessionInfo::rewindable` (foreign ACP sessions report `false`).
+    pub const CURRENT: Self = Self(13);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

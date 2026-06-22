@@ -343,6 +343,25 @@ pub struct JournalPage {
     pub head_cursor: u64,
 }
 
+/// An append-only conversation-rewind seal recorded against a journal stream (conversation-rewind
+/// spec §6). The journal stays a complete audit log; the seal marks that a rewind occurred at
+/// `seal_cursor` (the stream head at rewind time) retaining `retained_turns` conversation turns, so
+/// `session_history` can surface the boundary (`JournalPageView::sealed_after`) and a reconnecting
+/// client reconciles against the engine's truncated conversation (the authoritative `Snapshot`/
+/// `ConvView`). The latest seal for a stream is the active one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalSeal {
+    /// The stream head cursor at the moment of the rewind: everything already journaled belongs to
+    /// the pre-rewind audit history.
+    pub seal_cursor: u64,
+    /// The number of conversation turns the engine retained (turns `[0, retained_turns)` survive).
+    pub retained_turns: u64,
+    /// The incarnation epoch the rewind bumped to (fences stale commits/events).
+    pub epoch: u64,
+    /// Unix seconds when the seal was recorded.
+    pub recorded_unix: u64,
+}
+
 /// A crash boundary the in-memory store can be armed to fail at, for acceptance test #2.
 ///
 /// These model the durable boundaries enumerated in `rust-substrate-evaluation.md` §6 test #2.
@@ -605,6 +624,22 @@ pub trait SessionStore: Send + Sync {
     ) -> JournalPage {
         JournalPage::default()
     }
+
+    /// Record an append-only conversation-rewind seal against `stream` (conversation-rewind spec §6).
+    /// Default no-op for stores without a verifiable journal.
+    async fn record_journal_seal(
+        &self,
+        _stream: &JournalStreamId,
+        _seal: JournalSeal,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The active (latest) conversation-rewind seal for `stream`, if any. Surfaced by
+    /// `session_history` as `JournalPageView::sealed_after`. Default `None`.
+    async fn active_journal_seal(&self, _stream: &JournalStreamId) -> Option<JournalSeal> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +683,8 @@ struct Inner {
     journal_roots: HashMap<(JournalStreamId, u64), CommittedRoot>,
     /// Stream-monotonic cursor allocator (the pagination key for `load_journal`).
     journal_cursor: u64,
+    /// Append-only conversation-rewind seals per stream, in record order (the latest is active).
+    journal_seals: HashMap<JournalStreamId, Vec<JournalSeal>>,
 }
 
 /// In-memory [`SessionStore`] backend. The default backend for phase 1 and the conformance harness.
@@ -1238,6 +1275,30 @@ impl SessionStore for InMemoryStore {
             head_cursor,
         }
     }
+
+    async fn record_journal_seal(
+        &self,
+        stream: &JournalStreamId,
+        seal: JournalSeal,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .journal_seals
+            .entry(stream.clone())
+            .or_default()
+            .push(seal);
+        Ok(())
+    }
+
+    async fn active_journal_seal(&self, stream: &JournalStreamId) -> Option<JournalSeal> {
+        self.inner
+            .lock()
+            .unwrap()
+            .journal_seals
+            .get(stream)
+            .and_then(|seals| seals.last().copied())
+    }
 }
 
 #[cfg(test)]
@@ -1264,6 +1325,37 @@ mod journal_tests {
             .unwrap();
         let fence = store.acquire_activation_lease(&id).await.unwrap();
         (store, id, fence)
+    }
+
+    /// Conversation-rewind seals are append-only; the latest seal for a stream is the active one and
+    /// other streams are unaffected (conversation-rewind spec §6).
+    #[tokio::test]
+    async fn journal_seal_round_trips_latest_active() {
+        let store = InMemoryStore::new();
+        let stream = JournalStreamId::session(&SessionId::new("rw"));
+        assert!(store.active_journal_seal(&stream).await.is_none());
+
+        for (cursor, retained, epoch, ts) in [(10u64, 2u64, 1u64, 100u64), (25, 1, 2, 200)] {
+            store
+                .record_journal_seal(
+                    &stream,
+                    JournalSeal {
+                        seal_cursor: cursor,
+                        retained_turns: retained,
+                        epoch,
+                        recorded_unix: ts,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let active = store.active_journal_seal(&stream).await.expect("seal");
+        assert_eq!(active.seal_cursor, 25);
+        assert_eq!(active.retained_turns, 1);
+        assert_eq!(active.epoch, 2);
+        let other = JournalStreamId::session(&SessionId::new("other"));
+        assert!(store.active_journal_seal(&other).await.is_none());
     }
 
     #[tokio::test]

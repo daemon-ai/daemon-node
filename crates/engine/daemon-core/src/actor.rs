@@ -13,14 +13,14 @@
 //! [`TurnTrigger::Steer`] turn, and a second `StartTurn` while busy is queued.
 
 use crate::control::{SteerReq, TurnControl};
-use crate::engine::{Engine, TurnOutcome};
+use crate::engine::{Engine, RewindError, RewindOutcome, TurnOutcome};
 use crate::events::SessionLog;
 use crate::provider::Provider;
 use crate::Failure;
 use daemon_common::ReqId;
 use daemon_protocol::{
     AgentCommand, AgentEvent, Disposition, EndReason, HostRequestHandler, Origin, OriginScope,
-    SessionLogEntry, SessionPayload, TransportId, TurnSummary, UserMsg,
+    RewindAnchor, SessionLogEntry, SessionPayload, TransportId, TurnSummary, UserMsg,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,6 +67,15 @@ enum ActorMsg {
         reason: Option<String>,
         origin: Origin,
     },
+    /// Rewind the conversation to `anchor` (conversation-rewind spec): interrupt any live turn, then
+    /// truncate + reconstruct + bump epoch + emit `Rewound`. The reply carries the resolved outcome
+    /// (or the rewind error) so the caller can drive the durable journal seal.
+    RewindTo {
+        anchor: RewindAnchor,
+        request_id: ReqId,
+        origin: Origin,
+        reply: oneshot::Sender<Result<RewindOutcome, RewindError>>,
+    },
     /// Live per-session model switch: swap the engine's provider. Applied at a turn boundary so an
     /// in-flight turn's prompt cache is never invalidated mid-conversation.
     SetProvider {
@@ -92,6 +101,7 @@ impl ActorMsg {
             | ActorMsg::Observe { origin, .. }
             | ActorMsg::Snapshot { origin, .. }
             | ActorMsg::Interrupt { origin, .. }
+            | ActorMsg::RewindTo { origin, .. }
             | ActorMsg::SetProvider { origin, .. }
             | ActorMsg::SetApprovalPolicy { origin, .. }
             | ActorMsg::Shutdown { origin } => origin,
@@ -139,6 +149,15 @@ impl ActorMsg {
             ActorMsg::Interrupt { reason, .. } => (
                 SessionPayload::Command(AgentCommand::Interrupt {
                     reason: reason.clone(),
+                }),
+                Disposition::Transport,
+            ),
+            ActorMsg::RewindTo {
+                anchor, request_id, ..
+            } => (
+                SessionPayload::Command(AgentCommand::RewindTo {
+                    anchor: anchor.clone(),
+                    request_id: *request_id,
                 }),
                 Disposition::Transport,
             ),
@@ -221,6 +240,40 @@ impl AgentHandle {
                 origin: local_origin(),
             })
             .await;
+    }
+
+    /// Rewind the conversation to `anchor` attributed to `origin` (conversation-rewind spec). Any
+    /// live turn is interrupted first, then the conversation is truncated/reconstructed, the epoch is
+    /// bumped, and `Rewound` is emitted on the event stream. Awaits the resolved [`RewindOutcome`].
+    pub async fn rewind_to_from(
+        &self,
+        origin: Origin,
+        request_id: ReqId,
+        anchor: RewindAnchor,
+    ) -> Result<RewindOutcome, Failure> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorMsg::RewindTo {
+                anchor,
+                request_id,
+                origin,
+                reply,
+            })
+            .await
+            .map_err(|_| Failure::Other("engine actor is gone".into()))?;
+        rx.await
+            .map_err(|_| Failure::Other("engine actor dropped the reply".into()))?
+            .map_err(|e| Failure::Other(e.to_string()))
+    }
+
+    /// Rewind the conversation to `anchor` (untagged local origin).
+    pub async fn rewind_to(
+        &self,
+        request_id: ReqId,
+        anchor: RewindAnchor,
+    ) -> Result<RewindOutcome, Failure> {
+        self.rewind_to_from(local_origin(), request_id, anchor)
+            .await
     }
 
     /// Inject steering text attributed to `origin`.
@@ -358,6 +411,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
         // A live edit-approval mode switch requested while a turn was running (or while idle):
         // applied at the turn boundary alongside the provider switch.
         let mut pending_policy: Option<crate::approval::ApprovalPolicy> = None;
+        // A rewind requested while a turn was running: the turn is cancelled (interrupt-first) and the
+        // rewind is applied here at the boundary, once the abandoned turn has released `&mut engine`.
+        type PendingRewind = (RewindAnchor, ReqId, oneshot::Sender<Result<RewindOutcome, RewindError>>);
+        let mut pending_rewind: Option<PendingRewind> = None;
         let mut shutting_down = false;
 
         loop {
@@ -422,6 +479,16 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                     ActorMsg::Snapshot { request_id, .. } => control.push_snapshot(request_id),
                     // Idle: there is no in-flight turn to interrupt.
                     ActorMsg::Interrupt { .. } => {}
+                    // Idle: no live turn to interrupt, so rewind immediately.
+                    ActorMsg::RewindTo {
+                        anchor,
+                        request_id,
+                        reply,
+                        ..
+                    } => {
+                        let outcome = engine.rewind_to(&anchor, request_id, &sink);
+                        let _ = reply.send(outcome);
+                    }
                     ActorMsg::SetProvider { provider, .. } => {
                         pending_provider = Some(provider);
                     }
@@ -445,6 +512,20 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                                 record_inbound(&sink, &msg);
                                 match msg {
                                     ActorMsg::Interrupt { .. } => control.cancel(),
+                                    // Interrupt-first: cancel the live turn and stash the rewind; it is
+                                    // applied at the boundary below once the turn releases `&mut engine`.
+                                    ActorMsg::RewindTo {
+                                        anchor,
+                                        request_id,
+                                        reply,
+                                        ..
+                                    } => {
+                                        control.cancel();
+                                        if let Some((.., stale)) = pending_rewind.replace((anchor, request_id, reply)) {
+                                            // Supersede an earlier un-applied rewind; its caller errors out.
+                                            drop(stale);
+                                        }
+                                    }
                                     ActorMsg::Steer { request_id, text, .. } => {
                                         control.push_steer(SteerReq { request_id, text });
                                     }
@@ -482,6 +563,12 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
 
             if let Some(reply) = reply_slot {
                 let _ = reply.send(summary);
+            }
+            // Apply a rewind requested mid-turn: the abandoned turn has now released `&mut engine`, so
+            // truncate/reconstruct/bump-epoch/emit-Rewound here at the boundary (interrupt-first done).
+            if let Some((anchor, request_id, reply)) = pending_rewind.take() {
+                let outcome = engine.rewind_to(&anchor, request_id, &sink);
+                let _ = reply.send(outcome);
             }
             // Fresh cancellation token for the next turn.
             control.reset();
@@ -724,6 +811,55 @@ mod tests {
             .await;
 
         assert_eq!(turn_text(&handle, &mut rx).await, "second");
+        handle.shutdown().await;
+    }
+
+    /// `RewindTo` while a turn is live interrupts it first, then truncates: the abandoned turn
+    /// finalizes as `Interrupted` and `Rewound` is emitted only after, so no abandoned-turn event
+    /// races the truncation (conversation-rewind spec §4 interrupt-first).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rewind_while_busy_interrupts_first() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WaitForCancelTool));
+        let engine = Engine::fresh(
+            SessionId::new("rewind-busy"),
+            SystemPrompt::new("test"),
+            Arc::new(MockProvider::delegating("wait", "done")),
+            Arc::new(registry),
+        );
+        let handle = spawn_agent_session(engine, Arc::new(NoopHost));
+        let mut rx = handle.subscribe();
+
+        let driver = handle.clone();
+        tokio::spawn(async move {
+            let _ = driver.start_turn(UserMsg::new("hi")).await;
+        });
+
+        // Hold the turn genuinely in flight (the tool blocks until cancelled), then rewind.
+        recv_until(&mut rx, |e| matches!(e, AgentEvent::ToolStarted { .. })).await;
+        let rewinder = handle.clone();
+        let rewound = tokio::spawn(async move {
+            rewinder
+                .rewind_to(ReqId(9), RewindAnchor::UserTurn { ordinal: 0 })
+                .await
+        });
+
+        // The live turn finalizes as Interrupted before the conversation is truncated.
+        let finished = recv_until(&mut rx, |e| matches!(e, AgentEvent::TurnFinished { .. })).await;
+        assert!(matches!(
+            finished,
+            AgentEvent::TurnFinished { summary, .. } if summary.end_reason == EndReason::Interrupted
+        ));
+
+        // Rewound is emitted after the interrupt, retaining zero turns (rewound to the first user).
+        let ev = recv_until(&mut rx, |e| matches!(e, AgentEvent::Rewound { .. })).await;
+        assert!(matches!(
+            ev,
+            AgentEvent::Rewound { to_cursor, request_id, .. } if to_cursor == 0 && request_id == ReqId(9)
+        ));
+
+        let outcome = rewound.await.unwrap().expect("rewind resolves");
+        assert_eq!(outcome.retained_turns, 0);
         handle.shutdown().await;
     }
 }

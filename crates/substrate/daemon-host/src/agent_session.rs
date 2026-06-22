@@ -67,6 +67,16 @@ pub trait AgentSession: Send + Sync {
 
     /// Subscribe to the lossless-primary §17 event stream.
     fn subscribe(&self) -> broadcast::Receiver<AgentEvent>;
+
+    /// Whether this session supports conversation rewind (`AgentCommand::RewindTo`). `true` for the
+    /// in-tree daemon-core engine (the daemon owns the conversation state and can truncate it);
+    /// `false` for a foreign backend (e.g. ACP) whose protocol has no truncate-at-anchor primitive
+    /// and which owns its own conversation state. Surfaced to clients as `SessionInfo::rewindable` so
+    /// a GUI/TUI hides rewind for non-rewindable sessions instead of issuing a command that is
+    /// dropped. Defaults to `true` (the common in-process case).
+    fn rewindable(&self) -> bool {
+        true
+    }
 }
 
 /// An engine (in-process or foreign) presented to its supervisor as a `UnitKind::Engine`
@@ -145,6 +155,13 @@ impl AgentUnit {
             last_work,
             outbound,
         }
+    }
+
+    /// Whether the underlying session supports conversation rewind (`AgentCommand::RewindTo`): `true`
+    /// for the in-tree daemon-core engine, `false` for a foreign backend (e.g. ACP). Surfaced to
+    /// clients so a GUI/TUI hides rewind for non-rewindable units (conversation-rewind spec).
+    pub fn rewindable(&self) -> bool {
+        self.session.rewindable()
     }
 }
 

@@ -55,7 +55,10 @@ pub use conversation::{
 };
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use embed::{cosine, EmbeddingProvider, MockEmbedder};
-pub use engine::{Completion, Engine, Suspension, TurnOutcome, APPROVAL_SUSPEND_PAYLOAD};
+pub use engine::{
+    Completion, Engine, RewindError, RewindOutcome, Suspension, TurnOutcome,
+    APPROVAL_SUSPEND_PAYLOAD,
+};
 pub use events::{EventSink, SessionLog};
 pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
 pub use memory::{

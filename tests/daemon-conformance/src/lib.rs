@@ -4813,6 +4813,113 @@ mod node_interface {
         handle.shutdown().await;
     }
 
+    /// Conversation rewind (conversation-rewind spec) end-to-end over the node surface: a
+    /// `daemon-core` session is rewindable, `RewindTo` emits `Rewound`, the durable journal records
+    /// the seal (`JournalPageView::sealed_after`), and a follow-up `StartTurn` re-runs from the anchor.
+    #[tokio::test]
+    async fn rewind_to_seals_history_and_reruns_over_node() {
+        use daemon_api::{ControlApi, SessionApi};
+        use daemon_common::ReqId;
+        use daemon_protocol::{AgentCommand, AgentEvent, Outbound, RewindAnchor, UserMsg};
+
+        async fn drive_to_finished(node: &Arc<NodeApiImpl>, session: &SessionId) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let drained = node.poll(session.clone(), 0).await.expect("poll");
+                if drained
+                    .iter()
+                    .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("the turn never reached TurnFinished");
+        }
+
+        let (node, handle) = assemble();
+        let session = SessionId::new("rewind-1");
+
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hello"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit StartTurn");
+        drive_to_finished(&node, &session).await;
+
+        // A daemon-core session advertises itself as rewindable (durable store sessions are all
+        // daemon-core-backed). A purely-live session may not be in the durable list yet; when it is,
+        // it must report `rewindable = true`.
+        if let Some(info) = node
+            .sessions()
+            .await
+            .into_iter()
+            .find(|s| s.session == session)
+        {
+            assert!(info.rewindable, "daemon-core sessions must be rewindable");
+        }
+
+        // Rewind to the first user turn; the engine emits `Rewound { to_cursor: 0 }`.
+        node.submit(
+            session.clone(),
+            AgentCommand::RewindTo {
+                anchor: RewindAnchor::UserTurn { ordinal: 0 },
+                request_id: ReqId(2),
+            },
+        )
+        .await
+        .expect("submit RewindTo");
+
+        let mut rewound = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let drained = node.poll(session.clone(), 0).await.expect("poll");
+            if let Some(ev) = drained.iter().find_map(|o| match o {
+                Outbound::Event(AgentEvent::Rewound { to_cursor, epoch, .. }) => {
+                    Some((*to_cursor, *epoch))
+                }
+                _ => None,
+            }) {
+                rewound = Some(ev);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (to_cursor, _epoch) = rewound.expect("Rewound event observed");
+        assert_eq!(to_cursor, 0, "rewound to the first user turn");
+
+        // The durable journal records the seal so a reconnecting client sees the boundary.
+        let mut sealed = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let page = node.session_history(session.clone(), 0, 0).await;
+            if page.sealed_after.is_some() {
+                sealed = page.sealed_after;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(sealed.is_some(), "session_history must flag the rewind seal");
+
+        // A follow-up StartTurn replays from the rewound point (the engine is idle and accepts it).
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("again"),
+                request_id: ReqId(3),
+            },
+        )
+        .await
+        .expect("submit StartTurn after rewind");
+        drive_to_finished(&node, &session).await;
+
+        handle.shutdown().await;
+    }
+
     /// A provider registry whose session default is a deterministic [`ScriptedProvider`] that drives
     /// the real ReAct loop: write a file, read it back, run a command, then finish. Orchestrator /
     /// child slots are completing mocks (unused by this leaf-work scenario, but the composition root

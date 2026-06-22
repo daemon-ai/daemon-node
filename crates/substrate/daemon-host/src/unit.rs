@@ -39,6 +39,12 @@ impl AgentSession for LiveAgentSession {
             }
             AgentCommand::Snapshot { request_id } => self.handle.snapshot(request_id).await,
             AgentCommand::Interrupt { reason } => self.handle.interrupt(reason).await,
+            // Conversation rewind on the managed daemon-core path: truncate + reconstruct + emit
+            // `Rewound` (the durable journal seal / workspace rollback is driven by the live-session
+            // layer; the managed/fleet path applies the engine-level rewind best-effort).
+            AgentCommand::RewindTo { anchor, request_id } => {
+                let _ = self.handle.rewind_to(request_id, anchor).await;
+            }
             AgentCommand::Shutdown => self.handle.shutdown().await,
             _ => {}
         }
