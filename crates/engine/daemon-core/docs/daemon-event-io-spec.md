@@ -778,6 +778,18 @@ assembly (`RoutingRegistry::bind_instances_from_profiles`); an explicit config i
 over a profile-declared one. `credential_ref` names the opaque account session blob in the
 `CredentialStore` (the system of record), consumed by a live transport (M2/M3) to restore the client.
 
+**Landed (the read side — account provisioning):** the host exposes an **in-process**
+`AccountProvisioning` seam (beside `DeliveryHost`, a live handle on `NodeApiImpl`, *not* a wire op)
+that turns the stored `bound_accounts` + `CredentialStore` blobs into the least-privilege surface a
+chat-transport adapter's bring-up consumes: `bound_accounts(transport_family)` enumerates every
+account of a family (the segment before the first `/`, so `"matrix"` matches `matrix/@a:hs` /
+`matrix/@b:hs` but not `slack/…`) across all profiles, returning `ProvisionedAccount { profile,
+transport_instance, credential_ref }`; `account_credential(credential_ref)` resolves the *full*
+blob (in-process only — it never crosses the wire, where `credential_list` stays redacted); and
+`store_account_credential(credential_ref, blob)` is the token-refresh write-back. Enumeration is
+deliberately separate from secret resolution (least-privilege): listing accounts touches no secrets.
+Returning a secret, it carries no `WireVersion`/CDDL change.
+
 ---
 
 ## 6. Recommended dependency crates

@@ -3118,6 +3118,124 @@ mod node_interface {
         handle.shutdown().await;
     }
 
+    /// FOUNDATION (account provisioning, daemon-event-io-spec §5.9.4 — the M2 bring-up seam): the
+    /// host exposes an in-process [`AccountProvisioning`] surface so a chat-transport adapter can
+    /// (a) enumerate the accounts it owns across every profile, by transport *family*; (b) resolve
+    /// each account's full credential blob in-process (the secret that never crosses the wire); and
+    /// (c) write back a refreshed blob (the token-refresh seam). Proves, with no chat transport:
+    /// (1) `bound_accounts("matrix")` returns exactly the two `matrix/...` accounts (right
+    /// profile/instance/credential_ref) and excludes the `slack/...` one (family-prefix matching);
+    /// (2) `account_credential(ref)` returns the opaque blob while the wire `credential_list` still
+    /// lists it redacted (enumeration vs. secret are least-privilege separate); (3)
+    /// `store_account_credential(ref, refreshed)` updates the store and `account_credential` reflects
+    /// the refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_provisioning_enumerates_resolves_and_refreshes() {
+        use daemon_api::{BoundAccount, CredentialApi, ProfileSpec, ProviderSelector};
+        use daemon_host::{AccountProvisioning, MemCredentialStore, MemProfileStore, ProfileStore};
+        use daemon_protocol::TransportId;
+
+        // alpha owns one matrix account; beta owns a second matrix account AND a slack account. The
+        // credential_ref of each names where its opaque session blob lives in the CredentialStore.
+        let store = Arc::new(MemProfileStore::new());
+        store
+            .create(
+                ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a").with_bound_accounts(
+                    vec![BoundAccount::new("matrix/@a:hs", "matrix/alpha/a")],
+                ),
+            )
+            .expect("create alpha");
+        store
+            .create(
+                ProfileSpec::new("beta", ProviderSelector::GenAi, "model-b").with_bound_accounts(
+                    vec![
+                        BoundAccount::new("matrix/@b:hs", "matrix/beta/b"),
+                        BoundAccount::new("slack/T0/@bot", "slack/beta/bot"),
+                    ],
+                ),
+            )
+            .expect("create beta");
+        store.set_active("alpha").expect("set active");
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("alpha"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x55; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: Some(store),
+            provider_resolver: None,
+            credential_store: Some(Arc::new(MemCredentialStore::new())),
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            routing: None,
+            checkpoints: None,
+        });
+
+        // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.
+        let mut matrix = node.bound_accounts("matrix");
+        matrix.sort_by(|a, b| a.transport_instance.as_str().cmp(b.transport_instance.as_str()));
+        assert_eq!(matrix.len(), 2, "two matrix accounts, slack excluded: {matrix:?}");
+        assert_eq!(matrix[0].profile, ProfileRef::new("alpha"));
+        assert_eq!(matrix[0].transport_instance, TransportId::new("matrix/@a:hs"));
+        assert_eq!(matrix[0].credential_ref, "matrix/alpha/a");
+        assert_eq!(matrix[1].profile, ProfileRef::new("beta"));
+        assert_eq!(matrix[1].transport_instance, TransportId::new("matrix/@b:hs"));
+        assert_eq!(matrix[1].credential_ref, "matrix/beta/b");
+        assert_eq!(
+            node.bound_accounts("slack").len(),
+            1,
+            "the slack family enumerates only its own account"
+        );
+
+        // 2. Resolve a blob in-process; the wire credential_list still hides it.
+        node.credential_set("matrix/alpha/a".into(), "mxsession-blob-7f3c".into())
+            .await
+            .expect("store the opaque account session blob");
+        assert_eq!(
+            node.account_credential("matrix/alpha/a").as_deref(),
+            Some("mxsession-blob-7f3c"),
+            "the in-process seam resolves the full blob"
+        );
+        assert!(
+            node.account_credential("matrix/does-not-exist").is_none(),
+            "an unknown credential_ref resolves to None"
+        );
+        let listed = node.credential_list().await;
+        let acct = listed
+            .iter()
+            .find(|c| c.profile == "matrix/alpha/a")
+            .expect("the blob is listed under its credential ref");
+        assert!(acct.present);
+        assert_eq!(
+            acct.hint, "…7f3c",
+            "the wire surface stays redacted — the secret never crosses it"
+        );
+
+        // 3. Write-back: a refreshed blob updates the store and is reflected on the next resolve.
+        node.store_account_credential("matrix/alpha/a", "mxsession-blob-REFRESHED")
+            .expect("write back the refreshed credential");
+        assert_eq!(
+            node.account_credential("matrix/alpha/a").as_deref(),
+            Some("mxsession-blob-REFRESHED"),
+            "account_credential reflects the token-refresh write-back"
+        );
+
+        handle.shutdown().await;
+    }
+
     /// FOUNDATION (outbound delivery, daemon-event-io-spec §5.9.3 — the in-process PUSH half): the
     /// host's per-session pump resolves each session's *current* `Primary` and pushes its outbound
     /// entries to the registered [`DeliverySink`] owning that transport. Proves, with no chat

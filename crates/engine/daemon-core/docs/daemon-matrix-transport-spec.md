@@ -256,8 +256,16 @@ store (§6.3).
   `credential_ref` names the session blob below. The host derives the routing registry's
   `instance_profiles` baseline (precedence step 2) from every profile's `bound_accounts` at assembly
   (`RoutingRegistry::bind_instances_from_profiles`); an explicit config instance binding overrides it.
-  A profile owns 1..N accounts; the adapter (M3) discovers them by scanning profiles' `bound_accounts`
-  and brings up one `Client` per account.
+  A profile owns 1..N accounts.
+- **Bring-up seam — landed (`AccountProvisioning`).** M2/M3 account bring-up does **not** scan
+  profiles or hold the raw `CredentialStore` itself; it consumes the host's in-process
+  `AccountProvisioning` seam ([`daemon-host`](../../../substrate/daemon-host/src/node_api.rs), beside
+  `DeliveryHost`): `bound_accounts("matrix")` enumerates every `matrix/...` account across profiles
+  (returning `ProvisionedAccount { profile, transport_instance, credential_ref }`), the adapter
+  brings up one `Client` per account, `account_credential(credential_ref)` restores its session blob
+  (in-process; the secret never crosses the wire), and the `set_session_callback` write-back persists
+  refreshes via `store_account_credential`. Enumeration is least-privilege-separate from secret
+  resolution. No wire/CDDL change — it returns secrets, so it stays in-process.
 
 ### 6.3 E2EE store stays matrix-sdk-owned (NOT in the credential store)
 
@@ -359,11 +367,14 @@ whole point of the merged-log paradigm.
   precedence step 2); and the **outbound delivery foundation** (§5.9.3 made reusable):
   `delivery_sessions` owned-session discovery (wire v10), the in-process `DeliverySink` push pump
   (`daemon_host::DeliveryHost`), and the reusable `daemon-delivery` pull subscriber (the M3/M4 outbound
-  substrate this adapter plugs its `Projector` into). All testable without Matrix.
+  substrate this adapter plugs its `Projector` into); and the **account provisioning seam** (§6.2):
+  the in-process `daemon_host::AccountProvisioning` (enumerate accounts by family + resolve/write-back
+  credential blobs) the M2/M3 bring-up consumes. All testable without Matrix.
 - **M2 — `daemon-matrix` skeleton + per-account `login`.** SSO writes the session into `CredentialStore`
-  under the profile's Matrix credential-ref; the adapter restores from there and opens the per-account
-  E2EE store; refresh write-back. Feasibility proof.
-- **M3 — inbound projection.** Enumerate credential-bound accounts per profile; SyncService/Timeline →
+  via `AccountProvisioning::store_account_credential` under the account's credential-ref; the adapter
+  restores from there (`account_credential`) and opens the per-account E2EE store; refresh write-back.
+  Feasibility proof.
+- **M3 — inbound projection.** Enumerate credential-bound accounts per profile (`bound_accounts("matrix")`); SyncService/Timeline →
   router (account→profile default + room override) → `submit_from`; mention/busy policy; final-text
   reply to the per-account `Primary`.
 - **M4 — outbound richness.** Outbound delivery via the `daemon-delivery` subscriber (or an in-process
