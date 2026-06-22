@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 5)
+wire_version = uint                 ; daemon-common WireVersion (current = 6)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id = tstr
@@ -346,6 +346,8 @@ gguf-info = {
 ; `origin` is additive on the v2 wire: absent (old encodings) or null -> the host-local default;
 ; a value routes through `submit_from` so per-event attribution is recorded on the merged log.
 api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null) } }
+            ; routing (wire v6): submit by origin; the host resolves session + profile + delivery -> Routed
+            / { "SubmitRouted": { origin: origin, command: agent-command } }
             / { "Poll": { session: session-id, max: uint } }
             / { "Respond": { session: session-id, response: host-response } }
             / "Health"
@@ -390,6 +392,7 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "ModelInspect": { id: model-id } }
 
 api-response = "Ok"
+             / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v6)
              / { "Drained": [* outbound] }
              / { "Health": health-report }
              / { "Stats": stats-report }

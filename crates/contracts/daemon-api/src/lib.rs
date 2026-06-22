@@ -26,7 +26,10 @@ use daemon_common::{
     ModelRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage, SearchQuery, SessionId,
     UnitId, UsageDelta, WireVersion,
 };
-use daemon_protocol::{AgentCommand, DeliveryTarget, HostResponse, Origin, TranscriptBlock};
+use daemon_protocol::{
+    session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
+    TranscriptBlock,
+};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -112,6 +115,25 @@ pub trait SessionApi: Send + Sync {
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         self.submit(session, command).await
+    }
+
+    /// Submit a command by handing the host only an [`Origin`] (no caller-chosen `SessionId`): the
+    /// host's routing capability (daemon-event-io-spec §5.9) resolves the origin to a session, the
+    /// profile that runs it, and where its replies post, then opens/binds the session and submits.
+    /// Returns the derived [`SessionId`] so the caller can `subscribe`/`poll` it. This is the seam a
+    /// chat transport (or any multi-tenant surface) uses instead of deriving the id itself.
+    ///
+    /// Default (a host with no routing registry): derive the id with [`IsolationPolicy::PerThread`]
+    /// and delegate to [`Self::submit_from`], so a transport gets correct naming + attribution even
+    /// before the host opts into agent-selection routing.
+    async fn submit_routed(
+        &self,
+        origin: Origin,
+        command: AgentCommand,
+    ) -> Result<SessionId, ApiError> {
+        let session = session_id_for(&origin, IsolationPolicy::PerThread);
+        self.submit_from(session.clone(), origin, command).await?;
+        Ok(session)
     }
 
     /// Drain up to `max` outbound items (events + raised host requests) for `session`.
@@ -766,6 +788,14 @@ pub enum ApiRequest {
         #[serde(default)]
         origin: Option<Origin>,
     },
+    /// [`SessionApi::submit_routed`]: submit by [`Origin`] and let the host's routing capability pick
+    /// the session + profile + delivery. The reply is [`ApiResponse::Routed`] carrying the session.
+    SubmitRouted {
+        /// The inbound origin to route.
+        origin: Origin,
+        /// The §17 command.
+        command: AgentCommand,
+    },
     /// [`SessionApi::poll`].
     Poll {
         /// Target session.
@@ -1071,6 +1101,11 @@ pub enum ApiRequest {
 pub enum ApiResponse {
     /// A successful unit reply (submit/respond/assign/cancel).
     Ok,
+    /// The session a routed submit ([`ApiRequest::SubmitRouted`]) resolved to and opened.
+    Routed {
+        /// The derived session id (subscribe/poll it for the reply).
+        session: SessionId,
+    },
     /// Drained outbound items (poll).
     Drained(Vec<Outbound>),
     /// A health report.
@@ -1173,6 +1208,12 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             Some(origin) => unit_or_err(api.submit_from(session, origin, command).await),
             None => unit_or_err(api.submit(session, command).await),
         },
+        ApiRequest::SubmitRouted { origin, command } => {
+            match api.submit_routed(origin, command).await {
+                Ok(session) => ApiResponse::Routed { session },
+                Err(e) => ApiResponse::Error(e),
+            }
+        }
         ApiRequest::Poll { session, max } => match api.poll(session, max).await {
             Ok(items) => ApiResponse::Drained(items),
             Err(e) => ApiResponse::Error(e),
@@ -1342,6 +1383,7 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         },
         // Session variants were handled by `serve_session`.
         ApiRequest::Submit { .. }
+        | ApiRequest::SubmitRouted { .. }
         | ApiRequest::Poll { .. }
         | ApiRequest::Respond { .. }
         | ApiRequest::SessionHistory { .. }

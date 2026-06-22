@@ -344,7 +344,12 @@ impl WireVersion {
     /// v5 (runtime control): adds the live per-session model switch (`SetSessionModel`), the §12
     /// edit-approval session modes (`SetSessionMode` + `ApprovalMode`), and the durable HITL approval
     /// surface (`HostResponseBody::Deferred`, `ApprovalsPending`/`ApprovalDecide`, `ApprovalInfo`).
-    pub const CURRENT: Self = Self(5);
+    ///
+    /// v6 (routing): adds the host-routed submit (`SubmitRouted { origin, command }` ->
+    /// `ApiResponse::Routed { session }`), the seam a transport uses to hand the host an `Origin` and
+    /// let the §5.9 routing capability resolve the session + profile + delivery (rather than deriving
+    /// the `SessionId` itself).
+    pub const CURRENT: Self = Self(6);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

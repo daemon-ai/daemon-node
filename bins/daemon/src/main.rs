@@ -32,8 +32,10 @@ use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
     CloudCatalog, CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit,
     FileCredentialStore, FileProfileStore, HostConfig, JournalFeeder, JournalSink,
-    MemCredentialStore, MemProfileStore, OwnerBroker, PooledStoreCredentialSource, ProfileStore,
+    MemCredentialStore, MemProfileStore, OriginMatcher, OwnerBroker, PooledStoreCredentialSource,
+    ProfileStore, RoutingRegistry, ScopePattern, SessionBinding, TransportPattern,
 };
+use daemon_protocol::{IsolationPolicy, TransportId};
 use daemon_api::{
     BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileSpec,
     ProviderSelector,
@@ -62,7 +64,8 @@ use daemon_supervision::ManagedUnit;
 use daemon_transport::RemoteHost;
 
 use config::{
-    ContextEngineKind, EmbedKind, MemoryProviderKind, NodeConfig, ProviderKind, StoreBackend,
+    ContextEngineKind, EmbedKind, MemoryProviderKind, NodeConfig, ProviderKind, RoutingConfig,
+    StoreBackend,
 };
 
 /// The environment variable that selects the placed-child role.
@@ -1168,6 +1171,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         Arc::new(move |spec: &ProfileSpec| provider_builder_for(spec, &cfg, &manager, &active))
     };
 
+    let routing = build_routing_registry(&cfg.routing);
     let AssembledNode { node, handle, .. } = assemble(NodeAssembly {
         store,
         partition: cfg.partition,
@@ -1189,6 +1193,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         credential_store: Some(credential_store),
         cloud_catalog: Some(Arc::new(GenAiCloudCatalog)),
         prompt_sources,
+        routing,
     });
     tracing::info!("daemon host node started");
 
@@ -1225,6 +1230,54 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     handle.shutdown().await;
     let _ = std::fs::remove_file(&cfg.socket_path);
     Ok(())
+}
+
+/// Build the host routing registry (daemon-event-io-spec §5.9) from the resolved `[routing]` config,
+/// mapping the declarative rules onto `SessionBinding`s / instance bindings / the node default.
+/// Returns `None` when the table is empty, so the node installs no agent-selection routing (routed
+/// submits then use `PerThread` naming + the active default profile — the legacy behavior).
+fn build_routing_registry(cfg: &RoutingConfig) -> Option<RoutingRegistry> {
+    if cfg.is_empty() {
+        return None;
+    }
+    let mut reg = RoutingRegistry::new();
+    if let Some(profile) = &cfg.default_profile {
+        reg = reg.with_default_profile(ProfileRef::new(profile.clone()));
+    }
+    for ip in &cfg.instance_profiles {
+        reg = reg.bind_instance(
+            TransportId::new(ip.transport.clone()),
+            ProfileRef::new(ip.profile.clone()),
+        );
+    }
+    for rule in &cfg.routes {
+        let transport = match (&rule.transport, &rule.transport_family) {
+            (Some(t), _) => TransportPattern::Exact(TransportId::new(t.clone())),
+            (None, Some(f)) => TransportPattern::Family(f.clone()),
+            (None, None) => TransportPattern::Any,
+        };
+        let scope = match rule.scope.to_ascii_lowercase().as_str() {
+            "dm" => ScopePattern::Dm,
+            "group" => ScopePattern::Group {
+                chat_glob: rule.chat_glob.clone(),
+            },
+            "api" => ScopePattern::Api,
+            "internal" => ScopePattern::Internal,
+            _ => ScopePattern::Any,
+        };
+        let isolation = match rule.isolation.to_ascii_lowercase().as_str() {
+            "per_user" => IsolationPolicy::PerUser,
+            "per_chat" => IsolationPolicy::PerChat,
+            "shared" => IsolationPolicy::Shared,
+            _ => IsolationPolicy::PerThread,
+        };
+        let mut binding = SessionBinding::new(OriginMatcher { transport, scope }, isolation);
+        if let Some(profile) = &rule.profile {
+            binding = binding.with_profile(ProfileRef::new(profile.clone()));
+        }
+        reg = reg.with_binding(binding);
+    }
+    Some(reg)
 }
 
 /// Build the owner end of the credential brokering chain over the persisted credential store

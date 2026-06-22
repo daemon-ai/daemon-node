@@ -505,6 +505,58 @@ pub enum StoreBackend {
     },
 }
 
+/// A single declarative routing rule — the config surface of a `SessionBinding`
+/// (daemon-event-io-spec §5.9). Matches an inbound origin and selects session naming + an optional
+/// per-rule profile override.
+#[derive(Clone, Debug)]
+pub struct RouteRule {
+    /// Match this exact instance-qualified transport id (e.g. `matrix/@bot:hs.org`). Mutually
+    /// exclusive with [`RouteRule::transport_family`].
+    pub transport: Option<String>,
+    /// Match any instance of this transport family (the `family/...` prefix before the first `/`).
+    pub transport_family: Option<String>,
+    /// Scope kind to match: `dm` | `group` | `api` | `internal` | `any` (default `any`).
+    pub scope: String,
+    /// For `group` scope, the chat-handle `*`-glob (default `*`).
+    pub chat_glob: String,
+    /// The profile override for matched origins (precedence step 1); `None` falls through.
+    pub profile: Option<String>,
+    /// Isolation policy for naming: `per_user` | `per_chat` | `per_thread` | `shared` (default
+    /// `per_thread`).
+    pub isolation: String,
+}
+
+/// Binds a transport instance to a default profile — the account->profile baseline (§5.9 step 2).
+#[derive(Clone, Debug)]
+pub struct InstanceProfile {
+    /// The instance-qualified transport id.
+    pub transport: String,
+    /// The profile all of that instance's origins run under unless a route overrides.
+    pub profile: String,
+}
+
+/// The resolved `[routing]` config: the general host routing table (§5.9), consumed into a
+/// `daemon_host::RoutingRegistry` at assembly. Empty by default — routed submits then use
+/// `PerThread` naming + the node's active default profile (the legacy single-profile behavior).
+#[derive(Clone, Debug, Default)]
+pub struct RoutingConfig {
+    /// The node default profile for routed submits with no matching route/instance (step 3).
+    pub default_profile: Option<String>,
+    /// Per-instance default profiles (step 2).
+    pub instance_profiles: Vec<InstanceProfile>,
+    /// Ordered routing rules (first match wins).
+    pub routes: Vec<RouteRule>,
+}
+
+impl RoutingConfig {
+    /// Whether the table carries no routing information at all.
+    pub fn is_empty(&self) -> bool {
+        self.default_profile.is_none()
+            && self.instance_profiles.is_empty()
+            && self.routes.is_empty()
+    }
+}
+
 /// The resolved node configuration (TOML overlaid by env).
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -568,6 +620,9 @@ pub struct NodeConfig {
     /// How many orchestrator levels the top fleet materializes before its engine leaves. `0` (the
     /// default) is a flat fleet; `n` nests the management tree `n` deep (fleets-of-fleets).
     pub nesting_depth: usize,
+    /// The general host routing table (§5.9) consumed into the routing registry at assembly. Empty
+    /// by default (no agent-selection routing — routed submits use the active default profile).
+    pub routing: RoutingConfig,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -606,6 +661,36 @@ struct FileConfig {
     web: Option<FileWebConfig>,
     browser: Option<FileBrowserConfig>,
     skills: Option<FileSkillsConfig>,
+    routing: Option<FileRoutingConfig>,
+}
+
+/// The `[routing]` TOML table — the general host routing table (§5.9; every field optional).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileRoutingConfig {
+    default_profile: Option<String>,
+    instance_profile: Vec<FileInstanceProfile>,
+    route: Vec<FileRouteRule>,
+}
+
+/// A `[[routing.instance_profile]]` entry — bind a transport instance to a default profile.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileInstanceProfile {
+    transport: Option<String>,
+    profile: Option<String>,
+}
+
+/// A `[[routing.route]]` entry — one declarative routing rule.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileRouteRule {
+    transport: Option<String>,
+    transport_family: Option<String>,
+    scope: Option<String>,
+    chat_glob: Option<String>,
+    profile: Option<String>,
+    isolation: Option<String>,
 }
 
 /// The `[skills]` TOML table — skills-subsystem tuning (every field optional; env wins).
@@ -901,6 +986,7 @@ impl NodeConfig {
         let web = Self::resolve_web(file.web.unwrap_or_default());
         let browser = Self::resolve_browser(file.browser.unwrap_or_default())?;
         let skills = Self::resolve_skills(file.skills.unwrap_or_default())?;
+        let routing = Self::resolve_routing(file.routing.unwrap_or_default())?;
 
         Ok(Self {
             partition,
@@ -929,6 +1015,44 @@ impl NodeConfig {
             engine,
             journal_seed,
             nesting_depth,
+            routing,
+        })
+    }
+
+    /// Resolve the `[routing]` table into the general host routing config (§5.9). File-only (no env);
+    /// validates the `transport`/`transport_family` exclusivity and the required instance-profile
+    /// fields, leaving string->type mapping (patterns/isolation) to the assembly step in `main`.
+    fn resolve_routing(file: FileRoutingConfig) -> anyhow::Result<RoutingConfig> {
+        let mut instance_profiles = Vec::new();
+        for ip in file.instance_profile {
+            let transport = ip.transport.ok_or_else(|| {
+                anyhow::anyhow!("[[routing.instance_profile]] requires `transport`")
+            })?;
+            let profile = ip
+                .profile
+                .ok_or_else(|| anyhow::anyhow!("[[routing.instance_profile]] requires `profile`"))?;
+            instance_profiles.push(InstanceProfile { transport, profile });
+        }
+        let mut routes = Vec::new();
+        for r in file.route {
+            if r.transport.is_some() && r.transport_family.is_some() {
+                anyhow::bail!(
+                    "[[routing.route]] sets both `transport` and `transport_family` (pick one)"
+                );
+            }
+            routes.push(RouteRule {
+                transport: r.transport,
+                transport_family: r.transport_family,
+                scope: r.scope.unwrap_or_else(|| "any".to_string()),
+                chat_glob: r.chat_glob.unwrap_or_else(|| "*".to_string()),
+                profile: r.profile,
+                isolation: r.isolation.unwrap_or_else(|| "per_thread".to_string()),
+            });
+        }
+        Ok(RoutingConfig {
+            default_profile: file.default_profile,
+            instance_profiles,
+            routes,
         })
     }
 

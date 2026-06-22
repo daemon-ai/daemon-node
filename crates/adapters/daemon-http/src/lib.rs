@@ -31,6 +31,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daemon_api::{dispatch, ApiRequest, ApiResponse, LogStream, NodeApi};
 use daemon_common::SessionId;
+use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use tower_http::cors::CorsLayer;
@@ -57,9 +58,14 @@ struct CursorQuery {
 /// - `GET /sessions/{session}/log` — non-destructive cursor page of the merged log.
 /// - `GET /sessions/{session}/subscribe` — Server-Sent Events stream of the merged log.
 /// - `GET /sessions/{session}/ws` — WebSocket stream of the merged log.
+/// - `POST /tenants/{tenant}/submit` — a routed submit: the adapter maps the path tenant onto an
+///   `Origin` (`transport: http/{tenant}`, `scope: Api{ key: tenant }`) and lets the host's §5.9
+///   routing registry pick the session + profile + delivery. Demonstrates an external transport
+///   routing by its own principal without deriving the `SessionId` itself.
 pub fn router(api: Arc<dyn NodeApi>) -> Router {
     Router::new()
         .route("/api", post(api_dispatch))
+        .route("/tenants/{tenant}/submit", post(submit_routed_tenant))
         .route("/sessions/{session}/log", get(log_after))
         .route("/sessions/{session}/subscribe", get(subscribe_sse))
         .route("/sessions/{session}/ws", get(subscribe_ws))
@@ -84,6 +90,26 @@ async fn api_dispatch(
     Json(req): Json<ApiRequest>,
 ) -> Json<ApiResponse> {
     Json(dispatch(state.api.as_ref(), req).await)
+}
+
+/// `POST /tenants/{tenant}/submit` — a routed submit. The adapter derives the `Origin` from its own
+/// principal (the path `tenant` as an `Api` key on the `http/{tenant}` transport instance) and hands
+/// it to [`daemon_api::SessionApi::submit_routed`]; the host resolves the session + profile +
+/// delivery. Returns [`ApiResponse::Routed`] with the derived session, so the client can then open
+/// `…/subscribe` on the same surface to read the reply.
+async fn submit_routed_tenant(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+    Json(command): Json<AgentCommand>,
+) -> Json<ApiResponse> {
+    let origin = Origin::new(
+        TransportId::new(format!("http/{tenant}")),
+        OriginScope::Api { key: tenant },
+    );
+    match state.api.submit_routed(origin, command).await {
+        Ok(session) => Json(ApiResponse::Routed { session }),
+        Err(e) => Json(ApiResponse::Error(e)),
+    }
 }
 
 /// `GET /sessions/{session}/log` — the one-shot/long-poll cursor read of the merged session event

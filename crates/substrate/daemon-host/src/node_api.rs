@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
+use crate::routing::RoutingRegistry;
 use daemon_api::{
     ApiError, ApprovalInfo, ConfigPatch, ConfigSchema, ControlApi, CredentialApi, CredentialInfo,
     FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView,
@@ -30,8 +31,8 @@ use daemon_api::{
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
-    ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, QuantRecommendation, QuantizeId,
-    QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
+    ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, ProfileRef, QuantRecommendation,
+    QuantizeId, QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
 };
 use daemon_core::{spawn_agent_session, AgentHandle, Engine, Provider, Snapshot};
 use daemon_models::{ModelError, ModelManager};
@@ -72,8 +73,10 @@ fn api_origin() -> Origin {
 }
 
 /// Builds a fresh live [`Engine`] for an interactive session id (the session sub-surface's engine
-/// seam — the binary supplies the provider/tools/system).
-pub type SessionEngineBuilder = Arc<dyn Fn(SessionId) -> Engine + Send + Sync>;
+/// seam — the binary supplies the provider/tools/system). The optional [`ProfileRef`] selects which
+/// profile bundle the engine is materialized from (host routing's agent-selection degree of freedom);
+/// `None` resolves the node's active default, preserving the legacy single-profile behavior.
+pub type SessionEngineBuilder = Arc<dyn Fn(SessionId, Option<ProfileRef>) -> Engine + Send + Sync>;
 
 /// Builds a fresh model [`Provider`] from a (model-overridden) [`ProfileSpec`] — the seam a live
 /// [`SessionApi::set_session_model`](daemon_api::SessionApi::set_session_model) uses to rebuild a
@@ -150,6 +153,10 @@ pub struct NodeApiImpl {
     /// live [`ParkingHandler`] to decide auto-allow vs park, in lockstep with the engine's snapshot
     /// policy (both updated by the same op).
     session_modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
+    /// The host routing registry (daemon-event-io-spec §5.9) consulted by [`SessionApi::submit_routed`]
+    /// to resolve an inbound `Origin` to (session, profile, delivery). Empty by default — a pure
+    /// passthrough: `PerThread` naming, node active-default profile, origin-seeded delivery.
+    routing: Arc<RoutingRegistry>,
 }
 
 impl NodeApiImpl {
@@ -186,7 +193,16 @@ impl NodeApiImpl {
             model_factory: None,
             session_models: Arc::new(DashMap::new()),
             session_modes,
+            routing: Arc::new(RoutingRegistry::new()),
         }
+    }
+
+    /// Install the host routing registry consulted by [`SessionApi::submit_routed`] (the §5.9
+    /// inbound-routing capability). Call during assembly; absent, routed submits fall back to
+    /// `PerThread` naming with the node's active default profile.
+    pub fn with_routing(mut self, routing: RoutingRegistry) -> Self {
+        self.routing = Arc::new(routing);
+        self
     }
 
     /// Attach the live model-provider factory so [`SessionApi::set_session_model`] can rebuild a
@@ -641,6 +657,32 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<(), ApiError> {
         self.claim(&session, Lifecycle::Live)?;
         self.live.submit_from(session, origin, command).await
+    }
+
+    async fn submit_routed(
+        &self,
+        origin: Origin,
+        command: AgentCommand,
+    ) -> Result<SessionId, ApiError> {
+        // Resolve the origin through the §5.9 routing registry: session name, the profile that runs
+        // it (agent selection), and where its replies post.
+        let resolved = self.routing.resolve(&origin);
+        self.claim(&resolved.session, Lifecycle::Live)?;
+        // For session-opening commands, bind the resolved profile (sticky on first `ensure`) and seed
+        // the resolved `Primary` before submitting, so routing owns agent-selection + delivery. Other
+        // commands act on an already-open session whose profile/Primary were bound when it opened.
+        if matches!(
+            command,
+            AgentCommand::StartTurn { .. } | AgentCommand::Steer { .. }
+        ) {
+            self.live.ensure(&resolved.session, resolved.profile.clone());
+            self.live
+                .seed_primary_target(&resolved.session, resolved.delivery.clone());
+        }
+        self.live
+            .submit_from(resolved.session.clone(), origin, command)
+            .await?;
+        Ok(resolved.session)
     }
 
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
@@ -1194,12 +1236,14 @@ impl LiveSessions {
         self.sessions.get(session).map(|s| s.handle.clone())
     }
 
-    /// Spawn (or reuse) the actor for `session`, returning its handle.
-    fn ensure(&self, session: &SessionId) -> AgentHandle {
+    /// Spawn (or reuse) the actor for `session`, returning its handle. The `profile` selects which
+    /// profile bundle a *new* session's engine is built from (the routing agent-selection seam); a
+    /// resident session ignores it (the first `ensure` binds the profile — bindings are sticky).
+    fn ensure(&self, session: &SessionId, profile: Option<ProfileRef>) -> AgentHandle {
         if let Some(s) = self.sessions.get(session) {
             return s.handle.clone();
         }
-        let engine = (self.builder)(session.clone());
+        let engine = (self.builder)(session.clone(), profile);
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let log: Merged = Arc::new(Mutex::new(MergedLog::new()));
@@ -1283,7 +1327,7 @@ impl LiveSessions {
             AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
                 // (including the terminal `TurnFinished`) flow to the drain queue for `poll`.
-                let handle = self.ensure(&session);
+                let handle = self.ensure(&session, None);
                 // Seed the session's Primary reply sink from the opening origin (where replies post by
                 // default), unless one is already in force. Handover re-points it later.
                 self.seed_primary(&session, &origin);
@@ -1332,7 +1376,7 @@ impl LiveSessions {
             AgentCommand::Steer { text, request_id } => {
                 // Steer-when-idle opens a fresh turn; mid-turn it is drained at a phase boundary.
                 // Either way the ack + any turn events flow to the drain queue via the pump.
-                let handle = self.ensure(&session);
+                let handle = self.ensure(&session, None);
                 self.record_inbound(
                     &session,
                     origin,
@@ -1406,6 +1450,17 @@ impl LiveSessions {
             let mut targets = s.delivery.lock().unwrap();
             if !targets.iter().any(|t| t.kind == SinkKind::Primary) {
                 targets.push(origin.primary_target());
+            }
+        }
+    }
+
+    /// Seed the session's `Primary` reply sink to an already-resolved `target` if none is set yet —
+    /// the routed-submit counterpart of [`Self::seed_primary`], honoring a binding's pinned delivery.
+    fn seed_primary_target(&self, session: &SessionId, target: DeliveryTarget) {
+        if let Some(s) = self.sessions.get(session) {
+            let mut targets = s.delivery.lock().unwrap();
+            if !targets.iter().any(|t| t.kind == SinkKind::Primary) {
+                targets.push(target);
             }
         }
     }

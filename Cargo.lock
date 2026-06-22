@@ -1771,6 +1771,7 @@ dependencies = [
  "daemon-mnemosyne",
  "daemon-models",
  "daemon-node",
+ "daemon-protocol",
  "daemon-providers",
  "daemon-provision",
  "daemon-pytool-client",
