@@ -169,6 +169,13 @@ pub struct Usage {
     pub input_tokens: u64,
     /// Generated (output) tokens.
     pub output_tokens: u64,
+    /// Prompt tokens served from a reused KV-cache prefix rather than re-prefilled this turn
+    /// (the local analogue of a cloud prompt-cache read). Compute/TTFT savings only — local
+    /// inference has no per-token billing, so this never affects cost. `0` when the backend does
+    /// not report prefix reuse (e.g. mistral.rs, whose prefix cache is engine-internal). Defaulted
+    /// for wire back-compat with older workers.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
 }
 
 /// A classified backend failure — maps onto the daemon's `Failure` taxonomy so the existing §8
@@ -436,6 +443,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cache_read_tokens: 6,
             },
         });
         round_trip_event(Event::Embeddings {

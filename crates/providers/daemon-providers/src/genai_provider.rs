@@ -96,7 +96,7 @@ impl GenAiProvider {
         Self::new(AdapterKind::Anthropic, model)
     }
 
-    fn options(&self) -> ChatOptions {
+    fn options(&self, req: &Request) -> ChatOptions {
         ChatOptions::default()
             .with_capture_usage(true)
             .with_capture_content(true)
@@ -104,6 +104,10 @@ impl GenAiProvider {
             .with_capture_tool_calls(true)
             .with_normalize_reasoning_content(true)
             .with_max_tokens(self.max_tokens)
+            // A conversation-stable cache key derived from the stable prefix (system + tools). Used
+            // by OpenAI to keep a conversation's requests routed to the same backend so its automatic
+            // prefix cache stays warm; ignored by adapters that do not honor it.
+            .with_prompt_cache_key(prompt_cache_key(req))
     }
 
     fn chat_request(&self, req: &Request) -> ChatRequest {
@@ -137,6 +141,25 @@ impl GenAiProvider {
         }
         chat
     }
+}
+
+/// A conversation-stable OpenAI `prompt_cache_key` derived from the request's stable prefix (the
+/// system prompt + the offered tools' names/schemas). The engine keeps that prefix byte-stable
+/// across a conversation's turns, so this key is identical turn to turn — exactly what OpenAI wants
+/// to route repeat requests to the same cache-warm backend. Other adapters ignore the key.
+///
+/// `DefaultHasher` (fixed-key SipHash) is process-independent and deterministic, so the key is the
+/// same across daemon restarts for the same prefix; this is a routing hint, not a security boundary.
+fn prompt_cache_key(req: &Request) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    req.system.hash(&mut hasher);
+    for tool in &req.tools {
+        tool.name.hash(&mut hasher);
+        tool.schema.hash(&mut hasher);
+    }
+    format!("daemon-{:016x}", hasher.finish())
 }
 
 /// The genai adapters the node probes for live model discovery. genai 0.6.5 exposes no public
@@ -465,7 +488,7 @@ impl Provider for GenAiProvider {
         )
         .await?;
         let chat = self.chat_request(&req);
-        let opts = self.options();
+        let opts = self.options(&req);
         let valid = req.tool_names();
         let resp = self
             .client
@@ -482,7 +505,7 @@ impl Provider for GenAiProvider {
         let endpoint = self.endpoint.clone();
         let auth = req.auth.clone();
         let chat = self.chat_request(&req);
-        let opts = self.options();
+        let opts = self.options(&req);
         let valid = req.tool_names();
         let pricing = self.pricing;
         let (tx, rx) = futures::channel::mpsc::unbounded();
