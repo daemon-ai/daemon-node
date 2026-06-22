@@ -319,16 +319,25 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
     match cfg.context_engine {
         ContextEngineKind::Budgeted => ContextWiring::off(),
         ContextEngineKind::Lcm => {
-            let lcm_cfg = if cfg.persist_providers() {
+            let persist = cfg.persist_providers();
+            // The base config carries the *root*; the bank cache re-roots `data_dir` to
+            // `<data_root>/<profile>/` per resolved profile (in-memory banks ignore the path).
+            let lcm_cfg = if persist {
                 LcmConfig {
-                    data_dir: cfg.profile_home(),
+                    data_dir: cfg.data_root(),
                     bank: "default".to_string(),
                     ..LcmConfig::default()
                 }
             } else {
                 LcmConfig::in_memory()
             };
-            let banks = Arc::new(LcmBanks::new(lcm_cfg, aux));
+            let banks = Arc::new(LcmBanks::new(
+                lcm_cfg,
+                persist,
+                cfg.data_root(),
+                ProfileRef::new(cfg.profile.clone()),
+                aux,
+            ));
             // The `lcm_*` tool defs are session-independent; enumerate once.
             let tools: Vec<Arc<dyn Tool>> = daemon_context_lcm::tools::tool_defs()
                 .into_iter()
@@ -341,13 +350,15 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
                 .collect();
             let builder: ContextEngineBuilder = {
                 let banks = banks.clone();
-                Arc::new(move |id: &SessionId| match banks.get_or_open(id) {
-                    Some(lcm) => lcm as Arc<dyn ContextEngine>,
-                    None => {
-                        tracing::warn!(session = %id,
-                            "failed to open LCM context engine for session; using budgeted fallback");
-                        Arc::new(daemon_core::BudgetedContextEngine::default())
-                            as Arc<dyn ContextEngine>
+                Arc::new(move |profile: Option<&ProfileRef>, id: &SessionId| {
+                    match banks.get_or_open(profile, id) {
+                        Some(lcm) => lcm as Arc<dyn ContextEngine>,
+                        None => {
+                            tracing::warn!(session = %id,
+                                "failed to open LCM context engine for session; using budgeted fallback");
+                            Arc::new(daemon_core::BudgetedContextEngine::default())
+                                as Arc<dyn ContextEngine>
+                        }
                     }
                 })
             };
@@ -365,33 +376,61 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
 /// session's live compaction state and durable transcript.
 struct LcmBanks {
     cfg: LcmConfig,
+    /// Whether banks are durable (re-rooted per profile under `data_root`) or in-memory.
+    persist: bool,
+    /// The `<data_dir>` root profile homes hang off; a durable bank opens under `data_root/<profile>`.
+    data_root: std::path::PathBuf,
+    /// The profile a `None` (legacy single-profile) resolution scopes to — the node launch profile.
+    default_profile: ProfileRef,
     aux: Arc<dyn Provider>,
-    sessions: Mutex<HashMap<SessionId, Arc<LcmContextEngine>>>,
+    sessions: Mutex<HashMap<(ProfileRef, SessionId), Arc<LcmContextEngine>>>,
 }
 
 impl LcmBanks {
-    fn new(cfg: LcmConfig, aux: Arc<dyn Provider>) -> Self {
+    fn new(
+        cfg: LcmConfig,
+        persist: bool,
+        data_root: std::path::PathBuf,
+        default_profile: ProfileRef,
+        aux: Arc<dyn Provider>,
+    ) -> Self {
         Self {
             cfg,
+            persist,
+            data_root,
+            default_profile,
             aux,
             sessions: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Open (once) and cache the engine for `session`, bound to that session id over the shared bank.
-    fn get_or_open(&self, session: &SessionId) -> Option<Arc<LcmContextEngine>> {
+    /// Open (once) and cache the engine for `(profile, session)`. A durable bank is rooted at
+    /// `<data_root>/<profile>/`, so two sessions routed to two profiles never share compaction
+    /// state or transcript; `profile = None` scopes to the node default (legacy single-profile home).
+    fn get_or_open(
+        &self,
+        profile: Option<&ProfileRef>,
+        session: &SessionId,
+    ) -> Option<Arc<LcmContextEngine>> {
+        let profile = profile.cloned().unwrap_or_else(|| self.default_profile.clone());
+        let key = (profile.clone(), session.clone());
         let mut sessions = self.sessions.lock().expect("lcm banks poisoned");
-        if let Some(existing) = sessions.get(session) {
+        if let Some(existing) = sessions.get(&key) {
             return Some(existing.clone());
         }
-        match LcmContextEngine::open_for_session(self.cfg.clone(), session, self.aux.clone()) {
+        let mut cfg = self.cfg.clone();
+        if self.persist {
+            cfg.data_dir = self.data_root.join(profile.as_str());
+        }
+        match LcmContextEngine::open_for_session(cfg, session, self.aux.clone()) {
             Ok(lcm) => {
                 let lcm = Arc::new(lcm);
-                sessions.insert(session.clone(), lcm.clone());
+                sessions.insert(key, lcm.clone());
                 Some(lcm)
             }
             Err(e) => {
-                tracing::warn!(error = %e, session = %session, "failed to open LCM bank");
+                tracing::warn!(error = %e, profile = %profile, session = %session,
+                    "failed to open LCM bank");
                 None
             }
         }
@@ -418,7 +457,7 @@ impl Tool for LcmTool {
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
-        let result = match self.banks.get_or_open(&cx.session_id) {
+        let result = match self.banks.get_or_open(cx.profile.as_ref(), &cx.session_id) {
             Some(lcm) => lcm.call_tool(&self.def.name, args).await,
             None => serde_json::json!({"status": "error", "error": "lcm bank unavailable"})
                 .to_string(),
@@ -471,9 +510,11 @@ fn build_memory(
             }
         },
         MemoryProviderKind::Mnemosyne => {
+            // The base config carries the *root*; the bank cache re-roots `data_dir` to
+            // `<data_root>/<profile>/` per resolved profile (in-memory banks ignore the path).
             let base = if cfg.persist_providers() {
                 MnemosyneConfig {
-                    data_dir: cfg.profile_home(),
+                    data_dir: cfg.data_root(),
                     ..MnemosyneConfig::default()
                 }
             } else {
@@ -482,6 +523,8 @@ fn build_memory(
             let banks = Arc::new(MnemosyneBanks::new(
                 base,
                 cfg.persist_providers(),
+                cfg.data_root(),
+                ProfileRef::new(cfg.profile.clone()),
                 embedder,
                 llm,
             ));
@@ -505,10 +548,14 @@ fn build_memory(
                 .collect();
             let builder: MemoryBuilder = {
                 let banks = banks.clone();
-                Arc::new(move |id: &SessionId| match banks.get_or_open(id) {
-                    Some(p) => vec![p as Arc<dyn MemoryProvider>],
-                    None => Vec::new(),
-                })
+                Arc::new(
+                    move |profile: Option<&ProfileRef>, id: &SessionId| {
+                        match banks.get_or_open(profile, id) {
+                            Some(p) => vec![p as Arc<dyn MemoryProvider>],
+                            None => Vec::new(),
+                        }
+                    },
+                )
             };
             MemoryWiring {
                 builder: Some(builder),
@@ -695,51 +742,69 @@ fn build_browser_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
 struct MnemosyneBanks {
     base: MnemosyneConfig,
     persist: bool,
+    /// The `<data_dir>` root profile homes hang off; a durable bank opens under `data_root/<profile>`.
+    data_root: std::path::PathBuf,
+    /// The profile a `None` (legacy single-profile) resolution scopes to — the node launch profile.
+    default_profile: ProfileRef,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     llm: Option<Arc<dyn Provider>>,
-    sessions: Mutex<HashMap<SessionId, Arc<MnemosyneProvider>>>,
+    sessions: Mutex<HashMap<(ProfileRef, SessionId), Arc<MnemosyneProvider>>>,
 }
 
 impl MnemosyneBanks {
     fn new(
         base: MnemosyneConfig,
         persist: bool,
+        data_root: std::path::PathBuf,
+        default_profile: ProfileRef,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<dyn Provider>>,
     ) -> Self {
         Self {
             base,
             persist,
+            data_root,
+            default_profile,
             embedder,
             llm,
             sessions: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Open (once) and cache the provider for `session`, configured with that session id over the
-    /// shared bank. Returns `None` if the bank cannot be opened.
-    fn get_or_open(&self, session: &SessionId) -> Option<Arc<MnemosyneProvider>> {
+    /// Open (once) and cache the provider for `(profile, session)`. A durable bank is rooted at
+    /// `<data_root>/<profile>/`, so two sessions routed to two profiles get isolated memory banks on
+    /// disk; `profile = None` scopes to the node default (legacy single-profile home). Returns `None`
+    /// if the bank cannot be opened.
+    fn get_or_open(
+        &self,
+        profile: Option<&ProfileRef>,
+        session: &SessionId,
+    ) -> Option<Arc<MnemosyneProvider>> {
+        let profile = profile.cloned().unwrap_or_else(|| self.default_profile.clone());
+        let key = (profile.clone(), session.clone());
         let mut sessions = self.sessions.lock().expect("mnemosyne banks poisoned");
-        if let Some(existing) = sessions.get(session) {
+        if let Some(existing) = sessions.get(&key) {
             return Some(existing.clone());
         }
         let mut cfg = self.base.clone();
         cfg.session_id = session.as_str().to_string();
         let provider = if self.persist {
+            cfg.data_dir = self.data_root.join(profile.as_str());
             MnemosyneProvider::open_with_backends(cfg, self.embedder.clone(), self.llm.clone())
         } else {
-            // Ephemeral node: a private in-memory bank per session (no cross-session sharing, which
-            // is acceptable when the session store itself is non-durable).
+            // Ephemeral node: a private in-memory bank per (profile, session) (no cross-session
+            // sharing, which is acceptable when the session store itself is non-durable).
             crate::ephemeral_mnemosyne(cfg, self.embedder.clone(), self.llm.clone())
         };
         match provider {
             Ok(p) => {
                 let p = Arc::new(p);
-                sessions.insert(session.clone(), p.clone());
+                sessions.insert(key, p.clone());
                 Some(p)
             }
             Err(e) => {
-                tracing::warn!(error = %e, session = %session, "failed to open Mnemosyne bank");
+                tracing::warn!(error = %e, profile = %profile, session = %session,
+                    "failed to open Mnemosyne bank");
                 None
             }
         }
@@ -747,12 +812,12 @@ impl MnemosyneBanks {
 
     /// Enumerate the `mnemosyne_*` tool defs from a throwaway probe instance (session-independent).
     fn probe_tool_defs(&self) -> Option<Vec<ToolDef>> {
-        let probe = self.get_or_open(&SessionId::new("__probe__"))?;
+        let probe = self.get_or_open(None, &SessionId::new("__probe__"))?;
         let defs = probe.tools();
         self.sessions
             .lock()
             .expect("mnemosyne banks poisoned")
-            .remove(&SessionId::new("__probe__"));
+            .remove(&(self.default_profile.clone(), SessionId::new("__probe__")));
         Some(defs)
     }
 }
@@ -789,7 +854,7 @@ impl Tool for MemoryProviderTool {
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
-        let result = match self.banks.get_or_open(&cx.session_id) {
+        let result = match self.banks.get_or_open(cx.profile.as_ref(), &cx.session_id) {
             Some(provider) => provider.call_tool(&self.def.name, args).await,
             None => serde_json::json!({"status": "error", "error": "memory bank unavailable"})
                 .to_string(),

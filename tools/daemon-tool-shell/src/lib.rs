@@ -199,6 +199,7 @@ mod tests {
             events: &events,
             host,
             session_id: SessionId::new("t"),
+            profile: None,
             budget: Budget::unlimited(),
             exec: env,
             tool_result_budget: 0,

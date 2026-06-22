@@ -51,6 +51,13 @@ enum ActorMsg {
         text: String,
         origin: Origin,
     },
+    /// Context-only append (no turn): folds into the conversation when idle, or queues on
+    /// [`TurnControl`] to land in the following turn when busy (event-io §5.9 multi-party context).
+    Observe {
+        request_id: ReqId,
+        input: UserMsg,
+        origin: Origin,
+    },
     Snapshot {
         request_id: ReqId,
         origin: Origin,
@@ -82,6 +89,7 @@ impl ActorMsg {
         match self {
             ActorMsg::StartTurn { origin, .. }
             | ActorMsg::Steer { origin, .. }
+            | ActorMsg::Observe { origin, .. }
             | ActorMsg::Snapshot { origin, .. }
             | ActorMsg::Interrupt { origin, .. }
             | ActorMsg::SetProvider { origin, .. }
@@ -110,6 +118,16 @@ impl ActorMsg {
                     text: text.clone(),
                     request_id: *request_id,
                 }),
+                Disposition::Context,
+            ),
+            ActorMsg::Observe {
+                request_id, input, ..
+            } => (
+                SessionPayload::Command(AgentCommand::Observe {
+                    input: input.clone(),
+                    request_id: *request_id,
+                }),
+                // Context-bearing (enters the conversation), exactly like StartTurn/Steer.
                 Disposition::Context,
             ),
             ActorMsg::Snapshot { request_id, .. } => (
@@ -221,6 +239,25 @@ impl AgentHandle {
     /// idle it opens a fresh steer turn. The ack rides the event stream as [`AgentEvent::Steered`].
     pub async fn steer(&self, request_id: ReqId, text: String) {
         self.steer_from(local_origin(), request_id, text).await;
+    }
+
+    /// Append context-only input attributed to `origin` **without** opening a turn (event-io §5.9):
+    /// it folds into the conversation when idle and lands in the following turn when busy. No turn is
+    /// started and no ack is emitted — the next mention-gated `start_turn` sees the accumulated text.
+    pub async fn observe_from(&self, origin: Origin, request_id: ReqId, input: UserMsg) {
+        let _ = self
+            .tx
+            .send(ActorMsg::Observe {
+                request_id,
+                input,
+                origin,
+            })
+            .await;
+    }
+
+    /// Append context-only input (untagged local origin) without opening a turn.
+    pub async fn observe(&self, request_id: ReqId, input: UserMsg) {
+        self.observe_from(local_origin(), request_id, input).await;
     }
 
     /// Request a read-only snapshot. The reply rides the event stream as [`AgentEvent::Snapshot`]
@@ -378,6 +415,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                     } => {
                         control.push_steer(SteerReq { request_id, text });
                     }
+                    // Idle observe: fold the context straight into the conversation, opening no turn.
+                    ActorMsg::Observe { input, .. } => {
+                        engine.push_observe(input);
+                    }
                     ActorMsg::Snapshot { request_id, .. } => control.push_snapshot(request_id),
                     // Idle: there is no in-flight turn to interrupt.
                     ActorMsg::Interrupt { .. } => {}
@@ -406,6 +447,11 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                                     ActorMsg::Interrupt { .. } => control.cancel(),
                                     ActorMsg::Steer { request_id, text, .. } => {
                                         control.push_steer(SteerReq { request_id, text });
+                                    }
+                                    // Busy observe: queue it; the boundary folds it into the
+                                    // conversation as plain context for the following turn.
+                                    ActorMsg::Observe { input, .. } => {
+                                        control.push_observe(input);
                                     }
                                     ActorMsg::Snapshot { request_id, .. } => {
                                         control.push_snapshot(request_id);
