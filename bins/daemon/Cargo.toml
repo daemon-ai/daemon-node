@@ -56,6 +56,9 @@ daemon-api = { workspace = true }
 daemon-protocol = { workspace = true }
 # Optional in-process HTTP/WS surface, toggled on at launch by a configured bind address.
 daemon-http = { workspace = true }
+# The Matrix chat transport, toggled on at launch by `[matrix].enabled`. It isolates the heavy
+# matrix-sdk deps; the daemon binary only references `serve` / `login` / `MatrixConfig`.
+daemon-matrix = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }

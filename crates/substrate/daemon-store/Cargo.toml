@@ -17,7 +17,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 # SQLite backend (feature-gated). `bundled` compiles the amalgamation from source so the durable
 # store needs no system libsqlite3.
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

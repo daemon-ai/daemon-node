@@ -88,7 +88,54 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // One-shot operator subcommand: `daemon matrix login --homeserver <url> --credential-ref <key>`
+    // performs the interactive SSO flow and writes the resulting session into the credential store
+    // (daemon-matrix-transport-spec §6.1). Everything else falls through to the host role.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("matrix")
+        && args.get(2).map(String::as_str) == Some("login")
+    {
+        return run_matrix_login(&args[3..]).await;
+    }
+
     run_as_host(NodeConfig::load()?).await
+}
+
+/// The `daemon matrix login` subcommand: SSO-login one account and persist its session under the
+/// given credential-ref (the same key the profile's `bound_accounts` declares). Writes to the
+/// durable `FileCredentialStore` the host reads at startup.
+async fn run_matrix_login(args: &[String]) -> anyhow::Result<()> {
+    let mut homeserver: Option<String> = None;
+    let mut credential_ref: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--homeserver" => homeserver = it.next().cloned(),
+            "--credential-ref" | "--credential_ref" => credential_ref = it.next().cloned(),
+            other => anyhow::bail!(
+                "unknown `matrix login` arg {other:?} (use --homeserver <url> --credential-ref <key>)"
+            ),
+        }
+    }
+    let homeserver =
+        homeserver.ok_or_else(|| anyhow::anyhow!("`matrix login` requires --homeserver <url>"))?;
+    let credential_ref = credential_ref
+        .ok_or_else(|| anyhow::anyhow!("`matrix login` requires --credential-ref <key>"))?;
+
+    let cfg = NodeConfig::load()?;
+    // Login implies persistence: write to the same on-disk credential store the host reads.
+    std::fs::create_dir_all(&cfg.data_dir).map_err(|e| {
+        anyhow::anyhow!("creating data dir {}: {e}", cfg.data_dir.display())
+    })?;
+    let credential_store: Arc<dyn CredentialStore> =
+        Arc::new(FileCredentialStore::open(cfg.data_dir.join("credentials.json"))?);
+    daemon_matrix::login(
+        credential_store,
+        &homeserver,
+        &cfg.matrix.store_root,
+        &credential_ref,
+    )
+    .await
 }
 
 /// Build the provider registry the config selected. `Mock` keeps the deterministic fleet wiring
@@ -1359,6 +1406,20 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // configured bind address (like the MCP surface). It shares the same `Arc<dyn NodeApi>`, so it is
     // just another transport over the one canonical interface — JSON dispatch plus SSE/WS streaming
     // over the merged session event log.
+    // Optionally spawn the Matrix chat transport (the `daemon-matrix` adapter), toggled on by
+    // `[matrix].enabled`. It drives the same `Arc<dyn NodeApi>` as a client and consumes the host's
+    // in-process `AccountProvisioning` seam (enumerate bound accounts + resolve/write-back session
+    // blobs); both `node` coercions come off the one concrete `NodeApiImpl`.
+    let matrix_server = if cfg.matrix.enabled {
+        tracing::info!("spawning matrix transport (daemon-matrix)");
+        let api: Arc<dyn daemon_api::NodeApi> = node.clone();
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        let mcfg = cfg.matrix.clone();
+        Some(tokio::spawn(daemon_matrix::serve(api, provisioning, mcfg)))
+    } else {
+        None
+    };
+
     let http_server = match &cfg.http_addr {
         Some(addr) => {
             let http_listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1378,6 +1439,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     server.abort();
     if let Some(http_server) = http_server {
         http_server.abort();
+    }
+    if let Some(matrix_server) = matrix_server {
+        matrix_server.abort();
     }
     handle.shutdown().await;
     let _ = std::fs::remove_file(&cfg.socket_path);

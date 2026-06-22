@@ -5,7 +5,9 @@ members = ["crates/*/*", "tools/*", "bindings/*", "bins/*", "tests/*", "xtask"]
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.79"
+# matrix-sdk 0.18 (the `daemon-matrix` adapter) sets the workspace MSRV floor at 1.93; the flake's
+# fenix `stable` toolchain (1.96 at lock time) satisfies it. All matrix types stay inside that crate.
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/daemon"
 
@@ -33,6 +35,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # enable only the client + the two client transports. Isolated to that one adapter crate so rmcp's
 # runtime never leaks into host/core (mirrors the genai/axum isolation).
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# the Matrix client SDK: the `daemon-matrix` adapter speaks Matrix (sync, send, E2EE) to homeservers
+# and drives our engine as a `NodeApi` client (the inverse of `daemon-acp`). `e2e-encryption` +
+# `sqlite`/`bundled-sqlite` give a per-account on-disk crypto+state store with no system libsqlite3
+# (matching `daemon-store`); `sso-login` backs the operator `matrix login` flow; the `testing` feature
+# (dev) provides the wiremock-based `MatrixMockServer`. Default features carry the rustls HTTP client.
+# All matrix-sdk/ruma types stay confined to that one adapter crate so they never leak into host/core
+# (mirrors genai/axum/rmcp). Inbound uses the native `Client::sync` + event-handler path (robust and
+# mock-testable) rather than `matrix-sdk-ui`'s sliding-sync `SyncService` (which needs MSC4186).
+matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "bundled-sqlite", "sso-login"] }
 # readability/HTML->markdown extraction for the key-less `web_extract` fallback (Mozilla readability
 # port). Isolated to the `daemon-tool-web` crate; no network I/O of its own.
 dom_smoothie = "0.18"
@@ -120,6 +131,7 @@ daemon-http = { path = "crates/adapters/daemon-http" }
 daemon-mcp-client = { path = "crates/adapters/daemon-mcp-client" }
 daemon-delivery = { path = "crates/adapters/daemon-delivery" }
 daemon-ingest = { path = "crates/adapters/daemon-ingest" }
+daemon-matrix = { path = "crates/adapters/daemon-matrix" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }

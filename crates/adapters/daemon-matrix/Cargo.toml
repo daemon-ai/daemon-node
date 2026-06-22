@@ -1,0 +1,38 @@
+[package]
+name = "daemon-matrix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Matrix chat transport (daemon-matrix-transport-spec.md): an in-process `NodeApi`-client adapter,
+# structurally the *inverse* of `daemon-acp`. It isolates the heavy `matrix-sdk` / `matrix-sdk-ui` deps
+# and drives *our* engine as a client — normalising room events into `Origin`s and handing them to the
+# reusable `daemon-ingest` gate (inbound), and projecting the session's outbound merged log to
+# `m.room.message`s via a `daemon-delivery` `Projector` (outbound). All matrix-sdk/ruma types stay
+# confined to this crate (mirrors genai/axum/rmcp isolation); it leaks no Matrix types into host/core.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# the in-process bring-up seams (not wire): AccountProvisioning (enumerate bound matrix accounts +
+# resolve/write-back session blobs) and the CredentialStore the one-shot `login` writes into.
+daemon-host = { workspace = true }
+# the two reusable transport-agnostic halves this adapter plugs into.
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+matrix-sdk = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# `testing` pulls in `test_utils::mocks::MatrixMockServer`; `matrix-sdk-test` provides the
+# `JoinedRoomBuilder` / `EventFactory` sync-injection helpers used to drive the inbound path.
+matrix-sdk = { workspace = true, features = ["testing"] }
+matrix-sdk-test = "0.18"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
