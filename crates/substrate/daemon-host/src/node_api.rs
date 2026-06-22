@@ -186,9 +186,11 @@ pub struct NodeApiImpl {
     /// The append-only revision history backing profile + skill versioning. `None` => the versioning
     /// ops (`profile_history`/`revert`, `skill_history`/`revert`) resolve to [`ApiError::Unsupported`].
     revisions: Option<Arc<dyn daemon_common::RevisionLog>>,
-    /// The skills store backing the skill versioning + distribution ops. `None` => skill ops and the
-    /// skill payload of a distribution are unavailable.
-    skills: Option<Arc<daemon_skills::SkillStore>>,
+    /// The per-profile skills provider backing skill versioning, distribution, and curation. Resolves
+    /// an `Arc<SkillStore>` per profile id (rooted at that agent's home), so skill ops act on the
+    /// right agent's library. `None` => skill/curator ops + the skill payload of a distribution are
+    /// unavailable.
+    skills: Option<Arc<daemon_skills::SkillsProvider>>,
     /// The host routing registry (daemon-event-io-spec §5.9) consulted by [`SessionApi::submit_routed`]
     /// to resolve an inbound `Origin` to (session, profile, delivery). Empty by default — a pure
     /// passthrough: `PerThread` naming, node active-default profile, origin-seeded delivery.
@@ -321,9 +323,9 @@ impl NodeApiImpl {
         self
     }
 
-    /// Attach the skills store backing skill versioning + the skill payload of a distribution. Call
-    /// during assembly (the same `Arc<SkillStore>` the skill tools write through).
-    pub fn with_skills(mut self, skills: Arc<daemon_skills::SkillStore>) -> Self {
+    /// Attach the per-profile skills provider backing skill versioning, distribution, and curation.
+    /// Call during assembly (the same provider the engine path resolves per-session stores through).
+    pub fn with_skills(mut self, skills: Arc<daemon_skills::SkillsProvider>) -> Self {
         self.skills = Some(skills);
         self
     }
@@ -426,11 +428,52 @@ impl NodeApiImpl {
             .ok_or_else(|| ApiError::Unsupported("versioning not available".into()))
     }
 
-    /// The skills store, or [`ApiError::Unsupported`] when this node hosts no skills.
-    fn skills_store(&self) -> Result<&Arc<daemon_skills::SkillStore>, ApiError> {
+    /// The skills provider, or [`ApiError::Unsupported`] when this node hosts no skills.
+    fn skills_provider(&self) -> Result<&Arc<daemon_skills::SkillsProvider>, ApiError> {
         self.skills
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("skills not available".into()))
+    }
+
+    /// Resolve the [`SkillStore`](daemon_skills::SkillStore) for an explicit profile `id`.
+    fn skills_store_for(&self, id: &str) -> Result<Arc<daemon_skills::SkillStore>, ApiError> {
+        Ok(self.skills_provider()?.for_profile(id))
+    }
+
+    /// Resolve the skills store for the profile a skill *versioning* op targets: the node's active
+    /// default profile (falling back to the node's `default_local_profile` when no profile store /
+    /// active default is set). The skill revision history is keyed by bare skill name, so this picks
+    /// the library a name-keyed `skill_revert` writes back into.
+    fn active_skills_store(&self) -> Result<Arc<daemon_skills::SkillStore>, ApiError> {
+        let id = self
+            .profiles
+            .as_ref()
+            .and_then(|p| p.active().ok().flatten())
+            .unwrap_or_else(|| self.default_local_profile.clone());
+        self.skills_store_for(&id)
+    }
+
+    /// Resolve the skills store a curator op targets: an explicit `profile`, else the active default.
+    fn curator_store(
+        &self,
+        profile: Option<String>,
+    ) -> Result<Arc<daemon_skills::SkillStore>, ApiError> {
+        match profile {
+            Some(id) => self.skills_store_for(&id),
+            None => self.active_skills_store(),
+        }
+    }
+
+    /// The per-profile usage sidecar for a curator op, or [`ApiError::Unsupported`] when usage
+    /// tracking is off (no `.usage.json` factory wired).
+    fn curator_usage(
+        &self,
+        store: &Arc<daemon_skills::SkillStore>,
+    ) -> Result<Arc<dyn daemon_common::SkillUsageLog>, ApiError> {
+        store
+            .usage()
+            .cloned()
+            .ok_or_else(|| ApiError::Unsupported("skill usage tracking not available".into()))
     }
 
     /// Record a profile revision of `id`'s current on-disk spec under `author`/`reason`. Best-effort:
@@ -1312,6 +1355,15 @@ fn revision_err(e: daemon_common::RevisionError) -> ApiError {
     }
 }
 
+fn skill_err(e: daemon_skills::SkillError) -> ApiError {
+    use daemon_skills::SkillError;
+    match e {
+        SkillError::NotFound(id) => ApiError::UnknownSession(format!("skill/{id}")),
+        SkillError::Exists(id) => ApiError::Conflict(format!("skill exists: {id}")),
+        other => ApiError::Other(other.to_string()),
+    }
+}
+
 #[async_trait]
 impl ProfileApi for NodeApiImpl {
     async fn profile_list(&self) -> Vec<ProfileInfo> {
@@ -1380,10 +1432,11 @@ impl ProfileApi for NodeApiImpl {
             .get(&id)
             .map_err(profile_err)?
             .ok_or_else(|| ApiError::UnknownSession(id.clone()))?;
-        // A profile distribution carries the profile's local (non-bundled) skills, when skills are
-        // hosted; otherwise just the spec. credential_ref is kept (a name, not a secret).
+        // A profile distribution carries *that profile's* local (non-bundled) skills, resolved from
+        // its own per-profile store; otherwise just the spec. credential_ref is kept (a name).
         let skills = match self.skills.as_ref() {
-            Some(s) => s
+            Some(provider) => provider
+                .for_profile(&id)
                 .export_local()
                 .map_err(|e| ApiError::Other(format!("skill export: {e}")))?,
             None => Vec::new(),
@@ -1422,9 +1475,11 @@ impl ProfileApi for NodeApiImpl {
         let id = spec.id.clone();
         store.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "import");
-        // Reconstitute the bundled skills (operator-authored, so attribute to the operator). A skill
-        // that already exists is left as-is rather than clobbered.
-        if let Some(skill_store) = self.skills.as_ref() {
+        // Materialize the distribution's local skills into the *imported profile's own* skills dir
+        // (so a session that resolves this agent actually sees them), attributed to the operator. A
+        // skill that already exists is left as-is rather than clobbered.
+        if let Some(provider) = self.skills.as_ref() {
+            let skill_store = provider.for_profile(&id);
             for bundle in &dist.skills {
                 if skill_store.is_bundled(&bundle.name) {
                     continue;
@@ -1483,7 +1538,7 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn skill_revert(&self, name: String, seq: u64) -> Result<(), ApiError> {
-        let skills = self.skills_store()?;
+        let skills = self.active_skills_store()?;
         if skills.is_bundled(&name) {
             return Err(ApiError::Conflict(format!(
                 "skill `{name}` is binary-bundled and cannot be reverted"
@@ -1497,6 +1552,97 @@ impl ProfileApi for NodeApiImpl {
                 &format!("revert to {seq}"),
             )
             .map_err(|e| ApiError::Other(format!("skill revert: {e}")))
+    }
+
+    async fn curator_list(
+        &self,
+        profile: Option<String>,
+    ) -> Result<Vec<daemon_api::CuratorEntry>, ApiError> {
+        let store = self.curator_store(profile)?;
+        let usage = store.usage();
+        let mut entries = Vec::new();
+        // Live (discovered) skills, with their usage record (defaulting when untracked).
+        for item in store.list() {
+            let record = usage
+                .and_then(|u| u.get(&item.name))
+                .unwrap_or_default();
+            entries.push(daemon_api::CuratorEntry {
+                name: item.name.clone(),
+                category: item.category,
+                is_bundled: store.is_bundled(&item.name),
+                usage: record,
+            });
+        }
+        // Archived skills (out of discovery): surfaced with their archived-state record so an
+        // operator can see + restore them.
+        for name in store.archived() {
+            let mut record = usage.and_then(|u| u.get(&name)).unwrap_or_default();
+            record.state = daemon_common::SkillState::Archived;
+            entries.push(daemon_api::CuratorEntry {
+                name: name.clone(),
+                category: None,
+                is_bundled: store.is_bundled(&name),
+                usage: record,
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn curator_pin(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
+        let store = self.curator_store(profile)?;
+        self.curator_usage(&store)?.set_pinned(&name, true);
+        Ok(())
+    }
+
+    async fn curator_unpin(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
+        let store = self.curator_store(profile)?;
+        self.curator_usage(&store)?.set_pinned(&name, false);
+        Ok(())
+    }
+
+    async fn curator_archive(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
+        self.curator_store(profile)?.archive(&name).map_err(skill_err)
+    }
+
+    async fn curator_restore(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
+        self.curator_store(profile)?.restore(&name).map_err(skill_err)
+    }
+
+    async fn curator_run(
+        &self,
+        profile: Option<String>,
+    ) -> Result<Vec<daemon_api::CuratorChange>, ApiError> {
+        let store = self.curator_store(profile)?;
+        let usage = self.curator_usage(&store)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let transitions = daemon_skills::apply_automatic_transitions(
+            &usage.all(),
+            now,
+            daemon_skills::CuratorConfig::default(),
+        );
+        let mut changes = Vec::new();
+        for t in transitions {
+            match t.to {
+                // Physically archive (also flips usage state to Archived). A skill already gone from
+                // discovery (race) yields a not-found we tolerate.
+                daemon_common::SkillState::Archived => {
+                    if store.archive(&t.name).is_err() {
+                        continue;
+                    }
+                }
+                // Stale / reactivation are soft (the body stays discoverable): just flip the record.
+                state => usage.set_state(&t.name, state),
+            }
+            changes.push(daemon_api::CuratorChange {
+                name: t.name,
+                from: t.from,
+                to: t.to,
+            });
+        }
+        Ok(changes)
     }
 }
 

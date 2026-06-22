@@ -376,13 +376,28 @@ engine-native realization of hermes' `agent/background_review.py` daemon-thread 
 built in `assemble()` from the node's tools and is inert (spawn no-ops) unless skills/memory tools are
 present **and** the engine's review intervals are non-zero (opt-in).
 
-**Skills subsystem (stable-tier index + tools).** When skills are enabled, `assemble()` builds a
-`daemon_skills::SkillStore` over `<profile_home>/skills/`, registers the `skills_list` / `skill_view`
-/ `skill_manage` tools on every role registry, and folds the progressive-disclosure *index* into the
-stable system-prompt tier via a `StablePromptSource` (`SkillsPromptSource`). The index is
-cache-stable (names + short descriptions only); full bodies load on demand through `skill_view` tool
-results — the prompt-caching invariant hermes preserves. Writes through `skill_manage` invalidate the
-store's memoized index so the next turn's stable block reflects the change.
+**Skills subsystem (per-profile, stable-tier index + tools).** Skills are an *agent-owned* library
+resolved **per profile**, exactly like memory and the context engine — not a node-global store built
+once over the launch agent. When skills are enabled the binary builds a `daemon_skills::SkillsProvider`
+(`per_profile` → `<data_dir>/<id>/skills`, or the legacy `fixed` single-dir override) and hands
+`daemon-node` a `SkillsResolver` closure. For each session, `resolve_effective` resolves the routed
+profile's own `Arc<SkillStore>` and registers *that agent's* `skills_list` / `skill_view` /
+`skill_manage` tools (allowlist-gated) plus the progressive-disclosure *index* as a `StablePromptSource`
+(`SkillsPromptSource`) in the stable system-prompt tier. Role engines (orchestrator/child) and the
+background `skill_review` fork run the launch agent's resolved skill tools. The index is cache-stable
+(names + short descriptions only); full bodies load on demand through `skill_view` — the prompt-caching
+invariant hermes preserves. Writes through `skill_manage` invalidate the store's memoized index. Each
+profile's store records writes through the shared `RevisionLog` and tracks a co-located `.usage.json`
+sidecar (`FileSkillUsageLog`).
+
+**Curator (per-profile skill hygiene).** A deterministic curator keeps each agent's library lean. The
+`.usage.json` sidecar records per-skill `created_by` provenance (agent / user / bundled), view/use/patch
+counts, `pinned`, and a lifecycle `state`. `apply_automatic_transitions` is a pure transition table
+(idle → `Stale` → `Archived`, reactivate on activity) that only touches **agent-created, unpinned**
+skills (operator-authored and binary-bundled skills are protected); archiving physically moves a bundle
+to `<root>/.archive/` (out of discovery + the index) with revision provenance, and `restore` brings it
+back. The operator surface is the per-profile `Curator{List,Pin,Unpin,Archive,Restore,Run}` family
+(`daemon-cli curator …`), wire v12.
 
 **One-lifecycle-owner invariant.** The durable and live lifecycles are intentionally distinct: a
 durable session runs its engine dormant-between-turns through the activation seam (control surface,

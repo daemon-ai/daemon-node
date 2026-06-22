@@ -12,7 +12,11 @@ daemon-core = { workspace = true }
 daemon-common = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+# JSON (de)serialization of the per-profile `.usage.json` usage + lifecycle sidecar.
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Structured logging for per-profile seeding / curation diagnostics.
+tracing = { workspace = true }
 # CBOR (de)serialization of a portable skill bundle (the snapshot blob + distribution payload).
 ciborium = { workspace = true }
 # Embeds the curated bundled-skills tree (`bundled/`) into the binary so a deployed daemon can seed

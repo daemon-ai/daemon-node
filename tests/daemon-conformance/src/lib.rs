@@ -1684,6 +1684,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         })
@@ -1756,6 +1757,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         });
@@ -2557,17 +2559,23 @@ mod node_interface {
     ) -> (
         Arc<NodeApiImpl>,
         daemon_host::SupervisorHandle,
-        Arc<daemon_skills::SkillStore>,
+        Arc<daemon_skills::SkillsProvider>,
     ) {
         use daemon_host::{FileProfileStore, FileRevisionLog, ProfileStore};
         let profiles: Arc<dyn ProfileStore> =
             Arc::new(FileProfileStore::open(dir.join("profiles")).unwrap());
         let revisions: Arc<dyn daemon_common::RevisionLog> =
             Arc::new(FileRevisionLog::open(dir.join("revisions")).unwrap());
+        // Per-profile skills: each profile id roots at `<dir>/<id>/skills`, recording through the
+        // shared revision log, with a per-profile `.usage.json` sidecar (the curator's record).
         let skills = Arc::new(
-            daemon_skills::SkillStore::new(dir.join("skills")).with_revisions(revisions.clone()),
+            daemon_skills::SkillsProvider::per_profile(dir.to_path_buf())
+                .with_revisions(revisions.clone())
+                .with_usage(Arc::new(|root: &std::path::Path| {
+                    Arc::new(daemon_skills::FileSkillUsageLog::open(root))
+                        as Arc<dyn daemon_common::SkillUsageLog>
+                })),
         );
-        skills.seed_bundled().expect("seed bundled skills");
         let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
             store: Arc::new(InMemoryStore::new()),
             partition: PARTITION,
@@ -2591,6 +2599,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: Some(revisions),
             skills: Some(skills.clone()),
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         });
@@ -2663,10 +2672,14 @@ mod node_interface {
         assert_eq!(p2.credential_ref.as_deref(), Some("team-key"));
 
         // --- skill versioning (the agent's own write path records revisions) ---
-        skills
+        // Skills are per-profile: target p1's own library, and make p1 the active default so the
+        // name-keyed skill revision ops (`skill_revert`) write back into p1's store.
+        node.profile_select("p1".into()).await.expect("select p1");
+        let p1_skills = skills.for_profile("p1");
+        p1_skills
             .create("mine", &sample_skill_md("v1"), None)
             .expect("create skill");
-        skills
+        p1_skills
             .edit("mine", &sample_skill_md("v2"))
             .expect("edit skill");
         let sk_hist = node.skill_history("mine".into()).await.unwrap();
@@ -2678,7 +2691,7 @@ mod node_interface {
         );
         // Revert the skill to its first revision (description v1).
         node.skill_revert("mine".into(), 1).await.expect("skill revert");
-        assert!(skills
+        assert!(p1_skills
             .view("mine", None)
             .unwrap()
             .contains("description: v1"));
@@ -2726,8 +2739,8 @@ mod node_interface {
         assert_eq!(imported.credential_ref.as_deref(), Some("team-key"));
         assert_eq!(imported.model, "claude-3-5-sonnet-latest");
         assert!(
-            skills2.find("mine").is_ok(),
-            "the imported distribution reconstituted the local skill"
+            skills2.for_profile("imported").find("mine").is_ok(),
+            "the imported distribution reconstituted the local skill into the imported profile's dir"
         );
         assert_eq!(
             node2.profile_history("imported".into()).await.unwrap().len(),
@@ -2752,6 +2765,133 @@ mod node_interface {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// THE PER-PROFILE CURATOR GATE: skills are agent-owned libraries, and the curator surface acts on
+    /// the right agent's library. Proves, over the node api: (1) two profiles keep isolated skill
+    /// libraries + usage (a skill created for `p1` is invisible to `p2`), (2) `curator_list` surfaces
+    /// usage counts + lifecycle state, (3) pin protects an agent-created skill from `curator_run`'s
+    /// idle-archive while an unpinned idle one is archived (agent-created provenance is the eligibility
+    /// signal), and (4) archive/restore move a skill out of and back into discovery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn curator_per_profile_lifecycle_over_node() {
+        use daemon_api::{ProfileApi, ProfileSpec, ProviderSelector};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-curator-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (node, handle, skills) = assemble_versioning(&dir);
+
+        // Two profiles, each its own agent.
+        for id in ["p1", "p2"] {
+            let spec = ProfileSpec::new(id, ProviderSelector::GenAi, "claude-opus-4-8");
+            node.profile_create(spec).await.expect("create profile");
+        }
+        node.profile_select("p1".into()).await.expect("select p1");
+
+        // Pre-seed p1's usage sidecar with two *ancient* (idle-since-epoch) agent-created entries
+        // BEFORE the store is first resolved, so the curator's staleness is deterministic (staleness
+        // is wall-clock relative; a freshly-created skill is never idle). `beta` will be archived;
+        // `delta` is the same but will be pinned (and thus protected).
+        let p1_root = skills.root_for("p1");
+        std::fs::create_dir_all(&p1_root).unwrap();
+        let mut seed: std::collections::BTreeMap<String, daemon_common::SkillUsage> =
+            std::collections::BTreeMap::new();
+        for name in ["beta", "delta"] {
+            seed.insert(
+                name.to_string(),
+                daemon_common::SkillUsage {
+                    created_by: daemon_api::SkillCreator::Agent,
+                    state: daemon_api::SkillState::Active,
+                    created_at_ms: 0,
+                    last_used_ms: Some(0),
+                    ..Default::default()
+                },
+            );
+        }
+        std::fs::write(
+            p1_root.join(".usage.json"),
+            serde_json::to_vec_pretty(&seed).unwrap(),
+        )
+        .unwrap();
+
+        // p1 grows three skills (alpha fresh, beta/delta backed by the ancient usage entries); p2 one.
+        // The agent's own write path defaults to Agent authorship, so all are curation-eligible.
+        let p1 = skills.for_profile("p1");
+        for name in ["alpha", "beta", "delta"] {
+            p1.create(name, &sample_skill_md(name), None)
+                .unwrap_or_else(|e| panic!("create {name}: {e}"));
+        }
+        let p2 = skills.for_profile("p2");
+        p2.create("gamma", &sample_skill_md("gamma skill"), None)
+            .expect("p2 gamma");
+
+        // (1) Isolation: p1's listing has its own skills, never p2's gamma; and vice versa.
+        let p1_list = node.curator_list(Some("p1".into())).await.expect("list p1");
+        let p1_names: Vec<_> = p1_list.iter().map(|e| e.name.as_str()).collect();
+        assert!(p1_names.contains(&"alpha") && p1_names.contains(&"beta"));
+        assert!(
+            !p1_names.contains(&"gamma"),
+            "p2's skill must not leak into p1's library"
+        );
+        let p2_list = node.curator_list(Some("p2".into())).await.expect("list p2");
+        let p2_names: Vec<_> = p2_list.iter().map(|e| e.name.as_str()).collect();
+        assert!(p2_names.contains(&"gamma") && !p2_names.contains(&"alpha"));
+
+        // (2) Usage view: a viewed (fresh) skill shows a non-zero view/use count + agent provenance.
+        p1.view("alpha", None).expect("view alpha");
+        let alpha = node
+            .curator_list(Some("p1".into()))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "alpha")
+            .unwrap();
+        assert!(alpha.usage.view_count >= 1 && alpha.usage.use_count >= 1);
+        assert_eq!(alpha.usage.created_by, daemon_api::SkillCreator::Agent);
+
+        // (3) Pin protects from auto-archive: pin delta, run the curator. The idle unpinned `beta`
+        // archives; the idle but pinned `delta` survives; fresh `alpha` is untouched.
+        node.curator_pin(Some("p1".into()), "delta".into())
+            .await
+            .expect("pin delta");
+        let changes = node.curator_run(Some("p1".into())).await.expect("run");
+        let archived: Vec<_> = changes
+            .iter()
+            .filter(|c| c.to == daemon_api::SkillState::Archived)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            archived.contains(&"beta"),
+            "an idle, unpinned, agent-created skill is archived; got {changes:?}"
+        );
+        assert!(
+            !archived.contains(&"delta"),
+            "a pinned skill is protected from auto-archive; got {changes:?}"
+        );
+        assert!(
+            !archived.contains(&"alpha"),
+            "a fresh skill is not archived; got {changes:?}"
+        );
+
+        // beta left discovery; delta + alpha are still live.
+        assert!(p1.find("beta").is_err(), "beta archived out of discovery");
+        assert!(p1.find("delta").is_ok());
+        assert!(p1.find("alpha").is_ok());
+
+        // (4) Restore beta back into the live library.
+        node.curator_restore(Some("p1".into()), "beta".into())
+            .await
+            .expect("restore beta");
+        assert!(p1.find("beta").is_ok(), "restored beta is discoverable again");
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE ROUTING GATE (daemon-event-io-spec §5.9): a routed submit hands the host only an `Origin`
@@ -2836,6 +2976,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: Some(routing),
             checkpoints: None,
         });
@@ -3047,6 +3188,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         });
@@ -3107,6 +3249,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: Some(routing),
             checkpoints: None,
         });
@@ -3180,6 +3323,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         });
@@ -3320,6 +3464,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: Some(routing),
             checkpoints: None,
         });
@@ -3514,6 +3659,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: Some(routing),
             checkpoints: None,
         });
@@ -3714,6 +3860,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: Some(routing),
             checkpoints: None,
         });
@@ -3872,6 +4019,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: Some(routing),
             checkpoints: None,
         });
@@ -4147,6 +4295,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         });
@@ -4362,6 +4511,7 @@ mod node_interface {
             prompt_sources: vec![],
             revisions: None,
             skills: None,
+            skills_resolver: None,
             routing: None,
             checkpoints: None,
         })

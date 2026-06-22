@@ -19,15 +19,20 @@
 
 #![forbid(unsafe_code)]
 
-use daemon_common::{Author, RevisionKind, RevisionLog, SkillBundle};
+use daemon_common::{Author, RevisionKind, RevisionLog, SkillBundle, SkillCreator, SkillUsageLog};
 use daemon_core::StablePromptSource;
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+
+mod curator;
+mod usage;
+pub use curator::{apply_automatic_transitions, CuratorConfig, CuratorTransition};
+pub use usage::FileSkillUsageLog;
 
 /// The curated, tool-agnostic skills daemon ships with, embedded into the binary at compile time and
 /// materialized into the profile's skills dir on first run (see [`SkillStore::seed_bundled`]) — the
@@ -180,6 +185,10 @@ pub struct SkillStore {
     /// Optional append-only revision history; when set, every write records a [`SkillBundle`]
     /// snapshot so skills are versioned (incl. the agent's own background-review edits).
     revisions: Option<Arc<dyn RevisionLog>>,
+    /// Optional per-profile usage + lifecycle sidecar (the `.usage.json`): when set, reads/writes
+    /// bump view/use/patch counters and creates record provenance, so the curator can reason about
+    /// what is actually used. Best-effort: a usage-log hiccup never fails the underlying skill op.
+    usage: Option<Arc<dyn SkillUsageLog>>,
     /// The author attributed to writes through the model-facing tool surface (the agent). Operator
     /// writes (import / revert from the NodeApi) pass their author explicitly.
     default_author: Author,
@@ -192,6 +201,7 @@ impl SkillStore {
             root: root.into(),
             index_cache: Mutex::new(None),
             revisions: None,
+            usage: None,
             default_author: Author::Agent("skill_manage".to_string()),
         }
     }
@@ -200,6 +210,18 @@ impl SkillStore {
     pub fn with_revisions(mut self, revisions: Arc<dyn RevisionLog>) -> Self {
         self.revisions = Some(revisions);
         self
+    }
+
+    /// Attach a per-profile [`SkillUsageLog`] (the `.usage.json` sidecar) so reads/writes bump
+    /// usage counters and the curator can track lifecycle state.
+    pub fn with_usage(mut self, usage: Arc<dyn SkillUsageLog>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// The usage sidecar, if one is attached (the curator's system of record for this profile).
+    pub fn usage(&self) -> Option<&Arc<dyn SkillUsageLog>> {
+        self.usage.as_ref()
     }
 
     /// The skills root directory.
@@ -282,13 +304,18 @@ impl SkillStore {
     /// given (loaded on demand — the progressive-disclosure level-2/3 read).
     pub fn view(&self, name: &str, file_path: Option<&str>) -> Result<String, SkillError> {
         let entry = self.find(name)?;
-        match file_path {
-            None => Ok(fs::read_to_string(entry.skill_md())?),
+        let body = match file_path {
+            None => fs::read_to_string(entry.skill_md())?,
             Some(rel) => {
                 let path = self.safe_join(&entry.dir, rel)?;
-                Ok(fs::read_to_string(path)?)
+                fs::read_to_string(path)?
             }
+        };
+        // A successful load counts as a use (the agent loaded the body to apply the skill).
+        if let Some(usage) = &self.usage {
+            usage.record_view(name);
         }
+        Ok(body)
     }
 
     /// Create a new skill bundle `<root>/[category/]name/SKILL.md` from a full `SKILL.md` `content`.
@@ -316,6 +343,10 @@ impl SkillStore {
         fs::write(&md, content)?;
         self.invalidate();
         self.record(name, self.default_author.clone(), "create");
+        // A create through the model-facing tool surface is agent-authored (curation-eligible).
+        if let Some(usage) = &self.usage {
+            usage.record_create(name, creator_of(&self.default_author));
+        }
         Ok(md)
     }
 
@@ -326,6 +357,9 @@ impl SkillStore {
         fs::write(entry.skill_md(), content)?;
         self.invalidate();
         self.record(name, self.default_author.clone(), "edit");
+        if let Some(usage) = &self.usage {
+            usage.record_patch(name);
+        }
         Ok(entry.skill_md())
     }
 
@@ -357,6 +391,9 @@ impl SkillStore {
         fs::write(&target, patched)?;
         self.invalidate();
         self.record(name, self.default_author.clone(), "patch");
+        if let Some(usage) = &self.usage {
+            usage.record_patch(name);
+        }
         Ok(target)
     }
 
@@ -378,6 +415,9 @@ impl SkillStore {
         fs::remove_dir_all(&entry.dir)?;
         self.invalidate();
         self.record(name, self.default_author.clone(), "delete");
+        if let Some(usage) = &self.usage {
+            usage.forget(name);
+        }
         Ok(())
     }
 
@@ -397,6 +437,9 @@ impl SkillStore {
         fs::write(&path, content)?;
         self.invalidate();
         self.record(name, self.default_author.clone(), "write_file");
+        if let Some(usage) = &self.usage {
+            usage.record_patch(name);
+        }
         Ok(path)
     }
 
@@ -407,6 +450,9 @@ impl SkillStore {
         fs::remove_file(&path)?;
         self.invalidate();
         self.record(name, self.default_author.clone(), "remove_file");
+        if let Some(usage) = &self.usage {
+            usage.record_patch(name);
+        }
         Ok(())
     }
 
@@ -477,6 +523,16 @@ impl SkillStore {
             )));
         }
         self.invalidate();
+        if let Some(usage) = &self.usage {
+            // An import is operator/agent-authored per `author`; a bundled name (reconstituted on
+            // import) is protected from curation.
+            let creator = if self.is_bundled(&bundle.name) {
+                SkillCreator::Bundled
+            } else {
+                creator_of(&author)
+            };
+            usage.record_create(&bundle.name, creator);
+        }
         self.record(&bundle.name, author, reason);
         Ok(())
     }
@@ -484,6 +540,86 @@ impl SkillStore {
     /// Whether `name` is one of the binary-bundled skills (read-only: not versioned/reverted/exported).
     pub fn is_bundled(&self, name: &str) -> bool {
         bundled_names().contains(name)
+    }
+
+    // -- curator lifecycle (archive / restore) --------------------------------------------------
+
+    /// The `.archive/` subdir under the store root (discovery-excluded).
+    fn archive_root(&self) -> PathBuf {
+        self.root.join(".archive")
+    }
+
+    /// Archive a live skill: move its bundle dir under `<root>/.archive/` (preserving the category
+    /// subpath) so it leaves discovery + the prompt index without being destroyed. Records a revision
+    /// + flips usage state to `Archived`. Rejected for binary-bundled skills (read-only).
+    pub fn archive(&self, name: &str) -> Result<(), SkillError> {
+        if self.is_bundled(name) {
+            return Err(SkillError::Invalid(format!(
+                "skill `{name}` is binary-bundled and cannot be archived"
+            )));
+        }
+        let entry = self.find(name)?;
+        let rel = entry
+            .dir
+            .strip_prefix(&self.root)
+            .map_err(|_| SkillError::Invalid(format!("skill `{name}` is outside the store root")))?;
+        let dest = self.archive_root().join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if dest.exists() {
+            fs::remove_dir_all(&dest)?;
+        }
+        move_dir(&entry.dir, &dest)?;
+        self.invalidate();
+        self.record(name, self.default_author.clone(), "archive");
+        if let Some(usage) = &self.usage {
+            usage.set_state(name, daemon_common::SkillState::Archived);
+        }
+        Ok(())
+    }
+
+    /// Restore an archived skill: move its bundle dir back from `<root>/.archive/` into the live tree
+    /// (at its original category path). Records a revision + flips usage state to `Active`.
+    pub fn restore(&self, name: &str) -> Result<(), SkillError> {
+        let mut found = Vec::new();
+        walk_skill_files(&self.archive_root(), &mut found);
+        let src = found
+            .into_iter()
+            .map(|md| md.parent().map(Path::to_path_buf).unwrap_or_default())
+            .find(|dir| dir.file_name().map(|n| n.to_string_lossy()).as_deref() == Some(name))
+            .ok_or_else(|| SkillError::NotFound(format!(".archive/{name}")))?;
+        let rel = src
+            .strip_prefix(self.archive_root())
+            .map_err(|_| SkillError::Invalid(format!("archived `{name}` is malformed")))?;
+        let dest = self.root.join(rel);
+        if dest.exists() {
+            return Err(SkillError::Exists(name.to_string()));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        move_dir(&src, &dest)?;
+        self.invalidate();
+        self.record(name, self.default_author.clone(), "restore");
+        if let Some(usage) = &self.usage {
+            usage.set_state(name, daemon_common::SkillState::Active);
+        }
+        Ok(())
+    }
+
+    /// The names of every archived skill bundle under `<root>/.archive/`.
+    pub fn archived(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        walk_skill_files(&self.archive_root(), &mut found);
+        found
+            .into_iter()
+            .filter_map(|md| {
+                md.parent()
+                    .and_then(Path::file_name)
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .collect()
     }
 
     /// Record a revision of `name`'s current on-disk bundle (a tombstone when it was just deleted).
@@ -617,6 +753,112 @@ impl SkillStore {
     }
 }
 
+/// How a [`SkillsProvider`] roots each profile's skills dir.
+enum SkillsRoot {
+    /// Per-profile (the default): each profile `id` roots at `<data_dir>/<id>/skills`, so two agents
+    /// never share a skills library (the per-profile model — a profile *is* an agent).
+    PerProfile(PathBuf),
+    /// A single fixed dir shared by every profile (the legacy `[skills].dir` operator override): all
+    /// profiles resolve the same store. Back-compat for a single-agent node with an explicit dir.
+    Fixed(PathBuf),
+}
+
+/// Resolves (and caches) a per-profile [`SkillStore`] — the seam that makes skills *profile-aware*.
+///
+/// Memory and context are resolved per agent at session open (the `MemoryBuilder`/`ContextEngineBuilder`
+/// closures keyed on the routed [`ProfileRef`]); skills were the one engine subsystem still built once
+/// at node startup over the launch agent's home and shared across every session. [`SkillsProvider`] is
+/// the analogue: given a profile id it yields that agent's `Arc<SkillStore>` rooted at
+/// `<data_dir>/<id>/skills`, seeded with the bundled skills on first open and recording through the
+/// node's shared [`RevisionLog`]. Stores are cached per id (skills are read-mostly; one resident store
+/// per agent, reused across that agent's sessions), so the index memoization survives between turns.
+/// A per-profile usage-log factory: given a profile store's root dir, yields the [`SkillUsageLog`]
+/// (the `.usage.json` sidecar) bound to that profile.
+pub type UsageLogFactory = Arc<dyn Fn(&Path) -> Arc<dyn SkillUsageLog> + Send + Sync>;
+
+pub struct SkillsProvider {
+    root: SkillsRoot,
+    /// The append-only revision log every resolved store records through (shared by profiles + skills).
+    revisions: Option<Arc<dyn RevisionLog>>,
+    /// The per-profile usage sidecar factory: given a store root, yields the `.usage.json`-backed log
+    /// attached to that profile's store (`None` => usage tracking off).
+    usage: Option<UsageLogFactory>,
+    /// Resolved stores, keyed by profile id (read-mostly; one resident store per agent).
+    cache: Mutex<HashMap<String, Arc<SkillStore>>>,
+}
+
+impl SkillsProvider {
+    /// A per-profile provider rooting each profile `id` at `<data_dir>/<id>/skills`.
+    pub fn per_profile(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root: SkillsRoot::PerProfile(data_dir.into()),
+            revisions: None,
+            usage: None,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A provider that resolves every profile to one fixed `dir` (the legacy `[skills].dir` override
+    /// for a single-agent node).
+    pub fn fixed(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root: SkillsRoot::Fixed(dir.into()),
+            revisions: None,
+            usage: None,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attach the shared revision log every resolved store records writes through.
+    pub fn with_revisions(mut self, revisions: Arc<dyn RevisionLog>) -> Self {
+        self.revisions = Some(revisions);
+        self
+    }
+
+    /// Attach a per-profile usage-log factory (the `.usage.json` sidecar): the closure is handed each
+    /// profile store's root and returns the log bound to that profile.
+    pub fn with_usage(mut self, factory: UsageLogFactory) -> Self {
+        self.usage = Some(factory);
+        self
+    }
+
+    /// The skills root directory for profile `id`.
+    pub fn root_for(&self, id: &str) -> PathBuf {
+        match &self.root {
+            SkillsRoot::PerProfile(data_dir) => data_dir.join(id).join("skills"),
+            SkillsRoot::Fixed(dir) => dir.clone(),
+        }
+    }
+
+    /// Resolve (constructing + caching on first call) the [`SkillStore`] for profile `id`: rooted at
+    /// [`Self::root_for`], recording through the shared revision log, with the bundled skills seeded
+    /// into the profile on first open (best-effort — a seed hiccup never fails resolution).
+    pub fn for_profile(&self, id: &str) -> Arc<SkillStore> {
+        if let Some(store) = self.cache.lock().unwrap().get(id) {
+            return store.clone();
+        }
+        let root = self.root_for(id);
+        let mut store = SkillStore::new(root.clone());
+        if let Some(revisions) = &self.revisions {
+            store = store.with_revisions(revisions.clone());
+        }
+        if let Some(factory) = &self.usage {
+            store = store.with_usage(factory(&root));
+        }
+        let store = Arc::new(store);
+        match store.seed_bundled() {
+            Ok(seeded) if !seeded.is_empty() => {
+                tracing::info!(profile = id, skills = ?seeded, "seeded bundled skills into profile")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(profile = id, error = %e, "seeding bundled skills failed"),
+        }
+        // Double-checked insert: another thread may have resolved concurrently; keep whichever won.
+        let mut cache = self.cache.lock().unwrap();
+        cache.entry(id.to_string()).or_insert(store).clone()
+    }
+}
+
 /// The skills *index* as a [`StablePromptSource`] (§10): emits the progressive-disclosure index into
 /// the stable system-prompt tier, but **only when enabled** — hermes injects the index only if the
 /// agent actually has the skills tools (`skills_list`/`skill_view`/`skill_manage`), so the binary
@@ -694,6 +936,15 @@ fn validate_skill_md(content: &str) -> Result<(), SkillError> {
     Ok(())
 }
 
+/// Map a revision [`Author`] onto the usage-log [`SkillCreator`] provenance (operator => user;
+/// agent => agent). The bundled case is decided by the caller via [`SkillStore::is_bundled`].
+fn creator_of(author: &Author) -> SkillCreator {
+    match author {
+        Author::Operator => SkillCreator::User,
+        Author::Agent(_) => SkillCreator::Agent,
+    }
+}
+
 fn validate_name(name: &str) -> Result<(), SkillError> {
     validate_segment(name)
 }
@@ -759,6 +1010,17 @@ fn walk_skill_files(root: &Path, out: &mut Vec<PathBuf>) {
             walk_skill_files(&path, out);
         }
     }
+}
+
+/// Move `src` to `dst`, preferring an atomic rename and falling back to copy + remove when the move
+/// crosses a filesystem boundary (`EXDEV`). Used by archive/restore.
+fn move_dir(src: &Path, dst: &Path) -> Result<(), SkillError> {
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    copy_dir_all(src, dst)?;
+    fs::remove_dir_all(src)?;
+    Ok(())
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), SkillError> {
