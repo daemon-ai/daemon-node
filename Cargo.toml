@@ -119,6 +119,7 @@ daemon-acp = { path = "crates/adapters/daemon-acp" }
 daemon-http = { path = "crates/adapters/daemon-http" }
 daemon-mcp-client = { path = "crates/adapters/daemon-mcp-client" }
 daemon-delivery = { path = "crates/adapters/daemon-delivery" }
+daemon-ingest = { path = "crates/adapters/daemon-ingest" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }

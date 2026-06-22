@@ -1,0 +1,22 @@
+[package]
+name = "daemon-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Reusable, transport-agnostic *inbound* gate (daemon-event-io-spec §5.9.1): the symmetric counterpart
+# to `daemon-delivery`. An adapter classifies whether a transport message is addressed (mention / DM /
+# `!command`); this crate owns the transport-agnostic decision of *which* `AgentCommand` to submit
+# (StartTurn / Steer / Observe / Interrupt) given the addressing + the session's busy state, plus the
+# bounded queue/fold buffering, driving `submit_routed`. Depends only on the contracts + async runtime,
+# so it carries no host or substrate types and any transport adapter can build on it.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

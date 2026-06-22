@@ -101,6 +101,14 @@ flowchart LR
 `session_id_for(origin, binding.isolation)` (default `PerThread`, collapsing to `PerChat` where the
 room has no threads) yields the deterministic `SessionId`.
 
+The adapter does **not** hand-roll the addressed-vs-ambient → command mapping above (rows 1–2): it
+classifies *addressed* (mention / DM / `!command` — the transport-specific part) and hands a
+normalised `Reception { origin, input, addressed }` to the reusable `daemon-ingest` gate (event-io
+§5.9.1), which owns the command selection (`StartTurn` / `Observe` / busy `Queue`|`Interrupt`|`Steer`)
+and the bounded buffering over `submit_routed` — the inbound mirror of the `daemon-delivery`
+`Projector` it already runs outbound. Busy state is fed to the gate from the same outbound stream
+(`TurnStarted`/`TurnFinished`).
+
 ### 3.2 Outbound mapping (daemon → Matrix)
 
 The adapter `subscribe`s the sessions whose Primary names one of its account instances (subscriber
@@ -142,11 +150,15 @@ should *see* other humans' chatter as context but only *turn* on a mention / DM 
   as context and still mention-gate the *turn*, without the buffer-and-fold workaround. Either
   approach works; `Observe` is the cleaner one now that it exists.
 
-**Addressing / trigger + busy policy is pure adapter logic** (prior art: hermes `busy_input_mode`), no
-contract home needed:
-- *trigger:* explicit mention of the bot, DM, or a `!command` prefix; configurable per route.
-- *busy session:* `queue` (default) | `interrupt` | `steer`, with the ring cap; mirrors hermes
-  semantics without importing its mechanism.
+**Addressing / trigger + busy policy** is split cleanly: *addressing classification* is the only
+transport-specific piece the adapter keeps; *busy/Observe command selection* is the reusable
+`daemon-ingest` gate (event-io §5.9.1), no per-adapter re-implementation:
+- *trigger (adapter-owned):* explicit mention of the bot, DM, or a `!command` prefix; configurable
+  per route. The adapter sets `Reception.addressed`.
+- *busy session (the gate, `daemon_ingest::BusyPolicy`):* `Queue` (default) | `Interrupt` | `Steer`,
+  with the ring cap; mirrors hermes `busy_input_mode` semantics without importing its mechanism.
+- *ambient (the gate, `daemon_ingest::AmbientPolicy`):* `Observe` (default — append context without a
+  turn, wire v8) | `Fold` (buffer-and-fold into the next addressed `StartTurn`).
 
 ---
 
@@ -369,14 +381,19 @@ whole point of the merged-log paradigm.
   (`daemon_host::DeliveryHost`), and the reusable `daemon-delivery` pull subscriber (the M3/M4 outbound
   substrate this adapter plugs its `Projector` into); and the **account provisioning seam** (§6.2):
   the in-process `daemon_host::AccountProvisioning` (enumerate accounts by family + resolve/write-back
-  credential blobs) the M2/M3 bring-up consumes. All testable without Matrix.
+  credential blobs) the M2/M3 bring-up consumes; and the **reusable inbound gate** (§5.9.1):
+  `daemon-ingest` (`Ingestor` + `Reception`, the addressing/busy/Observe command selection over
+  `submit_routed`) — the symmetric counterpart to `daemon-delivery` the M3 inbound path plugs into.
+  All testable without Matrix.
 - **M2 — `daemon-matrix` skeleton + per-account `login`.** SSO writes the session into `CredentialStore`
   via `AccountProvisioning::store_account_credential` under the account's credential-ref; the adapter
   restores from there (`account_credential`) and opens the per-account E2EE store; refresh write-back.
   Feasibility proof.
 - **M3 — inbound projection.** Enumerate credential-bound accounts per profile (`bound_accounts("matrix")`); SyncService/Timeline →
-  router (account→profile default + room override) → `submit_from`; mention/busy policy; final-text
-  reply to the per-account `Primary`.
+  the adapter classifies addressing and hands a `Reception` to the `daemon-ingest` gate (which owns
+  busy/Observe command selection over `submit_routed`, account→profile default + room override);
+  final-text reply to the per-account `Primary`. The gate's busy state is fed from the M4 outbound
+  stream's `TurnStarted`/`TurnFinished`.
 - **M4 — outbound richness.** Outbound delivery via the `daemon-delivery` subscriber (or an in-process
   `DeliverySink`) with a Matrix `Projector`; `HostRequest` → reaction-approval → `respond`;
   typing/receipt → `record_meta`; streaming-edit replies.

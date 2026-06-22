@@ -712,6 +712,19 @@ profiles also imply **profile-scoped subsystem stores**, also landed: `profile_h
 routed to two profiles get isolated banks. The `instance_profiles` baseline (precedence step 2) is
 itself derived from each profile's declared `bound_accounts` (§5.9.4).
 
+**Reusable inbound gate (landed) — the symmetric counterpart to §5.9.3's `daemon-delivery`.** The
+adapter still owns the *transport-specific* part: classifying whether a message is *addressed* (a
+mention / DM / `!command`). Everything transport-agnostic from there is stitched into one reusable
+helper, `daemon-ingest`, so an adapter does not re-implement it: it owns the decision of **which**
+`AgentCommand` to submit given the addressing + the session's busy state, plus the bounded
+queue/fold buffering, driving `submit_routed` (so routing, profile binding, and `Primary` seeding
+stay host-owned). The decision table — idle+addressed → `StartTurn`; ambient → `Observe` (or
+buffer-and-fold); addressed-while-busy → `Queue` (replay on turn finish) | `Interrupt` | `Steer` — is
+the inbound mirror of the outbound `Projector` policy. Busy state is driven by `note_turn_started` /
+`note_turn_finished` hooks the adapter feeds from the outbound turn lifecycle it already consumes via
+`daemon-delivery` (no second subscription, no host coupling). It reuses only the existing
+`submit_routed` + `AgentCommand` surface, so it carries no `WireVersion`/CDDL/MSRV change.
+
 #### 5.9.2 Transport-instance identity (multiple accounts)
 
 A transport *family* (`"matrix"`, `"slack"`) can have many *instances* (accounts). Two ways to carry
