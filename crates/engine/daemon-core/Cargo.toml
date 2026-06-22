@@ -17,3 +17,6 @@ ciborium = { workspace = true }
 futures = { workspace = true }
 strsim = { workspace = true }
 serde_json = { workspace = true }
+# best-effort observability for the §12 checkpoint stage (capture/restore failures never fail a turn,
+# so they are logged rather than propagated). The only logging dep in the otherwise log-free core.
+tracing = { workspace = true }

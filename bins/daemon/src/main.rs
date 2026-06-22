@@ -688,6 +688,52 @@ async fn build_python_tools(cfg: &NodeConfig) -> Vec<Arc<dyn Tool>> {
     }
 }
 
+/// Discover + register tools from every enabled MCP server (`[[mcp.servers]]`). Each server is
+/// surfaced through the shared [`ToolProvider`](daemon_core::ToolProvider) seam (the same boundary as
+/// the Python worker); its `mcp__{server}__{tool}` proxies join the registry by name and the
+/// connection is (re)established lazily. Discovery failures degrade gracefully: a warning is logged
+/// and that server contributes no tools, so one unreachable server never blocks node startup.
+async fn build_mcp_tools(cfg: &NodeConfig) -> Vec<Arc<dyn Tool>> {
+    use config::{McpServerEntry, McpTransportEntry};
+    use daemon_mcp_client::{McpClientProvider, McpServerConfig, McpTransport};
+
+    let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+    for entry in &cfg.mcp.servers {
+        let McpServerEntry {
+            name,
+            enable,
+            transport,
+            op_timeout,
+        } = entry;
+        if !enable {
+            continue;
+        }
+        let transport = match transport {
+            McpTransportEntry::Stdio { command, args, env } => McpTransport::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+            },
+            McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
+        };
+        let provider = McpClientProvider::new(McpServerConfig {
+            name: name.clone(),
+            transport,
+            op_timeout: *op_timeout,
+        });
+        match provider.discover().await {
+            Ok(tools) => {
+                tracing::info!(server = %name, count = tools.len(), "mcp tools discovered and registered");
+                out.extend(tools);
+            }
+            Err(err) => {
+                tracing::warn!(server = %name, error = %err, "mcp server discovery failed; no tools registered");
+            }
+        }
+    }
+    out
+}
+
 /// Build the `browser` tool when enabled and compiled in (the `browser` feature). The supervised
 /// Chromium is launched lazily on first use.
 #[cfg(feature = "browser")]
@@ -1226,6 +1272,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // tool joins the registry by name; the worker process itself is (re)spawned lazily on first call.
     extra_tools.extend(build_python_tools(&cfg).await);
 
+    // The optional MCP tools (opt-in per `[[mcp.servers]]`). Discovered up-front through the same
+    // `ToolProvider` seam; each server's `mcp__{server}__{tool}` proxies join the registry by name
+    // and the connection is (re)established lazily. Gated by `ProfileSpec.tool_allowlist` like any
+    // other tool.
+    extra_tools.extend(build_mcp_tools(&cfg).await);
+
     // The optional `browser` tool — only available when the daemon is built with the `browser`
     // feature (which compiles chromiumoxide); a no-op otherwise.
     if let Some(browser_tool) = build_browser_tool(&cfg) {
@@ -1260,6 +1312,14 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     };
 
     let routing = build_routing_registry(&cfg.routing);
+    // The §12 tool-checkpoint store: a workspace checkpoint is recorded before each mutating tool
+    // runs (rewindable via the `Checkpoint{List,Rewind}` control ops). The ledger lives under the
+    // data dir so rewind points survive a restart.
+    let checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>> =
+        Some(Arc::new(daemon_core::LocalCheckpointStore::new(
+            cfg.data_dir.join("checkpoints"),
+        )) as Arc<dyn daemon_core::CheckpointStore>);
+
     let AssembledNode { node, handle, .. } = assemble(NodeAssembly {
         store,
         partition: cfg.partition,
@@ -1284,6 +1344,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         revisions,
         skills: skills_store,
         routing,
+        checkpoints,
     });
     tracing::info!("daemon host node started");
 

@@ -16,12 +16,19 @@
 
 use crate::conversation::{ToolCall, ToolResult};
 use crate::repair::{repair_tool_args, wrap_untrusted_tool_result};
-use crate::tools::{ToolOutcome, ToolRegistry};
+use crate::tools::{ToolOutcome, ToolRegistry, TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH};
 use crate::turn::TurnCx;
 
 /// Run one tool call through the pipeline (§12): resolve -> validate/repair args -> execute ->
-/// wrap-untrusted -> sanitize + budget.
+/// wrap-untrusted -> sanitize + budget. The `tool_search`/`tool_describe`/`tool_call` bridge names
+/// (progressive disclosure for tools) are intercepted here, where the `registry` is in scope.
 pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>) -> ToolOutcome {
+    match call.name.as_str() {
+        TOOL_SEARCH => return tool_search(call, registry),
+        TOOL_DESCRIBE => return tool_describe(call, registry),
+        TOOL_CALL => return Box::pin(tool_call(call, registry, cx)).await,
+        _ => {}
+    }
     // Stage 2: repair + canonicalize the argument JSON (§9). Cheap no-op for already-clean args;
     // recovers fenced/trailing-comma/truncated payloads so the tool's own decode succeeds.
     let repaired = repair_tool_args(&call.args);
@@ -30,7 +37,22 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
         name: call.name.clone(),
         args: repaired.args,
     };
-    let mut outcome = match registry.get(&call.name) {
+    let resolved = registry.get(&call.name);
+
+    // Stage 2.5 (§12 checkpoint): before a *mutating* tool touches the workspace, record a
+    // best-effort checkpoint so an operator can rewind. Never fails the turn (capture logs + skips).
+    if let (Some(store), Some(tool)) = (cx.checkpoints, &resolved) {
+        if tool.mutates() {
+            if let Some(record) = store
+                .capture(cx.session_id.as_str(), &call.call_id, &call.name, cx.exec)
+                .await
+            {
+                tracing::debug!(checkpoint = %record.id, tool = %call.name, "recorded pre-tool checkpoint");
+            }
+        }
+    }
+
+    let mut outcome = match resolved {
         Some(tool) => tool.run(&call, cx).await,
         None => ToolOutcome::text(
             call.call_id.clone(),
@@ -45,6 +67,93 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
     }
     budget_result(&mut outcome.result, cx.tool_result_budget);
     outcome
+}
+
+/// `tool_search`: rank the deferrable tools whose name or schema matches the query's keywords and
+/// return a compact `name + schema` listing (the model then `tool_describe`s or `tool_call`s one).
+fn tool_search(call: &ToolCall, registry: &ToolRegistry) -> ToolOutcome {
+    let query = json_field(&call.args, "query").unwrap_or_default();
+    let needles: Vec<String> = query
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+    let mut hits: Vec<_> = registry
+        .deferrable_defs()
+        .into_iter()
+        .filter_map(|d| {
+            let hay = format!("{} {}", d.name, d.schema).to_lowercase();
+            // Empty query lists everything; otherwise score by matched keyword count.
+            let score = if needles.is_empty() {
+                1
+            } else {
+                needles.iter().filter(|n| hay.contains(n.as_str())).count()
+            };
+            (score > 0).then_some((score, d))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    if hits.is_empty() {
+        return ToolOutcome::text(
+            call.call_id.clone(),
+            true,
+            format!("no tools match {query:?}"),
+        );
+    }
+    let listing: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(_, d)| serde_json::json!({ "name": d.name, "schema": d.schema }))
+        .collect();
+    let body = serde_json::to_string(&listing).unwrap_or_else(|_| "[]".to_string());
+    ToolOutcome::text(call.call_id.clone(), true, body)
+}
+
+/// `tool_describe`: return the named tool's full JSON-Schema (across core + deferrable).
+fn tool_describe(call: &ToolCall, registry: &ToolRegistry) -> ToolOutcome {
+    let name = json_field(&call.args, "name").unwrap_or_default();
+    match registry.get(&name) {
+        Some(tool) => ToolOutcome::text(
+            call.call_id.clone(),
+            true,
+            serde_json::json!({ "name": tool.name(), "schema": tool.schema() }).to_string(),
+        ),
+        None => ToolOutcome::text(call.call_id.clone(), false, format!("unknown tool: {name}")),
+    }
+}
+
+/// `tool_call`: invoke a (possibly collapsed) tool by name. Unwraps `{ name, arguments }`, builds the
+/// inner [`ToolCall`] (reusing the outer `call_id` so the result threads back), and runs it through
+/// the ordinary pipeline — so a deferrable tool reached via the bridge gets the same repair +
+/// untrusted-fence + budget treatment as a directly-offered one.
+async fn tool_call(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>) -> ToolOutcome {
+    let parsed: serde_json::Value = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
+    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return ToolOutcome::text(
+            call.call_id.clone(),
+            false,
+            "tool_call requires a `name`".to_string(),
+        );
+    }
+    // `arguments` may be an embedded object or a JSON string; normalize to a JSON string for the
+    // inner call (the pipeline repairs it again defensively).
+    let args = match parsed.get("arguments") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => "{}".to_string(),
+    };
+    let inner = ToolCall {
+        call_id: call.call_id.clone(),
+        name: name.to_string(),
+        args,
+    };
+    run_tool(&inner, registry, cx).await
+}
+
+/// Pull a string field out of a (possibly messy) JSON argument object, repairing it first.
+fn json_field(args: &str, key: &str) -> Option<String> {
+    let repaired = repair_tool_args(args);
+    let v: serde_json::Value = serde_json::from_str(&repaired.args).ok()?;
+    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
 /// The §12 sanitize+budget stage: truncate an oversized tool result to the per-tool budget, leaving
@@ -86,6 +195,65 @@ mod tests {
         }
     }
 
+    /// A trivial deferrable tool that echoes its name into the result content.
+    struct DeferTool {
+        name: &'static str,
+        schema: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DeferTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn schema(&self) -> &str {
+            self.schema
+        }
+        fn deferrable(&self) -> bool {
+            true
+        }
+        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {
+            ToolOutcome::text(call.call_id.clone(), true, format!("ran {}", self.name))
+        }
+    }
+
+    /// Build a minimal `TurnCx` for pipeline tests (mirrors `untrusted_outcome_is_fenced_by_pipeline`).
+    macro_rules! with_cx {
+        ($cx:ident => $body:block) => {{
+            use crate::events::EventSink;
+            use crate::exec::LocalEnvironment;
+            use daemon_common::{Budget, SessionId};
+            use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+
+            struct NoopHost;
+            #[async_trait::async_trait]
+            impl HostRequestHandler for NoopHost {
+                async fn request(&self, req: HostRequest) -> HostResponse {
+                    HostResponse {
+                        request_id: req.request_id,
+                        body: HostResponseBody::Approved(true),
+                    }
+                }
+            }
+            let events = EventSink::discarding();
+            let exec = LocalEnvironment::sandbox("bridge-test");
+            let $cx = TurnCx {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                events: &events,
+                host: &NoopHost,
+                session_id: SessionId::new("s"),
+                profile: None,
+                budget: Budget::unlimited(),
+                exec: &exec,
+                tool_result_budget: 0,
+                approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
+                pre_approved: false,
+                checkpoints: None,
+            };
+            $body
+        }};
+    }
+
     /// An untrusted outcome is fenced by the pipeline before budgeting so the model reads it as data.
     #[tokio::test]
     async fn untrusted_outcome_is_fenced_by_pipeline() {
@@ -120,6 +288,7 @@ mod tests {
             tool_result_budget: 0,
             approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
             pre_approved: false,
+            checkpoints: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -154,6 +323,178 @@ mod tests {
         budget_result(&mut result, 0);
         assert_eq!(result.content.len(), 1000);
         assert!(!result.content.contains("truncated"));
+    }
+
+    #[test]
+    fn registry_splits_core_and_deferrable_and_collapses_over_threshold() {
+        use crate::tools::{TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH};
+        use std::sync::Arc;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(UntrustedTool)); // core (deferrable() == false)
+        registry.register(Arc::new(DeferTool {
+            name: "mcp__srv__alpha",
+            schema: "{\"a\":1}",
+        }));
+        registry.register(Arc::new(DeferTool {
+            name: "mcp__srv__beta",
+            schema: "{\"b\":2}",
+        }));
+
+        // Below threshold (0 disables): every tool offered inline, no bridge.
+        let inline = registry.offered_defs(0);
+        let inline_names: Vec<_> = inline.iter().map(|d| d.name.as_str()).collect();
+        assert!(inline_names.contains(&"untrusted"));
+        assert!(inline_names.contains(&"mcp__srv__alpha"));
+        assert!(inline_names.contains(&"mcp__srv__beta"));
+        assert!(!inline_names.contains(&TOOL_SEARCH));
+
+        // Above threshold: core stays, deferrable collapses behind the three bridge tools.
+        let collapsed = registry.offered_defs(1);
+        let names: Vec<_> = collapsed.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"untrusted"));
+        assert!(names.contains(&TOOL_SEARCH));
+        assert!(names.contains(&TOOL_DESCRIBE));
+        assert!(names.contains(&TOOL_CALL));
+        assert!(!names.contains(&"mcp__srv__alpha"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_then_tool_call_reaches_a_collapsed_tool() {
+        use std::sync::Arc;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DeferTool {
+            name: "mcp__srv__alpha",
+            schema: "{\"description\":\"alpha widget\"}",
+        }));
+        registry.register(Arc::new(DeferTool {
+            name: "mcp__srv__beta",
+            schema: "{\"description\":\"beta gadget\"}",
+        }));
+
+        with_cx!(cx => {
+            // tool_search narrows by keyword.
+            let search = ToolCall {
+                call_id: "s1".into(),
+                name: "tool_search".into(),
+                args: "{\"query\":\"widget\"}".into(),
+            };
+            let out = run_tool(&search, &registry, &cx).await;
+            assert!(out.result.ok);
+            assert!(out.result.content.contains("mcp__srv__alpha"));
+            assert!(!out.result.content.contains("mcp__srv__beta"));
+
+            // tool_describe returns the full schema.
+            let describe = ToolCall {
+                call_id: "d1".into(),
+                name: "tool_describe".into(),
+                args: "{\"name\":\"mcp__srv__beta\"}".into(),
+            };
+            let out = run_tool(&describe, &registry, &cx).await;
+            assert!(out.result.content.contains("beta gadget"));
+
+            // tool_call routes through the pipeline to the collapsed tool, preserving call_id.
+            let call = ToolCall {
+                call_id: "c1".into(),
+                name: "tool_call".into(),
+                args: "{\"name\":\"mcp__srv__alpha\",\"arguments\":{}}".into(),
+            };
+            let out = run_tool(&call, &registry, &cx).await;
+            assert!(out.result.ok);
+            assert_eq!(out.result.call_id, "c1");
+            assert_eq!(out.result.content, "ran mcp__srv__alpha");
+        });
+    }
+
+    /// A mutating tool that writes a file in the workspace.
+    struct MutatingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MutatingTool {
+        fn name(&self) -> &str {
+            "mutator"
+        }
+        fn schema(&self) -> &str {
+            "{}"
+        }
+        fn mutates(&self) -> bool {
+            true
+        }
+        async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
+            let _ = cx
+                .exec
+                .write(std::path::Path::new("out.txt"), b"changed")
+                .await;
+            ToolOutcome::text(call.call_id.clone(), true, "wrote")
+        }
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_records_a_checkpoint_before_running() {
+        use crate::checkpoint::{CheckpointStore, LocalCheckpointStore};
+        use crate::events::EventSink;
+        use crate::exec::LocalEnvironment;
+        use daemon_common::{Budget, SessionId};
+        use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+        use std::sync::Arc;
+
+        struct NoopHost;
+        #[async_trait::async_trait]
+        impl HostRequestHandler for NoopHost {
+            async fn request(&self, req: HostRequest) -> HostResponse {
+                HostResponse {
+                    request_id: req.request_id,
+                    body: HostResponseBody::Approved(true),
+                }
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ws = std::env::temp_dir().join(format!("daemon-ckpt-stage-ws-{nanos}"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("out.txt"), b"original").unwrap();
+        // The checkpoint data-root lives OUTSIDE the workspace (as `<data_dir>/checkpoints` does in
+        // production), so a snapshot never recursively copies itself.
+        let store_root = std::env::temp_dir().join(format!("daemon-ckpt-stage-store-{nanos}"));
+        let store: Arc<dyn CheckpointStore> = Arc::new(LocalCheckpointStore::new(&store_root));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(MutatingTool));
+        let events = EventSink::discarding();
+        let exec = LocalEnvironment::new(&ws);
+        let cx = TurnCx {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            events: &events,
+            host: &NoopHost,
+            session_id: SessionId::new("sess"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: &exec,
+            tool_result_budget: 0,
+            approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
+            pre_approved: false,
+            checkpoints: Some(store.as_ref()),
+        };
+        let call = ToolCall {
+            call_id: "call-1".into(),
+            name: "mutator".into(),
+            args: "{}".into(),
+        };
+        let out = run_tool(&call, &registry, &cx).await;
+        assert!(out.result.ok);
+
+        // The pre-tool checkpoint was recorded, and rewinding restores the pre-edit content.
+        let records = store.list(Some("sess")).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool, "mutator");
+        assert_eq!(std::fs::read(ws.join("out.txt")).unwrap(), b"changed");
+        store.restore(&records[0]).await.unwrap();
+        assert_eq!(std::fs::read(ws.join("out.txt")).unwrap(), b"original");
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store_root);
     }
 
     #[test]

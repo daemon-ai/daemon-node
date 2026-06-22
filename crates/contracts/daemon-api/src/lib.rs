@@ -359,6 +359,23 @@ pub trait ControlApi: Send + Sync {
     async fn verifying_key(&self) -> Option<String> {
         None
     }
+
+    /// List recorded §12 tool checkpoints (workspace snapshots taken before a mutating tool ran),
+    /// newest first — for one `session` when given, else node-wide. Default: empty (a node with no
+    /// checkpoint store). The GUI renders these as rewind points.
+    async fn checkpoints(&self, _session: Option<SessionId>) -> Vec<CheckpointInfo> {
+        Vec::new()
+    }
+
+    /// Rewind the workspace to a recorded checkpoint (`checkpoint_id` from [`Self::checkpoints`]).
+    /// Best-effort restore of the captured workspace state. Default: unsupported (no checkpoint store).
+    async fn checkpoint_rewind(
+        &self,
+        _session: SessionId,
+        _checkpoint_id: String,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("checkpoint_rewind".into()))
+    }
 }
 
 /// The model-management sub-surface: search/download/cache/catalog/activate the local-inference
@@ -710,6 +727,21 @@ pub struct ApprovalInfo {
     /// The target path, when the action is a file edit (`None` for a non-path action).
     #[serde(default)]
     pub path: Option<String>,
+}
+
+/// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`
+/// `CheckpointRecord`, surfaced by [`ControlApi::checkpoints`] so a GUI/operator can render the
+/// rewind points and restore one with [`ControlApi::checkpoint_rewind`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    /// The opaque checkpoint id to pass back to [`ControlApi::checkpoint_rewind`].
+    pub id: String,
+    /// The session whose turn produced the checkpoint.
+    pub session: SessionId,
+    /// The mutating tool whose run was checkpointed (e.g. `fs` / `shell`).
+    pub tool: String,
+    /// Unix seconds at capture.
+    pub created_unix: u64,
 }
 
 /// A transport-stable mirror of the durable session lifecycle (decoupled from `daemon-store`).
@@ -1205,6 +1237,19 @@ pub enum ApiRequest {
         /// The operator's decision (allow / deny).
         allow: bool,
     },
+    /// [`ControlApi::checkpoints`].
+    CheckpointList {
+        /// Filter to one session, or `None` for the node-wide checkpoint list.
+        #[serde(default)]
+        session: Option<SessionId>,
+    },
+    /// [`ControlApi::checkpoint_rewind`].
+    CheckpointRewind {
+        /// The session the checkpoint belongs to.
+        session: SessionId,
+        /// The opaque checkpoint id (from [`CheckpointInfo`]).
+        checkpoint_id: String,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -1229,6 +1274,8 @@ pub enum ApiResponse {
     Sessions(Vec<SessionInfo>),
     /// A list of parked §12 edit-approval requests awaiting an operator decision.
     Approvals(Vec<ApprovalInfo>),
+    /// A list of recorded §12 tool checkpoints (rewind points), newest first.
+    Checkpoints(Vec<CheckpointInfo>),
     /// A fleet report.
     Fleet(FleetReport),
     /// A tree report.
@@ -1396,6 +1443,13 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             request_id,
             allow,
         } => unit_or_err(api.approval_decide(session, request_id, allow).await),
+        ApiRequest::CheckpointList { session } => {
+            ApiResponse::Checkpoints(api.checkpoints(session).await)
+        }
+        ApiRequest::CheckpointRewind {
+            session,
+            checkpoint_id,
+        } => unit_or_err(api.checkpoint_rewind(session, checkpoint_id).await),
         ApiRequest::Assign { session } => unit_or_err(api.assign(session).await),
         ApiRequest::Cancel { session } => unit_or_err(api.cancel(session).await),
         ApiRequest::Fleet => ApiResponse::Fleet(api.fleet().await),

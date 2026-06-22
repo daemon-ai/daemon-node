@@ -45,6 +45,10 @@ pub struct TurnCx<'a> {
     /// by an operator (the durable HITL resume): the tool skips its approval gate and performs the
     /// side effect directly. `false` on a normal turn.
     pub pre_approved: bool,
+    /// The checkpoint store (§12 safety). When present, the pipeline records a workspace checkpoint
+    /// before a [`mutates`](crate::tools::Tool::mutates) tool runs, so an operator can rewind. `None`
+    /// disables checkpointing (the default for engines the host did not wire one into).
+    pub checkpoints: Option<&'a dyn crate::checkpoint::CheckpointStore>,
 }
 
 /// An effect a turn phase or tool produces; the single-owner applier orders and applies them

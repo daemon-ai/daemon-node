@@ -158,6 +158,10 @@ pub struct NodeAssembly {
     /// default) installs an empty registry — routed submits then derive the session with `PerThread`
     /// and run the node's active default profile (the legacy single-profile behavior).
     pub routing: Option<RoutingRegistry>,
+    /// The §12 tool-checkpoint store: wired into every engine (records a workspace checkpoint before
+    /// a mutating tool runs) and into the control surface (the `Checkpoint{List,Rewind}` ops).
+    /// `None` builds a node without checkpointing (tests / read-only nodes).
+    pub checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -203,6 +207,9 @@ fn dress_with_credential(
     }
     for source in &a.prompt_sources {
         profile = profile.with_prompt_block(source.clone());
+    }
+    if let Some(checkpoints) = &a.checkpoints {
+        profile = profile.with_checkpoints(checkpoints.clone());
     }
     match &a.credentials {
         Some(credentials) => profile.with_credentials(credentials.clone(), cred_profile),
@@ -607,6 +614,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     }
     // Bind the background-review spawner so live sessions materialize `Spawn` requests fire-and-forget.
     node_api = node_api.with_background(background.clone());
+    // Bind the §12 tool-checkpoint store so the `Checkpoint{List,Rewind}` ops see the same rewind
+    // points the engines record.
+    if let Some(checkpoints) = a.checkpoints.clone() {
+        node_api = node_api.with_checkpoints(checkpoints);
+    }
     let node = Arc::new(node_api);
 
     AssembledNode {

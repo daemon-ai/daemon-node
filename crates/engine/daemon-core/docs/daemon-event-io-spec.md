@@ -554,13 +554,28 @@ bespoke store.
 
 ### 5.6 MCP as adapter (both roles)
 
-- **MCP client (tool breadth).** A `ToolProvider` adapter that connects to configured external MCP
-  servers (stdio / streamable-HTTP / SSE via `rmcp`), discovers their tools, and registers them into
-  the engine `ToolRegistry` under a namespaced toolset (`mcp:{server}`), reusing the existing
-  `check_fn`-style gating so a server that fails to connect simply contributes no tools. This is the
-  daemon analogue of `tools/mcp_tool.py`, isolated to its own crate (proposed `daemon-mcp-client`)
-  so `rmcp` never leaks into `daemon-core`. It is the sanctioned breadth mechanism
-  (`daemon-core-redesign.md`: "in-process breadth → out-of-process via MCP").
+- **MCP client (tool breadth).** *Implemented as [`daemon-mcp-client`](../../../adapters/daemon-mcp-client/src/lib.rs).* A `ToolProvider` adapter (`McpClientProvider`) that connects to configured external MCP
+  servers (stdio child-process and streamable-HTTP via `rmcp` 1.7) and, on `discover()`, lists their
+  tools and returns one `McpToolProxy` (`impl Tool`) each, which register into the ordinary
+  `ToolRegistry` so the engine never knows they are remote. As-built details:
+  - **Namespacing.** Engine-facing names are `mcp__{server}__{tool}` (double-underscore, *not*
+    `mcp:{server}:{tool}`) because provider tool-name grammars are typically `^[a-zA-Z0-9_-]+$`, so a
+    colon would be rejected by Anthropic/OpenAI. The provider's diagnostic `label()` keeps the
+    human-readable `mcp:{server}` form.
+  - **Trust boundary.** MCP results are external content, so a proxy's `run()` always emits
+    `ToolOutcome::untrusted_text` — the §12 pipeline fences it before budgeting so the model reads it
+    as inert data, never as instructions.
+  - **Breadth → tool-search.** Proxies report `deferrable() == true`, so a large MCP surface collapses
+    behind the `tool_search`/`tool_describe`/`tool_call` bridge tools once the summed deferrable schema
+    bytes cross the configured threshold (`Engine::tool_defs`).
+  - **Lifecycle + degradation.** `McpClient` owns one connection per server with lazy connect +
+    reconnect-on-fault (mirroring `PyToolHost`); a server that fails to start logs a warning and
+    contributes no tools. Servers are declared in the host `[mcp]` config block and folded into
+    `extra_tools` next to the Python provider, so `ProfileSpec.tool_allowlist` gates MCP tools by name
+    with no new code.
+  This is the daemon analogue of `tools/mcp_tool.py`, isolated to its own crate so `rmcp` never leaks
+  into `daemon-core`. It is the sanctioned breadth mechanism (`daemon-core-redesign.md`: "in-process
+  breadth → out-of-process via MCP"). *(The MCP **server** role below remains deferred to P4.)*
 - **MCP server (expose daemon).** A host adapter (proposed `daemon-mcp-server`) over `NodeApi` that
   exposes daemon to external MCP hosts as tools+resources. It embeds no runtime policy; it is pure
   translation of the `NodeApi` surface, exactly like the surface-mapping table in

@@ -163,6 +163,9 @@ pub struct NodeApiImpl {
     /// to resolve an inbound `Origin` to (session, profile, delivery). Empty by default — a pure
     /// passthrough: `PerThread` naming, node active-default profile, origin-seeded delivery.
     routing: Arc<RoutingRegistry>,
+    /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
+    /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
+    checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
 }
 
 impl NodeApiImpl {
@@ -202,6 +205,7 @@ impl NodeApiImpl {
             revisions: None,
             skills: None,
             routing: Arc::new(RoutingRegistry::new()),
+            checkpoints: None,
         }
     }
 
@@ -210,6 +214,14 @@ impl NodeApiImpl {
     /// `PerThread` naming with the node's active default profile.
     pub fn with_routing(mut self, routing: RoutingRegistry) -> Self {
         self.routing = Arc::new(routing);
+        self
+    }
+
+    /// Attach the §12 tool-checkpoint store so the `Checkpoint{List,Rewind}` ops can list rewind
+    /// points and restore the workspace. Call during assembly with the same store wired into the
+    /// engines (so a checkpoint recorded by a turn is visible + rewindable here).
+    pub fn with_checkpoints(mut self, checkpoints: Arc<dyn daemon_core::CheckpointStore>) -> Self {
+        self.checkpoints = Some(checkpoints);
         self
     }
 
@@ -690,6 +702,43 @@ impl ControlApi for NodeApiImpl {
 
     async fn verifying_key(&self) -> Option<String> {
         self.verifier.as_ref().map(|s| s.verifying_key().to_hex())
+    }
+
+    async fn checkpoints(&self, session: Option<SessionId>) -> Vec<daemon_api::CheckpointInfo> {
+        let Some(store) = &self.checkpoints else {
+            return Vec::new();
+        };
+        let filter = session.as_ref().map(|s| s.to_string());
+        store
+            .list(filter.as_deref())
+            .await
+            .into_iter()
+            .map(|r| daemon_api::CheckpointInfo {
+                id: r.id,
+                session: SessionId::new(r.session),
+                tool: r.tool,
+                created_unix: r.created_unix,
+            })
+            .collect()
+    }
+
+    async fn checkpoint_rewind(
+        &self,
+        _session: SessionId,
+        checkpoint_id: String,
+    ) -> Result<(), ApiError> {
+        let store = self
+            .checkpoints
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("checkpoint_rewind".into()))?;
+        let record = store
+            .get(&checkpoint_id)
+            .await
+            .ok_or_else(|| ApiError::Other(format!("unknown checkpoint: {checkpoint_id}")))?;
+        store
+            .restore(&record)
+            .await
+            .map_err(|e| ApiError::Other(format!("rewind failed: {e}")))
     }
 }
 

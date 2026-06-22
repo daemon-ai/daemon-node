@@ -1685,6 +1685,7 @@ mod node_interface {
             revisions: None,
             skills: None,
             routing: None,
+            checkpoints: None,
         })
     }
 
@@ -1756,6 +1757,7 @@ mod node_interface {
             revisions: None,
             skills: None,
             routing: None,
+            checkpoints: None,
         });
         (node, handle)
     }
@@ -2590,6 +2592,7 @@ mod node_interface {
             revisions: Some(revisions),
             skills: Some(skills.clone()),
             routing: None,
+            checkpoints: None,
         });
         (node, handle, skills)
     }
@@ -2839,6 +2842,7 @@ mod node_interface {
             revisions: None,
             skills: None,
             routing: Some(routing),
+            checkpoints: None,
         });
 
         // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -3020,6 +3024,7 @@ mod node_interface {
             revisions: None,
             skills: None,
             routing: Some(routing),
+            checkpoints: None,
         });
 
         async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {
@@ -3297,6 +3302,7 @@ mod node_interface {
             revisions: None,
             skills: None,
             routing: None,
+            checkpoints: None,
         });
         let busy = SessionId::new("obs-busy");
 
@@ -3511,6 +3517,7 @@ mod node_interface {
             revisions: None,
             skills: None,
             routing: None,
+            checkpoints: None,
         })
     }
 
@@ -4446,6 +4453,7 @@ mod web_tools {
             tool_result_budget: 0,
             approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
             pre_approved: false,
+            checkpoints: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -4583,6 +4591,7 @@ mod tool_provider {
             tool_result_budget: 0,
             approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
             pre_approved: false,
+            checkpoints: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),

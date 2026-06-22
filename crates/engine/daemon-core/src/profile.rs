@@ -81,6 +81,9 @@ pub struct EngineProfile {
     memory_builder: Option<MemoryBuilder>,
     /// Generic stable-tier prompt sources (§10), e.g. the skills index — independent of memory.
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
+    /// The §12 tool-checkpoint store every engine this profile builds records pre-mutation
+    /// checkpoints into (shared across sessions; rewound via the control surface). `None` => off.
+    checkpoints: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
 }
 
 impl EngineProfile {
@@ -107,6 +110,7 @@ impl EngineProfile {
             memory: Vec::new(),
             memory_builder: None,
             prompt_sources: Vec::new(),
+            checkpoints: None,
         }
     }
 
@@ -152,6 +156,16 @@ impl EngineProfile {
     /// it, engines fall back to the per-session [`LocalEnvironment`] sandbox.
     pub fn with_exec(mut self, exec: ExecEnvBuilder) -> Self {
         self.exec = Some(exec);
+        self
+    }
+
+    /// Inject the §12 tool-checkpoint store every engine this profile builds records pre-mutation
+    /// checkpoints into. Without it, checkpointing is off (read-only / no-rewind engines).
+    pub fn with_checkpoints(
+        mut self,
+        checkpoints: Arc<dyn crate::checkpoint::CheckpointStore>,
+    ) -> Self {
+        self.checkpoints = Some(checkpoints);
         self
     }
 
@@ -230,6 +244,9 @@ impl EngineProfile {
         if let Some(build) = &self.exec {
             let exec = build(&engine.snapshot().session_id);
             engine = engine.with_exec(exec);
+        }
+        if let Some(checkpoints) = &self.checkpoints {
+            engine = engine.with_checkpoints(checkpoints.clone());
         }
         // Context/memory: a per-session builder (for stateful/session-scoped backends) takes
         // precedence over a shared instance; both are keyed on the engine's owning profile + session

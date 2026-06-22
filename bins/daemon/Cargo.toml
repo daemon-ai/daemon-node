@@ -35,6 +35,9 @@ daemon-tool-metta = { workspace = true }
 # The Python tool worker client: discovers + proxies tools from the `daemon_pytool` worker process.
 # Like the metta client it pulls only the light wire types (`daemon-pytool`); no Python links here.
 daemon-pytool-client = { workspace = true }
+# The MCP client: connects to external MCP servers and proxies their tools through the same
+# `ToolProvider` seam as the Python worker. Opt-in per server via `[[mcp.servers]]`.
+daemon-mcp-client = { workspace = true }
 # The web tools (`web_search`/`web_extract`); opt-in at runtime via `[web].enable`.
 daemon-tool-web = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.
