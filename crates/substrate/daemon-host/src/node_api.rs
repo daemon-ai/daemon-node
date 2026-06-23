@@ -117,6 +117,12 @@ pub fn decode_overlay(bytes: &[u8]) -> SessionOverlay {
 /// running session's provider without `daemon-host` linking the provider crate.
 pub type ModelProviderFactory = Arc<dyn Fn(&ProfileSpec) -> Arc<dyn Provider> + Send + Sync>;
 
+/// The routing rebuild hook (the §5.9 hot-reload seam): produces a fresh [`RoutingRegistry`] from
+/// current node state (profiles + bound accounts). Re-run on `profile_update` / `auth_complete` so
+/// routing stays current without a restart. The assembling binary owns the closure (it owns the
+/// profile source); the host never links the routing-from-profiles policy directly.
+pub type RoutingBuilder = Arc<dyn Fn() -> RoutingRegistry + Send + Sync>;
+
 /// Which lifecycle owns a `SessionId`. The durable and live lifecycles are intentionally distinct
 /// (one runs an engine dormant-between-turns through the activation seam, the other keeps it
 /// resident in an actor), and a single id must not exist as two divergent engine instances. This is
@@ -198,7 +204,18 @@ pub struct NodeApiImpl {
     /// The host routing registry (daemon-event-io-spec §5.9) consulted by [`SessionApi::submit_routed`]
     /// to resolve an inbound `Origin` to (session, profile, delivery). Empty by default — a pure
     /// passthrough: `PerThread` naming, node active-default profile, origin-seeded delivery.
-    routing: Arc<RoutingRegistry>,
+    ///
+    /// Held behind an `RwLock<Arc<…>>` so it is *hot-swappable*: a profile/auth change can rebuild
+    /// the routing table live (via [`NodeApiImpl::rebuild_routing`]) without restarting the node.
+    /// `submit_routed` clones the inner `Arc` under a brief read lock, so an in-flight resolve never
+    /// blocks a swap.
+    routing: Arc<std::sync::RwLock<Arc<RoutingRegistry>>>,
+    /// The optional rebuild hook that produces a fresh [`RoutingRegistry`] from current node state
+    /// (profiles + bound accounts). Installed by the assembling binary (which owns the profile
+    /// source); when set, it is re-run on `profile_update` / `auth_complete` to keep routing current.
+    /// `None` => routing is static (an explicit [`NodeApiImpl::with_routing`] table or the empty
+    /// passthrough).
+    routing_builder: Option<RoutingBuilder>,
     /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
     /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
     checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
@@ -249,7 +266,8 @@ impl NodeApiImpl {
             session_modes,
             revisions: None,
             skills: None,
-            routing: Arc::new(RoutingRegistry::new()),
+            routing: Arc::new(std::sync::RwLock::new(Arc::new(RoutingRegistry::new()))),
+            routing_builder: None,
             checkpoints: None,
             auth_flows: None,
         }
@@ -259,8 +277,38 @@ impl NodeApiImpl {
     /// inbound-routing capability). Call during assembly; absent, routed submits fall back to
     /// `PerThread` naming with the node's active default profile.
     pub fn with_routing(mut self, routing: RoutingRegistry) -> Self {
-        self.routing = Arc::new(routing);
+        self.routing = Arc::new(std::sync::RwLock::new(Arc::new(routing)));
         self
+    }
+
+    /// Install the routing *rebuild hook* (the §5.9 hot-reload seam): a closure that rebuilds the
+    /// routing table from current node state. When set, it is run immediately to seed routing and
+    /// re-run on every `profile_update` / `auth_complete`, so a profile/account change takes effect
+    /// without a restart. The binary owns this closure because it owns the profile source.
+    pub fn with_routing_builder(mut self, builder: RoutingBuilder) -> Self {
+        *self.routing.write().unwrap() = Arc::new(builder());
+        self.routing_builder = Some(builder);
+        self
+    }
+
+    /// Hot-swap the routing table (live). Used by the rebuild hook and available to the binary for an
+    /// explicit refresh; an in-flight `submit_routed` resolve (which clones the inner `Arc`) is
+    /// unaffected.
+    pub fn swap_routing(&self, routing: RoutingRegistry) {
+        *self.routing.write().unwrap() = Arc::new(routing);
+    }
+
+    /// Re-run the routing rebuild hook (if installed) and swap in the fresh table. A no-op when no
+    /// builder is set (static routing). Called after profile/auth mutations so routing stays current.
+    fn rebuild_routing(&self) {
+        if let Some(builder) = &self.routing_builder {
+            self.swap_routing(builder());
+        }
+    }
+
+    /// A snapshot of the current routing registry (clones the inner `Arc` under a brief read lock).
+    fn routing(&self) -> Arc<RoutingRegistry> {
+        self.routing.read().unwrap().clone()
     }
 
     /// Attach the §12 tool-checkpoint store so the `Checkpoint{List,Rewind}` ops can list rewind
@@ -367,6 +415,65 @@ impl NodeApiImpl {
             total.add(&self.store.usage_of(&session).await);
         }
         total
+    }
+
+    /// The unified, unscoped roster: every durable `session_record` row plus every live-interactive
+    /// session, each enriched with its host meta (profile/title/last_activity/role/parent). The
+    /// durable status wins when an id exists in both. The scope filter, sort, and pagination are
+    /// applied by [`ControlApi::sessions_query`] on top of this.
+    async fn roster(&self) -> Vec<SessionInfo> {
+        let mut seen: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (session, status) in self.store.list_sessions().await {
+            let meta = self.store.session_meta(&session).await.unwrap_or_default();
+            out.push(session_info_from(
+                &session,
+                Some(status),
+                &meta,
+                ApiLifecycle::Durable,
+            ));
+            seen.insert(session);
+        }
+        for session in self.live.live_ids() {
+            if seen.contains(&session) {
+                continue;
+            }
+            let meta = self.store.session_meta(&session).await.unwrap_or_default();
+            out.push(session_info_from(&session, None, &meta, ApiLifecycle::Live));
+        }
+        out
+    }
+
+    /// Record activity on `session` from an inbound `command`: stamp `last_activity_ms` to now
+    /// (roster sort key), seed a title from the first user turn when none is set, and index the
+    /// turn's user text into the durable FTS surface (`session_search`). Read-modify-writes the host
+    /// meta so the overlay/profile/role stay intact. Best-effort: a store error is swallowed (a
+    /// missed stamp/index must never fail a submit).
+    async fn note_activity(&self, session: &SessionId, command: &AgentCommand) {
+        let turn_text = match command {
+            AgentCommand::StartTurn { input, .. } => Some(input.text.clone()),
+            AgentCommand::Steer { text, .. } => Some(text.clone()),
+            _ => None,
+        };
+        let mut meta = self.store.session_meta(session).await.unwrap_or_default();
+        meta.last_activity_ms = Some(now_ms());
+        // Seed a roster title from the opening user turn (truncated) when the session has none yet;
+        // a real generated title can replace it later (the field is the foundation).
+        if meta.title.is_none() {
+            if let Some(text) = &turn_text {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    meta.title = Some(title_from_text(trimmed));
+                }
+            }
+        }
+        let title = meta.title.clone();
+        let _ = self.store.set_session_meta(session, meta).await;
+        if let Some(text) = turn_text {
+            if !text.trim().is_empty() {
+                self.store.index_session_text(session, title, &text).await;
+            }
+        }
     }
 
     /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.
@@ -689,6 +796,46 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The default roster page size when [`SessionQuery::limit`] is `0`.
+const DEFAULT_ROSTER_PAGE: usize = 50;
+
+/// A roster title seeded from the first user turn: the first line, trimmed to ~60 chars on a word
+/// boundary with an ellipsis. A placeholder until a real generated title replaces it.
+fn title_from_text(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or(text).trim();
+    const MAX: usize = 60;
+    if first_line.chars().count() <= MAX {
+        return first_line.to_string();
+    }
+    let truncated: String = first_line.chars().take(MAX).collect();
+    let cut = truncated.rsplit_once(' ').map(|(h, _)| h).unwrap_or(&truncated);
+    format!("{}…", cut.trim_end())
+}
+
+/// Build a wire [`SessionInfo`] from a session id + its (optional) durable status + host meta +
+/// lifecycle. The single place the enriched roster line is assembled, so the durable, live, and
+/// detail paths stay consistent. A live session with no durable row reports `Active`.
+fn session_info_from(
+    session: &SessionId,
+    status: Option<SessionStatus>,
+    meta: &SessionMeta,
+    lifecycle: ApiLifecycle,
+) -> SessionInfo {
+    SessionInfo {
+        session: session.clone(),
+        state: status.map(map_state).unwrap_or(SessionState::Active),
+        // Daemon-core-backed engines own their conversation state and can truncate it, so durable
+        // and live sessions are both rewindable; foreign ACP units are surfaced via the fleet API.
+        rewindable: true,
+        bound_profile: meta.bound_profile.clone(),
+        title: meta.title.clone(),
+        last_activity_ms: meta.last_activity_ms,
+        lifecycle,
+        role: map_role(meta.role),
+        parent: meta.parent.clone(),
+    }
+}
+
 #[async_trait]
 impl ControlApi for NodeApiImpl {
     async fn health(&self) -> HealthReport {
@@ -845,13 +992,12 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn session_search(&self, query: String, limit: u32) -> Vec<SessionSearchHit> {
-        let cap = if limit == 0 { 20 } else { limit as usize };
         self.store
-            .search_sessions(&query, cap)
+            .search_sessions(&query, limit)
             .await
             .into_iter()
             .map(|hit| SessionSearchHit {
-                session: hit.session,
+                session: hit.session_id,
                 title: hit.title,
                 snippet: hit.snippet,
             })
@@ -951,6 +1097,37 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
+    async fn tree_subscribe(
+        &self,
+        filter: daemon_api::TreeSubFilter,
+    ) -> Result<daemon_api::TreeStream, ApiError> {
+        // Foundation push form: an immediate snapshot, then a coalesced snapshot every
+        // `coalesce_ms` (the churn window; clamped to a sane floor). The wire also carries a
+        // `TreeEvent::Subagent` delta variant for a finer push path to fill in later behind the same
+        // stream. `include_ephemeral=false` drops transient-subagent nodes from each snapshot.
+        let this = self.clone();
+        let period = std::time::Duration::from_millis(filter.coalesce_ms.unwrap_or(1000).max(100));
+        let stream = stream::unfold(
+            (this, filter, true),
+            move |(this, filter, first)| async move {
+                if !first {
+                    tokio::time::sleep(period).await;
+                }
+                let mut report = this.tree().await;
+                if !filter.include_ephemeral {
+                    report
+                        .nodes
+                        .retain(|n| n.role != Some(SessionRole::EphemeralSubagent));
+                }
+                Some((
+                    daemon_api::TreeEvent::Snapshot(report),
+                    (this, filter, false),
+                ))
+            },
+        );
+        Ok(stream.boxed())
+    }
+
     async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
         match &self.fleet {
             Some(fleet) => fleet.unit_events(&id, max).await,
@@ -1009,6 +1186,10 @@ impl ControlApi for NodeApiImpl {
                 session: SessionId::new(r.session),
                 tool: r.tool,
                 created_unix: r.created_unix,
+                // The turn/cursor correlation is not yet recorded on the checkpoint ledger; the wire
+                // fields exist (rewind-unify foundation) and fill in when the ledger carries them.
+                turn_ordinal: None,
+                cursor: None,
             })
             .collect()
     }
@@ -1038,6 +1219,7 @@ impl SessionApi for NodeApiImpl {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
         // Guard-rail: claim the session for the live lifecycle (rejects an id already durable-managed).
         self.claim(&session, Lifecycle::Live)?;
+        self.note_activity(&session, &command).await;
         self.live.submit(session, command).await
     }
 
@@ -1048,7 +1230,28 @@ impl SessionApi for NodeApiImpl {
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         self.claim(&session, Lifecycle::Live)?;
+        self.note_activity(&session, &command).await;
         self.live.submit_from(session, origin, command).await
+    }
+
+    async fn submit_as(
+        &self,
+        session: SessionId,
+        origin: Option<Origin>,
+        command: AgentCommand,
+        profile: Option<ProfileRef>,
+    ) -> Result<(), ApiError> {
+        self.claim(&session, Lifecycle::Live)?;
+        // Bind the explicit profile sticky-on-first-open (the same `ensure` seam `submit_routed`
+        // uses), so a GUI can "open this chat as agent X" before the first turn submits.
+        if profile.is_some() {
+            self.live.ensure(&session, profile).await;
+        }
+        self.note_activity(&session, &command).await;
+        match origin {
+            Some(origin) => self.live.submit_from(session, origin, command).await,
+            None => self.live.submit(session, command).await,
+        }
     }
 
     async fn submit_routed(
@@ -1058,7 +1261,7 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<SessionId, ApiError> {
         // Resolve the origin through the §5.9 routing registry: session name, the profile that runs
         // it (agent selection), and where its replies post.
-        let resolved = self.routing.resolve(&origin);
+        let resolved = self.routing().resolve(&origin);
         self.claim(&resolved.session, Lifecycle::Live)?;
         // For session-opening commands, bind the resolved profile (sticky on first `ensure`) and seed
         // the resolved `Primary` before submitting, so routing owns agent-selection + delivery. Other
@@ -1075,6 +1278,7 @@ impl SessionApi for NodeApiImpl {
             self.live
                 .seed_primary_target(&resolved.session, resolved.delivery.clone());
         }
+        self.note_activity(&resolved.session, &command).await;
         self.live
             .submit_from(resolved.session.clone(), origin, command)
             .await?;
@@ -1551,6 +1755,9 @@ impl ProfileApi for NodeApiImpl {
         let id = spec.id.clone();
         self.profile_store()?.update(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "update");
+        // A profile change can alter routing (agent selection / transport patterns): rebuild the
+        // live table so routed submits pick up the change without a restart (§5.9 hot-reload).
+        self.rebuild_routing();
         Ok(())
     }
 
@@ -1704,6 +1911,25 @@ impl ProfileApi for NodeApiImpl {
                 &format!("revert to {seq}"),
             )
             .map_err(|e| ApiError::Other(format!("skill revert: {e}")))
+    }
+
+    async fn skill_get(&self, name: String) -> Result<daemon_common::SkillBundle, ApiError> {
+        self.active_skills_store()?
+            .export_bundle(&name)
+            .map_err(|e| ApiError::Other(format!("skill get: {e}")))
+    }
+
+    async fn skill_put(&self, bundle: daemon_common::SkillBundle) -> Result<(), ApiError> {
+        let skills = self.active_skills_store()?;
+        if skills.is_bundled(&bundle.name) {
+            return Err(ApiError::Conflict(format!(
+                "skill `{}` is binary-bundled and cannot be edited",
+                bundle.name
+            )));
+        }
+        skills
+            .import_bundle(&bundle, daemon_common::Author::Operator, "skill_put")
+            .map_err(|e| ApiError::Other(format!("skill put: {e}")))
     }
 
     async fn curator_list(
@@ -1885,6 +2111,12 @@ impl AuthApi for NodeApiImpl {
                 .push(BoundAccount::new(transport_instance.as_str(), &credential_ref));
             profiles.update(spec).map_err(profile_err)?;
             bound_profile = Some(bind.profile.clone());
+        }
+
+        // A completed account bind can change which transport instances route to which profile:
+        // rebuild routing so the freshly-authenticated account is reachable without a restart.
+        if bound_profile.is_some() {
+            self.rebuild_routing();
         }
 
         Ok(AuthCompleteResponse {

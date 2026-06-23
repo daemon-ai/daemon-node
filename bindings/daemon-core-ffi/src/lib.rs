@@ -245,6 +245,7 @@ pub unsafe extern "C" fn daemon_session_submit(
             session: session.session.clone(),
             command,
             origin: None,
+            profile: None,
         };
         match session
             .handle

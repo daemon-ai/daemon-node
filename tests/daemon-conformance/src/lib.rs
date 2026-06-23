@@ -2493,6 +2493,7 @@ mod node_interface {
                         request_id: ReqId(1),
                     },
                     origin: None,
+                    profile: None,
                 })
                 .await
                 .unwrap(),
@@ -5416,6 +5417,7 @@ mod node_interface {
                         request_id: ReqId(1),
                     },
                     origin: None,
+                    profile: None,
                 })
                 .await
                 .unwrap(),
@@ -5434,6 +5436,7 @@ mod node_interface {
                     request_id: ReqId(2),
                 },
                 origin: None,
+                profile: None,
             })
             .await
             .unwrap();
@@ -5456,6 +5459,7 @@ mod node_interface {
                     request_id: ReqId(3),
                 },
                 origin: None,
+                profile: None,
             })
             .await
             .unwrap();
@@ -5473,6 +5477,7 @@ mod node_interface {
                         reason: Some("stop".into()),
                     },
                     origin: None,
+                    profile: None,
                 })
                 .await
                 .unwrap(),

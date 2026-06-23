@@ -1087,6 +1087,18 @@ impl FleetViewImpl {
             },
             _ => daemon_api::UnitState::Running,
         };
+        // Enrich the node with the session's durable identity (profile/title/role) so a GUI tree
+        // drill-down carries the same identity as the roster line, sourced from the same host meta.
+        let meta = self.store.session_meta(session).await.unwrap_or_default();
+        let role = match meta.role {
+            Some(daemon_store::SessionRole::Primary) | None => daemon_api::SessionRole::Primary,
+            Some(daemon_store::SessionRole::ManagedChild) => {
+                daemon_api::SessionRole::ManagedChild
+            }
+            Some(daemon_store::SessionRole::EphemeralSubagent) => {
+                daemon_api::SessionRole::EphemeralSubagent
+            }
+        };
         daemon_api::UnitNode {
             id: UnitId::new(session.as_str()),
             kind,
@@ -1094,6 +1106,10 @@ impl FleetViewImpl {
             work: self.store.delegation_work(session).await,
             usage: self.store.usage_of(session).await,
             children: children.iter().map(|c| UnitId::new(c.as_str())).collect(),
+            profile: meta.bound_profile,
+            session: Some(session.clone()),
+            title: meta.title,
+            role: Some(role),
         }
     }
 }

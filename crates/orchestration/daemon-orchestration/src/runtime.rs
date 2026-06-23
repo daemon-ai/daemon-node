@@ -22,7 +22,8 @@ use crate::registry::{ChildRecord, ChildStatus};
 use crate::spawner::ChildSpawner;
 use async_trait::async_trait;
 use daemon_api::{
-    ManageEventView, Outbound, TreeReport, UnitKind as ApiUnitKind, UnitNode, UnitState,
+    ManageEventView, Outbound, SessionRole, TreeReport, UnitKind as ApiUnitKind, UnitNode,
+    UnitState,
 };
 use daemon_common::{
     Budget, Epoch, PartitionId, ReqId, SessionId, SnapshotBlob, UnitId, UsageDelta,
@@ -377,6 +378,12 @@ impl FleetRuntime {
             work: None,
             usage: self.fleet_usage(),
             children,
+            // The synthetic node-root is the fleet itself, not a session: no profile/session/title,
+            // and no `SessionRole` (it is above the `Primary`/child taxonomy).
+            profile: None,
+            session: None,
+            title: None,
+            role: None,
         }
     }
 
@@ -524,13 +531,31 @@ fn project_unit(id: &UnitId, record: &ChildRecord) -> UnitNode {
         },
         _ => UnitState::Running,
     };
+    let kind = map_kind(record.unit.kind());
+    // A fleet child unit's id *is* its session id; engine children are long-lived `ManagedChild`
+    // sessions (the fleet runtime creates no ephemeral-subagent marker yet — that distinction is the
+    // deferred delegation-seam `ChildLifetime` work). Orchestrator children carry no session role.
+    let (session, role) = match kind {
+        ApiUnitKind::Engine => (
+            Some(SessionId::new(id.as_str())),
+            Some(SessionRole::ManagedChild),
+        ),
+        // Orchestrator / Host units are not leaf sessions: no session id or `SessionRole`.
+        _ => (None, None),
+    };
     UnitNode {
         id: id.clone(),
-        kind: map_kind(record.unit.kind()),
+        kind,
         state,
         work: Some(render_work(&record.work)),
         usage: record.usage,
         children: Vec::new(),
+        // Profile/title are not tracked on the fleet child record yet; the host's `node_for` seam
+        // enriches them from session meta when projecting the tree.
+        profile: None,
+        session,
+        title: None,
+        role,
     }
 }
 

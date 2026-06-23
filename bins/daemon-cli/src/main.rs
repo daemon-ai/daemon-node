@@ -642,6 +642,7 @@ async fn main() -> anyhow::Result<()> {
                         request_id: ReqId(1),
                     },
                     origin: None,
+                    profile: None,
                 })
                 .await?,
         ),
@@ -1146,6 +1147,80 @@ fn render(resp: ApiResponse) {
                 for c in changes {
                     println!("  - {}: {:?} -> {:?}", c.name, c.from, c.to);
                 }
+            }
+        }
+        ApiResponse::SessionPage(page) => {
+            println!("sessions: {}", page.sessions.len());
+            for s in page.sessions {
+                let profile = s
+                    .bound_profile
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let title = s.title.unwrap_or_else(|| "(untitled)".to_string());
+                println!(
+                    "  - {} [{:?}/{:?}] profile={} {}",
+                    s.session, s.lifecycle, s.role, profile, title
+                );
+            }
+            if let Some(c) = page.next_cursor {
+                println!("  next_cursor={c}");
+            }
+        }
+        ApiResponse::SessionDetail(detail) => match detail {
+            Some(d) => println!(
+                "session {}: state={:?} role={:?} model={:?} children={} checkpoints={}",
+                d.info.session,
+                d.info.state,
+                d.info.role,
+                d.model,
+                d.children.len(),
+                d.checkpoints
+            ),
+            None => println!("session: not found"),
+        },
+        ApiResponse::SessionsByProfile(groups) => {
+            for (profile, sessions) in groups {
+                println!("profile {}: {} session(s)", profile.as_str(), sessions.len());
+                for s in sessions {
+                    println!("  - {}", s.session);
+                }
+            }
+        }
+        ApiResponse::SessionSearch(hits) => {
+            println!("hits: {}", hits.len());
+            for h in hits {
+                println!("  - {} {}: {}", h.session, h.title, h.snippet);
+            }
+        }
+        ApiResponse::AcpCatalog(entries) => {
+            println!("acp agents: {}", entries.len());
+            for e in entries {
+                println!(
+                    "  - {} [{:?}] installed={} version={:?}",
+                    e.name, e.source, e.installed, e.version
+                );
+            }
+        }
+        ApiResponse::Providers(providers) => {
+            for p in providers {
+                println!("  - {} available={}", p.name, p.available);
+            }
+        }
+        ApiResponse::Tools(tools) => {
+            for t in tools {
+                println!("  - {}", t.name);
+            }
+        }
+        ApiResponse::Config(c) => println!("config ({}):\n{}", c.format, c.body),
+        ApiResponse::CronJobs(jobs) => {
+            for j in jobs {
+                println!("  - {} {} ({})", j.id, j.spec.name, j.spec.schedule);
+            }
+        }
+        ApiResponse::CronId(id) => println!("cron: {id}"),
+        ApiResponse::CronRuns(runs) => {
+            for r in runs {
+                println!("  - started={} ok={}", r.started_unix, r.ok);
             }
         }
         ApiResponse::Error(e) => println!("error: {e}"),

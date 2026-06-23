@@ -2661,6 +2661,7 @@ mod tests {
                     request_id: ReqId(7),
                 },
                 origin: None,
+                profile: None,
             },
             // The origin-carrying form (per-event attribution) must round-trip too.
             ApiRequest::Submit {
@@ -2673,6 +2674,7 @@ mod tests {
                     "telegram",
                     daemon_protocol::OriginScope::Dm { user: "u1".into() },
                 )),
+                profile: Some(ProfileRef::new("agent-x")),
             },
             ApiRequest::Poll {
                 session: SessionId::new("s1"),
@@ -2751,6 +2753,7 @@ mod tests {
                 session: SessionId::new("s1"),
                 command: AgentCommand::Shutdown,
                 origin: None,
+                profile: None,
             }
         );
     }
@@ -2764,6 +2767,135 @@ mod tests {
         let bytes = to_cbor(&resp);
         let back: ApiResponse = from_cbor(&bytes).unwrap();
         assert_eq!(resp, back);
+    }
+
+    fn sample_info() -> SessionInfo {
+        SessionInfo {
+            session: SessionId::new("s1"),
+            state: SessionState::Active,
+            rewindable: true,
+            bound_profile: Some(ProfileRef::new("agent-x")),
+            title: Some("hello world".into()),
+            last_activity_ms: Some(1_700_000_000_000),
+            lifecycle: Lifecycle::Live,
+            role: SessionRole::ManagedChild,
+            parent: Some(SessionId::new("p1")),
+        }
+    }
+
+    #[test]
+    fn roster_requests_and_responses_round_trip() {
+        let reqs = vec![
+            ApiRequest::SessionsQuery {
+                query: SessionQuery {
+                    scope: SessionScope::ByProfile(ProfileRef::new("agent-x")),
+                    after: Some(SessionId::new("s0")),
+                    limit: 25,
+                },
+            },
+            ApiRequest::SessionGet {
+                session: SessionId::new("s1"),
+            },
+            ApiRequest::SessionsByProfile,
+            ApiRequest::SessionSearch {
+                query: "build".into(),
+                limit: 10,
+            },
+            ApiRequest::Rewind {
+                session: SessionId::new("s1"),
+                point: RewindPoint {
+                    anchor: RewindAnchor::UserTurn { ordinal: 3 },
+                    restore_workspace: true,
+                },
+            },
+            ApiRequest::AcpDiscover,
+            ApiRequest::AcpRegister {
+                entry: AcpAgentEntry {
+                    name: "gemini".into(),
+                    recipe: AcpRecipe {
+                        program: Some("gemini".into()),
+                        args: vec!["--acp".into()],
+                        env: vec![("KEY".into(), "v".into())],
+                        endpoint: None,
+                    },
+                    source: AcpSource::Builtin,
+                    installed: true,
+                    version: Some("0.1".into()),
+                    capabilities: vec![("fs".into(), "true".into())],
+                },
+            },
+        ];
+        for req in reqs {
+            assert_eq!(req, from_cbor::<ApiRequest>(&to_cbor(&req)).unwrap());
+        }
+
+        let resps = vec![
+            ApiResponse::SessionPage(SessionPage {
+                sessions: vec![sample_info()],
+                next_cursor: Some(SessionId::new("s1")),
+            }),
+            ApiResponse::SessionDetail(Some(SessionDetail {
+                info: sample_info(),
+                overlay: None,
+                model: Some("groq::llama".into()),
+                delivery_targets: vec![],
+                children: vec![SessionId::new("c1")],
+                checkpoints: 2,
+            })),
+            ApiResponse::SessionsByProfile(vec![(
+                ProfileRef::new("agent-x"),
+                vec![sample_info()],
+            )]),
+            ApiResponse::SessionSearch(vec![SessionSearchHit {
+                session: SessionId::new("s1"),
+                title: "hello".into(),
+                snippet: "…[hello]…".into(),
+            }]),
+        ];
+        for resp in resps {
+            assert_eq!(resp, from_cbor::<ApiResponse>(&to_cbor(&resp)).unwrap());
+        }
+    }
+
+    #[test]
+    fn session_info_defaults_when_enrichment_absent() {
+        // An old-shape SessionInfo (only session/state) must still decode: the additive roster
+        // fields fall back to their serde defaults (no profile/title/activity, durable, primary).
+        #[derive(Serialize)]
+        struct LegacyInfo {
+            session: SessionId,
+            state: SessionState,
+        }
+        let legacy = LegacyInfo {
+            session: SessionId::new("s1"),
+            state: SessionState::Ready,
+        };
+        let back: SessionInfo = from_cbor(&to_cbor(&legacy)).unwrap();
+        assert_eq!(back.role, SessionRole::Primary);
+        assert_eq!(back.lifecycle, Lifecycle::Durable);
+        assert!(back.rewindable);
+        assert!(back.bound_profile.is_none());
+        assert!(back.parent.is_none());
+    }
+
+    #[test]
+    fn tree_event_round_trips() {
+        let ev = TreeEvent::Snapshot(TreeReport {
+            root: Some(UnitId::new("root")),
+            nodes: vec![UnitNode {
+                id: UnitId::new("root"),
+                kind: UnitKind::Orchestrator,
+                state: UnitState::Running,
+                work: None,
+                usage: UsageDelta::default(),
+                children: vec![],
+                profile: None,
+                session: None,
+                title: None,
+                role: None,
+            }],
+        });
+        assert_eq!(ev, from_cbor::<TreeEvent>(&to_cbor(&ev)).unwrap());
     }
 
     #[test]

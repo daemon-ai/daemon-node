@@ -1541,6 +1541,10 @@ mod session_meta_tests {
         SessionMeta {
             bound_profile: Some(ProfileRef::new("opus")),
             overlay: vec![0xCB, 0x01, 0x02, 0x03],
+            title: Some("a chat".into()),
+            last_activity_ms: Some(1_700_000_000_000),
+            role: Some(SessionRole::ManagedChild),
+            parent: Some(SessionId::new("p1")),
         }
     }
 
@@ -1556,6 +1560,7 @@ mod session_meta_tests {
         let updated = SessionMeta {
             bound_profile: Some(ProfileRef::new("opus")),
             overlay: vec![0xFF],
+            ..SessionMeta::default()
         };
         store.set_session_meta(&id, updated.clone()).await.unwrap();
         assert_eq!(store.session_meta(&id).await.unwrap(), updated);
@@ -1572,6 +1577,7 @@ mod session_meta_tests {
         let updated = SessionMeta {
             bound_profile: None,
             overlay: Vec::new(),
+            ..SessionMeta::default()
         };
         store.set_session_meta(&id, updated.clone()).await.unwrap();
         assert_eq!(store.session_meta(&id).await.unwrap(), updated);
