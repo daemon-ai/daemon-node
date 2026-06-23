@@ -74,6 +74,58 @@ pub struct SessionMeta {
     pub bound_profile: Option<ProfileRef>,
     /// Opaque CBOR of the host's `SessionOverlay` (empty = no overlay recorded).
     pub overlay: Vec<u8>,
+    /// A human-readable conversation title (`None` until set/generated). Surfaced on the wire
+    /// `SessionInfo` for the GUI roster; generation is deferred (the field is the foundation).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Unix-millis of the last inbound/outbound activity on this session, for roster sort
+    /// (`None` until first stamped). Stamped by the host on submit/append.
+    #[serde(default)]
+    pub last_activity_ms: Option<u64>,
+    /// This session's hierarchy role relative to its parent: a top-level conversation, a long-lived
+    /// managed child, or a transient subagent. Drives the GUI roster scope (`Primary` only in the
+    /// inbox) and tree churn handling. `None` on legacy rows => treated as `Primary`.
+    #[serde(default)]
+    pub role: Option<SessionRole>,
+    /// The parent session id, when this is a child/subagent (`None` for a `Primary`).
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+}
+
+/// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
+/// child roles are reached only by walking the tree. The `ManagedChild` vs `EphemeralSubagent` split
+/// lets clients keep long-lived children stable while coalescing transient-subagent churn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// A top-level conversation (the only role listed in the `TopLevel` roster scope).
+    Primary,
+    /// A long-lived child an agent owns/manages; stable, low churn; always in the tree.
+    ManagedChild,
+    /// A transient/temporary subagent; in the tree but high churn (rapidly created/destroyed).
+    EphemeralSubagent,
+}
+
+impl Default for SessionRole {
+    fn default() -> Self {
+        Self::Primary
+    }
+}
+
+/// The lifetime an agent declares when delegating a child: a long-lived managed child vs a transient
+/// subagent. The source of truth for the [`SessionRole`] child distinction, recorded at the
+/// delegation seam (today every child is created identically, with no managed-vs-ephemeral marker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChildLifetime {
+    /// A long-lived child the parent manages (becomes [`SessionRole::ManagedChild`]).
+    Persistent,
+    /// A transient subagent spun up for a bounded task (becomes [`SessionRole::EphemeralSubagent`]).
+    Ephemeral,
+}
+
+impl Default for ChildLifetime {
+    fn default() -> Self {
+        Self::Persistent
+    }
 }
 
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).

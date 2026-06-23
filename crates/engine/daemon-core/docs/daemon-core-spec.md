@@ -909,8 +909,11 @@ typed context to `call_tool`, LCM's tools get the live conversation cleanly. The
 `Summarize` strategy remains the dependency-free fallback when Python is absent.
 
 **Priority.** P0 for the `ContextEngine` trait + error-driven compaction retry and at least a
-summarizing strategy. P1 for full anti-thrash/preflight/mid-turn triggers, tiered prompt + prefix
-cache, and session rotation/locks. P2 for `@`-references.
+summarizing strategy. P1 for full anti-thrash/preflight/mid-turn triggers and session rotation/locks.
+The tiered `PromptAssembler` (stable / blocks / recalled / body) and prefix-cache discipline have
+**landed** — cache-stable stable-tier sources (memory `prompt_block`, the skills index) fold into a
+byte-stable prefix, and the engine's `mark_cache_breakpoints` drives Anthropic `cache_control` + an
+OpenAI `prompt_cache_key` (local engines reuse the KV/prefix). P2 for `@`-references.
 
 **Acceptance.** A long session compresses into a structured summary preserving active task, completed
 actions, pending asks, files, and decisions; tool-call/result pairs cannot be split; the stable
@@ -1752,8 +1755,13 @@ acceptance criteria. Each phase is shippable.
 > + builtin `FileMemory`), and a networked `GenAiProvider` in `daemon-providers` — one `genai`
 > native-protocol client over OpenAI/Anthropic/Gemini/Groq/… under our `Provider` trait, with native
 > tool JSON-Schema + `tool_call_id` round-tripping (config-selected; Mock is the zero-config default).
-> **Still deferred**: the deep summary-DAG / embedding memory store, checkpoint/rewind + parallel tool
-> batching (§12), and remote exec backends (§13, P3).
+> **Prompt caching + tiered assembly have landed**: the tiered `PromptAssembler` (stable / blocks /
+> recalled / body) folds cache-stable sources (memory `prompt_block`, skills index) into a byte-stable
+> prefix, and `mark_cache_breakpoints` drives Anthropic `cache_control` ephemeral blocks + an OpenAI
+> `prompt_cache_key` (the local mistral.rs/llama.cpp engines reuse the KV/prefix themselves).
+> **Checkpoint/rewind** (§12) has also landed (git-first/snapshot `CheckpointStore` + conversation
+> `RewindTo`/`Rewound`). **Still deferred**: the deep summary-DAG / embedding memory store, parallel
+> tool batching (§12), and remote exec backends (§13, P3).
 
 ### P0 — Production survival
 - Typed `Conversation`/`Turn`/`ToolTurn` (§5) + wire conversion + serialization skeleton (§6).
@@ -1767,8 +1775,8 @@ acceptance criteria. Each phase is shippable.
   and bad tool names never crash the loop; no out-of-workspace writes.
 
 ### P1 — Long-session coding
-- Anthropic native transport (§7); summarizing `ContextEngine` + anti-thrash + triggers (§10).
-- Tiered prompt + prefix-cache discipline (§10); `MemoryProvider` trait + builtin + hook order (§11).
+- Anthropic native transport (§7, **landed** via `GenAiProvider`); summarizing `ContextEngine` + anti-thrash + triggers (§10).
+- Tiered prompt assembler + prefix-cache discipline (§10) — **landed**; `MemoryProvider` trait + builtin + hook order (§11).
 - Checkpoint/rewind, guardrail loop detection, interactive approval via `HostRequest`, spillover
   store (§12); parallel tool-batch correctness (all-or-nothing + path-overlap, §12);
   `LocalEnvironment` (§13); SQLite `SessionStore` + FTS + lineage + locks + resume (§14).

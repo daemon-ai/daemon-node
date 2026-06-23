@@ -272,8 +272,9 @@ decides **where** it runs:
   > the engine's workspace via the `EngineProfile`'s exec-env builder (an in-core `LocalEnvironment`
   > enforcing workspace containment + child-env scrub; the seam stays routable to a future host-owned
   > env). The loop is fully in-process; only `Effect::Delegate` still crosses the durable suspension
-  > boundary, so activation/snapshot semantics are unchanged. The provider remains deterministic this
-  > phase (real networked model I/O is deferred).
+  > boundary, so activation/snapshot semantics are unchanged. Real networked model I/O has since
+  > landed via `GenAiProvider` (Anthropic/OpenAI streaming); a deterministic mock provider is retained
+  > for tests/conformance.
 - **Placement** — in-process (default; same address space) or remote (a remote host driving the
   engine over §17). Placement is a host concern invisible to the orchestrator, which only routes by
   `UnitId`.

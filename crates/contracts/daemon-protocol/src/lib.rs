@@ -12,7 +12,9 @@
 
 #![forbid(unsafe_code)]
 
-use daemon_common::{Budget, JobId, RateLimitSnapshot, ReqId, SessionId, UnitId, UsageDelta};
+use daemon_common::{
+    Budget, JobId, ProfileRef, RateLimitSnapshot, ReqId, SessionId, UnitId, UsageDelta,
+};
 use serde::{Deserialize, Serialize};
 
 /// A user-authored turn input (the `StartTurn` payload; the §5 message type proper lives in core).
@@ -1050,6 +1052,34 @@ pub enum UnitState {
     Unknown,
 }
 
+/// A unit/session's hierarchy role — the shared roster/tree taxonomy a GUI uses to keep the inbox
+/// (`Primary` only) separate from drill-down children, and to keep long-lived managed children
+/// stable while coalescing transient-subagent churn. The transport-stable mirror of the store's
+/// `SessionRole`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// A top-level conversation (the only role in the `TopLevel` roster scope / fleet root).
+    Primary,
+    /// A long-lived child an agent owns/manages: stable, low churn; always projected into the tree.
+    ManagedChild,
+    /// A transient/temporary subagent: in the tree but high churn (rapidly created/destroyed), so
+    /// consumers may coalesce or filter it.
+    EphemeralSubagent,
+}
+
+impl Default for SessionRole {
+    fn default() -> Self {
+        Self::Primary
+    }
+}
+
+impl SessionRole {
+    /// Whether this role is a transient subagent (the churn source consumers may collapse).
+    pub fn is_ephemeral(self) -> bool {
+        matches!(self, SessionRole::EphemeralSubagent)
+    }
+}
+
 /// One node in the orchestration tree projection (the GUI's per-unit view). The tree is a flat node
 /// list plus per-node `children` ids, so deeper / cross-node nesting can fill in later without a DTO
 /// change.
@@ -1067,6 +1097,20 @@ pub struct UnitNode {
     pub usage: UsageDelta,
     /// The ids of this unit's direct children.
     pub children: Vec<UnitId>,
+    /// The profile this unit's engine runs under, when known (GUI agent identity).
+    #[serde(default)]
+    pub profile: Option<ProfileRef>,
+    /// The session id backing this unit, when it maps to one (so a client can join to the roster).
+    #[serde(default)]
+    pub session: Option<SessionId>,
+    /// A human-readable title for this unit/conversation, when known.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// This unit's hierarchy role: a top-level conversation, a long-lived managed child, or a
+    /// transient subagent. Lets a client keep stable nodes pinned and collapse ephemeral churn.
+    /// `None` on legacy payloads => treat as `Primary`.
+    #[serde(default)]
+    pub role: Option<SessionRole>,
 }
 
 /// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`.
@@ -1118,6 +1162,32 @@ pub enum ManageEventView {
         /// A rendered error message.
         message: String,
     },
+    /// A delegation/subagent lifecycle signal — the coalescable churn-control event a GUI uses to
+    /// render the subtree without polling `tree()`. Ephemeral-subagent spawn/finish is the churn
+    /// source, so this carries the child id + role + a running active-child count rather than
+    /// per-tick noise; clients filter by `role` (e.g. ignore `EphemeralSubagent`).
+    Subagent {
+        /// Monotonic per-unit sequence.
+        seq: u64,
+        /// The child unit this signal is about.
+        child: UnitId,
+        /// The child's hierarchy role (managed vs ephemeral).
+        role: SessionRole,
+        /// The child lifecycle phase this signal reports.
+        phase: SubagentPhase,
+        /// The parent's count of currently-active children after this transition (for a stable
+        /// "N running" badge even when individual ephemeral spawns are coalesced).
+        active_children: u32,
+    },
+}
+
+/// A delegation/subagent lifecycle phase (the [`ManageEventView::Subagent`] discriminator).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubagentPhase {
+    /// The child was spawned/attached.
+    Spawned,
+    /// The child reached a terminal outcome and detached.
+    Finished,
 }
 
 #[cfg(test)]

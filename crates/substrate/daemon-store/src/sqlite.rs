@@ -13,8 +13,8 @@
 
 use crate::{
     Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, JournalSeal, ParkedApproval, SessionMeta, SessionSearchHit, SessionStatus,
-    SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
+    JournalPage, JournalSeal, ParkedApproval, SessionMeta, SessionRole, SessionSearchHit,
+    SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -108,9 +108,13 @@ CREATE TABLE IF NOT EXISTS background_edges (
 -- rehydration. A sidecar table (not columns on `session_record`) so it never touches the hot
 -- checkpoint/fence row logic.
 CREATE TABLE IF NOT EXISTS session_meta (
-    session_id    TEXT PRIMARY KEY,
-    bound_profile TEXT,
-    overlay       BLOB
+    session_id       TEXT PRIMARY KEY,
+    bound_profile    TEXT,
+    overlay          BLOB,
+    title            TEXT,
+    last_activity_ms INTEGER,
+    role             TEXT,
+    parent           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_usage (
@@ -185,6 +189,11 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         "ALTER TABLE session_usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE session_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE session_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
+        // Roster/identity columns added for the GUI session surface (title/last_activity/role/parent).
+        "ALTER TABLE session_meta ADD COLUMN title TEXT",
+        "ALTER TABLE session_meta ADD COLUMN last_activity_ms INTEGER",
+        "ALTER TABLE session_meta ADD COLUMN role TEXT",
+        "ALTER TABLE session_meta ADD COLUMN parent TEXT",
     ];
     for stmt in USAGE_COLUMNS {
         match conn.execute(stmt, []) {
@@ -195,6 +204,23 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+fn role_to_str(role: SessionRole) -> &'static str {
+    match role {
+        SessionRole::Primary => "primary",
+        SessionRole::ManagedChild => "managed_child",
+        SessionRole::EphemeralSubagent => "ephemeral_subagent",
+    }
+}
+
+fn role_from_str(s: &str) -> Option<SessionRole> {
+    match s {
+        "primary" => Some(SessionRole::Primary),
+        "managed_child" => Some(SessionRole::ManagedChild),
+        "ephemeral_subagent" => Some(SessionRole::EphemeralSubagent),
+        _ => None,
+    }
 }
 
 fn status_from_row(kind: &str, job: Option<String>) -> SessionStatus {
@@ -943,10 +969,15 @@ impl SessionStore for SqliteStore {
     async fn set_session_meta(&self, id: &SessionId, meta: SessionMeta) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let bound = meta.bound_profile.as_ref().map(|p| p.as_str());
+        let role = meta.role.map(role_to_str);
+        let parent = meta.parent.as_ref().map(|p| p.as_str());
+        let last_activity = meta.last_activity_ms.map(|v| v as i64);
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay) VALUES (?1, ?2, ?3)
-             ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3",
-            params![id.as_str(), bound, meta.overlay],
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
+             last_activity_ms = ?5, role = ?6, parent = ?7",
+            params![id.as_str(), bound, meta.overlay, meta.title, last_activity, role, parent],
         )
         .map_err(sql_err)?;
         Ok(())
@@ -955,14 +986,23 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay FROM session_meta WHERE session_id = ?1",
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent \
+             FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
                 let bound: Option<String> = row.get(0)?;
                 let overlay: Vec<u8> = row.get(1)?;
+                let title: Option<String> = row.get(2)?;
+                let last_activity_ms: Option<i64> = row.get(3)?;
+                let role: Option<String> = row.get(4)?;
+                let parent: Option<String> = row.get(5)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
+                    title,
+                    last_activity_ms: last_activity_ms.map(|v| v as u64),
+                    role: role.as_deref().and_then(role_from_str),
+                    parent: parent.map(SessionId::new),
                 })
             },
         )

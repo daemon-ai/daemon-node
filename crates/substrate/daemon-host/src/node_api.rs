@@ -27,10 +27,11 @@ use daemon_api::{
     ApiError, ApprovalInfo, ApprovalMode, AuthApi, AuthBeginRequest, AuthBeginResponse,
     AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo, BoundAccount, ControlApi,
     CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, HealthReport,
-    JournalPageView, JournalRecord, JournalRecordPayload, LogPageView, LogStream, ManageEventView,
-    ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo, ProfileSpec, ProviderSelector,
-    ServiceHealth, SessionApi, SessionInfo, SessionOverlay, SessionState, StatsReport,
-    TelemetryDump, TreeReport, UnitNode,
+    JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle, LogPageView,
+    LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo,
+    ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionDetail, SessionInfo,
+    SessionOverlay, SessionPage, SessionQuery, SessionRole, SessionScope, SessionSearchHit,
+    SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -44,7 +45,7 @@ use daemon_protocol::{
     HostRequestKind, HostResponse, HostResponseBody, Origin, OriginScope, SessionLogEntry,
     SessionPayload, SinkKind, TranscriptBlock, TransportId,
 };
-use daemon_store::{SessionStatus, SessionStore};
+use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
 use daemon_telemetry::{
     decode_entry, verify_segment, JournalPayload, Metrics, SegmentInput, TraceSigner, VerifyingKey,
     GENESIS_ROOT,
@@ -670,6 +671,24 @@ fn map_state(status: SessionStatus) -> SessionState {
     }
 }
 
+/// Map a store-level [`StoreRole`] to the wire [`SessionRole`] (the two are distinct types so the
+/// store stays protocol-free); a `None` role on a legacy meta row is a top-level `Primary`.
+fn map_role(role: Option<StoreRole>) -> SessionRole {
+    match role {
+        Some(StoreRole::Primary) | None => SessionRole::Primary,
+        Some(StoreRole::ManagedChild) => SessionRole::ManagedChild,
+        Some(StoreRole::EphemeralSubagent) => SessionRole::EphemeralSubagent,
+    }
+}
+
+/// Unix-millis now (roster `last_activity_ms` stamp).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl ControlApi for NodeApiImpl {
     async fn health(&self) -> HealthReport {
@@ -730,18 +749,111 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn sessions(&self) -> Vec<SessionInfo> {
+        self.sessions_query(SessionQuery::default()).await.sessions
+    }
+
+    async fn sessions_query(&self, query: SessionQuery) -> SessionPage {
+        let mut roster = self.roster().await;
+        // Scope filter. `TopLevel` (the inbox) shows only `Primary`; children are reached by walking
+        // the tree. The by-profile/by-transport scopes back the per-agent/per-transport views.
+        match &query.scope {
+            SessionScope::TopLevel => roster.retain(|i| i.role == SessionRole::Primary),
+            SessionScope::ByProfile(p) => {
+                roster.retain(|i| i.bound_profile.as_ref() == Some(p))
+            }
+            SessionScope::ByTransport(t) => {
+                let owned: std::collections::HashSet<SessionId> =
+                    self.live.delivery_sessions(t).into_iter().collect();
+                roster.retain(|i| owned.contains(&i.session));
+            }
+            SessionScope::All => {}
+        }
+        // Stable order: most-recently-active first, id as the tie-break (so the cursor is total).
+        roster.sort_by(|a, b| {
+            b.last_activity_ms
+                .cmp(&a.last_activity_ms)
+                .then_with(|| a.session.as_str().cmp(b.session.as_str()))
+        });
+        // Cursor pagination: `after` is the last id of the previous page; skip through it.
+        if let Some(after) = &query.after {
+            if let Some(pos) = roster.iter().position(|i| &i.session == after) {
+                roster.drain(..=pos);
+            }
+        }
+        let limit = if query.limit == 0 {
+            DEFAULT_ROSTER_PAGE
+        } else {
+            query.limit as usize
+        };
+        let next_cursor = if roster.len() > limit {
+            roster.truncate(limit);
+            roster.last().map(|i| i.session.clone())
+        } else {
+            None
+        };
+        SessionPage {
+            sessions: roster,
+            next_cursor,
+        }
+    }
+
+    async fn session_get(&self, session: SessionId) -> Option<SessionDetail> {
+        let status = self.store.status(&session).await;
+        let is_live = self.live.live_ids().iter().any(|s| s == &session);
+        if status.is_none() && !is_live {
+            return None;
+        }
+        let meta = self.store.session_meta(&session).await.unwrap_or_default();
+        let lifecycle = if status.is_some() {
+            ApiLifecycle::Durable
+        } else {
+            ApiLifecycle::Live
+        };
+        let info = session_info_from(&session, status, &meta, lifecycle);
+        let overlay = (!meta.overlay.is_empty()).then(|| decode_overlay(&meta.overlay));
+        let model = self.session_models.get(&session).map(|m| m.clone());
+        let delivery_targets = self.live.delivery_targets(&session);
+        let children = self.store.children_of(&session).await;
+        let checkpoints = match &self.checkpoints {
+            Some(store) => store.list(Some(session.as_str())).await.len() as u32,
+            None => 0,
+        };
+        Some(SessionDetail {
+            info,
+            overlay,
+            model,
+            delivery_targets,
+            children,
+            checkpoints,
+        })
+    }
+
+    async fn sessions_by_profile(&self) -> Vec<(ProfileRef, Vec<SessionInfo>)> {
+        let mut roster = self.roster().await;
+        roster.retain(|i| i.role == SessionRole::Primary && i.bound_profile.is_some());
+        let mut grouped: std::collections::BTreeMap<String, (ProfileRef, Vec<SessionInfo>)> =
+            std::collections::BTreeMap::new();
+        for info in roster {
+            let profile = info.bound_profile.clone().expect("retained Some above");
+            grouped
+                .entry(profile.as_str().to_string())
+                .or_insert_with(|| (profile, Vec::new()))
+                .1
+                .push(info);
+        }
+        grouped.into_values().collect()
+    }
+
+    async fn session_search(&self, query: String, limit: u32) -> Vec<SessionSearchHit> {
+        let cap = if limit == 0 { 20 } else { limit as usize };
         self.store
-            .list_sessions()
+            .search_sessions(&query, cap)
             .await
             .into_iter()
-            .map(|(session, status)| SessionInfo {
-                session,
-                state: map_state(status),
-                // Durable store sessions are daemon-core-backed engines: the daemon owns the
-                // conversation state and can truncate it, so they are rewindable. Foreign ACP agents
-                // are managed units (surfaced via the fleet/unit API, queryable as
-                // `AgentUnit::rewindable`), not durable store sessions, so they never appear here.
-                rewindable: true,
+            .map(|hit| SessionSearchHit {
+                session: hit.session,
+                title: hit.title,
+                snippet: hit.snippet,
             })
             .collect()
     }
@@ -2360,6 +2472,12 @@ impl LiveSessions {
             })
             .map(|s| s.key().clone())
             .collect()
+    }
+
+    /// Every live (in-memory, submit/poll) session id — the visibility half of the unified roster
+    /// (these never appear in the durable `list_sessions` until `assign`). An on-demand snapshot scan.
+    fn live_ids(&self) -> Vec<SessionId> {
+        self.sessions.iter().map(|s| s.key().clone()).collect()
     }
 
     /// Register an in-process push [`DeliverySink`] for `transport` (a live handle, replacing any

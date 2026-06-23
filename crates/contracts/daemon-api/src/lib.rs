@@ -29,7 +29,7 @@ use daemon_common::{
 use std::collections::BTreeMap;
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
-    TranscriptBlock, TransportId,
+    RewindAnchor, TranscriptBlock, TransportId,
 };
 pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
@@ -137,6 +137,24 @@ pub trait SessionApi: Send + Sync {
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         self.submit(session, command).await
+    }
+
+    /// Submit a command, optionally binding the session to an explicit `profile` on open (the "open
+    /// chat as agent X" seam). When `profile` is `Some`, the host binds it (sticky on first open,
+    /// the same path [`Self::submit_routed`] uses) before submitting; `None` keeps the routing-config
+    /// / default binding. Default: ignore `profile` and delegate to [`Self::submit_from`] /
+    /// [`Self::submit`] (a host with no profile binding keeps working).
+    async fn submit_as(
+        &self,
+        session: SessionId,
+        origin: Option<Origin>,
+        command: AgentCommand,
+        _profile: Option<ProfileRef>,
+    ) -> Result<(), ApiError> {
+        match origin {
+            Some(origin) => self.submit_from(session, origin, command).await,
+            None => self.submit(session, command).await,
+        }
     }
 
     /// Submit a command by handing the host only an [`Origin`] (no caller-chosen `SessionId`): the
@@ -315,8 +333,37 @@ pub trait ControlApi: Send + Sync {
         }
     }
 
-    /// The known durable sessions and their statuses.
-    async fn sessions(&self) -> Vec<SessionInfo>;
+    /// The roster's first page at [`SessionScope::TopLevel`] (back-compat convenience). Prefer
+    /// [`Self::sessions_query`] for scoping/pagination. The unified roster surfaces *both* durable
+    /// and live-interactive sessions; the default delegates to [`Self::sessions_query`].
+    async fn sessions(&self) -> Vec<SessionInfo> {
+        self.sessions_query(SessionQuery::default()).await.sessions
+    }
+
+    /// The scoped, paginated roster — the GUI inbox / per-agent / per-transport views. Unifies
+    /// durable `session_record` rows with live-interactive submit/poll chats, filtering subagents
+    /// out of [`SessionScope::TopLevel`]. Default: an empty page.
+    async fn sessions_query(&self, _query: SessionQuery) -> SessionPage {
+        SessionPage::default()
+    }
+
+    /// The full detail of one session (roster line + overlay/model/delivery/children/checkpoints) —
+    /// the GUI detail-pane read. `None` if unknown. Default: `None`.
+    async fn session_get(&self, _session: SessionId) -> Option<SessionDetail> {
+        None
+    }
+
+    /// The roster grouped by owning profile (the "agent owns N conversations" view). Scoped to
+    /// top-level conversations like the inbox. Default: empty.
+    async fn sessions_by_profile(&self) -> Vec<(ProfileRef, Vec<SessionInfo>)> {
+        Vec::new()
+    }
+
+    /// Full-text search over indexed session text (title + coalesced body), most-relevant first,
+    /// capped at `limit` (`0` => a server default). Default: empty (no text index).
+    async fn session_search(&self, _query: String, _limit: u32) -> Vec<SessionSearchHit> {
+        Vec::new()
+    }
 
     /// Ensure a durable session exists and wake it (start/resume work).
     async fn assign(&self, session: SessionId) -> Result<(), ApiError>;
@@ -422,6 +469,124 @@ pub trait ControlApi: Send + Sync {
         _checkpoint_id: String,
     ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("checkpoint_rewind".into()))
+    }
+
+    /// The unified rewind op (conversation-rewind spec): truncate `session`'s transcript at
+    /// `point.anchor` and, when `point.restore_workspace`, roll the workspace back to the matching
+    /// checkpoint — sealing the journal and reconstructing the engine on both the live and the
+    /// managed path (the two are made consistent here). Default: unsupported.
+    async fn rewind(&self, _session: SessionId, _point: RewindPoint) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("rewind".into()))
+    }
+
+    /// Subscribe to the orchestration tree as a push stream of [`TreeEvent`]s, filtered for churn by
+    /// `filter` (drop or coalesce transient subagents). The push delivery a streaming transport
+    /// holds open; one-shot transports poll [`Self::tree`] instead. Default: an empty stream.
+    async fn tree_subscribe(&self, _filter: TreeSubFilter) -> Result<TreeStream, ApiError> {
+        Ok(stream::empty().boxed())
+    }
+
+    // -- ACP discovery + registry (catalog-style; the daemon probes its own PATH/endpoints) --
+
+    /// Trigger a server-side ACP discovery scan (PATH + well-known locations + the curated
+    /// known-agent recipe table + configured endpoints), confirming each candidate via the ACP
+    /// `initialize` handshake. Operator-triggered (spawns subprocesses), like `model_search`.
+    /// Default: empty.
+    async fn acp_discover(&self) -> Vec<AcpAgentEntry> {
+        Vec::new()
+    }
+
+    /// The last ACP discovery results plus any manually-registered recipes (the persisted catalog a
+    /// GUI renders). Default: empty.
+    async fn acp_catalog(&self) -> Vec<AcpAgentEntry> {
+        Vec::new()
+    }
+
+    /// Manually register (persist) an ACP agent launch recipe — for a local path auto-detect missed
+    /// or a remote endpoint. Default: unsupported.
+    async fn acp_register(&self, _entry: AcpAgentEntry) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("acp_register".into()))
+    }
+
+    /// Remove a registered/cataloged ACP agent by name. Default: unsupported.
+    async fn acp_remove(&self, _name: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("acp_remove".into()))
+    }
+
+    // -- Log-tail (I16): a node-level observability stream (shape now; thin impl later) --
+
+    /// Subscribe to a node log-tail stream (resident-service / dashboard view). Default: an empty
+    /// stream (a node exposing no log tail — clients fall back to `health`/`stats`/`telemetry`).
+    async fn logs(&self, _filter: LogFilter) -> Result<LogLineStream, ApiError> {
+        Ok(stream::empty().boxed())
+    }
+
+    // -- Forward-compat stubs (I11-I13, I15): shape now, runtime deferred. Grouped on ControlApi
+    //    (defaulted) rather than new sub-traits to avoid breaking every NodeApi implementor; the
+    //    DTOs are the stable wire contract a GUI can build against. --
+
+    /// The runtime provider registry (I11). Default: empty (providers are frozen at node assembly;
+    /// cloud-by-key already works via [`CredentialApi`]).
+    async fn provider_list(&self) -> Vec<ProviderInfo> {
+        Vec::new()
+    }
+
+    /// Register/configure a provider *type* at runtime (I11). Default: unsupported (assembly-time
+    /// only today).
+    async fn provider_register(&self, _provider: ProviderInfo) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("provider_register".into()))
+    }
+
+    /// The tools available at the node (I12). Default: empty (tools are launch-time / profile policy).
+    async fn tool_list(&self) -> Vec<ToolInfo> {
+        Vec::new()
+    }
+
+    /// Register a tool at runtime (I12). Default: unsupported (tools are launch-time policy today;
+    /// only `ProfileSpec.tool_allowlist` is dynamic).
+    async fn tool_register(&self, _tool: ToolInfo) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("tool_register".into()))
+    }
+
+    /// Read the node's runtime config (I13). Default: unsupported (config is env/TOML startup-only).
+    async fn config_get(&self) -> Result<NodeConfigView, ApiError> {
+        Err(ApiError::Unsupported("config_get".into()))
+    }
+
+    /// Write the node's runtime config (I13). Default: unsupported.
+    async fn config_set(&self, _config: NodeConfigView) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("config_set".into()))
+    }
+
+    /// List scheduled cron jobs (I15). Default: empty (the scheduler is PLANNED; builds on the
+    /// `daemon-activation` wake/outbox substrate).
+    async fn cron_list(&self) -> Vec<CronJob> {
+        Vec::new()
+    }
+
+    /// Create a scheduled job (I15). Default: unsupported.
+    async fn cron_create(&self, _spec: CronSpec) -> Result<String, ApiError> {
+        Err(ApiError::Unsupported("cron_create".into()))
+    }
+
+    /// Update a scheduled job (I15). Default: unsupported.
+    async fn cron_update(&self, _id: String, _spec: CronSpec) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("cron_update".into()))
+    }
+
+    /// Delete a scheduled job (I15). Default: unsupported.
+    async fn cron_delete(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("cron_delete".into()))
+    }
+
+    /// Fire a scheduled job now (I15). Default: unsupported.
+    async fn cron_trigger(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("cron_trigger".into()))
+    }
+
+    /// List recent runs of a scheduled job (I15). Default: empty.
+    async fn cron_runs(&self, _id: String) -> Vec<CronRun> {
+        Vec::new()
     }
 }
 
@@ -671,6 +836,18 @@ pub trait ProfileApi: Send + Sync {
     async fn curator_run(&self, _profile: Option<String>) -> Result<Vec<CuratorChange>, ApiError> {
         Err(ApiError::Unsupported("curator_run".into()))
     }
+
+    /// Read a skill bundle at its current head revision (the in-app view convenience — `skill_at` at
+    /// the latest `seq`). Default: unsupported.
+    async fn skill_get(&self, _name: String) -> Result<SkillBundle, ApiError> {
+        Err(ApiError::Unsupported("skill_get".into()))
+    }
+
+    /// Create or replace a skill bundle's body (the in-app edit half; records a new revision).
+    /// Default: unsupported.
+    async fn skill_put(&self, _bundle: SkillBundle) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("skill_put".into()))
+    }
 }
 
 /// The credential sub-surface: set / list (redacted) / remove the provider secrets the node's
@@ -910,7 +1087,28 @@ pub struct TelemetryDump {
     pub active: u64,
 }
 
-/// A durable session's identity + lifecycle state.
+/// Whether a session is owned by the durable (control surface, `assign`) or the live-interactive
+/// (session surface, `submit`) lifecycle. The two are mutually exclusive for a given id; the unified
+/// roster surfaces both so a GUI sees in-progress interactive chats *and* durable sessions in one
+/// list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lifecycle {
+    /// Durable-managed (a `session_record` row; driven via [`ControlApi::assign`]).
+    Durable,
+    /// Live-interactive (an in-memory submit/poll chat; driven via [`SessionApi::submit`]).
+    Live,
+}
+
+impl Default for Lifecycle {
+    fn default() -> Self {
+        Self::Durable
+    }
+}
+
+/// A session's identity + lifecycle state + roster metadata. Enriched for the GUI roster: it carries
+/// the bound profile (agent identity), an optional title, last-activity (for sort), the
+/// durable-vs-live [`Lifecycle`], and the hierarchy [`SessionRole`] + `parent` so a client can keep
+/// the `Primary` inbox separate from drill-down children.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// The session id.
@@ -923,12 +1121,114 @@ pub struct SessionInfo {
     /// primitive. A GUI/TUI reads this to hide rewind for non-rewindable sessions.
     #[serde(default = "default_rewindable")]
     pub rewindable: bool,
+    /// The profile this session binds its engine to (the agent that owns it); `None` = the node's
+    /// active default.
+    #[serde(default)]
+    pub bound_profile: Option<ProfileRef>,
+    /// A human-readable conversation title, when set (generation is deferred).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Unix-millis of the last activity on this session, for roster sort (`None` if never stamped).
+    #[serde(default)]
+    pub last_activity_ms: Option<u64>,
+    /// Whether this session is durable-managed or live-interactive.
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
+    /// This session's hierarchy role (`Primary` is the only role in the `TopLevel` roster).
+    #[serde(default)]
+    pub role: SessionRole,
+    /// The parent session id, when this is a child/subagent.
+    #[serde(default)]
+    pub parent: Option<SessionId>,
 }
 
 /// `serde` default for [`SessionInfo::rewindable`] on older wire payloads that predate the field:
 /// daemon-core sessions are rewindable, so the safe default is `true`.
 fn default_rewindable() -> bool {
     true
+}
+
+/// The scope filter for [`ControlApi::sessions_query`] — the GUI roster query. The tree is the lazy
+/// drill-down for children, so the default `TopLevel` returns only `Primary` conversations (the
+/// inbox); the by-profile / by-transport scopes back the per-agent / per-transport views.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionScope {
+    /// Only top-level (`Primary`) conversations — the inbox. Children are reached via `tree()`.
+    TopLevel,
+    /// Sessions bound to a specific profile (the per-agent view).
+    ByProfile(ProfileRef),
+    /// Sessions whose `Primary` delivery target names a specific transport instance.
+    ByTransport(TransportId),
+    /// Every session regardless of role (explicit opt-in; can be large in a fleets-of-fleets node).
+    All,
+}
+
+impl Default for SessionScope {
+    fn default() -> Self {
+        Self::TopLevel
+    }
+}
+
+/// A scoped, paginated roster query. The cursor is the last session id from the previous page
+/// (`None` for the first page); `limit == 0` means a sensible server default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionQuery {
+    /// The roster scope filter.
+    #[serde(default)]
+    pub scope: SessionScope,
+    /// The exclusive cursor: the last [`SessionId`] returned by the previous page (`None` = start).
+    #[serde(default)]
+    pub after: Option<SessionId>,
+    /// Maximum sessions to return (`0` = a server default).
+    #[serde(default)]
+    pub limit: u32,
+}
+
+/// A page of the scoped roster: the matching sessions plus the cursor to fetch the next page
+/// (`None` when the page is the last).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPage {
+    /// The sessions in this page (already scope-filtered + ordered).
+    pub sessions: Vec<SessionInfo>,
+    /// The cursor to pass as [`SessionQuery::after`] on the next read; `None` => no more pages.
+    #[serde(default)]
+    pub next_cursor: Option<SessionId>,
+}
+
+/// The full detail of one session — the single round-trip a GUI detail pane reads: roster `info`
+/// plus the resolved overlay/model/provider, delivery targets, parent/children ids, and a
+/// checkpoint count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDetail {
+    /// The roster line for this session.
+    pub info: SessionInfo,
+    /// The session's persisted per-session overlay (model/provider/tools/approval), when recorded.
+    #[serde(default)]
+    pub overlay: Option<SessionOverlay>,
+    /// The model the session currently resolves to, when known.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The session's outbound delivery targets (where its replies post).
+    #[serde(default)]
+    pub delivery_targets: Vec<DeliveryTarget>,
+    /// This session's direct children (subagents / managed children), for tree drill-down.
+    #[serde(default)]
+    pub children: Vec<SessionId>,
+    /// How many §12 tool checkpoints are recorded for this session (rewind points).
+    #[serde(default)]
+    pub checkpoints: u32,
+}
+
+/// One full-text session-search hit — the transport-stable mirror of the store's `SessionSearchHit`
+/// ([`ControlApi::session_search`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    /// The session that matched.
+    pub session: SessionId,
+    /// The session's indexed title (empty when none was indexed).
+    pub title: String,
+    /// A highlighted excerpt of the matching body text.
+    pub snippet: String,
 }
 
 /// A parked §12 edit-approval request awaiting an operator decision — the transport-stable mirror of
@@ -960,6 +1260,14 @@ pub struct CheckpointInfo {
     pub tool: String,
     /// Unix seconds at capture.
     pub created_unix: u64,
+    /// The user-turn ordinal the checkpoint was taken under, when known — lets a GUI correlate a
+    /// workspace checkpoint with a conversation rewind anchor ([`daemon_protocol::RewindAnchor`]).
+    #[serde(default)]
+    pub turn_ordinal: Option<u64>,
+    /// The merged-log cursor (`seq`) at capture, when known — the other half of the rewind/checkpoint
+    /// correlation (the live-log position the checkpoint lines up with).
+    #[serde(default)]
+    pub cursor: Option<u64>,
 }
 
 /// A transport-stable mirror of the durable session lifecycle (decoupled from `daemon-store`).
@@ -992,11 +1300,222 @@ pub struct FleetReport {
 // `UnitKind`, `UnitState`, `UnitNode`, and `TreeReport` are defined in `daemon-protocol` (next to
 // `Outbound`) so the management contract can carry the projection seam without depending on this
 // surface crate; they are re-exported here so every transport and the cddl mirror are unchanged.
-pub use daemon_protocol::{TreeReport, UnitKind, UnitNode, UnitState};
+pub use daemon_protocol::{SessionRole, TreeReport, UnitKind, UnitNode, UnitState};
 
 // `ManageEventView` is defined in `daemon-protocol` (so the `ManagedUnit` projection seam can carry
 // it without a surface-crate edge) and re-exported here unchanged.
-pub use daemon_protocol::ManageEventView;
+pub use daemon_protocol::{ManageEventView, SubagentPhase};
+
+/// A live, push-based stream of [`TreeEvent`]s — the delivery shape a streaming transport returns
+/// from [`ControlApi::tree_subscribe`]. Like [`LogStream`], streaming is a *transport capability*;
+/// the one-shot/poll form is [`ControlApi::tree`].
+pub type TreeStream = BoxStream<'static, TreeEvent>;
+
+/// A churn-control filter for [`ControlApi::tree_subscribe`]. The tree is mostly stable
+/// `ManagedChild` topology punctuated by transient `EphemeralSubagent` churn, so a client can opt
+/// out of ephemeral nodes entirely or have rapid ephemeral changes coalesced into one update per
+/// window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeSubFilter {
+    /// Whether to deliver `EphemeralSubagent` node changes at all (`false` = stable topology only).
+    #[serde(default = "default_true")]
+    pub include_ephemeral: bool,
+    /// If set, coalesce changes into at most one update per this many milliseconds (debounce); the
+    /// emitted snapshot reflects the latest state. `None` = deliver every change.
+    #[serde(default)]
+    pub coalesce_ms: Option<u64>,
+}
+
+impl Default for TreeSubFilter {
+    fn default() -> Self {
+        Self {
+            include_ephemeral: true,
+            coalesce_ms: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One push update on the [`ControlApi::tree_subscribe`] stream. The foundation is a coalesced
+/// whole-tree snapshot (simple, churn-bounded); finer node-delta events can fill in later behind the
+/// same wire shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeEvent {
+    /// The current tree snapshot (already scope/coalesce-filtered for the subscriber).
+    Snapshot(TreeReport),
+    /// A subagent/delegation lifecycle signal (mirrors [`ManageEventView::Subagent`]) for clients
+    /// that want the churn signal without diffing snapshots.
+    Subagent(ManageEventView),
+}
+
+/// Where to rewind a session to — the unified rewind address spanning conversation rewind (truncate
+/// the transcript at `anchor`) and the optional workspace rollback. A single
+/// [`ControlApi::rewind`] op replaces the separate conversation-`RewindTo` and workspace-only
+/// [`ControlApi::checkpoint_rewind`] paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindPoint {
+    /// The conversation anchor to truncate the transcript at.
+    pub anchor: RewindAnchor,
+    /// Whether to also roll the workspace back to the checkpoint captured at/just before `anchor`.
+    #[serde(default)]
+    pub restore_workspace: bool,
+}
+
+/// Where a cataloged ACP agent's launch recipe came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcpSource {
+    /// From the curated builtin known-agent recipe table.
+    Builtin,
+    /// Manually registered by an operator (via [`ControlApi::acp_register`]).
+    Manual,
+    /// A network endpoint (TCP / stdio-bus / remote), not a PATH binary.
+    Endpoint,
+}
+
+/// A launch recipe for a foreign ACP agent — the catalog's mirror of the host's spawn spec. Either a
+/// stdio subprocess (`program` + `args` + `env`) or a network `endpoint`; exactly one is meaningful
+/// per `source`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpRecipe {
+    /// The program to exec for a stdio agent (the candidate binary, possibly an adapter shim).
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Arguments passed to the program (e.g. an adapter subcommand/flag).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the spawned agent.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// A network endpoint for a non-PATH agent (`source = Endpoint`), e.g. `tcp://host:port`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// One entry in the ACP agent catalog ([`ControlApi::acp_catalog`] / [`ControlApi::acp_discover`]):
+/// a known/registered agent, whether it is installed, and the ACP `initialize`-verified metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpAgentEntry {
+    /// The agent display name (catalog key, e.g. `"gemini"`, `"goose"`, `"claude-via-zed"`).
+    pub name: String,
+    /// How to launch it.
+    pub recipe: AcpRecipe,
+    /// Where the recipe came from.
+    pub source: AcpSource,
+    /// Whether a candidate binary/endpoint was found (PATH/well-known/endpoint probe).
+    #[serde(default)]
+    pub installed: bool,
+    /// The ACP protocol version the agent reported at `initialize`, when probed.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Agent capabilities advertised at `initialize` (opaque key/value), when probed.
+    #[serde(default)]
+    pub capabilities: Vec<(String, String)>,
+}
+
+/// A push stream of [`LogLine`]s ([`ControlApi::logs`]). Streaming is a transport capability, like
+/// [`LogStream`].
+pub type LogLineStream = BoxStream<'static, LogLine>;
+
+/// A filter for the node log-tail stream ([`ControlApi::logs`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFilter {
+    /// Minimum level to deliver (e.g. `"info"`, `"warn"`, `"error"`); `None` = all.
+    #[serde(default)]
+    pub min_level: Option<String>,
+    /// Restrict to a resident-service/target substring, when set.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// One node log line.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// Unix-millis timestamp.
+    pub ts_ms: u64,
+    /// The level (`"info"` / `"warn"` / `"error"` / ...).
+    pub level: String,
+    /// The emitting target/service.
+    pub target: String,
+    /// The rendered message.
+    pub message: String,
+}
+
+/// A runtime provider-registry entry (I11 stub DTO): a provider *type* the node can resolve engines
+/// against (the cloud/network builder selection frozen at assembly today).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInfo {
+    /// The provider id/name (e.g. `"anthropic"`, `"openai"`, `"genai"`).
+    pub name: String,
+    /// A base URL override, when the provider is endpoint-configurable.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Whether the node currently has this provider wired/usable.
+    #[serde(default)]
+    pub available: bool,
+}
+
+/// A node tool entry (I12 stub DTO).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInfo {
+    /// The tool name (as used in `ProfileSpec.tool_allowlist`).
+    pub name: String,
+    /// A short human description, when known.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// An opaque view of the node's runtime config (I13 stub DTO). Carried as a serialized blob so the
+/// concrete `NodeConfig` (a binary-layer type) need not leak into the contract; the shape is the
+/// stable wire envelope, the encoding fills in with the runtime.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeConfigView {
+    /// The config encoding discriminator (e.g. `"toml"` / `"json"`).
+    pub format: String,
+    /// The serialized config body.
+    pub body: String,
+}
+
+/// A scheduled-job spec (I15 stub DTO): when to fire and what to do.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronSpec {
+    /// A human name for the job.
+    pub name: String,
+    /// The schedule expression (cron syntax / ISO interval — runtime-defined).
+    pub schedule: String,
+    /// The session/profile the job drives, when it targets one.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// The opaque payload/command the job submits when it fires.
+    #[serde(default)]
+    pub payload: Vec<u8>,
+}
+
+/// A scheduled job (I15 stub DTO): a [`CronSpec`] plus its id and next-fire time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronJob {
+    /// The opaque job id.
+    pub id: String,
+    /// The job spec.
+    pub spec: CronSpec,
+    /// Unix seconds of the next scheduled fire, when computed.
+    #[serde(default)]
+    pub next_fire_unix: Option<u64>,
+}
+
+/// One recorded run of a scheduled job (I15 stub DTO).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronRun {
+    /// Unix seconds the run started.
+    pub started_unix: u64,
+    /// Whether the run succeeded.
+    pub ok: bool,
+    /// A rendered outcome detail, when present.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Verifiable journal read DTOs (the non-destructive reconnect / scroll-back surface)
@@ -1087,7 +1606,7 @@ pub struct LogPageView {
 /// marshals onto the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiRequest {
-    /// [`SessionApi::submit`] / [`SessionApi::submit_from`].
+    /// [`SessionApi::submit`] / [`SessionApi::submit_from`] / [`SessionApi::submit_as`].
     Submit {
         /// Target session.
         session: SessionId,
@@ -1097,6 +1616,10 @@ pub enum ApiRequest {
         /// `Some` routes through [`SessionApi::submit_from`] so the origin is recorded on the log.
         #[serde(default)]
         origin: Option<Origin>,
+        /// Optional explicit profile to bind on open ("open chat as agent X", I9). `Some` routes
+        /// through [`SessionApi::submit_as`]; `None` keeps routing-config / default binding.
+        #[serde(default)]
+        profile: Option<ProfileRef>,
     },
     /// [`SessionApi::submit_routed`]: submit by [`Origin`] and let the host's routing capability pick
     /// the session + profile + delivery. The reply is [`ApiResponse::Routed`] carrying the session.
@@ -1528,6 +2051,106 @@ pub enum ApiRequest {
         /// The opaque checkpoint id (from [`CheckpointInfo`]).
         checkpoint_id: String,
     },
+    /// [`ControlApi::sessions_query`] — the scoped, paginated roster.
+    SessionsQuery {
+        /// The roster query (scope + cursor + limit).
+        query: SessionQuery,
+    },
+    /// [`ControlApi::session_get`] — one session's full detail.
+    SessionGet {
+        /// The session to detail.
+        session: SessionId,
+    },
+    /// [`ControlApi::sessions_by_profile`] — the roster grouped by owning profile.
+    SessionsByProfile,
+    /// [`ControlApi::session_search`] — full-text session search.
+    SessionSearch {
+        /// The search query.
+        query: String,
+        /// Max hits (`0` = a server default).
+        limit: u32,
+    },
+    /// [`ControlApi::rewind`] — unified conversation + workspace rewind.
+    Rewind {
+        /// The session to rewind.
+        session: SessionId,
+        /// Where to rewind to.
+        point: RewindPoint,
+    },
+    /// [`ControlApi::acp_discover`] — trigger an ACP discovery scan.
+    AcpDiscover,
+    /// [`ControlApi::acp_catalog`] — the persisted ACP agent catalog.
+    AcpCatalog,
+    /// [`ControlApi::acp_register`] — register an ACP launch recipe.
+    AcpRegister {
+        /// The recipe to persist.
+        entry: AcpAgentEntry,
+    },
+    /// [`ControlApi::acp_remove`] — remove a cataloged/registered ACP agent.
+    AcpRemove {
+        /// The agent name to remove.
+        name: String,
+    },
+    /// [`ProfileApi::skill_get`] — read a skill bundle at head.
+    SkillGet {
+        /// The skill (bundle) name.
+        name: String,
+    },
+    /// [`ProfileApi::skill_put`] — create/replace a skill bundle body.
+    SkillPut {
+        /// The bundle to write.
+        bundle: SkillBundle,
+    },
+    /// [`ControlApi::provider_list`].
+    ProviderList,
+    /// [`ControlApi::provider_register`].
+    ProviderRegister {
+        /// The provider to register.
+        provider: ProviderInfo,
+    },
+    /// [`ControlApi::tool_list`].
+    ToolList,
+    /// [`ControlApi::tool_register`].
+    ToolRegister {
+        /// The tool to register.
+        tool: ToolInfo,
+    },
+    /// [`ControlApi::config_get`].
+    ConfigGet,
+    /// [`ControlApi::config_set`].
+    ConfigSet {
+        /// The replacement config.
+        config: NodeConfigView,
+    },
+    /// [`ControlApi::cron_list`].
+    CronList,
+    /// [`ControlApi::cron_create`].
+    CronCreate {
+        /// The job spec.
+        spec: CronSpec,
+    },
+    /// [`ControlApi::cron_update`].
+    CronUpdate {
+        /// The job id.
+        id: String,
+        /// The replacement spec.
+        spec: CronSpec,
+    },
+    /// [`ControlApi::cron_delete`].
+    CronDelete {
+        /// The job id.
+        id: String,
+    },
+    /// [`ControlApi::cron_trigger`].
+    CronTrigger {
+        /// The job id.
+        id: String,
+    },
+    /// [`ControlApi::cron_runs`].
+    CronRuns {
+        /// The job id.
+        id: String,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -1618,6 +2241,28 @@ pub enum ApiResponse {
     CuratorSkills(Vec<CuratorEntry>),
     /// The lifecycle changes a curator run applied (curator_run).
     CuratorRun(Vec<CuratorChange>),
+    /// A page of the scoped roster (sessions_query).
+    SessionPage(SessionPage),
+    /// One session's full detail, or `None` if unknown (session_get).
+    SessionDetail(Option<SessionDetail>),
+    /// The roster grouped by owning profile (sessions_by_profile).
+    SessionsByProfile(Vec<(ProfileRef, Vec<SessionInfo>)>),
+    /// Full-text session-search hits (session_search).
+    SessionSearch(Vec<SessionSearchHit>),
+    /// The ACP agent catalog (acp_discover / acp_catalog).
+    AcpCatalog(Vec<AcpAgentEntry>),
+    /// The runtime provider registry (provider_list).
+    Providers(Vec<ProviderInfo>),
+    /// The node tool list (tool_list).
+    Tools(Vec<ToolInfo>),
+    /// The node runtime config (config_get).
+    Config(NodeConfigView),
+    /// The scheduled cron jobs (cron_list).
+    CronJobs(Vec<CronJob>),
+    /// A created cron job id (cron_create).
+    CronId(String),
+    /// Recent runs of a scheduled job (cron_runs).
+    CronRuns(Vec<CronRun>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -1658,10 +2303,17 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             session,
             command,
             origin,
-        } => match origin {
-            Some(origin) => unit_or_err(api.submit_from(session, origin, command).await),
-            None => unit_or_err(api.submit(session, command).await),
-        },
+            profile,
+        } => {
+            if profile.is_some() {
+                unit_or_err(api.submit_as(session, origin, command, profile).await)
+            } else {
+                match origin {
+                    Some(origin) => unit_or_err(api.submit_from(session, origin, command).await),
+                    None => unit_or_err(api.submit(session, command).await),
+                }
+            }
+        }
         ApiRequest::SubmitRouted { origin, command } => {
             match api.submit_routed(origin, command).await {
                 Ok(session) => ApiResponse::Routed { session },
@@ -1899,6 +2551,48 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             Ok(m) => ApiResponse::ModelCurrent(m),
             Err(e) => ApiResponse::Error(e),
         },
+        ApiRequest::SessionsQuery { query } => {
+            ApiResponse::SessionPage(api.sessions_query(query).await)
+        }
+        ApiRequest::SessionGet { session } => {
+            ApiResponse::SessionDetail(api.session_get(session).await)
+        }
+        ApiRequest::SessionsByProfile => {
+            ApiResponse::SessionsByProfile(api.sessions_by_profile().await)
+        }
+        ApiRequest::SessionSearch { query, limit } => {
+            ApiResponse::SessionSearch(api.session_search(query, limit).await)
+        }
+        ApiRequest::Rewind { session, point } => unit_or_err(api.rewind(session, point).await),
+        ApiRequest::AcpDiscover => ApiResponse::AcpCatalog(api.acp_discover().await),
+        ApiRequest::AcpCatalog => ApiResponse::AcpCatalog(api.acp_catalog().await),
+        ApiRequest::AcpRegister { entry } => unit_or_err(api.acp_register(entry).await),
+        ApiRequest::AcpRemove { name } => unit_or_err(api.acp_remove(name).await),
+        ApiRequest::SkillGet { name } => match api.skill_get(name).await {
+            Ok(bundle) => ApiResponse::SkillBundle(bundle),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::SkillPut { bundle } => unit_or_err(api.skill_put(bundle).await),
+        ApiRequest::ProviderList => ApiResponse::Providers(api.provider_list().await),
+        ApiRequest::ProviderRegister { provider } => {
+            unit_or_err(api.provider_register(provider).await)
+        }
+        ApiRequest::ToolList => ApiResponse::Tools(api.tool_list().await),
+        ApiRequest::ToolRegister { tool } => unit_or_err(api.tool_register(tool).await),
+        ApiRequest::ConfigGet => match api.config_get().await {
+            Ok(c) => ApiResponse::Config(c),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::ConfigSet { config } => unit_or_err(api.config_set(config).await),
+        ApiRequest::CronList => ApiResponse::CronJobs(api.cron_list().await),
+        ApiRequest::CronCreate { spec } => match api.cron_create(spec).await {
+            Ok(id) => ApiResponse::CronId(id),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::CronUpdate { id, spec } => unit_or_err(api.cron_update(id, spec).await),
+        ApiRequest::CronDelete { id } => unit_or_err(api.cron_delete(id).await),
+        ApiRequest::CronTrigger { id } => unit_or_err(api.cron_trigger(id).await),
+        ApiRequest::CronRuns { id } => ApiResponse::CronRuns(api.cron_runs(id).await),
         // Session variants were handled by `serve_session`.
         ApiRequest::Submit { .. }
         | ApiRequest::SubmitRouted { .. }
