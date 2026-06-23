@@ -57,8 +57,16 @@ pub struct TurnCx<'a> {
 pub enum Effect {
     /// Append a turn to the conversation (durable record).
     Persist(Turn),
-    /// The engine delegated background work and now waits on `JobId` — drives suspension.
-    Delegate(JobId),
+    /// The engine delegated background work and now waits on `job` — drives suspension. `payload` is
+    /// the opaque job payload (a CBOR [`DelegationInput`](daemon_protocol::DelegationInput): task +
+    /// attachment paths) the node-side worker decodes to seed the child + materialize its `inbox/`;
+    /// the engine treats it as opaque bytes (it never reads the blob store).
+    Delegate {
+        /// The delegated job the parent now waits on.
+        job: JobId,
+        /// The opaque job payload handed to the background worker.
+        payload: Vec<u8>,
+    },
     /// Spawn an attached, non-joining, self-closing background child (§4.3): the applier issues a
     /// fire-and-forget [`HostRequestKind::Spawn`](daemon_protocol::HostRequestKind::Spawn) and keeps
     /// running — unlike [`Effect::Delegate`], it never enters `waiting_for` and never suspends the

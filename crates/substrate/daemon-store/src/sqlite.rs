@@ -522,7 +522,12 @@ impl SessionStore for SqliteStore {
             .optional()
             .map_err(sql_err)?;
         if let Some((parent_session, parent_epoch, job_id)) = parent {
-            let payload = format!("child:{}", checkpoint.session_id).into_bytes();
+            // Prefer the structured completion payload (DelegationResult: summary + artifact refs)
+            // when the incarnation captured one; else the legacy `child:{id}` marker.
+            let payload = checkpoint
+                .completion_payload
+                .clone()
+                .unwrap_or_else(|| format!("child:{}", checkpoint.session_id).into_bytes());
             let fresh = tx
                 .execute(
                     "INSERT OR IGNORE INTO completion_inbox (session_id, epoch, job_id, payload) \

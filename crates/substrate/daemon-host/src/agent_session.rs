@@ -166,6 +166,14 @@ impl AgentUnit {
 }
 
 /// Resolve a [`WorkRef`] to the engine's `StartTurn` input (§4: `work` resolves to a `UserMsg`).
+///
+/// Content-transfer note (daemon-content-transfer-spec.md Phase 2a): the structured file vocabulary
+/// (`DelegationInput`/`DelegationResult` carrying [`BlobRef`](daemon_common::BlobRef)s, materialized
+/// node-side into `inbox/`/`outbox/`) rides the **durable delegation payload**, not this coarse
+/// live/foreign assign path. The supervision [`WorkRef`]/[`Outcome`] refs are intentionally opaque
+/// string handles (`ContentRef`/`ArtifactRef`) the unit resolves through its own tools/store — the
+/// management tree stays payload-agnostic by design — so a `content` ref is surfaced verbatim as a
+/// resolvable handle in the turn text rather than being interpreted as a blob here.
 fn resolve_work(work: &WorkRef) -> UserMsg {
     if let Some(payload) = &work.payload {
         UserMsg::new(payload.text.clone())
@@ -218,6 +226,10 @@ fn map_event(ev: AgentEvent, last_work: &Arc<Mutex<Option<WorkId>>>) -> Option<M
                 outcome: Outcome {
                     end_reason: map_end_reason(end_reason),
                     summary: summary.final_text,
+                    // Artifact refs are intentionally empty on the coarse management projection: the
+                    // content-transfer artifact vocabulary (`DelegationResult` BlobRefs, materialized
+                    // node-side into the parent's `inbox/`) rides the durable delegation payload, not
+                    // this payload-agnostic supervision event stream (one ref vocabulary, one home).
                     artifacts: Vec::new(),
                 },
             },

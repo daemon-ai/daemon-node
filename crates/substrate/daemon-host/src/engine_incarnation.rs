@@ -12,8 +12,10 @@
 //! [`crate::unit`]).
 
 use crate::background::BackgroundSpawner;
+use crate::blob_store::BlobStore;
 use crate::journal::{JournalFeeder, JournalSink};
 use crate::node_api::{decode_overlay, DurableProfileResolver};
+use crate::workspace_fs::WorkspaceRoots;
 use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
 use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, SessionId};
@@ -57,6 +59,19 @@ pub struct CoreEngineFactory {
     /// from *its own* profile + overlay (the unified resolution path) instead of pinning this
     /// factory's fixed `profile`; `None` (or no recorded binding) falls back to `profile`.
     resolver: Option<DurableProfileResolver>,
+    /// The content store + workspace roots for node-mediated artifact transfer (content-transfer
+    /// Phase 2a): at a child's terminal completion the incarnation captures its `outbox/` into the
+    /// store; on a parent's hydrate it materializes a child's returned artifacts into the parent's
+    /// `inbox/`. `None` disables artifact capture/materialization (the legacy `child:{id}` marker).
+    content: Option<ContentTransfer>,
+}
+
+/// The node-side content-transfer handles threaded into a durable incarnation (blob store +
+/// workspace roots), used to capture/materialize delegated artifacts.
+#[derive(Clone)]
+struct ContentTransfer {
+    blobs: Arc<dyn BlobStore>,
+    roots: Arc<WorkspaceRoots>,
 }
 
 impl CoreEngineFactory {
@@ -77,6 +92,7 @@ impl CoreEngineFactory {
             journal: None,
             background: None,
             resolver: None,
+            content: None,
         }
     }
 
@@ -91,6 +107,7 @@ impl CoreEngineFactory {
             journal: None,
             background: None,
             resolver: None,
+            content: None,
         }
     }
 
@@ -101,6 +118,7 @@ impl CoreEngineFactory {
             journal: None,
             background: None,
             resolver: None,
+            content: None,
         }
     }
 
@@ -126,6 +144,14 @@ impl CoreEngineFactory {
         self
     }
 
+    /// Inject the content store + workspace roots so this factory's incarnations capture a child's
+    /// `outbox/` artifacts at completion and materialize a child's returned artifacts into a parent's
+    /// `inbox/` on hydrate (daemon-content-transfer-spec.md Phase 2a, node-mediated).
+    pub fn with_content(mut self, blobs: Arc<dyn BlobStore>, roots: Arc<WorkspaceRoots>) -> Self {
+        self.content = Some(ContentTransfer { blobs, roots });
+        self
+    }
+
     /// Inject an authority-backed (or brokered) credential provider + profile into every engine
     /// this factory builds — the host bridge for the §7 port (host-spec §6).
     pub fn with_credentials(mut self, credentials: CredentialBuilder, profile: ProfileRef) -> Self {
@@ -142,6 +168,8 @@ impl EngineFactory for CoreEngineFactory {
             journal: self.journal.clone(),
             background: self.background.clone(),
             resolver: self.resolver.clone(),
+            content: self.content.clone(),
+            completion_payload: None,
         })
     }
 }
@@ -158,6 +186,13 @@ pub struct CoreIncarnation {
     /// from its bound profile + persisted overlay at hydrate, so a durable session honors its own
     /// profile + restored session override instead of the factory's fixed profile.
     resolver: Option<DurableProfileResolver>,
+    /// Node-side content transfer (blob store + workspace roots) for capturing/materializing
+    /// delegated artifacts; `None` disables it.
+    content: Option<ContentTransfer>,
+    /// The structured completion payload captured at `Step::Completed` (a CBOR `DelegationResult`
+    /// over the child's `outbox/`), surfaced via [`Incarnation::completion_payload`]. `None` => no
+    /// artifacts captured (the store falls back to the legacy `child:{id}` marker).
+    completion_payload: Option<Vec<u8>>,
 }
 
 fn map_failure(failure: Failure) -> EngineError {
@@ -178,6 +213,67 @@ impl CoreIncarnation {
         let overlay = decode_overlay(&meta.overlay);
         resolver(meta.bound_profile, &overlay)
     }
+
+    /// Capture this (child) session's `outbox/` into the content store as a structured
+    /// [`DelegationResult`](daemon_protocol::DelegationResult): each regular file is `blob_put` and
+    /// referenced by name. Returns `None` (legacy marker) when content transfer is unwired or the
+    /// `outbox/` is absent/empty. Best-effort: an unreadable file or store error is skipped.
+    async fn capture_outbox(&self, session: &SessionId) -> Option<Vec<u8>> {
+        let content = self.content.as_ref()?;
+        let outbox = content.roots.session_root(session.as_str()).join("outbox");
+        let mut artifacts = Vec::new();
+        for entry in std::fs::read_dir(&outbox).ok()?.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(mut blob_ref) = content.blobs.put(&bytes).await else {
+                continue;
+            };
+            blob_ref.name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            artifacts.push(blob_ref);
+        }
+        if artifacts.is_empty() {
+            return None;
+        }
+        let summary = format!("completed with {} artifact(s)", artifacts.len());
+        Some(daemon_protocol::DelegationResult { summary, artifacts }.encode())
+    }
+
+    /// Materialize the artifacts a delegated child returned (decoded from its completion payload)
+    /// into this (parent) session's `inbox/`, fetching each from the content store. Best-effort and a
+    /// no-op when content transfer is unwired, the payload is legacy/structureless, or there are no
+    /// artifacts. The basename guards against a name escaping `inbox/`.
+    async fn materialize_artifacts(&self, session: &SessionId, payload: &[u8]) {
+        let Some(content) = &self.content else {
+            return;
+        };
+        let result = daemon_protocol::DelegationResult::decode(payload);
+        if result.artifacts.is_empty() {
+            return;
+        }
+        let inbox = content.roots.session_root(session.as_str()).join("inbox");
+        if std::fs::create_dir_all(&inbox).is_err() {
+            return;
+        }
+        for art in &result.artifacts {
+            let Ok(bytes) = content.blobs.get(&art.hash, None).await else {
+                continue;
+            };
+            let name = art
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}.bin", art.hash.to_hex()));
+            let base = std::path::Path::new(&name)
+                .file_name()
+                .map(|n| n.to_owned())
+                .unwrap_or_else(|| std::ffi::OsStr::new("artifact").to_owned());
+            let _ = std::fs::write(inbox.join(base), bytes);
+        }
+    }
 }
 
 #[async_trait]
@@ -193,6 +289,7 @@ impl Incarnation for CoreIncarnation {
             ));
         }
         let snap = Snapshot::decode(&snapshot)?;
+        let session_id = snap.session_id.clone();
         // A background child (§4.3) hydrates under its constrained review profile (skills-only /
         // memory-only tools + bounded budget + nudges off), not the parent's full profile. Otherwise,
         // when a per-session resolver + journal store are wired, re-resolve this session's profile
@@ -211,6 +308,12 @@ impl Incarnation for CoreIncarnation {
             self.profile.clone()
         };
         let mut engine = profile.from_snapshot(snap);
+        // Node-side: materialize any artifacts the completed children returned into this (parent)
+        // session's `inbox/` before the engine folds the completions (the engine sees only the
+        // summary text; the files land on disk). Best-effort; no-op without content transfer.
+        for completion in &unapplied {
+            self.materialize_artifacts(&session_id, &completion.payload).await;
+        }
         let completions = unapplied
             .into_iter()
             .map(|c| Completion {
@@ -304,7 +407,13 @@ impl Incarnation for CoreIncarnation {
         }
 
         match outcome {
-            TurnOutcome::Completed(_) => Ok(Step::Completed),
+            TurnOutcome::Completed(_) => {
+                // Terminal: capture this child's `outbox/` artifacts into the content store as the
+                // structured completion payload (the parent materializes them on its wake). `None`
+                // when content transfer is unwired or no artifacts were produced (legacy marker).
+                self.completion_payload = self.capture_outbox(&session_id).await;
+                Ok(Step::Completed)
+            }
             // §12 HITL: an approval park records its parked rows for the operator surface and enqueues
             // no runnable job (the activation layer routes it to `park_approval`). The snapshot keeps
             // the typed `PendingApproval`s (with the deferred `ToolCall`); these are the store rows.
@@ -350,6 +459,10 @@ impl Incarnation for CoreIncarnation {
 
     fn epoch(&self) -> Epoch {
         self.engine.as_ref().map(|e| e.epoch()).unwrap_or_default()
+    }
+
+    fn completion_payload(&self) -> Option<Vec<u8>> {
+        self.completion_payload.clone()
     }
 }
 
@@ -420,5 +533,81 @@ impl HostRequestHandler for DelegateResolver {
             request_id: req.request_id,
             body,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob_store::FileBlobStore;
+    use daemon_core::{MockProvider, Provider, SystemPrompt, ToolRegistry};
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("daemon-inc-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn incarnation_with_content(
+        blobs: Arc<dyn BlobStore>,
+        roots: Arc<WorkspaceRoots>,
+    ) -> CoreIncarnation {
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("test"),
+        );
+        CoreIncarnation {
+            profile,
+            engine: None,
+            journal: None,
+            background: None,
+            resolver: None,
+            content: Some(ContentTransfer { blobs, roots }),
+            completion_payload: None,
+        }
+    }
+
+    /// A child's `outbox/` is captured into the content store as a structured `DelegationResult`,
+    /// and that result materializes back into a (parent) session's `inbox/` — the node-mediated
+    /// artifact round-trip (daemon-content-transfer-spec.md Phase 2a, completion-up).
+    #[tokio::test]
+    async fn outbox_capture_round_trips_into_parent_inbox() {
+        let ws = unique_dir("ws");
+        let cas = unique_dir("cas");
+        let roots = Arc::new(WorkspaceRoots::new(ws.clone()));
+        let blobs: Arc<dyn BlobStore> =
+            Arc::new(FileBlobStore::open(cas.clone()).expect("open blob store"));
+        let inc = incarnation_with_content(blobs.clone(), roots.clone());
+
+        let child = SessionId::new("parent/c1");
+        let parent = SessionId::new("parent");
+
+        // The child writes an artifact into its outbox/.
+        let outbox = roots.session_root(child.as_str()).join("outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::write(outbox.join("report.txt"), b"final report").unwrap();
+
+        // Capture: the outbox is folded into a DelegationResult referencing the stored blob.
+        let payload = inc
+            .capture_outbox(&child)
+            .await
+            .expect("a non-empty outbox yields a structured payload");
+        let result = daemon_protocol::DelegationResult::decode(&payload);
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(result.artifacts[0].name.as_deref(), Some("report.txt"));
+
+        // Materialize: the parent's inbox/ receives the artifact bytes fetched from the store.
+        inc.materialize_artifacts(&parent, &payload).await;
+        let landed = roots.session_root(parent.as_str()).join("inbox/report.txt");
+        assert_eq!(std::fs::read(&landed).unwrap(), b"final report");
+
+        // An empty outbox captures nothing (the store falls back to the legacy marker).
+        let empty_child = SessionId::new("parent/c2");
+        assert!(inc.capture_outbox(&empty_child).await.is_none());
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&cas);
     }
 }

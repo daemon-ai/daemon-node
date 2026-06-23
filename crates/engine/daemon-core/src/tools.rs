@@ -330,13 +330,19 @@ impl Tool for DelegateTool {
             HostResponseBody::Delegated(job) => job,
             _ => JobId::new(format!("{}:unresolved", cx.session_id)),
         };
+        // Carry the task as the structured job payload (no attachments from this core tool); the
+        // node-side worker decodes it to seed the child. Replaces the historical fixed marker.
+        let payload = daemon_protocol::DelegationInput::task(self.label.clone()).encode();
         ToolOutcome {
             result: ToolResult {
                 call_id: call.call_id.clone(),
                 ok: true,
                 content: format!("delegated:{job_id}"),
             },
-            effects: vec![Effect::Delegate(job_id)],
+            effects: vec![Effect::Delegate {
+                job: job_id,
+                payload,
+            }],
             detail: None,
             untrusted: false,
         }

@@ -11,3 +11,5 @@ daemon-orchestration = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 async-trait = { workspace = true }
+# Parse the optional `attachments` arg (paths to hand down) from a JSON tool call.
+serde_json = { workspace = true }

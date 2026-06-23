@@ -30,7 +30,7 @@ use daemon_core::{
 };
 use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
-    CodecSession, CoreEngineFactory, CredentialStore, DurableProfileResolver, EngineUnit,
+    BlobStore, CodecSession, CoreEngineFactory, CredentialStore, DurableProfileResolver, EngineUnit,
     FileBlobStore, FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder,
     JournalSink, ModelProviderFactory, NodeApiImpl, ProcessAgentUnit, ProfileStore, RoutingRegistry,
     ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle, WorkspaceFs,
@@ -647,6 +647,14 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         }
         Arc::new(WorkspaceRoots::new(base).with_browse_roots(browse))
     });
+    // The content store (blob CAS), shared by the durable job worker (materializing delegated
+    // attachments) and the NodeApi `blob_*`/`fs_write_from_blob` surface. A failed open leaves it
+    // unbound (those ops resolve to Unsupported; attachment transfer is a no-op).
+    let blob_store: Option<Arc<dyn BlobStore>> = a.blob_root.as_ref().and_then(|root| {
+        FileBlobStore::open(root.clone())
+            .ok()
+            .map(|s| Arc::new(s) as Arc<dyn BlobStore>)
+    });
     let child_profile = root_profile(
         dress(
             EngineProfile::new(
@@ -763,14 +771,23 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             });
         factory = factory.with_session_resolver(resolver);
     }
+    // Give durable incarnations the content store + workspace roots so a completed child captures
+    // its outbox/ into blobs and a waking parent materializes the returned artifacts into its inbox/.
+    if let (Some(roots), Some(blobs)) = (&workspace_roots, &blob_store) {
+        factory = factory.with_content(blobs.clone(), roots.clone());
+    }
 
     // One durable job worker for the whole node: every delegation (top or nested) materializes a
     // parent-bound durable child session seeded from the same orchestrator profile.
-    let host =
-        Host::new(a.store.clone(), Arc::new(factory), a.host_config).with_job_worker(Arc::new(
-            FleetJobWorker::new(a.store.clone(), a.partition, orchestrator_profile)
-                .with_event_sink(fleet_events.clone()),
-        ));
+    let mut job_worker = FleetJobWorker::new(a.store.clone(), a.partition, orchestrator_profile)
+        .with_event_sink(fleet_events.clone());
+    // Give the worker the workspace roots + content store so it can materialize delegated
+    // attachments from the parent's workspace into the child's inbox/ (node-mediated).
+    if let (Some(roots), Some(blobs)) = (&workspace_roots, &blob_store) {
+        job_worker = job_worker.with_workspace(roots.clone(), blobs.clone());
+    }
+    let host = Host::new(a.store.clone(), Arc::new(factory), a.host_config)
+        .with_job_worker(Arc::new(job_worker));
     let handle = host.start();
 
     // The interactive (session sub-surface) engines: built from the same seam (resolved provider +
@@ -845,12 +862,9 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     if let Some(roots) = &workspace_roots {
         node_api = node_api.with_workspace(Arc::new(WorkspaceFs::new(roots.clone())));
     }
-    // Bind the content store (blob CAS) when a blob root is configured. A failure to open the
-    // directory leaves the content surface unbound (the blob_* ops resolve to Unsupported).
-    if let Some(blob_root) = &a.blob_root {
-        if let Ok(store) = FileBlobStore::open(blob_root.clone()) {
-            node_api = node_api.with_blobs(Arc::new(store));
-        }
+    // Bind the content store (blob CAS) surface, reusing the shared store built above.
+    if let Some(blobs) = &blob_store {
+        node_api = node_api.with_blobs(blobs.clone());
     }
     // Bind the model-management sub-surface when this node hosts local-inference model management.
     if let Some(models) = a.models.clone() {
@@ -1132,6 +1146,11 @@ pub struct FleetJobWorker {
     events: Option<tokio::sync::broadcast::Sender<TreeEvent>>,
     /// Monotonic sequence for the spawn markers the worker emits onto the bus.
     bus_seq: std::sync::atomic::AtomicU64,
+    /// Workspace roots for materializing delegated attachments (parent -> child inbox/). `None`
+    /// disables attachment transfer.
+    workspace_roots: Option<Arc<WorkspaceRoots>>,
+    /// The content store used to put/fetch delegated attachment bytes. `None` disables transfer.
+    blobs: Option<Arc<dyn BlobStore>>,
 }
 
 impl FleetJobWorker {
@@ -1147,6 +1166,57 @@ impl FleetJobWorker {
             profile,
             events: None,
             bus_seq: std::sync::atomic::AtomicU64::new(0),
+            workspace_roots: None,
+            blobs: None,
+        }
+    }
+
+    /// Give the worker the workspace roots + content store so it materializes a delegation's
+    /// attachment paths (read from the parent's workspace, round-tripped through the content store)
+    /// into the child's `inbox/` before the child's first turn. No-op transfer when unset.
+    pub fn with_workspace(
+        mut self,
+        roots: Arc<WorkspaceRoots>,
+        blobs: Arc<dyn BlobStore>,
+    ) -> Self {
+        self.workspace_roots = Some(roots);
+        self.blobs = Some(blobs);
+        self
+    }
+
+    /// Materialize a delegation's attachment paths from the parent workspace into the child's
+    /// `inbox/`, round-tripping each through the content store (dedup + integrity; federation-ready).
+    /// Best-effort: a missing/contained-rejected path or store error is skipped, never failing the
+    /// job. No-op when no workspace/blob store is wired or there are no attachments.
+    async fn materialize_attachments(&self, parent: &SessionId, child: &SessionId, paths: &[String]) {
+        let (Some(roots), Some(blobs)) = (&self.workspace_roots, &self.blobs) else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let parent_root = roots.session_root(parent.as_str());
+        let inbox = roots.session_root(child.as_str()).join("inbox");
+        if std::fs::create_dir_all(&inbox).is_err() {
+            return;
+        }
+        for path in paths {
+            let Ok(src) = daemon_core::exec::contain(&parent_root, std::path::Path::new(path)) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&src) else {
+                continue;
+            };
+            let Ok(blob_ref) = blobs.put(&bytes).await else {
+                continue;
+            };
+            let Ok(out) = blobs.get(&blob_ref.hash, None).await else {
+                continue;
+            };
+            let name = std::path::Path::new(path)
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("attachment"));
+            let _ = std::fs::write(inbox.join(name), out);
         }
     }
 
@@ -1202,9 +1272,14 @@ impl JobWorker for FleetJobWorker {
             // Create-if-absent: a fresh durable child session seeded with the delegated work as its
             // first turn (recovery-idempotent — a re-processed job finds the child already present).
             if self.store.status(&child).await.is_none() {
-                let work = String::from_utf8_lossy(&job.payload).into_owned();
+                // Decode the structured delegation (task + attachment paths), falling back to a
+                // legacy plain-text task for pre-upgrade jobs. Seed the child with the real task and
+                // materialize any attachments into its inbox/ before the first turn.
+                let input = daemon_protocol::DelegationInput::decode(&job.payload);
+                self.materialize_attachments(&job.session_id, &child, &input.attachments)
+                    .await;
                 let mut engine = self.profile.fresh(child.clone());
-                engine.push_user(daemon_protocol::UserMsg::new(work));
+                engine.push_user(daemon_protocol::UserMsg::new(input.task));
                 let blob = engine.snapshot().encode().map_err(ServiceError::new)?;
                 self.store
                     .create_session(child.clone(), self.partition, blob)
@@ -1635,5 +1710,42 @@ mod tests {
                 .expect("lcm_status returns JSON");
         assert_eq!(status["session_id"], "lcm-tools");
         assert!(status["store"]["session_messages"].is_number());
+    }
+
+    /// The fleet job worker materializes a delegation's attachment paths from the parent's workspace
+    /// into the child's `inbox/`, round-tripping through the content store (content-transfer Phase 2a,
+    /// delegation-down).
+    #[tokio::test]
+    async fn worker_materializes_attachment_into_child_inbox() {
+        let ws = std::env::temp_dir().join(format!("daemon-worker-ws-{}", std::process::id()));
+        let cas = std::env::temp_dir().join(format!("daemon-worker-cas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&cas);
+        let roots = Arc::new(WorkspaceRoots::new(ws.clone()));
+        let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(cas.clone()).unwrap());
+        let store: Arc<dyn daemon_store::SessionStore> = Arc::new(daemon_store::InMemoryStore::new());
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("x")) as Arc<dyn Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("t"),
+        );
+        let worker = FleetJobWorker::new(store, PartitionId::DEFAULT, profile)
+            .with_workspace(roots.clone(), blobs);
+
+        let parent = SessionId::new("parent");
+        let child = SessionId::new("parent/c1");
+        let pdir = roots.session_root(parent.as_str());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("input.txt"), b"hand me down").unwrap();
+
+        worker
+            .materialize_attachments(&parent, &child, &["input.txt".to_string()])
+            .await;
+
+        let landed = roots.session_root(child.as_str()).join("inbox/input.txt");
+        assert_eq!(std::fs::read(&landed).unwrap(), b"hand me down");
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&cas);
     }
 }

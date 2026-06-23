@@ -541,6 +541,18 @@ impl BlobRef {
             mime: None,
         }
     }
+
+    /// Attach a suggested file name (display / default save path / inbox filename).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Attach a best-effort content type.
+    pub fn with_mime(mut self, mime: impl Into<String>) -> Self {
+        self.mime = Some(mime.into());
+        self
+    }
 }
 
 /// A half-open byte range `[offset, offset + len)` for a ranged blob read.

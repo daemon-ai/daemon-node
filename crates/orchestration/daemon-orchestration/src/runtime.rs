@@ -213,11 +213,7 @@ impl FleetInner {
         let fence = self.store.acquire_activation_lease(&session).await?;
         self.store
             .mark_completed(
-                Checkpoint {
-                    session_id: session,
-                    epoch: Epoch::ZERO,
-                    snapshot: SnapshotBlob::default(),
-                },
+                Checkpoint::new(session, Epoch::ZERO, SnapshotBlob::default()),
                 fence,
             )
             .await?;

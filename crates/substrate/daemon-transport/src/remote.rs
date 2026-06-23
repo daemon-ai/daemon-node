@@ -204,11 +204,7 @@ impl RemoteHost {
                 epoch,
                 fence,
             } => {
-                let checkpoint = Checkpoint {
-                    session_id: session,
-                    epoch,
-                    snapshot: SnapshotBlob::default(),
-                };
+                let checkpoint = Checkpoint::new(session, epoch, SnapshotBlob::default());
                 Resp::Commit(
                     self.store
                         .mark_completed(checkpoint, fence)

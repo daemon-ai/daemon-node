@@ -234,6 +234,30 @@ pub struct Checkpoint {
     pub epoch: Epoch,
     /// The serialized snapshot.
     pub snapshot: SnapshotBlob,
+    /// The opaque completion payload to record when this checkpoint marks a delegated child's
+    /// terminal completion (daemon-content-transfer-spec.md Phase 2a: a CBOR `DelegationResult` -
+    /// summary + artifact refs). `None` falls back to the legacy `child:{id}` marker.
+    #[serde(default)]
+    pub completion_payload: Option<Vec<u8>>,
+}
+
+impl Checkpoint {
+    /// A checkpoint with no completion payload (the common case: a suspension/park checkpoint, or a
+    /// completion that carries no structured result).
+    pub fn new(session_id: SessionId, epoch: Epoch, snapshot: SnapshotBlob) -> Self {
+        Self {
+            session_id,
+            epoch,
+            snapshot,
+            completion_payload: None,
+        }
+    }
+
+    /// Attach a structured completion payload (used when a delegated child completes).
+    pub fn with_completion_payload(mut self, payload: Option<Vec<u8>>) -> Self {
+        self.completion_payload = payload;
+        self
+    }
 }
 
 /// A durable parked edit-approval request (§12 HITL): a gated tool action (an fs edit, a dangerous
@@ -1011,7 +1035,10 @@ impl SessionStore for InMemoryStore {
                 session_id: job.session_id.clone(),
                 epoch: job.epoch,
                 job_id: job.job_id.clone(),
-                payload: format!("child:{}", checkpoint.session_id).into_bytes(),
+                payload: checkpoint
+                    .completion_payload
+                    .clone()
+                    .unwrap_or_else(|| format!("child:{}", checkpoint.session_id).into_bytes()),
             };
             if inner.sessions.contains_key(&completion.session_id)
                 && Self::apply_completion_locked(&mut inner, &completion)

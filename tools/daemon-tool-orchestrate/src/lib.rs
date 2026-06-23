@@ -26,7 +26,7 @@ enum Verb {
     Cancel(String),
 }
 
-/// Parse a verb from the tool-call args. Minimal by design (no JSON dep): a bare verb word, with
+/// Parse a verb from the tool-call args. Minimal by design: a bare verb word, with
 /// `cancel:<unit-id>` carrying its target. Anything unrecognized (including the empty `{}` the mock
 /// provider emits) is a `delegate`.
 fn parse_verb(args: &str) -> Verb {
@@ -38,6 +38,36 @@ fn parse_verb(args: &str) -> Verb {
     } else {
         Verb::Delegate
     }
+}
+
+/// Parse the verb plus optional `attachments` (parent-workspace-relative paths to hand down) from
+/// the tool-call args. Prefers the JSON object shape a real model emits
+/// (`{"verb":"delegate","attachments":["a.txt"]}`); falls back to the minimal word parser (and no
+/// attachments) for `status`, `cancel:<id>`, or the bare `{}` the mock provider emits.
+fn parse_args(args: &str) -> (Verb, Vec<String>) {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(args) {
+        let verb = match map.get("verb").and_then(|v| v.as_str()) {
+            Some("status") => Verb::Status,
+            Some("cancel") => Verb::Cancel(
+                map.get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            _ => Verb::Delegate,
+        };
+        let attachments = map
+            .get("attachments")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (verb, attachments);
+    }
+    (parse_verb(args), Vec::new())
 }
 
 /// The default ceiling on nested delegation depth before the tool stops delegating (and the engine
@@ -111,7 +141,8 @@ impl Tool for OrchestrateTool {
     }
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
-        match parse_verb(&call.args) {
+        let (verb, attachments) = parse_args(&call.args);
+        match verb {
             // Depth guard: at the cap, stop delegating and let the turn complete — this is what
             // terminates the recursive durable delegation chain (every child is itself
             // orchestrator-capable, so an always-delegating model would otherwise nest forever).
@@ -134,10 +165,20 @@ impl Tool for OrchestrateTool {
                     HostResponseBody::Delegated(job) => job,
                     _ => JobId::new(format!("{}:unresolved", cx.session_id)),
                 };
+                // Carry the task + attachment paths as the structured job payload; the node-side
+                // worker seeds the child from `task` and materializes `attachments` into its inbox/.
+                let payload = daemon_protocol::DelegationInput {
+                    task: self.label.clone(),
+                    attachments,
+                }
+                .encode();
                 Self::ok(
                     call,
                     format!("delegated:{job_id}"),
-                    vec![Effect::Delegate(job_id)],
+                    vec![Effect::Delegate {
+                        job: job_id,
+                        payload,
+                    }],
                 )
             }
             Verb::Status => {

@@ -857,14 +857,19 @@ impl Engine {
     fn resolve_pending(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         for completion in pending {
-            let payload = String::from_utf8_lossy(&completion.payload).to_string();
+            // Decode the structured child result for its summary (the artifact refs are materialized
+            // node-side by the incarnation; the engine surfaces only the text). Back-compat: the
+            // decode falls back to the raw bytes as the summary, so a legacy `child:{id}` payload
+            // still renders the same tool-result text.
+            let summary = daemon_protocol::DelegationResult::decode(&completion.payload).summary;
             for turn in self.snapshot.conversation.turns.iter_mut() {
                 if let Turn::Tool(tool_turn) = turn {
                     for (_call, result) in tool_turn.calls.iter_mut() {
                         if result.content.contains(completion.job_id.as_str()) {
                             // Deterministic value => applying the same completion twice is a no-op.
                             result.ok = true;
-                            result.content = format!("completed:{}:{}", completion.job_id, payload);
+                            result.content =
+                                format!("completed:{}:{}", completion.job_id, summary);
                         }
                     }
                 }
@@ -930,7 +935,10 @@ impl Engine {
             if !self.snapshot.pending_approvals.is_empty() {
                 return Ok(self.suspend_for_approval(job_id, events, false));
             }
-            return Ok(self.suspend(job_id, events, false));
+            // Recovery re-suspend of an already-enqueued job: the durable outbox `OR IGNORE`-dedupes
+            // the re-enqueue on `(session, epoch, job_id)`, so this payload is discarded in favor of
+            // the original. Pass the legacy marker to preserve prior bytes for this path.
+            return Ok(self.suspend(job_id, b"delegated-work".to_vec(), events, false));
         }
 
         // §10/§11 once-per-incarnation lifecycle hooks before the first turn's work.
@@ -1111,13 +1119,13 @@ impl Engine {
                 },
                 calls,
             }));
-            let mut delegated: Option<JobId> = None;
+            let mut delegated: Option<(JobId, Vec<u8>)> = None;
             let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
             let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
             for effect in effects {
                 match effect {
                     Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
-                    Effect::Delegate(job_id) => delegated = Some(job_id),
+                    Effect::Delegate { job, payload } => delegated = Some((job, payload)),
                     Effect::Spawn(spec) => spawns.push(spec),
                     Effect::AwaitDecision {
                         job_id,
@@ -1157,12 +1165,12 @@ impl Engine {
                 return Ok(self.suspend_for_approval(first, events, true));
             }
 
-            if let Some(job_id) = delegated {
+            if let Some((job_id, payload)) = delegated {
                 // A delegation crosses the durable boundary: notify memory of the handoff, then
                 // suspend the turn and wait for the wake.
                 self.notify_session_switch(SwitchReason::Handoff).await;
                 self.snapshot.waiting_for.push(job_id.clone());
-                return Ok(self.suspend(job_id, events, true));
+                return Ok(self.suspend(job_id, payload, events, true));
             }
             // §11 -> §10 post-round hooks (spec order) on the recorded tool turn, then loop — the
             // next `call_model` sees the tool results in context.
@@ -1217,7 +1225,13 @@ impl Engine {
 
     /// Emit the suspending `TurnFinished` and build the suspension handoff, bumping the epoch on a
     /// fresh suspension (but not on a deterministic recovery re-suspend).
-    fn suspend(&mut self, job_id: JobId, events: &EventSink, bump_epoch: bool) -> TurnOutcome {
+    fn suspend(
+        &mut self,
+        job_id: JobId,
+        payload: Vec<u8>,
+        events: &EventSink,
+        bump_epoch: bool,
+    ) -> TurnOutcome {
         if bump_epoch {
             self.snapshot.epoch = self.snapshot.epoch.next();
         }
@@ -1226,7 +1240,7 @@ impl Engine {
         TurnOutcome::Suspended(Suspension {
             job_id,
             epoch: self.snapshot.epoch,
-            payload: b"delegated-work".to_vec(),
+            payload,
         })
     }
 

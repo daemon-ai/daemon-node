@@ -670,6 +670,42 @@ impl NodeApiImpl {
                 self.store.index_session_text(session, title, &text).await;
             }
         }
+        // Materialize any inbound message attachments into the session workspace `inbox/` before the
+        // turn runs (daemon-content-transfer-spec.md Phase 2b), node-mediated: the client first
+        // `blob_put`s the bytes, then submits the refs; the engine then sees the on-disk files.
+        if let AgentCommand::StartTurn { input, .. } = command {
+            if !input.attachments.is_empty() {
+                self.materialize_inbound(session, &input.attachments).await;
+            }
+        }
+    }
+
+    /// Materialize inbound message attachment blobs into the session workspace `inbox/`. Best-effort:
+    /// a fetch/write failure is skipped, never failing the submit. No-op when no workspace/blob store
+    /// is bound.
+    async fn materialize_inbound(&self, session: &SessionId, attachments: &[BlobRef]) {
+        let (Some(ws), Some(blobs)) = (&self.workspace, &self.blobs) else {
+            return;
+        };
+        let inbox = ws.roots().session_root(session.as_str()).join("inbox");
+        if tokio::fs::create_dir_all(&inbox).await.is_err() {
+            return;
+        }
+        for att in attachments {
+            let Ok(bytes) = blobs.get(&att.hash, None).await else {
+                continue;
+            };
+            let name = att
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}.bin", att.hash.to_hex()));
+            // Guard against a malicious name escaping inbox/ (use only the basename).
+            let base = std::path::Path::new(&name)
+                .file_name()
+                .map(|n| n.to_owned())
+                .unwrap_or_else(|| std::ffi::OsStr::new("attachment").to_owned());
+            let _ = tokio::fs::write(inbox.join(base), bytes).await;
+        }
     }
 
     /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.

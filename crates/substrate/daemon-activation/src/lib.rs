@@ -74,6 +74,15 @@ pub trait Incarnation: Send {
 
     /// The current incarnation epoch (post-bump at suspension).
     fn epoch(&self) -> Epoch;
+
+    /// The structured completion payload to record when this incarnation reaches `Step::Completed`
+    /// (daemon-content-transfer-spec.md Phase 2a: a CBOR `DelegationResult` capturing the child's
+    /// summary + artifact refs). Default `None` (legacy `child:{id}` marker). A `daemon-core`
+    /// incarnation with a content store + workspace roots overrides it to capture the child's
+    /// `outbox/`.
+    fn completion_payload(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Constructs fresh [`Incarnation`]s for the activation layer to hydrate.
@@ -138,11 +147,7 @@ impl ManagerInner {
         match inc.run().await? {
             Step::Suspended { job } => {
                 let snapshot = inc.checkpoint()?;
-                let checkpoint = Checkpoint {
-                    session_id: id.clone(),
-                    epoch: inc.epoch(),
-                    snapshot,
-                };
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
                 self.store
                     .checkpoint_and_enqueue(checkpoint, job, fence)
                     .await?;
@@ -152,22 +157,17 @@ impl ManagerInner {
                 // in one transaction, but enqueue *no* runnable job — the session stays dormant until
                 // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
                 let snapshot = inc.checkpoint()?;
-                let checkpoint = Checkpoint {
-                    session_id: id.clone(),
-                    epoch: inc.epoch(),
-                    snapshot,
-                };
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
                 self.store
                     .park_approval(checkpoint, approvals, fence)
                     .await?;
             }
             Step::Completed => {
                 let snapshot = inc.checkpoint()?;
-                let checkpoint = Checkpoint {
-                    session_id: id.clone(),
-                    epoch: inc.epoch(),
-                    snapshot,
-                };
+                // A delegated child carries its structured result (DelegationResult: summary +
+                // artifact refs) on the completion payload; the incarnation captured it at terminal.
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                    .with_completion_payload(inc.completion_payload());
                 self.store.mark_completed(checkpoint, fence).await?;
             }
         }

@@ -23,7 +23,7 @@ usage-delta = {
 }
 
 ; ----- §17 protocol shapes (daemon-protocol; summarized) -----
-user-msg = { text: tstr }
+user-msg = { text: tstr, ? attachments: [* blob-ref] }   ; attachments wire v14 (content-transfer Phase 2b)
 
 agent-command = { "StartTurn": { input: user-msg, request_id: req-id } }
               / { "Steer": { text: tstr, request_id: req-id } }

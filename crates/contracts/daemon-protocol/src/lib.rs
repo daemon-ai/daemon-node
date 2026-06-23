@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 use daemon_common::{
-    Budget, JobId, ProfileRef, RateLimitSnapshot, ReqId, SessionId, UnitId, UsageDelta,
+    BlobRef, Budget, JobId, ProfileRef, RateLimitSnapshot, ReqId, SessionId, UnitId, UsageDelta,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,12 +22,104 @@ use serde::{Deserialize, Serialize};
 pub struct UserMsg {
     /// The textual body of the message.
     pub text: String,
+    /// Content-addressed attachments accompanying the message (daemon-content-transfer-spec.md
+    /// Phase 2b). The node materializes these into the session workspace before the turn; the engine
+    /// sees the on-disk files (plus a note in `text`) and ignores this field.
+    #[serde(default)]
+    pub attachments: Vec<BlobRef>,
 }
 
 impl UserMsg {
-    /// Construct a user message from text.
+    /// Construct a user message from text (no attachments).
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Attach content-addressed blobs to this message.
+    pub fn with_attachments(mut self, attachments: Vec<BlobRef>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+}
+
+/// The structured input a parent hands a delegated child (daemon-content-transfer-spec.md Phase 2a):
+/// the task text plus parent-workspace-relative paths to hand down. Carried as the opaque
+/// `JobCommand.payload`. The node (which holds the workspace roots + blob store) resolves the paths
+/// to the child's `inbox/`; the engine only ever produces/consumes the opaque bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationInput {
+    /// The task instruction seeded as the child's first message.
+    pub task: String,
+    /// Parent-workspace-relative paths to materialize into the child's `inbox/`.
+    #[serde(default)]
+    pub attachments: Vec<String>,
+}
+
+impl DelegationInput {
+    /// A bare delegation with no attachments.
+    pub fn task(task: impl Into<String>) -> Self {
+        Self {
+            task: task.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// CBOR-encode for the job payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("encode DelegationInput");
+        buf
+    }
+
+    /// Decode a job payload, falling back to treating raw bytes as a legacy plain-text task (e.g.
+    /// the historical `b"delegated-work"` marker), so jobs enqueued before the upgrade still resolve.
+    pub fn decode(bytes: &[u8]) -> Self {
+        ciborium::from_reader(bytes).unwrap_or_else(|_| Self {
+            task: String::from_utf8_lossy(bytes).into_owned(),
+            attachments: Vec::new(),
+        })
+    }
+}
+
+/// The structured result a child returns to its parent (daemon-content-transfer-spec.md Phase 2a):
+/// a summary plus content-addressed artifacts (captured by the node from the child's `outbox/`).
+/// Carried as the opaque completion payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationResult {
+    /// A short human-readable summary of the child's outcome.
+    pub summary: String,
+    /// Content-addressed artifacts the child produced.
+    #[serde(default)]
+    pub artifacts: Vec<BlobRef>,
+}
+
+impl DelegationResult {
+    /// A result with a summary and no artifacts.
+    pub fn summary(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// CBOR-encode for the completion payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("encode DelegationResult");
+        buf
+    }
+
+    /// Decode a completion payload, falling back to treating raw bytes as a legacy plain-text summary
+    /// (e.g. the historical `"child:{id}"` marker), so completions written before the upgrade still
+    /// resolve.
+    pub fn decode(bytes: &[u8]) -> Self {
+        ciborium::from_reader(bytes).unwrap_or_else(|_| Self {
+            summary: String::from_utf8_lossy(bytes).into_owned(),
+            artifacts: Vec::new(),
+        })
     }
 }
 
@@ -1193,6 +1285,32 @@ pub enum SubagentPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_payloads_round_trip_and_fall_back() {
+        // Structured round-trip.
+        let input = DelegationInput {
+            task: "do the thing".into(),
+            attachments: vec!["src/a.rs".into(), "notes.md".into()],
+        };
+        assert_eq!(DelegationInput::decode(&input.encode()), input);
+
+        let hash = daemon_common::ContentHash::new([3u8; 32]);
+        let result = DelegationResult {
+            summary: "done".into(),
+            artifacts: vec![daemon_common::BlobRef::new(hash, 9)],
+        };
+        assert_eq!(DelegationResult::decode(&result.encode()), result);
+
+        // Legacy plain-text payloads (pre-upgrade) decode via the fallback path.
+        let legacy_in = DelegationInput::decode(b"delegated-work");
+        assert_eq!(legacy_in.task, "delegated-work");
+        assert!(legacy_in.attachments.is_empty());
+
+        let legacy_out = DelegationResult::decode(b"child:parent/c1");
+        assert_eq!(legacy_out.summary, "child:parent/c1");
+        assert!(legacy_out.artifacts.is_empty());
+    }
 
     fn cbor_round_trip<T>(value: &T) -> T
     where

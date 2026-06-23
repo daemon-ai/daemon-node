@@ -1945,6 +1945,80 @@ mod node_interface {
         let _ = std::fs::remove_dir_all(&blobs);
     }
 
+    /// Inbound message attachments (daemon-content-transfer-spec.md Phase 2b) end to end through a
+    /// fully assembled node: a client `blob_put`s file bytes, then submits a `StartTurn` carrying the
+    /// `BlobRef`; the node materializes it into the session's `inbox/` before the turn, where the
+    /// agent's filesystem surface (and tools) can read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_attachment_materializes_into_session_inbox() {
+        use daemon_api::{ControlApi, FsRootId, SessionApi};
+        use daemon_common::{BlobRef, ReqId};
+        use daemon_protocol::{AgentCommand, UserMsg};
+
+        let ws = std::env::temp_dir().join(format!("daemon-attach-it-ws-{}", std::process::id()));
+        let blobs = std::env::temp_dir().join(format!("daemon-attach-it-cas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&blobs);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x47; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: None,
+            provider_resolver: None,
+            credential_store: None,
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            skills_resolver: None,
+            routing: None,
+            checkpoints: None,
+            auth_factories: vec![],
+            workspace_root: Some(ws.clone()),
+            blob_root: Some(blobs.clone()),
+        });
+
+        // The client stages the attachment in the content store, then names it on the turn.
+        let r = node.blob_put(b"attached payload".to_vec()).await.expect("put");
+        let att = BlobRef::new(r.hash, r.size).with_name("hello.txt");
+        let session = SessionId::new("attach-session");
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new("see attached").with_attachments(vec![att]),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("submit");
+
+        // The node materialized the blob into the session's inbox/ (visible via the fs surface, and
+        // on disk where the agent's tools operate).
+        let read = node
+            .fs_read(FsRootId::Session(session.clone()), "inbox/hello.txt".into(), 0)
+            .await
+            .expect("read materialized attachment");
+        assert_eq!(read.bytes, b"attached payload");
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&blobs);
+    }
+
     fn temp_socket() -> std::path::PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -6591,11 +6665,7 @@ mod store_backends {
         let snapshot = Snapshot::fresh(child.clone()).encode().expect("encode");
         store
             .mark_completed(
-                Checkpoint {
-                    session_id: child.clone(),
-                    epoch: daemon_common::Epoch::ZERO,
-                    snapshot,
-                },
+                Checkpoint::new(child.clone(), daemon_common::Epoch::ZERO, snapshot),
                 fence,
             )
             .await
@@ -7238,11 +7308,7 @@ mod approval {
         };
         store
             .park_approval(
-                Checkpoint {
-                    session_id: id.clone(),
-                    epoch: Epoch(1),
-                    snapshot: blob,
-                },
+                Checkpoint::new(id.clone(), Epoch(1), blob),
                 vec![approval],
                 fence,
             )

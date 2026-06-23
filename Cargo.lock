@@ -2649,6 +2649,7 @@ dependencies = [
  "daemon-core",
  "daemon-orchestration",
  "daemon-protocol",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,7 +1,11 @@
 # Content-addressed file / artifact transfer
 
-Status: design / feasibility. No implementation yet. Companion to
-`daemon-fs-surface-spec.md` (the path-based workspace filesystem surface) and the GUI design at
+Status: partially implemented. **Phase 1** (the node content store + `blob_*`/`fs_write_from_blob`
+surface) and **Phase 2** (in-process tree transfer: delegation/completion file transfer + inbound
+message attachments, backend-only, node-mediated) are shipped — see §10 for the per-phase status and
+§5 for the as-built design. Phases 3 (federation over cut/remote) and 4 (GC/pin/quotas) and the
+daemon-app GUI surface remain design / feasibility. Companion to `daemon-fs-surface-spec.md` (the
+path-based workspace filesystem surface) and the GUI design at
 `../../../daemon-app/docs/file-browser-workspace-design.md`.
 
 This spec answers two questions with one primitive:
@@ -218,66 +222,76 @@ in-memory document is a first-class blob, not a forced temp file. Dirty state is
 Files move between units as `BlobRef`s carried in the envelopes that already cross each boundary;
 the recipient fetches bytes lazily and either holds the blob or materializes it into its workspace.
 
-### 5.1 Delegate (parent -> child)
+### 5.1 Delegate (parent -> child) — *implemented*
 
-Replace the fixed `b"delegated-work"` payload with a structured, CBOR-encoded job payload:
+The fixed `b"delegated-work"` payload is replaced with a structured, CBOR-encoded job payload
+(`daemon-protocol`):
 
 ```rust
-// proposed — the decoded shape of JobCommand.payload (stays Vec<u8> on the store)
-struct DelegationInput {
-    task: String,                 // the instruction (today's implicit "work" string)
-    attachments: Vec<BlobRef>,    // files handed down to the child
+// the decoded shape of JobCommand.payload (stays Vec<u8> on the store)
+pub struct DelegationInput {
+    pub task: String,             // the instruction seeded as the child's first message
+    pub attachments: Vec<String>, // parent-workspace-relative paths handed down to the child
 }
 ```
 
-- Set in `engine.rs::suspend` (or just before `checkpoint_and_enqueue` in `engine_incarnation.rs`)
-  from the orchestrate tool's resolved label + any referenced blobs.
-- The `FleetJobWorker` (`daemon-node`), when seeding the child, decodes the payload and either:
-  (a) **materializes** each attachment into the child's workspace sandbox
-  (`blob_get` -> `fs_write_from_blob` at a conventional `inbox/` path), and/or
-  (b) passes the `BlobRef`s in the child's first message so the agent can fetch on demand.
-- This is the concrete wiring of the dormant `WorkRef.content: Option<ContentRef>`: `ContentRef`
-  becomes a `BlobRef` and `resolve_work` fetches/materializes instead of stubbing `content:{...}`.
+Note the **paths, not inline `BlobRef`s**: the agent names files it can already see in its own
+workspace; the node (which holds the `BlobStore` + `WorkspaceRoots`) does the CAS round-trip. This
+keeps the engine content-store-free.
 
-### 5.2 Complete (child -> parent)
+- Built by the orchestrate tool from its label + an `attachments: [path]` arg and carried on
+  `Effect::Delegate { job, payload }`; `engine.rs::suspend` passes the opaque bytes into the
+  suspension (no `BlobStore` in core).
+- The `FleetJobWorker` (`daemon-node`, +`WorkspaceRoots` +`BlobStore`) decodes the payload, seeds
+  the child's first message from `task`, and **materializes** each attachment: read the parent file
+  (`session_root(parent)/<path>`), `blob_put` -> `blob_get`, write into `session_root(child)/inbox/`.
+- The dormant `WorkRef.content` is **not** repurposed as a `BlobRef` (see §5.4): the live/foreign
+  `resolve_work` path stays as-is; the structured vocabulary lives on the durable delegation payload.
+
+### 5.2 Complete (child -> parent) — *implemented*
 
 Symmetric structured completion payload:
 
 ```rust
-// proposed — the decoded shape of JobCompletion.payload (stays Vec<u8> on the store)
-struct DelegationResult {
-    summary: String,
-    artifacts: Vec<BlobRef>,      // files the child produced
+// the decoded shape of the completion payload (stays Vec<u8> on the store)
+pub struct DelegationResult {
+    pub summary: String,
+    pub artifacts: Vec<BlobRef>,  // files the child produced (captured from its outbox/)
 }
 ```
 
-- Written where the durable terminal completion is recorded (the `mark_completed` delegation branch
-  in `sqlite.rs`, today `"child:{id}"`), and/or from the legacy `Outcome.summary` path. Wires the
-  dormant `Outcome.artifacts: Vec<ArtifactRef>`.
-- The parent's `engine.rs::resolve_pending` decodes the structured result and surfaces it to the
-  open orchestrate tool slot; artifacts can be materialized into the parent's workspace or left as
-  refs the parent agent fetches on demand.
+- The child's `CoreIncarnation` captures its `outbox/` at `Step::Completed` (`blob_put` each regular
+  file), encodes a `DelegationResult`, and surfaces it via `Incarnation::completion_payload()`. The
+  activation layer attaches it to the `Checkpoint` (new additive `completion_payload` field) and
+  `mark_completed` records it as the completion payload instead of the `"child:{id}"` marker.
+- The waking parent's `CoreIncarnation` materializes `artifacts` into `session_root(parent)/inbox/`
+  on hydrate; `engine.rs::resolve_pending` decodes the `summary` into the open orchestrate tool slot.
+- `Outcome.artifacts` is **not** populated from this (see §5.4).
 
-**Back-compat (required).** `JobCommand.payload` and `JobCompletion.payload` are `Vec<u8>` today
-holding the legacy markers `b"delegated-work"` and `"child:{id}"`. Moving to CBOR structs must use a
-**versioned / fallback decode**: attempt to decode the structured form (e.g. a tagged/versioned
-CBOR), and on failure treat the bytes as the legacy text (task string / completion marker). This
-lets durable jobs and completions enqueued *before* the upgrade still resolve after it, so the
-change is safe across a rolling restart.
+**Back-compat (implemented).** `DelegationInput::decode` / `DelegationResult::decode` attempt CBOR
+and, on failure, treat the raw bytes as the legacy text (task string / completion summary), so
+durable jobs and completions enqueued *before* the upgrade (`b"delegated-work"` / `"child:{id}"`)
+still resolve after it — safe across a rolling restart.
 
-### 5.3 Messages / attachments
+### 5.3 Messages / attachments — *implemented (backend), GUI deferred*
 
-- Add an optional `attachments: Vec<BlobRef>` to the inbound/outbound message model (the event-io
-  spec already reserves an attachments placeholder on `MessageEvent`). A user/GUI message, an agent
-  reply, and a tool result can each carry blob refs without inlining bytes.
-- The GUI composer `@file:` reference resolves to a `BlobRef` (put the bytes, attach the ref) -
-  superseding the text-only `@file:` marker for actual transfer.
+- `UserMsg` carries an optional `attachments: Vec<BlobRef>` (`#[serde(default)]`), flowing through
+  `StartTurn` (+ `daemon-api.cddl`). `NodeApiImpl::submit` materializes each attachment node-side
+  into `session_root(session)/inbox/` before the turn, so the engine/tools see the on-disk files
+  (the engine ignores the field). The client first `blob_put`s the bytes, then submits the refs.
+- The daemon-app GUI composer `@file:` -> `BlobRef` flow is **not** part of this phase (Phase 2 is
+  backend-only); the message model now supports it.
 
-### 5.4 One ref vocabulary
+### 5.4 One ref vocabulary — *reconciled*
 
-`ContentRef` (delegation input) and `ArtifactRef` (completion output) in `daemon-supervision` are
-unified as `BlobRef` (or thin newtypes wrapping it) with a single content-store resolver, so the
-management tree, the durable delegation path, and the GUI all speak one handle type.
+The structured file vocabulary (`DelegationInput`/`DelegationResult` carrying `BlobRef`s, plus
+`UserMsg.attachments`) lives on the **durable delegation payload and the message model**. The coarse
+`daemon-supervision` refs (`ContentRef`/`ArtifactRef`) are deliberately left as opaque string handles
+and the management event projection (`WorkRef.content` / `Outcome.artifacts`) stays **payload-agnostic
+by design** — it never interprets blob content. So rather than collapsing those newtypes into
+`BlobRef`, the one handle type (`BlobRef`) is the vocabulary of the content-bearing paths, and the
+management tree keeps its agnostic refs. (The earlier proposal to unify the newtypes was dropped to
+respect that boundary.)
 
 ## 6. Transport: lazy fetch by hash
 
@@ -352,16 +366,32 @@ convenience).
 
 ## 10. Phasing
 
-1. **Content store + GUI in-memory docs (one node).** `BlobStore` over `<data_dir>/blobs`;
-   `blob_put`/`blob_get`/`blob_stat` + `fs_write_from_blob` on `ControlApi` (+ cddl); GUI
-   `DocumentSource` (`WorkspaceFile` already works, add `Blob`/`Ephemeral`). Delivers seamless
-   in-memory-or-disk editing.
-2. **In-process tree transfer.** Structured `JobCommand`/`JobCompletion` payloads carrying
-   `BlobRef`s; wire `WorkRef.content` + `Outcome.artifacts`; message `attachments`. Delivers
-   agent-to-agent file transfer within one node (shared CAS).
+1. **Content store + GUI in-memory docs (one node).** *(Implemented.)* `BlobStore` over
+   `<data_dir>/blobs`; `blob_put`/`blob_get`/`blob_stat` + `fs_write_from_blob` on `ControlApi`
+   (+ cddl); GUI `DocumentSource` (`WorkspaceFile` already works, add `Blob`/`Ephemeral`). Delivers
+   seamless in-memory-or-disk editing.
+2. **In-process tree transfer (backend).** *(Implemented; node-mediated — the node holds the
+   `BlobStore` + `WorkspaceRoots`, the engine stays content-store-free, exchanging only opaque
+   payload bytes.)* Split into:
+   - **2a — delegation/completion file transfer.** The opaque `Effect::Delegate` payload now carries
+     a CBOR `DelegationInput { task, attachments: [path] }` (orchestrate tool `attachments` arg); the
+     `FleetJobWorker` seeds the child from `task` and materializes each parent-workspace path through
+     the CAS into the child's `inbox/`. On completion the child's `CoreIncarnation` captures its
+     `outbox/` into a CBOR `DelegationResult { summary, artifacts: [BlobRef] }` carried on the
+     `Checkpoint`/`mark_completed` completion payload; the waking parent's incarnation materializes
+     the artifacts into its own `inbox/` and `resolve_pending` surfaces the summary text. Both
+     decoders fall back to the legacy plaintext markers (`b"delegated-work"` / `"child:{id}"`), so
+     in-flight jobs survive a rolling restart. The coarse supervision/management projection
+     (`WorkRef.content` / `Outcome.artifacts`) stays payload-agnostic by design: the ref vocabulary
+     lives on the durable delegation payload, not the management event stream.
+   - **2b — inbound message attachments (backend message model only; no GUI).** `UserMsg.attachments:
+     [BlobRef]` (`#[serde(default)]`, + cddl) flows through `StartTurn`; `NodeApiImpl::submit`
+     materializes each attachment node-side into the session's `inbox/` before the turn, so the
+     engine/tools see on-disk files. The daemon-app GUI compose surface is **not** part of this phase.
 3. **Federation.** `BlobCall`/`BlobReply` over the placement cut; `Blob*` RPC on `daemon-transport`
    for remote nodes; lazy fetch-by-hash across boundaries. Delivers transfer through placed/remote
-   parts of the tree.
+   parts of the tree. (The cut's `MarkCompleted` does not yet carry the completion payload — a
+   single-node-only limitation to lift here.)
 4. **Lifecycle hardening.** Refcount/pin + retention sweep + quotas + fetch scoping.
 
 ## 11. Out of scope (future)
