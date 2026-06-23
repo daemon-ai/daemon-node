@@ -128,6 +128,18 @@ impl Default for ChildLifetime {
     }
 }
 
+impl ChildLifetime {
+    /// The hierarchy [`SessionRole`] a child created under this lifetime takes: a managed (persistent)
+    /// child is a [`SessionRole::ManagedChild`]; a transient one is a [`SessionRole::EphemeralSubagent`].
+    /// This is the seam that derives the child's roster/tree role from the parent's delegation intent.
+    pub fn role(self) -> SessionRole {
+        match self {
+            ChildLifetime::Persistent => SessionRole::ManagedChild,
+            ChildLifetime::Ephemeral => SessionRole::EphemeralSubagent,
+        }
+    }
+}
+
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCommand {
@@ -139,6 +151,12 @@ pub struct JobCommand {
     pub epoch: Epoch,
     /// Opaque job payload.
     pub payload: Vec<u8>,
+    /// The lifetime the delegating parent declared for the child this job materializes (managed vs
+    /// transient subagent). The source of truth for the child's [`SessionRole`]. Defaults to
+    /// `Persistent` for legacy jobs and the current orchestrate path (which spawns long-lived
+    /// managed children); the ephemeral-subagent producer is forward-looking.
+    #[serde(default)]
+    pub lifetime: ChildLifetime,
 }
 
 /// A durable background-job completion, applied idempotently per `(session, epoch, job)`.

@@ -9,10 +9,11 @@
 wire_version = uint                 ; daemon-common WireVersion (current = 14)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
-session-id = tstr
-unit-id    = tstr
-req-id     = uint
-job-id     = tstr
+session-id  = tstr
+unit-id     = tstr
+req-id      = uint
+job-id      = tstr
+profile-ref = tstr
 
 ; ----- usage (daemon-common UsageDelta) -----
 usage-delta = {
@@ -104,9 +105,63 @@ session-state = "Active"
               / "Completed"
               / "Unknown"
 
+; ----- GUI roster identity/hierarchy (wire v14, additive) -----
+; Whether a session is owned by the durable (control surface) or live-interactive (session surface)
+; lifecycle; the unified roster surfaces both. `session-role` is the inbox/tree taxonomy: only
+; `Primary` is listed in the `TopLevel` roster scope; children are reached by walking the tree.
+lifecycle    = "Durable" / "Live"
+session-role = "Primary" / "ManagedChild" / "EphemeralSubagent"
+
 session-info = {
   session: session-id,
   state: session-state,
+  ? rewindable: bool,                 ; default true (daemon-core sessions truncate; foreign do not)
+  ? bound_profile: (profile-ref / null),
+  ? title: (tstr / null),
+  ? last_activity_ms: (uint / null),
+  ? lifecycle: lifecycle,             ; default "Durable"
+  ? role: session-role,               ; default "Primary"
+  ? parent: (session-id / null),
+}
+
+; The scoped roster query (ControlApi::sessions_query). `TopLevel` is the inbox (Primary only).
+session-scope = "TopLevel"
+              / { "ByProfile": profile-ref }
+              / { "ByTransport": transport-id }
+              / "All"
+
+session-query = {
+  ? scope: session-scope,             ; default "TopLevel"
+  ? after: (session-id / null),       ; exclusive cursor (last id of previous page)
+  ? limit: uint,                      ; 0 = server default
+}
+
+session-page = {
+  sessions: [* session-info],
+  ? next_cursor: (session-id / null), ; null => last page
+}
+
+; One session's full detail (the detail-pane round-trip).
+session-detail = {
+  info: session-info,
+  ? overlay: (session-overlay / null),
+  ? model: (tstr / null),
+  ? delivery_targets: [* delivery-target],
+  ? children: [* session-id],
+  ? checkpoints: uint,
+}
+
+session-search-hit = { session: session-id, title: tstr, snippet: tstr }
+
+; A recorded §12 tool checkpoint (rewind point). `turn_ordinal`/`cursor` correlate a workspace
+; checkpoint with the conversation rewind anchor / merged-log position when the ledger carries them.
+checkpoint-info = {
+  id: tstr,
+  session: session-id,
+  tool: tstr,
+  created_unix: uint,
+  ? turn_ordinal: (uint / null),
+  ? cursor: (uint / null),
 }
 
 fleet-report = {
@@ -155,6 +210,11 @@ unit-node = {
   work: (tstr / null),
   usage: usage-delta,
   children: [* unit-id],
+  ; GUI identity/hierarchy enrichment (wire v14, additive).
+  ? profile: (profile-ref / null),
+  ? session: (session-id / null),
+  ? title: (tstr / null),
+  ? role: (session-role / null),      ; null => Primary
 }
 
 tree-report = {
@@ -162,11 +222,34 @@ tree-report = {
   nodes: [* unit-node],
 }
 
+; A delegation/subagent lifecycle phase (the Subagent manage-event discriminator).
+subagent-phase = "Spawned" / "Finished"
+
 manage-event-view = { "Started": { seq: uint } }
                   / { "Progress": { seq: uint, text: (tstr / null) } }
                   / { "Usage": { seq: uint, delta: usage-delta } }
                   / { "Finished": { seq: uint, end_reason: tstr, summary: (tstr / null) } }
                   / { "Error": { seq: uint, message: tstr } }
+                  ; subagent spawn/finish churn signal (wire v14)
+                  / { "Subagent": { seq: uint, child: unit-id, role: session-role, phase: subagent-phase, active_children: uint } }
+
+; ----- tree-subscribe push stream (wire v14) -----
+; A churn-control filter: opt out of ephemeral nodes or coalesce rapid changes into one update per
+; window. A `tree-event` is a coalesced whole-tree snapshot or a subagent churn signal.
+tree-sub-filter = {
+  ? include_ephemeral: bool,          ; default true
+  ? coalesce_ms: (uint / null),       ; null => deliver every change
+}
+
+tree-event = { "Snapshot": tree-report }
+           / { "Subagent": manage-event-view }
+
+; ----- unified rewind (wire v14) -----
+; Where to rewind a session: a conversation anchor to truncate at, plus optional workspace rollback.
+rewind-point = {
+  anchor: rewind-anchor,
+  ? restore_workspace: bool,          ; default false
+}
 
 ; ----- verifiable journal read DTOs (non-destructive reconnect / scroll-back history) -----
 ; A finished, coalesced chat block (daemon-protocol TranscriptBlock), already decoded for the
@@ -364,6 +447,40 @@ gguf-info = {
   size_bytes: uint,
 }
 
+; ----- ACP agent discovery/catalog DTOs (wire v14; ControlApi::acp_*) -----
+; Where a cataloged ACP agent's launch recipe came from. A recipe is either a stdio subprocess
+; (`program` + `args` + `env`) or a network `endpoint`; capabilities/version are `initialize`-verified.
+acp-source = "Builtin" / "Manual" / "Endpoint"
+
+acp-recipe = {
+  ? program: (tstr / null),
+  ? args: [* tstr],
+  ? env: [* [tstr, tstr]],
+  ? endpoint: (tstr / null),
+}
+
+acp-agent-entry = {
+  name: tstr,
+  recipe: acp-recipe,
+  source: acp-source,
+  ? installed: bool,
+  ? version: (tstr / null),
+  ? capabilities: [* [tstr, tstr]],
+}
+
+; ----- node log-tail stream DTOs (wire v14; ControlApi::logs) -----
+log-filter = { ? min_level: (tstr / null), ? target: (tstr / null) }
+log-line   = { ts_ms: uint, level: tstr, target: tstr, message: tstr }
+
+; ----- long-tail surface stub DTOs (wire v14) -----
+provider-info    = { name: tstr, ? base_url: (tstr / null), ? available: bool }
+tool-info        = { name: tstr, ? description: (tstr / null) }
+node-config-view = { format: tstr, body: tstr }
+
+cron-spec = { name: tstr, schedule: tstr, ? target: (tstr / null), ? payload: bstr }
+cron-job  = { id: tstr, spec: cron-spec, ? next_fire_unix: (uint / null) }
+cron-run  = { started_unix: uint, ok: bool, ? detail: (tstr / null) }
+
 ; ----- the request/response mirror (1:1 with the interface methods) -----
 ; `origin` is additive on the v2 wire: absent (old encodings) or null -> the host-local default;
 ; a value routes through `submit_from` so per-event attribution is recorded on the merged log.
@@ -420,7 +537,7 @@ auth-complete-response = {
   bound_profile: (tstr / null),
 }
 
-api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null) } }
+api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null), ? profile: (profile-ref / null) } }  ; profile wire v14 ("open chat as agent X")
             ; routing (wire v7): submit by origin; the host resolves session + profile + delivery -> Routed
             / { "SubmitRouted": { origin: origin, command: agent-command } }
             / { "Poll": { session: session-id, max: uint } }
@@ -482,6 +599,36 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "AuthComplete": auth-complete-request } ; finish from captured redirect -> AuthCompleted
             / { "AuthCancel": { flow_id: tstr } }       ; drop a pending flow (idempotent) -> Ok
             / "AuthProviders"                           ; capability discovery -> AuthProviders
+            ; ----- §12 checkpoints (rewind points) -----
+            / { "CheckpointList": { ? session: (session-id / null) } }                  ; -> Checkpoints
+            / { "CheckpointRewind": { session: session-id, checkpoint_id: tstr } }      ; workspace-only rewind -> Ok
+            ; ----- GUI roster + unified rewind (wire v14) -----
+            / { "SessionsQuery": { query: session-query } }                             ; scoped/paginated roster -> SessionPage
+            / { "SessionGet": { session: session-id } }                                 ; one session detail -> SessionDetail
+            / "SessionsByProfile"                                                       ; roster grouped by profile -> SessionsByProfile
+            / { "SessionSearch": { query: tstr, limit: uint } }                         ; full-text search -> SessionSearch
+            / { "Rewind": { session: session-id, point: rewind-point } }                ; conversation + workspace rewind -> Ok
+            ; ----- ACP discovery/catalog (wire v14) -----
+            / "AcpDiscover"                                                             ; trigger a discovery scan -> AcpCatalog
+            / "AcpCatalog"                                                              ; persisted catalog -> AcpCatalog
+            / { "AcpRegister": { entry: acp-agent-entry } }                             ; register a recipe -> Ok
+            / { "AcpRemove": { name: tstr } }                                           ; remove an entry -> Ok
+            ; ----- skills (bundle get/put, wire v14) -----
+            / { "SkillGet": { name: tstr } }                                            ; -> SkillBundle
+            / { "SkillPut": { bundle: skill-bundle } }                                  ; -> Ok
+            ; ----- long-tail surfaces (wire v14) -----
+            / "ProviderList"                                                            ; -> Providers
+            / { "ProviderRegister": { provider: provider-info } }                       ; -> Ok
+            / "ToolList"                                                                ; -> Tools
+            / { "ToolRegister": { tool: tool-info } }                                   ; -> Ok
+            / "ConfigGet"                                                               ; -> Config
+            / { "ConfigSet": { config: node-config-view } }                             ; -> Ok
+            / "CronList"                                                                ; -> CronJobs
+            / { "CronCreate": { spec: cron-spec } }                                     ; -> CronId
+            / { "CronUpdate": { id: tstr, spec: cron-spec } }                           ; -> Ok
+            / { "CronDelete": { id: tstr } }                                            ; -> Ok
+            / { "CronTrigger": { id: tstr } }                                           ; -> Ok
+            / { "CronRuns": { id: tstr } }                                              ; -> CronRuns
 
 api-response = "Ok"
              / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v7)
@@ -517,4 +664,19 @@ api-response = "Ok"
              / { "AuthBegun": auth-begin-response }
              / { "AuthCompleted": auth-complete-response }
              / { "AuthProviders": [* auth-provider-info] }
+             ; ----- §12 checkpoints + GUI roster + unified rewind (wire v14) -----
+             / { "Checkpoints": [* checkpoint-info] }
+             / { "SessionPage": session-page }
+             / { "SessionDetail": (session-detail / null) }
+             / { "SessionsByProfile": [* [profile-ref, [* session-info]]] }
+             / { "SessionSearch": [* session-search-hit] }
+             ; ----- ACP discovery/catalog (wire v14) -----
+             / { "AcpCatalog": [* acp-agent-entry] }
+             ; ----- long-tail surfaces (wire v14) -----
+             / { "Providers": [* provider-info] }
+             / { "Tools": [* tool-info] }
+             / { "Config": node-config-view }
+             / { "CronJobs": [* cron-job] }
+             / { "CronId": tstr }
+             / { "CronRuns": [* cron-run] }
              / { "Error": api-error }

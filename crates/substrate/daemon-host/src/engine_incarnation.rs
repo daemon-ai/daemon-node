@@ -332,6 +332,9 @@ impl Incarnation for CoreIncarnation {
                     session_id,
                     epoch: suspension.epoch,
                     payload: suspension.payload,
+                    // The orchestrate path delegates long-lived managed children; the ephemeral
+                    // subagent producer is forward-looking, so default to `Persistent` here.
+                    lifetime: daemon_store::ChildLifetime::default(),
                 },
             }),
         }

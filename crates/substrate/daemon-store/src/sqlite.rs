@@ -12,9 +12,9 @@
 //! transaction / before any post-commit fault fires, so a crash boundary leaves consistent state.
 
 use crate::{
-    Activation, Checkpoint, CommittedRoot, FaultPoint, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, JournalSeal, ParkedApproval, SessionMeta, SessionRole, SessionSearchHit,
-    SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
+    Activation, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint, JobCommand, JobCompletion,
+    JournalEntry, JournalPage, JournalSeal, ParkedApproval, SessionMeta, SessionRole,
+    SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS job_outbox (
     job_id     TEXT NOT NULL,
     session_id TEXT NOT NULL,
     epoch      INTEGER NOT NULL,
-    payload    BLOB NOT NULL
+    payload    BLOB NOT NULL,
+    lifetime   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS enqueued_jobs (
@@ -194,6 +195,8 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         "ALTER TABLE session_meta ADD COLUMN last_activity_ms INTEGER",
         "ALTER TABLE session_meta ADD COLUMN role TEXT",
         "ALTER TABLE session_meta ADD COLUMN parent TEXT",
+        // Delegation child-lifetime marker on the durable outbox (managed vs ephemeral subagent).
+        "ALTER TABLE job_outbox ADD COLUMN lifetime TEXT",
     ];
     for stmt in USAGE_COLUMNS {
         match conn.execute(stmt, []) {
@@ -220,6 +223,21 @@ fn role_from_str(s: &str) -> Option<SessionRole> {
         "managed_child" => Some(SessionRole::ManagedChild),
         "ephemeral_subagent" => Some(SessionRole::EphemeralSubagent),
         _ => None,
+    }
+}
+
+fn lifetime_to_str(lifetime: ChildLifetime) -> &'static str {
+    match lifetime {
+        ChildLifetime::Persistent => "persistent",
+        ChildLifetime::Ephemeral => "ephemeral",
+    }
+}
+
+fn lifetime_from_str(s: Option<String>) -> ChildLifetime {
+    match s.as_deref() {
+        Some("ephemeral") => ChildLifetime::Ephemeral,
+        // Legacy rows (NULL) and the persistent marker both map to a managed child.
+        _ => ChildLifetime::Persistent,
     }
 }
 
@@ -429,13 +447,14 @@ impl SessionStore for SqliteStore {
                 .map_err(sql_err)?;
             if fresh > 0 {
                 tx.execute(
-                    "INSERT INTO job_outbox (job_id, session_id, epoch, payload) \
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO job_outbox (job_id, session_id, epoch, payload, lifetime) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         job.job_id.as_str(),
                         job.session_id.as_str(),
                         job.epoch.0 as i64,
                         job.payload,
+                        lifetime_to_str(job.lifetime),
                     ],
                 )
                 .map_err(sql_err)?;
@@ -909,7 +928,7 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT rowseq, job_id, session_id, epoch, payload FROM job_outbox \
+                "SELECT rowseq, job_id, session_id, epoch, payload, lifetime FROM job_outbox \
                  ORDER BY rowseq LIMIT 1",
                 [],
                 |row| {
@@ -920,6 +939,7 @@ impl SessionStore for SqliteStore {
                             session_id: SessionId::new(row.get::<_, String>(2)?),
                             epoch: Epoch(row.get::<_, i64>(3)? as u64),
                             payload: row.get::<_, Vec<u8>>(4)?,
+                            lifetime: lifetime_from_str(row.get::<_, Option<String>>(5)?),
                         },
                     ))
                 },

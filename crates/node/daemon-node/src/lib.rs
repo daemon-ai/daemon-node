@@ -1036,6 +1036,17 @@ impl JobWorker for FleetJobWorker {
                     .create_session(child.clone(), self.partition, blob)
                     .await
                     .map_err(ServiceError::new)?;
+                // Stamp the hierarchy edge so the child is excluded from the `TopLevel` roster and
+                // reached only by walking the tree: it is a non-`Primary` child of the delegating
+                // session. Read-modify-write preserves any bound profile/overlay; the role is
+                // derived from the job's declared `ChildLifetime` (managed vs ephemeral subagent).
+                let mut meta = self.store.session_meta(&child).await.unwrap_or_default();
+                meta.parent = Some(job.session_id.clone());
+                meta.role = Some(job.lifetime.role());
+                self.store
+                    .set_session_meta(&child, meta)
+                    .await
+                    .map_err(ServiceError::new)?;
             }
             // Durable tree edge: the child's terminal completion fulfills this job and wakes the
             // parent (in the store's mark_completed transaction). Idempotent.

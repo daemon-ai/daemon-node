@@ -29,7 +29,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use daemon_api::{dispatch, ApiRequest, ApiResponse, LogStream, NodeApi, SessionLogEntry};
+use daemon_api::{
+    dispatch, ApiRequest, ApiResponse, LogFilter, LogLineStream, LogStream, NodeApi,
+    SessionLogEntry, TreeStream, TreeSubFilter,
+};
 use daemon_common::SessionId;
 use daemon_delivery::{serve_delivery, Projector};
 use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId};
@@ -77,6 +80,8 @@ pub fn router(api: Arc<dyn NodeApi>) -> Router {
         .route("/sessions/{session}/log", get(log_after))
         .route("/sessions/{session}/subscribe", get(subscribe_sse))
         .route("/sessions/{session}/ws", get(subscribe_ws))
+        .route("/tree/subscribe", get(tree_subscribe_sse))
+        .route("/logs", get(logs_sse))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(AppState { api })
