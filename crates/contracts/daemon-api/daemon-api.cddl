@@ -194,7 +194,7 @@ approval-mode = "ask" / "accept_edits" / "auto_allow" / "deny"
 ; node toolset, or override to an explicit list. `provider` is the opaque provider-selector.
 tools-override = "inherit" / "full_toolset" / { "allowlist": [* tstr] }
 
-; `workspace` selects the session's workspace root binding (wire v15): inherit the node default
+; `workspace` selects the session's workspace root binding (wire v14): inherit the node default
 ; (isolated per-session sandbox) when absent, or bind in-place to an operator-specified directory.
 workspace-binding = "isolated" / { "bound": tstr }
 
@@ -671,7 +671,7 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "RoutingBindChat": { origin: origin, session: session-id, ? profile: (profile-ref / null) } }  ; -> Ok
             / { "RoutingUnbindChat": { origin: origin } }                               ; -> Ok
             / { "TransportRooms": { transport: transport-id } }                         ; -> Rooms
-            ; ----- filesystem / workspace surface (wire v15; daemon-fs-surface-spec.md) -----
+            ; ----- filesystem / workspace surface (wire v14; daemon-fs-surface-spec.md) -----
             / "FsRoots"                                                                  ; -> FsRoots
             / { "FsList": { root: fs-root-id, dir: tstr, ? show_ignored: bool } }        ; -> FsList
             / { "FsStat": { root: fs-root-id, path: tstr } }                             ; -> FsStat
@@ -679,6 +679,11 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "FsWrite": { root: fs-root-id, path: tstr, bytes: bstr, ? base_revision: (fs-revision / null), ? force: bool } }  ; -> FsWrite
             / { "FsSearch": { root: fs-root-id, query: fs-search-query } }               ; -> FsSearch
             / { "FsWatchPoll": { root: fs-root-id, dir: tstr, after_seq: uint, max: uint } }  ; cursor read -> FsWatch
+            ; ----- content store (wire v14; daemon-content-transfer-spec.md) -----
+            / { "BlobPut": { bytes: bstr } }                                             ; -> BlobPut
+            / { "BlobGet": { hash: content-hash, ? range: (byte-range / null) } }        ; -> BlobGet
+            / { "BlobStat": { hash: content-hash } }                                     ; -> BlobStat
+            / { "FsWriteFromBlob": { root: fs-root-id, path: tstr, hash: content-hash, ? base_revision: (fs-revision / null), ? force: bool } }  ; -> FsWrite
 
 api-response = "Ok"
              / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v7)
@@ -734,7 +739,7 @@ api-response = "Ok"
              / { "ChatRoute": (chat-route / null) }
              / { "Rooms": [* room-info] }
              / { "Error": api-error }
-             ; ----- filesystem / workspace surface (wire v15) -----
+             ; ----- filesystem / workspace surface (wire v14) -----
              / { "FsRoots": [* fs-root] }
              / { "FsList": [* fs-entry] }
              / { "FsStat": fs-entry }
@@ -742,18 +747,28 @@ api-response = "Ok"
              / { "FsWrite": fs-revision }
              / { "FsSearch": fs-search-page }
              / { "FsWatch": fs-watch-page-view }
+             ; ----- content store (wire v14) -----
+             / { "BlobPut": blob-ref }
+             / { "BlobGet": bstr }
+             / { "BlobStat": blob-stat }
 
-; ----- filesystem / workspace surface DTOs (wire v15; daemon-fs-surface-spec.md) -----
+; ----- filesystem / workspace surface DTOs (wire v14; daemon-fs-surface-spec.md) -----
 fs-root-id = { "host": tstr } / "workspace" / { "session": session-id }
 fs-root-kind = "host" / "workspace" / "session"
 fs-root = { id: fs-root-id, label: tstr, kind: fs-root-kind, ? session: (session-id / null) }
 fs-entry-kind = "file" / "dir" / "symlink"
 fs-entry = { name: tstr, path: tstr, kind: fs-entry-kind, size: uint, mtime_ms: uint, ? ignored: bool }
 fs-revision = { mtime_ms: uint, size: uint }
-fs-content = { bytes: bstr, revision: fs-revision, ? truncated: bool }
+fs-content = { bytes: bstr, revision: fs-revision, ? truncated: bool, ? blob_ref: (blob-ref / null) }
 fs-search-query = { query: tstr, ? regex: bool, ? case_sensitive: bool, ? max_results: uint, ? page: uint }
 fs-search-hit = { path: tstr, line: uint, col: uint, preview: tstr }
 fs-search-page = { hits: [* fs-search-hit], ? has_more: bool }
 fs-change-kind = "created" / "modified" / "removed"
 fs-change = { path: tstr, kind: fs-change-kind }
 fs-watch-page-view = { events: [* fs-change], next_seq: uint }
+
+; ----- content store DTOs (wire v14; daemon-content-transfer-spec.md) -----
+content-hash = bstr                 ; 32-byte SHA-256 (mirrors revision.content_hash)
+byte-range = { offset: uint, len: uint }
+blob-ref = { hash: content-hash, size: uint, ? name: (tstr / null), ? mime: (tstr / null) }
+blob-stat = { size: uint, present: bool }

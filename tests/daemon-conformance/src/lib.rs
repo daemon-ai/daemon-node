@@ -1689,6 +1689,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         })
     }
 
@@ -1764,6 +1765,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
         (node, handle)
     }
@@ -1808,6 +1810,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: Some(ws.clone()),
+            blob_root: None,
         });
 
         // The node advertises at least the writable workspace root.
@@ -1856,6 +1859,90 @@ mod node_interface {
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The content store (blob CAS, daemon-content-transfer-spec.md Phase 1) end to end through a
+    /// fully assembled node: blob_put -> blob_get round-trips, identical content dedupes to one
+    /// BlobRef, fs_read attaches a matching blob_ref, fs_write_from_blob materializes the blob into
+    /// the workspace, and a tampered store file fails the integrity check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_store_round_trips_and_materializes() {
+        use daemon_api::{ControlApi, FsRootId};
+
+        let ws = std::env::temp_dir().join(format!("daemon-blob-it-ws-{}", std::process::id()));
+        let blobs = std::env::temp_dir().join(format!("daemon-blob-it-cas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&blobs);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x46; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: None,
+            provider_resolver: None,
+            credential_store: None,
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            skills_resolver: None,
+            routing: None,
+            checkpoints: None,
+            auth_factories: vec![],
+            workspace_root: Some(ws.clone()),
+            blob_root: Some(blobs.clone()),
+        });
+
+        // put -> get round-trip.
+        let r = node.blob_put(b"content-addressed".to_vec()).await.expect("put");
+        assert_eq!(r.size, 17);
+        assert_eq!(
+            node.blob_get(r.hash, None).await.expect("get"),
+            b"content-addressed"
+        );
+        assert!(node.blob_stat(r.hash).await.present);
+
+        // Dedup: identical bytes -> identical ref.
+        let r2 = node.blob_put(b"content-addressed".to_vec()).await.unwrap();
+        assert_eq!(r.hash, r2.hash);
+
+        // fs_read attaches a matching blob_ref for an untruncated read.
+        node.fs_write(FsRootId::Workspace, "doc.txt".into(), b"hi there".to_vec(), None, false)
+            .await
+            .unwrap();
+        let read = node.fs_read(FsRootId::Workspace, "doc.txt".into(), 0).await.unwrap();
+        let read_ref = read.blob_ref.expect("blob_ref attached");
+        assert_eq!(read_ref.size, 8);
+        // The attached ref resolves to the same bytes via the content store.
+        assert_eq!(node.blob_get(read_ref.hash, None).await.unwrap(), b"hi there");
+
+        // fs_write_from_blob materializes a blob into the workspace in place.
+        node.fs_write_from_blob(FsRootId::Workspace, "from_blob.txt".into(), r.hash, None, false)
+            .await
+            .expect("materialize");
+        assert_eq!(std::fs::read(ws.join("from_blob.txt")).unwrap(), b"content-addressed");
+
+        // Integrity: tampering with the on-disk blob fails a full get.
+        let path = blobs.join(format!("{}.bin", r.hash.to_hex()));
+        std::fs::write(&path, b"tampered").unwrap();
+        assert!(node.blob_get(r.hash, None).await.is_err());
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&blobs);
     }
 
     fn temp_socket() -> std::path::PathBuf {
@@ -3164,6 +3251,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
         (node, handle, skills)
     }
@@ -3543,6 +3631,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -3757,6 +3846,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         let text_a = route_text(&node, origin("@a:hs")).await;
@@ -3820,6 +3910,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
         let text_override = route_text(&node, origin("@a:hs")).await;
         assert!(
@@ -3940,6 +4031,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![Arc::new(StubFactory)],
             workspace_root: None,
+            blob_root: None,
         });
 
         // (1) discovery: the stub family is listed.
@@ -4107,6 +4199,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.
@@ -4250,6 +4343,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         // Register two in-process sinks: the matrix account and a GUI surface.
@@ -4447,6 +4541,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         async fn drive_turn(node: &Arc<NodeApiImpl>, origin: Origin, req: u64) -> SessionId {
@@ -4650,6 +4745,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {
@@ -4811,6 +4907,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
 
         let origin = Origin::new(
@@ -5089,6 +5186,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
         let busy = SessionId::new("obs-busy");
 
@@ -5348,6 +5446,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
         let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
         let origin = Origin::new(
@@ -5483,6 +5582,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         });
         let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
 
@@ -5791,6 +5891,7 @@ mod node_interface {
             checkpoints: None,
             auth_factories: vec![],
             workspace_root: None,
+            blob_root: None,
         })
     }
 

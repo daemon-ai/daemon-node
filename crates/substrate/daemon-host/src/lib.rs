@@ -32,6 +32,7 @@
 pub mod agent_session;
 pub mod auth;
 pub mod background;
+pub mod blob_store;
 pub mod config;
 pub mod credentials;
 pub mod credstore;
@@ -88,6 +89,7 @@ pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
     TransportPattern,
 };
+pub use blob_store::{BlobError, BlobStore, FileBlobStore, MAX_BLOB_SIZE};
 pub use socket::{serve_api_unix, ApiClient};
 pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};
 pub use streamjson::StreamJsonCodec;

@@ -24,6 +24,7 @@ const STORE_PATH_ENV: &str = "DAEMON_STORE_PATH";
 /// Mnemosyne stores live under `<data_dir>/<profile>/`, mirroring hermes' per-profile home).
 const DATA_DIR_ENV: &str = "DAEMON_DATA_DIR";
 const WORKSPACE_ROOT_ENV: &str = "DAEMON_WORKSPACE_ROOT";
+const BLOB_ROOT_ENV: &str = "DAEMON_BLOB_ROOT";
 /// Overrides the owned partition id (a `u64`).
 const PARTITION_ENV: &str = "DAEMON_PARTITION";
 /// Overrides the model provider/credential profile name.
@@ -629,6 +630,9 @@ pub struct NodeConfig {
     /// (`<workspace_root>/<session_id>`, or an operator-bound directory) instead of `$TMP`. Defaults
     /// to `<data_dir>/workspaces`.
     pub workspace_root: PathBuf,
+    /// The node content store (content-addressed blob CAS, daemon-content-transfer-spec.md) root,
+    /// backing the `blob_*` ops + `fs_write_from_blob`. Defaults to `<data_dir>/blobs`.
+    pub blob_root: PathBuf,
     /// How often the wake/job dispatchers poll the durable outboxes.
     pub dispatch_interval: Duration,
     /// How often the recovery scanner re-checks for resumable sessions.
@@ -697,6 +701,7 @@ struct FileConfig {
     store_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
+    blob_root: Option<PathBuf>,
     dispatch_interval_ms: Option<u64>,
     scan_interval_ms: Option<u64>,
     profile: Option<String>,
@@ -1052,6 +1057,12 @@ impl NodeConfig {
             .or_else(|| file.workspace_root.clone())
             .unwrap_or_else(|| data_dir.join("workspaces"));
 
+        // The content store root (blob CAS); defaults under the data dir alongside workspaces.
+        let blob_root = env_string(BLOB_ROOT_ENV)
+            .map(PathBuf::from)
+            .or_else(|| file.blob_root.clone())
+            .unwrap_or_else(|| data_dir.join("blobs"));
+
         let socket_path = env_string(API_SOCKET_ENV)
             .map(PathBuf::from)
             .or(file.socket_path)
@@ -1153,6 +1164,7 @@ impl NodeConfig {
             store,
             data_dir,
             workspace_root,
+            blob_root,
             dispatch_interval,
             scan_interval,
             profile,

@@ -31,8 +31,8 @@ use daemon_core::{
 use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
     CodecSession, CoreEngineFactory, CredentialStore, DurableProfileResolver, EngineUnit,
-    FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink,
-    ModelProviderFactory, NodeApiImpl, ProcessAgentUnit, ProfileStore, RoutingRegistry,
+    FileBlobStore, FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder,
+    JournalSink, ModelProviderFactory, NodeApiImpl, ProcessAgentUnit, ProfileStore, RoutingRegistry,
     ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle, WorkspaceFs,
     WorkspaceRoots,
 };
@@ -203,6 +203,11 @@ pub struct NodeAssembly {
     /// filesystem surface (`fs_*`) serves files from there. `None` keeps the temp-sandbox default
     /// and leaves the filesystem surface unbound (tests / nodes without a workspace).
     pub workspace_root: Option<PathBuf>,
+    /// The node content store (blob CAS, daemon-content-transfer-spec.md) root. When `Some`, the
+    /// `blob_*` ops + `fs_write_from_blob` are served from a `FileBlobStore` rooted here, and
+    /// `fs_read` attaches a `BlobRef` to untruncated reads. `None` leaves the content surface
+    /// unbound (the ops resolve to `ApiError::Unsupported`).
+    pub blob_root: Option<PathBuf>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -839,6 +844,13 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // exec builders root at, so operator and agent see one filesystem.
     if let Some(roots) = &workspace_roots {
         node_api = node_api.with_workspace(Arc::new(WorkspaceFs::new(roots.clone())));
+    }
+    // Bind the content store (blob CAS) when a blob root is configured. A failure to open the
+    // directory leaves the content surface unbound (the blob_* ops resolve to Unsupported).
+    if let Some(blob_root) = &a.blob_root {
+        if let Ok(store) = FileBlobStore::open(blob_root.clone()) {
+            node_api = node_api.with_blobs(Arc::new(store));
+        }
     }
     // Bind the model-management sub-surface when this node hosts local-inference model management.
     if let Some(models) = a.models.clone() {

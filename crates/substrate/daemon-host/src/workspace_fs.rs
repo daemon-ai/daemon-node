@@ -324,6 +324,8 @@ impl WorkspaceFs {
                 size: meta.len(),
             },
             truncated,
+            // Populated by the node layer (NodeApiImpl::fs_read) when a content store is bound.
+            blob_ref: None,
         })
     }
 

@@ -1,6 +1,6 @@
 # daemon-api filesystem / workspace surface
 
-Status: design, in implementation. Driven by the GUI design at
+Status: implemented (this document tracks the shipped surface). Driven by the GUI design at
 `../../../daemon-app/docs/file-browser-workspace-design.md`.
 
 ## Why
@@ -35,10 +35,12 @@ checkpoint rewind for workspace state. This spec adds a first-class filesystem s
 ## Root kinds (`FsRootId`)
 
 - `Host(String)` - browse the node's **own machine** for discovery, bounded by an operator
-  policy: default browse roots = the node user's home directory + an operator allowlist of
-  additional roots (+ a recents/bookmarks list). Read/discovery only - `fs_write` is rejected
-  for `Host`. This is what lets a user discover directories on a *remote* node before binding
-  (the Hermes `RemoteFolderPicker` / VS Code Remote "Open Folder" pattern).
+  policy. Shipped: the node registers the user's **home directory** as the sole browse root
+  (`daemon-node` builds `browse = [("home", $HOME)]`). An operator allowlist of additional roots
+  and a recents/bookmarks list are **future** (the policy structure is in place via
+  `WorkspaceRoots::with_browse_roots`). Read/discovery only - `fs_write` is rejected for `Host`.
+  This is what lets a user discover directories on a *remote* node before binding (the Hermes
+  `RemoteFolderPicker` / VS Code Remote "Open Folder" pattern).
 - `Workspace` - the node's configured workspace root.
 - `Session(SessionId)` - a session/unit's workspace sandbox (its `ExecutionEnvironment` root).
 
@@ -55,8 +57,12 @@ and already round-trips on the wire, so this is additive; no new "bind" op is ne
 - `Bound(PathBuf)` - the operator-specified directory directly, edited **in place** (mirrors
   Hermes cwd / Cursor workspace). Containment keeps the agent inside it.
 
-`ProcessProvisioner` realizes the binding; `EngineProfile::with_exec` roots the engine at it,
-replacing the current `$TMP/daemon-ws-{session}` default.
+The binding is realized by the `WorkspaceRoots` resolver + `EngineProfile::with_exec` closures in
+`daemon-node` (`root_profile` for the base profiles, and `resolve_effective` for the per-session
+overlay path), which root each engine at `WorkspaceRoots::session_root(id)` (the bound dir when set,
+else `<workspace_root>/<session_id>`) and record the resolved root so the FS surface serves the same
+directory - replacing the `$TMP/daemon-ws-{session}` default. (`ProcessProvisioner::workspace`
+remains unused; the resolver, not the provisioner, owns rooting.)
 
 ## API surface
 
@@ -65,17 +71,23 @@ Methods on `ControlApi` (all `#[async_trait]`, `Unsupported` defaults):
 - `fs_roots() -> Vec<FsRoot>` - the node's `Host` browse roots + `Workspace` + opened
   `Session` roots.
 - `fs_list(root, dir, show_ignored) -> Result<Vec<FsEntry>, ApiError>` - one directory's
-  children; ignore rules (gitignore + artifacts) mark `ignored` rather than hiding.
+  children; entries matching the built-in artifact/VCS `IGNORED_NAMES` set (`.git`, `node_modules`,
+  `target`, `__pycache__`, ...) are marked `ignored` (and dropped when `show_ignored` is false).
+  Full `.gitignore` evaluation is **future** (the `ignore` crate was intentionally not added, to
+  keep the dependency/nix-vendoring surface small).
 - `fs_stat(root, path) -> Result<FsEntry, ApiError>`.
 - `fs_read(root, path, max_bytes) -> Result<FsContent, ApiError>` - bytes + an `FsRevision`
   etag + a `truncated` flag.
-- `fs_write(root, path, bytes, base_revision) -> Result<FsRevision, ApiError>` - optimistic
-  concurrency; `Workspace`/`Session` roots only.
+- `fs_write(root, path, bytes, base_revision, force) -> Result<FsRevision, ApiError>` - optimistic
+  concurrency; `Workspace`/`Session` roots only; `force` overrides the sensitive-path / `Deny` gate.
 - `fs_search(root, query) -> Result<FsSearchPage, ApiError>` - server-side content/regex
   search, paginated.
-- `fs_watch(root, dir) -> Result<FsWatchStream, ApiError>` (push; transport capability) and
-  `fs_watch_after(root, dir, after_seq, max) -> Result<FsWatchPageView, ApiError>` (the
-  one-shot/long-poll cursor form the wire mirror marshals, modeled on `SessionApi::log_after`).
+- `fs_watch_after(root, dir, after_seq, max) -> Result<FsWatchPageView, ApiError>` - the
+  implemented change cursor: each call re-scans the directory, folds created/modified/removed into
+  a bounded per-dir ring keyed by a monotonic `seq` (on-demand diff; no OS watcher), and returns
+  events after `after_seq`. `fs_watch(root, dir) -> Result<FsWatchStream, ApiError>` is the
+  push-stream seam but ships as the default empty stream; HTTP `GET /fs/watch` provides live
+  delivery by polling `fs_watch_after`.
 
 ### DTOs
 
@@ -108,8 +120,9 @@ The operator *is* the human, so operator writes do **not** route through
 adapter gets them via `POST /api` for free; `fs_watch` adds an SSE route (`GET /fs/watch`)
 mirroring `subscribe_sse`, with `fs_watch_after` as the socket/long-poll cursor.
 
-The new enum variants + the defaulted overlay field are additive; bump `API_WIRE_VERSION` only
-if the project's policy treats added ops as a wire change.
+The new enum variants + the defaulted `SessionOverlay.workspace` field are additive, so
+`API_WIRE_VERSION` / `WireVersion::CURRENT` is **kept at 14** (the cddl labels the FS ops as wire
+v14); no bump is required.
 
 ## Out of scope (future)
 

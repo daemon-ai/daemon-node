@@ -513,6 +513,45 @@ hash32! {
     MerkleRoot
 }
 
+/// A content-addressed handle to a blob in the node content store (daemon-content-transfer-spec.md).
+/// The `hash` is the identity (SHA-256 of the bytes); the rest is small metadata that lets a client
+/// render/route a transfer without fetching the bytes. A "file" in any envelope is a `BlobRef`
+/// (plus, optionally, a target workspace path) - the bytes are never inline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    /// Identity: SHA-256 of the blob's bytes.
+    pub hash: ContentHash,
+    /// Byte length of the blob (known at put time).
+    pub size: u64,
+    /// Suggested file name (display / default save path); `None` if unknown.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Best-effort content type; `None` if unknown.
+    #[serde(default)]
+    pub mime: Option<String>,
+}
+
+impl BlobRef {
+    /// A bare ref carrying only identity + size (no name/mime).
+    pub fn new(hash: ContentHash, size: u64) -> Self {
+        Self {
+            hash,
+            size,
+            name: None,
+            mime: None,
+        }
+    }
+}
+
+/// A half-open byte range `[offset, offset + len)` for a ranged blob read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteRange {
+    /// Start offset into the blob.
+    pub offset: u64,
+    /// Number of bytes to read from `offset`.
+    pub len: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Credential primitives (phase 7)
 // ---------------------------------------------------------------------------

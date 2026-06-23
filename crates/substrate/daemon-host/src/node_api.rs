@@ -26,10 +26,10 @@ use crate::routing::RoutingRegistry;
 use daemon_api::{
     from_cbor, to_cbor, AcpAgentEntry, AcpSource, ApiError, ApprovalInfo, ApprovalMode, AuthApi,
     AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo,
-    BoundAccount, ChatRoute, ControlApi, CredentialApi, CredentialInfo, DeliverySink, Distribution,
-    FleetReport, FsContent, FsEntry, FsRevision, FsRoot, FsRootId, FsRootKind, FsSearchPage,
-    FsSearchQuery, FsWatchPageView, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
-    Lifecycle as ApiLifecycle,
+    BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, ControlApi, CredentialApi, CredentialInfo,
+    DeliverySink, Distribution, FleetReport, FsContent, FsEntry, FsRevision, FsRoot, FsRootId,
+    FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView, HealthReport, JournalPageView,
+    JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle,
     LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
     ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
     SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole,
@@ -270,6 +270,10 @@ pub struct NodeApiImpl {
     /// watch. `None` => the `fs_*` ops resolve to [`ApiError::Unsupported`] (a node with no
     /// configured workspace).
     workspace: Option<Arc<crate::workspace_fs::WorkspaceFs>>,
+    /// The content store (content-addressed blob CAS, daemon-content-transfer-spec.md): backs the
+    /// `blob_*` ops and `fs_write_from_blob`. `None` => those ops resolve to
+    /// [`ApiError::Unsupported`] (a node with no configured blob store).
+    blobs: Option<Arc<dyn crate::blob_store::BlobStore>>,
 }
 
 impl NodeApiImpl {
@@ -323,6 +327,7 @@ impl NodeApiImpl {
             auth_flows: None,
             fleet_events: None,
             workspace: None,
+            blobs: None,
         }
     }
 
@@ -333,6 +338,67 @@ impl NodeApiImpl {
     pub fn with_workspace(mut self, workspace: Arc<crate::workspace_fs::WorkspaceFs>) -> Self {
         self.workspace = Some(workspace);
         self
+    }
+
+    /// Bind the content store (blob CAS) backing the `blob_*` ops + `fs_write_from_blob`. Absent,
+    /// those ops resolve to [`ApiError::Unsupported`].
+    pub fn with_blobs(mut self, blobs: Arc<dyn crate::blob_store::BlobStore>) -> Self {
+        self.blobs = Some(blobs);
+        self
+    }
+
+    /// The gated workspace write shared by `fs_write` and `fs_write_from_blob`: `Workspace`/`Session`
+    /// roots only, sensitive-path + per-session `Deny` gate (overridable by `force`), a pre-mutation
+    /// checkpoint for session roots, and the `Conflict`-on-stale-`base_revision` guard inside
+    /// `WorkspaceFs::write`.
+    async fn write_gated(
+        &self,
+        root: FsRootId,
+        path: String,
+        bytes: Vec<u8>,
+        base_revision: Option<FsRevision>,
+        force: bool,
+    ) -> Result<FsRevision, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_write".into()))?;
+        // Host browse roots are read-only.
+        if !ws.writable(&root)? {
+            return Err(ApiError::Unsupported(
+                "host browse roots are read-only".into(),
+            ));
+        }
+        // Sensitive-path gate (the same `.git`/`.ssh`/dotenv/keys rule the agent fs tool uses);
+        // `force` overrides. The operator *is* the human, so this never routes through a host ask.
+        if !force && is_sensitive_path(&path) {
+            return Err(ApiError::Other(format!(
+                "sensitive path {path:?} blocked; set force to override"
+            )));
+        }
+        if let FsRootId::Session(sid) = &root {
+            // A `Deny`-mode session blocks operator writes too, unless forced.
+            if !force {
+                if let Some(policy) = self.session_modes.get(sid) {
+                    if *policy == ApprovalPolicy::Deny {
+                        return Err(ApiError::Other(format!(
+                            "session {} is in deny mode; set force to override",
+                            sid.as_str()
+                        )));
+                    }
+                }
+            }
+            // Capture a checkpoint before mutating, so an operator edit is rewindable like an agent
+            // edit (best-effort; a capture failure never blocks the write).
+            if let Some(store) = &self.checkpoints {
+                let env = LocalEnvironment::new(ws.roots().session_root(sid.as_str()));
+                let call_id = format!("operator-fs-write:{path}");
+                let _ = store
+                    .capture(sid.as_str(), &call_id, "operator_fs_write", &env)
+                    .await;
+            }
+        }
+        ws.write(&root, &path, &bytes, base_revision).await
     }
 
     /// Install the host routing registry consulted by [`SessionApi::submit_routed`] (the §5.9
@@ -1691,7 +1757,17 @@ impl ControlApi for NodeApiImpl {
             .workspace
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("fs_read".into()))?;
-        ws.read(&root, &path, max_bytes).await
+        let mut content = ws.read(&root, &path, max_bytes).await?;
+        // When a content store is bound and the whole file was returned, attach a content-addressed
+        // ref so a client can hand the same bytes to an agent without re-uploading.
+        if !content.truncated {
+            if let Some(blobs) = &self.blobs {
+                if let Ok(blob_ref) = blobs.put(&content.bytes).await {
+                    content.blob_ref = Some(blob_ref);
+                }
+            }
+        }
+        Ok(content)
     }
 
     async fn fs_write(
@@ -1702,46 +1778,71 @@ impl ControlApi for NodeApiImpl {
         base_revision: Option<FsRevision>,
         force: bool,
     ) -> Result<FsRevision, ApiError> {
-        let ws = self
-            .workspace
+        self.write_gated(root, path, bytes, base_revision, force).await
+    }
+
+    async fn fs_write_from_blob(
+        &self,
+        root: FsRootId,
+        path: String,
+        hash: ContentHash,
+        base_revision: Option<FsRevision>,
+        force: bool,
+    ) -> Result<FsRevision, ApiError> {
+        let blobs = self
+            .blobs
             .as_ref()
-            .ok_or_else(|| ApiError::Unsupported("fs_write".into()))?;
-        // Host browse roots are read-only.
-        if !ws.writable(&root)? {
-            return Err(ApiError::Unsupported(
-                "host browse roots are read-only".into(),
-            ));
+            .ok_or_else(|| ApiError::Unsupported("fs_write_from_blob".into()))?;
+        let bytes = blobs
+            .get(&hash, None)
+            .await
+            .map_err(|e| ApiError::Other(format!("blob fetch: {e}")))?;
+        self.write_gated(root, path, bytes, base_revision, force).await
+    }
+
+    async fn blob_put(&self, bytes: Vec<u8>) -> Result<BlobRef, ApiError> {
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("blob_put".into()))?;
+        blobs
+            .put(&bytes)
+            .await
+            .map_err(|e| ApiError::Other(format!("blob put: {e}")))
+    }
+
+    async fn blob_get(
+        &self,
+        hash: ContentHash,
+        range: Option<ByteRange>,
+    ) -> Result<Vec<u8>, ApiError> {
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("blob_get".into()))?;
+        blobs
+            .get(&hash, range)
+            .await
+            .map_err(|e| ApiError::Other(format!("blob get: {e}")))
+    }
+
+    async fn blob_stat(&self, hash: ContentHash) -> BlobStat {
+        match &self.blobs {
+            Some(blobs) => match blobs.stat(&hash).await {
+                Some(size) => BlobStat {
+                    size,
+                    present: true,
+                },
+                None => BlobStat {
+                    size: 0,
+                    present: false,
+                },
+            },
+            None => BlobStat {
+                size: 0,
+                present: false,
+            },
         }
-        // Sensitive-path gate (the same `.git`/`.ssh`/dotenv/keys rule the agent fs tool uses);
-        // `force` overrides. The operator *is* the human, so this never routes through a host ask.
-        if !force && is_sensitive_path(&path) {
-            return Err(ApiError::Other(format!(
-                "sensitive path {path:?} blocked; set force to override"
-            )));
-        }
-        if let FsRootId::Session(sid) = &root {
-            // A `Deny`-mode session blocks operator writes too, unless forced.
-            if !force {
-                if let Some(policy) = self.session_modes.get(sid) {
-                    if *policy == ApprovalPolicy::Deny {
-                        return Err(ApiError::Other(format!(
-                            "session {} is in deny mode; set force to override",
-                            sid.as_str()
-                        )));
-                    }
-                }
-            }
-            // Capture a checkpoint before mutating, so an operator edit is rewindable like an agent
-            // edit (best-effort; a capture failure never blocks the write).
-            if let Some(store) = &self.checkpoints {
-                let env = LocalEnvironment::new(ws.roots().session_root(sid.as_str()));
-                let call_id = format!("operator-fs-write:{path}");
-                let _ = store
-                    .capture(sid.as_str(), &call_id, "operator_fs_write", &env)
-                    .await;
-            }
-        }
-        ws.write(&root, &path, &bytes, base_revision).await
     }
 
     async fn fs_search(

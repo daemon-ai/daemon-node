@@ -22,16 +22,18 @@
 
 use async_trait::async_trait;
 use daemon_common::{
-    DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile, ModelId,
-    ModelRef, ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage, SearchQuery,
-    SessionId, UnitId, UsageDelta, WireVersion,
+    ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile,
+    ModelId, ModelRef, ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage,
+    SearchQuery, SessionId, UnitId, UsageDelta, WireVersion,
 };
 use std::collections::BTreeMap;
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
     RewindAnchor, TranscriptBlock, TransportId,
 };
-pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle, WorkspaceBinding};
+pub use daemon_common::{
+    Author, BlobRef, ByteRange, Revision, RevisionKind, SkillBundle, WorkspaceBinding,
+};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -725,6 +727,47 @@ pub trait ControlApi: Send + Sync {
         _dir: String,
     ) -> Result<FsWatchStream, ApiError> {
         Ok(stream::empty().boxed())
+    }
+
+    // -- Content store (daemon-content-transfer-spec.md, Phase 1). Defaulted/unsupported so a node
+    //    without a configured blob store inherits the surface. --
+
+    /// Store bytes in the node content store, returning a content-addressed [`BlobRef`]
+    /// (write-if-absent + dedup). Default: unsupported.
+    async fn blob_put(&self, _bytes: Vec<u8>) -> Result<BlobRef, ApiError> {
+        Err(ApiError::Unsupported("blob_put".into()))
+    }
+
+    /// Read a blob by hash (full read is integrity-verified; a `range` read returns an unverified
+    /// slice). Default: unsupported.
+    async fn blob_get(
+        &self,
+        _hash: ContentHash,
+        _range: Option<ByteRange>,
+    ) -> Result<Vec<u8>, ApiError> {
+        Err(ApiError::Unsupported("blob_get".into()))
+    }
+
+    /// Metadata for a blob (presence + size). Default: absent.
+    async fn blob_stat(&self, _hash: ContentHash) -> BlobStat {
+        BlobStat {
+            size: 0,
+            present: false,
+        }
+    }
+
+    /// Materialize a blob into a workspace path (the `Workspace`/`Session` write path, with the same
+    /// containment + sensitive-path/`force` + checkpoint + `Conflict` gating as `fs_write`). Default:
+    /// unsupported.
+    async fn fs_write_from_blob(
+        &self,
+        _root: FsRootId,
+        _path: String,
+        _hash: ContentHash,
+        _base_revision: Option<FsRevision>,
+        _force: bool,
+    ) -> Result<FsRevision, ApiError> {
+        Err(ApiError::Unsupported("fs_write_from_blob".into()))
     }
 }
 
@@ -2459,6 +2502,39 @@ pub enum ApiRequest {
         /// Max events to drain.
         max: u32,
     },
+    /// [`ControlApi::blob_put`].
+    BlobPut {
+        /// The bytes to store.
+        bytes: Vec<u8>,
+    },
+    /// [`ControlApi::blob_get`].
+    BlobGet {
+        /// The content hash to fetch.
+        hash: ContentHash,
+        /// An optional byte range (a ranged read is returned unverified).
+        #[serde(default)]
+        range: Option<ByteRange>,
+    },
+    /// [`ControlApi::blob_stat`].
+    BlobStat {
+        /// The content hash to stat.
+        hash: ContentHash,
+    },
+    /// [`ControlApi::fs_write_from_blob`].
+    FsWriteFromBlob {
+        /// The target root (Workspace/Session only).
+        root: FsRootId,
+        /// Root-relative destination path.
+        path: String,
+        /// The blob to materialize.
+        hash: ContentHash,
+        /// The base etag for optimistic concurrency (`None` = create-or-overwrite).
+        #[serde(default)]
+        base_revision: Option<FsRevision>,
+        /// Override the sensitive-path / `Deny` gate.
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -2593,6 +2669,12 @@ pub enum ApiResponse {
     FsSearch(FsSearchPage),
     /// A page of watch change events (fs_watch_after).
     FsWatch(FsWatchPageView),
+    /// A stored blob's ref (blob_put).
+    BlobPut(BlobRef),
+    /// A blob's bytes (blob_get).
+    BlobGet(Vec<u8>),
+    /// A blob's metadata (blob_stat).
+    BlobStat(BlobStat),
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,8 +2745,9 @@ pub struct FsEntry {
     pub size: u64,
     /// Last-modified wall-clock milliseconds since the Unix epoch (0 if unknown).
     pub mtime_ms: u64,
-    /// Whether the node's ignore rules (gitignore + artifacts) matched this entry (marked, not
-    /// hidden — the client decides whether to show it).
+    /// Whether the node's ignore rules matched this entry (marked, not hidden — the client decides
+    /// whether to show it). Shipped: a built-in artifact/VCS name set (`.git`, `node_modules`,
+    /// `target`, ...); full `.gitignore` evaluation is future.
     #[serde(default)]
     pub ignored: bool,
 }
@@ -2689,6 +2772,20 @@ pub struct FsContent {
     /// Whether the bytes were truncated at `max_bytes`.
     #[serde(default)]
     pub truncated: bool,
+    /// A content-addressed ref for the served bytes, when the node has a content store and the read
+    /// was **not** truncated (so the ref identifies the whole file). Lets a client hand the same
+    /// content to an agent without re-uploading. `None` when truncated or no blob store is bound.
+    #[serde(default)]
+    pub blob_ref: Option<BlobRef>,
+}
+
+/// Metadata for a blob in the node content store (`blob_stat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobStat {
+    /// The blob's byte length (0 when absent).
+    pub size: u64,
+    /// Whether the blob is present in the store.
+    pub present: bool,
 }
 
 /// A server-side project-search query (fs_search).
@@ -3155,6 +3252,25 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             Ok(page) => ApiResponse::FsWatch(page),
             Err(e) => ApiResponse::Error(e),
         },
+        ApiRequest::BlobPut { bytes } => match api.blob_put(bytes).await {
+            Ok(blob_ref) => ApiResponse::BlobPut(blob_ref),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::BlobGet { hash, range } => match api.blob_get(hash, range).await {
+            Ok(bytes) => ApiResponse::BlobGet(bytes),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::BlobStat { hash } => ApiResponse::BlobStat(api.blob_stat(hash).await),
+        ApiRequest::FsWriteFromBlob {
+            root,
+            path,
+            hash,
+            base_revision,
+            force,
+        } => match api.fs_write_from_blob(root, path, hash, base_revision, force).await {
+            Ok(rev) => ApiResponse::FsWrite(rev),
+            Err(e) => ApiResponse::Error(e),
+        },
         // Session variants were handled by `serve_session`.
         ApiRequest::Submit { .. }
         | ApiRequest::SubmitRouted { .. }
@@ -3365,6 +3481,7 @@ mod tests {
                     size: 2,
                 },
                 truncated: true,
+                blob_ref: None,
             }),
             ApiResponse::FsWrite(FsRevision {
                 mtime_ms: 3,
@@ -3376,6 +3493,47 @@ mod tests {
                     kind: FsChangeKind::Modified,
                 }],
                 next_seq: 5,
+            }),
+        ];
+        for resp in resps {
+            let bytes = to_cbor(&resp);
+            let back: ApiResponse = from_cbor(&bytes).unwrap();
+            assert_eq!(resp, back);
+        }
+    }
+
+    #[test]
+    fn blob_requests_and_responses_round_trip() {
+        let hash = ContentHash::new([7u8; 32]);
+        let reqs = vec![
+            ApiRequest::BlobPut {
+                bytes: vec![1, 2, 3],
+            },
+            ApiRequest::BlobGet {
+                hash,
+                range: Some(ByteRange { offset: 1, len: 2 }),
+            },
+            ApiRequest::BlobStat { hash },
+            ApiRequest::FsWriteFromBlob {
+                root: FsRootId::Session(SessionId::new("s1")),
+                path: "out/x.bin".into(),
+                hash,
+                base_revision: None,
+                force: false,
+            },
+        ];
+        for req in reqs {
+            let bytes = to_cbor(&req);
+            let back: ApiRequest = from_cbor(&bytes).unwrap();
+            assert_eq!(req, back);
+        }
+
+        let resps = vec![
+            ApiResponse::BlobPut(BlobRef::new(hash, 3)),
+            ApiResponse::BlobGet(vec![2, 3]),
+            ApiResponse::BlobStat(BlobStat {
+                size: 3,
+                present: true,
             }),
         ];
         for resp in resps {
