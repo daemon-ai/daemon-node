@@ -27,19 +27,23 @@ use daemon_api::{
     from_cbor, to_cbor, AcpAgentEntry, AcpSource, ApiError, ApprovalInfo, ApprovalMode, AuthApi,
     AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo,
     BoundAccount, ChatRoute, ControlApi, CredentialApi, CredentialInfo, DeliverySink, Distribution,
-    FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
+    FleetReport, FsContent, FsEntry, FsRevision, FsRoot, FsRootId, FsRootKind, FsSearchPage,
+    FsSearchQuery, FsWatchPageView, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
     Lifecycle as ApiLifecycle,
     LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
     ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
-    SessionInfo, SessionOverlay, SessionPage, SessionQuery, SessionRole, SessionScope,
-    SessionSearchHit, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
+    SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole,
+    SessionScope, SessionSearchHit, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
     ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, ProfileRef, QuantRecommendation,
     QuantizeId, QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
 };
-use daemon_core::{spawn_agent_session, AgentHandle, Engine, Provider, Snapshot};
+use daemon_core::{
+    is_sensitive_path, spawn_agent_session, AgentHandle, ApprovalPolicy, Engine, LocalEnvironment,
+    Provider, Snapshot,
+};
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestHandler,
@@ -255,6 +259,17 @@ pub struct NodeApiImpl {
     /// login seam). `None` (or an empty registry) => every `AuthApi` call resolves to
     /// [`ApiError::Unsupported`] / an empty provider list.
     auth_flows: Option<Arc<PendingAuthFlows>>,
+    /// The host-owned fleet event bus (I4/I8): the broadcast sender producers (the `FleetJobWorker`
+    /// delegation seam, the in-memory `FleetRuntime`, and the `session_update_meta` op) ping on a
+    /// real topology change, and [`ControlApi::tree_subscribe`] subscribes to so it can push live
+    /// deltas instead of re-projecting `tree()` on a fixed poll interval. `None` => `tree_subscribe`
+    /// falls back to the snapshot-only foundation with no live push source.
+    fleet_events: Option<broadcast::Sender<daemon_api::TreeEvent>>,
+    /// The filesystem / workspace surface (daemon-fs-surface-spec.md): resolves `FsRootId`s to
+    /// directories (shared with the engine exec builder) and serves list/stat/read/write/search/
+    /// watch. `None` => the `fs_*` ops resolve to [`ApiError::Unsupported`] (a node with no
+    /// configured workspace).
+    workspace: Option<Arc<crate::workspace_fs::WorkspaceFs>>,
 }
 
 impl NodeApiImpl {
@@ -306,7 +321,18 @@ impl NodeApiImpl {
             last_acp: Arc::new(std::sync::RwLock::new(Vec::new())),
             checkpoints: None,
             auth_flows: None,
+            fleet_events: None,
+            workspace: None,
         }
+    }
+
+    /// Bind the filesystem / workspace surface (`fs_*`), backed by the shared
+    /// [`WorkspaceRoots`](crate::workspace_fs::WorkspaceRoots) the engine exec builder roots at, so
+    /// operator (`fs_*`) and agent (`fs`/`shell` tools) see one filesystem. Absent, the `fs_*` ops
+    /// resolve to [`ApiError::Unsupported`].
+    pub fn with_workspace(mut self, workspace: Arc<crate::workspace_fs::WorkspaceFs>) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     /// Install the host routing registry consulted by [`SessionApi::submit_routed`] (the §5.9
@@ -411,6 +437,41 @@ impl NodeApiImpl {
     pub fn with_acp_discovery(mut self, acp: Arc<dyn AcpDiscovery>) -> Self {
         self.acp = Some(acp);
         self
+    }
+
+    /// Attach the host-owned fleet event bus (I4/I8) so [`ControlApi::tree_subscribe`] forwards live
+    /// topology deltas. The same sender is handed to the orchestration producers (the
+    /// `FleetJobWorker` delegation seam + the in-memory `FleetRuntime`) during assembly, so a real
+    /// topology change pushes promptly instead of waiting for the next poll interval.
+    pub fn with_fleet_events(mut self, tx: broadcast::Sender<daemon_api::TreeEvent>) -> Self {
+        self.fleet_events = Some(tx);
+        self
+    }
+
+    /// Ping the fleet bus that the roster/tree changed (a rename/pin/archive that no producer models
+    /// as a subagent transition). Projects a fresh `tree()` snapshot onto the bus off-thread so live
+    /// `tree_subscribe` subscribers refresh promptly; a no-op when no bus is wired or there are no
+    /// subscribers (so the projection cost is only paid when someone is watching).
+    pub fn emit_tree_changed(&self) {
+        if let Some(tx) = &self.fleet_events {
+            if tx.receiver_count() == 0 {
+                return;
+            }
+            let this = self.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let report = this.tree().await;
+                let _ = tx.send(daemon_api::TreeEvent::Snapshot(report));
+            });
+        }
+    }
+
+    /// Forward a concrete subagent/delegation lifecycle delta onto the fleet bus. A no-op when no bus
+    /// is wired or there are no subscribers.
+    pub fn emit_subagent(&self, view: daemon_protocol::ManageEventView) {
+        if let Some(tx) = &self.fleet_events {
+            let _ = tx.send(daemon_api::TreeEvent::Subagent(view));
+        }
     }
 
     /// Attach the §4.3 background-spawn materializer so a live session's `Effect::Spawn` raises an
@@ -938,6 +999,49 @@ fn session_info_from(
         lifecycle,
         role: map_role(meta.role),
         parent: meta.parent.clone(),
+        pinned: meta.pinned,
+        archived: meta.archived,
+    }
+}
+
+/// Project a fresh tree snapshot, applying the subscriber's ephemeral filter — the re-projection a
+/// coalescing `tree_subscribe` collapses a burst into, and the re-sync after a broadcast lag.
+async fn filtered_tree(this: &NodeApiImpl, filter: &daemon_api::TreeSubFilter) -> TreeReport {
+    let mut report = this.tree().await;
+    if !filter.include_ephemeral {
+        report
+            .nodes
+            .retain(|n| n.role != Some(SessionRole::EphemeralSubagent));
+    }
+    report
+}
+
+/// Apply the `TreeSubFilter` to one live bus event for the no-coalesce (forward-every-delta) path.
+/// Returns `None` for events a stable-topology-only subscriber filters out (ephemeral subagent
+/// deltas); a `Snapshot` is re-filtered to drop ephemeral nodes.
+fn forward_event(
+    event: daemon_api::TreeEvent,
+    filter: &daemon_api::TreeSubFilter,
+) -> Option<daemon_api::TreeEvent> {
+    match event {
+        daemon_api::TreeEvent::Snapshot(mut report) => {
+            if !filter.include_ephemeral {
+                report
+                    .nodes
+                    .retain(|n| n.role != Some(SessionRole::EphemeralSubagent));
+            }
+            Some(daemon_api::TreeEvent::Snapshot(report))
+        }
+        daemon_api::TreeEvent::Subagent(view) => {
+            if !filter.include_ephemeral {
+                if let daemon_protocol::ManageEventView::Subagent { role, .. } = &view {
+                    if *role == SessionRole::EphemeralSubagent {
+                        return None;
+                    }
+                }
+            }
+            Some(daemon_api::TreeEvent::Subagent(view))
+        }
     }
 }
 
@@ -1009,21 +1113,28 @@ impl ControlApi for NodeApiImpl {
         // Scope filter. `TopLevel` (the inbox) shows only `Primary`; children are reached by walking
         // the tree. The by-profile/by-transport scopes back the per-agent/per-transport views.
         match &query.scope {
-            SessionScope::TopLevel => roster.retain(|i| i.role == SessionRole::Primary),
+            SessionScope::TopLevel => {
+                roster.retain(|i| i.role == SessionRole::Primary && !i.archived)
+            }
             SessionScope::ByProfile(p) => {
-                roster.retain(|i| i.bound_profile.as_ref() == Some(p))
+                roster.retain(|i| i.bound_profile.as_ref() == Some(p) && !i.archived)
             }
             SessionScope::ByTransport(t) => {
                 let owned: std::collections::HashSet<SessionId> =
                     self.live.delivery_sessions(t).into_iter().collect();
-                roster.retain(|i| owned.contains(&i.session));
+                roster.retain(|i| owned.contains(&i.session) && !i.archived);
+            }
+            SessionScope::Archived => {
+                roster.retain(|i| i.role == SessionRole::Primary && i.archived)
             }
             SessionScope::All => {}
         }
-        // Stable order: most-recently-active first, id as the tie-break (so the cursor is total).
+        // Stable order: pinned conversations first, then most-recently-active, then id as the final
+        // tie-break (so the cursor stays total across pages).
         roster.sort_by(|a, b| {
-            b.last_activity_ms
-                .cmp(&a.last_activity_ms)
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.last_activity_ms.cmp(&a.last_activity_ms))
                 .then_with(|| a.session.as_str().cmp(b.session.as_str()))
         });
         // Cursor pagination: `after` is the last id of the previous page; skip through it.
@@ -1107,6 +1218,33 @@ impl ControlApi for NodeApiImpl {
                 snippet: hit.snippet,
             })
             .collect()
+    }
+
+    async fn session_update_meta(
+        &self,
+        session: SessionId,
+        patch: SessionMetaPatch,
+    ) -> Result<(), ApiError> {
+        // Read-modify-write of the durable `SessionMeta`, preserving the fields the patch does not
+        // touch (overlay/role/parent/bound profile/last activity). Each `None` patch field is a
+        // leave-unchanged; `title: Some(None)` clears the title (rename-to-empty).
+        let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
+        if let Some(title) = patch.title {
+            meta.title = title;
+        }
+        if let Some(pinned) = patch.pinned {
+            meta.pinned = pinned;
+        }
+        if let Some(archived) = patch.archived {
+            meta.archived = archived;
+        }
+        self.store
+            .set_session_meta(&session, meta)
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+        // Nudge live roster/tree subscribers so the rename/pin/archive shows up without a poll.
+        self.emit_tree_changed();
+        Ok(())
     }
 
     async fn approvals_pending(&self, session: Option<SessionId>) -> Vec<ApprovalInfo> {
@@ -1206,30 +1344,72 @@ impl ControlApi for NodeApiImpl {
         &self,
         filter: daemon_api::TreeSubFilter,
     ) -> Result<daemon_api::TreeStream, ApiError> {
-        // Foundation push form: an immediate snapshot, then a coalesced snapshot every
-        // `coalesce_ms` (the churn window; clamped to a sane floor). The wire also carries a
-        // `TreeEvent::Subagent` delta variant for a finer push path to fill in later behind the same
-        // stream. `include_ephemeral=false` drops transient-subagent nodes from each snapshot.
+        // Real event-driven merge (I4/I8): subscribe to the host fleet bus *first* (so no delta is
+        // lost between the initial snapshot and the live tail), emit the current snapshot, then
+        // forward live topology deltas. The `TreeSubFilter` is applied on the way out:
+        //   - `include_ephemeral=false` drops `EphemeralSubagent` nodes from snapshots and drops
+        //     `Subagent` deltas whose role is ephemeral (stable-topology-only subscribers).
+        //   - `coalesce_ms` debounces a burst of deltas into one fresh `tree()` snapshot; `None`
+        //     forwards every delta as it arrives.
         let this = self.clone();
-        let period = std::time::Duration::from_millis(filter.coalesce_ms.unwrap_or(1000).max(100));
-        let stream = stream::unfold(
-            (this, filter, true),
-            move |(this, filter, first)| async move {
-                if !first {
-                    tokio::time::sleep(period).await;
+        let rx = self.fleet_events.as_ref().map(|tx| tx.subscribe());
+
+        // The initial snapshot is always emitted, bus or not.
+        let initial = {
+            let mut report = this.tree().await;
+            if !filter.include_ephemeral {
+                report
+                    .nodes
+                    .retain(|n| n.role != Some(SessionRole::EphemeralSubagent));
+            }
+            daemon_api::TreeEvent::Snapshot(report)
+        };
+
+        // No bus wired: fall back to the snapshot-only foundation (a single initial snapshot).
+        let Some(rx) = rx else {
+            return Ok(stream::once(async move { initial }).boxed());
+        };
+
+        let live = stream::unfold(
+            (this, rx, filter),
+            move |(this, mut rx, filter)| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            if let Some(window) = filter.coalesce_ms {
+                                // Debounce: collapse this burst into one fresh re-projection.
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    window.max(1),
+                                ))
+                                .await;
+                                while rx.try_recv().is_ok() {}
+                                let report = filtered_tree(&this, &filter).await;
+                                return Some((
+                                    daemon_api::TreeEvent::Snapshot(report),
+                                    (this, rx, filter),
+                                ));
+                            }
+                            // No coalescing: forward the delta, applying the ephemeral filter.
+                            match forward_event(event, &filter) {
+                                Some(out) => return Some((out, (this, rx, filter))),
+                                None => continue,
+                            }
+                        }
+                        // We fell behind the bus: re-sync with a fresh authoritative snapshot.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let report = filtered_tree(&this, &filter).await;
+                            return Some((
+                                daemon_api::TreeEvent::Snapshot(report),
+                                (this, rx, filter),
+                            ));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
                 }
-                let mut report = this.tree().await;
-                if !filter.include_ephemeral {
-                    report
-                        .nodes
-                        .retain(|n| n.role != Some(SessionRole::EphemeralSubagent));
-                }
-                Some((
-                    daemon_api::TreeEvent::Snapshot(report),
-                    (this, filter, false),
-                ))
             },
         );
+
+        let stream = stream::once(async move { initial }).chain(live);
         Ok(stream.boxed())
     }
 
@@ -1443,6 +1623,151 @@ impl ControlApi for NodeApiImpl {
             .restore(&record)
             .await
             .map_err(|e| ApiError::Other(format!("rewind failed: {e}")))
+    }
+
+    // ----- filesystem / workspace surface (daemon-fs-surface-spec.md) -----
+
+    async fn fs_roots(&self) -> Vec<FsRoot> {
+        let Some(ws) = &self.workspace else {
+            return Vec::new();
+        };
+        let mut roots = Vec::new();
+        // Host browse roots (home + operator allowlist) — discovery before binding.
+        for (id, _dir) in ws.roots().browse_roots() {
+            roots.push(FsRoot {
+                id: FsRootId::Host(id.clone()),
+                label: id.clone(),
+                kind: FsRootKind::Host,
+                session: None,
+            });
+        }
+        // The node workspace root.
+        roots.push(FsRoot {
+            id: FsRootId::Workspace,
+            label: "workspace".to_string(),
+            kind: FsRootKind::Workspace,
+            session: None,
+        });
+        // Opened (live) session sandboxes.
+        for sid in self.live.live_ids() {
+            roots.push(FsRoot {
+                id: FsRootId::Session(sid.clone()),
+                label: sid.as_str().to_string(),
+                kind: FsRootKind::Session,
+                session: Some(sid),
+            });
+        }
+        roots
+    }
+
+    async fn fs_list(
+        &self,
+        root: FsRootId,
+        dir: String,
+        show_ignored: bool,
+    ) -> Result<Vec<FsEntry>, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_list".into()))?;
+        ws.list(&root, &dir, show_ignored).await
+    }
+
+    async fn fs_stat(&self, root: FsRootId, path: String) -> Result<FsEntry, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_stat".into()))?;
+        ws.stat(&root, &path).await
+    }
+
+    async fn fs_read(
+        &self,
+        root: FsRootId,
+        path: String,
+        max_bytes: u64,
+    ) -> Result<FsContent, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_read".into()))?;
+        ws.read(&root, &path, max_bytes).await
+    }
+
+    async fn fs_write(
+        &self,
+        root: FsRootId,
+        path: String,
+        bytes: Vec<u8>,
+        base_revision: Option<FsRevision>,
+        force: bool,
+    ) -> Result<FsRevision, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_write".into()))?;
+        // Host browse roots are read-only.
+        if !ws.writable(&root)? {
+            return Err(ApiError::Unsupported(
+                "host browse roots are read-only".into(),
+            ));
+        }
+        // Sensitive-path gate (the same `.git`/`.ssh`/dotenv/keys rule the agent fs tool uses);
+        // `force` overrides. The operator *is* the human, so this never routes through a host ask.
+        if !force && is_sensitive_path(&path) {
+            return Err(ApiError::Other(format!(
+                "sensitive path {path:?} blocked; set force to override"
+            )));
+        }
+        if let FsRootId::Session(sid) = &root {
+            // A `Deny`-mode session blocks operator writes too, unless forced.
+            if !force {
+                if let Some(policy) = self.session_modes.get(sid) {
+                    if *policy == ApprovalPolicy::Deny {
+                        return Err(ApiError::Other(format!(
+                            "session {} is in deny mode; set force to override",
+                            sid.as_str()
+                        )));
+                    }
+                }
+            }
+            // Capture a checkpoint before mutating, so an operator edit is rewindable like an agent
+            // edit (best-effort; a capture failure never blocks the write).
+            if let Some(store) = &self.checkpoints {
+                let env = LocalEnvironment::new(ws.roots().session_root(sid.as_str()));
+                let call_id = format!("operator-fs-write:{path}");
+                let _ = store
+                    .capture(sid.as_str(), &call_id, "operator_fs_write", &env)
+                    .await;
+            }
+        }
+        ws.write(&root, &path, &bytes, base_revision).await
+    }
+
+    async fn fs_search(
+        &self,
+        root: FsRootId,
+        query: FsSearchQuery,
+    ) -> Result<FsSearchPage, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_search".into()))?;
+        ws.search(&root, &query).await
+    }
+
+    async fn fs_watch_after(
+        &self,
+        root: FsRootId,
+        dir: String,
+        after_seq: u64,
+        max: u32,
+    ) -> Result<FsWatchPageView, ApiError> {
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_watch_after".into()))?;
+        ws.watch_after(&root, &dir, after_seq, max).await
     }
 
     async fn rewind(

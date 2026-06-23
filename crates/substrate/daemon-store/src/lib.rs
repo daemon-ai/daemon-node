@@ -90,6 +90,15 @@ pub struct SessionMeta {
     /// The parent session id, when this is a child/subagent (`None` for a `Primary`).
     #[serde(default)]
     pub parent: Option<SessionId>,
+    /// Whether the operator pinned this conversation to the top of the roster (GUI session action).
+    /// Pinned conversations sort ahead of the activity order; `false` on legacy rows.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Whether the operator archived this conversation (GUI session action). Archived conversations
+    /// drop out of the default (`TopLevel`/per-agent) roster scopes and surface only under the
+    /// explicit archived scope; `false` on legacy rows.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
@@ -1676,6 +1685,8 @@ mod session_meta_tests {
             last_activity_ms: Some(1_700_000_000_000),
             role: Some(SessionRole::ManagedChild),
             parent: Some(SessionId::new("p1")),
+            pinned: true,
+            archived: false,
         }
     }
 

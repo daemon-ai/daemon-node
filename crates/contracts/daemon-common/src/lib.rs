@@ -1150,6 +1150,27 @@ pub struct SkillBundle {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
+/// How a session's workspace root is chosen (host-spec §7). Carried on the session overlay and
+/// realized by the provisioner + `EngineProfile::with_exec`, so the agent engine and the
+/// filesystem surface resolve the *same* directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceBinding {
+    /// An isolated per-session sandbox under the node's configured `workspace_root`
+    /// (`<workspace_root>/<session_id>`). The default — good for ephemeral / parallel / untrusted
+    /// agents.
+    Isolated,
+    /// Bind the session to an operator-specified directory directly, edited in place (the
+    /// "work on my repo" case). Containment still keeps the agent inside it.
+    Bound(PathBuf),
+}
+
+impl Default for WorkspaceBinding {
+    fn default() -> Self {
+        Self::Isolated
+    }
+}
+
 /// Which versioned artifact a revision history tracks. One [`RevisionLog`] keys its history by
 /// `(kind, id)`, so profiles and skills share one append-only mechanism.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

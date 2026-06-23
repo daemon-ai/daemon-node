@@ -36,5 +36,7 @@ serde_json = { workspace = true }
 ciborium = { workspace = true }
 # content hashing for the append-only profile/skill revision log (content-addressed snapshot blobs).
 sha2 = { workspace = true }
+# regex-mode project search for the filesystem surface (daemon-fs-surface-spec.md `fs_search`).
+regex = { workspace = true }
 # the file-backed skills store backing the node's skill versioning + distribution ops.
 daemon-skills = { workspace = true }

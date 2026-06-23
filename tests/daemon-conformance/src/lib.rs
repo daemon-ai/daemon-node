@@ -1688,6 +1688,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         })
     }
 
@@ -1762,8 +1763,99 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
         (node, handle)
+    }
+
+    /// The filesystem / workspace surface (daemon-fs-surface-spec.md) end to end through a fully
+    /// assembled node: a configured `workspace_root` binds the `fs_*` ops to a real directory, the
+    /// node advertises its roots, write/read round-trips in the workspace root, the sensitive-path
+    /// gate blocks a dotenv write unless forced, and a containment escape is rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filesystem_surface_round_trips_and_gates() {
+        use daemon_api::{ControlApi, FsRootId};
+
+        let ws = std::env::temp_dir().join(format!("daemon-fs-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+            store: Arc::new(InMemoryStore::new()),
+            partition: PARTITION,
+            host_config: fast_host_config(),
+            providers: gate_providers(),
+            credentials: None,
+            profile: ProfileRef::new("openai"),
+            engine_config: daemon_core::Config::default(),
+            journal_seed: Some([0x45; 32]),
+            nesting_depth: 0,
+            context: None,
+            context_builder: None,
+            memory: Vec::new(),
+            memory_builder: None,
+            extra_tools: Vec::new(),
+            models: None,
+            profiles: None,
+            provider_resolver: None,
+            credential_store: None,
+            cloud_catalog: None,
+            prompt_sources: vec![],
+            revisions: None,
+            skills: None,
+            skills_resolver: None,
+            routing: None,
+            checkpoints: None,
+            auth_factories: vec![],
+            workspace_root: Some(ws.clone()),
+        });
+
+        // The node advertises at least the writable workspace root.
+        let roots = node.fs_roots().await;
+        assert!(
+            roots.iter().any(|r| matches!(r.id, FsRootId::Workspace)),
+            "fs_roots should advertise the workspace root, got {roots:?}"
+        );
+
+        // Write + read round-trips in the workspace root.
+        let rev = node
+            .fs_write(FsRootId::Workspace, "notes/hello.txt".into(), b"hi".to_vec(), None, false)
+            .await
+            .expect("write");
+        assert_eq!(rev.size, 2);
+        let content = node
+            .fs_read(FsRootId::Workspace, "notes/hello.txt".into(), 0)
+            .await
+            .expect("read");
+        assert_eq!(content.bytes, b"hi");
+        // The bytes are on disk under the configured workspace root (the same dir an agent's tools
+        // would operate in).
+        assert_eq!(std::fs::read(ws.join("notes/hello.txt")).unwrap(), b"hi");
+
+        let listing = node
+            .fs_list(FsRootId::Workspace, "notes".into(), false)
+            .await
+            .expect("list");
+        assert!(listing.iter().any(|e| e.name == "hello.txt"));
+
+        // The sensitive-path gate blocks a dotenv write unless forced.
+        let blocked = node
+            .fs_write(FsRootId::Workspace, ".env".into(), b"SECRET=1".to_vec(), None, false)
+            .await;
+        assert!(blocked.is_err(), "a .env write should be gated");
+        let forced = node
+            .fs_write(FsRootId::Workspace, ".env".into(), b"SECRET=1".to_vec(), None, true)
+            .await;
+        assert!(forced.is_ok(), "force overrides the sensitive-path gate");
+
+        // Containment: a path escaping the root is rejected.
+        assert!(node
+            .fs_read(FsRootId::Workspace, "../escape".into(), 0)
+            .await
+            .is_err());
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     fn temp_socket() -> std::path::PathBuf {
@@ -2313,6 +2405,188 @@ mod node_interface {
             node.routing_get(origin.clone()).await.is_none(),
             "the pin must be gone after unbind"
         );
+
+        handle.shutdown().await;
+    }
+
+    /// Session-action ops (Phase-3 A): `session_update_meta` is a durable read-modify-write of the
+    /// roster metadata that rename/pin/archive ride. Proves: (a) a rename surfaces on the roster
+    /// line; (b) a pinned conversation sorts *first* in `TopLevel` (ahead of activity order); (c) an
+    /// archived conversation drops out of `TopLevel` and surfaces only under `Archived`; (d) the
+    /// patch op round-trips over the socket (`ApiResponse::Ok`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_meta_rename_pin_archive_round_trip() {
+        use daemon_api::{SessionApi, SessionMetaPatch, SessionQuery, SessionScope};
+        use daemon_protocol::{AgentCommand, UserMsg};
+
+        let (node, handle) = assemble();
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+
+        // Three live top-level conversations (opened oldest-first so activity order is a, b, c).
+        let ids: Vec<SessionId> = (0..3).map(|n| SessionId::new(format!("act-{n}"))).collect();
+        for id in &ids {
+            node.submit(
+                id.clone(),
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: daemon_common::ReqId(1),
+                },
+            )
+            .await
+            .expect("submit opens a live session");
+        }
+
+        // (a) Rename act-0 over the socket; the new title surfaces on its roster line.
+        assert!(matches!(
+            client
+                .call(ApiRequest::SessionUpdateMeta {
+                    session: ids[0].clone(),
+                    patch: SessionMetaPatch {
+                        title: Some(Some("renamed".into())),
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+        let line_title = node
+            .sessions_query(SessionQuery {
+                scope: SessionScope::All,
+                ..Default::default()
+            })
+            .await
+            .sessions
+            .into_iter()
+            .find(|i| i.session == ids[0])
+            .and_then(|i| i.title);
+        assert_eq!(
+            line_title.as_deref(),
+            Some("renamed"),
+            "the rename must surface on the roster line"
+        );
+
+        // (b) Pin act-0 (the oldest); it must now sort first in TopLevel despite being least-recent.
+        node.session_update_meta(
+            ids[0].clone(),
+            SessionMetaPatch {
+                pinned: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("pin act-0");
+        let top = node.sessions_query(SessionQuery::default()).await.sessions;
+        assert_eq!(
+            top.first().map(|i| &i.session),
+            Some(&ids[0]),
+            "a pinned conversation must sort first, got {top:?}"
+        );
+        assert!(
+            top.first().map(|i| i.pinned).unwrap_or(false),
+            "the first line carries the pinned flag"
+        );
+
+        // (c) Archive act-1; it leaves TopLevel and appears only under the Archived scope.
+        node.session_update_meta(
+            ids[1].clone(),
+            SessionMetaPatch {
+                archived: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("archive act-1");
+        let top = node.sessions_query(SessionQuery::default()).await.sessions;
+        assert!(
+            !top.iter().any(|i| i.session == ids[1]),
+            "an archived conversation must drop out of TopLevel"
+        );
+        let archived = node
+            .sessions_query(SessionQuery {
+                scope: SessionScope::Archived,
+                ..Default::default()
+            })
+            .await
+            .sessions;
+        assert!(
+            archived.iter().any(|i| i.session == ids[1] && i.archived),
+            "the archived conversation must surface under the Archived scope"
+        );
+
+        server.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Live fleet push (Phase-3 B, I4/I8): `tree_subscribe` is a real event-driven merge, not a
+    /// poll. Proves: (a) the stream opens with an immediate `Snapshot`; (b) a delegation spawn pushes
+    /// a live delta **promptly** — well inside what any old fixed poll interval would have been; and
+    /// (c) `include_ephemeral=false` still delivers the (non-ephemeral) managed-child delta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tree_subscribe_pushes_delegation_spawn_promptly() {
+        use daemon_api::{ControlApi, TreeEvent, TreeSubFilter};
+        use futures::StreamExt;
+
+        let (node, handle) = assemble();
+
+        // Subscribe first (stable topology only) so no spawn delta is missed.
+        let mut stream = node
+            .tree_subscribe(TreeSubFilter {
+                include_ephemeral: false,
+                coalesce_ms: None,
+            })
+            .await
+            .expect("tree_subscribe opens");
+
+        // (a) The first event is the initial snapshot.
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("an initial event arrives")
+            .expect("the stream yields");
+        assert!(
+            matches!(first, TreeEvent::Snapshot(_)),
+            "the stream must open with a Snapshot, got {first:?}"
+        );
+
+        // Drive one durable delegation (the default node delegates once on Assign).
+        node.assign(SessionId::new("push-op"))
+            .await
+            .expect("assign drives a delegation");
+
+        // (b)+(c) A live delta arrives promptly (a managed-child spawn passes the ephemeral filter).
+        // No poll interval is involved: the bus pushes the delta as soon as the child is created.
+        let pushed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match stream.next().await {
+                    Some(ev) => return ev,
+                    None => panic!("the stream closed before a live delta"),
+                }
+            }
+        })
+        .await
+        .expect("a live delta is pushed promptly after the spawn");
+        match pushed {
+            // The forward-every-delta path delivers the spawn marker directly.
+            TreeEvent::Subagent(view) => assert!(
+                matches!(
+                    view,
+                    daemon_protocol::ManageEventView::Subagent { .. }
+                        | daemon_protocol::ManageEventView::Started { .. }
+                        | daemon_protocol::ManageEventView::Finished { .. }
+                        | daemon_protocol::ManageEventView::Progress { .. }
+                        | daemon_protocol::ManageEventView::Usage { .. }
+                        | daemon_protocol::ManageEventView::Error { .. }
+                ),
+                "a subagent delta is pushed"
+            ),
+            // A re-projected snapshot is also an acceptable prompt push.
+            TreeEvent::Snapshot(_) => {}
+        }
 
         handle.shutdown().await;
     }
@@ -2889,6 +3163,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
         (node, handle, skills)
     }
@@ -3267,6 +3542,7 @@ mod node_interface {
             routing: Some(routing),
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -3480,6 +3756,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         let text_a = route_text(&node, origin("@a:hs")).await;
@@ -3542,6 +3819,7 @@ mod node_interface {
             routing: Some(routing),
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
         let text_override = route_text(&node, origin("@a:hs")).await;
         assert!(
@@ -3661,6 +3939,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![Arc::new(StubFactory)],
+            workspace_root: None,
         });
 
         // (1) discovery: the stub family is listed.
@@ -3827,6 +4106,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.
@@ -3969,6 +4249,7 @@ mod node_interface {
             routing: Some(routing),
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         // Register two in-process sinks: the matrix account and a GUI surface.
@@ -4165,6 +4446,7 @@ mod node_interface {
             routing: Some(routing),
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         async fn drive_turn(node: &Arc<NodeApiImpl>, origin: Origin, req: u64) -> SessionId {
@@ -4367,6 +4649,7 @@ mod node_interface {
             routing: Some(routing),
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {
@@ -4527,6 +4810,7 @@ mod node_interface {
             routing: Some(routing),
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
 
         let origin = Origin::new(
@@ -4804,6 +5088,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
         let busy = SessionId::new("obs-busy");
 
@@ -5062,6 +5347,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
         let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
         let origin = Origin::new(
@@ -5196,6 +5482,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         });
         let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
 
@@ -5503,6 +5790,7 @@ mod node_interface {
             routing: None,
             checkpoints: None,
             auth_factories: vec![],
+            workspace_root: None,
         })
     }
 

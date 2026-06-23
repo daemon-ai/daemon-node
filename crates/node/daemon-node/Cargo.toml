@@ -30,6 +30,9 @@ daemon-models = { workspace = true }
 # versioning + the skill payload of a profile distribution.
 daemon-skills = { workspace = true }
 async-trait = { workspace = true }
+# The host fleet event bus (I4/I8) is a `tokio::sync::broadcast` channel threaded through the
+# assembled producers (FleetRuntime/FleetJobWorker) into the tree-push surface.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # Smoke-test the wired-in defaults (LCM context + Mnemosyne memory) end-to-end through an engine turn.

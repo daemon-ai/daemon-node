@@ -122,13 +122,25 @@ session-info = {
   ? lifecycle: lifecycle,             ; default "Durable"
   ? role: session-role,               ; default "Primary"
   ? parent: (session-id / null),
+  ? pinned: bool,                     ; default false (operator-pinned, sorts first)
+  ? archived: bool,                   ; default false (excluded from default scopes)
 }
 
 ; The scoped roster query (ControlApi::sessions_query). `TopLevel` is the inbox (Primary only).
 session-scope = "TopLevel"
               / { "ByProfile": profile-ref }
               / { "ByTransport": transport-id }
+              / "Archived"
               / "All"
+
+; A partial update to a session's roster metadata (rename/pin/archive). Each `null`/absent field is
+; a leave-unchanged; a non-null `title` sets it. (`title` is `Option<Option<String>>` in Rust; the
+; outer/inner `None` both encode as CBOR null, so the wire shape is `tstr / null`.)
+session-meta-patch = {
+  ? title: (tstr / null),
+  ? pinned: (bool / null),
+  ? archived: (bool / null),
+}
 
 session-query = {
   ? scope: session-scope,             ; default "TopLevel"
@@ -182,11 +194,16 @@ approval-mode = "ask" / "accept_edits" / "auto_allow" / "deny"
 ; node toolset, or override to an explicit list. `provider` is the opaque provider-selector.
 tools-override = "inherit" / "full_toolset" / { "allowlist": [* tstr] }
 
+; `workspace` selects the session's workspace root binding (wire v15): inherit the node default
+; (isolated per-session sandbox) when absent, or bind in-place to an operator-specified directory.
+workspace-binding = "isolated" / { "bound": tstr }
+
 session-overlay = {
   ? model: (tstr / null),
   ? provider: (any / null),
   ? tool_allowlist: tools-override,
   ? approval_mode: (approval-mode / null),
+  ? workspace: (workspace-binding / null),
 }
 
 approval-info = {
@@ -624,6 +641,7 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "SessionGet": { session: session-id } }                                 ; one session detail -> SessionDetail
             / "SessionsByProfile"                                                       ; roster grouped by profile -> SessionsByProfile
             / { "SessionSearch": { query: tstr, limit: uint } }                         ; full-text search -> SessionSearch
+            / { "SessionUpdateMeta": { session: session-id, patch: session-meta-patch } } ; rename/pin/archive -> Ok
             / { "Rewind": { session: session-id, point: rewind-point } }                ; conversation + workspace rewind -> Ok
             ; ----- ACP discovery/catalog (wire v14) -----
             / "AcpDiscover"                                                             ; trigger a discovery scan -> AcpCatalog
@@ -653,6 +671,14 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "RoutingBindChat": { origin: origin, session: session-id, ? profile: (profile-ref / null) } }  ; -> Ok
             / { "RoutingUnbindChat": { origin: origin } }                               ; -> Ok
             / { "TransportRooms": { transport: transport-id } }                         ; -> Rooms
+            ; ----- filesystem / workspace surface (wire v15; daemon-fs-surface-spec.md) -----
+            / "FsRoots"                                                                  ; -> FsRoots
+            / { "FsList": { root: fs-root-id, dir: tstr, ? show_ignored: bool } }        ; -> FsList
+            / { "FsStat": { root: fs-root-id, path: tstr } }                             ; -> FsStat
+            / { "FsRead": { root: fs-root-id, path: tstr, ? max_bytes: uint } }          ; -> FsRead
+            / { "FsWrite": { root: fs-root-id, path: tstr, bytes: bstr, ? base_revision: (fs-revision / null), ? force: bool } }  ; -> FsWrite
+            / { "FsSearch": { root: fs-root-id, query: fs-search-query } }               ; -> FsSearch
+            / { "FsWatchPoll": { root: fs-root-id, dir: tstr, after_seq: uint, max: uint } }  ; cursor read -> FsWatch
 
 api-response = "Ok"
              / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v7)
@@ -708,3 +734,26 @@ api-response = "Ok"
              / { "ChatRoute": (chat-route / null) }
              / { "Rooms": [* room-info] }
              / { "Error": api-error }
+             ; ----- filesystem / workspace surface (wire v15) -----
+             / { "FsRoots": [* fs-root] }
+             / { "FsList": [* fs-entry] }
+             / { "FsStat": fs-entry }
+             / { "FsRead": fs-content }
+             / { "FsWrite": fs-revision }
+             / { "FsSearch": fs-search-page }
+             / { "FsWatch": fs-watch-page-view }
+
+; ----- filesystem / workspace surface DTOs (wire v15; daemon-fs-surface-spec.md) -----
+fs-root-id = { "host": tstr } / "workspace" / { "session": session-id }
+fs-root-kind = "host" / "workspace" / "session"
+fs-root = { id: fs-root-id, label: tstr, kind: fs-root-kind, ? session: (session-id / null) }
+fs-entry-kind = "file" / "dir" / "symlink"
+fs-entry = { name: tstr, path: tstr, kind: fs-entry-kind, size: uint, mtime_ms: uint, ? ignored: bool }
+fs-revision = { mtime_ms: uint, size: uint }
+fs-content = { bytes: bstr, revision: fs-revision, ? truncated: bool }
+fs-search-query = { query: tstr, ? regex: bool, ? case_sensitive: bool, ? max_results: uint, ? page: uint }
+fs-search-hit = { path: tstr, line: uint, col: uint, preview: tstr }
+fs-search-page = { hits: [* fs-search-hit], ? has_more: bool }
+fs-change-kind = "created" / "modified" / "removed"
+fs-change = { path: tstr, kind: fs-change-kind }
+fs-watch-page-view = { events: [* fs-change], next_seq: uint }

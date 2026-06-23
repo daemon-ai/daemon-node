@@ -31,7 +31,7 @@ use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
     RewindAnchor, TranscriptBlock, TransportId,
 };
-pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle};
+pub use daemon_common::{Author, Revision, RevisionKind, SkillBundle, WorkspaceBinding};
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -365,6 +365,18 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// Apply a partial update to a session's roster metadata — the backend of daemon-app's "session
+    /// actions" (rename, pin/reorder, archive). A read-modify-write of the session's
+    /// `SessionMeta` that preserves the untouched fields (overlay/role/parent/bound profile) and
+    /// promptly refreshes any live roster/tree subscribers. Default: unsupported.
+    async fn session_update_meta(
+        &self,
+        _session: SessionId,
+        _patch: SessionMetaPatch,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("session_update_meta".into()))
+    }
+
     /// Ensure a durable session exists and wake it (start/resume work).
     async fn assign(&self, session: SessionId) -> Result<(), ApiError>;
 
@@ -631,6 +643,88 @@ pub trait ControlApi: Send + Sync {
     /// List recent runs of a scheduled job (I15). Default: empty.
     async fn cron_runs(&self, _id: String) -> Vec<CronRun> {
         Vec::new()
+    }
+
+    // -- Filesystem / workspace surface (daemon-fs-surface-spec.md). Grouped (defaulted) here, not a
+    //    new sub-trait, so every NodeApi implementor inherits the surface; a node with a workspace
+    //    binds the real impl (backed by daemon-host's WorkspaceFs). --
+
+    /// The browsable roots this node exposes: host browse roots (home + operator allowlist) +
+    /// the workspace root + any opened session sandboxes. Default: empty (no workspace surface).
+    async fn fs_roots(&self) -> Vec<FsRoot> {
+        Vec::new()
+    }
+
+    /// One directory's children (root-relative `dir`, "" = the root). Ignored entries are *marked*
+    /// (`FsEntry.ignored`), not hidden, when `show_ignored` is false the caller may still hide them.
+    /// Default: unsupported.
+    async fn fs_list(
+        &self,
+        _root: FsRootId,
+        _dir: String,
+        _show_ignored: bool,
+    ) -> Result<Vec<FsEntry>, ApiError> {
+        Err(ApiError::Unsupported("fs_list".into()))
+    }
+
+    /// One entry's metadata. Default: unsupported.
+    async fn fs_stat(&self, _root: FsRootId, _path: String) -> Result<FsEntry, ApiError> {
+        Err(ApiError::Unsupported("fs_stat".into()))
+    }
+
+    /// Read up to `max_bytes` (`0` = a server default) of a file, plus an etag + truncation flag.
+    /// Default: unsupported.
+    async fn fs_read(
+        &self,
+        _root: FsRootId,
+        _path: String,
+        _max_bytes: u64,
+    ) -> Result<FsContent, ApiError> {
+        Err(ApiError::Unsupported("fs_read".into()))
+    }
+
+    /// Write bytes with optimistic concurrency (`base_revision`; `None` = create-or-overwrite).
+    /// `force` overrides the sensitive-path / `Deny` gate. `Workspace`/`Session` roots only —
+    /// `Host` roots are read-only. Returns the new etag. Default: unsupported.
+    async fn fs_write(
+        &self,
+        _root: FsRootId,
+        _path: String,
+        _bytes: Vec<u8>,
+        _base_revision: Option<FsRevision>,
+        _force: bool,
+    ) -> Result<FsRevision, ApiError> {
+        Err(ApiError::Unsupported("fs_write".into()))
+    }
+
+    /// Server-side project search over a root (content / regex), paginated. Default: unsupported.
+    async fn fs_search(
+        &self,
+        _root: FsRootId,
+        _query: FsSearchQuery,
+    ) -> Result<FsSearchPage, ApiError> {
+        Err(ApiError::Unsupported("fs_search".into()))
+    }
+
+    /// The cursor / long-poll form of the change stream (the wire-marshaled form of `fs_watch`):
+    /// drain change events under `dir` since `after_seq`. Default: unsupported.
+    async fn fs_watch_after(
+        &self,
+        _root: FsRootId,
+        _dir: String,
+        _after_seq: u64,
+        _max: u32,
+    ) -> Result<FsWatchPageView, ApiError> {
+        Err(ApiError::Unsupported("fs_watch_after".into()))
+    }
+
+    /// A live push stream of changes under `dir` (transport capability). Default: empty stream.
+    async fn fs_watch(
+        &self,
+        _root: FsRootId,
+        _dir: String,
+    ) -> Result<FsWatchStream, ApiError> {
+        Ok(stream::empty().boxed())
     }
 }
 
@@ -1184,6 +1278,13 @@ pub struct SessionInfo {
     /// The parent session id, when this is a child/subagent.
     #[serde(default)]
     pub parent: Option<SessionId>,
+    /// Whether the operator pinned this conversation (sorts ahead of activity order in the roster).
+    #[serde(default)]
+    pub pinned: bool,
+    /// Whether the operator archived this conversation (excluded from the default roster scopes,
+    /// surfaced only under [`SessionScope::Archived`]).
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// `serde` default for [`SessionInfo::rewindable`] on older wire payloads that predate the field:
@@ -1203,6 +1304,9 @@ pub enum SessionScope {
     ByProfile(ProfileRef),
     /// Sessions whose `Primary` delivery target names a specific transport instance.
     ByTransport(TransportId),
+    /// Only archived `Primary` conversations — the explicit archived view. The default scopes
+    /// (`TopLevel`/`ByProfile`/`ByTransport`) exclude archived sessions; this is the opt-in to see them.
+    Archived,
     /// Every session regardless of role (explicit opt-in; can be large in a fleets-of-fleets node).
     All,
 }
@@ -1237,6 +1341,24 @@ pub struct SessionPage {
     /// The cursor to pass as [`SessionQuery::after`] on the next read; `None` => no more pages.
     #[serde(default)]
     pub next_cursor: Option<SessionId>,
+}
+
+/// A partial update to a session's roster metadata — the backend of daemon-app's "session actions"
+/// (rename, pin/reorder, archive). Each field is `None` to leave it unchanged; `title` is a
+/// double-option so a `Some(None)` clears the title (rename-to-empty) while `None` leaves it intact.
+/// Applied as a read-modify-write of [`SessionMeta`](../daemon_store/struct.SessionMeta.html) that
+/// preserves the untouched fields (overlay/role/parent/bound profile).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetaPatch {
+    /// Set/clear the conversation title (`None` = leave; `Some(None)` = clear; `Some(Some(t))` = set).
+    #[serde(default)]
+    pub title: Option<Option<String>>,
+    /// Pin/unpin the conversation (`None` = leave unchanged).
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    /// Archive/unarchive the conversation (`None` = leave unchanged).
+    #[serde(default)]
+    pub archived: Option<bool>,
 }
 
 /// The full detail of one session — the single round-trip a GUI detail pane reads: roster `info`
@@ -2155,6 +2277,13 @@ pub enum ApiRequest {
         /// Max hits (`0` = a server default).
         limit: u32,
     },
+    /// [`ControlApi::session_update_meta`] — rename/pin/archive a session (roster session actions).
+    SessionUpdateMeta {
+        /// The session to update.
+        session: SessionId,
+        /// The partial metadata patch.
+        patch: SessionMetaPatch,
+    },
     /// [`ControlApi::rewind`] — unified conversation + workspace rewind.
     Rewind {
         /// The session to rewind.
@@ -2267,6 +2396,68 @@ pub enum ApiRequest {
     TransportRooms {
         /// The transport instance.
         transport: TransportId,
+    },
+    /// [`ControlApi::fs_roots`].
+    FsRoots,
+    /// [`ControlApi::fs_list`].
+    FsList {
+        /// The root to list within.
+        root: FsRootId,
+        /// Root-relative directory ("" = the root).
+        dir: String,
+        /// Include ignored entries (they are marked either way).
+        #[serde(default)]
+        show_ignored: bool,
+    },
+    /// [`ControlApi::fs_stat`].
+    FsStat {
+        /// The root.
+        root: FsRootId,
+        /// Root-relative path.
+        path: String,
+    },
+    /// [`ControlApi::fs_read`].
+    FsRead {
+        /// The root.
+        root: FsRootId,
+        /// Root-relative path.
+        path: String,
+        /// Max bytes (`0` = a server default).
+        #[serde(default)]
+        max_bytes: u64,
+    },
+    /// [`ControlApi::fs_write`].
+    FsWrite {
+        /// The root (Workspace/Session only).
+        root: FsRootId,
+        /// Root-relative path.
+        path: String,
+        /// The bytes to write.
+        bytes: Vec<u8>,
+        /// The base etag for optimistic concurrency (`None` = create-or-overwrite).
+        #[serde(default)]
+        base_revision: Option<FsRevision>,
+        /// Override the sensitive-path / `Deny` gate.
+        #[serde(default)]
+        force: bool,
+    },
+    /// [`ControlApi::fs_search`].
+    FsSearch {
+        /// The root to search within.
+        root: FsRootId,
+        /// The search query.
+        query: FsSearchQuery,
+    },
+    /// [`ControlApi::fs_watch_after`] — the cursor / long-poll form of the change stream.
+    FsWatchPoll {
+        /// The root.
+        root: FsRootId,
+        /// Root-relative directory being watched.
+        dir: String,
+        /// Drain changes after this cursor.
+        after_seq: u64,
+        /// Max events to drain.
+        max: u32,
     },
 }
 
@@ -2388,7 +2579,194 @@ pub enum ApiResponse {
     Rooms(Vec<RoomInfo>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
+    /// The browsable filesystem roots (fs_roots).
+    FsRoots(Vec<FsRoot>),
+    /// A directory listing (fs_list).
+    FsList(Vec<FsEntry>),
+    /// One entry's metadata (fs_stat).
+    FsStat(FsEntry),
+    /// A file's bytes + etag (fs_read).
+    FsRead(FsContent),
+    /// A write's new etag (fs_write).
+    FsWrite(FsRevision),
+    /// A page of project-search hits (fs_search).
+    FsSearch(FsSearchPage),
+    /// A page of watch change events (fs_watch_after).
+    FsWatch(FsWatchPageView),
 }
+
+// ---------------------------------------------------------------------------
+// Filesystem / workspace surface DTOs (daemon-fs-surface-spec.md)
+// ---------------------------------------------------------------------------
+
+/// Which root a filesystem op addresses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsRootId {
+    /// Browse the node's own machine for discovery, bounded by the node browse policy (home +
+    /// operator allowlist). Read-only. The `String` names which advertised browse root.
+    Host(String),
+    /// The node's configured workspace root.
+    Workspace,
+    /// A session/unit's workspace sandbox (its execution-environment root).
+    Session(SessionId),
+}
+
+/// The kind of an advertised root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsRootKind {
+    /// A host browse root (read-only discovery).
+    Host,
+    /// The node workspace root.
+    Workspace,
+    /// A session sandbox root.
+    Session,
+}
+
+/// A browsable root the node advertises (`fs_roots`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsRoot {
+    /// The root id to pass to the other fs ops.
+    pub id: FsRootId,
+    /// A human label (basename / home / session title).
+    pub label: String,
+    /// What kind of root this is.
+    pub kind: FsRootKind,
+    /// The owning session, when `kind == Session`.
+    #[serde(default)]
+    pub session: Option<SessionId>,
+}
+
+/// What kind of directory entry a listing row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsEntryKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+    /// A symbolic link.
+    Symlink,
+}
+
+/// One directory child (fs_list / fs_stat). `path` is root-relative with POSIX separators.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsEntry {
+    /// The entry's base name.
+    pub name: String,
+    /// Root-relative path (POSIX separators).
+    pub path: String,
+    /// File / dir / symlink.
+    pub kind: FsEntryKind,
+    /// Size in bytes (0 for directories).
+    pub size: u64,
+    /// Last-modified wall-clock milliseconds since the Unix epoch (0 if unknown).
+    pub mtime_ms: u64,
+    /// Whether the node's ignore rules (gitignore + artifacts) matched this entry (marked, not
+    /// hidden — the client decides whether to show it).
+    #[serde(default)]
+    pub ignored: bool,
+}
+
+/// A cheap opaque content etag for optimistic-concurrency writes. NOT [`Revision`] (which is
+/// profile/skill versioning); this avoids re-reading a file to validate a write base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsRevision {
+    /// Last-modified wall-clock milliseconds at read time.
+    pub mtime_ms: u64,
+    /// Size in bytes at read time.
+    pub size: u64,
+}
+
+/// A file's bytes + etag (fs_read).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsContent {
+    /// The (possibly truncated) file bytes.
+    pub bytes: Vec<u8>,
+    /// The content etag (pass as `base_revision` to fs_write).
+    pub revision: FsRevision,
+    /// Whether the bytes were truncated at `max_bytes`.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// A server-side project-search query (fs_search).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSearchQuery {
+    /// The search text (or regex when `regex`).
+    pub query: String,
+    /// Treat `query` as a regular expression.
+    #[serde(default)]
+    pub regex: bool,
+    /// Case-sensitive match (default: insensitive).
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Max hits to return (`0` = a server default).
+    #[serde(default)]
+    pub max_results: u32,
+    /// Zero-based page index for pagination.
+    #[serde(default)]
+    pub page: u32,
+}
+
+/// One project-search hit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSearchHit {
+    /// Root-relative path of the matching file.
+    pub path: String,
+    /// 1-based line number of the match.
+    pub line: u32,
+    /// 1-based column of the match.
+    pub col: u32,
+    /// The matching line (trimmed) for preview.
+    pub preview: String,
+}
+
+/// A page of project-search hits (fs_search).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FsSearchPage {
+    /// The hits in this page.
+    pub hits: Vec<FsSearchHit>,
+    /// Whether more hits exist beyond this page.
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// What changed under a watched directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsChangeKind {
+    /// A path appeared.
+    Created,
+    /// A path's contents changed.
+    Modified,
+    /// A path was removed.
+    Removed,
+}
+
+/// One change event under a watched directory (fs_watch).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsChange {
+    /// Root-relative path that changed.
+    pub path: String,
+    /// The kind of change.
+    pub kind: FsChangeKind,
+}
+
+/// A page of change events drained by the watch cursor (fs_watch_after), modeled on the session
+/// log's cursor read: `next_seq` is the cursor to pass on the next poll.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FsWatchPageView {
+    /// The change events since the requested cursor.
+    pub events: Vec<FsChange>,
+    /// The cursor to pass as `after_seq` on the next poll.
+    pub next_seq: u64,
+}
+
+/// A live push stream of filesystem changes (a transport capability, like [`LogStream`]; the
+/// one-shot/long-poll cursor form every transport marshals is `fs_watch_after`).
+pub type FsWatchStream = BoxStream<'static, FsChange>;
 
 /// Why an api call failed (serializable so it round-trips over any transport).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -2686,6 +3064,9 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::SessionSearch { query, limit } => {
             ApiResponse::SessionSearch(api.session_search(query, limit).await)
         }
+        ApiRequest::SessionUpdateMeta { session, patch } => {
+            unit_or_err(api.session_update_meta(session, patch).await)
+        }
         ApiRequest::Rewind { session, point } => unit_or_err(api.rewind(session, point).await),
         ApiRequest::AcpDiscover => ApiResponse::AcpCatalog(api.acp_discover().await),
         ApiRequest::AcpCatalog => ApiResponse::AcpCatalog(api.acp_catalog().await),
@@ -2730,6 +3111,50 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::TransportRooms { transport } => {
             ApiResponse::Rooms(api.transport_rooms(transport).await)
         }
+        ApiRequest::FsRoots => ApiResponse::FsRoots(api.fs_roots().await),
+        ApiRequest::FsList {
+            root,
+            dir,
+            show_ignored,
+        } => match api.fs_list(root, dir, show_ignored).await {
+            Ok(entries) => ApiResponse::FsList(entries),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::FsStat { root, path } => match api.fs_stat(root, path).await {
+            Ok(entry) => ApiResponse::FsStat(entry),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::FsRead {
+            root,
+            path,
+            max_bytes,
+        } => match api.fs_read(root, path, max_bytes).await {
+            Ok(content) => ApiResponse::FsRead(content),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::FsWrite {
+            root,
+            path,
+            bytes,
+            base_revision,
+            force,
+        } => match api.fs_write(root, path, bytes, base_revision, force).await {
+            Ok(rev) => ApiResponse::FsWrite(rev),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::FsSearch { root, query } => match api.fs_search(root, query).await {
+            Ok(page) => ApiResponse::FsSearch(page),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::FsWatchPoll {
+            root,
+            dir,
+            after_seq,
+            max,
+        } => match api.fs_watch_after(root, dir, after_seq, max).await {
+            Ok(page) => ApiResponse::FsWatch(page),
+            Err(e) => ApiResponse::Error(e),
+        },
         // Session variants were handled by `serve_session`.
         ApiRequest::Submit { .. }
         | ApiRequest::SubmitRouted { .. }
@@ -2868,6 +3293,111 @@ mod tests {
     }
 
     #[test]
+    fn fs_requests_and_responses_round_trip() {
+        let reqs = vec![
+            ApiRequest::FsRoots,
+            ApiRequest::FsList {
+                root: FsRootId::Host("home".into()),
+                dir: "projects".into(),
+                show_ignored: true,
+            },
+            ApiRequest::FsStat {
+                root: FsRootId::Workspace,
+                path: "src/main.rs".into(),
+            },
+            ApiRequest::FsRead {
+                root: FsRootId::Session(SessionId::new("s1")),
+                path: "README.md".into(),
+                max_bytes: 1024,
+            },
+            ApiRequest::FsWrite {
+                root: FsRootId::Session(SessionId::new("s1")),
+                path: "a.txt".into(),
+                bytes: vec![1, 2, 3],
+                base_revision: Some(FsRevision {
+                    mtime_ms: 10,
+                    size: 3,
+                }),
+                force: false,
+            },
+            ApiRequest::FsSearch {
+                root: FsRootId::Workspace,
+                query: FsSearchQuery {
+                    query: "TODO".into(),
+                    regex: false,
+                    case_sensitive: false,
+                    max_results: 50,
+                    page: 0,
+                },
+            },
+            ApiRequest::FsWatchPoll {
+                root: FsRootId::Workspace,
+                dir: String::new(),
+                after_seq: 4,
+                max: 32,
+            },
+        ];
+        for req in reqs {
+            let bytes = to_cbor(&req);
+            let back: ApiRequest = from_cbor(&bytes).unwrap();
+            assert_eq!(req, back);
+        }
+
+        let resps = vec![
+            ApiResponse::FsRoots(vec![FsRoot {
+                id: FsRootId::Workspace,
+                label: "workspace".into(),
+                kind: FsRootKind::Workspace,
+                session: None,
+            }]),
+            ApiResponse::FsList(vec![FsEntry {
+                name: "src".into(),
+                path: "src".into(),
+                kind: FsEntryKind::Dir,
+                size: 0,
+                mtime_ms: 1,
+                ignored: false,
+            }]),
+            ApiResponse::FsRead(FsContent {
+                bytes: vec![9, 9],
+                revision: FsRevision {
+                    mtime_ms: 2,
+                    size: 2,
+                },
+                truncated: true,
+            }),
+            ApiResponse::FsWrite(FsRevision {
+                mtime_ms: 3,
+                size: 7,
+            }),
+            ApiResponse::FsWatch(FsWatchPageView {
+                events: vec![FsChange {
+                    path: "a.txt".into(),
+                    kind: FsChangeKind::Modified,
+                }],
+                next_seq: 5,
+            }),
+        ];
+        for resp in resps {
+            let bytes = to_cbor(&resp);
+            let back: ApiResponse = from_cbor(&bytes).unwrap();
+            assert_eq!(resp, back);
+        }
+    }
+
+    #[test]
+    fn overlay_workspace_binding_round_trips() {
+        let overlay = SessionOverlay {
+            workspace: Some(WorkspaceBinding::Bound("/srv/projects/foo".into())),
+            ..SessionOverlay::default()
+        };
+        let bytes = to_cbor(&overlay);
+        let back: SessionOverlay = from_cbor(&bytes).unwrap();
+        assert_eq!(overlay, back);
+        assert!(!overlay.is_empty());
+    }
+
+    #[test]
     fn submit_origin_field_defaults_when_absent() {
         // An old-shape Submit encoded WITHOUT `origin` must still decode (serde default -> None),
         // proving the additive field is backward compatible on the v2 wire.
@@ -2917,6 +3447,8 @@ mod tests {
             lifecycle: Lifecycle::Live,
             role: SessionRole::ManagedChild,
             parent: Some(SessionId::new("p1")),
+            pinned: false,
+            archived: false,
         }
     }
 

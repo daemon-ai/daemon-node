@@ -23,6 +23,7 @@ const STORE_PATH_ENV: &str = "DAEMON_STORE_PATH";
 /// The host data directory rooting the profile-scoped subsystem databases (the §10/§11 LCM +
 /// Mnemosyne stores live under `<data_dir>/<profile>/`, mirroring hermes' per-profile home).
 const DATA_DIR_ENV: &str = "DAEMON_DATA_DIR";
+const WORKSPACE_ROOT_ENV: &str = "DAEMON_WORKSPACE_ROOT";
 /// Overrides the owned partition id (a `u64`).
 const PARTITION_ENV: &str = "DAEMON_PARTITION";
 /// Overrides the model provider/credential profile name.
@@ -623,6 +624,11 @@ pub struct NodeConfig {
     /// The host data directory rooting the profile-scoped subsystem databases (§10/§11). The LCM and
     /// Mnemosyne stores live under [`NodeConfig::profile_home`]; see [`NodeConfig::persist_providers`].
     pub data_dir: PathBuf,
+    /// The parent directory of per-session workspace sandboxes and the `FsRootId::Workspace` browse
+    /// root for the filesystem surface (daemon-fs-surface-spec.md). Every engine roots under it
+    /// (`<workspace_root>/<session_id>`, or an operator-bound directory) instead of `$TMP`. Defaults
+    /// to `<data_dir>/workspaces`.
+    pub workspace_root: PathBuf,
     /// How often the wake/job dispatchers poll the durable outboxes.
     pub dispatch_interval: Duration,
     /// How often the recovery scanner re-checks for resumable sessions.
@@ -690,6 +696,7 @@ struct FileConfig {
     store: Option<String>,
     store_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    workspace_root: Option<PathBuf>,
     dispatch_interval_ms: Option<u64>,
     scan_interval_ms: Option<u64>,
     profile: Option<String>,
@@ -1037,6 +1044,14 @@ impl NodeConfig {
         // Resolve engine tunables before the `String`/`PathBuf` fields below partially move `file`.
         let engine = Self::resolve_engine(&file)?;
 
+        // The workspace root: the parent of per-session sandboxes + the filesystem-surface
+        // browse root. Defaults under the data dir so a fresh node has a stable, persistent place
+        // for agent workspaces (instead of `$TMP/daemon-ws-*`).
+        let workspace_root = env_string(WORKSPACE_ROOT_ENV)
+            .map(PathBuf::from)
+            .or_else(|| file.workspace_root.clone())
+            .unwrap_or_else(|| data_dir.join("workspaces"));
+
         let socket_path = env_string(API_SOCKET_ENV)
             .map(PathBuf::from)
             .or(file.socket_path)
@@ -1137,6 +1152,7 @@ impl NodeConfig {
             http_addr,
             store,
             data_dir,
+            workspace_root,
             dispatch_interval,
             scan_interval,
             profile,

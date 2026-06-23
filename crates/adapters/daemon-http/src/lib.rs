@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daemon_api::{
-    dispatch, ApiRequest, ApiResponse, LogFilter, LogLineStream, LogStream, NodeApi,
+    dispatch, ApiRequest, ApiResponse, FsRootId, LogFilter, LogLineStream, LogStream, NodeApi,
     SessionLogEntry, TreeStream, TreeSubFilter,
 };
 use daemon_common::SessionId;
@@ -84,6 +84,7 @@ pub fn router(api: Arc<dyn NodeApi>) -> Router {
         .route("/sessions/{session}/subscribe", get(subscribe_sse))
         .route("/sessions/{session}/ws", get(subscribe_ws))
         .route("/tree/subscribe", get(tree_subscribe_sse))
+        .route("/fs/watch", get(fs_watch_sse))
         .route("/logs", get(logs_sse))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -281,6 +282,71 @@ async fn open_tree(state: &AppState, filter: TreeSubFilter) -> TreeStream {
         .tree_subscribe(filter)
         .await
         .unwrap_or_else(|_| futures::stream::empty().boxed())
+}
+
+/// Query params for the filesystem change stream (`?root=workspace&dir=src&poll_ms=750`). `root` is
+/// `workspace` (default), `session:<id>`, or `host:<id>`; `dir` is the root-relative directory.
+#[derive(Debug, Deserialize)]
+struct FsWatchQuery {
+    #[serde(default = "default_fs_root")]
+    root: String,
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    poll_ms: u64,
+}
+
+fn default_fs_root() -> String {
+    "workspace".to_string()
+}
+
+/// Parse the `root` query param into an [`FsRootId`].
+fn parse_fs_root(s: &str) -> FsRootId {
+    if let Some(id) = s.strip_prefix("session:") {
+        FsRootId::Session(SessionId::new(id))
+    } else if let Some(id) = s.strip_prefix("host:") {
+        FsRootId::Host(id.to_string())
+    } else {
+        FsRootId::Workspace
+    }
+}
+
+/// `GET /fs/watch` — a Server-Sent Events stream of filesystem change events under a watched
+/// directory (daemon-fs-surface-spec.md). Mirrors [`subscribe_sse`] as a transport capability: it
+/// holds the connection open and polls the wire cursor (`fs_watch_after`) on an interval, pushing a
+/// JSON array of [`daemon_api::FsChange`]s whenever the directory changes (one-shot clients poll the
+/// `FsWatchPoll` op directly instead).
+async fn fs_watch_sse(
+    State(state): State<AppState>,
+    Query(q): Query<FsWatchQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let root = parse_fs_root(&q.root);
+    let dir = q.dir;
+    let poll = std::time::Duration::from_millis(if q.poll_ms == 0 { 750 } else { q.poll_ms });
+    let api = state.api.clone();
+    let stream = futures::stream::unfold(0u64, move |after_seq| {
+        let api = api.clone();
+        let root = root.clone();
+        let dir = dir.clone();
+        async move {
+            loop {
+                tokio::time::sleep(poll).await;
+                match api.fs_watch_after(root.clone(), dir.clone(), after_seq, 0).await {
+                    Ok(page) if !page.events.is_empty() => {
+                        let event = Event::default()
+                            .json_data(&page.events)
+                            .unwrap_or_else(|_| Event::default().data("serialize error"));
+                        return Some((Ok::<_, Infallible>(event), page.next_seq));
+                    }
+                    // Primed / no changes: keep polling on the same cursor.
+                    Ok(_) => continue,
+                    // The surface is unbound (no workspace) — end the stream.
+                    Err(_) => return None,
+                }
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Query params for the node log-tail stream (`?min_level=info&target=substr`). Both optional.

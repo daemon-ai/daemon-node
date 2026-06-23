@@ -19,21 +19,22 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApprovalMode, ContextEngineSel, EngineTunables, FleetReport, MemoryProviderSel, ProfileSpec,
-    SessionOverlay,
+    ApprovalMode, ContextEngineSel, EngineTunables, FleetReport, ManageEventView, MemoryProviderSel,
+    ProfileSpec, SessionOverlay, SubagentPhase, TreeEvent, WorkspaceBinding,
 };
 use daemon_common::{Budget, JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     ApprovalPolicy, Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile,
-    MemoryBuilder, MemoryProvider, ProviderBuilder, ProviderRegistry, StablePromptSource,
-    SystemPrompt, Tool, ToolRegistry,
+    ExecutionEnvironment, LocalEnvironment, MemoryBuilder, MemoryProvider, ProviderBuilder,
+    ProviderRegistry, StablePromptSource, SystemPrompt, Tool, ToolRegistry,
 };
 use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
     CodecSession, CoreEngineFactory, CredentialStore, DurableProfileResolver, EngineUnit,
     FleetControl, Host, HostConfig, JobWorker, JournalConfig, JournalFeeder, JournalSink,
     ModelProviderFactory, NodeApiImpl, ProcessAgentUnit, ProfileStore, RoutingRegistry,
-    ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle,
+    ServiceError, SessionEngineBuilder, StreamJsonCodec, SupervisorHandle, WorkspaceFs,
+    WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -195,6 +196,13 @@ pub struct NodeAssembly {
     /// `auth_begin`/`auth_complete` resolve to `ApiError::Unsupported` and whose `auth_providers` is
     /// empty. Completion writes through the same credential + profile stores wired above.
     pub auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>>,
+    /// The node's workspace root: the parent directory of per-session sandboxes and the
+    /// `FsRootId::Workspace` browse root. When `Some`, every engine this node builds is rooted under
+    /// it (`<workspace_root>/<session_id>` for an isolated session, or the operator-bound directory
+    /// for a `Bound` session) instead of the per-session `$TMP/daemon-ws-*` sandbox, and the
+    /// filesystem surface (`fs_*`) serves files from there. `None` keeps the temp-sandbox default
+    /// and leaves the filesystem surface unbound (tests / nodes without a workspace).
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -399,6 +407,9 @@ struct SessionFactoryCtx {
     memory_builder: Option<MemoryBuilder>,
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
     skills_resolver: Option<SkillsResolver>,
+    /// The node's workspace-root resolver (shared with the engine exec builder + the filesystem
+    /// surface). `None` keeps engines on the temp-sandbox default.
+    workspace_roots: Option<Arc<WorkspaceRoots>>,
 }
 
 impl SessionFactoryCtx {
@@ -502,6 +513,22 @@ impl SessionFactoryCtx {
                 profile = profile.with_fallback_profile(ProfileRef::new(fallback));
             }
         }
+        // Root the engine's execution environment (§13) at the session's workspace: the operator-bound
+        // directory when the overlay carries `Bound(path)`, else the isolated `<workspace_root>/<id>`
+        // sandbox. Record the resolved root so the filesystem surface (`fs_*`) serves the *same*
+        // directory the agent's fs/shell tools operate in. No-op when no workspace root is configured.
+        if let Some(roots) = &self.workspace_roots {
+            let roots = roots.clone();
+            let binding = overlay.workspace.clone();
+            profile = profile.with_exec(Arc::new(move |id: &SessionId| {
+                let root = match &binding {
+                    Some(WorkspaceBinding::Bound(p)) => p.clone(),
+                    _ => roots.isolated_root(id.as_str()),
+                };
+                roots.record(id.as_str(), root.clone());
+                Arc::new(LocalEnvironment::new(root)) as Arc<dyn ExecutionEnvironment>
+            }));
+        }
         profile
     }
 }
@@ -514,6 +541,23 @@ fn approval_mode_to_policy(mode: ApprovalMode) -> ApprovalPolicy {
         ApprovalMode::AcceptEdits => ApprovalPolicy::AcceptEdits,
         ApprovalMode::AutoAllow => ApprovalPolicy::AutoAllow,
         ApprovalMode::Deny => ApprovalPolicy::Deny,
+    }
+}
+
+/// Root a base profile's engines under the node `workspace_root` (isolated per-session sandbox),
+/// recording the resolved root so the filesystem surface serves the same directory. No-op when no
+/// workspace root is configured (engines then fall back to the per-session temp sandbox).
+fn root_profile(profile: EngineProfile, roots: &Option<Arc<WorkspaceRoots>>) -> EngineProfile {
+    match roots {
+        Some(roots) => {
+            let roots = roots.clone();
+            profile.with_exec(Arc::new(move |id: &SessionId| {
+                let root = roots.session_root(id.as_str());
+                roots.record(id.as_str(), root.clone());
+                Arc::new(LocalEnvironment::new(root)) as Arc<dyn ExecutionEnvironment>
+            }))
+        }
+        None => profile,
     }
 }
 
@@ -586,16 +630,31 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         approval_policy: ApprovalPolicy::AutoAllow,
         ..a.engine_config
     };
-    let child_profile = dress(
-        EngineProfile::new(
-            provider_for(&a.providers, CHILD_PROFILE),
-            Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
-            SystemPrompt::new("fleet child"),
-        ),
-        &a,
-        launch_index,
-    )
-    .with_config(autonomous_config);
+    // The node's workspace-root resolver: shared by every engine's exec-env builder (so agents root
+    // under it) and the filesystem surface (so operator + agent see one filesystem). `None` keeps
+    // the per-session temp-sandbox default (tests / nodes without a workspace).
+    let workspace_roots: Option<Arc<WorkspaceRoots>> = a.workspace_root.clone().map(|base| {
+        // Host browse roots for discovery before binding (daemon-fs-surface-spec.md): default to the
+        // node user's home directory. (An operator allowlist / recents can extend this later.)
+        let mut browse = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            browse.push(("home".to_string(), PathBuf::from(home)));
+        }
+        Arc::new(WorkspaceRoots::new(base).with_browse_roots(browse))
+    });
+    let child_profile = root_profile(
+        dress(
+            EngineProfile::new(
+                provider_for(&a.providers, CHILD_PROFILE),
+                Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
+                SystemPrompt::new("fleet child"),
+            ),
+            &a,
+            launch_index,
+        )
+        .with_config(autonomous_config),
+        &workspace_roots,
+    );
     // The legacy synchronous placement seam (in-process live engine children + foreign agents). The
     // durable Core delegation path no longer uses this — it materializes children as durable
     // sessions through the shared activation manager (see `FleetJobWorker`) — so this spawner is
@@ -605,13 +664,19 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             .with_journal(journal.clone())
             .with_rewind(a.store.clone(), a.checkpoints.clone()),
     );
+    // The host-owned fleet event bus (I4/I8): the single broadcast sender the orchestration
+    // producers (this in-memory `FleetRuntime` + the durable `FleetJobWorker`) ping on a real
+    // topology change, and `NodeApiImpl::tree_subscribe` subscribes to for live push. Capacity is a
+    // burst cushion; a slow subscriber that lags re-syncs with a fresh snapshot.
+    let (fleet_events, _) = tokio::sync::broadcast::channel::<TreeEvent>(256);
     let fleet = FleetRuntime::new(
         a.store.clone(),
         a.partition,
         spawner,
         Arc::new(DefaultAnswerPolicy),
         None::<Arc<dyn ManageRequestHandler>>,
-    );
+    )
+    .with_event_sink(fleet_events.clone());
 
     // The one orchestrator-capable engine shape, used at *every* durable level: the top session and
     // every delegated child are built from this profile, so a child is itself an orchestrator that
@@ -625,16 +690,19 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
             .with_max_depth(a.nesting_depth + 1),
     ));
-    let orchestrator_profile = dress(
-        EngineProfile::new(
-            provider_for(&a.providers, ORCHESTRATOR_PROFILE),
-            Arc::new(registry),
-            SystemPrompt::new("daemon host node"),
-        ),
-        &a,
-        launch_index,
-    )
-    .with_config(autonomous_config);
+    let orchestrator_profile = root_profile(
+        dress(
+            EngineProfile::new(
+                provider_for(&a.providers, ORCHESTRATOR_PROFILE),
+                Arc::new(registry),
+                SystemPrompt::new("daemon host node"),
+            ),
+            &a,
+            launch_index,
+        )
+        .with_config(autonomous_config),
+        &workspace_roots,
+    );
     // The §4.3 background-review spawner: shared by the durable factory (so a review child raised
     // mid-turn resolves its constrained profile during hydrate) and the live surface (so a `Spawn`
     // host request from an interactive session is materialized fire-and-forget). Inert when the
@@ -663,6 +731,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
                     memory_builder: a.memory_builder.clone(),
                     prompt_sources: a.prompt_sources.clone(),
                     skills_resolver: a.skills_resolver.clone(),
+                    workspace_roots: workspace_roots.clone(),
                 });
                 Some((store, ctx))
             }
@@ -694,20 +763,24 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // parent-bound durable child session seeded from the same orchestrator profile.
     let host =
         Host::new(a.store.clone(), Arc::new(factory), a.host_config).with_job_worker(Arc::new(
-            FleetJobWorker::new(a.store.clone(), a.partition, orchestrator_profile),
+            FleetJobWorker::new(a.store.clone(), a.partition, orchestrator_profile)
+                .with_event_sink(fleet_events.clone()),
         ));
     let handle = host.start();
 
     // The interactive (session sub-surface) engines: built from the same seam (resolved provider +
     // brokered credentials), so the live path is not credential-asymmetric with the durable one.
-    let session_profile = dress(
-        EngineProfile::new(
-            provider_for(&a.providers, a.profile.as_str()),
-            Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
-            SystemPrompt::new("interactive session"),
+    let session_profile = root_profile(
+        dress(
+            EngineProfile::new(
+                provider_for(&a.providers, a.profile.as_str()),
+                Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
+                SystemPrompt::new("interactive session"),
+            ),
+            &a,
+            launch_index,
         ),
-        &a,
-        launch_index,
+        &workspace_roots,
     );
     // Profile-aware interactive session builder: when the node carries a profile store + provider
     // resolver, each session resolves its bound profile bundle at open, applies the persisted
@@ -758,7 +831,15 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // Live interactive sessions journal per turn; also records the signer so history reads verify.
     .with_journal(a.store.clone(), signer.clone())
     // Surface the resident telemetry aggregator through the `telemetry` control op.
-    .with_metrics(host.metrics().clone());
+    .with_metrics(host.metrics().clone())
+    // Subscribe the tree-push surface to the host fleet bus (I4/I8): `tree_subscribe` now forwards
+    // live spawn/terminal/progress deltas instead of re-projecting on a fixed poll interval.
+    .with_fleet_events(fleet_events.clone());
+    // Bind the filesystem / workspace surface (`fs_*`) over the SAME `WorkspaceRoots` the engine
+    // exec builders root at, so operator and agent see one filesystem.
+    if let Some(roots) = &workspace_roots {
+        node_api = node_api.with_workspace(Arc::new(WorkspaceFs::new(roots.clone())));
+    }
     // Bind the model-management sub-surface when this node hosts local-inference model management.
     if let Some(models) = a.models.clone() {
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
@@ -1033,6 +1114,12 @@ pub struct FleetJobWorker {
     /// The orchestrator-capable profile every durable session (top and child) is built from — one
     /// engine shape at every level. Used here to seed a fresh child's first turn.
     profile: EngineProfile,
+    /// The host fleet event bus (I4/I8). On a real durable child create the worker pushes a
+    /// [`TreeEvent::Subagent`] spawn marker so `tree_subscribe` shows the new subagent row promptly
+    /// (before any poll interval). `None` => no live push from the durable delegation seam.
+    events: Option<tokio::sync::broadcast::Sender<TreeEvent>>,
+    /// Monotonic sequence for the spawn markers the worker emits onto the bus.
+    bus_seq: std::sync::atomic::AtomicU64,
 }
 
 impl FleetJobWorker {
@@ -1046,7 +1133,36 @@ impl FleetJobWorker {
             store,
             partition,
             profile,
+            events: None,
+            bus_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Inject the host fleet event bus so a durable child create pushes a live spawn delta. Call
+    /// during assembly with the same sender wired into `NodeApiImpl`/`FleetRuntime`.
+    pub fn with_event_sink(mut self, events: tokio::sync::broadcast::Sender<TreeEvent>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Push the spawn marker for a freshly-created durable child onto the fleet bus (role from the
+    /// job's `ChildLifetime`, active count = the parent's current durable child total). A no-op when
+    /// no bus is wired.
+    async fn emit_spawn(&self, parent: &SessionId, child: &SessionId, role: daemon_api::SessionRole) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        let active_children = self.store.children_of(parent).await.len() as u32;
+        let seq = self
+            .bus_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = events.send(TreeEvent::Subagent(ManageEventView::Subagent {
+            seq,
+            child: UnitId::new(child.as_str()),
+            role,
+            phase: SubagentPhase::Spawned,
+            active_children,
+        }));
     }
 
     /// The deterministic id of the child session a delegation job materializes: the parent's id plus
@@ -1054,6 +1170,15 @@ impl FleetJobWorker {
     /// child, and the `/`-delimited path encodes the tree depth the orchestrate-tool guard reads.
     fn child_id(job: &daemon_store::JobCommand) -> SessionId {
         SessionId::new(format!("{}/c{}", job.session_id, job.epoch.0))
+    }
+}
+
+/// Map a durable-store session role to its wire-surface equivalent (for the fleet bus markers).
+fn map_store_role(role: daemon_store::SessionRole) -> daemon_api::SessionRole {
+    match role {
+        daemon_store::SessionRole::Primary => daemon_api::SessionRole::Primary,
+        daemon_store::SessionRole::ManagedChild => daemon_api::SessionRole::ManagedChild,
+        daemon_store::SessionRole::EphemeralSubagent => daemon_api::SessionRole::EphemeralSubagent,
     }
 }
 
@@ -1079,11 +1204,16 @@ impl JobWorker for FleetJobWorker {
                 // derived from the job's declared `ChildLifetime` (managed vs ephemeral subagent).
                 let mut meta = self.store.session_meta(&child).await.unwrap_or_default();
                 meta.parent = Some(job.session_id.clone());
-                meta.role = Some(job.lifetime.role());
+                let child_role = job.lifetime.role();
+                meta.role = Some(child_role);
                 self.store
                     .set_session_meta(&child, meta)
                     .await
                     .map_err(ServiceError::new)?;
+                // Real topology change: push the spawn delta so a live `tree_subscribe` shows the new
+                // subagent row promptly (the conformance "push before poll" guarantee).
+                self.emit_spawn(&job.session_id, &child, map_store_role(child_role))
+                    .await;
             }
             // Durable tree edge: the child's terminal completion fulfills this job and wakes the
             // parent (in the store's mark_completed transaction). Idempotent.
@@ -1369,6 +1499,7 @@ mod tests {
             memory_builder: None,
             prompt_sources: Vec::new(),
             skills_resolver: None,
+            workspace_roots: None,
         };
 
         let base = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");
@@ -1377,6 +1508,7 @@ mod tests {
             provider: None,
             tool_allowlist: ToolsOverride::Allowlist(vec!["fs".to_string()]),
             approval_mode: Some(ApprovalMode::AutoAllow),
+            workspace: None,
         };
         let _profile = ctx.resolve_effective(&base, &overlay);
 

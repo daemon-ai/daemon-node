@@ -30,6 +30,7 @@ daemon-ingest = { workspace = true }
 agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 ciborium = { workspace = true }
 serde_json = { workspace = true }

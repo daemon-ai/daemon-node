@@ -50,6 +50,7 @@ pub mod streamjson;
 pub mod supervisor;
 pub mod transcript;
 pub mod unit;
+pub mod workspace_fs;
 
 pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
@@ -88,6 +89,7 @@ pub use routing::{
     TransportPattern,
 };
 pub use socket::{serve_api_unix, ApiClient};
+pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,

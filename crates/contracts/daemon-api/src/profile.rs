@@ -333,6 +333,10 @@ pub struct SessionOverlay {
     pub tool_allowlist: ToolsOverride,
     /// Override the edit-approval mode (`None` = inherit the profile/engine default).
     pub approval_mode: Option<crate::ApprovalMode>,
+    /// How the session's workspace root is chosen (`None` = the node default = isolated
+    /// per-session sandbox). `Some(Bound(path))` roots the session's engine + filesystem surface
+    /// at an operator-specified directory, in place (the "work on my repo" case).
+    pub workspace: Option<daemon_common::WorkspaceBinding>,
 }
 
 impl SessionOverlay {
@@ -342,6 +346,7 @@ impl SessionOverlay {
             && self.provider.is_none()
             && matches!(self.tool_allowlist, ToolsOverride::Inherit)
             && self.approval_mode.is_none()
+            && self.workspace.is_none()
     }
 
     /// Apply the model/provider/tool-allowlist overrides onto a profile spec in place. The
@@ -509,6 +514,7 @@ mod tests {
             provider: Some(ProviderSelector::Mock),
             tool_allowlist: ToolsOverride::Allowlist(vec!["fs".to_string()]),
             approval_mode: Some(crate::ApprovalMode::AutoAllow),
+            workspace: None,
         };
         assert!(!overlay.is_empty());
         let mut spec = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");
@@ -538,6 +544,7 @@ mod tests {
             provider: Some(ProviderSelector::GenAi),
             tool_allowlist: ToolsOverride::Allowlist(vec!["a".into(), "b".into()]),
             approval_mode: Some(crate::ApprovalMode::Deny),
+            workspace: None,
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&overlay, &mut buf).unwrap();

@@ -128,7 +128,9 @@ CREATE TABLE IF NOT EXISTS session_meta (
     title            TEXT,
     last_activity_ms INTEGER,
     role             TEXT,
-    parent           TEXT
+    parent           TEXT,
+    pinned           INTEGER NOT NULL DEFAULT 0,
+    archived         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS session_usage (
@@ -208,6 +210,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         "ALTER TABLE session_meta ADD COLUMN last_activity_ms INTEGER",
         "ALTER TABLE session_meta ADD COLUMN role TEXT",
         "ALTER TABLE session_meta ADD COLUMN parent TEXT",
+        // Roster session-action flags (pin/archive) for the GUI session-actions surface.
+        "ALTER TABLE session_meta ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE session_meta ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
         // Delegation child-lifetime marker on the durable outbox (managed vs ephemeral subagent).
         "ALTER TABLE job_outbox ADD COLUMN lifetime TEXT",
     ];
@@ -1006,11 +1011,21 @@ impl SessionStore for SqliteStore {
         let parent = meta.parent.as_ref().map(|p| p.as_str());
         let last_activity = meta.last_activity_ms.map(|v| v as i64);
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
-             last_activity_ms = ?5, role = ?6, parent = ?7",
-            params![id.as_str(), bound, meta.overlay, meta.title, last_activity, role, parent],
+             last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9",
+            params![
+                id.as_str(),
+                bound,
+                meta.overlay,
+                meta.title,
+                last_activity,
+                role,
+                parent,
+                meta.pinned as i64,
+                meta.archived as i64
+            ],
         )
         .map_err(sql_err)?;
         Ok(())
@@ -1019,7 +1034,7 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent \
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived \
              FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
@@ -1029,6 +1044,8 @@ impl SessionStore for SqliteStore {
                 let last_activity_ms: Option<i64> = row.get(3)?;
                 let role: Option<String> = row.get(4)?;
                 let parent: Option<String> = row.get(5)?;
+                let pinned: i64 = row.get(6)?;
+                let archived: i64 = row.get(7)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
@@ -1036,6 +1053,8 @@ impl SessionStore for SqliteStore {
                     last_activity_ms: last_activity_ms.map(|v| v as u64),
                     role: role.as_deref().and_then(role_from_str),
                     parent: parent.map(SessionId::new),
+                    pinned: pinned != 0,
+                    archived: archived != 0,
                 })
             },
         )

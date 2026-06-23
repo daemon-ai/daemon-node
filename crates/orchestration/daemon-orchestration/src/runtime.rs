@@ -22,8 +22,8 @@ use crate::registry::{ChildRecord, ChildStatus};
 use crate::spawner::ChildSpawner;
 use async_trait::async_trait;
 use daemon_api::{
-    ManageEventView, Outbound, SessionRole, TreeReport, UnitKind as ApiUnitKind, UnitNode,
-    UnitState,
+    ManageEventView, Outbound, SessionRole, SubagentPhase, TreeEvent, TreeReport,
+    UnitKind as ApiUnitKind, UnitNode, UnitState,
 };
 use daemon_common::{
     Budget, Epoch, PartitionId, ReqId, SessionId, SnapshotBlob, UnitId, UsageDelta,
@@ -38,6 +38,7 @@ use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::broadcast;
 
 /// The default ceiling on concurrently-attached children before `Delegate` escalates instead.
 const DEFAULT_MAX_CHILDREN: usize = 16;
@@ -70,6 +71,14 @@ struct FleetInner {
     /// top node fleet). `None` for a sub-fleet — its owning orchestrator's node is built one level
     /// up from that orchestrator's record, so the sub-fleet projects only its members.
     root_id: Option<UnitId>,
+    /// The host-owned fleet event bus (I4/I8), injected at assembly. On a real topology change (a
+    /// child spawn/terminal) or a folded child event, the runtime pushes a [`TreeEvent::Subagent`]
+    /// here so `tree_subscribe` forwards it live instead of polling. `None` => no live push (the
+    /// fleet still folds state; only the push side is dark).
+    event_sink: Option<broadcast::Sender<TreeEvent>>,
+    /// Monotonic sequence for the synthetic spawn/terminal `Subagent` markers the runtime emits onto
+    /// the bus (the per-child `ManageEvent` seq is the engine's; this counts the bus markers).
+    bus_seq: AtomicU64,
 }
 
 impl FleetInner {
@@ -87,6 +96,9 @@ impl FleetInner {
             child_id.clone(),
             ChildRecord::new(unit.clone(), spec.work.clone()),
         );
+        // A real topology change: push the spawn marker (with the post-insert active count) so a live
+        // `tree_subscribe` shows the new subagent row promptly, before any poll interval.
+        self.emit_subagent_marker(&child_id, SubagentPhase::Spawned);
 
         // Answer-authority for this child + lossless fan-in: install + subscribe before Assign.
         let handler: Arc<dyn ManageRequestHandler> = Arc::new(FleetRequestHandler {
@@ -145,7 +157,10 @@ impl FleetInner {
                 r.usage.add(delta);
             }
             if let Some(view) = project_event(ev) {
-                r.push_event(view);
+                r.push_event(view.clone());
+                // Forward the folded child event onto the fleet bus so a live `tree_subscribe`
+                // renders per-child progress without polling.
+                self.emit_subagent(view);
             }
         }
     }
@@ -155,6 +170,37 @@ impl FleetInner {
             r.status = status;
             r.outcome = Some(outcome.clone());
         }
+        // A real topology change: push the explicit terminal marker (with the post-transition active
+        // count) so subscribers update the subtree + "N running" badge.
+        self.emit_subagent_marker(id, SubagentPhase::Finished);
+    }
+
+    /// Push a raw [`ManageEventView`] onto the fleet bus, wrapped as a [`TreeEvent::Subagent`]. A
+    /// no-op when no bus is wired or there are no subscribers.
+    fn emit_subagent(&self, view: ManageEventView) {
+        if let Some(sink) = &self.event_sink {
+            let _ = sink.send(TreeEvent::Subagent(view));
+        }
+    }
+
+    /// Push a synthetic spawn/terminal `Subagent` topology marker (child id + role + phase + the
+    /// current active-child count) onto the fleet bus.
+    fn emit_subagent_marker(&self, child: &UnitId, phase: SubagentPhase) {
+        if self.event_sink.is_none() {
+            return;
+        }
+        let seq = self.bus_seq.fetch_add(1, Ordering::SeqCst);
+        // Engine children are the leaf sessions a GUI renders as subagent rows; the runtime treats
+        // them as `ManagedChild` (mirrors `project_unit`). The active count is the post-transition
+        // registered-child total.
+        let active_children = self.children.len() as u32;
+        self.emit_subagent(ManageEventView::Subagent {
+            seq,
+            child: child.clone(),
+            role: SessionRole::ManagedChild,
+            phase,
+            active_children,
+        });
     }
 
     /// Record the child as a real durable session, ending `Completed` (synthesis §4.1: the run tree
@@ -209,8 +255,20 @@ impl FleetRuntime {
                 max_children: DEFAULT_MAX_CHILDREN,
                 id_prefix: String::new(),
                 root_id: None,
+                event_sink: None,
+                bus_seq: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Inject the host-owned fleet event bus (I4/I8) so child spawn/terminal transitions and folded
+    /// child events push live [`TreeEvent::Subagent`] deltas to `tree_subscribe` subscribers. Call
+    /// during assembly, before the handle is shared.
+    pub fn with_event_sink(mut self, sink: broadcast::Sender<TreeEvent>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_event_sink before sharing")
+            .event_sink = Some(sink);
+        self
     }
 
     /// Cap the number of concurrently-attached children before `Delegate` escalates.

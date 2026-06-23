@@ -1413,6 +1413,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         routing,
         checkpoints,
         auth_factories,
+        workspace_root: Some(cfg.workspace_root.clone()),
     });
     // Load any durable chat→session routing pins (§5.9, I5) into the live registry so resolve-first
     // overrides survive restarts; rides the same hot-reload seam profile/auth changes use.

@@ -50,6 +50,29 @@ enum Command {
         /// The session id.
         id: String,
     },
+    /// Rename a session (set/clear its roster title).
+    Rename {
+        /// The session id.
+        id: String,
+        /// The new title (omit to clear it).
+        title: Option<String>,
+    },
+    /// Pin or unpin a session (pinned conversations sort first in the roster).
+    Pin {
+        /// The session id.
+        id: String,
+        /// Unpin instead of pin.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Archive or unarchive a session (archived conversations leave the default roster).
+    Archive {
+        /// The session id.
+        id: String,
+        /// Unarchive instead of archive.
+        #[arg(long)]
+        off: bool,
+    },
     /// The orchestration fleet roster + folded usage.
     Fleet,
     /// The orchestration tree the GUI/TUI drives (unit structure, state, work, usage).
@@ -583,6 +606,39 @@ async fn main() -> anyhow::Result<()> {
             client
                 .call(ApiRequest::Cancel {
                     session: SessionId::new(id),
+                })
+                .await?,
+        ),
+        Command::Rename { id, title } => render(
+            client
+                .call(ApiRequest::SessionUpdateMeta {
+                    session: SessionId::new(id),
+                    patch: daemon_api::SessionMetaPatch {
+                        title: Some(title),
+                        ..Default::default()
+                    },
+                })
+                .await?,
+        ),
+        Command::Pin { id, off } => render(
+            client
+                .call(ApiRequest::SessionUpdateMeta {
+                    session: SessionId::new(id),
+                    patch: daemon_api::SessionMetaPatch {
+                        pinned: Some(!off),
+                        ..Default::default()
+                    },
+                })
+                .await?,
+        ),
+        Command::Archive { id, off } => render(
+            client
+                .call(ApiRequest::SessionUpdateMeta {
+                    session: SessionId::new(id),
+                    patch: daemon_api::SessionMetaPatch {
+                        archived: Some(!off),
+                        ..Default::default()
+                    },
                 })
                 .await?,
         ),
@@ -1259,6 +1315,9 @@ fn render(resp: ApiResponse) {
             }
         }
         ApiResponse::Error(e) => println!("error: {e}"),
+        // Filesystem-surface responses (daemon-fs-surface-spec.md) and any other variant: the CLI
+        // has no first-class fs command yet, so render the debug form generically.
+        other => println!("{other:?}"),
     }
 }
 
