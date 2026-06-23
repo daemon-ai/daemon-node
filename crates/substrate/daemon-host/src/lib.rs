@@ -76,7 +76,7 @@ pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, 
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
 pub use journal::{journal_stream, JournalFeeder, JournalSink};
 pub use node_api::{
-    decode_overlay, encode_overlay, AccountProvisioning, CloudCatalog, DeliveryHost,
+    decode_overlay, encode_overlay, AccountProvisioning, AcpDiscovery, CloudCatalog, DeliveryHost,
     DurableProfileResolver, ModelProviderFactory, NodeApiImpl, ProvisionedAccount,
     SessionEngineBuilder,
 };
@@ -94,7 +94,7 @@ pub use supervisor::{
     SupervisorHandle, SupervisorObserver,
 };
 pub use transcript::{BlockCoalescer, JournalAction};
-pub use unit::EngineUnit;
+pub use unit::{EngineUnit, RewindHooks};
 
 use async_trait::async_trait;
 use daemon_activation::{ActivationManager, EngineFactory};

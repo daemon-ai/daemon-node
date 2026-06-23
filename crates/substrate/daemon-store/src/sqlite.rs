@@ -12,9 +12,10 @@
 //! transaction / before any post-commit fault fires, so a crash boundary leaves consistent state.
 
 use crate::{
-    Activation, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint, JobCommand, JobCompletion,
-    JournalEntry, JournalPage, JournalSeal, ParkedApproval, SessionMeta, SessionRole,
-    SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry, TraceSegment,
+    AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint,
+    JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval, SessionMeta,
+    SessionRole, SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry,
+    TraceSegment,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -58,6 +59,18 @@ CREATE TABLE IF NOT EXISTS job_outbox (
     epoch      INTEGER NOT NULL,
     payload    BLOB NOT NULL,
     lifetime   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS chat_routes (
+    key        TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    profile    TEXT,
+    descriptor BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS acp_catalog (
+    name  TEXT PRIMARY KEY,
+    entry BLOB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS enqueued_jobs (
@@ -1029,6 +1042,108 @@ impl SessionStore for SqliteStore {
         .optional()
         .ok()
         .flatten()
+    }
+
+    async fn routing_list(&self) -> Vec<ChatRoute> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT key, session_id, profile, descriptor FROM chat_routes ORDER BY key")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(ChatRoute {
+                key: row.get::<_, String>(0)?,
+                session_id: SessionId::new(row.get::<_, String>(1)?),
+                profile: row.get::<_, Option<String>>(2)?.map(ProfileRef::new),
+                descriptor: row.get::<_, Vec<u8>>(3)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn routing_get(&self, key: &str) -> Option<ChatRoute> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT key, session_id, profile, descriptor FROM chat_routes WHERE key = ?1",
+            params![key],
+            |row| {
+                Ok(ChatRoute {
+                    key: row.get::<_, String>(0)?,
+                    session_id: SessionId::new(row.get::<_, String>(1)?),
+                    profile: row.get::<_, Option<String>>(2)?.map(ProfileRef::new),
+                    descriptor: row.get::<_, Vec<u8>>(3)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    async fn routing_set(&self, route: ChatRoute) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let profile = route.profile.as_ref().map(|p| p.as_str());
+        conn.execute(
+            "INSERT INTO chat_routes (key, session_id, profile, descriptor) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(key) DO UPDATE SET session_id = ?2, profile = ?3, descriptor = ?4",
+            params![
+                route.key,
+                route.session_id.as_str(),
+                profile,
+                route.descriptor
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn routing_remove(&self, key: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM chat_routes WHERE key = ?1", params![key])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn acp_list(&self) -> Vec<AcpEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT name, entry FROM acp_catalog ORDER BY name") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(AcpEntry {
+                name: row.get::<_, String>(0)?,
+                entry: row.get::<_, Vec<u8>>(1)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn acp_set(&self, entry: AcpEntry) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO acp_catalog (name, entry) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET entry = ?2",
+            params![entry.name, entry.entry],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn acp_remove(&self, name: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM acp_catalog WHERE name = ?1", params![name])
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {

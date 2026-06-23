@@ -140,6 +140,36 @@ impl ChildLifetime {
     }
 }
 
+/// A durable chat→session routing pin (daemon-event-io-spec §5.9): binds a canonical inbound-origin
+/// `key` to an explicit `session_id` (+ optional `profile`), overriding the deterministic
+/// `session_id_for` derivation in the host's routing registry. The store stays protocol-free, so the
+/// full protocol descriptor (the `Origin` + isolation policy) rides through as the opaque
+/// host-encoded `descriptor` blob (the host round-trips it back to a GUI); `key`/`session_id`/
+/// `profile` are the typed columns the host indexes and builds the live pin map from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRoute {
+    /// The canonical origin key (host-computed; the primary key for upsert/lookup/delete).
+    pub key: String,
+    /// The session this origin is pinned to.
+    pub session_id: SessionId,
+    /// An explicit profile to run the pinned session under (`None` = fall through to the registry's
+    /// deterministic profile precedence).
+    pub profile: Option<ProfileRef>,
+    /// The opaque host descriptor (CBOR of the protocol `Origin` + isolation) for round-trip.
+    pub descriptor: Vec<u8>,
+}
+
+/// A durable manually-registered ACP agent catalog entry (I7): the operator-persisted half of the
+/// ACP discovery catalog (auto-discovered builtins are re-probed each scan and need no persistence).
+/// `entry` is the opaque host-encoded CBOR of the wire `AcpAgentEntry`; the store stays protocol-free.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpEntry {
+    /// The agent catalog key (display name; the primary key for upsert/lookup/delete).
+    pub name: String,
+    /// The opaque host descriptor (CBOR of the wire `AcpAgentEntry`).
+    pub entry: Vec<u8>,
+}
+
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCommand {
@@ -627,6 +657,43 @@ pub trait SessionStore: Send + Sync {
         None
     }
 
+    /// List every durable chat→session routing pin (§5.9). The host loads these into the live routing
+    /// registry's resolve-first pin map (via the hot-reload rebuild hook). Default: none (a store
+    /// without durable routing — pins are then in-memory only for the process lifetime).
+    async fn routing_list(&self) -> Vec<ChatRoute> {
+        Vec::new()
+    }
+
+    /// Read one routing pin by its canonical key (`None` if unpinned). Default: `None`.
+    async fn routing_get(&self, _key: &str) -> Option<ChatRoute> {
+        None
+    }
+
+    /// Upsert a chat→session routing pin (keyed by [`ChatRoute::key`]). Default: no-op.
+    async fn routing_set(&self, _route: ChatRoute) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a routing pin by key (idempotent). Default: no-op.
+    async fn routing_remove(&self, _key: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// List the durable manually-registered ACP agent catalog entries (I7). Default: none.
+    async fn acp_list(&self) -> Vec<AcpEntry> {
+        Vec::new()
+    }
+
+    /// Upsert a manually-registered ACP catalog entry (keyed by [`AcpEntry::name`]). Default: no-op.
+    async fn acp_set(&self, _entry: AcpEntry) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a manually-registered ACP catalog entry by name (idempotent). Default: no-op.
+    async fn acp_remove(&self, _name: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List every durable session id with its current status (the node control surface's
     /// `sessions` projection). Defaults to empty so a non-authoritative store (the brokered child
     /// proxy) need not implement it; an authoritative backend overrides it.
@@ -746,6 +813,12 @@ struct Inner {
     /// Per-session host-level metadata: bound profile + opaque overlay blob (the in-memory analogue
     /// of the SQLite `session_meta` table).
     session_meta: HashMap<SessionId, SessionMeta>,
+    /// Durable chat→session routing pins, keyed by canonical origin key (§5.9; the in-memory analogue
+    /// of the SQLite `chat_routes` table).
+    chat_routes: HashMap<String, ChatRoute>,
+    /// Durable manually-registered ACP catalog entries, keyed by name (I7; the in-memory analogue of
+    /// the SQLite `acp_catalog` table).
+    acp_catalog: HashMap<String, AcpEntry>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
     journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
@@ -1187,6 +1260,46 @@ impl SessionStore for InMemoryStore {
 
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         self.inner.lock().unwrap().session_meta.get(id).cloned()
+    }
+
+    async fn routing_list(&self) -> Vec<ChatRoute> {
+        self.inner.lock().unwrap().chat_routes.values().cloned().collect()
+    }
+
+    async fn routing_get(&self, key: &str) -> Option<ChatRoute> {
+        self.inner.lock().unwrap().chat_routes.get(key).cloned()
+    }
+
+    async fn routing_set(&self, route: ChatRoute) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .chat_routes
+            .insert(route.key.clone(), route);
+        Ok(())
+    }
+
+    async fn routing_remove(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().chat_routes.remove(key);
+        Ok(())
+    }
+
+    async fn acp_list(&self) -> Vec<AcpEntry> {
+        self.inner.lock().unwrap().acp_catalog.values().cloned().collect()
+    }
+
+    async fn acp_set(&self, entry: AcpEntry) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .acp_catalog
+            .insert(entry.name.clone(), entry);
+        Ok(())
+    }
+
+    async fn acp_remove(&self, name: &str) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().acp_catalog.remove(name);
+        Ok(())
     }
 
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {

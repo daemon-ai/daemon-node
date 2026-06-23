@@ -97,6 +97,205 @@ impl AcpLaunch {
     }
 }
 
+/// The verified outcome of an ACP `initialize` handshake against a candidate binary (I7 discovery):
+/// the agent answered `initialize`, so it *is* an ACP agent, and reported this protocol version +
+/// capabilities. Captured by [`probe`] from the `InitializeResponse` the live [`drive`] path
+/// otherwise discards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpProbe {
+    /// The protocol version the agent reported (rendered).
+    pub protocol_version: String,
+    /// The agent capabilities advertised at `initialize`, flattened to opaque key/value pairs.
+    pub capabilities: Vec<(String, String)>,
+}
+
+/// The discovery/probe timeout: a candidate that does not complete the ACP `initialize` handshake
+/// within this window is treated as "not an ACP agent" (no hang on a mis-curated binary).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Probe a candidate by spawning it and attempting the ACP `initialize` handshake, capturing the
+/// `InitializeResponse` (the "is this an ACP agent?" confirmation + its metadata). Returns `None` if
+/// the binary fails to spawn, does not speak ACP, or exceeds [`PROBE_TIMEOUT`]. This is the half of
+/// the connection [`drive`] discards — surfaced standalone for catalog discovery.
+pub async fn probe(launch: AcpLaunch) -> Option<AcpProbe> {
+    let (agent, _cwd) = launch.into_agent();
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let sink = captured.clone();
+    let run = Client
+        .builder()
+        .name("daemon-acp-probe")
+        .connect_with(agent, move |cx: ConnectionTo<Agent>| {
+            let sink = sink.clone();
+            async move {
+                let resp = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                // Serialize the whole response generically so we need not track the exact schema:
+                // pull the protocol version + flatten capabilities into opaque key/value pairs.
+                if let Ok(value) = serde_json::to_value(&resp) {
+                    *sink.lock().unwrap() = Some(value);
+                }
+                Ok(())
+            }
+        });
+    match tokio::time::timeout(PROBE_TIMEOUT, run).await {
+        Ok(Ok(())) => {}
+        // A connection error (failed spawn / not ACP) or a timeout: not a confirmed ACP agent.
+        _ => return None,
+    }
+    let value = captured.lock().unwrap().take()?;
+    Some(AcpProbe {
+        protocol_version: extract_protocol_version(&value),
+        capabilities: flatten_capabilities(&value),
+    })
+}
+
+/// Best-effort protocol-version extraction from a serialized `InitializeResponse` (camelCase or
+/// snake_case key), rendered to a string.
+fn extract_protocol_version(value: &serde_json::Value) -> String {
+    for key in ["protocolVersion", "protocol_version"] {
+        if let Some(v) = value.get(key) {
+            return match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+        }
+    }
+    String::new()
+}
+
+/// Flatten the `agentCapabilities` object of a serialized `InitializeResponse` into opaque key/value
+/// pairs (one level deep). Schema-agnostic so a capabilities-shape change does not break discovery.
+fn flatten_capabilities(value: &serde_json::Value) -> Vec<(String, String)> {
+    let caps = value
+        .get("agentCapabilities")
+        .or_else(|| value.get("agent_capabilities"));
+    let Some(serde_json::Value::Object(map)) = caps else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, v) in map {
+        match v {
+            serde_json::Value::Object(inner) => {
+                for (ik, iv) in inner {
+                    out.push((format!("{k}.{ik}"), scalar_string(iv)));
+                }
+            }
+            other => out.push((k.clone(), scalar_string(other))),
+        }
+    }
+    out
+}
+
+fn scalar_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve a program name on `$PATH` (or as a direct path), returning the resolved path when found.
+/// The "is it installed?" half of discovery, independent of whether it actually speaks ACP.
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(program);
+    if p.is_absolute() || program.contains('/') {
+        return p.exists().then(|| p.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The curated direct-binary ACP recipe table (I7): `(name, program, acp-mode args)`. Only
+/// **direct-binary** agents that speak ACP on stdio are auto-detected here; adapter-wrapped agents
+/// (Claude-via-Zed, Bub, Pi, Codex-via-Zed) and IDE-embedded agents (Cursor, Copilot, Junie) stay
+/// manual-register entries (`source = Manual`). The ACP-mode invocation flags are best-effort; a
+/// mis-curated flag simply means the `initialize` probe does not confirm (the binary still shows as
+/// installed-on-PATH, just unverified).
+const CURATED: &[(&str, &str, &[&str])] = &[
+    ("gemini", "gemini", &["--experimental-acp"]),
+    ("qwen", "qwen", &["--experimental-acp"]),
+    ("goose", "goose", &["acp"]),
+    ("opencode", "opencode", &[]),
+    ("codex", "codex", &["acp"]),
+    ("kimi", "kimi", &[]),
+    ("crow-cli", "crow-cli", &[]),
+    ("cursor-agent", "cursor-agent", &[]),
+];
+
+/// The server-side ACP discoverer (I7): probes the curated direct-binary recipe table on `$PATH` via
+/// the ACP `initialize` handshake. Implements [`daemon_host::AcpDiscovery`] so the host's
+/// `acp_discover` / `acp_register` ops can confirm + enrich entries without `daemon-host` linking the
+/// ACP runtime (which would be a dependency cycle — `daemon-acp` depends on `daemon-host`).
+#[derive(Clone, Debug, Default)]
+pub struct AcpDiscoverer;
+
+impl AcpDiscoverer {
+    /// A fresh discoverer over the curated recipe table.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+/// Build an [`AcpLaunch`] from a wire [`daemon_api::AcpRecipe`]'s program + args + env (stdio agents
+/// only; an endpoint recipe has no local binary to spawn).
+fn launch_from_recipe(recipe: &daemon_api::AcpRecipe) -> Option<AcpLaunch> {
+    let program = recipe.program.as_ref()?;
+    Some(
+        AcpLaunch::new(program.clone())
+            .args(recipe.args.clone())
+            .env(recipe.env.clone()),
+    )
+}
+
+#[async_trait]
+impl daemon_host::AcpDiscovery for AcpDiscoverer {
+    async fn discover(&self) -> Vec<daemon_api::AcpAgentEntry> {
+        let mut out = Vec::with_capacity(CURATED.len());
+        for (name, program, args) in CURATED {
+            let installed = which(program).is_some();
+            let recipe = daemon_api::AcpRecipe {
+                program: Some((*program).to_string()),
+                args: args.iter().map(|s| (*s).to_string()).collect(),
+                env: Vec::new(),
+                endpoint: None,
+            };
+            let mut entry = daemon_api::AcpAgentEntry {
+                name: (*name).to_string(),
+                recipe,
+                source: daemon_api::AcpSource::Builtin,
+                installed,
+                version: None,
+                capabilities: Vec::new(),
+            };
+            // Confirm it really speaks ACP (and capture metadata) only when the binary is present.
+            if installed {
+                if let Some(launch) = launch_from_recipe(&entry.recipe) {
+                    if let Some(p) = probe(launch).await {
+                        entry.version = Some(p.protocol_version);
+                        entry.capabilities = p.capabilities;
+                    }
+                }
+            }
+            out.push(entry);
+        }
+        out
+    }
+
+    async fn probe(&self, mut entry: daemon_api::AcpAgentEntry) -> daemon_api::AcpAgentEntry {
+        if let Some(launch) = launch_from_recipe(&entry.recipe) {
+            entry.installed = which(entry.recipe.program.as_deref().unwrap_or("")).is_some();
+            if let Some(p) = probe(launch).await {
+                entry.version = Some(p.protocol_version);
+                entry.capabilities = p.capabilities;
+            }
+        }
+        entry
+    }
+}
+
 /// A §17 session over a foreign ACP agent. Construct via [`acp_unit`] to present it as a managed
 /// engine unit; the connection runs on a dedicated task and is fed commands through an mpsc queue.
 pub struct AcpSession {

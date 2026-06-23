@@ -64,6 +64,9 @@ struct CursorQuery {
 /// - `GET /sessions/{session}/log` — non-destructive cursor page of the merged log.
 /// - `GET /sessions/{session}/subscribe` — Server-Sent Events stream of the merged log.
 /// - `GET /sessions/{session}/ws` — WebSocket stream of the merged log.
+/// - `GET /tree/subscribe` — Server-Sent Events stream of orchestration-tree events
+///   ([`daemon_api::TreeEvent`]), churn-filtered by `?include_ephemeral=&coalesce_ms=`.
+/// - `GET /logs` — Server-Sent Events stream of node log lines, filtered by `?min_level=&target=`.
 /// - `POST /tenants/{tenant}/submit` — a routed submit: the adapter maps the path tenant onto an
 ///   `Origin` (`transport: http/{tenant}`, `scope: Api{ key: tenant }`) and lets the host's §5.9
 ///   routing registry pick the session + profile + delivery. Demonstrates an external transport
@@ -236,6 +239,84 @@ async fn open_log(state: &AppState, session: String, after_seq: u64) -> LogStrea
     state
         .api
         .subscribe(SessionId::new(session), after_seq)
+        .await
+        .unwrap_or_else(|_| futures::stream::empty().boxed())
+}
+
+/// Query params for the tree-subscribe push stream (`?include_ephemeral=bool&coalesce_ms=N`). Both
+/// optional; absent → the [`TreeSubFilter`] defaults (deliver every change, include ephemerals).
+#[derive(Debug, Default, Deserialize)]
+struct TreeSubQuery {
+    #[serde(default)]
+    include_ephemeral: Option<bool>,
+    #[serde(default)]
+    coalesce_ms: Option<u64>,
+}
+
+/// `GET /tree/subscribe` — a Server-Sent Events stream of [`daemon_api::TreeEvent`]s over the
+/// orchestration tree, churn-filtered by the query params. Mirrors [`subscribe_sse`]: the push
+/// delivery a streaming transport holds open (one-shot transports poll the wire `Tree` op instead).
+async fn tree_subscribe_sse(
+    State(state): State<AppState>,
+    Query(q): Query<TreeSubQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let filter = TreeSubFilter {
+        include_ephemeral: q.include_ephemeral.unwrap_or(true),
+        coalesce_ms: q.coalesce_ms,
+    };
+    let stream = open_tree(&state, filter).await;
+    let events = stream.map(|event| {
+        let event = Event::default()
+            .json_data(&event)
+            .unwrap_or_else(|_| Event::default().data("serialize error"));
+        Ok::<_, Infallible>(event)
+    });
+    Sse::new(events).keep_alive(KeepAlive::default())
+}
+
+/// Open the tree push stream, degrading to an empty stream when the node exposes no live tree.
+async fn open_tree(state: &AppState, filter: TreeSubFilter) -> TreeStream {
+    state
+        .api
+        .tree_subscribe(filter)
+        .await
+        .unwrap_or_else(|_| futures::stream::empty().boxed())
+}
+
+/// Query params for the node log-tail stream (`?min_level=info&target=substr`). Both optional.
+#[derive(Debug, Default, Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    min_level: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// `GET /logs` — a Server-Sent Events stream of node [`daemon_api::LogLine`]s (resident-service /
+/// dashboard view), filtered by the query params. Mirrors [`subscribe_sse`].
+async fn logs_sse(
+    State(state): State<AppState>,
+    Query(q): Query<LogQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let filter = LogFilter {
+        min_level: q.min_level,
+        target: q.target,
+    };
+    let stream = open_logs(&state, filter).await;
+    let events = stream.map(|line| {
+        let event = Event::default()
+            .json_data(&line)
+            .unwrap_or_else(|_| Event::default().data("serialize error"));
+        Ok::<_, Infallible>(event)
+    });
+    Sse::new(events).keep_alive(KeepAlive::default())
+}
+
+/// Open the node log-tail push stream, degrading to an empty stream when the node exposes no tail.
+async fn open_logs(state: &AppState, filter: LogFilter) -> LogLineStream {
+    state
+        .api
+        .logs(filter)
         .await
         .unwrap_or_else(|_| futures::stream::empty().boxed())
 }

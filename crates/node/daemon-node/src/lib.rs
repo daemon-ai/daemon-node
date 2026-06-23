@@ -600,8 +600,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // durable Core delegation path no longer uses this — it materializes children as durable
     // sessions through the shared activation manager (see `FleetJobWorker`) — so this spawner is
     // retained only for the foreign/ephemeral coarse lifecycle and the live management escalation.
-    let spawner: Arc<dyn ChildSpawner> =
-        Arc::new(ProfileChildSpawner::core(child_profile).with_journal(journal.clone()));
+    let spawner: Arc<dyn ChildSpawner> = Arc::new(
+        ProfileChildSpawner::core(child_profile)
+            .with_journal(journal.clone())
+            .with_rewind(a.store.clone(), a.checkpoints.clone()),
+    );
     let fleet = FleetRuntime::new(
         a.store.clone(),
         a.partition,
@@ -807,6 +810,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {
         node_api = node_api.with_cloud_catalog(cloud_catalog);
     }
+    // Wire the server-side ACP discovery hook (I7): the host's `acp_discover` op probes the curated
+    // direct-binary recipe table via the ACP `initialize` handshake. The host cannot link the ACP
+    // runtime directly (`daemon-acp` depends on `daemon-host`), so the discoverer is injected here.
+    node_api = node_api.with_acp_discovery(Arc::new(daemon_acp::AcpDiscoverer::new()));
     // Bind the live model-switch factory when this node resolves per-session profiles: a
     // `SetSessionModel` rebuilds a running session's provider for the new model id from the
     // (model-overridden) profile bundle via the same provider resolver.
@@ -883,6 +890,11 @@ pub struct ProfileChildSpawner {
     /// The verifiable-journal store + signer; when set, each spawned child journals its transcript
     /// (finished blocks + lifecycle) sealed per turn into the shared store, keyed by its `UnitId`.
     journal: Option<JournalConfig>,
+    /// The durable session store + §12 checkpoint store, threaded into a `Core` child's managed
+    /// engine so a conversation rewind on it applies the same journal seal + workspace rollback the
+    /// live-session path applies (conversation-rewind spec §6). `None` keeps the engine-only truncate.
+    rewind_store: Option<Arc<dyn daemon_store::SessionStore>>,
+    rewind_checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
 }
 
 impl ProfileChildSpawner {
@@ -892,6 +904,8 @@ impl ProfileChildSpawner {
             backend: AgentBackend::Core(profile),
             provisioner: Arc::new(ProcessProvisioner::new()),
             journal: None,
+            rewind_store: None,
+            rewind_checkpoints: None,
         }
     }
 
@@ -901,7 +915,21 @@ impl ProfileChildSpawner {
             backend: AgentBackend::Foreign(launch),
             provisioner: Arc::new(ProcessProvisioner::new()),
             journal: None,
+            rewind_store: None,
+            rewind_checkpoints: None,
         }
+    }
+
+    /// Thread the durable seal + workspace-rollback handles into the spawned `Core` children so a
+    /// conversation rewind on a managed engine matches the live path (conversation-rewind spec §6).
+    pub fn with_rewind(
+        mut self,
+        store: Arc<dyn daemon_store::SessionStore>,
+        checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
+    ) -> Self {
+        self.rewind_store = Some(store);
+        self.rewind_checkpoints = checkpoints;
+        self
     }
 
     /// Journal every spawned child into the unified verifiable journal (keyed by `UnitId`).
@@ -929,8 +957,17 @@ impl ChildSpawner for ProfileChildSpawner {
         let feeder = self.feeder(&id);
         match &self.backend {
             AgentBackend::Core(profile) => {
-                let engine = profile.fresh(SessionId::new(id.as_str()));
-                Arc::new(EngineUnit::spawn_journaled(id, engine, feeder))
+                let session = SessionId::new(id.as_str());
+                let engine = profile.fresh(session.clone());
+                // Thread the durable seal/rollback handles into the managed engine so a rewind on it
+                // matches the live path (the §17⇄management seam fix); `None` store => engine-only.
+                let rewind = self.rewind_store.clone().map(|store| daemon_host::RewindHooks {
+                    store,
+                    checkpoints: self.rewind_checkpoints.clone(),
+                    journaled: feeder.is_some(),
+                    session,
+                });
+                Arc::new(EngineUnit::spawn_rewindable(id, engine, feeder, rewind))
             }
             AgentBackend::Foreign(launch) => {
                 let session = SessionId::new(id.as_str());

@@ -2034,6 +2034,289 @@ mod node_interface {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Roster correctness (Phase-2 A1 regression): a durable delegation child is stamped
+    /// `role = ManagedChild`/`parent` at the delegation seam, so the `TopLevel` inbox scope excludes
+    /// it (it is reached only by walking `tree()`), while the `All` scope still surfaces it. The
+    /// scoped roster is byte-identical in-process and over the socket (live+durable parity).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roster_top_level_excludes_managed_children_across_transports() {
+        use daemon_api::{SessionQuery, SessionRole, SessionScope};
+
+        let (node, handle) = assemble();
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+
+        // Drive one delegation so the durable graph has a parent + a managed child.
+        let session = SessionId::new("roster-op");
+        assert!(matches!(
+            client
+                .call(ApiRequest::Assign {
+                    session: session.clone()
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let ApiResponse::Sessions(list) = client.call(ApiRequest::Sessions).await.unwrap() {
+                if list
+                    .iter()
+                    .any(|i| i.session == session && i.state == SessionState::Completed)
+                {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "the assigned session never completed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The managed child id, sourced from the tree projection (the GUI's drill-down).
+        let tree = node.tree().await;
+        let child = tree
+            .nodes
+            .iter()
+            .find(|n| n.kind == daemon_api::UnitKind::Engine)
+            .and_then(|n| n.session.clone())
+            .expect("a managed child session is present in the tree");
+        assert_ne!(child, session, "the child is a distinct session from the parent");
+
+        // The child carries role ManagedChild + parent in the roster (the A1 stamp).
+        let all = node
+            .sessions_query(SessionQuery {
+                scope: SessionScope::All,
+                ..Default::default()
+            })
+            .await;
+        let child_line = all
+            .sessions
+            .iter()
+            .find(|i| i.session == child)
+            .expect("the child appears in the All scope");
+        assert_eq!(
+            child_line.role,
+            SessionRole::ManagedChild,
+            "the durable delegation child must be stamped ManagedChild (A1)"
+        );
+        assert_eq!(
+            child_line.parent.as_ref(),
+            Some(&session),
+            "the child must record its delegating parent"
+        );
+
+        // TopLevel (the inbox) excludes the managed child; the parent stays.
+        let top = node
+            .sessions_query(SessionQuery::default())
+            .await
+            .sessions;
+        assert!(
+            top.iter().all(|i| i.role == SessionRole::Primary),
+            "TopLevel must contain only Primary conversations"
+        );
+        assert!(
+            !top.iter().any(|i| i.session == child),
+            "the managed child must NOT leak into the TopLevel inbox (A1 regression)"
+        );
+
+        // Transport parity: the scoped roster agrees in-process and over the socket.
+        let socket_top = match client
+            .call(ApiRequest::SessionsQuery {
+                query: SessionQuery::default(),
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::SessionPage(page) => page.sessions,
+            other => panic!("expected SessionPage, got {other:?}"),
+        };
+        assert_eq!(top, socket_top, "TopLevel roster must agree across transports");
+
+        server.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The scoped roster's cursor pagination is *total*: walking `All` one bounded page at a time
+    /// visits every session exactly once and terminates (no gaps, no repeats, `next_cursor == None`
+    /// on the last page). The order is stable (most-recent-first, id tie-break) so the cursor is
+    /// well-defined even when activity timestamps collide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roster_pagination_cursor_is_total() {
+        use daemon_api::{SessionApi, SessionQuery, SessionScope};
+        use daemon_protocol::{AgentCommand, UserMsg};
+
+        let (node, handle) = assemble();
+
+        // Several live top-level sessions.
+        let ids: Vec<SessionId> = (0..5).map(|n| SessionId::new(format!("page-{n}"))).collect();
+        for id in &ids {
+            node.submit(
+                id.clone(),
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: daemon_common::ReqId(1),
+                },
+            )
+            .await
+            .expect("submit opens a live session");
+        }
+
+        // The full unpaged view (the ground truth).
+        let full: Vec<SessionId> = node
+            .sessions_query(SessionQuery {
+                scope: SessionScope::All,
+                ..Default::default()
+            })
+            .await
+            .sessions
+            .into_iter()
+            .map(|i| i.session)
+            .collect();
+        assert!(
+            ids.iter().all(|id| full.contains(id)),
+            "every live session is in the All roster, got {full:?}"
+        );
+
+        // Walk it one page of two at a time, accumulating ids.
+        let mut seen: Vec<SessionId> = Vec::new();
+        let mut after: Option<SessionId> = None;
+        let mut pages = 0;
+        loop {
+            let page = node
+                .sessions_query(SessionQuery {
+                    scope: SessionScope::All,
+                    after: after.clone(),
+                    limit: 2,
+                })
+                .await;
+            for info in &page.sessions {
+                assert!(
+                    !seen.contains(&info.session),
+                    "a session must not appear on two pages: {}",
+                    info.session
+                );
+                seen.push(info.session.clone());
+            }
+            pages += 1;
+            assert!(pages <= 16, "pagination must terminate");
+            match page.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, full,
+            "paginated traversal must visit exactly the unpaged set, in the same order"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// `sessions_by_profile` groups the `Primary` roster by bound profile (the per-agent view). A
+    /// session opened "as agent X" (sticky profile bind on first open) lands under that profile's
+    /// group; a managed child never appears (it is not `Primary`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roster_sessions_by_profile_groups_primary_sessions() {
+        use daemon_api::SessionApi;
+        use daemon_common::ProfileRef;
+        use daemon_protocol::{AgentCommand, UserMsg};
+
+        let (node, handle) = assemble();
+        let profile = ProfileRef::new("openai");
+
+        let ids: Vec<SessionId> = (0..2).map(|n| SessionId::new(format!("byprof-{n}"))).collect();
+        for id in &ids {
+            node.submit_as(
+                id.clone(),
+                None,
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: daemon_common::ReqId(1),
+                },
+                Some(profile.clone()),
+            )
+            .await
+            .expect("submit_as binds the profile and opens the session");
+        }
+
+        let grouped = node.sessions_by_profile().await;
+        let group = grouped
+            .iter()
+            .find(|(p, _)| p == &profile)
+            .map(|(_, s)| s)
+            .expect("a group for the bound profile");
+        for id in &ids {
+            assert!(
+                group.iter().any(|i| &i.session == id),
+                "session {id} must appear under its bound profile"
+            );
+        }
+
+        handle.shutdown().await;
+    }
+
+    /// Routing-pin resolution (Phase-2 B1): a durable chat→session pin is consulted *first* in
+    /// `resolve()`, so a routed submit lands on the pinned session id (overriding the deterministic
+    /// naming). The pin round-trips through `routing_get`, surfaces as a `transport_rooms` room, and
+    /// `routing_unbind_chat` clears it — all without a restart (the hot-reload seam).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_pin_resolves_to_bound_session() {
+        use daemon_api::SessionApi;
+        use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId, UserMsg};
+
+        let (node, handle) = assemble();
+        let origin = Origin::new("telegram", OriginScope::Dm { user: "alice".into() });
+        let pinned = SessionId::new("pinned-chat");
+
+        node.routing_bind_chat(origin.clone(), pinned.clone(), None)
+            .await
+            .expect("bind a chat→session pin");
+
+        // The pin round-trips through the durable store.
+        let got = node
+            .routing_get(origin.clone())
+            .await
+            .expect("a pinned route");
+        assert_eq!(got.session, pinned, "routing_get returns the pinned session");
+
+        // Resolve-first: a routed submit lands on the pinned session id.
+        let resolved = node
+            .submit_routed(
+                origin.clone(),
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: daemon_common::ReqId(1),
+                },
+            )
+            .await
+            .expect("routed submit resolves through the pin");
+        assert_eq!(
+            resolved, pinned,
+            "the pin must override the deterministic session naming"
+        );
+
+        // The pin surfaces as a room of its transport family.
+        let rooms = node.transport_rooms(TransportId::new("telegram")).await;
+        assert!(
+            rooms.iter().any(|r| r.session.as_ref() == Some(&pinned)),
+            "the pinned chat must enumerate as a transport room, got {rooms:?}"
+        );
+
+        // Unbind clears the pin (hot-reload): the origin falls back to deterministic naming.
+        node.routing_unbind_chat(origin.clone())
+            .await
+            .expect("unbind the pin");
+        assert!(
+            node.routing_get(origin.clone()).await.is_none(),
+            "the pin must be gone after unbind"
+        );
+
+        handle.shutdown().await;
+    }
+
     /// The recursive durable delegation tree (the GUI's real surface), re-sourced from the durable
     /// session graph: one delegation chain two levels deep — top -> orchestrator child -> leaf
     /// grandchild — projects a genuine multi-level tree where every node, including the *grandchild*,

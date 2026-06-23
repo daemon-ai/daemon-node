@@ -1223,6 +1223,41 @@ fn render(resp: ApiResponse) {
                 println!("  - started={} ok={}", r.started_unix, r.ok);
             }
         }
+        ApiResponse::ChatRoutes(routes) => {
+            println!("chat routes: {}", routes.len());
+            for r in routes {
+                let profile = r
+                    .profile
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "  - {}/{:?} -> {} profile={}",
+                    r.origin.transport.as_str(),
+                    r.origin.scope,
+                    r.session,
+                    profile
+                );
+            }
+        }
+        ApiResponse::ChatRoute(route) => match route {
+            Some(r) => println!(
+                "pin: {}/{:?} -> {}",
+                r.origin.transport.as_str(),
+                r.origin.scope,
+                r.session
+            ),
+            None => println!("pin: (none)"),
+        },
+        ApiResponse::Rooms(rooms) => {
+            println!("rooms: {}", rooms.len());
+            for r in rooms {
+                let session = r
+                    .session
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!("  - {} {} session={}", r.transport.as_str(), r.room, session);
+            }
+        }
         ApiResponse::Error(e) => println!("error: {e}"),
     }
 }

@@ -24,14 +24,15 @@ use crate::credstore::CredentialStore;
 use crate::profiles::ProfileStore;
 use crate::routing::RoutingRegistry;
 use daemon_api::{
-    ApiError, ApprovalInfo, ApprovalMode, AuthApi, AuthBeginRequest, AuthBeginResponse,
-    AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo, BoundAccount, ControlApi,
-    CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, HealthReport,
-    JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle, LogPageView,
-    LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi, ProfileInfo,
-    ProfileSpec, ProviderSelector, ServiceHealth, SessionApi, SessionDetail, SessionInfo,
-    SessionOverlay, SessionPage, SessionQuery, SessionRole, SessionScope, SessionSearchHit,
-    SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
+    from_cbor, to_cbor, AcpAgentEntry, AcpSource, ApiError, ApprovalInfo, ApprovalMode, AuthApi,
+    AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo,
+    BoundAccount, ChatRoute, ControlApi, CredentialApi, CredentialInfo, DeliverySink, Distribution,
+    FleetReport, HealthReport, JournalPageView, JournalRecord, JournalRecordPayload,
+    Lifecycle as ApiLifecycle,
+    LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
+    ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
+    SessionInfo, SessionOverlay, SessionPage, SessionQuery, SessionRole, SessionScope,
+    SessionSearchHit, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -42,8 +43,8 @@ use daemon_core::{spawn_agent_session, AgentHandle, Engine, Provider, Snapshot};
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestHandler,
-    HostRequestKind, HostResponse, HostResponseBody, Origin, OriginScope, SessionLogEntry,
-    SessionPayload, SinkKind, TranscriptBlock, TransportId,
+    HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin, OriginScope,
+    SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId,
 };
 use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -149,6 +150,20 @@ pub trait CloudCatalog: Send + Sync {
     async fn list(&self) -> Vec<ModelDescriptor>;
 }
 
+/// The ACP-discovery hook (I7). `daemon-host` does not link the ACP runtime (`daemon-acp` depends on
+/// *it*, not the reverse), so the actual `initialize`-handshake probing — the curated direct-binary
+/// recipe table + PATH probe — is injected by the assembling binary (which owns the ACP crate). When
+/// no hook is wired, `acp_discover` returns empty and only manual registrations are catalogued.
+#[async_trait]
+pub trait AcpDiscovery: Send + Sync {
+    /// Probe PATH + the curated direct-binary recipe table, confirming each candidate via the ACP
+    /// `initialize` handshake; return verified catalog entries (`source = Builtin`).
+    async fn discover(&self) -> Vec<daemon_api::AcpAgentEntry>;
+    /// Verify/enrich a single (manual) recipe by attempting the `initialize` handshake — fills in
+    /// `installed` / `version` / `capabilities`. Returns the entry unchanged on a failed probe.
+    async fn probe(&self, entry: daemon_api::AcpAgentEntry) -> daemon_api::AcpAgentEntry;
+}
+
 /// The node interface implemented over a running [`crate::Host`].
 #[derive(Clone)]
 pub struct NodeApiImpl {
@@ -210,12 +225,29 @@ pub struct NodeApiImpl {
     /// `submit_routed` clones the inner `Arc` under a brief read lock, so an in-flight resolve never
     /// blocks a swap.
     routing: Arc<std::sync::RwLock<Arc<RoutingRegistry>>>,
+    /// The pin-free *base* routing registry (the static [`NodeApiImpl::with_routing`] table, or empty
+    /// for the passthrough/builder cases). The live `routing` above is this base with the durable
+    /// chat→session pins (`chat_pins`) layered on by [`NodeApiImpl::rebuild_routing`]; keeping the
+    /// base separate lets a pin reload re-layer pins without losing the operator's binding table.
+    routing_base: Arc<std::sync::RwLock<Arc<RoutingRegistry>>>,
+    /// The resolve-first chat→session pins (§5.9, I5) loaded from the durable `chat_routes` store,
+    /// keyed by canonical origin key. Re-layered onto a freshly-built registry on every rebuild;
+    /// refreshed from the store by [`NodeApiImpl::load_routing_pins`] at boot and after a `routing_*`
+    /// mutation.
+    chat_pins: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::routing::ChatPin>>>,
     /// The optional rebuild hook that produces a fresh [`RoutingRegistry`] from current node state
     /// (profiles + bound accounts). Installed by the assembling binary (which owns the profile
     /// source); when set, it is re-run on `profile_update` / `auth_complete` to keep routing current.
     /// `None` => routing is static (an explicit [`NodeApiImpl::with_routing`] table or the empty
     /// passthrough).
     routing_builder: Option<RoutingBuilder>,
+    /// The ACP-discovery hook (I7), injected by the binary (which owns the ACP runtime). `None` =>
+    /// `acp_discover` yields nothing and the catalog is just the durable manual registrations.
+    acp: Option<Arc<dyn AcpDiscovery>>,
+    /// The last ACP discovery scan's results, cached in-memory so `acp_catalog` can surface them
+    /// alongside the durable manual entries without re-probing every read (discovery is the
+    /// operator-triggered, subprocess-spawning scan; manual entries are the persisted half).
+    last_acp: Arc<std::sync::RwLock<Vec<daemon_api::AcpAgentEntry>>>,
     /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
     /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
     checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,
@@ -267,7 +299,11 @@ impl NodeApiImpl {
             revisions: None,
             skills: None,
             routing: Arc::new(std::sync::RwLock::new(Arc::new(RoutingRegistry::new()))),
+            routing_base: Arc::new(std::sync::RwLock::new(Arc::new(RoutingRegistry::new()))),
+            chat_pins: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             routing_builder: None,
+            acp: None,
+            last_acp: Arc::new(std::sync::RwLock::new(Vec::new())),
             checkpoints: None,
             auth_flows: None,
         }
@@ -277,6 +313,7 @@ impl NodeApiImpl {
     /// inbound-routing capability). Call during assembly; absent, routed submits fall back to
     /// `PerThread` naming with the node's active default profile.
     pub fn with_routing(mut self, routing: RoutingRegistry) -> Self {
+        self.routing_base = Arc::new(std::sync::RwLock::new(Arc::new(routing.clone())));
         self.routing = Arc::new(std::sync::RwLock::new(Arc::new(routing)));
         self
     }
@@ -286,24 +323,49 @@ impl NodeApiImpl {
     /// re-run on every `profile_update` / `auth_complete`, so a profile/account change takes effect
     /// without a restart. The binary owns this closure because it owns the profile source.
     pub fn with_routing_builder(mut self, builder: RoutingBuilder) -> Self {
-        *self.routing.write().unwrap() = Arc::new(builder());
         self.routing_builder = Some(builder);
+        self.rebuild_routing();
         self
     }
 
-    /// Hot-swap the routing table (live). Used by the rebuild hook and available to the binary for an
-    /// explicit refresh; an in-flight `submit_routed` resolve (which clones the inner `Arc`) is
-    /// unaffected.
+    /// Hot-swap the *base* routing table (live). Used by the rebuild hook and available to the binary
+    /// for an explicit refresh; an in-flight `submit_routed` resolve (which clones the inner `Arc`) is
+    /// unaffected. The swap re-layers the current chat→session pins on top of the new base.
     pub fn swap_routing(&self, routing: RoutingRegistry) {
-        *self.routing.write().unwrap() = Arc::new(routing);
+        *self.routing_base.write().unwrap() = Arc::new(routing);
+        self.rebuild_routing();
     }
 
-    /// Re-run the routing rebuild hook (if installed) and swap in the fresh table. A no-op when no
-    /// builder is set (static routing). Called after profile/auth mutations so routing stays current.
+    /// Rebuild the live routing table: take the base (the rebuild hook's output when installed, else
+    /// the static `routing_base`), layer the durable chat→session pins on top, and swap it in. A
+    /// no-op-ish refresh when no builder is set, but always re-applies pins. Called after profile/auth
+    /// mutations and after a pin reload so routing stays current without a restart.
     fn rebuild_routing(&self) {
-        if let Some(builder) = &self.routing_builder {
-            self.swap_routing(builder());
+        let mut reg = match &self.routing_builder {
+            Some(builder) => builder(),
+            None => (**self.routing_base.read().unwrap()).clone(),
+        };
+        reg.set_pins(self.chat_pins.read().unwrap().clone());
+        *self.routing.write().unwrap() = Arc::new(reg);
+    }
+
+    /// Reload the durable chat→session routing pins (§5.9, I5) from the store into the in-memory pin
+    /// cache and re-layer them onto the live registry. Called at boot (by the assembling binary) and
+    /// after every `routing_*` mutation, riding the same hot-reload seam as profile/auth changes.
+    pub async fn load_routing_pins(&self) {
+        let routes = self.store.routing_list().await;
+        let mut map = std::collections::HashMap::with_capacity(routes.len());
+        for r in routes {
+            map.insert(
+                r.key.clone(),
+                crate::routing::ChatPin {
+                    session: r.session_id.clone(),
+                    profile: r.profile.clone(),
+                },
+            );
         }
+        *self.chat_pins.write().unwrap() = map;
+        self.rebuild_routing();
     }
 
     /// A snapshot of the current routing registry (clones the inner `Arc` under a brief read lock).
@@ -341,6 +403,13 @@ impl NodeApiImpl {
     /// `models()` lists cloud models for adapters that have a resolvable key. Call during assembly.
     pub fn with_cloud_catalog(mut self, cloud_catalog: Arc<dyn CloudCatalog>) -> Self {
         self.cloud_catalog = Some(cloud_catalog);
+        self
+    }
+
+    /// Attach the ACP-discovery hook (I7) so `acp_discover` probes the curated direct-binary recipe
+    /// table via the ACP `initialize` handshake. Injected by the binary (which owns `daemon-acp`).
+    pub fn with_acp_discovery(mut self, acp: Arc<dyn AcpDiscovery>) -> Self {
+        self.acp = Some(acp);
         self
     }
 
@@ -788,6 +857,42 @@ fn map_role(role: Option<StoreRole>) -> SessionRole {
     }
 }
 
+/// Encode a wire [`ChatRoute`] into the protocol-free store row (§5.9, I5): the canonical origin key
+/// + typed `session`/`profile` columns, with the full wire descriptor (origin + isolation) carried
+/// as the opaque CBOR `descriptor` blob for faithful round-trip.
+fn store_route_from_wire(route: &ChatRoute) -> daemon_store::ChatRoute {
+    daemon_store::ChatRoute {
+        key: crate::routing::origin_pin_key(&route.origin),
+        session_id: route.session.clone(),
+        profile: route.profile.clone(),
+        descriptor: to_cbor(route),
+    }
+}
+
+/// Decode a store row back to the wire [`ChatRoute`] from its opaque descriptor blob (`None` if the
+/// blob fails to decode — a forward-compat/corruption guard).
+fn wire_route_from_store(route: &daemon_store::ChatRoute) -> Option<ChatRoute> {
+    from_cbor(&route.descriptor).ok()
+}
+
+/// Whether a stored route's transport instance belongs to the requested transport: an exact instance
+/// match, or a family match (the requested id is the `family` segment before the first `/`). Lets
+/// `transport_rooms("matrix")` enumerate rooms across every `matrix/@account` instance.
+fn transport_family_matches(have: &TransportId, want: &TransportId) -> bool {
+    have == want || have.as_str().split('/').next() == Some(want.as_str())
+}
+
+/// A human room/chat label for [`RoomInfo`], derived from an origin scope.
+fn room_label(scope: &OriginScope) -> String {
+    match scope {
+        OriginScope::Dm { user } => user.clone(),
+        OriginScope::Group { chat, .. } => chat.clone(),
+        OriginScope::Api { key } => key.clone(),
+        OriginScope::Internal => "internal".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Unix-millis now (roster `last_activity_ms` stamp).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1128,6 +1233,133 @@ impl ControlApi for NodeApiImpl {
         Ok(stream.boxed())
     }
 
+    async fn routing_list_chats(&self) -> Vec<ChatRoute> {
+        self.store
+            .routing_list()
+            .await
+            .iter()
+            .filter_map(wire_route_from_store)
+            .collect()
+    }
+
+    async fn routing_get(&self, origin: Origin) -> Option<ChatRoute> {
+        let key = crate::routing::origin_pin_key(&origin);
+        self.store
+            .routing_get(&key)
+            .await
+            .as_ref()
+            .and_then(wire_route_from_store)
+    }
+
+    async fn routing_set(&self, route: ChatRoute) -> Result<(), ApiError> {
+        self.store
+            .routing_set(store_route_from_wire(&route))
+            .await
+            .map_err(|e| ApiError::Other(format!("routing set: {e}")))?;
+        // Ride the §5.9 hot-reload seam: reload pins into the live registry so the new pin resolves
+        // immediately (resolve-first), without a restart.
+        self.load_routing_pins().await;
+        Ok(())
+    }
+
+    async fn routing_bind_chat(
+        &self,
+        origin: Origin,
+        session: SessionId,
+        profile: Option<ProfileRef>,
+    ) -> Result<(), ApiError> {
+        // The convenience form: a pin with the registry's default (`PerThread`) naming — the pinned
+        // session id is authoritative, so the recorded isolation is informational.
+        self.routing_set(ChatRoute {
+            origin,
+            session,
+            profile,
+            isolation: IsolationPolicy::PerThread,
+        })
+        .await
+    }
+
+    async fn routing_unbind_chat(&self, origin: Origin) -> Result<(), ApiError> {
+        let key = crate::routing::origin_pin_key(&origin);
+        self.store
+            .routing_remove(&key)
+            .await
+            .map_err(|e| ApiError::Other(format!("routing unbind: {e}")))?;
+        self.load_routing_pins().await;
+        Ok(())
+    }
+
+    async fn transport_rooms(&self, transport: TransportId) -> Vec<RoomInfo> {
+        // Read-only enumeration backed by the durable routing pins: the rooms this transport instance
+        // (or family) has a pin for, each carrying its pinned session. A live adapter-backed room
+        // listing (e.g. Matrix joined rooms) can layer on later behind the same shape.
+        self.store
+            .routing_list()
+            .await
+            .iter()
+            .filter_map(wire_route_from_store)
+            .filter(|r| transport_family_matches(&r.origin.transport, &transport))
+            .map(|r| RoomInfo {
+                transport: r.origin.transport.clone(),
+                room: room_label(&r.origin.scope),
+                name: None,
+                session: Some(r.session.clone()),
+            })
+            .collect()
+    }
+
+    async fn acp_discover(&self) -> Vec<AcpAgentEntry> {
+        // Probe the curated direct-binary recipe table via the injected ACP hook (the binary owns the
+        // ACP runtime). Cache the results so `acp_catalog` surfaces them without re-probing, then
+        // return the merged catalog (discovery results + durable manual registrations).
+        if let Some(acp) = &self.acp {
+            let discovered = acp.discover().await;
+            *self.last_acp.write().unwrap() = discovered;
+        }
+        self.acp_catalog().await
+    }
+
+    async fn acp_catalog(&self) -> Vec<AcpAgentEntry> {
+        // The durable manual registrations (source = Manual) take precedence over a builtin of the
+        // same name; the in-memory last-discovery results fill in the auto-detected builtins.
+        let mut by_name: std::collections::BTreeMap<String, AcpAgentEntry> =
+            std::collections::BTreeMap::new();
+        for entry in self.last_acp.read().unwrap().iter() {
+            by_name.insert(entry.name.clone(), entry.clone());
+        }
+        for stored in self.store.acp_list().await {
+            if let Ok(entry) = from_cbor::<AcpAgentEntry>(&stored.entry) {
+                by_name.insert(entry.name.clone(), entry);
+            }
+        }
+        by_name.into_values().collect()
+    }
+
+    async fn acp_register(&self, mut entry: AcpAgentEntry) -> Result<(), ApiError> {
+        // A manual registration: force `source = Manual`, then verify/enrich it via the ACP
+        // `initialize` handshake when a discovery hook is wired (fills installed/version/caps).
+        entry.source = AcpSource::Manual;
+        if let Some(acp) = &self.acp {
+            entry = acp.probe(entry).await;
+            entry.source = AcpSource::Manual;
+        }
+        self.store
+            .acp_set(daemon_store::AcpEntry {
+                name: entry.name.clone(),
+                entry: to_cbor(&entry),
+            })
+            .await
+            .map_err(|e| ApiError::Other(format!("acp register: {e}")))
+    }
+
+    async fn acp_remove(&self, name: String) -> Result<(), ApiError> {
+        self.last_acp.write().unwrap().retain(|e| e.name != name);
+        self.store
+            .acp_remove(&name)
+            .await
+            .map_err(|e| ApiError::Other(format!("acp remove: {e}")))
+    }
+
     async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
         match &self.fleet {
             Some(fleet) => fleet.unit_events(&id, max).await,
@@ -1211,6 +1443,31 @@ impl ControlApi for NodeApiImpl {
             .restore(&record)
             .await
             .map_err(|e| ApiError::Other(format!("rewind failed: {e}")))
+    }
+
+    async fn rewind(
+        &self,
+        session: SessionId,
+        point: daemon_api::RewindPoint,
+    ) -> Result<(), ApiError> {
+        // The unified rewind (conversation-rewind spec): truncate the transcript at `point.anchor`
+        // and, when `point.restore_workspace`, roll the workspace back to the matching checkpoint —
+        // sealing the journal on the way out. A resident session rewinds its in-process engine
+        // directly through the shared seal+rollback seam that the live `RewindTo` command and the
+        // managed/fleet engine path also call (so all three stay consistent).
+        if self.live.handle_if_live(&session).is_some() {
+            return self
+                .live
+                .rewind_resident(&session, point.anchor, point.restore_workspace)
+                .await;
+        }
+        // A durable (non-resident) session has no live engine to truncate: its transcript is the
+        // sealed journal, and rewinding it means re-incarnating the engine to truncate-and-reseal.
+        // That activation-driven path is deferred (the checkpoint-ledger extension it needs is out of
+        // scope this phase); surface it explicitly rather than silently no-op.
+        Err(ApiError::Unsupported(
+            "rewind of a non-resident durable session (re-incarnation path deferred)".into(),
+        ))
     }
 }
 
@@ -2555,69 +2812,59 @@ impl LiveSessions {
                     .rewind_to(request_id, anchor)
                     .await
                     .map_err(|e| ApiError::Other(e.to_string()))?;
-                self.seal_after_rewind(&session, &outcome).await;
-                self.rollback_workspace_after_rewind(&session, &outcome).await;
+                // A bare `RewindTo` command rewinds the conversation *and* rolls the workspace back —
+                // the historical behavior. The finer conversation-only rewind is reachable via the
+                // unified `ControlApi::rewind` op with `restore_workspace = false`.
+                self.seal_and_rollback_after_rewind(&session, &outcome, true)
+                    .await;
                 Ok(())
             }
             _ => Err(ApiError::Unsupported("unknown agent command".into())),
         }
     }
 
-    /// Record the durable conversation-rewind seal against the session's journal stream (spec §6).
-    /// The journal stays a complete audit log; the seal surfaces as `JournalPageView::sealed_after`.
-    async fn seal_after_rewind(&self, session: &SessionId, outcome: &daemon_core::RewindOutcome) {
-        // Only meaningful when this session is journaled (otherwise there is no durable history).
-        if self.journal.lock().unwrap().is_none() {
-            return;
-        }
-        let stream = JournalStreamId::session(session);
-        let head = self.store.load_journal(&stream, u64::MAX, 1).await.head_cursor;
-        let recorded_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = self
-            .store
-            .record_journal_seal(
-                &stream,
-                daemon_store::JournalSeal {
-                    seal_cursor: head,
-                    retained_turns: outcome.retained_turns as u64,
-                    epoch: outcome.epoch.0,
-                    recorded_unix,
-                },
-            )
-            .await;
-    }
-
-    /// Roll the workspace back to the sealed-off range's earliest pre-mutation checkpoint (spec §6):
-    /// restoring the earliest checkpoint among the dropped tool calls undoes every later mutation in
-    /// the sealed range. A read-only rewound range (no checkpoints) leaves the filesystem untouched.
-    async fn rollback_workspace_after_rewind(
+    /// Apply the durable side-effects of a conversation rewind for this live session: seal the
+    /// journal (when journaled) and roll the workspace back to the dropped range's earliest
+    /// checkpoint. Delegates to the shared [`apply_rewind_side_effects`] helper so the live path and
+    /// the managed/fleet path ([`crate::unit::LiveAgentSession`]) stay byte-for-byte consistent.
+    async fn seal_and_rollback_after_rewind(
         &self,
         session: &SessionId,
         outcome: &daemon_core::RewindOutcome,
+        restore_workspace: bool,
     ) {
-        if outcome.dropped_call_ids.is_empty() {
-            return;
-        }
-        let store = match self.checkpoints.lock().unwrap().clone() {
-            Some(store) => store,
-            None => return,
-        };
-        let dropped: std::collections::HashSet<&str> =
-            outcome.dropped_call_ids.iter().map(|s| s.as_str()).collect();
-        // The checkpoints captured before the dropped tools ran, oldest first.
-        let mut matching: Vec<_> = store
-            .list(Some(session.as_str()))
+        let journaled = self.journal.lock().unwrap().is_some();
+        let checkpoints = self.checkpoints.lock().unwrap().clone();
+        apply_rewind_side_effects(
+            &self.store,
+            checkpoints.as_ref(),
+            journaled,
+            session,
+            outcome,
+            restore_workspace,
+        )
+        .await;
+    }
+
+    /// Rewind a *resident* session's transcript at `anchor` (in-process engine truncate + epoch bump),
+    /// then apply the shared durable side-effects honoring `restore_workspace`. The host-spec unified
+    /// rewind seam for the live path; backs [`NodeApiImpl::rewind`] for a live session.
+    async fn rewind_resident(
+        &self,
+        session: &SessionId,
+        anchor: daemon_protocol::RewindAnchor,
+        restore_workspace: bool,
+    ) -> Result<(), ApiError> {
+        let handle = self
+            .handle_if_live(session)
+            .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+        let outcome = handle
+            .rewind_to(daemon_common::ReqId(0), anchor)
             .await
-            .into_iter()
-            .filter(|r| dropped.contains(r.call_id.as_str()))
-            .collect();
-        matching.sort_by_key(|r| r.created_unix);
-        if let Some(earliest) = matching.first() {
-            let _ = store.restore(earliest).await;
-        }
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+        self.seal_and_rollback_after_rewind(session, &outcome, restore_workspace)
+            .await;
+        Ok(())
     }
 
     /// Append an inbound entry to a live session's merged log (no-op if the session is gone),
@@ -2815,6 +3062,63 @@ impl LiveSessions {
                 true
             }
             None => false,
+        }
+    }
+}
+
+/// The durable side-effects of a conversation rewind (conversation-rewind spec §6), factored out so
+/// the live path ([`LiveSessions::seal_and_rollback_after_rewind`]) and the managed/fleet path
+/// ([`crate::unit::LiveAgentSession`]) apply *exactly* the same seal + rollback. Previously only the
+/// live path sealed/rolled-back, so a rewind on a managed engine silently skipped both — this is the
+/// shared helper both now call.
+///
+/// - **Seal** (when `journaled`): append a `JournalSeal` at the journal head so the dropped tail is
+///   marked `sealed_after` while the audit log stays complete.
+/// - **Rollback** (when `restore_workspace` and there are dropped tool calls): restore the earliest
+///   pre-mutation checkpoint among the dropped calls, undoing every later mutation in the sealed
+///   range. A read-only rewound range (no checkpoints) leaves the filesystem untouched.
+pub(crate) async fn apply_rewind_side_effects(
+    store: &Arc<dyn SessionStore>,
+    checkpoints: Option<&Arc<dyn daemon_core::CheckpointStore>>,
+    journaled: bool,
+    session: &SessionId,
+    outcome: &daemon_core::RewindOutcome,
+    restore_workspace: bool,
+) {
+    if journaled {
+        let stream = JournalStreamId::session(session);
+        let head = store.load_journal(&stream, u64::MAX, 1).await.head_cursor;
+        let recorded_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = store
+            .record_journal_seal(
+                &stream,
+                daemon_store::JournalSeal {
+                    seal_cursor: head,
+                    retained_turns: outcome.retained_turns as u64,
+                    epoch: outcome.epoch.0,
+                    recorded_unix,
+                },
+            )
+            .await;
+    }
+
+    if restore_workspace && !outcome.dropped_call_ids.is_empty() {
+        if let Some(store) = checkpoints {
+            let dropped: std::collections::HashSet<&str> =
+                outcome.dropped_call_ids.iter().map(|s| s.as_str()).collect();
+            let mut matching: Vec<_> = store
+                .list(Some(session.as_str()))
+                .await
+                .into_iter()
+                .filter(|r| dropped.contains(r.call_id.as_str()))
+                .collect();
+            matching.sort_by_key(|r| r.created_unix);
+            if let Some(earliest) = matching.first() {
+                let _ = store.restore(earliest).await;
+            }
         }
     }
 }

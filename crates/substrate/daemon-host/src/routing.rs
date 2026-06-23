@@ -179,6 +179,35 @@ impl SessionBinding {
     }
 }
 
+/// A canonical, order-stable key for an inbound [`Origin`] used to index the chat→session pin map
+/// (§5.9, I5). Keyed by transport instance + scope identity so a pin matches the same logical chat
+/// regardless of ephemeral fields; mirrors the granularity [`session_id_for`] keys on.
+pub fn origin_pin_key(origin: &Origin) -> String {
+    let t = origin.transport.as_str();
+    match &origin.scope {
+        OriginScope::Dm { user } => format!("{t}\u{1}dm\u{1}{user}"),
+        OriginScope::Group { chat, thread } => {
+            format!("{t}\u{1}group\u{1}{chat}\u{1}{}", thread.as_deref().unwrap_or(""))
+        }
+        OriginScope::Api { key } => format!("{t}\u{1}api\u{1}{key}"),
+        OriginScope::Internal => format!("{t}\u{1}internal"),
+        // `OriginScope` is `#[non_exhaustive]`: fall back to a transport-scoped debug key so a future
+        // scope still produces a stable (if coarse) pin key rather than failing to compile/route.
+        other => format!("{t}\u{1}other\u{1}{other:?}"),
+    }
+}
+
+/// A resolve-first chat→session pin (§5.9, I5): an operator/GUI binding of a canonical origin to an
+/// explicit session, overriding the deterministic [`session_id_for`] naming. An optional `profile`
+/// override falls through to the deterministic precedence when `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatPin {
+    /// The session this origin is pinned to.
+    pub session: SessionId,
+    /// An explicit profile override; `None` falls through to instance/default precedence.
+    pub profile: Option<ProfileRef>,
+}
+
 /// The outcome of routing an origin: the derived session, the profile to run it under (if any), and
 /// where its replies post.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +227,10 @@ pub struct RoutingRegistry {
     bindings: Vec<SessionBinding>,
     instance_profiles: HashMap<TransportId, ProfileRef>,
     default_profile: Option<ProfileRef>,
+    /// Resolve-first chat→session pins (§5.9, I5), keyed by [`origin_pin_key`]. A pin overrides the
+    /// deterministic `session_id_for` derivation for its origin. Layered onto a freshly-built
+    /// registry by the host's hot-reload hook from the durable `chat_routes` store.
+    pins: HashMap<String, ChatPin>,
 }
 
 impl RoutingRegistry {
@@ -241,26 +274,64 @@ impl RoutingRegistry {
         self
     }
 
+    /// Install the resolve-first chat→session pin map (§5.9, I5), replacing any prior pins. Called by
+    /// the host's hot-reload rebuild hook with the pins loaded from the durable `chat_routes` store.
+    pub fn set_pins(&mut self, pins: HashMap<String, ChatPin>) {
+        self.pins = pins;
+    }
+
+    /// Add a single chat→session pin (builder form; handy for tests).
+    pub fn with_pin(mut self, origin: &Origin, pin: ChatPin) -> Self {
+        self.pins.insert(origin_pin_key(origin), pin);
+        self
+    }
+
     /// Whether the registry carries no routing information at all.
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
             && self.instance_profiles.is_empty()
             && self.default_profile.is_none()
+            && self.pins.is_empty()
     }
 
-    /// Resolve an origin to `(session, profile, delivery)`. The first matching binding wins; with no
-    /// matching binding, naming defaults to `PerThread` and delivery is seeded from the origin.
+    /// The deterministic profile precedence for an origin (binding override > transport-instance
+    /// bound profile > node default), independent of session naming. Shared by the pinned and
+    /// deterministic resolve paths.
+    fn profile_for(&self, origin: &Origin, binding: Option<&SessionBinding>) -> Option<ProfileRef> {
+        binding
+            .and_then(|b| b.profile.clone())
+            .or_else(|| self.instance_profiles.get(&origin.transport).cloned())
+            .or_else(|| self.default_profile.clone())
+    }
+
+    /// Resolve an origin to `(session, profile, delivery)`. A chat→session **pin** is consulted first
+    /// (§5.9, I5): when present it overrides the deterministic `session_id_for` naming for that
+    /// origin (its profile falls through to the deterministic precedence when the pin carries none).
+    /// Otherwise the first matching binding wins; with no matching binding, naming defaults to
+    /// `PerThread` and delivery is seeded from the origin.
     pub fn resolve(&self, origin: &Origin) -> Resolved {
         let binding = self.bindings.iter().find(|b| b.matcher.matches(origin));
+        // Resolve-first pin: an explicit chat→session binding overrides the deterministic id.
+        if let Some(pin) = self.pins.get(&origin_pin_key(origin)) {
+            let profile = pin
+                .profile
+                .clone()
+                .or_else(|| self.profile_for(origin, binding));
+            let delivery = match binding.map(|b| &b.delivery) {
+                Some(DeliveryPolicy::Fixed(target)) => target.clone(),
+                _ => origin.primary_target(),
+            };
+            return Resolved {
+                session: pin.session.clone(),
+                profile,
+                delivery,
+            };
+        }
         let isolation = binding
             .map(|b| b.isolation)
             .unwrap_or(IsolationPolicy::PerThread);
         let session = session_id_for(origin, isolation);
-        // Precedence: binding override > transport-instance bound profile > node default.
-        let profile = binding
-            .and_then(|b| b.profile.clone())
-            .or_else(|| self.instance_profiles.get(&origin.transport).cloned())
-            .or_else(|| self.default_profile.clone());
+        let profile = self.profile_for(origin, binding);
         let delivery = match binding.map(|b| &b.delivery) {
             Some(DeliveryPolicy::Fixed(target)) => target.clone(),
             _ => origin.primary_target(),
@@ -399,6 +470,58 @@ mod tests {
             reg.resolve(&matrix("@ops:hs.org", "#general")).profile,
             Some(ProfileRef::new("config-override"))
         );
+    }
+
+    #[test]
+    fn pin_overrides_deterministic_session_id() {
+        let o = matrix("@ops:hs.org", "#secops");
+        let deterministic = session_id_for(&o, IsolationPolicy::PerThread);
+        let pinned = SessionId::new("existing-conversation-7");
+
+        let reg = RoutingRegistry::new()
+            .with_default_profile(ProfileRef::new("node-default"))
+            .with_pin(
+                &o,
+                ChatPin {
+                    session: pinned.clone(),
+                    profile: Some(ProfileRef::new("pinned-agent")),
+                },
+            );
+
+        let r = reg.resolve(&o);
+        // Resolve-first: the pin wins over `session_id_for` and the deterministic profile.
+        assert_eq!(r.session, pinned);
+        assert_ne!(r.session, deterministic);
+        assert_eq!(r.profile, Some(ProfileRef::new("pinned-agent")));
+        // Delivery still seeds from the origin.
+        assert_eq!(r.delivery, o.primary_target());
+
+        // An unpinned origin on the same registry falls back to the deterministic path.
+        let other = matrix("@ops:hs.org", "#general");
+        let r2 = reg.resolve(&other);
+        assert_eq!(r2.session, session_id_for(&other, IsolationPolicy::PerThread));
+        assert_eq!(r2.profile, Some(ProfileRef::new("node-default")));
+    }
+
+    #[test]
+    fn pin_without_profile_falls_through_to_precedence() {
+        let o = matrix("@ops:hs.org", "#secops");
+        let reg = RoutingRegistry::new()
+            .bind_instance(
+                TransportId::new("matrix/@ops:hs.org"),
+                ProfileRef::new("ops-agent"),
+            )
+            .with_pin(
+                &o,
+                ChatPin {
+                    session: SessionId::new("pinned"),
+                    profile: None,
+                },
+            );
+        let r = reg.resolve(&o);
+        assert_eq!(r.session, SessionId::new("pinned"));
+        // No pin profile => the instance-bound profile (precedence step 2) applies.
+        assert_eq!(r.profile, Some(ProfileRef::new("ops-agent")));
     }
 
     #[test]

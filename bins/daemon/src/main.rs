@@ -1414,6 +1414,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         checkpoints,
         auth_factories,
     });
+    // Load any durable chat→session routing pins (§5.9, I5) into the live registry so resolve-first
+    // overrides survive restarts; rides the same hot-reload seam profile/auth changes use.
+    node.load_routing_pins().await;
     tracing::info!("daemon host node started");
 
     // Bind the api socket (fresh) and serve the unified surface over it.

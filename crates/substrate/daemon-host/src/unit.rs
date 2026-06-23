@@ -10,15 +10,34 @@
 use crate::agent_session::{AgentSession, AgentUnit};
 use crate::journal::JournalFeeder;
 use async_trait::async_trait;
-use daemon_common::UnitId;
-use daemon_core::{spawn_agent_session, AgentHandle, Engine};
+use daemon_common::{SessionId, UnitId};
+use daemon_core::{spawn_agent_session, AgentHandle, CheckpointStore, Engine};
 use daemon_protocol::{AgentCommand, AgentEvent, HostRequestHandler};
+use daemon_store::SessionStore;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+/// The durable-side handles a managed engine needs to apply a conversation rewind's seal + workspace
+/// rollback (conversation-rewind spec §6) — the exact side-effects the live-session path applies.
+/// Threaded into [`LiveAgentSession`] so the managed/fleet path no longer diverges from the live one
+/// (it previously skipped both). `None` (e.g. a node without a journal/checkpoint store) leaves the
+/// managed rewind as an engine-only truncate, matching the live path's behavior under the same node.
+pub struct RewindHooks {
+    /// The durable session store the journal seal is recorded against.
+    pub store: Arc<dyn SessionStore>,
+    /// The §12 tool-checkpoint store, when wired (drives the workspace rollback).
+    pub checkpoints: Option<Arc<dyn CheckpointStore>>,
+    /// Whether this unit journals its transcript (a seal is only meaningful when journaled).
+    pub journaled: bool,
+    /// The session id (journal stream + checkpoint scope) of this managed engine.
+    pub session: SessionId,
+}
 
 /// A [`AgentSession`] over a `daemon-core` engine on the in-process actor.
 struct LiveAgentSession {
     handle: AgentHandle,
+    /// The durable seal/rollback handles, when this managed engine should apply them on rewind.
+    rewind: Option<RewindHooks>,
 }
 
 #[async_trait]
@@ -40,10 +59,22 @@ impl AgentSession for LiveAgentSession {
             AgentCommand::Snapshot { request_id } => self.handle.snapshot(request_id).await,
             AgentCommand::Interrupt { reason } => self.handle.interrupt(reason).await,
             // Conversation rewind on the managed daemon-core path: truncate + reconstruct + emit
-            // `Rewound` (the durable journal seal / workspace rollback is driven by the live-session
-            // layer; the managed/fleet path applies the engine-level rewind best-effort).
+            // `Rewound`, then apply the *same* durable seal + workspace rollback the live path does,
+            // via the shared `apply_rewind_side_effects` helper (so the two paths stay consistent).
             AgentCommand::RewindTo { anchor, request_id } => {
-                let _ = self.handle.rewind_to(request_id, anchor).await;
+                if let Ok(outcome) = self.handle.rewind_to(request_id, anchor).await {
+                    if let Some(hooks) = &self.rewind {
+                        crate::node_api::apply_rewind_side_effects(
+                            &hooks.store,
+                            hooks.checkpoints.as_ref(),
+                            hooks.journaled,
+                            &hooks.session,
+                            &outcome,
+                            true,
+                        )
+                        .await;
+                    }
+                }
             }
             AgentCommand::Shutdown => self.handle.shutdown().await,
             _ => {}
@@ -71,9 +102,22 @@ impl EngineUnit {
         engine: Engine,
         journal: Option<Arc<JournalFeeder>>,
     ) -> AgentUnit {
-        AgentUnit::start_journaled(id, journal, |host: Arc<dyn HostRequestHandler>| {
+        Self::spawn_rewindable(id, engine, journal, None)
+    }
+
+    /// As [`Self::spawn_journaled`], but threads in the durable [`RewindHooks`] so a conversation
+    /// rewind on this managed engine applies the same journal seal + workspace rollback the live
+    /// path applies (conversation-rewind spec §6). `None` keeps the engine-only truncate.
+    pub fn spawn_rewindable(
+        id: UnitId,
+        engine: Engine,
+        journal: Option<Arc<JournalFeeder>>,
+        rewind: Option<RewindHooks>,
+    ) -> AgentUnit {
+        AgentUnit::start_journaled(id, journal, move |host: Arc<dyn HostRequestHandler>| {
             Arc::new(LiveAgentSession {
                 handle: spawn_agent_session(engine, host),
+                rewind,
             }) as Arc<dyn AgentSession>
         })
     }

@@ -486,6 +486,50 @@ pub trait ControlApi: Send + Sync {
         Ok(stream::empty().boxed())
     }
 
+    // -- chat→session routing pins (I5; daemon-event-io-spec §5.9) ------------------------------
+    //
+    // The resolve-first override table over the deterministic routing registry: a GUI/operator can
+    // pin an inbound origin (chat/room) to a specific session (+ profile). Pins are durable and hot-
+    // reloaded into the live registry. Defaults: empty / unsupported (a node without durable routing).
+
+    /// List all chat→session routing pins. Default: empty.
+    async fn routing_list_chats(&self) -> Vec<ChatRoute> {
+        Vec::new()
+    }
+
+    /// Read the routing pin for an origin, if one is set. Default: `None`.
+    async fn routing_get(&self, _origin: Origin) -> Option<ChatRoute> {
+        None
+    }
+
+    /// Upsert a full chat→session routing pin (origin + session + profile + isolation). Default:
+    /// unsupported.
+    async fn routing_set(&self, _route: ChatRoute) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("routing_set".into()))
+    }
+
+    /// Pin an origin to a session (+ optional profile) — the convenience form of [`Self::routing_set`]
+    /// with default isolation. Default: unsupported.
+    async fn routing_bind_chat(
+        &self,
+        _origin: Origin,
+        _session: SessionId,
+        _profile: Option<ProfileRef>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("routing_bind_chat".into()))
+    }
+
+    /// Remove the pin for an origin (idempotent). Default: unsupported.
+    async fn routing_unbind_chat(&self, _origin: Origin) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("routing_unbind_chat".into()))
+    }
+
+    /// Enumerate the rooms/chats a transport instance knows about (read-only), with the pinned
+    /// session for each when one exists. Default: empty (a transport with no room enumeration).
+    async fn transport_rooms(&self, _transport: TransportId) -> Vec<RoomInfo> {
+        Vec::new()
+    }
+
     // -- ACP discovery + registry (catalog-style; the daemon probes its own PATH/endpoints) --
 
     /// Trigger a server-side ACP discovery scan (PATH + well-known locations + the curated
@@ -1517,6 +1561,47 @@ pub struct CronRun {
     pub detail: Option<String>,
 }
 
+/// A chat→session routing pin (I5; daemon-event-io-spec §5.9): an explicit binding of an inbound
+/// [`Origin`] to a specific session (+ optional profile + session-naming isolation), surfaced by the
+/// `routing_*` ops so a GUI/operator can pin a chat to a named conversation. The host consults pins
+/// **resolve-first**, overriding the deterministic `session_id_for` derivation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRoute {
+    /// The inbound origin (transport instance + scope) this pin matches.
+    pub origin: Origin,
+    /// The session the origin is pinned to.
+    pub session: SessionId,
+    /// An explicit profile to run the pinned session under (`None` = registry default precedence).
+    #[serde(default)]
+    pub profile: Option<ProfileRef>,
+    /// The session-naming isolation the pin records (informational; the pinned id is authoritative).
+    #[serde(default = "default_isolation")]
+    pub isolation: IsolationPolicy,
+}
+
+/// `serde` default for [`ChatRoute::isolation`]: `PerThread`, matching the routing registry's
+/// deterministic default naming when no binding overrides it.
+fn default_isolation() -> IsolationPolicy {
+    IsolationPolicy::PerThread
+}
+
+/// A room/chat a transport instance knows about ([`ControlApi::transport_rooms`], I5): the read-only
+/// enumeration a GUI lists when binding a chat to a session. Carries the pinned session, when one
+/// exists, so the GUI can show which rooms are already routed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomInfo {
+    /// The transport instance the room belongs to.
+    pub transport: TransportId,
+    /// The room/chat handle (adapter-opaque).
+    pub room: String,
+    /// A human-readable room name, when known.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The session this room is currently pinned to, when one exists.
+    #[serde(default)]
+    pub session: Option<SessionId>,
+}
+
 // ---------------------------------------------------------------------------
 // Verifiable journal read DTOs (the non-destructive reconnect / scroll-back surface)
 // ---------------------------------------------------------------------------
@@ -2151,6 +2236,38 @@ pub enum ApiRequest {
         /// The job id.
         id: String,
     },
+    /// [`ControlApi::routing_list_chats`] — all chat→session routing pins.
+    RoutingListChats,
+    /// [`ControlApi::routing_get`] — the pin for an origin.
+    RoutingGet {
+        /// The origin to look up.
+        origin: Origin,
+    },
+    /// [`ControlApi::routing_set`] — upsert a full routing pin.
+    RoutingSet {
+        /// The pin to persist.
+        route: ChatRoute,
+    },
+    /// [`ControlApi::routing_bind_chat`] — pin an origin to a session (+ optional profile).
+    RoutingBindChat {
+        /// The origin to pin.
+        origin: Origin,
+        /// The session to pin it to.
+        session: SessionId,
+        /// An optional profile override.
+        #[serde(default)]
+        profile: Option<ProfileRef>,
+    },
+    /// [`ControlApi::routing_unbind_chat`] — remove an origin's pin.
+    RoutingUnbindChat {
+        /// The origin to unpin.
+        origin: Origin,
+    },
+    /// [`ControlApi::transport_rooms`] — enumerate a transport instance's rooms.
+    TransportRooms {
+        /// The transport instance.
+        transport: TransportId,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -2263,6 +2380,12 @@ pub enum ApiResponse {
     CronId(String),
     /// Recent runs of a scheduled job (cron_runs).
     CronRuns(Vec<CronRun>),
+    /// The chat→session routing pins (routing_list_chats).
+    ChatRoutes(Vec<ChatRoute>),
+    /// One origin's routing pin, if set (routing_get).
+    ChatRoute(Option<ChatRoute>),
+    /// A transport instance's rooms (transport_rooms).
+    Rooms(Vec<RoomInfo>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
 }
@@ -2593,6 +2716,20 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::CronDelete { id } => unit_or_err(api.cron_delete(id).await),
         ApiRequest::CronTrigger { id } => unit_or_err(api.cron_trigger(id).await),
         ApiRequest::CronRuns { id } => ApiResponse::CronRuns(api.cron_runs(id).await),
+        ApiRequest::RoutingListChats => ApiResponse::ChatRoutes(api.routing_list_chats().await),
+        ApiRequest::RoutingGet { origin } => ApiResponse::ChatRoute(api.routing_get(origin).await),
+        ApiRequest::RoutingSet { route } => unit_or_err(api.routing_set(route).await),
+        ApiRequest::RoutingBindChat {
+            origin,
+            session,
+            profile,
+        } => unit_or_err(api.routing_bind_chat(origin, session, profile).await),
+        ApiRequest::RoutingUnbindChat { origin } => {
+            unit_or_err(api.routing_unbind_chat(origin).await)
+        }
+        ApiRequest::TransportRooms { transport } => {
+            ApiResponse::Rooms(api.transport_rooms(transport).await)
+        }
         // Session variants were handled by `serve_session`.
         ApiRequest::Submit { .. }
         | ApiRequest::SubmitRouted { .. }

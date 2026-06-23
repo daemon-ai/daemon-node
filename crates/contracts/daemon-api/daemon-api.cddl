@@ -481,6 +481,23 @@ cron-spec = { name: tstr, schedule: tstr, ? target: (tstr / null), ? payload: bs
 cron-job  = { id: tstr, spec: cron-spec, ? next_fire_unix: (uint / null) }
 cron-run  = { started_unix: uint, ok: bool, ? detail: (tstr / null) }
 
+; ----- chat->session routing pins (wire v14; I5, §5.9; ControlApi::routing_*) -----
+; A resolve-first override of the deterministic origin->session derivation: pin an inbound origin to
+; an explicit session (+ optional profile). `isolation` mirrors daemon-protocol IsolationPolicy.
+isolation-policy = "PerUser" / "PerChat" / "PerThread" / "Shared"
+chat-route = {
+  origin: origin,
+  session: session-id,
+  ? profile: (profile-ref / null),
+  ? isolation: isolation-policy,      ; default "PerThread"
+}
+room-info = {
+  transport: transport-id,
+  room: tstr,
+  ? name: (tstr / null),
+  ? session: (session-id / null),     ; the pinned session, when one exists
+}
+
 ; ----- the request/response mirror (1:1 with the interface methods) -----
 ; `origin` is additive on the v2 wire: absent (old encodings) or null -> the host-local default;
 ; a value routes through `submit_from` so per-event attribution is recorded on the merged log.
@@ -629,6 +646,13 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "CronDelete": { id: tstr } }                                            ; -> Ok
             / { "CronTrigger": { id: tstr } }                                           ; -> Ok
             / { "CronRuns": { id: tstr } }                                              ; -> CronRuns
+            ; ----- chat->session routing pins (wire v14; I5, §5.9) -----
+            / "RoutingListChats"                                                        ; -> ChatRoutes
+            / { "RoutingGet": { origin: origin } }                                      ; -> ChatRoute
+            / { "RoutingSet": { route: chat-route } }                                   ; -> Ok
+            / { "RoutingBindChat": { origin: origin, session: session-id, ? profile: (profile-ref / null) } }  ; -> Ok
+            / { "RoutingUnbindChat": { origin: origin } }                               ; -> Ok
+            / { "TransportRooms": { transport: transport-id } }                         ; -> Rooms
 
 api-response = "Ok"
              / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v7)
@@ -679,4 +703,8 @@ api-response = "Ok"
              / { "CronJobs": [* cron-job] }
              / { "CronId": tstr }
              / { "CronRuns": [* cron-run] }
+             ; ----- chat->session routing pins (wire v14; I5, §5.9) -----
+             / { "ChatRoutes": [* chat-route] }
+             / { "ChatRoute": (chat-route / null) }
+             / { "Rooms": [* room-info] }
              / { "Error": api-error }

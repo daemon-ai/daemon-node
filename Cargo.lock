@@ -2031,6 +2031,7 @@ dependencies = [
  "agent-client-protocol",
  "async-trait",
  "ciborium",
+ "daemon-api",
  "daemon-common",
  "daemon-host",
  "daemon-protocol",

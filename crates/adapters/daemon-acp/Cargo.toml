@@ -13,6 +13,7 @@ license.workspace = true
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-host = { workspace = true }
+daemon-api = { workspace = true }
 agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
