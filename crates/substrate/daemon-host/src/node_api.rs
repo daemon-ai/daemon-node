@@ -21,13 +21,14 @@ use crate::profiles::ProfileStore;
 use crate::routing::RoutingRegistry;
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
     from_cbor, to_cbor, AcpAgentEntry, AcpSource, ApiError, ApprovalInfo, ApprovalMode, AuthApi,
     AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse,
-    AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, ControlApi,
+    AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, CommandInvocation,
+    CommandOutput, CommandScope, CommandSpec, ControlApi,
     CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, FsContent, FsEntry,
     FsRevision, FsRoot, FsRootId, FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView,
     HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle,
@@ -279,6 +280,13 @@ pub struct NodeApiImpl {
     /// every cron op resolves to its defaulted [`ApiError::Unsupported`] / empty list (a node built
     /// without the cron backing). Shared with the agent `cron` tool, so both create through one path.
     cron: Option<Arc<crate::cron::CronOps>>,
+    /// The daemon-authoritative command catalog backing `command_list`/`command_invoke`: built-in
+    /// node-op commands unified with the engine profile's [`CommandProvider`](daemon_core::CommandProvider)
+    /// contributions (`/lcm`, `/memory`, …). Empty => the command surface resolves to its defaulted
+    /// empty catalog / [`ApiError::Unsupported`]. Held behind an [`ArcSwapOption`] so the assembling
+    /// binary can bind it *after* the node is wrapped in an `Arc` (see [`NodeApiImpl::set_commands`]),
+    /// since the registry needs node-resolved provider handles the node construction does not own.
+    commands: Arc<ArcSwapOption<crate::commands::CommandRegistry>>,
 }
 
 impl NodeApiImpl {
@@ -334,6 +342,7 @@ impl NodeApiImpl {
             workspace: None,
             blobs: None,
             cron: None,
+            commands: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -359,6 +368,22 @@ impl NodeApiImpl {
     pub fn with_cron(mut self, cron: Arc<crate::cron::CronOps>) -> Self {
         self.cron = Some(cron);
         self
+    }
+
+    /// Bind the daemon-authoritative command catalog backing `command_list`/`command_invoke` at
+    /// construction time. The assembling layer builds it from
+    /// [`CommandRegistry::with_builtins`](crate::commands::CommandRegistry::with_builtins) plus the
+    /// engine profile's command providers. Absent, the command surface stays empty / unsupported.
+    pub fn with_commands(self, commands: Arc<crate::commands::CommandRegistry>) -> Self {
+        self.commands.store(Some(commands));
+        self
+    }
+
+    /// Bind (or replace) the command catalog *after* the node is wrapped in an `Arc` — the seam the
+    /// assembling binary uses, since the registry's provider handles (`/lcm`, `/memory`) are resolved
+    /// from node-owned bank caches the node construction does not itself hold.
+    pub fn set_commands(&self, commands: Arc<crate::commands::CommandRegistry>) {
+        self.commands.store(Some(commands));
     }
 
     /// The gated workspace write shared by `fs_write` and `fs_write_from_blob`: `Workspace`/`Session`
@@ -2027,6 +2052,249 @@ impl ControlApi for NodeApiImpl {
         Err(ApiError::Unsupported(
             "rewind of a non-resident durable session (re-incarnation path deferred)".into(),
         ))
+    }
+
+    async fn command_list(&self) -> Vec<CommandSpec> {
+        match self.commands.load().as_ref() {
+            Some(reg) => reg.specs(),
+            None => Vec::new(),
+        }
+    }
+
+    async fn command_invoke(
+        &self,
+        invocation: CommandInvocation,
+    ) -> Result<CommandOutput, ApiError> {
+        let reg = self.commands.load_full();
+        let reg = reg
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("command_invoke".into()))?;
+        let entry = reg
+            .resolve(&invocation.name)
+            .ok_or_else(|| ApiError::Other(format!("unknown command: {}", invocation.name)))?;
+        // Access gate (the `slash_access.py` analog): the caller's tier vs the command's `min_access`,
+        // with the read-only `User` floor always allowed.
+        let caller = crate::commands::caller_access(invocation.origin.as_ref());
+        if !crate::commands::access_allows(entry.spec.min_access, caller) {
+            return Err(ApiError::Other(format!(
+                "command /{} requires operator (admin) access",
+                entry.spec.name
+            )));
+        }
+        // Session-scoped commands need a session to act on.
+        if entry.spec.scope == CommandScope::Session && invocation.session.is_none() {
+            return Err(ApiError::Other(format!(
+                "command /{} requires an active session",
+                entry.spec.name
+            )));
+        }
+        match &entry.owner {
+            crate::commands::Owner::Builtin(builtin) => self.run_builtin(*builtin, &invocation).await,
+            crate::commands::Owner::Provider(provider) => {
+                let core_inv = daemon_core::CommandInvocation {
+                    name: invocation.name.clone(),
+                    args: invocation.args.clone(),
+                    session: invocation.session.clone(),
+                };
+                let cx = match &invocation.session {
+                    Some(s) => daemon_core::CommandCx::session(s.clone()),
+                    None => daemon_core::CommandCx::node(),
+                };
+                let out = provider
+                    .run_command(&core_inv, &cx)
+                    .await
+                    .map_err(command_err_to_api)?;
+                Ok(CommandOutput {
+                    text: out.text,
+                    ephemeral: out.ephemeral,
+                })
+            }
+        }
+    }
+}
+
+/// Map a [`daemon_core::CommandError`] to the wire [`ApiError`] at the command boundary.
+fn command_err_to_api(err: daemon_core::CommandError) -> ApiError {
+    use daemon_core::CommandError::*;
+    match err {
+        Unknown(name) => ApiError::Other(format!("unknown command: {name}")),
+        BadArgs(msg) => ApiError::Other(format!("invalid arguments: {msg}")),
+        MissingSession => ApiError::Other("command requires an active session".into()),
+        Failed(msg) => ApiError::Other(msg),
+    }
+}
+
+impl NodeApiImpl {
+    /// Dispatch a resolved built-in command over the node's existing typed ops — a thin adapter, not
+    /// a re-implementation (the logic for cancel/model/mode/approve lives once in the ops it calls).
+    /// `command_invoke` has already gated access and verified a session is present for session-scoped
+    /// commands.
+    async fn run_builtin(
+        &self,
+        builtin: crate::commands::Builtin,
+        invocation: &CommandInvocation,
+    ) -> Result<CommandOutput, ApiError> {
+        use crate::commands::Builtin;
+        let args = invocation.args.trim();
+        match builtin {
+            Builtin::Help => {
+                let specs = self
+                    .commands
+                    .load()
+                    .as_ref()
+                    .map(|r| r.specs())
+                    .unwrap_or_default();
+                Ok(CommandOutput {
+                    text: crate::commands::render_help(&specs),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Whoami => Ok(CommandOutput {
+                text: format!(
+                    "profile: {}\npartition: {:?}",
+                    self.default_local_profile, self.partition
+                ),
+                ephemeral: true,
+            }),
+            Builtin::Version => Ok(CommandOutput {
+                text: format!("daemon {}", env!("CARGO_PKG_VERSION")),
+                ephemeral: true,
+            }),
+            Builtin::Status => {
+                let t = self.telemetry().await;
+                Ok(CommandOutput {
+                    text: format!(
+                        "healthy: {}\nsessions: {} ({} active)\npending jobs: {}, wakes: {}\nevents: {}",
+                        t.healthy, t.sessions, t.active, t.pending_jobs, t.pending_wakes, t.events
+                    ),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Usage => {
+                let t = self.telemetry().await;
+                let u = &t.usage;
+                Ok(CommandOutput {
+                    text: format!(
+                        "tokens in/out: {}/{}\ncache read/write: {}/{}\nreasoning: {}\nest. cost: ${:.4}",
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_tokens,
+                        u.cache_write_tokens,
+                        u.reasoning_tokens,
+                        u.cost_micros as f64 / 1_000_000.0
+                    ),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Sessions => {
+                let roster = self.sessions().await;
+                let mut text = format!("{} session(s):\n", roster.len());
+                for s in &roster {
+                    let title = s.title.as_deref().unwrap_or("(untitled)");
+                    text.push_str(&format!("  {} — {}\n", s.session.as_str(), title));
+                }
+                Ok(CommandOutput {
+                    text,
+                    ephemeral: true,
+                })
+            }
+            Builtin::Stop => {
+                let session = invocation
+                    .session
+                    .clone()
+                    .ok_or_else(|| ApiError::Other("stop requires a session".into()))?;
+                self.cancel(session).await?;
+                Ok(CommandOutput {
+                    text: "cancelled in-flight work".into(),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Model => {
+                if args.is_empty() {
+                    return Err(ApiError::Other("usage: /model <model-id>".into()));
+                }
+                let session = invocation
+                    .session
+                    .clone()
+                    .ok_or_else(|| ApiError::Other("model requires a session".into()))?;
+                self.set_session_model(session, args.to_string(), None).await?;
+                Ok(CommandOutput {
+                    text: format!("session model set to {args}"),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Mode => {
+                let session = invocation
+                    .session
+                    .clone()
+                    .ok_or_else(|| ApiError::Other("mode requires a session".into()))?;
+                let mode = resolve_approval_mode(&invocation.name, args)?;
+                self.set_session_mode(session, mode).await?;
+                Ok(CommandOutput {
+                    text: format!("approval mode set to {mode:?}"),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Title => {
+                if args.is_empty() {
+                    return Err(ApiError::Other("usage: /title <new title>".into()));
+                }
+                let session = invocation
+                    .session
+                    .clone()
+                    .ok_or_else(|| ApiError::Other("title requires a session".into()))?;
+                let patch = SessionMetaPatch {
+                    title: Some(Some(args.to_string())),
+                    ..SessionMetaPatch::default()
+                };
+                self.session_update_meta(session, patch).await?;
+                Ok(CommandOutput {
+                    text: format!("title set to {args:?}"),
+                    ephemeral: true,
+                })
+            }
+            Builtin::Approve | Builtin::Deny => {
+                let allow = matches!(builtin, Builtin::Approve);
+                if args.is_empty() {
+                    return Err(ApiError::Other(format!(
+                        "usage: /{} <request-id>",
+                        if allow { "approve" } else { "deny" }
+                    )));
+                }
+                let session = invocation
+                    .session
+                    .clone()
+                    .ok_or_else(|| ApiError::Other("approval requires a session".into()))?;
+                self.approval_decide(session, args.to_string(), allow).await?;
+                Ok(CommandOutput {
+                    text: format!(
+                        "request {args} {}",
+                        if allow { "approved" } else { "denied" }
+                    ),
+                    ephemeral: true,
+                })
+            }
+        }
+    }
+}
+
+/// Resolve the requested [`ApprovalMode`] from a `/mode` invocation: the `yolo`/`fast` aliases map
+/// directly, otherwise the first argument is parsed (`yolo`/`auto`, `fast`/`accept`, `ask`, `deny`).
+fn resolve_approval_mode(name: &str, args: &str) -> Result<ApprovalMode, ApiError> {
+    let key = match name.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
+        "yolo" => "yolo".to_string(),
+        "fast" => "fast".to_string(),
+        _ => args.split_whitespace().next().unwrap_or("").to_ascii_lowercase(),
+    };
+    match key.as_str() {
+        "yolo" | "auto" | "autoallow" | "auto-allow" => Ok(ApprovalMode::AutoAllow),
+        "fast" | "accept" | "acceptedits" | "accept-edits" => Ok(ApprovalMode::AcceptEdits),
+        "ask" | "default" => Ok(ApprovalMode::Ask),
+        "deny" | "reject" => Ok(ApprovalMode::Deny),
+        "" => Err(ApiError::Other(
+            "usage: /mode <yolo|fast|ask|deny>".into(),
+        )),
+        other => Err(ApiError::Other(format!("unknown approval mode: {other}"))),
     }
 }
 

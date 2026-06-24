@@ -10,6 +10,10 @@ use crate::embeddings::Embedder;
 use crate::engine::{Engine, MemoryRow, RememberArgs};
 use crate::extract::Extractor;
 use crate::MnemosyneConfig;
+use daemon_core::command::{
+    CommandCx, CommandError, CommandInvocation, CommandOutput, CommandProvider,
+    CommandProviderHandle, CommandSpec,
+};
 use daemon_core::conversation::{Conversation, Turn};
 use daemon_core::memory::{MemoryProvider, PromptBlock, RecallQuery, RecalledBlock, SwitchReason};
 use daemon_core::tools::ToolDef;
@@ -196,6 +200,89 @@ impl MemoryProvider for MnemosyneProvider {
             self.run_sleep(true).await;
         }
     }
+
+    /// Expose this provider as a [`CommandProvider`] so the node command registry folds in `/memory`
+    /// (the operator memory-maintenance surface).
+    fn command_provider(self: Arc<Self>) -> Option<CommandProviderHandle> {
+        Some(self)
+    }
+}
+
+/// The `/memory` operator command surface: inspect (`stats`/`diagnose`), consolidate (`sleep`), and
+/// `export` the bank. Read subcommands run on the per-session engine; `sleep` is a mutating
+/// consolidation pass.
+#[async_trait::async_trait]
+impl CommandProvider for MnemosyneProvider {
+    fn name(&self) -> &str {
+        "mnemosyne"
+    }
+
+    fn commands(&self) -> Vec<CommandSpec> {
+        command_specs()
+    }
+
+    async fn run_command(
+        &self,
+        invocation: &CommandInvocation,
+        _cx: &CommandCx<'_>,
+    ) -> std::result::Result<CommandOutput, CommandError> {
+        let sub = invocation
+            .subcommand()
+            .unwrap_or("stats")
+            .to_ascii_lowercase();
+        match sub.as_str() {
+            "" | "stats" => {
+                let stats = self
+                    .engine
+                    .stats()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                Ok(CommandOutput::text(pretty(&stats)))
+            }
+            "diagnose" => {
+                let diag = self
+                    .engine
+                    .diagnose()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                Ok(CommandOutput::text(pretty(&diag)))
+            }
+            "sleep" => {
+                let force = matches!(invocation.rest().trim(), "force" | "--force" | "-f");
+                let report = self
+                    .engine
+                    .sleep(force)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                Ok(CommandOutput::text(pretty(&report)))
+            }
+            "export" => {
+                let bundle = self
+                    .engine
+                    .export()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                Ok(CommandOutput::text(
+                    serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| bundle.to_string()),
+                ))
+            }
+            other => Err(CommandError::BadArgs(format!(
+                "unknown /memory subcommand: {other} (try stats|diagnose|sleep|export)"
+            ))),
+        }
+    }
+}
+
+/// The static `/memory` command catalog — the single source for the node command registry (the
+/// binary's per-session wrapper advertises these without a live provider instance) and the
+/// instance-level [`CommandProvider::commands`].
+pub fn command_specs() -> Vec<CommandSpec> {
+    vec![CommandSpec::new("memory")
+        .summary("Mnemosyne memory: stats, diagnose, sleep, export")
+        .category("Memory")
+        .args_hint("<stats|diagnose|sleep|export>")
+        .subcommands(["stats", "diagnose", "sleep", "export"])]
+}
+
+/// Pretty-print a serializable value for human command output.
+fn pretty<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
 impl MnemosyneProvider {

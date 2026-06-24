@@ -22,15 +22,15 @@ use daemon_common::{
 };
 use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
-    ContextEngine, ContextEngineBuilder, CredentialBuilder, CredentialProvider, EmbeddingProvider,
-    EngineProfile, FileMemory, MemoryBuilder, MemoryProvider, MockProvider, Provider,
-    ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolProvider,
-    ToolRegistry, TurnCx,
+    CommandProviderHandle, ContextEngine, ContextEngineBuilder, CredentialBuilder,
+    CredentialProvider, EmbeddingProvider, EngineProfile, FileMemory, MemoryBuilder, MemoryProvider,
+    MockProvider, Provider, ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome,
+    ToolProvider, ToolRegistry, TurnCx,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
-    CloudCatalog, CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit,
+    CloudCatalog, CommandRegistry, CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit,
     FileCredentialStore, FileProfileStore, FileRevisionLog, HostConfig, JournalFeeder, JournalSink,
     MemCredentialStore, MemProfileStore, OriginMatcher, OwnerBroker, PooledStoreCredentialSource,
     ProfileStore, RoutingRegistry, ScopePattern, SessionBinding, TransportPattern,
@@ -347,6 +347,9 @@ fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
 struct ContextWiring {
     builder: Option<ContextEngineBuilder>,
     tools: Vec<Arc<dyn Tool>>,
+    /// The node-scoped `/lcm` command provider (resolves the per-session engine via the bank cache),
+    /// folded into the node command registry. `None` for the `Budgeted` fallback.
+    command_provider: Option<CommandProviderHandle>,
 }
 
 impl ContextWiring {
@@ -354,6 +357,7 @@ impl ContextWiring {
         Self {
             builder: None,
             tools: Vec::new(),
+            command_provider: None,
         }
     }
 }
@@ -410,11 +414,49 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
                     }
                 })
             };
+            let command_provider =
+                Some(Arc::new(LcmCommandProvider { banks: banks.clone() }) as CommandProviderHandle);
             ContextWiring {
                 builder: Some(builder),
                 tools,
+                command_provider,
             }
         }
+    }
+}
+
+/// A node-scoped `/lcm` command provider: resolves the calling session's [`LcmContextEngine`] from
+/// the shared [`LcmBanks`] cache (so the command observes that session's live compaction state +
+/// durable transcript) and delegates to the engine's own [`CommandProvider`] handler. The catalog
+/// metadata is the session-independent [`daemon_context_lcm::command_specs`].
+struct LcmCommandProvider {
+    banks: Arc<LcmBanks>,
+}
+
+#[async_trait::async_trait]
+impl daemon_core::CommandProvider for LcmCommandProvider {
+    fn name(&self) -> &str {
+        "lcm"
+    }
+
+    fn commands(&self) -> Vec<daemon_core::CommandSpec> {
+        daemon_context_lcm::command_specs()
+    }
+
+    async fn run_command(
+        &self,
+        invocation: &daemon_core::CommandInvocation,
+        cx: &daemon_core::CommandCx<'_>,
+    ) -> Result<daemon_core::CommandOutput, daemon_core::CommandError> {
+        let session = cx
+            .session
+            .as_ref()
+            .ok_or(daemon_core::CommandError::MissingSession)?;
+        let lcm = self
+            .banks
+            .get_or_open(None, session)
+            .ok_or_else(|| daemon_core::CommandError::Failed("lcm bank unavailable".into()))?;
+        lcm.run_command(invocation, cx).await
     }
 }
 
@@ -522,6 +564,9 @@ struct MemoryWiring {
     builder: Option<MemoryBuilder>,
     shared: Vec<Arc<dyn MemoryProvider>>,
     tools: Vec<Arc<dyn Tool>>,
+    /// The node-scoped `/memory` command provider (resolves the per-session provider via the bank
+    /// cache), folded into the node command registry. `None` when memory is off / file-backed.
+    command_provider: Option<CommandProviderHandle>,
 }
 
 impl MemoryWiring {
@@ -530,7 +575,42 @@ impl MemoryWiring {
             builder: None,
             shared: Vec::new(),
             tools: Vec::new(),
+            command_provider: None,
         }
+    }
+}
+
+/// A node-scoped `/memory` command provider: resolves the calling session's [`MnemosyneProvider`]
+/// from the shared [`MnemosyneBanks`] cache and delegates to the provider's own [`CommandProvider`]
+/// handler. The catalog metadata is the session-independent [`daemon_mnemosyne::command_specs`].
+struct MemoryCommandProvider {
+    banks: Arc<MnemosyneBanks>,
+}
+
+#[async_trait::async_trait]
+impl daemon_core::CommandProvider for MemoryCommandProvider {
+    fn name(&self) -> &str {
+        "mnemosyne"
+    }
+
+    fn commands(&self) -> Vec<daemon_core::CommandSpec> {
+        daemon_mnemosyne::command_specs()
+    }
+
+    async fn run_command(
+        &self,
+        invocation: &daemon_core::CommandInvocation,
+        cx: &daemon_core::CommandCx<'_>,
+    ) -> Result<daemon_core::CommandOutput, daemon_core::CommandError> {
+        let session = cx
+            .session
+            .as_ref()
+            .ok_or(daemon_core::CommandError::MissingSession)?;
+        let provider = self
+            .banks
+            .get_or_open(None, session)
+            .ok_or_else(|| daemon_core::CommandError::Failed("mnemosyne bank unavailable".into()))?;
+        provider.run_command(invocation, cx).await
     }
 }
 
@@ -551,6 +631,7 @@ fn build_memory(
                 builder: None,
                 shared: vec![Arc::new(FileMemory::load(path)) as Arc<dyn MemoryProvider>],
                 tools: Vec::new(),
+                command_provider: None,
             },
             None => {
                 tracing::warn!("memory_provider=file but DAEMON_MEMORY_FILE is unset; memory off");
@@ -605,10 +686,14 @@ fn build_memory(
                     },
                 )
             };
+            let command_provider = Some(
+                Arc::new(MemoryCommandProvider { banks: banks.clone() }) as CommandProviderHandle,
+            );
             MemoryWiring {
                 builder: Some(builder),
                 shared: Vec::new(),
                 tools,
+                command_provider,
             }
         }
     }
@@ -1434,6 +1519,20 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         workspace_root: Some(cfg.workspace_root.clone()),
         blob_root: Some(cfg.blob_root.clone()),
     });
+    // Build the daemon-authoritative command catalog (`command_list`/`command_invoke`): the built-in
+    // node-op commands unified with the provider commands the context engine (`/lcm`) and memory
+    // provider (`/memory`) contribute, each resolving its per-session bank at invocation time. Bound
+    // post-assembly because these providers wrap node-owned bank caches.
+    {
+        let mut command_registry = CommandRegistry::with_builtins();
+        if let Some(provider) = context.command_provider {
+            command_registry.register_provider(provider);
+        }
+        if let Some(provider) = memory.command_provider {
+            command_registry.register_provider(provider);
+        }
+        node.set_commands(Arc::new(command_registry));
+    }
     // Load any durable chat→session routing pins (§5.9, I5) into the live registry so resolve-first
     // overrides survive restarts; rides the same hot-reload seam profile/auth changes use.
     node.load_routing_pins().await;

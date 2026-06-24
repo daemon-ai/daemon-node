@@ -171,6 +171,18 @@ pub trait ContextEngine: Send + Sync {
     fn tools(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// The [`CommandProvider`](crate::command::CommandProvider) view of this engine, when it also
+    /// contributes operator/user commands (e.g. LCM's `/lcm`). Default `None`. Mirrors how the
+    /// engine exposes tools through the §12 registry — a distinct seam from the model-facing
+    /// [`ToolRegistry`](crate::tools), surfaced here so the node command registry can fold it in.
+    /// A concrete engine that also `impl`s [`CommandProvider`](crate::command::CommandProvider)
+    /// overrides this to `Some(self)`.
+    fn command_provider(
+        self: Arc<Self>,
+    ) -> Option<crate::command::CommandProviderHandle> {
+        None
+    }
 }
 
 /// How [`BudgetedContextEngine`] compacts an over-budget conversation.

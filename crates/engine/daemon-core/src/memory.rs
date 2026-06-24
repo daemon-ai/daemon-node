@@ -23,6 +23,7 @@
 use crate::conversation::{Conversation, Turn};
 use async_trait::async_trait;
 use std::path::Path;
+use std::sync::Arc;
 
 /// What the engine asks a memory provider to recall for a turn (§11).
 #[derive(Clone, Debug, Default)]
@@ -92,6 +93,16 @@ pub trait MemoryProvider: Send + Sync {
     /// own session/bank (it is constructed per-session by the composition layer), so the reason —
     /// not a session id — is all the engine threads here.
     async fn on_session_switch(&self, _reason: SwitchReason) {}
+
+    /// The [`CommandProvider`](crate::command::CommandProvider) view of this provider, when it also
+    /// contributes operator/user commands (e.g. Mnemosyne's `/memory`). Default `None`. A distinct
+    /// seam from the model-facing tools a backend may register through the §12
+    /// [`ToolRegistry`](crate::tools); surfaced here so the node command registry can fold it in. A
+    /// concrete provider that also `impl`s [`CommandProvider`](crate::command::CommandProvider)
+    /// overrides this to `Some(self)`.
+    fn command_provider(self: Arc<Self>) -> Option<crate::command::CommandProviderHandle> {
+        None
+    }
 }
 
 /// A minimal builtin memory provider (§11): a frozen MEMORY.md snapshot served as a stable prompt

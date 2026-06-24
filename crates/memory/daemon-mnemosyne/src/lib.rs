@@ -37,4 +37,4 @@ pub mod util;
 pub use config::{MnemosyneConfig, RecallMode};
 pub use engine::{Engine, MemoryRow, RememberArgs, Tier};
 pub use error::{Error, Result};
-pub use provider::MnemosyneProvider;
+pub use provider::{command_specs, MnemosyneProvider};

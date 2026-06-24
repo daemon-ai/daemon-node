@@ -19,7 +19,11 @@ use crate::tools::{ToolCx, TOOL_NAMES};
 use async_trait::async_trait;
 use daemon_common::SessionId;
 use daemon_core::tools::ToolDef;
-use daemon_core::{Conversation, ContextEngine, ModelInfo, Pressure, Provider, Turn};
+use daemon_core::{
+    CommandCx, CommandError, CommandInvocation, CommandOutput, CommandProvider,
+    CommandProviderHandle, CommandSpec, Conversation, ContextEngine, ModelInfo, Pressure, Provider,
+    Turn,
+};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -410,6 +414,86 @@ impl ContextEngine for LcmContextEngine {
     /// dispatch through the §12 [`ToolRegistry`](daemon_core::tools) (see [`Self::tool_defs`]).
     fn tools(&self) -> Vec<String> {
         TOOL_NAMES.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Expose this engine as a [`CommandProvider`] so the node command registry folds in `/lcm`
+    /// (the operator maintenance surface, the port of `hermes-lcm`'s `command.py`).
+    fn command_provider(self: Arc<Self>) -> Option<CommandProviderHandle> {
+        Some(self)
+    }
+}
+
+/// The `/lcm` operator command surface — the daemon-authoritative port of `hermes-lcm`'s
+/// `command.py`, reusing the engine's existing `lcm_status`/`lcm_doctor` handlers (so the
+/// drill-down checks back `/lcm doctor`). Mutating maintenance (`backup`/`rotate`) is reported as
+/// unavailable until the durable-bank maintenance is ported (parity Phase 0), rather than faked.
+#[async_trait]
+impl CommandProvider for LcmContextEngine {
+    fn name(&self) -> &str {
+        "lcm"
+    }
+
+    fn commands(&self) -> Vec<CommandSpec> {
+        command_specs()
+    }
+
+    async fn run_command(
+        &self,
+        invocation: &CommandInvocation,
+        _cx: &CommandCx<'_>,
+    ) -> std::result::Result<CommandOutput, CommandError> {
+        let sub = invocation
+            .subcommand()
+            .unwrap_or("status")
+            .to_ascii_lowercase();
+        match sub.as_str() {
+            "" | "status" => {
+                let json = self.call_tool("lcm_status", Value::Null).await;
+                Ok(CommandOutput::text(pretty_json(&json)))
+            }
+            "doctor" => {
+                let json = self.call_tool("lcm_doctor", Value::Null).await;
+                Ok(CommandOutput::text(pretty_json(&json)))
+            }
+            "preset" => {
+                let json = self.call_tool("lcm_status", Value::Null).await;
+                let parsed: Value = serde_json::from_str(&json).unwrap_or(Value::Null);
+                match parsed.get("preset_suggestion") {
+                    Some(p) if !p.is_null() => {
+                        Ok(CommandOutput::text(format!("suggested preset: {p}")))
+                    }
+                    _ => Ok(CommandOutput::text(
+                        "no preset suggestion for the current model window",
+                    )),
+                }
+            }
+            "backup" | "rotate" => Err(CommandError::Failed(format!(
+                "/lcm {sub}: durable-bank maintenance is not yet available in this build"
+            ))),
+            other => Err(CommandError::BadArgs(format!(
+                "unknown /lcm subcommand: {other} (try status|doctor|preset)"
+            ))),
+        }
+    }
+}
+
+/// The static `/lcm` command catalog — the single source for the node command registry (the
+/// binary's per-session wrapper advertises these without a live engine instance) and the
+/// instance-level [`CommandProvider::commands`].
+pub fn command_specs() -> Vec<CommandSpec> {
+    vec![CommandSpec::new("lcm")
+        .summary("Lossless context management: status, health, preset")
+        .category("Context")
+        .args_hint("<status|doctor|preset|backup|rotate>")
+        .subcommands(["status", "doctor", "preset", "backup", "rotate"])]
+}
+
+/// Pretty-print a tool JSON string for human display; fall back to the raw string if it does not
+/// parse (the handlers always return JSON, but a defensive fallback keeps output legible).
+fn pretty_json(s: &str) -> String {
+    match serde_json::from_str::<Value>(s) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| s.to_string()),
+        Err(_) => s.to_string(),
     }
 }
 

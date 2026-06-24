@@ -47,7 +47,7 @@ pub mod tools;
 
 pub use config::LcmConfig;
 pub use error::{Error, Result};
-pub use provider::LcmContextEngine;
+pub use provider::{command_specs, LcmContextEngine};
 pub use search::{MessageResult, NodeResult, SortMode};
 pub use store::{
     MessageFilter, MessageRow, NewMessage, NewNode, NodeHit, SourceType, SummaryNode,

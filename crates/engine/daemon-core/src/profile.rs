@@ -13,6 +13,7 @@
 //! ([`crate::actor`]) serves §17 commands over a mailbox — but both are now *constructed* from the
 //! same `EngineProfile`.
 
+use crate::command::CommandProviderHandle;
 use crate::config::Config;
 use crate::context::{ContextEngine, StablePromptSource};
 use crate::conversation::SystemPrompt;
@@ -84,6 +85,11 @@ pub struct EngineProfile {
     /// The §12 tool-checkpoint store every engine this profile builds records pre-mutation
     /// checkpoints into (shared across sessions; rewound via the control surface). `None` => off.
     checkpoints: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
+    /// Node-scoped command providers contributed explicitly (the `register_command` analog), folded
+    /// into the node command registry alongside the providers derived from the context engine /
+    /// memory set. Separate from the per-turn engine wiring: these back the out-of-band command
+    /// surface, not the turn loop.
+    command_providers: Vec<CommandProviderHandle>,
 }
 
 impl EngineProfile {
@@ -111,6 +117,7 @@ impl EngineProfile {
             memory_builder: None,
             prompt_sources: Vec::new(),
             checkpoints: None,
+            command_providers: Vec::new(),
         }
     }
 
@@ -218,6 +225,36 @@ impl EngineProfile {
     pub fn with_system(mut self, system: SystemPrompt) -> Self {
         self.system = system;
         self
+    }
+
+    /// Register a node-scoped [`CommandProvider`](crate::command::CommandProvider) (the
+    /// `register_command` analog) whose commands the node folds into its command registry. Use for
+    /// providers that are not the engine's own context/memory instances (e.g. a plugin, or a
+    /// node-level maintenance handle). Context-engine / memory-provider commands are picked up
+    /// automatically by [`command_providers`](Self::command_providers).
+    pub fn with_command_provider(mut self, provider: CommandProviderHandle) -> Self {
+        self.command_providers.push(provider);
+        self
+    }
+
+    /// Collect every command provider this profile contributes: the explicitly-registered ones plus
+    /// the [`CommandProvider`](crate::command::CommandProvider) views of the configured context
+    /// engine and memory providers (when they opt in via `command_provider()`). The node command
+    /// registry calls this once to build its catalog. Per-session builders are not invoked here —
+    /// only the shared instances a node-level catalog can enumerate without a session.
+    pub fn command_providers(&self) -> Vec<CommandProviderHandle> {
+        let mut providers = self.command_providers.clone();
+        if let Some(context) = &self.context {
+            if let Some(p) = context.clone().command_provider() {
+                providers.push(p);
+            }
+        }
+        for memory in &self.memory {
+            if let Some(p) = memory.clone().command_provider() {
+                providers.push(p);
+            }
+        }
+        providers
     }
 
     /// The tool registry shared by engines this profile builds.

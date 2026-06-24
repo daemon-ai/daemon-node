@@ -606,6 +606,25 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("tool_register".into()))
     }
 
+    /// The daemon-authoritative command catalog — every operator/user command the node exposes
+    /// (built-in node ops + context-engine / memory-provider / plugin contributions), as declarative
+    /// [`CommandSpec`]s a thin client renders + autocompletes. Distinct from [`Self::tool_list`]
+    /// (model-facing tools). Default: empty (a transport with no command registry).
+    async fn command_list(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
+
+    /// Run a command by name (alias-aware), routing to its owning handler with the invocation's
+    /// session/origin context, and return the rendered [`CommandOutput`]. Built-in commands are thin
+    /// adapters over existing typed `NodeApi` ops; provider commands (e.g. `/lcm`, `/memory`) run on
+    /// the contributing subsystem. Default: unsupported (a transport with no command registry).
+    async fn command_invoke(
+        &self,
+        _invocation: CommandInvocation,
+    ) -> Result<CommandOutput, ApiError> {
+        Err(ApiError::Unsupported("command_invoke".into()))
+    }
+
     /// Read the node's runtime config (I13). Default: unsupported (config is env/TOML startup-only).
     async fn config_get(&self) -> Result<NodeConfigView, ApiError> {
         Err(ApiError::Unsupported("config_get".into()))
@@ -1700,6 +1719,118 @@ pub struct ToolInfo {
     pub description: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Command surface (daemon-authoritative operator/user commands)
+// ---------------------------------------------------------------------------
+//
+// The daemon owns the command catalog and its execution; a GUI/TUI is a thin client that renders
+// [`command_list`](ControlApi::command_list) and dispatches [`command_invoke`](ControlApi::command_invoke).
+// This is distinct from [`ToolInfo`]/[`ControlApi::tool_list`] (model-facing tools the LLM calls):
+// commands are human-invoked. The Rust port of hermes' `CommandDef` registry — a single declarative
+// catalog decoupled from handlers; built-in handlers are thin adapters over existing typed `NodeApi`
+// ops, so no operation logic is duplicated.
+
+/// The minimum access tier required to run a command — the `slash_access.py` analog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandAccess {
+    /// Any authenticated user may run it (the read-only floor: e.g. `help`/`whoami`/`status`).
+    #[default]
+    User,
+    /// Operator/admin only — mutating or node-wide ops.
+    Admin,
+}
+
+/// Whether a command applies to a specific session or the node as a whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandScope {
+    /// Operates on a specific session (an invocation should carry a [`SessionId`]).
+    #[default]
+    Session,
+    /// Operates on the node as a whole (no session required).
+    Node,
+}
+
+/// A client surface a command is exposed on. An empty `surfaces` list means "all surfaces" (the
+/// common case); a non-empty list restricts the command (the hermes `cli_only`/`gateway_only` analog).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandSurface {
+    /// A terminal/CLI shell.
+    Cli,
+    /// A graphical client (desktop/web composer).
+    Gui,
+    /// A messaging/chat transport.
+    Chat,
+}
+
+/// A declarative command-catalog entry (the `CommandDef` analog). **Metadata only** — the handler
+/// lives in the node-side command registry. Clients render menus + autocomplete from this and never
+/// model commands themselves.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSpec {
+    /// Canonical name without the leading slash (e.g. `"lcm"`, `"new"`).
+    pub name: String,
+    /// Alternative names that resolve to the same command (e.g. `["reset"]` for `new`).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// One-line human description.
+    #[serde(default)]
+    pub summary: String,
+    /// Grouping for client menus (e.g. `"Session"`, `"Context"`, `"Memory"`, `"Info"`).
+    #[serde(default)]
+    pub category: String,
+    /// Short argument placeholder hint (e.g. `"<prompt>"`, `"[name]"`).
+    #[serde(default)]
+    pub args_hint: String,
+    /// Tab-completable subcommands (e.g. `["status", "doctor", "backup", "rotate", "preset"]`).
+    #[serde(default)]
+    pub subcommands: Vec<String>,
+    /// Whether the command applies to a session or the whole node.
+    #[serde(default)]
+    pub scope: CommandScope,
+    /// The surfaces the command is exposed on (empty = all).
+    #[serde(default)]
+    pub surfaces: Vec<CommandSurface>,
+    /// Whether the command mutates durable state (clients treat it as non-idempotent).
+    #[serde(default)]
+    pub side_effecting: bool,
+    /// A UX hint that the client should confirm before running (e.g. destructive `apply` variants).
+    #[serde(default)]
+    pub confirm: bool,
+    /// The minimum access tier required to run it.
+    #[serde(default)]
+    pub min_access: CommandAccess,
+    /// The subsystem that owns the handler (e.g. `"node"`, `"lcm"`, `"mnemosyne"`) — diagnostics only.
+    #[serde(default)]
+    pub source: String,
+}
+
+/// A request to run a command. `args` is the raw trailing argument string (handlers parse it, like
+/// hermes' `fn(raw_args: str)`); `session` is required for [`CommandScope::Session`] commands.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInvocation {
+    /// The command name or alias (with or without a leading slash).
+    pub name: String,
+    /// The raw trailing argument string (may be empty).
+    #[serde(default)]
+    pub args: String,
+    /// The target session, for session-scoped commands.
+    #[serde(default)]
+    pub session: Option<SessionId>,
+    /// Optional caller attribution, for access decisions and audit.
+    #[serde(default)]
+    pub origin: Option<Origin>,
+}
+
+/// The rendered result of a command invocation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOutput {
+    /// The rendered output text (the client displays it).
+    pub text: String,
+    /// When `true`, the output is client-local feedback and must not enter the transcript/journal.
+    #[serde(default)]
+    pub ephemeral: bool,
+}
+
 /// An opaque view of the node's runtime config (I13 stub DTO). Carried as a serialized blob so the
 /// concrete `NodeConfig` (a binary-layer type) need not leak into the contract; the shape is the
 /// stable wire envelope, the encoding fills in with the runtime.
@@ -2587,6 +2718,13 @@ pub enum ApiRequest {
         /// The tool to register.
         tool: ToolInfo,
     },
+    /// [`ControlApi::command_list`] — the daemon-authoritative command catalog.
+    CommandList,
+    /// [`ControlApi::command_invoke`] — run a command by name.
+    CommandInvoke {
+        /// The command + args + session/origin context.
+        invocation: CommandInvocation,
+    },
     /// [`ControlApi::config_get`].
     ConfigGet,
     /// [`ControlApi::config_set`].
@@ -2873,6 +3011,10 @@ pub enum ApiResponse {
     Providers(Vec<ProviderInfo>),
     /// The node tool list (tool_list).
     Tools(Vec<ToolInfo>),
+    /// The daemon-authoritative command catalog (command_list).
+    Commands(Vec<CommandSpec>),
+    /// A command invocation's rendered result (command_invoke).
+    CommandOutput(CommandOutput),
     /// The node runtime config (config_get).
     Config(NodeConfigView),
     /// The scheduled cron jobs (cron_list).
@@ -3416,6 +3558,11 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         }
         ApiRequest::ToolList => ApiResponse::Tools(api.tool_list().await),
         ApiRequest::ToolRegister { tool } => unit_or_err(api.tool_register(tool).await),
+        ApiRequest::CommandList => ApiResponse::Commands(api.command_list().await),
+        ApiRequest::CommandInvoke { invocation } => match api.command_invoke(invocation).await {
+            Ok(out) => ApiResponse::CommandOutput(out),
+            Err(e) => ApiResponse::Error(e),
+        },
         ApiRequest::ConfigGet => match api.config_get().await {
             Ok(c) => ApiResponse::Config(c),
             Err(e) => ApiResponse::Error(e),
