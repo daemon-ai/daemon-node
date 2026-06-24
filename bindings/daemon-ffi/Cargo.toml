@@ -10,6 +10,13 @@ publish = false
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-daemon-host = { workspace = true }
+daemon-common = { workspace = true }
+daemon-core = { workspace = true }
+daemon-providers = { workspace = true }
 daemon-protocol = { workspace = true }
-daemon-supervision = { workspace = true }
+daemon-api = { workspace = true }
+daemon-host = { workspace = true }
+daemon-node = { workspace = true }
+daemon-store = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true }
+serde = { workspace = true }

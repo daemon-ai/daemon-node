@@ -57,9 +57,23 @@ typedef struct daemon_session_t daemon_session_t;
 uint32_t daemon_abi_version(void);
 
 /**
- * Create a runtime handle. Returns null on failure (see `daemon_last_error`).
+ * Create a runtime handle with the zero-config mock brain (deterministic provider, embedded L1
+ * credential pool, no journal). Returns null on failure (see `daemon_last_error`). Use
+ * `daemon_runtime_new_with_config` to drive a real provider.
  */
 struct daemon_runtime_t *daemon_runtime_new(void);
+
+/**
+ * Create a runtime handle from a CBOR-encoded [`CoreFfiConfig`] `(cfg, len)` — the seam that wires
+ * a *real* provider and an injected API key into every session's engine. Returns null on failure
+ * (see `daemon_last_error`).
+ *
+ * # Safety
+ * `cfg` must point to `len` readable bytes (a CBOR `CoreFfiConfig`); `len` may be `0` for the
+ * default config.
+ */
+struct daemon_runtime_t *daemon_runtime_new_with_config(const uint8_t *cfg,
+                                                        size_t len);
 
 /**
  * Free a runtime handle created by `daemon_runtime_new`.

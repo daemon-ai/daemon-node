@@ -2193,8 +2193,10 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-protocol",
+ "daemon-providers",
  "dashmap",
  "futures",
+ "serde",
  "tokio",
  "tokio-stream",
 ]
@@ -2227,9 +2229,16 @@ dependencies = [
 name = "daemon-ffi"
 version = "0.0.0"
 dependencies = [
+ "daemon-api",
+ "daemon-common",
+ "daemon-core",
  "daemon-host",
+ "daemon-node",
  "daemon-protocol",
- "daemon-supervision",
+ "daemon-providers",
+ "daemon-store",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

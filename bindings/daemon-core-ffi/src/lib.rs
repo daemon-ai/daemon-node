@@ -26,13 +26,16 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use daemon_api::{
     dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, LogPageView,
-    LogStream, Outbound, SessionApi,
+    LogStream, Outbound, ProviderSelector, SessionApi,
 };
-use daemon_common::{ReqId, SessionId};
+use daemon_common::{Budget, CredScope, ProfileRef, ReqId, SessionId};
 use daemon_core::{
-    spawn_agent_session, AgentHandle, Config, Engine, EngineProfile, MockProvider, Provider,
+    spawn_agent_session, AgentHandle, Config, CredentialBuilder, CredentialProvider,
+    EmbeddedCredentialPool, Engine, EngineProfile, MockProvider, Provider, ProviderBuilder,
     SystemPrompt, ToolRegistry,
 };
+use daemon_providers::GenAiProvider;
+use serde::{Deserialize, Serialize};
 use daemon_protocol::{
     AgentCommand, Direction, Disposition, HostRequest, HostRequestHandler, HostResponse,
     HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, TransportId,
@@ -105,6 +108,87 @@ fn finish(result: Result<Result<(), String>, Box<dyn Any + Send>>) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// construction config
+// ---------------------------------------------------------------------------
+
+/// Construction config for a runtime, marshalled in as CBOR by `daemon_runtime_new_with_config`.
+///
+/// This is a *construction* input, **not** a protocol/domain message (daemon-ffi-spec §2.1): it
+/// bundles existing contract types ([`ProviderSelector`], [`Config`], [`Budget`]) so a C embedder
+/// can stand up a *real* engine — a networked provider plus an injected key — without implementing
+/// any host-side port. Every field has a default, so a partial/absent blob degrades to the
+/// zero-config mock brain (`daemon_runtime_new`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoreFfiConfig {
+    /// Which model provider every session's engine builds. `Mock` (the default) keeps the
+    /// deterministic in-tree provider; `GenAi` builds a real networked provider (adapter inferred
+    /// from `model`). Local kinds are not assembled by this L1 brain FFI (see `build_engine`).
+    pub provider: ProviderSelector,
+    /// The (optionally namespaced) model name, e.g. `claude-sonnet-4` or `gpt-4o`.
+    pub model: String,
+    /// Override the provider base URL (custom gateway / proxy). `None` => the adapter default.
+    pub base_url: Option<String>,
+    /// The API key every turn acquires (it lands on `Request.auth`). `None` keeps the engine's
+    /// embedded single-key pool (a networked provider then resolves its env-var key).
+    pub api_key: Option<String>,
+    /// The credential/identity profile keys are acquired under (defaults to `default`).
+    pub profile: String,
+    /// The system prompt the engine runs under.
+    pub system_prompt: String,
+    /// Output-token cap per generation (provider-side). `None` => the provider's per-model default.
+    pub max_output_tokens: Option<u32>,
+    /// An optional usage budget (token / wall-clock ceiling). `None` => unlimited.
+    pub budget: Option<Budget>,
+    /// Engine tunables (§20). `None` => [`Config::default`].
+    pub config: Option<Config>,
+}
+
+impl Default for CoreFfiConfig {
+    fn default() -> Self {
+        Self {
+            provider: ProviderSelector::Mock,
+            model: String::new(),
+            base_url: None,
+            api_key: None,
+            profile: "default".to_string(),
+            system_prompt: "daemon-core-ffi session".to_string(),
+            max_output_tokens: None,
+            budget: None,
+            config: None,
+        }
+    }
+}
+
+/// Build the per-engine model-provider factory the config selects: a real networked
+/// [`GenAiProvider`] for `GenAi` (adapter inferred from the model name, with optional endpoint /
+/// output-token overrides), else the deterministic [`MockProvider`]. The local-inference kinds need
+/// a `ModelManager` + on-disk worker binary this self-contained L1 brain does not assemble, so they
+/// also fall back to the mock for now (a noted embedding follow-up).
+fn provider_builder(cfg: &CoreFfiConfig) -> ProviderBuilder {
+    match cfg.provider {
+        ProviderSelector::GenAi => {
+            let model = cfg.model.clone();
+            let base_url = cfg.base_url.clone();
+            let max_output = cfg.max_output_tokens;
+            Arc::new(move || {
+                let mut p = GenAiProvider::for_model(model.clone());
+                if let Some(base) = &base_url {
+                    p = p.with_endpoint(base.clone());
+                }
+                if let Some(max) = max_output {
+                    p = p.with_max_tokens(max);
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            })
+        }
+        _ => Arc::new(|| {
+            Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // opaque handles
 // ---------------------------------------------------------------------------
 
@@ -131,19 +215,63 @@ pub extern "C" fn daemon_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Create a runtime handle. Returns null on failure (see `daemon_last_error`).
+/// Create a runtime handle with the zero-config mock brain (deterministic provider, embedded L1
+/// credential pool, no journal). Returns null on failure (see `daemon_last_error`). Use
+/// `daemon_runtime_new_with_config` to drive a real provider.
 #[no_mangle]
 pub extern "C" fn daemon_runtime_new() -> *mut daemon_runtime_t {
-    let result = catch_unwind(|| {
+    build_runtime(CoreFfiConfig::default())
+}
+
+/// Create a runtime handle from a CBOR-encoded [`CoreFfiConfig`] `(cfg, len)` — the seam that wires
+/// a *real* provider and an injected API key into every session's engine. Returns null on failure
+/// (see `daemon_last_error`).
+///
+/// # Safety
+/// `cfg` must point to `len` readable bytes (a CBOR `CoreFfiConfig`); `len` may be `0` for the
+/// default config.
+#[no_mangle]
+pub unsafe extern "C" fn daemon_runtime_new_with_config(
+    cfg: *const u8,
+    len: usize,
+) -> *mut daemon_runtime_t {
+    if cfg.is_null() && len != 0 {
+        set_last_error("null config pointer to daemon_runtime_new_with_config");
+        return std::ptr::null_mut();
+    }
+    let parsed = catch_unwind(AssertUnwindSafe(|| {
+        if len == 0 {
+            return Ok::<_, String>(CoreFfiConfig::default());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(cfg, len) };
+        from_cbor::<CoreFfiConfig>(bytes).map_err(|e| e.to_string())
+    }));
+    match parsed {
+        Ok(Ok(config)) => build_runtime(config),
+        Ok(Err(msg)) => {
+            set_last_error(msg);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error("panic decoding runtime config");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Shared construction for both runtime entry points: build the Tokio runtime + a config-driven
+/// session surface, boxing it into an opaque handle (null on failure).
+fn build_runtime(config: CoreFfiConfig) -> *mut daemon_runtime_t {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(Box::new(daemon_runtime_t {
             rt,
-            api: Arc::new(CoreSessionApi::new()),
+            api: Arc::new(CoreSessionApi::new(Arc::new(config))),
         }))
-    });
+    }));
     match result {
         Ok(Ok(b)) => Box::into_raw(b),
         Ok(Err(msg)) => {
@@ -482,33 +610,57 @@ impl Drop for LiveSession {
 /// stays free of `daemon-host`.
 struct CoreSessionApi {
     sessions: DashMap<SessionId, LiveSession>,
+    /// The construction config every session's engine is built from (provider, key, tunables).
+    config: Arc<CoreFfiConfig>,
 }
 
 impl CoreSessionApi {
-    fn new() -> Self {
+    fn new(config: Arc<CoreFfiConfig>) -> Self {
         Self {
             sessions: DashMap::new(),
+            config,
         }
     }
 
-    fn build_engine(id: SessionId) -> Engine {
-        // Construct through a `with_config`-dressed `EngineProfile` so the FFI's engine matches the
-        // rest of the system's construction seam (explicit tunables rather than a silent default).
-        //
-        // This embed path is deliberately self-contained (it cannot depend on `daemon-host`/
-        // `daemon-node`). Injecting a real provider, brokered credentials, or a verifiable-journal
-        // sink would need new C-ABI surface to pass those in; that is deferred to the embedding /
-        // ACP phase. Until then it uses the Mock provider, the engine's embedded L1 credential pool,
-        // and no journal.
-        EngineProfile::new(
-            Arc::new(|| {
-                Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>
-            }),
+    /// Build a fresh engine for `id` from the runtime's [`CoreFfiConfig`].
+    ///
+    /// Construction goes through the same `EngineProfile` seam the rest of the system uses, so the
+    /// FFI's engine matches the durable/live construction path. This embed stays self-contained (it
+    /// cannot depend on `daemon-host`/`daemon-node`): a *real* provider comes from `daemon-providers`
+    /// and a real key is injected through an embedded L1 [`EmbeddedCredentialPool`] (no host-side
+    /// broker). A durable verifiable journal and local-inference (`ModelManager` + worker binary)
+    /// remain L2/`daemon-ffi` concerns (daemon-ffi-spec §2.1) and fall back to the mock here.
+    fn build_engine(&self, id: SessionId) -> Engine {
+        let cfg = &self.config;
+        let mut profile = EngineProfile::new(
+            provider_builder(cfg),
             Arc::new(ToolRegistry::new()),
-            SystemPrompt::new("daemon-core-ffi session"),
+            SystemPrompt::new(cfg.system_prompt.clone()),
         )
-        .with_config(Config::default())
-        .fresh(id)
+        .with_config(cfg.config.unwrap_or_default());
+
+        if let Some(budget) = cfg.budget {
+            profile = profile.with_budget(budget);
+        }
+
+        // A real key reaches `Request.auth` through an embedded L1 pool scoped to the config
+        // profile. Without a key the engine keeps its default single-key pool (a networked provider
+        // then resolves its env-var key).
+        if let Some(key) = &cfg.api_key {
+            let profile_name = cfg.profile.clone();
+            let pool = Arc::new(EmbeddedCredentialPool::new(
+                profile_name.clone(),
+                CredScope::new([profile_name.as_str()], ["chat"], None),
+                [("ffi".to_string(), key.clone())],
+                60_000,
+                30_000,
+            ));
+            let builder: CredentialBuilder =
+                Arc::new(move || pool.clone() as Arc<dyn CredentialProvider>);
+            profile = profile.with_credentials(builder, ProfileRef::new(profile_name));
+        }
+
+        profile.fresh(id)
     }
 
     fn ensure(&self, session: &SessionId) -> AgentHandle {
@@ -523,7 +675,7 @@ impl CoreSessionApi {
             pending: pending.clone(),
             log: log.clone(),
         });
-        let handle = spawn_agent_session(Self::build_engine(session.clone()), host);
+        let handle = spawn_agent_session(self.build_engine(session.clone()), host);
 
         let mut rx = handle.subscribe();
         let pump_drain = drain.clone();
@@ -782,16 +934,19 @@ mod fixture_tests {
 
     use super::*;
 
-    /// CBOR for `AgentCommand::StartTurn { input: { text: "hi" }, request_id: 1 }`
-    /// (externally-tagged: `{"StartTurn": {"input": {"text": "hi"}, "request_id": 1}}`).
+    /// CBOR for `AgentCommand::StartTurn { input: { text: "hi", attachments: [] }, request_id: 1 }`
+    /// (externally-tagged: `{"StartTurn": {"input": {"text": "hi", "attachments": []},
+    /// "request_id": 1}}`).
     const START_TURN_HI: &[u8] = &[
         0xA1, // map(1)
         0x69, b'S', b't', b'a', b'r', b't', b'T', b'u', b'r', b'n', // "StartTurn"
         0xA2, // map(2)
         0x65, b'i', b'n', b'p', b'u', b't', // "input"
-        0xA1, // map(1)
+        0xA2, // map(2)
         0x64, b't', b'e', b'x', b't', // "text"
         0x62, b'h', b'i', // "hi"
+        0x6B, b'a', b't', b't', b'a', b'c', b'h', b'm', b'e', b'n', b't', b's', // "attachments"
+        0x80, // array(0)
         0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd', // "request_id"
         0x01, // 1
     ];
@@ -858,6 +1013,89 @@ mod fixture_tests {
 }
 
 #[cfg(test)]
+mod config_tests {
+    //! The construction-config surface: a [`CoreFfiConfig`] survives the CBOR round-trip the FFI
+    //! entry point decodes, and `provider_builder` selects a *real* networked provider for `GenAi`
+    //! (observable via streaming capability) while the default config stays on the mock brain.
+
+    use super::*;
+
+    #[test]
+    fn core_ffi_config_round_trips_through_cbor() {
+        let cfg = CoreFfiConfig {
+            provider: ProviderSelector::GenAi,
+            model: "claude-sonnet-4".into(),
+            base_url: Some("https://gateway.example/v1".into()),
+            api_key: Some("sk-test".into()),
+            profile: "work".into(),
+            system_prompt: "be helpful".into(),
+            max_output_tokens: Some(8192),
+            budget: Some(Budget {
+                tokens: Some(1_000_000),
+                wall_ms: None,
+            }),
+            config: Some(Config::default()),
+        };
+        let bytes = to_cbor(&cfg);
+        let decoded: CoreFfiConfig = from_cbor(&bytes).expect("decode CoreFfiConfig");
+        assert_eq!(cfg, decoded);
+    }
+
+    #[test]
+    fn empty_blob_decodes_to_default_via_serde_default() {
+        // The container `#[serde(default)]` means a minimal/partial blob degrades to defaults: an
+        // empty CBOR map (`0xA0`) decodes to the zero-config mock brain.
+        let decoded: CoreFfiConfig = from_cbor(&[0xA0]).expect("decode empty map");
+        assert_eq!(decoded, CoreFfiConfig::default());
+        assert_eq!(decoded.provider, ProviderSelector::Mock);
+    }
+
+    /// The exact CBOR the C harness embeds for its `daemon_runtime_new_with_config` call:
+    /// `{ "provider": "mock", "system_prompt": "harness-cfg" }`. Pins the field-name/enum encoding
+    /// so the harness fixture cannot silently drift.
+    const CORE_CONFIG: &[u8] = &[
+        0xA2, // map(2)
+        0x68, b'p', b'r', b'o', b'v', b'i', b'd', b'e', b'r', // "provider"
+        0x64, b'm', b'o', b'c', b'k', // "mock"
+        0x6D, b's', b'y', b's', b't', b'e', b'm', b'_', b'p', b'r', b'o', b'm', b'p',
+        b't', // "system_prompt"
+        0x6B, b'h', b'a', b'r', b'n', b'e', b's', b's', b'-', b'c', b'f', b'g', // "harness-cfg"
+    ];
+
+    #[test]
+    fn core_config_blob_decodes_to_mock() {
+        let cfg: CoreFfiConfig = from_cbor(CORE_CONFIG).expect("decode harness config blob");
+        assert_eq!(cfg.provider, ProviderSelector::Mock);
+        assert_eq!(cfg.system_prompt, "harness-cfg");
+    }
+
+    #[test]
+    fn genai_config_builds_a_real_streaming_provider() {
+        let cfg = CoreFfiConfig {
+            provider: ProviderSelector::GenAi,
+            model: "gpt-4o".into(),
+            ..CoreFfiConfig::default()
+        };
+        let provider = provider_builder(&cfg)();
+        // The deterministic mock is non-streaming; the real genai provider streams. This proves the
+        // config selected a genuine provider without any network call.
+        assert!(
+            provider.capabilities().supports_streaming,
+            "GenAi config must build the real (streaming) provider, not the mock"
+        );
+    }
+
+    #[test]
+    fn default_config_builds_the_mock_provider() {
+        let provider = provider_builder(&CoreFfiConfig::default())();
+        assert!(
+            !provider.capabilities().supports_streaming,
+            "default config must stay on the non-streaming mock brain"
+        );
+    }
+}
+
+#[cfg(test)]
 mod merged_log_tests {
     //! The non-destructive merged log over the self-contained FFI [`CoreSessionApi`]: a submitted
     //! `StartTurn` is recorded as an inbound entry under the unified `seq`, ahead of the engine's
@@ -870,7 +1108,7 @@ mod merged_log_tests {
 
     #[tokio::test]
     async fn log_after_records_inbound_then_outbound_non_destructively() {
-        let api = CoreSessionApi::new();
+        let api = CoreSessionApi::new(Arc::new(CoreFfiConfig::default()));
         let session = SessionId::new("merged");
 
         api.submit(
@@ -929,7 +1167,7 @@ mod merged_log_tests {
     async fn submit_from_attributes_inbound_to_origin() {
         // `submit_from` carries per-event provenance onto the merged log: the inbound entry is
         // attributed to the submitting surface's origin, not the host-local `ffi` default.
-        let api = CoreSessionApi::new();
+        let api = CoreSessionApi::new(Arc::new(CoreFfiConfig::default()));
         let session = SessionId::new("attributed");
         let origin = Origin::new("telegram", OriginScope::Dm { user: "u1".into() });
 
@@ -958,7 +1196,7 @@ mod merged_log_tests {
     async fn record_meta_is_observable_but_not_in_history() {
         // A `Transport` meta event lands on the merged live log (observable via `log_after`) but is
         // never folded into durable history (`session_history`) — observability, not context.
-        let api = CoreSessionApi::new();
+        let api = CoreSessionApi::new(Arc::new(CoreFfiConfig::default()));
         let session = SessionId::new("meta");
 
         // Open the session so it has a live log to record onto.

@@ -19,17 +19,34 @@
 
 #include "../include/daemon_core.h"
 
-/* CBOR for AgentCommand::StartTurn { input: { text: "hi" }, request_id: 1 }. */
+/* CBOR for AgentCommand::StartTurn { input: { text: "hi", attachments: [] }, request_id: 1 }. */
 static const uint8_t START_TURN_HI[] = {
     0xA1,
     0x69, 'S','t','a','r','t','T','u','r','n',
     0xA2,
     0x65, 'i','n','p','u','t',
-    0xA1,
+    0xA2,
     0x64, 't','e','x','t',
     0x62, 'h','i',
+    0x6B, 'a','t','t','a','c','h','m','e','n','t','s',
+    0x80,
     0x6A, 'r','e','q','u','e','s','t','_','i','d',
     0x01,
+};
+
+/*
+ * CBOR for a partial CoreFfiConfig { provider: "mock", system_prompt: "harness-cfg" } — the
+ * construction-config blob `daemon_runtime_new_with_config` decodes. Every field is
+ * `#[serde(default)]`, so this minimal map degrades to the zero-config mock brain with a custom
+ * prompt (a real provider would set provider: "genai" + model + api_key). Pinned by the Rust
+ * `config_tests::core_config_blob_decodes_to_mock` test so it cannot silently drift.
+ */
+static const uint8_t CORE_CONFIG[] = {
+    0xA2,
+    0x68, 'p','r','o','v','i','d','e','r',
+    0x64, 'm','o','c','k',
+    0x6D, 's','y','s','t','e','m','_','p','r','o','m','p','t',
+    0x6B, 'h','a','r','n','e','s','s','-','c','f','g',
 };
 
 /* CBOR for AgentCommand::Snapshot { request_id: 2 }. */
@@ -127,8 +144,26 @@ int main(void) {
     daemon_session_free(s);
     daemon_runtime_free(rt);
 
+    /*
+     * The construction-config entry point, over the same ABI: stand a runtime up from a CBOR
+     * CoreFfiConfig and drive the same transcript. (This blob keeps the mock provider so the
+     * harness stays network-free; a real embedder sets provider: "genai" + model + api_key.)
+     */
     if (ok) {
-        printf("OK: C ABI exercised StartTurn + Snapshot + Steer\n");
+        daemon_runtime_t *crt = daemon_runtime_new_with_config(CORE_CONFIG, sizeof(CORE_CONFIG));
+        if (!crt) { print_last_error("runtime_new_with_config"); return 1; }
+        const char *cname = "ffi-cfg-session";
+        daemon_session_t *cs = daemon_session_open(crt, (const uint8_t *)cname, strlen(cname));
+        if (!cs) { print_last_error("cfg session_open"); daemon_runtime_free(crt); return 1; }
+        if (submit_and_await(cs, START_TURN_HI, sizeof(START_TURN_HI), "cfg start_turn", "TurnFinished")) {
+            printf("OK: drained TurnFinished from a config-built runtime\n");
+        } else { ok = 0; }
+        daemon_session_free(cs);
+        daemon_runtime_free(crt);
+    }
+
+    if (ok) {
+        printf("OK: C ABI exercised StartTurn + Snapshot + Steer + config runtime\n");
         return 0;
     }
     return 1;

@@ -1,9 +1,10 @@
 //! `xtask` — repo automation (codegen, CI helpers).
 //!
 //! Subcommands:
-//! - `gen-headers` — run `cbindgen` over `bindings/daemon-core-ffi` to (re)generate the committed C
-//!   header `bindings/daemon-core-ffi/include/daemon_core.h`. The generated header plus the
-//!   published `daemon-api.cddl` are the complete non-Rust contract (daemon-ffi-spec §3.6).
+//! - `gen-headers` — run `cbindgen` over both binding crates to (re)generate the committed C
+//!   headers `bindings/daemon-core-ffi/include/daemon_core.h` (the L1 brain seam) and
+//!   `bindings/daemon-ffi/include/daemon.h` (the L2 durable-host seam). The generated headers plus
+//!   the published `daemon-api.cddl` are the complete non-Rust contract (daemon-ffi-spec §3.6).
 //! - `cddl` — a light presence/sanity check of the `daemon-api` mirror CDDL artifact.
 
 #![forbid(unsafe_code)]
@@ -31,25 +32,38 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Generate `bindings/daemon-core-ffi/include/daemon_core.h` via `cbindgen`.
+/// Generate the committed C headers for both binding crates via `cbindgen`.
 fn gen_headers() -> anyhow::Result<()> {
     let root = workspace_root();
-    let crate_dir = root.join("bindings/daemon-core-ffi");
+    // (crate name, crate dir relative to root, output header relative to the crate dir).
+    let crates = [
+        ("daemon-core-ffi", "bindings/daemon-core-ffi", "include/daemon_core.h"),
+        ("daemon-ffi", "bindings/daemon-ffi", "include/daemon.h"),
+    ];
+    for (name, dir, header) in crates {
+        gen_one_header(&root, name, dir, header)?;
+    }
+    Ok(())
+}
+
+/// Run `cbindgen` over one binding crate, writing its committed header.
+fn gen_one_header(root: &Path, name: &str, dir: &str, header: &str) -> anyhow::Result<()> {
+    let crate_dir = root.join(dir);
     let config = crate_dir.join("cbindgen.toml");
-    let out = crate_dir.join("include/daemon_core.h");
+    let out = crate_dir.join(header);
     std::fs::create_dir_all(out.parent().unwrap())?;
 
     let status = Command::new("cbindgen")
         .arg("--config")
         .arg(&config)
         .arg("--crate")
-        .arg("daemon-core-ffi")
+        .arg(name)
         .arg("--output")
         .arg(&out)
         .arg(&crate_dir)
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run cbindgen (is it on PATH?): {e}"))?;
-    anyhow::ensure!(status.success(), "cbindgen exited with {status}");
+    anyhow::ensure!(status.success(), "cbindgen exited with {status} for {name}");
 
     println!("generated {}", out.display());
     Ok(())
