@@ -61,6 +61,9 @@ struct State {
     breakers: Vec<SummaryCircuitBreaker>,
     /// How many compactions have actually run this incarnation.
     compaction_count: u64,
+    /// The token count of the most recent assembled prompt (measured in `before_turn`) — backs the
+    /// `context_pressure` doctor check (the `engine.last_prompt_tokens` analog).
+    last_prompt_tokens: usize,
     /// When the last compaction was a no-op (for the boundary cooldown).
     last_noop_at: Option<Instant>,
     /// The number of live conversation turns already ingested into `messages` this incarnation.
@@ -182,13 +185,14 @@ impl LcmContextEngine {
     /// string (§10.7). The tools read the durable store, so recovery works regardless of what is
     /// currently in-context.
     pub async fn call_tool(&self, name: &str, args: Value) -> String {
-        let (session_id, tokenizer, threshold_tokens, context_length, compaction_count, session_ignored, session_stateless) = {
+        let (session_id, tokenizer, threshold_tokens, context_length, last_prompt_tokens, compaction_count, session_ignored, session_stateless) = {
             let state = self.state.lock().expect("lcm state poisoned");
             (
                 effective_session(&state.session_id),
                 state.tokenizer.clone(),
                 state.threshold_tokens,
                 state.context_length,
+                state.last_prompt_tokens,
                 state.compaction_count,
                 state.session_ignored,
                 state.session_stateless,
@@ -202,6 +206,7 @@ impl LcmContextEngine {
             session_id: &session_id,
             threshold_tokens,
             context_length,
+            last_prompt_tokens,
             compaction_count,
             session_ignored,
             session_stateless,
@@ -322,8 +327,11 @@ impl ContextEngine for LcmContextEngine {
     fn before_turn(&self, conv: &Conversation, budget: Option<usize>) -> Pressure {
         // Keep the durable transcript current before measuring pressure (so the tools see this turn).
         self.ingest_current(conv);
-        let state = self.state.lock().expect("lcm state poisoned");
+        let mut state = self.state.lock().expect("lcm state poisoned");
         let used_tokens = state.tokenizer.count_conversation(conv);
+        // Remember the measured prompt size so `lcm_doctor`'s `context_pressure` check can report
+        // live usage vs the compaction threshold.
+        state.last_prompt_tokens = used_tokens;
         // Ignored/stateless sessions are never compacted (no store writes) — report no budget so the
         // turn loop never calls `compact` for them (§12.5).
         let filtered = state.session_ignored || state.session_stateless;
@@ -500,9 +508,16 @@ fn pretty_json(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemon_common::UsageDelta;
     use daemon_core::conversation::{AssistantMsg, ToolResult, ToolTurn};
-    use daemon_core::{ScriptedProvider, SystemPrompt, ToolCall, Turn};
-    use daemon_protocol::UserMsg;
+    use daemon_core::provider::{Capabilities, ModelOutput, Request, ToolCallFormat};
+    use daemon_core::{
+        Engine, EventSink, Failure, ScriptedProvider, Snapshot, SystemPrompt, ToolCall,
+        ToolRegistry, Turn, TurnControl, TurnOutcome,
+    };
+    use daemon_protocol::{
+        HostRequest, HostRequestHandler, HostResponse, HostResponseBody, UserMsg,
+    };
 
     fn aux_with(summary: &str) -> Arc<dyn Provider> {
         Arc::new(ScriptedProvider::new(Vec::new(), summary.to_string()))
@@ -837,5 +852,138 @@ mod tests {
             "no cross-attribution"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M8 (spec §15): concurrent sessions over **one shared bank** ingest and attribute both their
+    /// summary nodes and raw `messages` to the correct `session_id`, with no cross-contamination.
+    /// Strengthens `per_session_instances_attribute_summaries_correctly` by also driving the
+    /// `before_turn` ingest path and asserting raw-message attribution is disjoint by session.
+    #[tokio::test]
+    async fn m8_concurrent_sessions_isolate_ingest_and_attribution() {
+        let dir = std::env::temp_dir().join(format!("lcm-m8-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        let a =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("alpha"), aux_with("s"))
+                .unwrap();
+        let b =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("beta"), aux_with("s"))
+                .unwrap();
+        a.on_model(&model());
+        b.on_model(&model());
+
+        // Ingest each session's live transcript, then compact both concurrently over the one bank.
+        let (ca, cb) = (convo(50), convo(40));
+        a.before_turn(&ca, None);
+        b.before_turn(&cb, None);
+        let (_ra, _rb) = tokio::join!(a.compact(ca, 100), b.compact(cb, 100));
+
+        let reader =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("reader"), aux_with("s"))
+                .unwrap();
+        let store = reader.store();
+        // Summary nodes attributed to the right session, none leaked to a third.
+        assert_eq!(store.summary_count("alpha").unwrap(), 1, "alpha attributed");
+        assert_eq!(store.summary_count("beta").unwrap(), 1, "beta attributed");
+        assert_eq!(store.summary_count("reader").unwrap(), 0, "no cross-attribution");
+        // Raw messages ingested under each session are disjoint and non-empty.
+        assert!(store.message_count("alpha").unwrap() > 0, "alpha ingested");
+        assert!(store.message_count("beta").unwrap() > 0, "beta ingested");
+        assert_eq!(store.message_count("reader").unwrap(), 0, "reader ingested nothing");
+        // Every persisted node carries the session id it belongs to.
+        for sid in ["alpha", "beta"] {
+            for node in store.get_session_nodes(sid, None, 100).unwrap() {
+                assert_eq!(node.session_id, sid, "node {} mis-attributed", node.node_id);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host that approves everything (the §8 recovery loop never gates in this test).
+    struct NoopHost;
+
+    #[async_trait]
+    impl HostRequestHandler for NoopHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved(true),
+            }
+        }
+    }
+
+    /// A model provider that fails its first call with `ContextOverflow` (forcing the §8 ->
+    /// §10 compact-and-retry-once path) then succeeds. `max_context` is large so the *pre-turn*
+    /// budget check never compacts — the only compaction is the error-driven one under test.
+    struct OverflowOnceProvider {
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Provider for OverflowOnceProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(200_000),
+            }
+        }
+
+        async fn chat(&self, _req: Request) -> std::result::Result<ModelOutput, Failure> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                Err(Failure::ContextOverflow("prompt exceeds the model window".into()))
+            } else {
+                Ok(ModelOutput {
+                    text: "done after compaction".into(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: UsageDelta::default(),
+                })
+            }
+        }
+    }
+
+    /// M8 (spec §15): end-to-end context-overflow recovery through the real `Engine` driving a real
+    /// `LcmContextEngine`. The first model call overflows; the engine compacts via LCM exactly once
+    /// and retries; the retry succeeds. Asserts the turn completed, the model was called exactly
+    /// twice (one compact-then-retry), and LCM actually compacted (a summary node was written).
+    #[tokio::test]
+    async fn m8_context_overflow_compacts_via_lcm_and_retries_once() {
+        let aux = aux_with("a compacted summary of the earlier conversation");
+        let lcm = Arc::new(LcmContextEngine::open_in_memory(aux).unwrap());
+        let provider = Arc::new(OverflowOnceProvider {
+            calls: AtomicU64::new(0),
+        });
+
+        // Seed a long conversation (100 turns) so the forced compaction has a region beyond the
+        // fresh tail to summarize.
+        let mut snapshot = Snapshot::fresh(SessionId::new("overflow"));
+        snapshot.conversation = convo(50);
+        let mut engine =
+            Engine::from_snapshot(snapshot, provider.clone(), Arc::new(ToolRegistry::new()))
+                .with_context_engine(lcm.clone());
+        engine.push_user(UserMsg::new("continue please"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .expect("turn completes after a single compact + retry");
+
+        assert!(matches!(outcome, TurnOutcome::Completed(_)), "turn completed");
+        assert_eq!(
+            provider.calls.load(Ordering::Relaxed),
+            2,
+            "the overflow drove exactly one compact-then-retry"
+        );
+        assert!(
+            lcm.store().summary_count("overflow").unwrap() >= 1,
+            "LCM compacted the overflowed conversation (a summary node was written)"
+        );
     }
 }

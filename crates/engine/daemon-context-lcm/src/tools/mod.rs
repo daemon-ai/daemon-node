@@ -68,6 +68,9 @@ pub(crate) struct ToolCx<'a> {
     pub threshold_tokens: Option<usize>,
     /// The model context window in tokens, if known (drives the preset suggestion).
     pub context_length: Option<usize>,
+    /// The token count of the most recent assembled prompt (`before_turn`) — backs the
+    /// `context_pressure` doctor check.
+    pub last_prompt_tokens: usize,
     /// How many compactions have run this incarnation (status).
     pub compaction_count: u64,
     /// Whether the session is ignored (no ingest/compaction) — §12.5.
@@ -666,8 +669,17 @@ fn doctor(cx: &ToolCx<'_>) -> String {
 
     // database_integrity
     let integrity = cx.store.integrity_check().unwrap_or_else(|e| e.to_string());
-    let ok = integrity == "ok";
-    push_check(&mut checks, &mut worst, "database_integrity", ok, Health::Unhealthy, &integrity);
+    let integrity_ok = integrity == "ok";
+    push_check(&mut checks, &mut worst, "database_integrity", integrity_ok, Health::Unhealthy, integrity);
+
+    // schema_core_tables — every core table/index the schema declares is present (§10.6).
+    match cx.store.schema_health() {
+        Ok(schema) => {
+            let ok = schema.missing.is_empty();
+            push_check(&mut checks, &mut worst, "schema_core_tables", ok, Health::Unhealthy, to_detail(&schema));
+        }
+        Err(e) => push_check(&mut checks, &mut worst, "schema_core_tables", false, Health::Unhealthy, e.to_string()),
+    }
 
     // fts_index_sync (both shadows must match their base table)
     let counts = cx.store.table_counts().unwrap_or_default();
@@ -679,7 +691,7 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         "messages_fts_integrity",
         msg_sync,
         Health::Warnings,
-        &format!("messages={} fts={}", counts.messages, counts.messages_fts),
+        format!("messages={} fts={}", counts.messages, counts.messages_fts),
     );
     push_check(
         &mut checks,
@@ -687,8 +699,17 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         "nodes_fts_integrity",
         node_sync,
         Health::Warnings,
-        &format!("nodes={} fts={}", counts.nodes, counts.nodes_fts),
+        format!("nodes={} fts={}", counts.nodes, counts.nodes_fts),
     );
+
+    // sqlite_storage — journal mode + `quick_check` + backing-file posture (§10.6).
+    match cx.store.storage_posture() {
+        Ok(posture) => {
+            let ok = posture.quick_check == "ok";
+            push_check(&mut checks, &mut worst, "sqlite_storage", ok, Health::Unhealthy, to_detail(&posture));
+        }
+        Err(e) => push_check(&mut checks, &mut worst, "sqlite_storage", false, Health::Unhealthy, e.to_string()),
+    }
 
     // orphaned_dag_nodes
     let orphans = cx.store.orphaned_node_count().unwrap_or(0);
@@ -698,7 +719,7 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         "orphaned_dag_nodes",
         orphans == 0,
         Health::Warnings,
-        &format!("{orphans} orphaned child references"),
+        format!("{orphans} orphaned child references"),
     );
 
     // payload_storage — the externalization side channel (§9.1).
@@ -709,7 +730,7 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         "payload_storage",
         storage_ok,
         Health::Warnings,
-        &storage_detail,
+        storage_detail,
     );
 
     // sensitive_pattern_handling — the redaction catalog config (§8.1).
@@ -720,25 +741,104 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         "sensitive_pattern_handling",
         sens_ok,
         Health::Warnings,
-        &sens_detail,
+        sens_detail,
     );
+
+    // summary_quality — degraded compression ratios for the foreground session (§10.6).
+    match cx.store.summary_quality_stats(cx.session_id) {
+        Ok(sq) => {
+            let ok = sq.extreme_ratio_nodes + sq.tiny_large_source_nodes == 0;
+            push_check(&mut checks, &mut worst, "summary_quality", ok, Health::Warnings, to_detail(&sq));
+        }
+        Err(e) => push_check(&mut checks, &mut worst, "summary_quality", false, Health::Unhealthy, e.to_string()),
+    }
+
+    // config_validation — config values within sane operating ranges (§10.6).
+    let (config_ok, config_detail) = config_validation_check(cx);
+    push_check(&mut checks, &mut worst, "config_validation", config_ok, Health::Warnings, config_detail);
+
+    // source_lineage_hygiene — source-attribution bucket counts, bank-wide (§10.6). Detail-only
+    // (always `pass`), matching the Python reference.
+    match cx.store.source_stats(None) {
+        Ok(src) => {
+            let mut detail = to_detail(&src);
+            if let Value::Object(ref mut map) = detail {
+                map.insert("normalization_mode".to_string(), json!("backcompat-normalization"));
+            }
+            push_check(&mut checks, &mut worst, "source_lineage_hygiene", true, Health::Warnings, detail);
+        }
+        Err(e) => push_check(&mut checks, &mut worst, "source_lineage_hygiene", false, Health::Unhealthy, e.to_string()),
+    }
+
+    // lifecycle_fragmentation — session-id mismatches across messages/nodes/lifecycle state (§10.6).
+    match cx.store.lifecycle_fragmentation_stats() {
+        Ok(frag) => {
+            let ok = !frag.is_fragmented();
+            push_check(&mut checks, &mut worst, "lifecycle_fragmentation", ok, Health::Warnings, to_detail(&frag));
+        }
+        Err(e) => push_check(&mut checks, &mut worst, "lifecycle_fragmentation", false, Health::Unhealthy, e.to_string()),
+    }
+
+    // context_pressure — live prompt usage vs the compaction threshold (§10.6). Reported only when
+    // the model context window is known (the Python `if engine.context_length > 0` guard).
+    if let Some(ctx_len) = cx.context_length.filter(|n| *n > 0) {
+        let usage_pct = round1(cx.last_prompt_tokens as f64 / ctx_len as f64 * 100.0);
+        let threshold_pct = round1(cx.config.context_threshold * 100.0);
+        push_check(
+            &mut checks,
+            &mut worst,
+            "context_pressure",
+            usage_pct < threshold_pct,
+            Health::Warnings,
+            format!("{usage_pct}% used, compaction triggers at {threshold_pct}%"),
+        );
+    }
 
     json!({
         "overall": worst.as_str(),
         "runtime_identity": {"session_id": cx.session_id, "bank": cx.config.bank},
         "checks": checks,
-        // Spec checks not yet ported (separate config knobs, not part of the M5/M7 acceptance).
-        "skipped": [
-            "schema_core_tables",
-            "sqlite_storage",
-            "summary_quality",
-            "config_validation",
-            "source_lineage_hygiene",
-            "lifecycle_fragmentation",
-            "context_pressure",
-        ],
     })
     .to_string()
+}
+
+/// `config_validation` doctor check: flag config values outside sane operating ranges (the port of
+/// `lcm_doctor`'s configuration block, `LCM:tools.py:1860`). Returns `(ok, detail)` where `detail`
+/// is the warnings array (or an all-clear string).
+fn config_validation_check(cx: &ToolCx<'_>) -> (bool, Value) {
+    let c = cx.config;
+    let mut warnings: Vec<String> = Vec::new();
+    if c.fresh_tail_count < 2 {
+        warnings.push("fresh_tail_count < 2 may cause aggressive compaction".to_string());
+    }
+    if c.context_threshold > 0.95 {
+        warnings.push("context_threshold > 0.95 leaves very little headroom".to_string());
+    }
+    if c.context_threshold < 0.3 {
+        warnings.push("context_threshold < 0.3 triggers compaction very early".to_string());
+    }
+    if c.condensation_fanin < 2 {
+        warnings.push("condensation_fanin < 2 creates excessive depth growth".to_string());
+    }
+    if c.incremental_max_depth == 0 {
+        warnings.push("incremental_max_depth=0 disables condensation entirely".to_string());
+    }
+    if warnings.is_empty() {
+        (true, json!("all settings within normal ranges"))
+    } else {
+        (false, json!(warnings))
+    }
+}
+
+/// Round to one decimal place (the Python diagnostics' `round(x, 1)`).
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+/// Serialize a diagnostic struct into a JSON `detail` value (defaulting to `null` on the impossible
+/// serialization failure).
+fn to_detail<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
 /// `payload_storage` doctor check: the externalization directory is usable (metadata-only).
@@ -802,7 +902,7 @@ fn push_check(
     name: &str,
     ok: bool,
     fail_level: Health,
-    detail: &str,
+    detail: impl Into<Value>,
 ) {
     let status = if ok {
         "ok"
@@ -814,7 +914,7 @@ fn push_check(
             "warn"
         }
     };
-    checks.push(json!({"check": name, "status": status, "detail": detail}));
+    checks.push(json!({"check": name, "status": status, "detail": detail.into()}));
 }
 
 // ---- helpers ------------------------------------------------------------------------------------

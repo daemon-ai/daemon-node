@@ -81,6 +81,7 @@ impl Fixture {
             session_id: "s1",
             threshold_tokens: Some(350),
             context_length: Some(200_000),
+            last_prompt_tokens: 0,
             compaction_count: 2,
             session_ignored: false,
             session_stateless: false,
@@ -249,6 +250,90 @@ async fn doctor_is_healthy_on_a_consistent_store() {
     let checks = out["checks"].as_array().unwrap();
     assert!(checks.iter().any(|c| c["check"] == "database_integrity" && c["status"] == "ok"));
     assert!(checks.iter().any(|c| c["check"] == "messages_fts_integrity" && c["status"] == "ok"));
+    // The full ported catalog: 13 always-on checks plus `context_pressure` (emitted because the
+    // fixture's `ToolCx` carries a `context_length`). No check is `skipped` anymore.
+    let names: Vec<&str> = checks.iter().map(|c| c["check"].as_str().unwrap()).collect();
+    for expected in [
+        "database_integrity",
+        "schema_core_tables",
+        "messages_fts_integrity",
+        "nodes_fts_integrity",
+        "sqlite_storage",
+        "orphaned_dag_nodes",
+        "payload_storage",
+        "sensitive_pattern_handling",
+        "summary_quality",
+        "config_validation",
+        "source_lineage_hygiene",
+        "lifecycle_fragmentation",
+        "context_pressure",
+    ] {
+        assert!(names.contains(&expected), "doctor is missing the {expected} check");
+    }
+    assert!(out.get("skipped").is_none(), "no checks are skipped anymore");
+    // Every check on a clean, low-pressure store passes.
+    assert!(
+        checks.iter().all(|c| c["status"] == "ok"),
+        "all checks ok on a consistent store: {checks:?}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_ported_checks_carry_structured_detail() {
+    let fx = Fixture::new("");
+    let out = call(&fx, "lcm_doctor", json!({})).await;
+    let checks = out["checks"].as_array().unwrap();
+    let find = |name: &str| checks.iter().find(|c| c["check"] == name).unwrap();
+
+    // schema_core_tables lists the seven core objects, none missing.
+    let schema = find("schema_core_tables");
+    assert_eq!(schema["status"], "ok");
+    assert!(schema["detail"]["missing"].as_array().unwrap().is_empty());
+    assert_eq!(schema["detail"]["present"].as_array().unwrap().len(), 7);
+
+    // sqlite_storage reports an in-memory bank with a healthy quick_check.
+    let storage = find("sqlite_storage");
+    assert_eq!(storage["status"], "ok");
+    assert_eq!(storage["detail"]["quick_check"], "ok");
+    assert_eq!(storage["detail"]["in_memory"], true);
+
+    // summary_quality covers the seeded D0 node and flags nothing degraded.
+    let sq = find("summary_quality");
+    assert_eq!(sq["status"], "ok");
+    assert_eq!(sq["detail"]["total_nodes"], 1);
+    assert_eq!(sq["detail"]["extreme_ratio_nodes"], 0);
+
+    // source_lineage_hygiene is detail-only (always ok) and bank-wide (s1 + s2 = 3 messages).
+    let src = find("source_lineage_hygiene");
+    assert_eq!(src["status"], "ok");
+    assert_eq!(src["detail"]["messages_total"], 3);
+    assert_eq!(src["detail"]["normalization_mode"], "backcompat-normalization");
+
+    // lifecycle_fragmentation is read-only and, with no lifecycle rows bound, not fragmented.
+    let frag = find("lifecycle_fragmentation");
+    assert_eq!(frag["status"], "ok");
+    assert_eq!(frag["detail"]["read_only"], true);
+
+    // config_validation is all-clear on the default config.
+    assert_eq!(find("config_validation")["status"], "ok");
+}
+
+#[tokio::test]
+async fn doctor_config_validation_warns_on_out_of_range_settings() {
+    let fx = Fixture::new("");
+    let config = LcmConfig {
+        fresh_tail_count: 1,
+        incremental_max_depth: 0,
+        ..LcmConfig::in_memory()
+    };
+    let out = call_with(&fx, &config, "lcm_doctor", json!({})).await;
+    let checks = out["checks"].as_array().unwrap();
+    let cfg = checks.iter().find(|c| c["check"] == "config_validation").unwrap();
+    assert_eq!(cfg["status"], "warn");
+    let warnings = cfg["detail"].as_array().unwrap();
+    assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("fresh_tail_count")));
+    assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("incremental_max_depth")));
+    assert_eq!(out["overall"], "warnings");
 }
 
 #[tokio::test]
@@ -306,10 +391,8 @@ async fn doctor_reports_payload_and_sensitive_checks() {
     let sens = checks.iter().find(|c| c["check"] == "sensitive_pattern_handling").unwrap();
     assert_eq!(sens["status"], "warn", "unknown pattern name warns");
     assert_eq!(out["overall"], "warnings");
-    // The two checks are no longer in the skipped list.
-    let skipped = out["skipped"].as_array().unwrap();
-    assert!(!skipped.iter().any(|s| s == "payload_storage"));
-    assert!(!skipped.iter().any(|s| s == "sensitive_pattern_handling"));
+    // The full catalog ships — there is no longer a `skipped` list of unported checks.
+    assert!(out.get("skipped").is_none(), "no checks are skipped anymore");
 }
 
 #[tokio::test]

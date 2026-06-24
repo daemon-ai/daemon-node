@@ -10,6 +10,7 @@ pub mod schema;
 use crate::error::Result;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, Row};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -167,6 +168,147 @@ pub struct StoreCounts {
     pub nodes: i64,
     /// Rows in the `nodes_fts` shadow (should equal `nodes`).
     pub nodes_fts: i64,
+}
+
+/// Presence of the schema's core objects (`lcm_doctor`'s `schema_core_tables` check, §10.6) — the
+/// Rust analog of `inspect_lcm_schema_health` (`LCM:db_bootstrap.py:227`).
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SchemaHealth {
+    /// Core tables/indexes found in `sqlite_master`.
+    pub present: Vec<String>,
+    /// Expected core tables/indexes that are missing (any => the check fails).
+    pub missing: Vec<String>,
+    /// The recorded `metadata.schema_version`, if present.
+    pub schema_version: Option<i64>,
+}
+
+/// SQLite storage posture (`lcm_doctor`'s `sqlite_storage` check) — journal mode, `quick_check`,
+/// the backing file path, and the on-disk size.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct StoragePosture {
+    /// The main database file path (`""` for an in-memory bank).
+    pub database_path: String,
+    /// Whether the bank is in-memory (no backing file).
+    pub in_memory: bool,
+    /// `PRAGMA journal_mode` (WAL for a durable bank).
+    pub journal_mode: String,
+    /// `PRAGMA quick_check` first row (`"ok"` when healthy; drives pass/fail).
+    pub quick_check: String,
+    /// `page_count * page_size` — the logical database size.
+    pub database_size_bytes: i64,
+}
+
+/// One node flagged by the summary-quality diagnostic (worst compression ratios first).
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct WorstNode {
+    /// The node row id.
+    pub node_id: i64,
+    /// The session the node belongs to.
+    pub session_id: String,
+    /// The DAG depth.
+    pub depth: i64,
+    /// The summarized span's token count.
+    pub source_token_count: i64,
+    /// The summary's own token count.
+    pub token_count: i64,
+    /// `source_token_count / token_count` (rounded), or `None` when `token_count == 0`.
+    pub compression_ratio: Option<f64>,
+}
+
+/// Summary compression-quality diagnostics for one session (`lcm_doctor`'s `summary_quality`) —
+/// the port of `_summary_quality_stats` (`LCM:tools.py:1449`).
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SummaryQuality {
+    /// Total summary nodes for the session.
+    pub total_nodes: i64,
+    /// The session the stats cover.
+    pub session_id: String,
+    /// Sum of summarized-span tokens.
+    pub total_source_tokens: i64,
+    /// Sum of summary tokens.
+    pub total_summary_tokens: i64,
+    /// `total_source_tokens / total_summary_tokens` (rounded), or `0.0` when no summaries.
+    pub overall_compression_ratio: f64,
+    /// The extreme-ratio threshold (a fixed `400`).
+    pub extreme_ratio_threshold: i64,
+    /// Nodes whose source/summary ratio is `>= 400` (degraded fallback summaries).
+    pub extreme_ratio_nodes: i64,
+    /// Nodes summarizing a very large span into a tiny summary (`source >= 100000 AND token < 500`).
+    pub tiny_large_source_nodes: i64,
+    /// Up to five worst-offending nodes (inspect via `lcm_expand`).
+    pub worst_nodes: Vec<WorstNode>,
+}
+
+/// Source-attribution bucket counts (`lcm_doctor`'s `source_lineage_hygiene`) — the port of
+/// `get_source_stats` (`LCM:store.py:586`).
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SourceStats {
+    /// Total messages in scope.
+    pub messages_total: i64,
+    /// Messages with a concrete (non-unknown, non-blank) source.
+    pub attributed_messages: i64,
+    /// Messages normalized to the explicit `"unknown"` bucket.
+    pub normalized_unknown_messages: i64,
+    /// Legacy rows with a NULL/blank source (pre-normalization).
+    pub legacy_blank_source_messages: i64,
+    /// `normalized_unknown_messages + legacy_blank_source_messages`.
+    pub effective_unknown_messages: i64,
+}
+
+/// Lifecycle/session fragmentation diagnostics (`lcm_doctor`'s `lifecycle_fragmentation`) — the
+/// in-database portion of `get_fragmentation_stats` (`LCM:lifecycle_state.py:337`). The external host
+/// `state_db` comparison is intentionally omitted (the daemon has no separate host sessions DB).
+/// Read-only: reports mismatches without inferring corruption or rewriting any state.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct LifecycleFragmentation {
+    /// Always `true` — this diagnostic never mutates.
+    pub read_only: bool,
+    /// Rows in `lcm_lifecycle_state`.
+    pub lifecycle_rows: i64,
+    /// Total `messages` rows.
+    pub messages_total: i64,
+    /// Total `summary_nodes` rows.
+    pub summary_nodes_total: i64,
+    /// Distinct sessions seen in `messages`.
+    pub distinct_message_sessions: i64,
+    /// Distinct sessions seen in `summary_nodes`.
+    pub distinct_node_sessions: i64,
+    /// Distinct sessions seen in messages or nodes (the union).
+    pub distinct_lcm_any_sessions: i64,
+    /// Distinct `current_session_id` values in lifecycle state.
+    pub lifecycle_current_sessions: i64,
+    /// Distinct `last_finalized_session_id` values in lifecycle state.
+    pub lifecycle_last_finalized_sessions: i64,
+    /// Lifecycle `current` sessions absent from `messages`.
+    pub lifecycle_current_missing_in_messages: i64,
+    /// Lifecycle `current` sessions absent from `summary_nodes`.
+    pub lifecycle_current_missing_in_nodes: i64,
+    /// Lifecycle `current` sessions absent from messages and nodes.
+    pub lifecycle_current_missing_in_lcm_any: i64,
+    /// Lifecycle `last_finalized` sessions absent from `messages`.
+    pub lifecycle_last_finalized_missing_in_messages: i64,
+    /// Lifecycle `last_finalized` sessions absent from `summary_nodes`.
+    pub lifecycle_last_finalized_missing_in_nodes: i64,
+    /// Lifecycle `last_finalized` sessions absent from messages and nodes.
+    pub lifecycle_last_finalized_missing_in_lcm_any: i64,
+    /// Message sessions with no lifecycle `current` reference.
+    pub message_sessions_without_lifecycle_current: i64,
+    /// Message sessions with no lifecycle reference at all (current or finalized).
+    pub message_sessions_without_lifecycle_reference: i64,
+    /// Node sessions with no lifecycle reference at all (current or finalized).
+    pub node_sessions_without_lifecycle_reference: i64,
+}
+
+impl LifecycleFragmentation {
+    /// Whether these diagnostics should be treated as warning evidence — the port of
+    /// `has_lifecycle_fragmentation` (`LCM:diagnostics.py:33`), minus the omitted `state_db` keys.
+    pub fn is_fragmented(&self) -> bool {
+        self.lifecycle_current_missing_in_lcm_any > 0
+            || self.lifecycle_last_finalized_missing_in_lcm_any > 0
+            || (self.lifecycle_rows > 0
+                && (self.message_sessions_without_lifecycle_reference > 0
+                    || self.node_sessions_without_lifecycle_reference > 0))
+    }
 }
 
 /// A message to append (`store_id`/`timestamp` assigned by the store).
@@ -709,6 +851,259 @@ impl Store {
         Ok(n)
     }
 
+    /// The presence of the schema's core objects — `lcm_doctor`'s `schema_core_tables` check (§10.6).
+    pub fn schema_health(&self) -> Result<SchemaHealth> {
+        const CORE: [&str; 7] = [
+            "messages",
+            "summary_nodes",
+            "lcm_lifecycle_state",
+            "metadata",
+            "lcm_migration_state",
+            "messages_fts",
+            "nodes_fts",
+        ];
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for name in CORE {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [name],
+                |r| r.get::<_, i64>(0).map(|n| n != 0),
+            )?;
+            if exists {
+                present.push(name.to_string());
+            } else {
+                missing.push(name.to_string());
+            }
+        }
+        let schema_version = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+        Ok(SchemaHealth {
+            present,
+            missing,
+            schema_version,
+        })
+    }
+
+    /// SQLite storage posture (journal mode, `quick_check`, backing path, size) — `lcm_doctor`'s
+    /// `sqlite_storage` check (§10.6).
+    pub fn storage_posture(&self) -> Result<StoragePosture> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let journal_mode = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap_or_default();
+        let quick_check = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let page_count: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(0);
+        // `pragma_database_list` exposes the main db's backing file (empty for an in-memory bank),
+        // so the check reports the path without the `Store` having to carry it.
+        let database_path = conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        let in_memory = database_path.is_empty();
+        Ok(StoragePosture {
+            database_path,
+            in_memory,
+            journal_mode,
+            quick_check,
+            database_size_bytes: page_count * page_size,
+        })
+    }
+
+    /// Summary compression-quality diagnostics for one session — `lcm_doctor`'s `summary_quality`
+    /// check (§10.6), the port of `_summary_quality_stats` (`LCM:tools.py:1449`).
+    pub fn summary_quality_stats(&self, session_id: &str) -> Result<SummaryQuality> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let (
+            total_nodes,
+            total_source_tokens,
+            total_summary_tokens,
+            tiny_large_source_nodes,
+            extreme_ratio_nodes,
+        ) = conn.query_row(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(source_token_count), 0), \
+             COALESCE(SUM(token_count), 0), \
+             COALESCE(SUM(CASE WHEN source_token_count >= 100000 AND token_count < 500 \
+                          THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN token_count > 0 \
+                          AND CAST(source_token_count AS REAL) / token_count >= 400 \
+                          THEN 1 ELSE 0 END), 0) \
+             FROM summary_nodes WHERE session_id = ?1",
+            [session_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        let overall_compression_ratio = if total_summary_tokens > 0 {
+            round1(total_source_tokens as f64 / total_summary_tokens as f64)
+        } else {
+            0.0
+        };
+        let mut stmt = conn.prepare(
+            "SELECT node_id, session_id, depth, token_count, source_token_count \
+             FROM summary_nodes \
+             WHERE session_id = ?1 AND source_token_count > 0 \
+             ORDER BY \
+                 CASE WHEN token_count <= 0 THEN 1 ELSE 0 END DESC, \
+                 CASE WHEN token_count > 0 \
+                      THEN CAST(source_token_count AS REAL) / token_count \
+                      ELSE source_token_count END DESC \
+             LIMIT 5",
+        )?;
+        let worst_nodes = stmt
+            .query_map([session_id], |r| {
+                let token_count: i64 = r.get(3)?;
+                let source_token_count: i64 = r.get(4)?;
+                let compression_ratio = if token_count > 0 {
+                    Some(round1(source_token_count as f64 / token_count as f64))
+                } else {
+                    None
+                };
+                Ok(WorstNode {
+                    node_id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    depth: r.get(2)?,
+                    source_token_count,
+                    token_count,
+                    compression_ratio,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(SummaryQuality {
+            total_nodes,
+            session_id: session_id.to_string(),
+            total_source_tokens,
+            total_summary_tokens,
+            overall_compression_ratio,
+            extreme_ratio_threshold: 400,
+            extreme_ratio_nodes,
+            tiny_large_source_nodes,
+            worst_nodes,
+        })
+    }
+
+    /// Source-attribution bucket counts — `lcm_doctor`'s `source_lineage_hygiene` check (§10.6), the
+    /// port of `get_source_stats` (`LCM:store.py:586`). `session_id = None` is bank-wide (the doctor's
+    /// call); `Some` scopes to one session.
+    pub fn source_stats(&self, session_id: Option<&str>) -> Result<SourceStats> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let where_clause = if session_id.is_some() {
+            "WHERE session_id = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(CASE WHEN source = 'unknown' THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN source IS NULL OR TRIM(source) = '' THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN source IS NOT NULL AND TRIM(source) != '' \
+                          AND source != 'unknown' THEN 1 ELSE 0 END), 0) \
+             FROM messages {where_clause}"
+        );
+        let map = |r: &Row<'_>| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        };
+        let (messages_total, normalized_unknown_messages, legacy_blank_source_messages, attributed_messages) =
+            match session_id {
+                Some(sid) => conn.query_row(&sql, [sid], map)?,
+                None => conn.query_row(&sql, [], map)?,
+            };
+        Ok(SourceStats {
+            messages_total,
+            attributed_messages,
+            normalized_unknown_messages,
+            legacy_blank_source_messages,
+            effective_unknown_messages: normalized_unknown_messages + legacy_blank_source_messages,
+        })
+    }
+
+    /// Lifecycle/session fragmentation diagnostics — `lcm_doctor`'s `lifecycle_fragmentation` check
+    /// (§10.6), the in-database portion of `get_fragmentation_stats` (`LCM:lifecycle_state.py:337`).
+    pub fn lifecycle_fragmentation_stats(&self) -> Result<LifecycleFragmentation> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let session_set = |sql: &str| -> rusqlite::Result<HashSet<String>> {
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+            let mut set = HashSet::new();
+            for row in rows {
+                if let Some(v) = row? {
+                    if !v.is_empty() {
+                        set.insert(v);
+                    }
+                }
+            }
+            Ok(set)
+        };
+        let message_sessions = session_set(
+            "SELECT DISTINCT session_id FROM messages WHERE session_id IS NOT NULL",
+        )?;
+        let node_sessions = session_set(
+            "SELECT DISTINCT session_id FROM summary_nodes WHERE session_id IS NOT NULL",
+        )?;
+        let lifecycle_current = session_set(
+            "SELECT DISTINCT current_session_id FROM lcm_lifecycle_state \
+             WHERE current_session_id IS NOT NULL",
+        )?;
+        let lifecycle_finalized = session_set(
+            "SELECT DISTINCT last_finalized_session_id FROM lcm_lifecycle_state \
+             WHERE last_finalized_session_id IS NOT NULL",
+        )?;
+        let lcm_any: HashSet<String> = message_sessions.union(&node_sessions).cloned().collect();
+        let referenced: HashSet<String> =
+            lifecycle_current.union(&lifecycle_finalized).cloned().collect();
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0));
+        let diff = |a: &HashSet<String>, b: &HashSet<String>| a.difference(b).count() as i64;
+        Ok(LifecycleFragmentation {
+            read_only: true,
+            lifecycle_rows: count("SELECT COUNT(*) FROM lcm_lifecycle_state")?,
+            messages_total: count("SELECT COUNT(*) FROM messages")?,
+            summary_nodes_total: count("SELECT COUNT(*) FROM summary_nodes")?,
+            distinct_message_sessions: message_sessions.len() as i64,
+            distinct_node_sessions: node_sessions.len() as i64,
+            distinct_lcm_any_sessions: lcm_any.len() as i64,
+            lifecycle_current_sessions: lifecycle_current.len() as i64,
+            lifecycle_last_finalized_sessions: lifecycle_finalized.len() as i64,
+            lifecycle_current_missing_in_messages: diff(&lifecycle_current, &message_sessions),
+            lifecycle_current_missing_in_nodes: diff(&lifecycle_current, &node_sessions),
+            lifecycle_current_missing_in_lcm_any: diff(&lifecycle_current, &lcm_any),
+            lifecycle_last_finalized_missing_in_messages: diff(&lifecycle_finalized, &message_sessions),
+            lifecycle_last_finalized_missing_in_nodes: diff(&lifecycle_finalized, &node_sessions),
+            lifecycle_last_finalized_missing_in_lcm_any: diff(&lifecycle_finalized, &lcm_any),
+            message_sessions_without_lifecycle_current: diff(&message_sessions, &lifecycle_current),
+            message_sessions_without_lifecycle_reference: diff(&message_sessions, &referenced),
+            node_sessions_without_lifecycle_reference: diff(&node_sessions, &referenced),
+        })
+    }
+
     // ---- LifecycleStateStore (§4.5) --------------------------------------------------------
 
     /// Bind the active session for a conversation (idempotent).
@@ -775,6 +1170,11 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Round to one decimal place (matching the Python diagnostics' `round(x, 1)`).
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
 }
 
 /// Column list shared by every `summary_nodes` SELECT (keeps `map_node` indices stable).
