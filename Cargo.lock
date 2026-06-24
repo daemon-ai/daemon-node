@@ -2756,6 +2756,8 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "daemon-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

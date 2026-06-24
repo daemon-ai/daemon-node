@@ -1,7 +1,7 @@
 //! Engine configuration (data root, bank, session, decay/TTL knobs).
 //!
 //! Mirrors the Mnemosyne env-var surface (`MNEMOSYNE_DATA_DIR`, `MNEMOSYNE_RECENCY_HALFLIFE`,
-//! `MNEMOSYNE_WM_TTL_HOURS`, ...). Scaffold: only the fields the spec references are present.
+//! `MNEMOSYNE_WM_TTL_HOURS`, ...). Current slice includes the fields referenced by the Rust port.
 
 use std::path::PathBuf;
 

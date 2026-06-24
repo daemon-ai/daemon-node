@@ -1,19 +1,19 @@
-# daemon — workspace layout
+# daemon - workspace layout
 
-The ideal-state Cargo workspace structure for the whole system. Its job is to make the architecture's
-two invariants **physically visible in the directory tree**:
+The current Cargo workspace structure for the daemon system. Its job is to make the architecture's two
+invariants **physically visible in the directory tree**:
 
 1. the **crate-dependency DAG** ([`daemon-supervision-spec.md`](specs/daemon-supervision-spec.md) intro) — a
    crate never depends on one "above" it; and
-2. the **durable / borrowable seam** ([`beam-substrate-reference-extraction.md`](research/beam-substrate-reference-extraction.md) §1) —
-   the correctness-critical durable core is isolated enough to be built and proven against the seven
-   acceptance tests with a *stub* engine, before any borrowable mechanism is layered on.
+2. the **durable / borrowable seam** - the correctness-critical durable core is isolated from
+   borrowable mechanisms such as placement, adapters, credentials, and tools.
 
-Companion docs: [`daemon-orchestration-synthesis.md`](research/daemon-orchestration-synthesis.md) §3.1–§3.2 (the
-roles, the dual-interface, the unit-tree vs host-tiling framing this layout encodes),
-[`daemon-host-spec.md`](specs/daemon-host-spec.md) (the substrate), and
-[`rust-substrate-evaluation.md`](specs/rust-substrate-evaluation.md) §6 (the acceptance tests the conformance
-crate runs).
+Companion docs: [`daemon-host-spec.md`](specs/daemon-host-spec.md) (the substrate),
+[`daemon-supervision-spec.md`](specs/daemon-supervision-spec.md) (the management protocol),
+[`daemon-orchestrator-spec.md`](specs/daemon-orchestrator-spec.md) (fleet policy), and
+[`rust-substrate-evaluation.md`](specs/rust-substrate-evaluation.md) §6 (the acceptance tests the
+conformance crate runs). Historical research inputs live in the companion `daemon-hermes` archive
+rather than this workspace.
 
 ---
 
@@ -23,9 +23,9 @@ crate runs).
   with no runtime. The crate rule (`daemon-core` depends on `daemon-protocol`, **never** on
   `daemon-supervision`) is then enforced by the graph, not by convention.
 - **The durable core is split out of the host.** `daemon-store` + `daemon-activation` are separate
-  crates so they can be developed and proven against `daemon-conformance` using `daemon-stub-engine`,
-  with zero dependency on `daemon-core`, credentials, placement, or translation. This is what makes the
-  build-first milestone (§8) possible.
+  crates with zero dependency on `daemon-core`, credentials, placement, or translation. The conformance
+  harness now exercises the composed node/host path directly, while the durable seam remains visible in
+  the crate graph.
 - **Deferred concerns are stub crates / features, not absences.** A boundary that exists but is
   unimplemented (remote transport, process/container placement) is a real seam behind a feature flag,
   so the shape is defined before the work.
@@ -44,7 +44,8 @@ crate runs).
   (`bindings/`) pump CBOR-encoded `daemon-protocol` / `daemon-supervision` messages over opaque
   handles — one more row in the embedding spectrum, riding the existing `wire_version` + CDDL contract
   ([`docs/specs/daemon-ffi-spec.md`](specs/daemon-ffi-spec.md)).
-- **Reference material is outside the workspace** (`research/`), so the cloned trees never build or lint.
+- **Reference material is outside the workspace** (the sibling `daemon-hermes` archive), so cloned
+  research trees never build or lint with the project.
 
 ---
 
@@ -55,7 +56,7 @@ daemon/                              # cargo workspace root
 ├── Cargo.toml                       # [workspace] members = crates/*/*, tools/*, bindings/*, bins/*, tests/*, xtask
 ├── Cargo.lock
 ├── rust-toolchain.toml              # pinned toolchain
-├── rustfmt.toml · clippy.toml · deny.toml
+├── rustfmt.toml · deny.toml
 ├── README.md
 │
 ├── docs/
@@ -64,32 +65,29 @@ daemon/                              # cargo workspace root
 │   │   ├── daemon-host-spec.md
 │   │   ├── daemon-orchestrator-spec.md
 │   │   ├── daemon-lifecycle-persistence.md
+│   │   ├── daemon-ffi-spec.md
+│   │   ├── daemon-fs-surface-spec.md
+│   │   ├── daemon-content-transfer-spec.md
+│   │   ├── local-inference-spec.md
+│   │   ├── model-management-spec.md
 │   │   └── rust-substrate-evaluation.md
-│   ├── research/                    # how we got here (non-normative)
-│   │   ├── daemon-orchestration-synthesis.md
-│   │   ├── beam-substrate-reference-extraction.md
-│   │   ├── kameo-dehytration.md
-│   │   ├── source-audit.md
-│   │   ├── symphony-architecture-comparison.md
-│   │   ├── CMMI for Agentic Fleets.md
-│   │   ├── cmm-cmmi-maturity-ladder.md
-│   │   └── hermes/                  # legacy hermes/mnemosyne analysis the daemon-core docs cite
-│   ├── adr/                         # architecture decision records
+│   ├── skills/                      # bundled skill docs mirrored from crate assets where needed
 │   └── daemon-workspace-layout.md   # this document
-│
-├── research/                        # NOT a workspace member — reference clones, excluded from build/lint
-│   └── actor-otp-supervisors/       #   the --depth=1 trees we mined (kept in the daemon-hermes archive)
 │
 ├── crates/
 │   ├── contracts/                   # pure types + traits, the seams. No runtime.
 │   │   ├── daemon-common/           #   SessionId/UnitId/JobId, Budget, FenceToken, errors, wire-version, CDDL
 │   │   ├── daemon-protocol/         #   §17 host protocol: Agent{Command,Event}, HostRequest   (→ common)
-│   │   └── daemon-supervision/      #   management protocol: Manage{Command,Event,Request}, ManagedUnit (→ common)
+│   │   ├── daemon-supervision/      #   management protocol: Manage{Command,Event,Request}, ManagedUnit (→ common)
+│   │   └── daemon-api/              #   NodeApi request/response surface + CDDL mirror
 │   │
 │   ├── engine/
-│   │   └── daemon-core/             #   the engine: conversation, turn loop, snapshot (§6), Tool trait (→ protocol, common)
-│   │       └── docs/                #     the daemon-core spec family (spec/redesign/runtime-model/host-interface/
-│   │                                #     messaging-surface/gui-surfaces), co-located with the crate it specifies
+│   │   ├── daemon-core/             #   the engine: conversation, turn loop, snapshot (§6), Tool trait
+│   │   │   └── docs/                #     daemon-core spec family, co-located with the crate it specifies
+│   │   └── daemon-context-lcm/      #   long-context-memory ingestion, compaction, replay, protection
+│   │
+│   ├── memory/
+│   │   └── daemon-mnemosyne/        #   persistent memory provider and Mnemosyne Rust port
 │   │
 │   ├── substrate/                   # the durable layer + borrowable mechanism — the host's engine-room
 │   │   ├── daemon-store/            #   ★ SessionStore trait + SQLite/WAL/CBOR; 5 tables, 4 txns   (→ common)
@@ -99,9 +97,29 @@ daemon/                              # cargo workspace root
 │   │   ├── daemon-provision/        #   Provisioner: workspace + placement (in-proc / process / container) = the "cut"
 │   │   ├── daemon-credentials/      #   credential authority backing the engine's §7 port (host authority, not a tool)
 │   │   ├── daemon-telemetry/        #   trace-in-envelope, metrics, dumps
+│   │   ├── daemon-schedule/         #   cron expression parsing / next-fire helpers
 │   │   ├── daemon-host/             #   composes the above; §17 ↔ management translation; in-process host;
 │   │   │                            #     owns the downward management-protocol CLIENT (drive/place ONE child)
-│   │   └── daemon-transport/        #   DEFERRED stub: wire form of mgmt protocol + remote host
+│   │   └── daemon-transport/        #   deferred remote-host transport seam
+│   │
+│   ├── providers/
+│   │   ├── daemon-providers/        #   Provider impls/adapters (genai, local worker bridge, embeddings)
+│   │   ├── daemon-infer/            #   feature-gated local inference worker
+│   │   └── daemon-models/           #   model catalog, acquisition, cache, recommendation
+│   │
+│   ├── adapters/
+│   │   ├── daemon-acp/
+│   │   ├── daemon-http/
+│   │   ├── daemon-mcp-client/
+│   │   ├── daemon-delivery/
+│   │   ├── daemon-ingest/
+│   │   └── daemon-matrix/
+│   │
+│   ├── coprocessor/
+│   │   ├── daemon-metta/
+│   │   ├── daemon-metta-client/
+│   │   ├── daemon-pytool/
+│   │   └── daemon-pytool-client/
 │   │
 │   ├── orchestration/
 │   │   └── daemon-orchestration/    #   fleet RUNTIME (not an engine): child registry, Usage/RateLimit/Health
@@ -116,8 +134,15 @@ daemon/                              # cargo workspace root
 ├── tools/                           # the agent toolset, one crate per tool (the engine loads these)
 │   ├── daemon-tool-shell/
 │   ├── daemon-tool-fs/
-│   ├── daemon-tool-tkx/             #   work source = agent-managed tooling (NOT a core crate)
-│   └── daemon-tool-orchestrate/     #   thin agent veneer over daemon-orchestration (→ orchestration, core Tool trait)
+│   ├── daemon-tool-tkx/             #   stub work-source tool; tracked as cleanup debt until implemented
+│   ├── daemon-tool-orchestrate/     #   thin agent veneer over daemon-orchestration (→ orchestration, core Tool trait)
+│   ├── daemon-tool-cron/
+│   ├── daemon-tool-web/
+│   ├── daemon-tool-browser/
+│   ├── daemon-tool-metta/
+│   ├── daemon-tool-todo/
+│   ├── daemon-tool-clarify/
+│   └── daemon-tool-skill/
 │
 ├── bindings/                        # C ABI / embedding shells — thin cdylibs over the protocol seams (docs/specs/daemon-ffi-spec.md)
 │   ├── daemon-core-ffi/             #   cdylib+staticlib over §17 — embed the engine (→ core, protocol)
@@ -129,10 +154,9 @@ daemon/                              # cargo workspace root
 │   └── daemon-cli/                  # operator CLI
 │
 ├── tests/
-│   ├── daemon-conformance/          # ★ the 7 acceptance tests as a reusable harness vs ANY substrate impl
-│   └── daemon-stub-engine/          #   minimal snapshot/restore engine — decouples substrate tests from daemon-core
+│   └── daemon-conformance/          # ★ reusable acceptance harness and foreign-agent protocol tests
 │
-└── xtask/                           # dev automation: codegen, CDDL gen/check, fuzz, bench
+└── xtask/                           # dev automation: header generation and CDDL checks
 ```
 
 (★ = the build-first milestone surface, §8.)
@@ -160,7 +184,6 @@ flowchart TB
   tstd["daemon-tool-shell / fs / tkx"]
   node["daemon-node (composition root)"]
   bin["bins/daemon (thin)"]
-  stub["daemon-stub-engine"]
   conf["daemon-conformance ★"]
 
   common --> proto & sup & core & store
@@ -183,7 +206,6 @@ flowchart TB
   core --> bin
   host --> bin
   node --> conf
-  stub --> conf
   act --> conf
   host --> conf
 ```
@@ -286,8 +308,9 @@ be tool-shaped is possible but out of scope here — it stays a host authority.
 ## 6. Workspace hygiene & profile invariants
 
 - **`panic = "unwind"` is mandatory** (root `Cargo.toml`). Catch-unwind-based supervision is silently
-  void under `panic = "abort"` ([`beam-substrate-reference-extraction.md`](research/beam-substrate-reference-extraction.md) §2.2),
-  so the release profile must unwind. This is a structural guarantee, not a thing to remember:
+  void under `panic = "abort"` (see the BEAM substrate reference extraction in the companion
+  `daemon-hermes` archive), so the release profile must unwind. This is a structural guarantee, not a
+  thing to remember:
 
   ```toml
   [profile.release]
@@ -300,7 +323,7 @@ be tool-shaped is possible but out of scope here — it stays a host authority.
 - **Feature gates for swappable/deferred surfaces:** `daemon-activation/elfo` (off by default),
   `daemon-store` backends (`sqlite` default), `daemon-provision/{process,container}`,
   `daemon-transport/remote`.
-- **`research/` is excluded** from the workspace (no `members` glob reaches it); the cloned reference
+- **Research inputs are outside this workspace** (no `members` glob reaches them); cloned reference
   trees never compile or lint with the project.
 - **One node binary, role by config.** `bins/daemon` runs as an embedder, a host, or an orchestrating
   engine depending on configuration — mirroring the recursion: the same binary tiles the unit tree and
@@ -310,13 +333,12 @@ be tool-shaped is possible but out of scope here — it stays a host authority.
 
 ## 7. Build-first mapping
 
-The crates marked ★ are the irreducible, no-reference durable core — build them first as a vertical
-slice and prove them against `daemon-conformance` with `daemon-stub-engine`, before any borrowable
-mechanism:
+The crates marked ★ are the irreducible durable-core surfaces. They remain the first vertical slice,
+and the conformance harness now exercises them through the composed node/host path:
 
 | Phase | Crates | Gate |
 |---|---|---|
-| **1 — durable core** | `daemon-common`, `daemon-store`, `daemon-activation`, `daemon-stub-engine`, `daemon-conformance` | acceptance tests #1–#3, #5, #7; #4/#6 via simulated dual ownership |
+| **1 — durable core** | `daemon-common`, `daemon-store`, `daemon-activation`, `daemon-conformance` | acceptance tests #1–#3, #5, #7; #4/#6 via simulated dual ownership |
 | **2 — resident supervision** | the supervisor wiring inside `daemon-host` (bounded resident tree) | resident services restart/backoff/meltdown under churn |
 | **3 — real engine + translation** | `daemon-protocol`, `daemon-core`, `daemon-supervision`, `daemon-host` (replace the stub) | §17 ↔ management round-trips |
 | **4 — orchestration** | `daemon-orchestration` (fleet runtime) + `daemon-tool-orchestrate` | one engine delegates to a child; events fan in, a child request is answered/escalated |

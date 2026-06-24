@@ -12,9 +12,10 @@
 > model discovery (+ static fallback), per-session model/overlay selection, usage richness
 > (cache/reasoning tokens + `cost_micros` + folded turn `TurnSummary.usage`), node-wide
 > `telemetry()`/`TelemetryDump`, credential registration wire ops (`Credential{Set,List,Remove}`),
-> and the chat tools (`web_search`/`web_extract`/`todo`/`clarify`/`browser`). The remaining
-> demo-relevant gap is the **context-fill / compaction `AgentEvent`** (§5.3); the credential
-> *backing source* is still `StubCredentialSource` (§5.2).
+> `telemetry()`/`TelemetryDump`, credential registration wire ops (`Credential{Set,List,Remove}`),
+> `AgentEvent::Context` for context-fill/compaction status, and the chat tools
+> (`web_search`/`web_extract`/`todo`/`clarify`/`browser`). Remaining demo polish is GUI rendering and
+> production backing sources, notably replacing `StubCredentialSource` (§5.2).
 
 ## 0. How to read this document
 
@@ -35,8 +36,9 @@ Every capability row has four columns:
 
 This methodology is deliberate: the three issues raised during planning (live profile/config
 control, dynamic model discovery, usage/context/telemetry richness) are **not** special cases —
-they are simply the rows in Domain A and Domain D that are `MISSING`/`STUB` today, and they fall
-out of the inventory automatically.
+they were simply the rows in Domain A and Domain D that were `MISSING`/`STUB` in the original
+snapshot, and they fell out of the inventory automatically. Landed items are now marked in-place;
+older proposal text is retained only as design history.
 
 Hermes paths are relative to `../../../daemon-hermes/hermes-agent/` (sibling worktree). Daemon
 paths are repo-relative and rendered as markdown links.
@@ -50,12 +52,12 @@ Tiers:
 
 - **D0** — required for the concrete demo (the critical path in §2).
 - **P0–P3** — the existing parity-map phases from
-  [`hermes-agent-parity-map.md`](../research/hermes/hermes-agent-parity-map.md):
+  `hermes-agent-parity-map.md` in the companion `daemon-hermes` archive:
   P0 production survival, P1 long-session coding, P2 ecosystem breadth, P3 long-tail.
 
 ### 0.3 Companion documents (the roadmap triangle)
 
-- [`hermes-agent-parity-map.md`](../research/hermes/hermes-agent-parity-map.md) — the runtime parity checklist.
+- `hermes-agent-parity-map.md` in the companion `daemon-hermes` archive — the runtime parity checklist.
 - [`daemon-core-spec.md`](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §22 "Phased roadmap" (line 1666) — engine roadmap on the same tiers.
 - [`daemon-core-host-interface.md`](../../crates/engine/daemon-core/docs/daemon-core-host-interface.md) — typed §17 host boundary.
 - [`model-management-spec.md`](model-management-spec.md) — local-model (HF/GGUF) management parity bar.
@@ -121,16 +123,11 @@ Each step lists what works and what blocks it today.
   (`:1742`), `set_active_profile` (`:1414`), `list_profiles` (`:716`), plus dashboard REST
   `GET/POST /api/profiles`, `POST /api/profiles/active`, `PATCH/DELETE /api/profiles/{name}`,
   `PUT /api/profiles/{name}/model` (`hermes-agent/hermes_cli/web_server.py:9011-9357`).
-- **Daemon:** **MISSING.** There is no profile variant in `ApiRequest`
-  ([crates/contracts/daemon-api/src/lib.rs](../../crates/contracts/daemon-api/src/lib.rs):504-718).
-  The provider/profile bindings are frozen at startup in `build_providers`
-  ([bins/daemon/src/main.rs](../../bins/daemon/src/main.rs):81-147) and a session's provider is a
-  frozen registry lookup `provider_for`
-  ([crates/node/daemon-node/src/lib.rs](../../crates/node/daemon-node/src/lib.rs):128-132). The
-  only runtime knob is env/TOML `DAEMON_PROFILE`
-  ([bins/daemon/src/config.rs](../../bins/daemon/src/config.rs):29,578-580).
-- **Blocks the demo:** yes — there is no way for a GUI to create or set a profile at runtime.
-  Design in §5.1.
+- **Daemon:** **DONE.** `Profile{List,Get,Create,Update,Delete,Select}` and profile distributions
+  are exposed over `NodeApi`, backed by the durable `ProfileStore`, and per-session overlay writes can
+  switch the live model/provider without restarting the node.
+- **Blocks the demo:** no daemon-wire blocker remains; a GUI still has to render and call the landed
+  profile surface.
 
 ### Step 2 — open a session bound to that profile
 
@@ -142,8 +139,7 @@ Each step lists what works and what blocks it today.
   ([crates/contracts/daemon-api/src/lib.rs](../../crates/contracts/daemon-api/src/lib.rs):801-845,949-956)
   via `NodeApiImpl`
   ([crates/substrate/daemon-host/src/node_api.rs](../../crates/substrate/daemon-host/src/node_api.rs)).
-- **Gap:** the session cannot yet be *bound to a chosen profile at open time* (depends on Step 1).
-  No `fork_session`/`list_sessions`-with-cwd.
+- **Gap:** no `fork_session`/`list_sessions`-with-cwd; profile binding and overlays are landed.
 
 ### Step 3 — discover and select `claude-opus-4-8`, supply an Anthropic key
 
@@ -171,14 +167,13 @@ Each step lists what works and what blocks it today.
     with the static catalog as the no-key fallback + pricing/context overlay
     ([crates/contracts/daemon-api/src/profile.rs](../../crates/contracts/daemon-api/src/profile.rs));
     local GGUF models still merge from the `ModelManager` catalog.
-  - **Key injection: PARTIAL.** The credential lease feeds `Request.auth`
+  - **Key injection: DONE (wire) / PARTIAL (backing).** The credential lease feeds `Request.auth`
     ([crates/engine/daemon-core/src/engine.rs](../../crates/engine/daemon-core/src/engine.rs):357-365),
     but the host source is `StubCredentialSource`
     ([crates/substrate/daemon-credentials/src/source.rs](../../crates/substrate/daemon-credentials/src/source.rs))
-    and there is no `NodeApi` op to register/rotate a real Anthropic key.
-- **Blocks the demo:** model id is trivial (D0); model *picker* and key *registration* require new
-  surface (§5.2). For a hardcoded single-key launch, env `ANTHROPIC_API_KEY` + `DAEMON_MODEL`
-  suffices to get a first turn.
+    and `Credential{Set,List,Remove}` registers/rotates secrets over `NodeApi`. The source remains a
+    phase-1 stub until real provider key generation/rotation lands.
+- **Blocks the demo:** no daemon-wire blocker remains; production credential source work remains.
 
 ### Step 4 — send a user message
 
@@ -196,17 +191,11 @@ Each step lists what works and what blocks it today.
     `ToolStarted`/`ToolFinished`/`Usage`/`RateLimit`/`TurnFinished`
     ([crates/contracts/daemon-protocol/src/lib.rs](../../crates/contracts/daemon-protocol/src/lib.rs):230-327),
     delivered as `Outbound` via `Poll`/`Subscribe`.
-  - **Usage richness: PARTIAL/MISSING.** `UsageDelta` carries only
-    `input_tokens`/`output_tokens`/`api_calls`
-    ([crates/contracts/daemon-common/src/lib.rs](../../crates/contracts/daemon-common/src/lib.rs):226-233)
-    — no cache/reasoning tokens, no cost, no context-window fill. `TurnSummary.usage` reflects only
-    the **last** model call, not the whole turn
-    ([crates/engine/daemon-core/src/engine.rs](../../crates/engine/daemon-core/src/engine.rs):793-798).
-    Context pressure (`Pressure { used_tokens, budget_tokens }`) is engine-internal
-    ([crates/engine/daemon-core/src/context.rs](../../crates/engine/daemon-core/src/context.rs):51-56)
-    and never reaches the host.
-- **Blocks a *good* demo:** basic turn rendering works; the usage/cost/context HUD a GUI wants
-  needs §5.3.
+  - **Usage/context richness: DONE (wire).** `UsageDelta` carries cache/reasoning/cost fields,
+    `TurnSummary.usage` folds all model calls in the turn, and `AgentEvent::Context` carries
+    `ContextStatus { used_tokens, max_tokens, budget_tokens, compacted, dropped_turns }` for the
+    context HUD.
+- **Blocks a *good* demo:** the daemon stream has the data; the GUI still needs to render the HUD.
 
 ### 2.1 Minimal blocking-gap list for the demo
 
@@ -215,11 +204,11 @@ Each step lists what works and what blocks it today.
 | 1 | ~~Set/allow `claude-opus-4-8` + supply Anthropic key~~ — **DONE** (env path + `Credential{Set,List,Remove}` wire ops; host *source* still stubbed, §5.2) | D0 | §5.2 |
 | 2 | ~~Create / select / edit a profile at runtime over `NodeApi`~~ — **DONE** (`Profile{List,Get,Create,Update,Delete,Select}`) | D0 | §5.1 |
 | 3 | ~~Discover model list for the picker~~ — **DONE** (genai-native live discovery + static fallback) | D0 | §5.2 |
-| 4 | Usage richness — **mostly DONE** (cache/reasoning tokens + `cost_micros` + folded `TurnSummary.usage`); **remaining: context-fill / compaction `AgentEvent`** | D0 | §5.3 |
+| 4 | ~~Usage richness + context-fill / compaction stream~~ — **DONE (wire)** (`UsageDelta`, folded `TurnSummary.usage`, `AgentEvent::Context`) | D0 | §5.3 |
 | 5 | ~~Useful chat tools (web_search, todo, clarify)~~ — **DONE** (`daemon-tool-web`/`-todo`/`-clarify`/`-browser`) | P1 | Domain E |
 
 Everything else for a first chat (session lifecycle, streaming, fs/shell tools) is already DONE. The
-lone remaining D0 item is the context-fill / compaction event (row 4).
+remaining work is GUI integration and production-hardening backing sources, not D0 daemon-wire shape.
 
 ---
 
@@ -269,8 +258,8 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Canonical per-call usage (incl. cache/reasoning) | `agent/usage_pricing.py:30-46,703` | **DONE** — `UsageDelta` carries `cache_read_tokens`/`cache_write_tokens`/`reasoning_tokens` (+ additive `add()`) ([daemon-common](../../crates/contracts/daemon-common/src/lib.rs)). §5.3 |
 | Cost estimation | `agent/usage_pricing.py:776` | **DONE** — `Pricing` table + `UsageDelta::estimate_cost_micros` fill `cost_micros` at the provider boundary ([daemon-common](../../crates/contracts/daemon-common/src/lib.rs)). §5.3 |
 | Turn/session usage accumulation | `agent/conversation_loop.py:1808-1839`; `agent/turn_finalizer.py:326-354` | **DONE** — `run_turn` folds every model call's usage so `TurnSummary.usage` is the turn total, not the last call ([engine.rs](../../crates/engine/daemon-core/src/engine.rs)). §5.3 |
-| Context-window pressure → UI | `acp_adapter/server.py:661-711`; `agent/context_compressor.py:712-835` | **MISSING over NodeApi** — `Pressure` is engine-internal ([context.rs](../../crates/engine/daemon-core/src/context.rs)) and never surfaced as an `AgentEvent`. §5.3 |
-| Compression events | `agent/conversation_compression.py:48` | MISSING — no compaction event on the §17 stream. |
+| Context-window pressure → UI | `acp_adapter/server.py:661-711`; `agent/context_compressor.py:712-835` | **DONE (wire)** — `AgentEvent::Context` carries `ContextStatus { used_tokens, max_tokens, budget_tokens, compacted, dropped_turns }`; GUI rendering remains. §5.3 |
+| Compression events | `agent/conversation_compression.py:48` | **DONE (wire)** — compaction is signaled by `ContextStatus.compacted` and `dropped_turns`. |
 | Iteration budget | `agent/iteration_budget.py:17` | PARTIAL — enforced internally (`max_iterations`, [config.rs:35-58](../../crates/engine/daemon-core/src/config.rs)); not surfaced. |
 | Rate limits | `agent/rate_limit_tracker.py` | DONE — `AgentEvent::RateLimit` + `RateLimitSnapshot` ([daemon-protocol:289-294](../../crates/contracts/daemon-protocol/src/lib.rs); [daemon-common:247-254](../../crates/contracts/daemon-common/src/lib.rs)). |
 | Session stats / analytics | `hermes_state.py:514-542`; `web_server.py:9878` | **DONE** — `telemetry()` returns a `TelemetryDump` (folded usage + cost + event count + health + queue) and `StatsReport.usage` carries the folded node-wide accounting line ([daemon-api](../../crates/contracts/daemon-api/src/lib.rs)). §5.3 |
@@ -283,7 +272,7 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Tool executor (sequential / parallel) | `agent/tool_executor.py:243,770` | PARTIAL — sequential only; parallel batch deferred ([tool_pipeline.rs:12-15](../../crates/engine/daemon-core/src/tool_pipeline.rs)). P1. |
 | Loop guardrails | `agent/tool_guardrails.py:224` | MISSING — no duplicate-call guardrail. |
 | Core tools (fs/shell) | `tools/file_tools.py`; `tools/terminal_tool.py` | DONE — `fs`/`shell` with workspace containment ([daemon-tool-fs](../../tools/daemon-tool-fs/src/lib.rs):71-161; [daemon-tool-shell](../../tools/daemon-tool-shell/src/lib.rs):74-151). |
-| Web / browser / vision / todo / clarify | `tools/web_tools.py`, `browser_tool.py`, `vision_tools.py`, `todo_tool.py`, `clarify_tool.py` | **MOSTLY DONE** — `web_search`/`web_extract` ([daemon-tool-web](../../tools/daemon-tool-web/src/lib.rs)), `browser` ([daemon-tool-browser](../../tools/daemon-tool-browser/src/lib.rs)), `todo` ([daemon-tool-todo](../../tools/daemon-tool-todo/src/lib.rs)), `clarify` ([daemon-tool-clarify](../../tools/daemon-tool-clarify/src/lib.rs)). Remaining: vision tools; `tkx` is still a STUB ([daemon-tool-tkx:5](../../tools/daemon-tool-tkx/src/lib.rs)). P1–P3. |
+| Web / browser / vision / todo / clarify | `tools/web_tools.py`, `browser_tool.py`, `vision_tools.py`, `todo_tool.py`, `clarify_tool.py` | **MOSTLY DONE** — `web_search`/`web_extract` ([daemon-tool-web](../../tools/daemon-tool-web/src/lib.rs)), `browser` ([daemon-tool-browser](../../tools/daemon-tool-browser/src/lib.rs)), `todo` ([daemon-tool-todo](../../tools/daemon-tool-todo/src/lib.rs)), `clarify` ([daemon-tool-clarify](../../tools/daemon-tool-clarify/src/lib.rs)). Remaining: vision tools; `tkx` now has an explicit status-only tool while the tracker backend remains deferred ([daemon-tool-tkx](../../tools/daemon-tool-tkx/src/lib.rs)). P1–P3. |
 | Approval + checkpoints + tool-search | `tools/approval.py`; `tools/checkpoint_manager.py`; `tools/tool_search.py` | DONE — shell + fs edit approval (policy-gated, durable HITL park→decide→resume); **checkpoints/rewind** (`Tool::mutates()` hint, git-first/snapshot-fallback `CheckpointStore` over the exec root, `run_tool` checkpoint stage, `Checkpoint{List,Rewind}` `ControlApi` family + ledger, wire v9 — [checkpoint.rs](../../crates/engine/daemon-core/src/checkpoint.rs)); **tool-search** progressive disclosure (`ToolRegistry` core/deferrable split + `tool_search`/`tool_describe`/`tool_call` bridge tools, byte-threshold collapse in `Engine::tool_defs` — [tools.rs](../../crates/engine/daemon-core/src/tools.rs), [tool_pipeline.rs](../../crates/engine/daemon-core/src/tool_pipeline.rs)). |
 | External tool breadth (MCP client) | `mcp/` clients | DONE — `daemon-mcp-client` registers external MCP servers' tools through the `ToolProvider` seam (rmcp; stdio child-process + streamable-HTTP; namespaced `mcp__{server}__{tool}`, untrusted-fenced; lazy connect + reconnect), wired via the `[mcp]` config block ([daemon-mcp-client](../../crates/adapters/daemon-mcp-client/src/lib.rs)). MCP *server* adapter deferred (P4). |
 | Delegation tool | `tools/delegate_tool.py:3086` | DONE — `orchestrate` ([daemon-tool-orchestrate](../../tools/daemon-tool-orchestrate/src/lib.rs):103-158). |
@@ -294,7 +283,7 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 |---|---|---|
 | Context engine / compression | `agent/context_compressor.py:593` | PARTIAL/landed — LCM port `daemon-context-lcm`, 7 `lcm_*` tools ([tools/mod.rs:24-93](../../crates/engine/daemon-context-lcm/src/tools/mod.rs)). |
 | Long-term memory | `agent/memory_manager.py`; `tools/memory_tool.py:795` | PARTIAL — `daemon-mnemosyne` P0/P1/**P2 done** (typed-memory classifier, Weibull recall blend, synonyms, query-intent, 5-tier query cache, opt-in enhanced + polyphonic recall, rule-based gists, tier-2 LLM conflict detector, fuzzy entity-similarity injection — [engine.rs](../../crates/memory/daemon-mnemosyne/src/engine.rs), [port-spec §15](../../crates/engine/daemon-core/docs/mnemosyne-rust-port-spec.md)); ~20 `mnemosyne_*` tools ([tools.rs:28-170](../../crates/memory/daemon-mnemosyne/src/tools.rs)). P3 ecosystem (sync/streaming, SHMR, patterns, plugins, local-GGUF) remains. |
-| Background memory write/review | `agent/background_review.py:675` | MISSING. P2. |
+| Background memory write/review | `agent/background_review.py:675` | Covered by the engine-native background review fork in Domain G; no separate missing row. |
 
 ### Domain G — Skills
 
@@ -386,9 +375,9 @@ The canonical wire types a GUI talks to:
   `ModelApi` ([:234-325](../../crates/contracts/daemon-api/src/lib.rs)),
   `NodeApi = SessionApi + ControlApi + ModelApi` ([:328-329](../../crates/contracts/daemon-api/src/lib.rs)).
 
-**Update:** the `Profile*`, `Credential*`, and cloud-model-discovery (`Model*`) families have since
-**landed** — the three deep dives below are kept for design context, but their "MISSING" framing is
-historical. The remaining surface gap is the context-fill / compaction `AgentEvent` (§5.3).
+**Update:** the `Profile*`, `Credential*`, cloud-model-discovery (`Model*`), usage/cost, telemetry,
+and context-fill (`AgentEvent::Context`) families have since **landed**. The three deep dives below
+are kept for design context; their original "MISSING" framing is historical.
 
 ---
 
@@ -396,12 +385,9 @@ historical. The remaining surface gap is the context-fill / compaction `AgentEve
 
 ### 5.1 Profile & config as a live `NodeApi` surface
 
-**Problem.** Profiles, the active model, and the provider are all construction-time: `NodeConfig`
-([config.rs:323-378](../../bins/daemon/src/config.rs)) + `NodeAssembly`
-([daemon-node:45-91](../../crates/node/daemon-node/src/lib.rs)), with a `ProviderRegistry` frozen by
-`build_providers` ([main.rs:81-147](../../bins/daemon/src/main.rs)) and a per-session frozen lookup
-`provider_for` ([daemon-node:128-132](../../crates/node/daemon-node/src/lib.rs)). A GUI cannot
-create, select, or edit a profile.
+**Status.** Landed. Profiles, profile distributions, per-session overlays, and profile CRUD are live
+`NodeApi` surfaces. The original construction-time-only problem statement is retained below as the
+design context that led to the current `Profile*` and overlay families.
 
 **Hermes shape to match.** A profile is an isolated home with `config.yaml` + `.env` + `SOUL.md` +
 skills; CRUD lives in `hermes_cli/profiles.py` and is exposed over REST in `web_server.py`. Config
@@ -432,8 +418,8 @@ read/write is `load_config`/`save_config`/`set_config_value` with a typed schema
 
 ### 5.2 Dynamic model discovery (cloud + local, unified)
 
-**Problem.** `ModelApi` only covers HF/GGUF local models; cloud model lists are invisible to the
-GUI; the active cloud model is just `NodeConfig.model`.
+**Status.** Landed. `ModelApi::models()` merges genai-native cloud discovery (with static fallback)
+and local model catalog entries. The original cloud-list invisibility problem is historical.
 
 **Hermes shape to match.** `curated_models_for_provider` → live `provider_model_ids`
 (Anthropic/OpenAI `/v1/models`) with a static `_PROVIDER_MODELS` fallback, enriched by
@@ -458,8 +444,9 @@ context-length/pricing/capabilities (`hermes_cli/inventory.py:build_models_paylo
 
 ### 5.3 Usage / context / telemetry streaming
 
-**Problem.** `UsageDelta` is tokens+calls only; `TurnSummary.usage` is last-call-only; context
-pressure and telemetry never reach the host.
+**Status.** Landed. `UsageDelta` includes cache/reasoning/cost fields, turn usage is folded across
+model calls, telemetry is exposed, and `AgentEvent::Context` carries context-fill and compaction
+status.
 
 **Hermes shape to match.** Canonical usage (input/output/cache_read/cache_write/reasoning), cost,
 per-turn and per-session accumulation, ACP `UsageUpdate {size, used}` for context fill, plus
@@ -474,10 +461,8 @@ analytics.
 2. Accumulate per-turn: make `complete()` fold every iteration's `out.usage` into
    `TurnSummary.usage` instead of taking the last
    ([engine.rs:793-798](../../crates/engine/daemon-core/src/engine.rs)).
-3. Add a context-pressure event: surface `Pressure { used_tokens, budget_tokens }`
-   ([context.rs:51-56](../../crates/engine/daemon-core/src/context.rs)) and a `compaction` marker as
-   an `AgentEvent` (new variant) so the GUI can render a context-fill bar and "compacting" state —
-   matching Hermes ACP `UsageUpdate` + the `COMPACTION_STATUS` marker.
+3. Context pressure is now surfaced as `AgentEvent::Context { status: ContextStatus }`, including
+   `used_tokens`, `max_tokens`, `budget_tokens`, `compacted`, and `dropped_turns`.
 4. Cost: add a small pricing table (per-model input/output/cache rates) and compute `cost_micros`
    from accumulated usage, mirroring `estimate_usage_cost` (`agent/usage_pricing.py:776`).
 5. Expose telemetry: add a `NodeApi` op returning `daemon-telemetry::Dump`
@@ -485,9 +470,9 @@ analytics.
    `StatsReport` ([daemon-api:366-376](../../crates/contracts/daemon-api/src/lib.rs)) with folded
    usage, so a GUI can show session/fleet totals (Hermes `/api/analytics/usage`).
 
-**Minimal D0 slice.** *(Landed: cache/reasoning on `UsageDelta`, folded `TurnSummary.usage`, cost via
-`Pricing`/`cost_micros`, and `telemetry()` analytics.)* **Remaining: emit a context-fill / compaction
-`AgentEvent`** so the GUI can render a context-fill bar and "compacting" state.
+**Minimal D0 slice.** Landed: cache/reasoning on `UsageDelta`, folded `TurnSummary.usage`, cost via
+`Pricing`/`cost_micros`, `telemetry()` analytics, and `AgentEvent::Context` for context-fill /
+compaction rendering.
 
 ---
 
@@ -506,11 +491,10 @@ medium (add provider/credential constructors to the FFI, reuse §5.1/§5.2 once 
 
 ### 6.2 (C) Full-host C FFI — `bindings/daemon-ffi`
 
-A doc-comment TODO with no `extern "C"` functions
-([lib.rs:11-12](../../bindings/daemon-ffi/src/lib.rs)). To embed the durable `NodeApi` in-process a
-GUI would need the entire opaque-handle + CBOR message-pump surface built out. Effort: large.
-Recommended only after the socket path and §5 surfaces stabilize, per
-[daemon-ffi-spec.md](daemon-ffi-spec.md).
+Implemented as an opaque durable-host handle plus CBOR `ApiRequest` / `ApiResponse` pump:
+`daemon_host_new`, `daemon_host_new_with_config`, `daemon_host_call`, and shutdown/error helpers
+([lib.rs](../../bindings/daemon-ffi/src/lib.rs)). The Unix socket remains the primary GUI path, but a
+non-Rust embedder can now drive the full durable `NodeApi` in-process.
 
 ### 6.3 (D) stdio JSON-RPC / ACP-server (Daemon-as-agent)
 
@@ -530,13 +514,14 @@ after the socket `NodeApi` extensions land so there is one source of truth to pr
 | 1 | ~~Allow `claude-opus-4-8` + real Anthropic key~~ — **DONE** (env path + `Credential{Set,List,Remove}`; backing source still stub) | D0 | [engine.rs](../../crates/engine/daemon-core/src/engine.rs); [source.rs](../../crates/substrate/daemon-credentials/src/source.rs) |
 | 2 | ~~Profile create/select/edit over `NodeApi`~~ — **DONE** (`Profile{List,Get,Create,Update,Delete,Select}`) | D0 | [daemon-api](../../crates/contracts/daemon-api/src/lib.rs) |
 | 3 | ~~Per-session model selection + dynamic model list~~ — **DONE** (`SetSessionModel` overlay + genai-native `models()`) | D0 | [genai_provider.rs](../../crates/providers/daemon-providers/src/genai_provider.rs) |
-| 4 | Usage richness for rendering — **mostly DONE** (cache/reasoning + cost + folded turn usage); **remaining: context-fill / compaction event** | D0 | [daemon-common](../../crates/contracts/daemon-common/src/lib.rs); [engine.rs](../../crates/engine/daemon-core/src/engine.rs); [context.rs](../../crates/engine/daemon-core/src/context.rs) |
-| 5 | ~~Chat-useful tools: web_search/web_extract, todo, clarify~~ — **DONE** (browser too; `tkx` still a stub) | P1 | Domain E; [daemon-tool-tkx:5](../../tools/daemon-tool-tkx/src/lib.rs) |
-| 6 | Remaining: real credential *source* + context-fill bar event (cost/analytics now landed) | P1 | [source.rs](../../crates/substrate/daemon-credentials/src/source.rs) |
+| 4 | ~~Usage richness + context-fill/compaction rendering data~~ — **DONE (wire)** (`UsageDelta`, folded turn usage, `AgentEvent::Context`) | D0 | [daemon-common](../../crates/contracts/daemon-common/src/lib.rs); [daemon-protocol](../../crates/contracts/daemon-protocol/src/lib.rs); [engine.rs](../../crates/engine/daemon-core/src/engine.rs) |
+| 5 | ~~Chat-useful tools: web_search/web_extract, todo, clarify~~ — **DONE** (browser too; `tkx` exposes status-only until its tracker backend lands) | P1 | Domain E; [daemon-tool-tkx](../../tools/daemon-tool-tkx/src/lib.rs) |
+| 6 | Remaining: real credential *source* + GUI rendering of landed context events | P1 | [source.rs](../../crates/substrate/daemon-credentials/src/source.rs); [daemon-protocol](../../crates/contracts/daemon-protocol/src/lib.rs) |
 
 Tasks 1–5 have landed: the demo (profile → session → Opus 4.8 → chat → rendered turns with a usage
 HUD) is achievable on the Unix-socket path, and the same surface backs FFI/ACP later. The lone
-remaining D0 polish item is the context-fill / compaction `AgentEvent` (task 4 / task 6).
+remaining polish is replacing the stub credential backing source and rendering the landed context
+events in the GUI.
 
 ---
 
@@ -554,7 +539,8 @@ the parity-map. Use this as the long-horizon backlog after the D0 demo.
 - SQLite session store with FTS (Domain H) — DONE; dedicated token columns — PARTIAL.
 - Anthropic prompt caching (Domain B) — PARTIAL.
 - Parallel tool batch (Domain E) — MISSING.
-- Cost + analytics (Domain D, §5.3) — DONE; context-fill HUD event — MISSING.
+- Cost + analytics and context-fill HUD event (Domain D, §5.3) — DONE on the daemon wire; GUI
+  rendering remains.
 - Web/todo/clarify/browser tools (Domain E) — DONE.
 
 **P2 — ecosystem breadth:**
@@ -574,7 +560,7 @@ the parity-map. Use this as the long-horizon backlog after the D0 demo.
   curator + usage + per-profile libraries landed in P2), titles/search/goals/recap (Domain H),
   gateway/cron/kanban/voice/computer-use/image+video (Domain J) — MISSING / scoped out.
 
-Cross-references: [`hermes-agent-parity-map.md`](../research/hermes/hermes-agent-parity-map.md),
+Cross-references: `hermes-agent-parity-map.md` in the companion `daemon-hermes` archive,
 [`daemon-core-spec.md`](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §22 (line 1666),
 and the `daemon-hermes/implementation-plan.md` build phasing.
 
@@ -582,20 +568,17 @@ and the `daemon-hermes/implementation-plan.md` build phasing.
 
 ## 9. Doc-hygiene findings
 
-- **Cross-links OK (correction).** `docs/research/hermes/` is present and populated (including
-  [`hermes-agent-parity-map.md`](../research/hermes/hermes-agent-parity-map.md)); the relative
-  links from [daemon-core-spec.md](../../crates/engine/daemon-core/docs/daemon-core-spec.md):67,121
-  resolve. (An earlier audit snapshot saw this directory empty before the files were committed.)
+- **Research links are external.** The `docs/research/hermes/` tree is not tracked in this repo; the
+  parity-map and source-audit material live in the companion `daemon-hermes` archive. Specs should
+  avoid relative links to absent research files unless that archive is vendored.
 - **Stale provider note (resolved).** [daemon-host-spec.md](daemon-host-spec.md) §7 previously said
   the provider is "deterministic" and networked model I/O is "deferred"; that note has been updated to
   reflect the landed `GenAiProvider` (Anthropic/OpenAI streaming).
-- **`context_budget_tokens` comment.** [config.rs](../../crates/engine/daemon-core/src/config.rs)
-  says "not yet enforced", but compaction hooks do consume it
-  ([engine.rs](../../crates/engine/daemon-core/src/engine.rs)); the comment understates current
-  behavior (code-only nit, left for a future engine edit).
+- **Context status (resolved).** `AgentEvent::Context` now carries context-fill and compaction status
+  over the §17 stream; older rows that called this missing were historical.
 - **Usage/telemetry rows (resolved).** Earlier snapshots of Domains C/D/E marked usage richness, cost,
-  analytics, model discovery, and chat tools MISSING/PARTIAL; those rows are now updated to DONE per
-  the landed code. The only outstanding Domain-D item is the context-fill / compaction `AgentEvent`.
+  analytics, model discovery, context events, and chat tools MISSING/PARTIAL; those rows are now
+  updated to DONE per the landed code.
 
 ## 10. Out of scope
 

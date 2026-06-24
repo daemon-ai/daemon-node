@@ -305,10 +305,14 @@ boundary:
 
 ---
 
-## 7. Build-first note
+## 7. Implementation status
 
-This spec defines the contract only; no crates are scaffolded here (the current environment has no
-Rust toolchain). When a toolchain is available, the natural first slice is **`daemon-core-ffi` over the
-in-process §17 handle** (P0/P1 surface per §17.3) with `xtask gen-headers`, proven by a tiny C harness
-that scripts an `AgentCommand` transcript and asserts the drained `AgentEvent` stream — the
-cross-language analogue of the in-process transcript test the host-interface doc already prescribes.
+The first slices are implemented:
+
+- `bindings/daemon-core-ffi` exposes the in-process §17 engine handle and is covered by a C harness.
+- `bindings/daemon-ffi` exposes the durable host as an opaque handle plus a generic CBOR
+  `ApiRequest`/`ApiResponse` pump (`daemon_host_call`) over the same `NodeApi` dispatch used by the
+  Unix socket and HTTP surfaces.
+- `xtask gen-headers` and the CDDL checks keep generated headers and wire schemas aligned.
+
+Remaining FFI work is therefore feature breadth and packaging, not crate scaffolding.

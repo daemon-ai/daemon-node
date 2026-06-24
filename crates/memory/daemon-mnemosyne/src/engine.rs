@@ -7,7 +7,7 @@
 //! ([`crate::recall::scoring`]) with the FTS-blended lexical relevance, vector similarity, the MIB
 //! `binary_bonus`, and the tier/veracity multipliers — merged, content-deduped, and MMR-diversified.
 //! [`Engine::consolidate`] is a minimal WM->episodic promotion (no LLM summarization/degradation).
-//! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain TODO (port-spec P1).
+//! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain port-spec P1 work.
 
 use crate::config::{MnemosyneConfig, RecallMode};
 use crate::dynamics::{typed_memory, weibull};
@@ -313,8 +313,8 @@ impl Engine {
     /// `memory_embeddings` (the f32-BLOB-as-JSON fallback store).
     ///
     /// The embedding is computed by the caller (the async [`MnemosyneProvider`] hooks) and passed in,
-    /// so the synchronous engine never blocks on a model call. Scaffold: sanitize + classify +
-    /// insert + vector write (dedup and knowledge ingestion remain TODO).
+    /// so the synchronous engine never blocks on a model call. Current slice: sanitize + classify +
+    /// insert + vector write; dedup and expanded knowledge ingestion remain port-spec follow-ups.
     pub fn remember_with_vector(
         &self,
         content: &str,

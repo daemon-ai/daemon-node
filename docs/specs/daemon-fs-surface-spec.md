@@ -11,9 +11,10 @@ the node**, not off the operator's local disk: a unit's files live in its per-se
 may be reached in-process (`embedded`), over a Unix socket (`local`), or over HTTP/WS
 (`remote`). The only correct source of truth is the node surface.
 
-There is no such surface today: agents touch files via the `fs`/`shell` tools
-(`tools/daemon-tool-fs`), which go through `ExecutionEnvironment`; `daemon-api` exposes only
-checkpoint rewind for workspace state. This spec adds a first-class filesystem surface.
+Before this surface landed, agents touched files only via the `fs`/`shell` tools
+(`tools/daemon-tool-fs`), which go through `ExecutionEnvironment`, and `daemon-api` exposed only
+checkpoint rewind for workspace state. The shipped `fs_*` family is now the first-class filesystem
+surface for clients.
 
 ## Design principles (validated against the code)
 
@@ -120,9 +121,9 @@ The operator *is* the human, so operator writes do **not** route through
 adapter gets them via `POST /api` for free; `fs_watch` adds an SSE route (`GET /fs/watch`)
 mirroring `subscribe_sse`, with `fs_watch_after` as the socket/long-poll cursor.
 
-The new enum variants + the defaulted `SessionOverlay.workspace` field are additive, so
-`API_WIRE_VERSION` / `WireVersion::CURRENT` is **kept at 14** (the cddl labels the FS ops as wire
-v14); no bump is required.
+The enum variants + the defaulted `SessionOverlay.workspace` field were additive when introduced in
+wire v14. The current envelope version may advance for later surfaces; CDDL comments should read as
+"added in v14" rather than "the current wire version is v14".
 
 ## Out of scope (future)
 

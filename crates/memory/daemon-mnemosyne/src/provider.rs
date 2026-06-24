@@ -3,8 +3,8 @@
 //! Maps Mnemosyne onto the daemon-core seam: `prompt_block` = memory-override instructions
 //! (`system_prompt_block` L1437), `recall` = formatted BEAM recall block (`prefetch` L1474 / block
 //! format L1645-L1659), `after_turn` = the `sync_turn` persist gates (L1668), and `tools`/`call_tool`
-//! = the JSON tool dispatch (L1750). Scaffold: the core hooks are wired; the full 26-tool table and
-//! identity-signal capture are TODO.
+//! = the JSON tool dispatch (L1750). Current slice: the core hooks are wired; the full 26-tool table
+//! and identity-signal capture remain port-spec follow-ups.
 
 use crate::embeddings::Embedder;
 use crate::engine::{Engine, MemoryRow, RememberArgs};
@@ -186,7 +186,7 @@ impl MemoryProvider for MnemosyneProvider {
     }
 
     async fn before_compact(&self, _conv: &Conversation) {
-        // TODO: persist salient facts before the body is compacted (`on_pre_compress`).
+        // Port follow-up: persist salient facts before the body is compacted (`on_pre_compress`).
     }
 
     async fn on_session_switch(&self, reason: SwitchReason) {

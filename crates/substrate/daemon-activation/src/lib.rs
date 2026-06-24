@@ -4,8 +4,8 @@
 //! milestone). It owns the active-only directory, the monotonic lease/fence, the wake/job-outbox
 //! dispatchers, the completion consumer, and the recovery scanner — proving lifecycle §4 invariants
 //! #1, #5, #6, #7, #8. It drives engines through a protocol-agnostic seam ([`Incarnation`] /
-//! [`EngineFactory`]) so the durable core can be exercised by `daemon-stub-engine` with no
-//! dependency on `daemon-core` or `daemon-host`. Depends on `daemon-store` + `daemon-common`.
+//! [`EngineFactory`]) so the durable core remains independent of `daemon-core` and `daemon-host`.
+//! Depends on `daemon-store` + `daemon-common`.
 //!
 //! The `elfo` feature (off by default) is reserved for an optional elfo-backed mailbox experiment.
 

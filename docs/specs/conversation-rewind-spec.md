@@ -5,13 +5,16 @@ This spec describes the **conversation-rewind primitive** the `daemon` NodeApi e
 message and redo from there* — restore (re-run the same text), edit (re-run edited text), or
 regenerate the assistant reply — end-to-end against a live engine, instead of only client-side.
 
-**Implementation status (wire v14).** This is **implemented** for `daemon-core`-backed sessions:
-`AgentCommand::RewindTo { anchor, request_id }` + `AgentEvent::Rewound { to_cursor, epoch }` ride the
-existing `Submit` / event stream (no new op), with interrupt-first semantics, in-place snapshot
-reconstruction, an epoch bump, an append-only durable journal seal, and a workspace-checkpoint
-rollback. Foreign ACP-backed sessions are **explicitly non-rewindable** (ACP has no
-truncate-at-anchor primitive — see §9); they advertise `SessionInfo::rewindable = false` so a client
-hides rewind for them rather than issuing a command that is dropped.
+**Implementation status.** Implemented for live `daemon-core`-backed sessions. The client-facing
+contract is `ControlApi::rewind(session, RewindPoint { anchor, restore_workspace })`
+(`ApiRequest::Rewind`), introduced in wire v14 and carried by the current wire envelope. It funnels to
+the same live-engine rewind path as the lower-level `AgentCommand::RewindTo`, with interrupt-first
+semantics, in-place snapshot reconstruction, an epoch bump, an append-only durable journal seal, and
+optional workspace-checkpoint rollback. Foreign ACP-backed sessions are **explicitly non-rewindable**
+(ACP has no truncate-at-anchor primitive — see §9); they advertise `SessionInfo::rewindable = false`
+so a client hides rewind for them rather than issuing a command that is dropped. Durable
+non-resident sessions currently return `Unsupported` until the re-incarnation truncate-and-reseal path
+lands.
 
 It builds on:
 
@@ -20,9 +23,9 @@ It builds on:
 - [`daemon-orchestrator-spec.md`](daemon-orchestrator-spec.md) — §17 surface translation.
 - [`daemon-gui-readiness-roadmap.md`](daemon-gui-readiness-roadmap.md) — the GUI-facing gap list (`no fork_session`, etc.).
 
-## 1. The gap
+## 1. Problem solved
 
-The engine is **append-only** and has **no conversation-rewind op today**:
+The original gap was that the engine was append-only and had no conversation-rewind op:
 
 - `Conversation { turns: Vec<Turn> }` (`crates/engine/daemon-core/src/conversation.rs`) only grows.
 - The write surface is `AgentCommand::{ StartTurn, Steer, Observe, Interrupt, Snapshot, Shutdown }`
@@ -36,13 +39,31 @@ The engine is **append-only** and has **no conversation-rewind op today**:
 - Read cursors (`session_history(after_cursor)`, the live-log `segment`) are read-only; there is no
   truncate-to-cursor, edit, fork, or regenerate op.
 
-So a client wanting rewind must either truncate locally (what `daemon-app` does today, with no
-engine round-trip) or wait for the primitive below.
+That gap is closed for live daemon-core sessions by `ControlApi::rewind`, backed by the same engine
+primitive described below. The remaining limitation is non-resident durable sessions: the host has a
+sealed journal but no resident engine to truncate, so it returns `Unsupported("rewind of a
+non-resident durable session...")` rather than silently no-oping.
 
-## 2. New op — `RewindTo`
+## 2. Client op — `ControlApi::rewind`
 
-Add a submit-path command (it mutates conversation state, so it belongs with `StartTurn`/`Interrupt`
-rather than on the read-only `ControlApi`):
+Clients call the unified control-plane operation:
+
+```rust
+async fn rewind(&self, session: SessionId, point: RewindPoint) -> Result<(), ApiError>;
+
+pub struct RewindPoint {
+    pub anchor: RewindAnchor,
+    pub restore_workspace: bool,
+}
+```
+
+This replaces separate client flows for conversation rewind and workspace-only checkpoint rewind. For
+live daemon-core sessions the host translates it into the engine-level command below; for non-resident
+durable sessions it returns `Unsupported` until the activation-driven re-incarnation path exists.
+
+### Engine command — `RewindTo`
+
+The engine-level submit-path command remains the mutation primitive:
 
 ```rust
 pub enum AgentCommand {
@@ -115,13 +136,13 @@ reconnecting client reconciles against the engine's truncated conversation — t
 
 ## 4. Action mapping
 
-The three client actions decompose into `RewindTo` + a normal turn command:
+The three client actions decompose into `ControlApi::rewind` + a normal turn command:
 
 | Client action | NodeApi sequence |
 | :--- | :--- |
-| **restore** (re-run same text) | `RewindTo { UserTurn(o) }` → `StartTurn { input: <original UserMsg> }` |
-| **edit** (re-run edited text) | `RewindTo { UserTurn(o) }` → `StartTurn { input: <edited UserMsg> }` |
-| **regenerate** (new reply, same prompt) | `RewindTo { ReplyAfter(o) }` → `StartTurn` re-run **without** re-appending the user turn |
+| **restore** (re-run same text) | `ControlApi::rewind(UserTurn(o))` → `StartTurn { input: <original UserMsg> }` |
+| **edit** (re-run edited text) | `ControlApi::rewind(UserTurn(o))` → `StartTurn { input: <edited UserMsg> }` |
+| **regenerate** (new reply, same prompt) | `ControlApi::rewind(ReplyAfter(o))` → `StartTurn` re-run **without** re-appending the user turn |
 
 `restore`/`edit` differ only in the `UserMsg` payload of the follow-up `StartTurn`; `regenerate`
 keeps the user turn (`ReplyAfter`) and re-runs without a new input.
@@ -179,10 +200,10 @@ touches one place:
 
 | Client seam (`daemon-app`) | NodeApi call |
 | :--- | :--- |
-| `DocumentStore::rewindToMessage(id)` (truncate inclusive, return text) | `RewindTo { UserTurn(ordinal_of(id)) }` |
-| `DocumentStore::regenerateFromMessage(id)` (truncate reply, keep user) | `RewindTo { ReplyAfter(ordinal_of(id)) }` |
+| `DocumentStore::rewindToMessage(id)` (truncate inclusive, return text) | `ApiRequest::Rewind { point: RewindPoint { anchor: UserTurn(ordinal_of(id)), restore_workspace } }` |
+| `DocumentStore::regenerateFromMessage(id)` (truncate reply, keep user) | `ApiRequest::Rewind { point: RewindPoint { anchor: ReplyAfter(ordinal_of(id)), restore_workspace } }` |
 | `ConversationOrchestrator::rerun(text)` / `submit(text)` | `StartTurn { input: UserMsg::from(text) }` |
-| `cancel()` before a rewind (interrupt-if-busy) | folded into `RewindTo` (interrupt-first) |
+| `cancel()` before a rewind (interrupt-if-busy) | folded into `ControlApi::rewind` (interrupt-first) |
 | (live) drop transcript tail on `Rewound` | `AgentEvent::Rewound { to_cursor }` |
 
 `ordinal_of(messageId)` is the client→engine id resolution the adapter owns: the client's stable
@@ -202,6 +223,8 @@ message id maps to the engine turn ordinal / journal cursor carried alongside ea
 5. Idempotent on `request_id`; a duplicate `RewindTo` re-truncates to the same anchor.
 6. Foreign ACP sessions advertise `SessionInfo::rewindable = false` and a `RewindTo` submitted to a
    foreign agent is dropped (never faked).
+7. Non-resident durable sessions return `Unsupported` until the host can re-incarnate, truncate, and
+   reseal them without a live actor.
 
 ## 9. Foreign ACP sessions are non-rewindable
 
