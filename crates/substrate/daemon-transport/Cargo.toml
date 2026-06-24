@@ -20,6 +20,7 @@ serde = { workspace = true }
 ciborium = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 daemon-core = { workspace = true }

@@ -37,7 +37,10 @@ use daemon_supervision::{
     ManageRequest, ManageRequestHandler, ManageResponseBody, ManagedUnit, Outcome, StartTrigger,
     UnitKind,
 };
-use daemon_telemetry::{current_trace, set_trace, with_trace, Metrics, TraceSigner};
+use daemon_telemetry::{
+    current_trace, fields, restore_trace_span, with_trace, with_trace_span, Metrics, SpanKind,
+    TraceSigner,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -301,6 +304,48 @@ fn encode(frame: &CutFrame) -> Vec<u8> {
 
 fn decode(bytes: &[u8]) -> Option<Wire> {
     ciborium::from_reader(bytes).ok()
+}
+
+fn frame_kind(frame: &CutFrame) -> &'static str {
+    match frame {
+        CutFrame::RunTurn { .. } => "RunTurn",
+        CutFrame::Cancel { .. } => "Cancel",
+        CutFrame::Shutdown => "Shutdown",
+        CutFrame::StoreReply { .. } => "StoreReply",
+        CutFrame::RequestReply { .. } => "RequestReply",
+        CutFrame::CredReply { .. } => "CredReply",
+        CutFrame::Event(_) => "Event",
+        CutFrame::StoreCall { .. } => "StoreCall",
+        CutFrame::Request { .. } => "Request",
+        CutFrame::CredCall { .. } => "CredCall",
+    }
+}
+
+fn store_call_kind(call: &StoreCall) -> &'static str {
+    match call {
+        StoreCall::CreateSession { .. } => "CreateSession",
+        StoreCall::AcquireActivationLease { .. } => "AcquireActivationLease",
+        StoreCall::LoadForActivation { .. } => "LoadForActivation",
+        StoreCall::CheckpointAndEnqueue { .. } => "CheckpointAndEnqueue",
+        StoreCall::MarkCompleted { .. } => "MarkCompleted",
+        StoreCall::RecordCompletionAndWake { .. } => "RecordCompletionAndWake",
+        StoreCall::ScanResumable { .. } => "ScanResumable",
+        StoreCall::DequeueJob => "DequeueJob",
+        StoreCall::DequeueWake => "DequeueWake",
+        StoreCall::Status { .. } => "Status",
+        StoreCall::Stats => "Stats",
+        StoreCall::AppendTrace { .. } => "AppendTrace",
+        StoreCall::CommitTraceSegment { .. } => "CommitTraceSegment",
+        StoreCall::LoadTraceSegment { .. } => "LoadTraceSegment",
+        StoreCall::LoadJournal { .. } => "LoadJournal",
+    }
+}
+
+fn cred_call_kind(call: &CredCall) -> &'static str {
+    match call {
+        CredCall::Acquire { .. } => "Acquire",
+        CredCall::Use { .. } => "Use",
+    }
 }
 
 /// Serve one brokered store call against the parent's authoritative store (the parent side of the
@@ -674,17 +719,42 @@ pub async fn serve_credentials(channel: CutChannel, broker: Arc<dyn CredentialBr
         let Some(Wire { trace, frame }) = decode(&bytes) else {
             continue;
         };
-        set_trace(trace);
+        let span = restore_trace_span(trace, fields::span::CUT_RECV, SpanKind::Boundary);
+        span.in_scope(|| {
+            tracing::debug!(
+                trace_id = %trace,
+                frame = frame_kind(&frame),
+                event = fields::event::CUT_FRAME_IN,
+                "credential cut frame received"
+            );
+        });
         if let CutFrame::CredCall { id, call } = frame {
             let writer = writer.clone();
             let broker = broker.clone();
+            let cred_op = cred_call_kind(&call);
             // Serve under the restored trace so the audit at this hop (and every hop up) correlates.
-            tokio::spawn(with_trace(trace, async move {
-                let body = serve_cred_call(broker.as_ref(), call).await;
-                let _ = writer
-                    .send(&encode(&CutFrame::CredReply { id, body }))
-                    .await;
-            }));
+            tokio::spawn(with_trace_span(
+                trace,
+                fields::span::CUT_CRED_BROKER,
+                SpanKind::Credential,
+                async move {
+                    tracing::debug!(
+                        trace_id = %trace,
+                        cred_op,
+                        "serving brokered credential call"
+                    );
+                    let body = serve_cred_call(broker.as_ref(), call).await;
+                    tracing::debug!(
+                        trace_id = %trace,
+                        frame = "CredReply",
+                        event = fields::event::CUT_FRAME_OUT,
+                        "credential cut reply sent"
+                    );
+                    let _ = writer
+                        .send(&encode(&CutFrame::CredReply { id, body }))
+                        .await;
+                },
+            ));
         }
     }
 }
@@ -741,7 +811,15 @@ impl RemoteCredentialClient {
                 let Some(Wire { trace, frame }) = decode(&bytes) else {
                     continue;
                 };
-                set_trace(trace);
+                let span = restore_trace_span(trace, fields::span::CUT_RECV, SpanKind::Boundary);
+                span.in_scope(|| {
+                    tracing::debug!(
+                        trace_id = %trace,
+                        frame = frame_kind(&frame),
+                        event = fields::event::CUT_FRAME_IN,
+                        "credential client cut frame received"
+                    );
+                });
                 if let CutFrame::CredReply { id, body } = frame {
                     if let Some(tx) = c.pending.lock().unwrap().remove(&id) {
                         let _ = tx.send(body);
@@ -1042,6 +1120,7 @@ impl PlacedUnit {
         let handler_for_reader = handler.clone();
         let broker_for_reader = broker.clone();
         let child_trace_for_reader = child_trace.clone();
+        let id_for_reader = id.clone();
         // Establish a trace scope so `set_trace` (restore-on-receive) governs the replies this loop
         // sends back to the child (a served `StoreReply` correlates with the brokered `StoreCall`).
         tokio::spawn(with_trace(TraceId::NONE, async move {
@@ -1050,7 +1129,16 @@ impl PlacedUnit {
                     continue;
                 };
                 // Restore the child's trace context, and record it as proof of round-trip.
-                set_trace(trace);
+                let span = restore_trace_span(trace, fields::span::CUT_RECV, SpanKind::Boundary);
+                span.in_scope(|| {
+                    tracing::debug!(
+                        trace_id = %trace,
+                        frame = frame_kind(&frame),
+                        unit = %id_for_reader,
+                        event = fields::event::CUT_FRAME_IN,
+                        "placement cut frame received"
+                    );
+                });
                 if !trace.is_none() {
                     child_trace_for_reader.store(trace.0, Ordering::Relaxed);
                 }
@@ -1065,7 +1153,21 @@ impl PlacedUnit {
                         let _ = out.send(ev);
                     }
                     CutFrame::StoreCall { id, call } => {
-                        let body = serve_store_call(store_for_reader.as_ref(), call).await;
+                        let store_op = store_call_kind(&call);
+                        let body = with_trace_span(
+                            trace,
+                            fields::span::CUT_STORE_BROKER,
+                            SpanKind::Store,
+                            async {
+                                tracing::debug!(
+                                    trace_id = %trace,
+                                    store_op,
+                                    "serving brokered store call"
+                                );
+                                serve_store_call(store_for_reader.as_ref(), call).await
+                            },
+                        )
+                        .await;
                         let _ = writer_for_reader
                             .send(&encode(&CutFrame::StoreReply { id, body }))
                             .await;
@@ -1087,12 +1189,23 @@ impl PlacedUnit {
                             // Serve on its own task (under the restored trace) so a relay's upward
                             // forward — which awaits an even-higher hop — never blocks this reader.
                             Some(broker) => {
-                                tokio::spawn(with_trace(trace, async move {
-                                    let body = serve_cred_call(broker.as_ref(), call).await;
-                                    let _ = writer
-                                        .send(&encode(&CutFrame::CredReply { id, body }))
-                                        .await;
-                                }));
+                                let cred_op = cred_call_kind(&call);
+                                tokio::spawn(with_trace_span(
+                                    trace,
+                                    fields::span::CUT_CRED_BROKER,
+                                    SpanKind::Credential,
+                                    async move {
+                                        tracing::debug!(
+                                            trace_id = %trace,
+                                            cred_op,
+                                            "serving brokered credential call"
+                                        );
+                                        let body = serve_cred_call(broker.as_ref(), call).await;
+                                        let _ = writer
+                                            .send(&encode(&CutFrame::CredReply { id, body }))
+                                            .await;
+                                    },
+                                ));
                             }
                             None => {
                                 let body = no_authority_reply(&call);
@@ -1294,6 +1407,15 @@ async fn drive_placed_child(
         let Some(Wire { trace, frame }) = decode(&bytes) else {
             continue;
         };
+        let span = restore_trace_span(trace, fields::span::CUT_RECV, SpanKind::Boundary);
+        span.in_scope(|| {
+            tracing::debug!(
+                trace_id = %trace,
+                frame = frame_kind(&frame),
+                event = fields::event::CUT_FRAME_IN,
+                "placed child cut frame received"
+            );
+        });
         match frame {
             CutFrame::StoreReply { id, body } => client.complete(id, body),
             // Demultiplex the parent's brokered credential replies to the cut credential client
@@ -1310,49 +1432,60 @@ async fn drive_placed_child(
                 // reader loop, so it must run concurrently — awaiting it inline would deadlock.
                 // Run it inside the *restored* trace scope so every brokered store call and emitted
                 // event the child sends back is stamped with the parent's trace (round-trip proof).
-                tokio::spawn(with_trace(trace, async move {
-                    emit(
-                        &writer,
-                        ManageEvent::Started {
-                            seq: 0,
-                            trigger: StartTrigger::Resumed,
-                        },
-                    )
-                    .await;
-                    // A turn makes (at least) one provider call; report it as first-class usage so
-                    // it aggregates up the tree (the mock provider does not surface token counts).
-                    emit(
-                        &writer,
-                        ManageEvent::Usage {
-                            seq: 1,
-                            delta: UsageDelta {
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                api_calls: 1,
-                                ..Default::default()
+                tokio::spawn(with_trace_span(
+                    trace,
+                    fields::span::CUT_RUN_TURN,
+                    SpanKind::Lifecycle,
+                    async move {
+                        tracing::debug!(
+                            trace_id = %trace,
+                            session = %session,
+                            fence = ?fence,
+                            "placed child run turn received"
+                        );
+                        emit(
+                            &writer,
+                            ManageEvent::Started {
+                                seq: 0,
+                                trigger: StartTrigger::Resumed,
                             },
-                        },
-                    )
-                    .await;
-                    let event = match manager.activate(session, fence).await {
-                        Ok(()) => ManageEvent::Finished {
-                            seq: 2,
-                            outcome: Outcome::ended(EndReason::Completed),
-                        },
-                        Err(SubErr::Store(StoreError::Fenced { .. })) => ManageEvent::Error {
-                            seq: 2,
-                            failure: FailureView::new(
-                                FailureClass::Cancelled,
-                                "fenced across the cut",
-                            ),
-                        },
-                        Err(e) => ManageEvent::Error {
-                            seq: 2,
-                            failure: FailureView::new(FailureClass::Internal, e.to_string()),
-                        },
-                    };
-                    emit(&writer, event).await;
-                }));
+                        )
+                        .await;
+                        // A turn makes (at least) one provider call; report it as first-class usage so
+                        // it aggregates up the tree (the mock provider does not surface token counts).
+                        emit(
+                            &writer,
+                            ManageEvent::Usage {
+                                seq: 1,
+                                delta: UsageDelta {
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    api_calls: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        )
+                        .await;
+                        let event = match manager.activate(session, fence).await {
+                            Ok(()) => ManageEvent::Finished {
+                                seq: 2,
+                                outcome: Outcome::ended(EndReason::Completed),
+                            },
+                            Err(SubErr::Store(StoreError::Fenced { .. })) => ManageEvent::Error {
+                                seq: 2,
+                                failure: FailureView::new(
+                                    FailureClass::Cancelled,
+                                    "fenced across the cut",
+                                ),
+                            },
+                            Err(e) => ManageEvent::Error {
+                                seq: 2,
+                                failure: FailureView::new(FailureClass::Internal, e.to_string()),
+                            },
+                        };
+                        emit(&writer, event).await;
+                    },
+                ));
             }
             CutFrame::Cancel { .. } | CutFrame::Shutdown => break,
             _ => {}
@@ -1396,7 +1529,7 @@ mod cred_cut_tests {
                 let Some(Wire { trace, frame }) = decode(&bytes) else {
                     continue;
                 };
-                set_trace(trace);
+                daemon_telemetry::set_trace(trace);
                 if let CutFrame::CredReply { id, body } = frame {
                     cred.complete(id, body);
                 }
@@ -1407,13 +1540,12 @@ mod cred_cut_tests {
     fn owner(mode: CredMode, grant: CredScope) -> Arc<CredentialAuthority> {
         let signer = Arc::new(CapabilitySigner::generate());
         let source = Arc::new(StubCredentialSource::minting("openai", "sk-configured"));
-        Arc::new(CredentialAuthority::new(grant, mode, 60_000, signer, source))
+        Arc::new(CredentialAuthority::new(
+            grant, mode, 60_000, signer, source,
+        ))
     }
 
-    fn placed_with_broker(
-        parent: CutChannel,
-        broker: Arc<dyn CredentialBroker>,
-    ) -> PlacedUnit {
+    fn placed_with_broker(parent: CutChannel, broker: Arc<dyn CredentialBroker>) -> PlacedUnit {
         let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
         PlacedUnit::new(
             UnitId::new("child"),

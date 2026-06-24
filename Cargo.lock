@@ -2070,6 +2070,7 @@ dependencies = [
  "async-trait",
  "daemon-common",
  "daemon-store",
+ "daemon-telemetry",
  "dashmap",
  "thiserror 2.0.18",
  "tokio",
@@ -2274,6 +2275,7 @@ dependencies = [
  "daemon-common",
  "daemon-delivery",
  "daemon-protocol",
+ "daemon-telemetry",
  "futures",
  "reqwest 0.12.28",
  "serde",
@@ -2784,6 +2786,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

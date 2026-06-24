@@ -12,6 +12,7 @@ license.workspace = true
 [dependencies]
 daemon-api = { workspace = true }
 daemon-common = { workspace = true }
+daemon-telemetry = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-delivery = { workspace = true }
 tokio = { workspace = true }

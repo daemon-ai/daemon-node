@@ -16,9 +16,11 @@ use daemon_common::{DaemonError, Epoch, FenceToken, PartitionId, SessionId};
 use daemon_store::{
     Checkpoint, JobCommand, JobCompletion, ParkedApproval, SessionStatus, SessionStore, StoreError,
 };
+use daemon_telemetry::{current_trace, ingress_trace, with_trace};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 // Re-export so downstream crates need only depend on `daemon-activation` for the seam.
 pub use daemon_common::SnapshotBlob;
@@ -140,38 +142,77 @@ struct ManagerInner {
 
 impl ManagerInner {
     async fn run_cycle(&self, id: &SessionId, fence: FenceToken) -> Result<(), SubErr> {
-        let activation = self.store.load_for_activation(id, fence).await?;
-        let mut inc = self.factory.create();
-        inc.hydrate(activation.snapshot, activation.unapplied)
-            .await?;
-        match inc.run().await? {
-            Step::Suspended { job } => {
-                let snapshot = inc.checkpoint()?;
-                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
-                self.store
-                    .checkpoint_and_enqueue(checkpoint, job, fence)
-                    .await?;
+        let span = tracing::info_span!(
+            "activation.run_cycle",
+            trace_id = %current_trace(),
+            session = %id,
+            fence = fence.0
+        );
+        async {
+            let activation = self.store.load_for_activation(id, fence).await?;
+            tracing::debug!(
+                trace_id = %current_trace(),
+                session = %id,
+                unapplied_jobs = activation.unapplied.len(),
+                "activation.hydrate"
+            );
+            let mut inc = self.factory.create();
+            inc.hydrate(activation.snapshot, activation.unapplied)
+                .await?;
+            match inc.run().await? {
+                Step::Suspended { job } => {
+                    let snapshot = inc.checkpoint()?;
+                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
+                    tracing::info!(
+                        trace_id = %current_trace(),
+                        session = %id,
+                        epoch = inc.epoch().0,
+                        step = "Suspended",
+                        job_id = %job.job_id,
+                        "activation.commit"
+                    );
+                    self.store
+                        .checkpoint_and_enqueue(checkpoint, job, fence)
+                        .await?;
+                }
+                Step::ParkApproval { approvals } => {
+                    // §12 HITL park: checkpoint the suspended snapshot + record the parked approval rows
+                    // in one transaction, but enqueue *no* runnable job — the session stays dormant until
+                    // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
+                    let snapshot = inc.checkpoint()?;
+                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
+                    tracing::info!(
+                        trace_id = %current_trace(),
+                        session = %id,
+                        epoch = inc.epoch().0,
+                        step = "ParkApproval",
+                        approvals = approvals.len(),
+                        "activation.commit"
+                    );
+                    self.store
+                        .park_approval(checkpoint, approvals, fence)
+                        .await?;
+                }
+                Step::Completed => {
+                    let snapshot = inc.checkpoint()?;
+                    // A delegated child carries its structured result (DelegationResult: summary +
+                    // artifact refs) on the completion payload; the incarnation captured it at terminal.
+                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                        .with_completion_payload(inc.completion_payload());
+                    tracing::info!(
+                        trace_id = %current_trace(),
+                        session = %id,
+                        epoch = inc.epoch().0,
+                        step = "Completed",
+                        "activation.commit"
+                    );
+                    self.store.mark_completed(checkpoint, fence).await?;
+                }
             }
-            Step::ParkApproval { approvals } => {
-                // §12 HITL park: checkpoint the suspended snapshot + record the parked approval rows
-                // in one transaction, but enqueue *no* runnable job — the session stays dormant until
-                // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
-                let snapshot = inc.checkpoint()?;
-                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
-                self.store
-                    .park_approval(checkpoint, approvals, fence)
-                    .await?;
-            }
-            Step::Completed => {
-                let snapshot = inc.checkpoint()?;
-                // A delegated child carries its structured result (DelegationResult: summary +
-                // artifact refs) on the completion payload; the incarnation captured it at terminal.
-                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
-                    .with_completion_payload(inc.completion_payload());
-                self.store.mark_completed(checkpoint, fence).await?;
-            }
+            Ok(())
         }
-        Ok(())
+        .instrument(span)
+        .await
     }
 }
 
@@ -295,6 +336,13 @@ impl ActivationManager {
 #[async_trait]
 impl ActivationSubstrate for ActivationManager {
     async fn activate(&self, id: SessionId, fence: FenceToken) -> Result<(), SubErr> {
+        let trace = ingress_trace(Some(current_trace()));
+        tracing::debug!(
+            trace_id = %trace,
+            session = %id,
+            fence = fence.0,
+            "activation.wake"
+        );
         // Single-activation guard for this process (invariant #6). Cluster-wide single-activation is
         // enforced durably by the fence: a stale incarnation cannot commit (invariant #5).
         if self.inner.directory.contains_key(&id) {
@@ -304,12 +352,12 @@ impl ActivationSubstrate for ActivationManager {
 
         let inner = self.inner.clone();
         let task_id = id.clone();
-        let handle = self.inner.tracker.spawn(async move {
+        let handle = self.inner.tracker.spawn(with_trace(trace, async move {
             let result = inner.run_cycle(&task_id, fence).await;
             // Passivate: drop the directory entry so memory returns to baseline (invariant #8).
             inner.directory.remove(&task_id);
             result
-        });
+        }));
         match handle.await {
             Ok(result) => result,
             Err(join_err) => {

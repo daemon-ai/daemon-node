@@ -8,7 +8,7 @@ use daemon_common::{
 };
 use daemon_store::{Checkpoint, SessionStatus, SessionStore, StoreErrorWire};
 use daemon_supervision::{Ack, ManageCommand, ManageEvent, ManagedUnit, WorkRef};
-use daemon_telemetry::{current_trace, set_trace, with_trace};
+use daemon_telemetry::{current_trace, fields, restore_trace_span, with_trace, SpanKind};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +40,16 @@ enum Req {
     },
     /// Read a session's durable status.
     Status { session: SessionId },
+}
+
+fn req_kind(req: &Req) -> &'static str {
+    match req {
+        Req::Hello { .. } => "Hello",
+        Req::Drive { .. } => "Drive",
+        Req::AcquireFence { .. } => "AcquireFence",
+        Req::Commit { .. } => "Commit",
+        Req::Status { .. } => "Status",
+    }
 }
 
 /// A server→client reply.
@@ -163,7 +173,20 @@ impl RemoteHost {
         // A trace scope so `set_trace` (restore-on-decode) governs the replies we stamp back.
         with_trace(TraceId::NONE, async move {
             while let Some(frame) = read_frame::<OwnedReadHalf, Req>(&mut r).await? {
-                set_trace(frame.trace);
+                let operation = req_kind(&frame.body);
+                let span = restore_trace_span(
+                    frame.trace,
+                    fields::span::TRANSPORT_REQUEST,
+                    SpanKind::Transport,
+                );
+                let _guard = span.enter();
+                tracing::debug!(
+                    trace_id = %frame.trace,
+                    wire = "tcp",
+                    operation,
+                    event = fields::event::TRANSPORT_REQUEST,
+                    "transport request received"
+                );
                 let body = self.dispatch(frame.body).await;
                 let reply = Wire {
                     wire_version: WireVersion::CURRENT,
@@ -276,7 +299,18 @@ impl RemoteClient {
             .await?
             .ok_or(TransportError::Closed)?;
         // Restore the peer's trace context (so the journal/logs here correlate with the server).
-        set_trace(reply.trace);
+        let span = restore_trace_span(
+            reply.trace,
+            fields::span::TRANSPORT_REPLY,
+            SpanKind::Transport,
+        );
+        let _guard = span.enter();
+        tracing::debug!(
+            trace_id = %reply.trace,
+            wire = "tcp",
+            event = fields::event::TRANSPORT_REPLY,
+            "transport reply received"
+        );
         Ok(reply.body)
     }
 

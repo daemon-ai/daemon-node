@@ -114,8 +114,23 @@ impl CredentialBroker for OwnerBroker {
         profile: &ProfileRef,
         scope: &CredScope,
     ) -> Result<CapabilityLease, CredError> {
-        self.fence_ok()?;
+        if let Err(e) = self.fence_ok() {
+            tracing::warn!(
+                trace_id = %current_trace(),
+                profile = %profile,
+                requester = ?requester,
+                reason = ?e,
+                "cred.deny"
+            );
+            return Err(e);
+        }
         let ctx = AcquireCtx::new(requester, current_trace());
+        tracing::debug!(
+            trace_id = %current_trace(),
+            profile = %profile,
+            requester = ?ctx.requester,
+            "cred.acquire"
+        );
         self.authority.acquire(&ctx, profile, scope)
     }
 
@@ -124,8 +139,21 @@ impl CredentialBroker for OwnerBroker {
         requester: Option<UnitId>,
         lease: &CapabilityLease,
     ) -> Result<LeaseSecret, CredError> {
-        self.fence_ok()?;
+        if let Err(e) = self.fence_ok() {
+            tracing::warn!(
+                trace_id = %current_trace(),
+                requester = ?requester,
+                reason = ?e,
+                "cred.deny"
+            );
+            return Err(e);
+        }
         let ctx = AcquireCtx::new(requester, current_trace());
+        tracing::debug!(
+            trace_id = %current_trace(),
+            requester = ?ctx.requester,
+            "cred.use"
+        );
         self.authority.use_capability(&ctx, lease)
     }
 
@@ -178,12 +206,34 @@ impl CredentialBroker for RelayBroker {
         profile: &ProfileRef,
         scope: &CredScope,
     ) -> Result<CapabilityLease, CredError> {
-        self.fence_ok()?;
+        if let Err(e) = self.fence_ok() {
+            tracing::warn!(
+                trace_id = %current_trace(),
+                profile = %profile,
+                requester = ?requester,
+                reason = ?e,
+                "cred.deny"
+            );
+            return Err(e);
+        }
         // Per-hop attenuation: a descendant can never get more than this hop is itself granted.
         let narrowed = self.grant.intersect(scope);
         if narrowed.is_empty() {
+            tracing::warn!(
+                trace_id = %current_trace(),
+                profile = %profile,
+                requester = ?requester,
+                reason = "scope_denied",
+                "cred.deny"
+            );
             return Err(CredError::ScopeDenied);
         }
+        tracing::debug!(
+            trace_id = %current_trace(),
+            profile = %profile,
+            requester = ?requester,
+            "cred.acquire"
+        );
         self.upstream.acquire(requester, profile, &narrowed).await
     }
 
@@ -192,8 +242,21 @@ impl CredentialBroker for RelayBroker {
         requester: Option<UnitId>,
         lease: &CapabilityLease,
     ) -> Result<LeaseSecret, CredError> {
-        self.fence_ok()?;
+        if let Err(e) = self.fence_ok() {
+            tracing::warn!(
+                trace_id = %current_trace(),
+                requester = ?requester,
+                reason = ?e,
+                "cred.deny"
+            );
+            return Err(e);
+        }
         // A relay holds no secret; the use must reach the owner.
+        tracing::debug!(
+            trace_id = %current_trace(),
+            requester = ?requester,
+            "cred.use"
+        );
         self.upstream.use_capability(requester, lease).await
     }
 }
@@ -258,7 +321,11 @@ mod tests {
         store.add_key("grok", "key-b").unwrap();
 
         let signer = Arc::new(CapabilitySigner::generate());
-        let source = Arc::new(PooledStoreCredentialSource::new(store, "grok", "sk-fallback"));
+        let source = Arc::new(PooledStoreCredentialSource::new(
+            store,
+            "grok",
+            "sk-fallback",
+        ));
         let scope = CredScope::new(["grok"], ["chat"], Some(1_000));
         let authority = Arc::new(CredentialAuthority::new(
             scope.clone(),

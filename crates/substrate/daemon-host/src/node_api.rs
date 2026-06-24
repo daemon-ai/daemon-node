@@ -13,23 +13,23 @@
 //!   by the actor's event broadcast and a parked-request table so a poll-based embedder (the FFI)
 //!   sees events *and* blocking host requests on one queue and answers them with `respond`.
 
+use crate::auth::PendingAuthFlows;
+use crate::credstore::CredentialStore;
 use crate::engine_incarnation::JournalConfig;
 use crate::journal::{JournalFeeder, JournalSink};
+use crate::profiles::ProfileStore;
+use crate::routing::RoutingRegistry;
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
-use crate::auth::PendingAuthFlows;
-use crate::credstore::CredentialStore;
-use crate::profiles::ProfileStore;
-use crate::routing::RoutingRegistry;
 use daemon_api::{
     from_cbor, to_cbor, AcpAgentEntry, AcpSource, ApiError, ApprovalInfo, ApprovalMode, AuthApi,
-    AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse, AuthProviderInfo,
-    BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, ControlApi, CredentialApi, CredentialInfo,
-    DeliverySink, Distribution, FleetReport, FsContent, FsEntry, FsRevision, FsRoot, FsRootId,
-    FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView, HealthReport, JournalPageView,
-    JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle,
+    AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse,
+    AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, ControlApi,
+    CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, FsContent, FsEntry,
+    FsRevision, FsRoot, FsRootId, FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView,
+    HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle,
     LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
     ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
     SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole,
@@ -52,8 +52,8 @@ use daemon_protocol::{
 };
 use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
 use daemon_telemetry::{
-    decode_entry, verify_segment, JournalPayload, Metrics, SegmentInput, TraceSigner, VerifyingKey,
-    GENESIS_ROOT,
+    current_trace, decode_entry, verify_segment, JournalPayload, Metrics, SegmentInput,
+    TraceSigner, VerifyingKey, GENESIS_ROOT,
 };
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
@@ -869,7 +869,13 @@ impl NodeApiImpl {
         };
         let mut blob = Vec::new();
         if ciborium::into_writer(&spec, &mut blob).is_ok() {
-            let _ = log.append(daemon_common::RevisionKind::Profile, id, &blob, author, reason);
+            let _ = log.append(
+                daemon_common::RevisionKind::Profile,
+                id,
+                &blob,
+                author,
+                reason,
+            );
         }
     }
 
@@ -1089,7 +1095,10 @@ fn title_from_text(text: &str) -> String {
         return first_line.to_string();
     }
     let truncated: String = first_line.chars().take(MAX).collect();
-    let cut = truncated.rsplit_once(' ').map(|(h, _)| h).unwrap_or(&truncated);
+    let cut = truncated
+        .rsplit_once(' ')
+        .map(|(h, _)| h)
+        .unwrap_or(&truncated);
     format!("{}…", cut.trim_end())
 }
 
@@ -1493,10 +1502,8 @@ impl ControlApi for NodeApiImpl {
                         Ok(event) => {
                             if let Some(window) = filter.coalesce_ms {
                                 // Debounce: collapse this burst into one fresh re-projection.
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    window.max(1),
-                                ))
-                                .await;
+                                tokio::time::sleep(std::time::Duration::from_millis(window.max(1)))
+                                    .await;
                                 while rx.try_recv().is_ok() {}
                                 let report = filtered_tree(&this, &filter).await;
                                 return Some((
@@ -1796,9 +1803,15 @@ impl ControlApi for NodeApiImpl {
 
     async fn checkpoint_rewind(
         &self,
-        _session: SessionId,
+        session: SessionId,
         checkpoint_id: String,
     ) -> Result<(), ApiError> {
+        tracing::info!(
+            trace_id = %current_trace(),
+            session = %session,
+            checkpoint_id = %checkpoint_id,
+            "checkpoint.rewind.api"
+        );
         let store = self
             .checkpoints
             .as_ref()
@@ -1900,7 +1913,8 @@ impl ControlApi for NodeApiImpl {
         base_revision: Option<FsRevision>,
         force: bool,
     ) -> Result<FsRevision, ApiError> {
-        self.write_gated(root, path, bytes, base_revision, force).await
+        self.write_gated(root, path, bytes, base_revision, force)
+            .await
     }
 
     async fn fs_write_from_blob(
@@ -1919,7 +1933,8 @@ impl ControlApi for NodeApiImpl {
             .get(&hash, None)
             .await
             .map_err(|e| ApiError::Other(format!("blob fetch: {e}")))?;
-        self.write_gated(root, path, bytes, base_revision, force).await
+        self.write_gated(root, path, bytes, base_revision, force)
+            .await
     }
 
     async fn blob_put(&self, bytes: Vec<u8>) -> Result<BlobRef, ApiError> {
@@ -2172,7 +2187,9 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<(), ApiError> {
         // Persist the edit-approval override on the overlay, then switch the live actor's policy in
         // place when resident (the live ParkingHandler reads `session_modes` to auto-allow vs park).
-        let overlay = self.update_overlay(&session, |o| o.approval_mode = Some(mode)).await;
+        let overlay = self
+            .update_overlay(&session, |o| o.approval_mode = Some(mode))
+            .await;
         self.apply_overlay_live(&session, &overlay).await?;
         // Keep the live mode cache populated even when not resident, so a freshly-resident actor's
         // ParkingHandler sees the persisted policy until `apply_overlay_live` refreshes it.
@@ -2652,7 +2669,11 @@ impl ProfileApi for NodeApiImpl {
         let head_seq = self
             .revisions
             .as_ref()
-            .and_then(|log| log.head(daemon_common::RevisionKind::Profile, &id).ok().flatten())
+            .and_then(|log| {
+                log.head(daemon_common::RevisionKind::Profile, &id)
+                    .ok()
+                    .flatten()
+            })
             .map(|r| r.seq);
         Ok(Distribution {
             wire_version: daemon_common::WireVersion::CURRENT,
@@ -2693,7 +2714,11 @@ impl ProfileApi for NodeApiImpl {
                     continue;
                 }
                 skill_store
-                    .import_bundle(bundle, daemon_common::Author::Operator, &format!("import via {id}"))
+                    .import_bundle(
+                        bundle,
+                        daemon_common::Author::Operator,
+                        &format!("import via {id}"),
+                    )
                     .map_err(|e| ApiError::Other(format!("skill import: {e}")))?;
             }
         }
@@ -2790,9 +2815,7 @@ impl ProfileApi for NodeApiImpl {
         let mut entries = Vec::new();
         // Live (discovered) skills, with their usage record (defaulting when untracked).
         for item in store.list() {
-            let record = usage
-                .and_then(|u| u.get(&item.name))
-                .unwrap_or_default();
+            let record = usage.and_then(|u| u.get(&item.name)).unwrap_or_default();
             entries.push(daemon_api::CuratorEntry {
                 name: item.name.clone(),
                 category: item.category,
@@ -2828,11 +2851,15 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn curator_archive(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
-        self.curator_store(profile)?.archive(&name).map_err(skill_err)
+        self.curator_store(profile)?
+            .archive(&name)
+            .map_err(skill_err)
     }
 
     async fn curator_restore(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
-        self.curator_store(profile)?.restore(&name).map_err(skill_err)
+        self.curator_store(profile)?
+            .restore(&name)
+            .map_err(skill_err)
     }
 
     async fn curator_run(
@@ -2956,8 +2983,10 @@ impl AuthApi for NodeApiImpl {
                 .unwrap_or_else(|| outcome.transport_instance.clone());
             spec.bound_accounts
                 .retain(|a| a.transport_instance != transport_instance.as_str());
-            spec.bound_accounts
-                .push(BoundAccount::new(transport_instance.as_str(), &credential_ref));
+            spec.bound_accounts.push(BoundAccount::new(
+                transport_instance.as_str(),
+                &credential_ref,
+            ));
             profiles.update(spec).map_err(profile_err)?;
             bound_profile = Some(bind.profile.clone());
         }
@@ -3711,7 +3740,7 @@ pub(crate) async fn apply_rewind_side_effects(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let _ = store
+        let result = store
             .record_journal_seal(
                 &stream,
                 daemon_store::JournalSeal {
@@ -3722,12 +3751,31 @@ pub(crate) async fn apply_rewind_side_effects(
                 },
             )
             .await;
+        match result {
+            Ok(()) => tracing::info!(
+                trace_id = %current_trace(),
+                session = %session,
+                seal_cursor = head,
+                retained_turns = outcome.retained_turns,
+                epoch = outcome.epoch.0,
+                "rewind.seal"
+            ),
+            Err(e) => tracing::warn!(
+                trace_id = %current_trace(),
+                session = %session,
+                error = %e,
+                "rewind.seal.failed"
+            ),
+        }
     }
 
     if restore_workspace && !outcome.dropped_call_ids.is_empty() {
         if let Some(store) = checkpoints {
-            let dropped: std::collections::HashSet<&str> =
-                outcome.dropped_call_ids.iter().map(|s| s.as_str()).collect();
+            let dropped: std::collections::HashSet<&str> = outcome
+                .dropped_call_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
             let mut matching: Vec<_> = store
                 .list(Some(session.as_str()))
                 .await
@@ -3736,9 +3784,48 @@ pub(crate) async fn apply_rewind_side_effects(
                 .collect();
             matching.sort_by_key(|r| r.created_unix);
             if let Some(earliest) = matching.first() {
-                let _ = store.restore(earliest).await;
+                match store.restore(earliest).await {
+                    Ok(()) => tracing::info!(
+                        trace_id = %current_trace(),
+                        session = %session,
+                        checkpoint_id = %earliest.id,
+                        dropped_call_ids = outcome.dropped_call_ids.len(),
+                        "rewind.workspace"
+                    ),
+                    Err(e) => tracing::warn!(
+                        trace_id = %current_trace(),
+                        session = %session,
+                        checkpoint_id = %earliest.id,
+                        error = %e,
+                        "rewind.workspace.failed"
+                    ),
+                }
+            } else {
+                tracing::debug!(
+                    trace_id = %current_trace(),
+                    session = %session,
+                    reason = "no_matching_checkpoints",
+                    dropped_call_ids = outcome.dropped_call_ids.len(),
+                    "rewind.workspace.skipped"
+                );
             }
+        } else {
+            tracing::debug!(
+                trace_id = %current_trace(),
+                session = %session,
+                reason = "no_checkpoint_store",
+                dropped_call_ids = outcome.dropped_call_ids.len(),
+                "rewind.workspace.skipped"
+            );
         }
+    } else {
+        tracing::debug!(
+            trace_id = %current_trace(),
+            session = %session,
+            restore_workspace,
+            dropped_call_ids = outcome.dropped_call_ids.len(),
+            "rewind.workspace.skipped"
+        );
     }
 }
 

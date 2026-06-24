@@ -11,6 +11,7 @@ elfo = []
 
 [dependencies]
 daemon-common = { workspace = true }
+daemon-telemetry = { workspace = true }
 daemon-store = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

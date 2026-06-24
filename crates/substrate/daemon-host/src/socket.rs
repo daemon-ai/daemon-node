@@ -6,6 +6,7 @@
 //! 4-byte big-endian length prefix followed by the CBOR payload.
 
 use daemon_api::{dispatch, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, NodeApi};
+use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,10 +36,28 @@ pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
 
 async fn serve_conn(mut stream: UnixStream, api: Arc<dyn NodeApi>) -> std::io::Result<()> {
     while let Some(bytes) = read_frame(&mut stream).await? {
-        let response = match from_cbor::<ApiRequest>(&bytes) {
-            Ok(request) => dispatch(api.as_ref(), request).await,
-            Err(e) => ApiResponse::Error(e),
-        };
+        let trace = ingress_trace(None);
+        let response = with_trace_span(
+            trace,
+            fields::span::API_UNIX_REQUEST,
+            SpanKind::Boundary,
+            async {
+                let response = match from_cbor::<ApiRequest>(&bytes) {
+                    Ok(request) => {
+                        tracing::debug!(
+                            trace_id = %trace,
+                            api_variant = ?std::mem::discriminant(&request),
+                            event = fields::event::API_REQUEST,
+                            "api request received over unix socket"
+                        );
+                        dispatch(api.as_ref(), request).await
+                    }
+                    Err(e) => ApiResponse::Error(e),
+                };
+                response
+            },
+        )
+        .await;
         write_frame(&mut stream, &to_cbor(&response)).await?;
     }
     Ok(())

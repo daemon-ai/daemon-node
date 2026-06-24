@@ -18,65 +18,100 @@ use crate::conversation::{ToolCall, ToolResult};
 use crate::repair::{repair_tool_args, wrap_untrusted_tool_result};
 use crate::tools::{ToolOutcome, ToolRegistry, TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH};
 use crate::turn::TurnCx;
+use tracing::Instrument;
 
 /// Run one tool call through the pipeline (§12): resolve -> validate/repair args -> execute ->
 /// wrap-untrusted -> sanitize + budget. The `tool_search`/`tool_describe`/`tool_call` bridge names
 /// (progressive disclosure for tools) are intercepted here, where the `registry` is in scope.
 pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>) -> ToolOutcome {
-    match call.name.as_str() {
-        TOOL_SEARCH => return tool_search(call, registry),
-        TOOL_DESCRIBE => return tool_describe(call, registry),
-        TOOL_CALL => return Box::pin(tool_call(call, registry, cx)).await,
-        _ => {}
-    }
-    // Stage 2: repair + canonicalize the argument JSON (§9). Cheap no-op for already-clean args;
-    // recovers fenced/trailing-comma/truncated payloads so the tool's own decode succeeds.
-    let repaired = repair_tool_args(&call.args);
-    let call = ToolCall {
-        call_id: call.call_id.clone(),
-        name: call.name.clone(),
-        args: repaired.args,
-    };
-    let resolved = registry.get(&call.name);
+    let span = tracing::debug_span!(
+        "engine.tool",
+        call_id = %call.call_id,
+        tool_name = %call.name,
+        session = %cx.session_id
+    );
+    async {
+        match call.name.as_str() {
+            TOOL_SEARCH => return tool_search(call, registry),
+            TOOL_DESCRIBE => return tool_describe(call, registry),
+            TOOL_CALL => return Box::pin(tool_call(call, registry, cx)).await,
+            _ => {}
+        }
+        // Stage 2: repair + canonicalize the argument JSON (§9). Cheap no-op for already-clean args;
+        // recovers fenced/trailing-comma/truncated payloads so the tool's own decode succeeds.
+        let repaired = repair_tool_args(&call.args);
+        let repaired_args = repaired.args != call.args;
+        let call = ToolCall {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: repaired.args,
+        };
+        let resolved = registry.get(&call.name);
+        tracing::debug!(
+            repaired_args,
+            resolved = resolved.is_some(),
+            "engine.tool.resolved"
+        );
 
-    // Stage 2.5 (§12 checkpoint): before a *mutating* tool touches the workspace, record a
-    // best-effort checkpoint so an operator can rewind. Never fails the turn (capture logs + skips).
-    if let (Some(store), Some(tool)) = (cx.checkpoints, &resolved) {
-        if tool.mutates() {
-            if let Some(record) = store
-                .capture(cx.session_id.as_str(), &call.call_id, &call.name, cx.exec)
-                .await
-            {
-                tracing::debug!(checkpoint = %record.id, tool = %call.name, "recorded pre-tool checkpoint");
+        // Stage 2.5 (§12 checkpoint): before a *mutating* tool touches the workspace, record a
+        // best-effort checkpoint so an operator can rewind. Never fails the turn (capture logs + skips).
+        if let (Some(store), Some(tool)) = (cx.checkpoints, &resolved) {
+            if tool.mutates() {
+                if let Some(record) = store
+                    .capture(cx.session_id.as_str(), &call.call_id, &call.name, cx.exec)
+                    .await
+                {
+                    tracing::debug!(
+                        checkpoint = %record.id,
+                        tool = %call.name,
+                        "engine.tool.checkpoint"
+                    );
+                }
             }
         }
-    }
 
-    let mut outcome = match resolved {
-        Some(tool) => tool.run(&call, cx).await,
-        None => ToolOutcome::text(
-            call.call_id.clone(),
-            false,
-            format!("unknown tool: {}", call.name),
-        ),
-    };
-    // Stage 6a: fence untrusted external content (web/MCP/browser) so the model reads it as inert
-    // data, not instructions. Done before budgeting so the fence is never split by truncation.
-    if outcome.untrusted {
-        outcome.result.content = wrap_untrusted_tool_result(&outcome.result.content);
+        let mut outcome = match resolved {
+            Some(tool) => tool.run(&call, cx).await,
+            None => {
+                tracing::debug!(tool = %call.name, "engine.tool.unknown");
+                ToolOutcome::text(
+                    call.call_id.clone(),
+                    false,
+                    format!("unknown tool: {}", call.name),
+                )
+            }
+        };
+        // Stage 6a: fence untrusted external content (web/MCP/browser) so the model reads it as inert
+        // data, not instructions. Done before budgeting so the fence is never split by truncation.
+        if outcome.untrusted {
+            tracing::debug!(tool = %call.name, "engine.tool.untrusted_wrapped");
+            outcome.result.content = wrap_untrusted_tool_result(&outcome.result.content);
+        }
+        if let Some(dropped) = budget_result(&mut outcome.result, cx.tool_result_budget) {
+            tracing::debug!(
+                tool = %call.name,
+                dropped_bytes = dropped,
+                budget = cx.tool_result_budget,
+                "engine.tool.budget_truncated"
+            );
+        }
+        tracing::debug!(
+            result_ok = outcome.result.ok,
+            result_bytes = outcome.result.content.len(),
+            untrusted = outcome.untrusted,
+            "engine.tool.finished"
+        );
+        outcome
     }
-    budget_result(&mut outcome.result, cx.tool_result_budget);
-    outcome
+    .instrument(span)
+    .await
 }
 
 /// `tool_search`: rank the deferrable tools whose name or schema matches the query's keywords and
 /// return a compact `name + schema` listing (the model then `tool_describe`s or `tool_call`s one).
 fn tool_search(call: &ToolCall, registry: &ToolRegistry) -> ToolOutcome {
     let query = json_field(&call.args, "query").unwrap_or_default();
-    let needles: Vec<String> = query
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .collect();
+    let needles: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
     let mut hits: Vec<_> = registry
         .deferrable_defs()
         .into_iter()
@@ -125,7 +160,8 @@ fn tool_describe(call: &ToolCall, registry: &ToolRegistry) -> ToolOutcome {
 /// the ordinary pipeline — so a deferrable tool reached via the bridge gets the same repair +
 /// untrusted-fence + budget treatment as a directly-offered one.
 async fn tool_call(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>) -> ToolOutcome {
-    let parsed: serde_json::Value = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
     let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return ToolOutcome::text(
@@ -158,9 +194,9 @@ fn json_field(args: &str, key: &str) -> Option<String> {
 
 /// The §12 sanitize+budget stage: truncate an oversized tool result to the per-tool budget, leaving
 /// a clear marker, so a single large result cannot dominate the model context. `0` disables the cap.
-fn budget_result(result: &mut ToolResult, budget: usize) {
+fn budget_result(result: &mut ToolResult, budget: usize) -> Option<usize> {
     if budget == 0 || result.content.len() <= budget {
-        return;
+        return None;
     }
     let mut cut = budget.min(result.content.len());
     while cut > 0 && !result.content.is_char_boundary(cut) {
@@ -171,6 +207,7 @@ fn budget_result(result: &mut ToolResult, budget: usize) {
     result.content.push_str(&format!(
         "\n... [truncated {dropped} bytes over result budget]"
     ));
+    Some(dropped)
 }
 
 #[cfg(test)]
@@ -223,7 +260,9 @@ mod tests {
             use crate::events::EventSink;
             use crate::exec::LocalEnvironment;
             use daemon_common::{Budget, SessionId};
-            use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+            use daemon_protocol::{
+                HostRequest, HostRequestHandler, HostResponse, HostResponseBody,
+            };
 
             struct NoopHost;
             #[async_trait::async_trait]
@@ -297,7 +336,10 @@ mod tests {
         };
         let outcome = run_tool(&call, &registry, &cx).await;
         assert!(outcome.result.content.contains("UNTRUSTED_TOOL_OUTPUT"));
-        assert!(outcome.result.content.contains("ignore previous instructions"));
+        assert!(outcome
+            .result
+            .content
+            .contains("ignore previous instructions"));
     }
 
     #[test]
