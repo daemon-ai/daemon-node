@@ -31,6 +31,7 @@ use daemon_protocol::{
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// A background-job completion handed back to the engine on rehydration (the core-local form of the
 /// durable `JobCompletion`; the host adapter converts between them).
@@ -352,8 +353,21 @@ impl Engine {
         request_id: ReqId,
         events: &EventSink,
     ) -> Result<RewindOutcome, RewindError> {
+        let span = tracing::info_span!(
+            "engine.rewind",
+            session = %self.snapshot.session_id,
+            request_id = request_id.0,
+            anchor = ?anchor
+        );
+        let _guard = span.enter();
         let len = self.snapshot.conversation.turns.len();
-        let retained = self.resolve_anchor(anchor, len)?;
+        let retained = match self.resolve_anchor(anchor, len) {
+            Ok(retained) => retained,
+            Err(err) => {
+                tracing::warn!(error = ?err, turns_before = len, "engine.rewind.rejected");
+                return Err(err);
+            }
+        };
 
         // Collect the tool call-ids in the sealed-off tail (oldest first) so the host can roll the
         // workspace back via the §12 checkpoints captured before those tools ran.
@@ -389,6 +403,14 @@ impl Engine {
             to_cursor,
             epoch: epoch.0,
         });
+        tracing::info!(
+            turns_before = len,
+            turns_after = retained,
+            dropped_call_ids = dropped_call_ids.len(),
+            new_epoch = epoch.0,
+            to_cursor,
+            "engine.rewind.applied"
+        );
 
         Ok(RewindOutcome {
             retained_turns: retained,
@@ -529,6 +551,13 @@ impl Engine {
             seq,
             summary: emitted,
         });
+        tracing::info!(
+            end_reason = ?summary.end_reason,
+            input_tokens = summary.usage.input_tokens,
+            output_tokens = summary.usage.output_tokens,
+            api_calls = summary.usage.api_calls,
+            "engine.turn.finished"
+        );
         TurnOutcome::Completed(summary)
     }
 
@@ -545,6 +574,13 @@ impl Engine {
             seq,
             summary: emitted,
         });
+        tracing::info!(
+            end_reason = ?summary.end_reason,
+            input_tokens = summary.usage.input_tokens,
+            output_tokens = summary.usage.output_tokens,
+            api_calls = summary.usage.api_calls,
+            "engine.turn.finished"
+        );
         TurnOutcome::Completed(summary)
     }
 
@@ -591,6 +627,14 @@ impl Engine {
         let mut attempt = 0u32;
         let mut compacted = false;
         loop {
+            tracing::debug!(
+                attempt,
+                offer_tools,
+                tool_count = tools.len(),
+                compacted,
+                profile = %self.profile,
+                "engine.model_call.attempt"
+            );
             // Rebuilt each attempt: a compaction step rewrites the conversation in place. The §10
             // assembler folds memory/stable tiers into the system preamble (empty by default).
             let mut req = self.assembler.assemble(&self.snapshot.conversation, &tools);
@@ -611,7 +655,14 @@ impl Engine {
                 Ok(out) => return Ok(out),
                 Err(f) => f,
             };
-            match policy.decide(&failure, attempt) {
+            let step = policy.decide(&failure, attempt);
+            tracing::warn!(
+                attempt,
+                failure_kind = failure_kind(&failure),
+                recovery_step = recovery_step_kind(&step),
+                "engine.model.recovery"
+            );
+            match step {
                 RecoveryStep::Retry { after } => {
                     if let Failure::RateLimit { retry_after, .. } = &failure {
                         let reset_ms = retry_after.map(|d| d.as_millis() as u64);
@@ -898,8 +949,7 @@ impl Engine {
                         if result.content.contains(completion.job_id.as_str()) {
                             // Deterministic value => applying the same completion twice is a no-op.
                             result.ok = true;
-                            result.content =
-                                format!("completed:{}:{}", completion.job_id, summary);
+                            result.content = format!("completed:{}:{}", completion.job_id, summary);
                         }
                     }
                 }
@@ -920,325 +970,367 @@ impl Engine {
         events: &EventSink,
         control: &TurnControl,
     ) -> Result<TurnOutcome, Failure> {
-        let resuming = !self.pending.is_empty();
-        let trigger = self.next_trigger.take().unwrap_or(if resuming {
-            TurnTrigger::BackgroundCompletion {
-                source: CompletionSource::Delegation(self.pending[0].job_id.clone()),
-            }
-        } else {
-            TurnTrigger::User
-        });
-        events.emit(|seq| AgentEvent::TurnStarted { seq, trigger });
+        let span = tracing::info_span!(
+            "engine.turn",
+            session = %self.snapshot.session_id,
+            epoch = self.snapshot.epoch.0,
+            rounds_budget = self.config.max_iterations,
+        );
+        async {
+            let resuming = !self.pending.is_empty();
+            let trigger = self.next_trigger.take().unwrap_or(if resuming {
+                TurnTrigger::BackgroundCompletion {
+                    source: CompletionSource::Delegation(self.pending[0].job_id.clone()),
+                }
+            } else {
+                TurnTrigger::User
+            });
+            tracing::info!(
+                session = %self.snapshot.session_id,
+                epoch = self.snapshot.epoch.0,
+                resuming,
+                trigger = ?trigger,
+                "engine.turn.started"
+            );
+            events.emit(|seq| AgentEvent::TurnStarted { seq, trigger });
 
-        // Boundary: an interrupt that arrived before the turn does any work ends it immediately.
-        if self.boundary(control, events) {
-            return Ok(self.finish_interrupted(events));
-        }
-
-        if resuming {
-            // Resume path: a background completion arrived. First resolve any parked **approval**
-            // decisions (§12 HITL) — re-running the approved tool call (allow) or injecting a
-            // tool-error (deny) — taking those completions out of the pending set; then apply the
-            // remaining delegation completions and fall into the ReAct loop so the model sees the
-            // resolved tool result(s).
-            if !self.snapshot.pending_approvals.is_empty() {
-                self.resolve_approvals(host, events, control).await;
-            }
-            self.resolve_pending();
-            if let Some(next) = self.snapshot.pending_approvals.first().map(|a| a.job_id.clone()) {
-                // Not every parked approval was answered yet: re-suspend deterministically on a
-                // remaining one (the operator answers them one at a time).
-                self.snapshot.waiting_for = self
-                    .snapshot
-                    .pending_approvals
-                    .iter()
-                    .map(|a| a.job_id.clone())
-                    .collect();
-                return Ok(self.suspend_for_approval(next, events, false));
-            }
-            self.snapshot.waiting_for.clear();
-            self.snapshot.epoch = self.snapshot.epoch.next();
-        } else if let Some(job_id) = self.snapshot.waiting_for.first().cloned() {
-            // Re-activated while still suspended (e.g. recovery before the worker ran): re-suspend the
-            // same job deterministically; the durable outbox dedupes the re-enqueue. An unanswered
-            // approval park re-parks (no enqueue), everything else re-enqueues the background job.
-            if !self.snapshot.pending_approvals.is_empty() {
-                return Ok(self.suspend_for_approval(job_id, events, false));
-            }
-            // Recovery re-suspend of an already-enqueued job: the durable outbox `OR IGNORE`-dedupes
-            // the re-enqueue on `(session, epoch, job_id)`, so this payload is discarded in favor of
-            // the original. Pass the legacy marker to preserve prior bytes for this path.
-            return Ok(self.suspend(job_id, b"delegated-work".to_vec(), events, false));
-        }
-
-        // §10/§11 once-per-incarnation lifecycle hooks before the first turn's work.
-        self.ensure_session_started(resuming).await;
-
-        // §11/§10 pre-turn hooks: gather memory recall/blocks into the assembler, then measure
-        // budget pressure and compact if over budget (memory.before_compact -> ctx.compact).
-        self.prepare_turn_context(events).await;
-
-        // The in-turn ReAct loop (§4.2): build_context -> call_model -> execute_tools -> observe ->
-        // call_model again, until the model returns final text (completion) or a tool delegates
-        // (durable suspension). The iteration budget is the hard stop. The loop runs fully
-        // in-process within one durable turn; only `Effect::Delegate` crosses the suspension boundary.
-        let exec = self.exec.clone();
-        let checkpoints = self.checkpoints.clone();
-        let registry = self.registry.clone();
-        let tool_result_budget = self.config.tool_result_budget;
-        let effective_policy = self.effective_policy();
-        let mut rounds_left = self.config.max_iterations;
-        // Accumulated usage across every model call this turn makes (each round + the final summary
-        // call), so `TurnSummary.usage` is the turn total, not just the last call's delta.
-        let mut turn_usage = UsageDelta::default();
-        // Engine-native post-turn review nudge bookkeeping (§4.3): tool-executing rounds this turn,
-        // and whether a skill/memory tool ran (resets the corresponding cadence counter, mirroring
-        // hermes `tool_executor.py` resetting `_iters_since_skill` on `skill_manage`).
-        let mut tool_rounds: u32 = 0;
-        let mut used_skill_tool = false;
-        let mut used_memory_tool = false;
-        // §4.2 no-progress guard: the signature of the previous tool round and how many consecutive
-        // identical rounds we have seen. A model that keeps re-issuing the same calls and getting the
-        // same results is looping; we end the turn before it burns the whole iteration budget.
-        let mut last_round_sig: Option<u64> = None;
-        let mut repeated_rounds: u32 = 0;
-
-        let cancel = control.cancel_token();
-        loop {
-            if rounds_left == 0 {
-                // Budget exhausted: one final toolless call asks the model to summarize what it has,
-                // then the turn ends `BudgetExhausted` (the model cannot keep calling tools forever).
-                return Ok(self
-                    .finish_budget_exhausted(events, &cancel, turn_usage)
-                    .await);
-            }
-            rounds_left -= 1;
-
-            let out = match self.call_model(events, true, &cancel).await {
-                Ok(out) => out,
-                Err(f) => return Ok(self.finish_failed(f, events)),
-            };
-            turn_usage.add(&out.usage);
-
-            // Boundary after the model call: serve snapshots/steer, honor a mid-call interrupt.
+            // Boundary: an interrupt that arrived before the turn does any work ends it immediately.
             if self.boundary(control, events) {
                 return Ok(self.finish_interrupted(events));
             }
 
-            if out.tool_calls.is_empty() {
-                // §11 -> §10 post-turn hooks (spec order): record the assistant turn, then
-                // memory.after_turn, then ctx.after_response.
-                self.finalize_text(&out, events);
-                self.after_turn_memory().await;
-                self.context.after_response(&out.usage);
-                // §4.3 engine-native post-turn trigger: advance the review cadence counters and, on
-                // a threshold, fire-and-forget a background-review child (no suspend).
-                self.maybe_emit_reviews(host, tool_rounds, used_skill_tool, used_memory_tool)
-                    .await;
-                return Ok(self.complete(out, events, turn_usage));
-            }
-
-            let cx = TurnCx {
-                cancel: control.cancel_token(),
-                events,
-                host,
-                session_id: self.snapshot.session_id.clone(),
-                profile: self.subsystem_profile.clone(),
-                budget: self.budget,
-                exec: &*exec,
-                tool_result_budget,
-                approval_policy: effective_policy,
-                pre_approved: false,
-                checkpoints: checkpoints.as_deref(),
-            };
-
-            // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
-            // slots, effects, and structured detail for the rich §17 transcript views.
-            //
-            // A batch runs **concurrently** only when it has more than one call and *every* call
-            // resolves to a tool that declares itself [`ToolConcurrency::Parallel`] (all-or-nothing;
-            // any exclusive/mutating call serializes the batch — see [`crate::tools::Tool::concurrency`]).
-            let view_of = |call: &crate::conversation::ToolCall| ToolCallView {
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-                args_summary: call.args.clone(),
-                // A generic structured echo of the call arguments, opaque to the daemon; a tool
-                // with a richer call schema can refine this once providers carry structured args.
-                detail: Some(ToolDetail {
-                    kind: call.name.clone(),
-                    body: call.args.clone().into_bytes(),
-                }),
-            };
-            let result_view_of = |outcome: &crate::tools::ToolOutcome| ToolResultView {
-                call_id: outcome.result.call_id.clone(),
-                ok: outcome.result.ok,
-                summary: outcome.result.content.clone(),
-                // The tool's typed output (fs listing, command exit/stdout, ...) for a rich
-                // consumer; `None` for plain-text tools.
-                detail: outcome.detail.clone(),
-            };
-
-            let mut calls = Vec::new();
-            let mut effects: Vec<Effect> = Vec::new();
-            let mut interrupted = false;
-
-            // Count this tool-executing round and note skill/memory tool use for the review nudges.
-            tool_rounds = tool_rounds.saturating_add(1);
-            for c in &out.tool_calls {
-                if c.name.starts_with("skill_manage") {
-                    used_skill_tool = true;
-                } else if c.name.starts_with("mnemosyne_") {
-                    used_memory_tool = true;
+            if resuming {
+                // Resume path: a background completion arrived. First resolve any parked **approval**
+                // decisions (§12 HITL) — re-running the approved tool call (allow) or injecting a
+                // tool-error (deny) — taking those completions out of the pending set; then apply the
+                // remaining delegation completions and fall into the ReAct loop so the model sees the
+                // resolved tool result(s).
+                if !self.snapshot.pending_approvals.is_empty() {
+                    self.resolve_approvals(host, events, control).await;
                 }
-            }
-
-            let parallel = out.tool_calls.len() > 1
-                && out.tool_calls.iter().all(|c| {
-                    registry
-                        .get(&c.name)
-                        .map(|t| t.concurrency() == crate::tools::ToolConcurrency::Parallel)
-                        .unwrap_or(false)
-                });
-
-            if parallel {
-                // Emit all starts in call order, run the batch concurrently, then drain results in
-                // call order. Read-only parallel tools have no ordered side effects, so the boundary
-                // is evaluated once after the whole batch settles.
-                for call in &out.tool_calls {
-                    let view = view_of(call);
-                    events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-                }
-                let outcomes = futures::future::join_all(
-                    out.tool_calls
+                self.resolve_pending();
+                if let Some(next) = self
+                    .snapshot
+                    .pending_approvals
+                    .first()
+                    .map(|a| a.job_id.clone())
+                {
+                    // Not every parked approval was answered yet: re-suspend deterministically on a
+                    // remaining one (the operator answers them one at a time).
+                    self.snapshot.waiting_for = self
+                        .snapshot
+                        .pending_approvals
                         .iter()
-                        .map(|call| async { (call.clone(), run_tool(call, &registry, &cx).await) }),
-                )
+                        .map(|a| a.job_id.clone())
+                        .collect();
+                    return Ok(self.suspend_for_approval(next, events, false));
+                }
+                self.snapshot.waiting_for.clear();
+                self.snapshot.epoch = self.snapshot.epoch.next();
+            } else if let Some(job_id) = self.snapshot.waiting_for.first().cloned() {
+                // Re-activated while still suspended (e.g. recovery before the worker ran): re-suspend the
+                // same job deterministically; the durable outbox dedupes the re-enqueue. An unanswered
+                // approval park re-parks (no enqueue), everything else re-enqueues the background job.
+                if !self.snapshot.pending_approvals.is_empty() {
+                    return Ok(self.suspend_for_approval(job_id, events, false));
+                }
+                // Recovery re-suspend of an already-enqueued job: the durable outbox `OR IGNORE`-dedupes
+                // the re-enqueue on `(session, epoch, job_id)`, so this payload is discarded in favor of
+                // the original. Pass the legacy marker to preserve prior bytes for this path.
+                return Ok(self.suspend(job_id, b"delegated-work".to_vec(), events, false));
+            }
+
+            // §10/§11 once-per-incarnation lifecycle hooks before the first turn's work.
+            self.ensure_session_started(resuming).await;
+
+            // §11/§10 pre-turn hooks: gather memory recall/blocks into the assembler, then measure
+            // budget pressure and compact if over budget (memory.before_compact -> ctx.compact).
+            let context_session = self.snapshot.session_id.clone();
+            let context_epoch = self.snapshot.epoch.0;
+            let context_span = tracing::debug_span!(
+                "engine.context.prepare",
+                session = %context_session,
+                epoch = context_epoch
+            );
+            self.prepare_turn_context(events)
+                .instrument(context_span)
                 .await;
-                for (call, outcome) in outcomes {
-                    let result_view = result_view_of(&outcome);
-                    events.emit(|seq| AgentEvent::ToolFinished {
-                        seq,
-                        result: result_view,
-                    });
-                    calls.push((call, outcome.result));
-                    effects.extend(outcome.effects);
+
+            // The in-turn ReAct loop (§4.2): build_context -> call_model -> execute_tools -> observe ->
+            // call_model again, until the model returns final text (completion) or a tool delegates
+            // (durable suspension). The iteration budget is the hard stop. The loop runs fully
+            // in-process within one durable turn; only `Effect::Delegate` crosses the suspension boundary.
+            let exec = self.exec.clone();
+            let checkpoints = self.checkpoints.clone();
+            let registry = self.registry.clone();
+            let tool_result_budget = self.config.tool_result_budget;
+            let effective_policy = self.effective_policy();
+            let mut rounds_left = self.config.max_iterations;
+            // Accumulated usage across every model call this turn makes (each round + the final summary
+            // call), so `TurnSummary.usage` is the turn total, not just the last call's delta.
+            let mut turn_usage = UsageDelta::default();
+            // Engine-native post-turn review nudge bookkeeping (§4.3): tool-executing rounds this turn,
+            // and whether a skill/memory tool ran (resets the corresponding cadence counter, mirroring
+            // hermes `tool_executor.py` resetting `_iters_since_skill` on `skill_manage`).
+            let mut tool_rounds: u32 = 0;
+            let mut used_skill_tool = false;
+            let mut used_memory_tool = false;
+            // §4.2 no-progress guard: the signature of the previous tool round and how many consecutive
+            // identical rounds we have seen. A model that keeps re-issuing the same calls and getting the
+            // same results is looping; we end the turn before it burns the whole iteration budget.
+            let mut last_round_sig: Option<u64> = None;
+            let mut repeated_rounds: u32 = 0;
+
+            let cancel = control.cancel_token();
+            loop {
+                if rounds_left == 0 {
+                    // Budget exhausted: one final toolless call asks the model to summarize what it has,
+                    // then the turn ends `BudgetExhausted` (the model cannot keep calling tools forever).
+                    return Ok(self
+                        .finish_budget_exhausted(events, &cancel, turn_usage)
+                        .await);
                 }
-                if self.boundary_readonly(control, events) {
-                    interrupted = true;
+                rounds_left -= 1;
+
+                let model_session = self.snapshot.session_id.clone();
+                let model_epoch = self.snapshot.epoch.0;
+                let model_span = tracing::info_span!(
+                    "engine.model_call",
+                    session = %model_session,
+                    epoch = model_epoch,
+                    offer_tools = true
+                );
+                let out = match self
+                    .call_model(events, true, &cancel)
+                    .instrument(model_span)
+                    .await
+                {
+                    Ok(out) => out,
+                    Err(f) => return Ok(self.finish_failed(f, events)),
+                };
+                turn_usage.add(&out.usage);
+
+                // Boundary after the model call: serve snapshots/steer, honor a mid-call interrupt.
+                if self.boundary(control, events) {
+                    return Ok(self.finish_interrupted(events));
                 }
-            } else {
-                for call in &out.tool_calls {
-                    let view = view_of(call);
-                    events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-                    let outcome = run_tool(call, &registry, &cx).await;
-                    let result_view = result_view_of(&outcome);
-                    events.emit(|seq| AgentEvent::ToolFinished {
-                        seq,
-                        result: result_view,
-                    });
-                    calls.push((call.clone(), outcome.result));
-                    effects.extend(outcome.effects);
-                    // Boundary after each tool: an interrupt stops further tool execution.
-                    if self.boundary_readonly(control, events) {
-                        interrupted = true;
-                        break;
+
+                if out.tool_calls.is_empty() {
+                    // §11 -> §10 post-turn hooks (spec order): record the assistant turn, then
+                    // memory.after_turn, then ctx.after_response.
+                    self.finalize_text(&out, events);
+                    self.after_turn_memory().await;
+                    self.context.after_response(&out.usage);
+                    // §4.3 engine-native post-turn trigger: advance the review cadence counters and, on
+                    // a threshold, fire-and-forget a background-review child (no suspend).
+                    self.maybe_emit_reviews(host, tool_rounds, used_skill_tool, used_memory_tool)
+                        .await;
+                    return Ok(self.complete(out, events, turn_usage));
+                }
+
+                let cx = TurnCx {
+                    cancel: control.cancel_token(),
+                    events,
+                    host,
+                    session_id: self.snapshot.session_id.clone(),
+                    profile: self.subsystem_profile.clone(),
+                    budget: self.budget,
+                    exec: &*exec,
+                    tool_result_budget,
+                    approval_policy: effective_policy,
+                    pre_approved: false,
+                    checkpoints: checkpoints.as_deref(),
+                };
+
+                // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
+                // slots, effects, and structured detail for the rich §17 transcript views.
+                //
+                // A batch runs **concurrently** only when it has more than one call and *every* call
+                // resolves to a tool that declares itself [`ToolConcurrency::Parallel`] (all-or-nothing;
+                // any exclusive/mutating call serializes the batch — see [`crate::tools::Tool::concurrency`]).
+                let view_of = |call: &crate::conversation::ToolCall| ToolCallView {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    args_summary: call.args.clone(),
+                    // A generic structured echo of the call arguments, opaque to the daemon; a tool
+                    // with a richer call schema can refine this once providers carry structured args.
+                    detail: Some(ToolDetail {
+                        kind: call.name.clone(),
+                        body: call.args.clone().into_bytes(),
+                    }),
+                };
+                let result_view_of = |outcome: &crate::tools::ToolOutcome| ToolResultView {
+                    call_id: outcome.result.call_id.clone(),
+                    ok: outcome.result.ok,
+                    summary: outcome.result.content.clone(),
+                    // The tool's typed output (fs listing, command exit/stdout, ...) for a rich
+                    // consumer; `None` for plain-text tools.
+                    detail: outcome.detail.clone(),
+                };
+
+                let mut calls = Vec::new();
+                let mut effects: Vec<Effect> = Vec::new();
+                let mut interrupted = false;
+
+                // Count this tool-executing round and note skill/memory tool use for the review nudges.
+                tool_rounds = tool_rounds.saturating_add(1);
+                for c in &out.tool_calls {
+                    if c.name.starts_with("skill_manage") {
+                        used_skill_tool = true;
+                    } else if c.name.starts_with("mnemosyne_") {
+                        used_memory_tool = true;
                     }
                 }
-            }
 
-            // §4.2 no-progress signature of this round (the tool calls + their results), computed
-            // before `calls` is moved into the recorded turn. Repeated identical rounds => looping.
-            let round_sig = round_signature(&calls);
+                let parallel = out.tool_calls.len() > 1
+                    && out.tool_calls.iter().all(|c| {
+                        registry
+                            .get(&c.name)
+                            .map(|t| t.concurrency() == crate::tools::ToolConcurrency::Parallel)
+                            .unwrap_or(false)
+                    });
 
-            // The single-owner applier: record the assembled tool turn, then apply any extra effects.
-            self.snapshot.conversation.turns.push(Turn::Tool(ToolTurn {
-                assistant: AssistantMsg {
-                    text: out.text.clone(),
-                    reasoning: out.reasoning.clone(),
-                },
-                calls,
-            }));
-            let mut delegated: Option<(JobId, Vec<u8>)> = None;
-            let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
-            let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
-            for effect in effects {
-                match effect {
-                    Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
-                    Effect::Delegate { job, payload } => delegated = Some((job, payload)),
-                    Effect::Spawn(spec) => spawns.push(spec),
-                    Effect::AwaitDecision {
-                        job_id,
-                        call,
-                        prompt,
-                        path,
-                    } => awaiting.push(crate::snapshot::PendingApproval {
-                        job_id,
-                        call,
-                        prompt,
-                        path,
-                    }),
+                if parallel {
+                    // Emit all starts in call order, run the batch concurrently, then drain results in
+                    // call order. Read-only parallel tools have no ordered side effects, so the boundary
+                    // is evaluated once after the whole batch settles.
+                    for call in &out.tool_calls {
+                        let view = view_of(call);
+                        events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                    }
+                    let outcomes =
+                        futures::future::join_all(out.tool_calls.iter().map(|call| async {
+                            (call.clone(), run_tool(call, &registry, &cx).await)
+                        }))
+                        .await;
+                    for (call, outcome) in outcomes {
+                        let result_view = result_view_of(&outcome);
+                        events.emit(|seq| AgentEvent::ToolFinished {
+                            seq,
+                            result: result_view,
+                        });
+                        calls.push((call, outcome.result));
+                        effects.extend(outcome.effects);
+                    }
+                    if self.boundary_readonly(control, events) {
+                        interrupted = true;
+                    }
+                } else {
+                    for call in &out.tool_calls {
+                        let view = view_of(call);
+                        events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                        let outcome = run_tool(call, &registry, &cx).await;
+                        let result_view = result_view_of(&outcome);
+                        events.emit(|seq| AgentEvent::ToolFinished {
+                            seq,
+                            result: result_view,
+                        });
+                        calls.push((call.clone(), outcome.result));
+                        effects.extend(outcome.effects);
+                        // Boundary after each tool: an interrupt stops further tool execution.
+                        if self.boundary_readonly(control, events) {
+                            interrupted = true;
+                            break;
+                        }
+                    }
                 }
-            }
-            // Fire-and-forget: issue each spawn as a non-joining host request and keep running. The
-            // parent never enters `waiting_for` and never suspends for these (cf. `Delegate` below).
-            for spec in spawns {
-                self.issue_spawn(host, spec).await;
-            }
 
-            // An interrupt at a tool boundary finalizes the turn before it would suspend/loop.
-            if interrupted {
-                return Ok(self.finish_interrupted(events));
-            }
+                // §4.2 no-progress signature of this round (the tool calls + their results), computed
+                // before `calls` is moved into the recorded turn. Repeated identical rounds => looping.
+                let round_sig = round_signature(&calls);
 
-            if !awaiting.is_empty() {
-                // A gated tool needs a durable operator decision (§12 HITL): record the parked
-                // approvals on the snapshot and suspend, waiting on the operator's answer (delivered
-                // as a wake completion). Mirrors delegation suspension, but the wake source is an
-                // operator (`ApprovalDecide`), not a background worker.
-                self.notify_session_switch(SwitchReason::Handoff).await;
-                let first = awaiting[0].job_id.clone();
-                for a in &awaiting {
-                    self.snapshot.waiting_for.push(a.job_id.clone());
+                // The single-owner applier: record the assembled tool turn, then apply any extra effects.
+                self.snapshot.conversation.turns.push(Turn::Tool(ToolTurn {
+                    assistant: AssistantMsg {
+                        text: out.text.clone(),
+                        reasoning: out.reasoning.clone(),
+                    },
+                    calls,
+                }));
+                let mut delegated: Option<(JobId, Vec<u8>)> = None;
+                let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
+                let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
+                for effect in effects {
+                    match effect {
+                        Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
+                        Effect::Delegate { job, payload } => delegated = Some((job, payload)),
+                        Effect::Spawn(spec) => spawns.push(spec),
+                        Effect::AwaitDecision {
+                            job_id,
+                            call,
+                            prompt,
+                            path,
+                        } => awaiting.push(crate::snapshot::PendingApproval {
+                            job_id,
+                            call,
+                            prompt,
+                            path,
+                        }),
+                    }
                 }
-                self.snapshot.pending_approvals.extend(awaiting);
-                return Ok(self.suspend_for_approval(first, events, true));
-            }
+                // Fire-and-forget: issue each spawn as a non-joining host request and keep running. The
+                // parent never enters `waiting_for` and never suspends for these (cf. `Delegate` below).
+                for spec in spawns {
+                    self.issue_spawn(host, spec).await;
+                }
 
-            if let Some((job_id, payload)) = delegated {
-                // A delegation crosses the durable boundary: notify memory of the handoff, then
-                // suspend the turn and wait for the wake.
-                self.notify_session_switch(SwitchReason::Handoff).await;
-                self.snapshot.waiting_for.push(job_id.clone());
-                return Ok(self.suspend(job_id, payload, events, true));
-            }
+                // An interrupt at a tool boundary finalizes the turn before it would suspend/loop.
+                if interrupted {
+                    return Ok(self.finish_interrupted(events));
+                }
 
-            // §4.2 no-progress guard: a tool round whose calls + results are byte-identical to the
-            // immediately preceding round is the model looping. Count consecutive repeats and, once
-            // they reach `max_repeated_rounds`, end the turn cleanly (`NoProgress`) instead of
-            // burning the rest of the iteration budget re-running the same work.
-            if last_round_sig == Some(round_sig) {
-                repeated_rounds += 1;
-            } else {
-                repeated_rounds = 0;
-            }
-            last_round_sig = Some(round_sig);
-            if self.config.max_repeated_rounds > 0
-                && repeated_rounds + 1 >= self.config.max_repeated_rounds
-            {
+                if !awaiting.is_empty() {
+                    // A gated tool needs a durable operator decision (§12 HITL): record the parked
+                    // approvals on the snapshot and suspend, waiting on the operator's answer (delivered
+                    // as a wake completion). Mirrors delegation suspension, but the wake source is an
+                    // operator (`ApprovalDecide`), not a background worker.
+                    self.notify_session_switch(SwitchReason::Handoff).await;
+                    let first = awaiting[0].job_id.clone();
+                    for a in &awaiting {
+                        self.snapshot.waiting_for.push(a.job_id.clone());
+                    }
+                    self.snapshot.pending_approvals.extend(awaiting);
+                    return Ok(self.suspend_for_approval(first, events, true));
+                }
+
+                if let Some((job_id, payload)) = delegated {
+                    // A delegation crosses the durable boundary: notify memory of the handoff, then
+                    // suspend the turn and wait for the wake.
+                    self.notify_session_switch(SwitchReason::Handoff).await;
+                    self.snapshot.waiting_for.push(job_id.clone());
+                    return Ok(self.suspend(job_id, payload, events, true));
+                }
+
+                // §4.2 no-progress guard: a tool round whose calls + results are byte-identical to the
+                // immediately preceding round is the model looping. Count consecutive repeats and, once
+                // they reach `max_repeated_rounds`, end the turn cleanly (`NoProgress`) instead of
+                // burning the rest of the iteration budget re-running the same work.
+                if last_round_sig == Some(round_sig) {
+                    repeated_rounds += 1;
+                } else {
+                    repeated_rounds = 0;
+                }
+                last_round_sig = Some(round_sig);
+                if self.config.max_repeated_rounds > 0
+                    && repeated_rounds + 1 >= self.config.max_repeated_rounds
+                {
+                    self.after_turn_memory().await;
+                    self.context.after_response(&out.usage);
+                    tracing::debug!(
+                        repeated_rounds = repeated_rounds + 1,
+                        "engine.react_round.no_progress"
+                    );
+                    return Ok(self.finish_no_progress(events, &cancel, turn_usage).await);
+                }
+
+                // §11 -> §10 post-round hooks (spec order) on the recorded tool turn, then loop — the
+                // next `call_model` sees the tool results in context.
                 self.after_turn_memory().await;
                 self.context.after_response(&out.usage);
-                tracing::debug!(
-                    repeated_rounds = repeated_rounds + 1,
-                    "no-progress guard: identical tool round repeated; ending turn"
-                );
-                return Ok(self.finish_no_progress(events, &cancel, turn_usage).await);
             }
-
-            // §11 -> §10 post-round hooks (spec order) on the recorded tool turn, then loop — the
-            // next `call_model` sees the tool results in context.
-            self.after_turn_memory().await;
-            self.context.after_response(&out.usage);
         }
+        .instrument(span)
+        .await
     }
 
     /// Finalize a turn that hit its iteration budget: one final toolless model call to summarize,
@@ -1298,7 +1390,12 @@ impl Engine {
 
     /// Emit the terminal `TurnFinished` and build the completed outcome. `turn_usage` is the folded
     /// usage of every model call this turn made (the per-call deltas were already streamed live).
-    fn complete(&self, out: ModelOutput, events: &EventSink, turn_usage: UsageDelta) -> TurnOutcome {
+    fn complete(
+        &self,
+        out: ModelOutput,
+        events: &EventSink,
+        turn_usage: UsageDelta,
+    ) -> TurnOutcome {
         let summary = TurnSummary {
             end_reason: EndReason::Completed,
             final_text: Some(out.text),
@@ -1326,6 +1423,12 @@ impl Engine {
         }
         let summary = TurnSummary::ended(EndReason::Suspended);
         events.emit(|seq| AgentEvent::TurnFinished { seq, summary });
+        tracing::info!(
+            job_id = %job_id,
+            epoch = self.snapshot.epoch.0,
+            suspend_kind = "delegation",
+            "engine.turn.suspended"
+        );
         TurnOutcome::Suspended(Suspension {
             job_id,
             epoch: self.snapshot.epoch,
@@ -1348,6 +1451,12 @@ impl Engine {
         }
         let summary = TurnSummary::ended(EndReason::Suspended);
         events.emit(|seq| AgentEvent::TurnFinished { seq, summary });
+        tracing::info!(
+            job_id = %job_id,
+            epoch = self.snapshot.epoch.0,
+            suspend_kind = "approval",
+            "engine.turn.suspended"
+        );
         TurnOutcome::Suspended(Suspension {
             job_id,
             epoch: self.snapshot.epoch,
@@ -1451,10 +1560,8 @@ impl Engine {
 
         // Skill review: count this turn's tool iterations, but a `skill_manage` use this turn resets
         // the cadence (the agent just curated skills — no nudge needed).
-        self.snapshot.iters_since_skill = self
-            .snapshot
-            .iters_since_skill
-            .saturating_add(tool_rounds);
+        self.snapshot.iters_since_skill =
+            self.snapshot.iters_since_skill.saturating_add(tool_rounds);
         if used_skill_tool {
             self.snapshot.iters_since_skill = 0;
         } else if self.config.skill_review_interval > 0
@@ -1504,7 +1611,12 @@ impl Engine {
 /// `name` + `args` and its result's `ok` + `content`, but **not** the per-call `call_id` (freshly
 /// minted each round), so two rounds that issue the same calls and get the same results hash equal —
 /// the signal that the model is looping without converging.
-fn round_signature(calls: &[(crate::conversation::ToolCall, crate::conversation::ToolResult)]) -> u64 {
+fn round_signature(
+    calls: &[(
+        crate::conversation::ToolCall,
+        crate::conversation::ToolResult,
+    )],
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -1516,6 +1628,35 @@ fn round_signature(calls: &[(crate::conversation::ToolCall, crate::conversation:
         result.content.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+fn failure_kind(failure: &Failure) -> &'static str {
+    match failure {
+        Failure::Provider(_) => "provider",
+        Failure::Rotatable(_) => "rotatable",
+        Failure::RateLimit { .. } => "rate_limit",
+        Failure::Billing(_) => "billing",
+        Failure::Auth(_) => "auth",
+        Failure::ContextOverflow(_) => "context_overflow",
+        Failure::PayloadTooLarge(_) => "payload_too_large",
+        Failure::ContentPolicy(_) => "content_policy",
+        Failure::FormatError(_) => "format_error",
+        Failure::TransientTransport(_) => "transient_transport",
+        Failure::ProviderOverloaded(_) => "provider_overloaded",
+        Failure::Fatal(_) => "fatal",
+        Failure::Cancelled => "cancelled",
+        Failure::Other(_) => "other",
+    }
+}
+
+fn recovery_step_kind(step: &RecoveryStep) -> &'static str {
+    match step {
+        RecoveryStep::Retry { .. } => "retry",
+        RecoveryStep::Rotate => "rotate",
+        RecoveryStep::Compact => "compact",
+        RecoveryStep::Fallback => "fallback",
+        RecoveryStep::Abort => "abort",
+    }
 }
 
 #[cfg(test)]
@@ -1673,7 +1814,9 @@ mod tests {
             provider.clone(),
             Arc::new(ToolRegistry::new()),
         )
-        .with_prompt_sources(vec![Arc::new(FixedBlock("<available_skills>\n  x\n</available_skills>"))]);
+        .with_prompt_sources(vec![Arc::new(FixedBlock(
+            "<available_skills>\n  x\n</available_skills>",
+        ))]);
         engine.push_user(UserMsg::new("hi"));
         engine
             .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
@@ -1681,7 +1824,10 @@ mod tests {
             .unwrap();
         let seen = provider.seen.lock().unwrap().clone();
         assert!(seen.contains("base system"), "keeps the base system prompt");
-        assert!(seen.contains("<available_skills>"), "folds the stable block in");
+        assert!(
+            seen.contains("<available_skills>"),
+            "folds the stable block in"
+        );
     }
 
     /// A host that records every spawn `kind` it is asked to materialize.
@@ -1729,7 +1875,10 @@ mod tests {
             .await
             .expect("turn completes");
         assert!(matches!(outcome, TurnOutcome::Completed(_)));
-        assert!(engine.snapshot().waiting_for.is_empty(), "spawn does not suspend");
+        assert!(
+            engine.snapshot().waiting_for.is_empty(),
+            "spawn does not suspend"
+        );
         assert_eq!(
             *host.spawns.lock().unwrap(),
             vec!["memory_review".to_string()],
@@ -1752,7 +1901,10 @@ mod tests {
             .run_turn(&host, &EventSink::discarding(), &TurnControl::new())
             .await
             .expect("turn completes");
-        assert!(host.spawns.lock().unwrap().is_empty(), "no spawns when disabled");
+        assert!(
+            host.spawns.lock().unwrap().is_empty(),
+            "no spawns when disabled"
+        );
     }
 
     /// A credential provider serving two profiles with distinct secrets, recording each acquisition
@@ -1836,7 +1988,9 @@ mod tests {
             SystemPrompt::new("test"),
         )
         .with_credentials(
-            Arc::new(move || creds_for_builder.clone() as Arc<dyn crate::credentials::CredentialProvider>),
+            Arc::new(move || {
+                creds_for_builder.clone() as Arc<dyn crate::credentials::CredentialProvider>
+            }),
             ProfileRef::new("primary"),
         )
         .with_fallback_profile(ProfileRef::new("fallback"));
@@ -2595,7 +2749,10 @@ mod tests {
         let before = engine.snapshot().conversation.turns.len();
         let (sink, log) = collecting();
 
-        engine.run_turn(&NoopHost, &sink, &TurnControl::new()).await.unwrap();
+        engine
+            .run_turn(&NoopHost, &sink, &TurnControl::new())
+            .await
+            .unwrap();
 
         let log = log.lock().unwrap();
         assert!(
@@ -2638,7 +2795,10 @@ mod tests {
         engine.push_user(UserMsg::new("second"));
         let (sink, log) = collecting();
 
-        engine.run_turn(&NoopHost, &sink, &TurnControl::new()).await.unwrap();
+        engine
+            .run_turn(&NoopHost, &sink, &TurnControl::new())
+            .await
+            .unwrap();
 
         let log = log.lock().unwrap();
         assert!(
@@ -2830,7 +2990,11 @@ mod tests {
     async fn rewind_reply_after_keeps_user_turn() {
         let mut engine = rewind_engine();
         let outcome = engine
-            .rewind_to(&RewindAnchor::ReplyAfter { ordinal: 2 }, ReqId(1), &EventSink::discarding())
+            .rewind_to(
+                &RewindAnchor::ReplyAfter { ordinal: 2 },
+                ReqId(1),
+                &EventSink::discarding(),
+            )
             .expect("reply-after rewind resolves");
         assert_eq!(outcome.retained_turns, 3);
         assert!(matches!(
@@ -2844,7 +3008,11 @@ mod tests {
     async fn rewind_cursor_truncates_to_count() {
         let mut engine = rewind_engine();
         let outcome = engine
-            .rewind_to(&RewindAnchor::Cursor { seq: 1 }, ReqId(1), &EventSink::discarding())
+            .rewind_to(
+                &RewindAnchor::Cursor { seq: 1 },
+                ReqId(1),
+                &EventSink::discarding(),
+            )
             .expect("cursor rewind resolves");
         assert_eq!(outcome.retained_turns, 1);
         assert_eq!(engine.snapshot.conversation.turns.len(), 1);
@@ -2855,7 +3023,11 @@ mod tests {
     async fn rewind_out_of_range_is_rejected() {
         let mut engine = rewind_engine();
         let err = engine
-            .rewind_to(&RewindAnchor::UserTurn { ordinal: 99 }, ReqId(1), &EventSink::discarding())
+            .rewind_to(
+                &RewindAnchor::UserTurn { ordinal: 99 },
+                ReqId(1),
+                &EventSink::discarding(),
+            )
             .unwrap_err();
         assert_eq!(err, RewindError::OutOfRange);
         // The conversation is untouched on rejection.
@@ -2868,7 +3040,11 @@ mod tests {
         let mut engine = rewind_engine();
         // Ordinal 1 is the assistant turn `a1`.
         let err = engine
-            .rewind_to(&RewindAnchor::UserTurn { ordinal: 1 }, ReqId(1), &EventSink::discarding())
+            .rewind_to(
+                &RewindAnchor::UserTurn { ordinal: 1 },
+                ReqId(1),
+                &EventSink::discarding(),
+            )
             .unwrap_err();
         assert_eq!(err, RewindError::NotAUserTurn);
     }
@@ -2879,7 +3055,11 @@ mod tests {
         let mut engine = rewind_engine();
         engine.snapshot.waiting_for.push(JobId::new("job-1"));
         engine
-            .rewind_to(&RewindAnchor::UserTurn { ordinal: 0 }, ReqId(1), &EventSink::discarding())
+            .rewind_to(
+                &RewindAnchor::UserTurn { ordinal: 0 },
+                ReqId(1),
+                &EventSink::discarding(),
+            )
             .expect("rewind resolves");
         assert!(engine.snapshot.waiting_for.is_empty());
         // A completion for the abandoned job is dropped (not stashed) post-rewind.
@@ -2887,6 +3067,9 @@ mod tests {
             job_id: JobId::new("job-1"),
             payload: b"late".to_vec(),
         }]);
-        assert!(engine.pending.is_empty(), "late completion fenced by rewind");
+        assert!(
+            engine.pending.is_empty(),
+            "late completion fenced by rewind"
+        );
     }
 }

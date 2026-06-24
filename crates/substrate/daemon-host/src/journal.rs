@@ -154,6 +154,14 @@ impl JournalSink {
             timestamp_ms: now_ms(),
             payload,
         };
+        tracing::debug!(
+            trace_id = %TraceId(view.trace),
+            stream = %self.stream,
+            segment,
+            seq,
+            kind = %view.kind,
+            "journal.append"
+        );
         let (bytes, content_hash) = encode_entry(&view);
         self.store
             .append_trace(
@@ -205,6 +213,14 @@ impl JournalSink {
                 detail: event.summary(),
             },
         };
+        tracing::debug!(
+            trace_id = %TraceId(view.trace),
+            stream = %self.stream,
+            segment,
+            seq,
+            kind = %view.kind,
+            "journal.append"
+        );
         let (bytes, content_hash) = encode_entry(&view);
         self.store
             .append_trace(
@@ -260,6 +276,13 @@ impl JournalSink {
         self.store
             .commit_trace_segment(&self.stream, segment, root, signature, self.fence)
             .await?;
+        tracing::info!(
+            trace_id = %current_trace(),
+            stream = %self.stream,
+            segment,
+            entry_count = entries.len(),
+            "journal.seal"
+        );
         // Advance the chain: next turn is the next segment, chained onto this root.
         self.segment.fetch_add(1, Ordering::Relaxed);
         *self.prior.lock().unwrap() = root;
@@ -325,6 +348,11 @@ pub async fn drain_credential_audit(authority: &CredentialAuthority, sink: &Jour
         let _ = sink.record_credential(event).await;
     }
     let _ = sink.seal().await;
+    tracing::debug!(
+        trace_id = %current_trace(),
+        count = events.len(),
+        "journal.credential_drain"
+    );
     events.len()
 }
 

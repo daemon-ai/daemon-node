@@ -24,6 +24,7 @@ use daemon_protocol::AgentEvent;
 use futures::StreamExt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// What the recovery loop should do next for a given failure, *after* accounting for the retry
 /// budget — the actionable refinement of [`Recovery`].
@@ -220,79 +221,106 @@ pub async fn drive_model_call(
     watchdog: Duration,
     events: &EventSink,
 ) -> Result<ModelOutput, Failure> {
-    let mut stream = provider.stream(req);
-    let mut streamed_text = false;
-    let mut streamed_reasoning = false;
-    let mut streamed_usage = UsageDelta::default();
-    let mut done: Option<ModelOutput> = None;
+    let span = tracing::debug_span!(
+        "engine.model_stream",
+        watchdog_ms = watchdog.as_millis() as u64
+    );
+    async {
+        let mut stream = provider.stream(req);
+        let mut streamed_text = false;
+        let mut streamed_reasoning = false;
+        let mut streamed_usage = UsageDelta::default();
+        let mut done: Option<ModelOutput> = None;
 
-    loop {
-        let next = if watchdog.is_zero() {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Failure::Cancelled),
-                n = stream.next() => Ok(n),
-            }
-        } else {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Failure::Cancelled),
-                n = tokio::time::timeout(watchdog, stream.next()) => n,
-            }
-        };
-        let event = match next {
-            Err(_elapsed) => {
-                return Err(Failure::TransientTransport(
-                    "model stream stalled (watchdog elapsed)".into(),
-                ))
-            }
-            Ok(None) => break,
-            Ok(Some(Err(failure))) => return Err(failure),
-            Ok(Some(Ok(event))) => event,
-        };
-        match event {
-            StreamEvent::TextDelta(text) => {
-                if !text.is_empty() {
-                    streamed_text = true;
-                    events.emit(|seq| AgentEvent::TextDelta { seq, text });
+        loop {
+            let next = if watchdog.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        tracing::debug!("engine.model.stream.cancelled");
+                        return Err(Failure::Cancelled);
+                    }
+                    n = stream.next() => Ok(n),
                 }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        tracing::debug!("engine.model.stream.cancelled");
+                        return Err(Failure::Cancelled);
+                    }
+                    n = tokio::time::timeout(watchdog, stream.next()) => n,
+                }
+            };
+            let event = match next {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        watchdog_ms = watchdog.as_millis() as u64,
+                        "engine.model.stream.stall"
+                    );
+                    return Err(Failure::TransientTransport(
+                        "model stream stalled (watchdog elapsed)".into(),
+                    ));
+                }
+                Ok(None) => break,
+                Ok(Some(Err(failure))) => return Err(failure),
+                Ok(Some(Ok(event))) => event,
+            };
+            match event {
+                StreamEvent::TextDelta(text) => {
+                    if !text.is_empty() {
+                        streamed_text = true;
+                        events.emit(|seq| AgentEvent::TextDelta { seq, text });
+                    }
+                }
+                StreamEvent::ReasoningDelta(text) => {
+                    if !text.is_empty() {
+                        streamed_reasoning = true;
+                        events.emit(|seq| AgentEvent::ReasoningDelta { seq, text });
+                    }
+                }
+                StreamEvent::Usage(delta) => streamed_usage.add(&delta),
+                StreamEvent::Done(output) => done = Some(output),
             }
-            StreamEvent::ReasoningDelta(text) => {
-                if !text.is_empty() {
-                    streamed_reasoning = true;
+        }
+
+        // The terminal `Done` carries the authoritative output; fall back to streamed usage if a
+        // provider somehow closed the stream without one.
+        let mut out = done.unwrap_or_default();
+        if out.usage == UsageDelta::default() && streamed_usage != UsageDelta::default() {
+            out.usage = streamed_usage;
+        }
+
+        // Emit any channel the provider did not stream incrementally, exactly once.
+        if !streamed_text && !out.text.is_empty() {
+            let text = out.text.clone();
+            events.emit(|seq| AgentEvent::TextDelta { seq, text });
+        }
+        if !streamed_reasoning {
+            if let Some(reasoning) = &out.reasoning {
+                if !reasoning.is_empty() {
+                    let text = reasoning.clone();
                     events.emit(|seq| AgentEvent::ReasoningDelta { seq, text });
                 }
             }
-            StreamEvent::Usage(delta) => streamed_usage.add(&delta),
-            StreamEvent::Done(output) => done = Some(output),
         }
+        events.emit(|seq| AgentEvent::Usage {
+            seq,
+            delta: out.usage,
+        });
+        tracing::debug!(
+            streamed_text,
+            streamed_reasoning,
+            input_tokens = out.usage.input_tokens,
+            output_tokens = out.usage.output_tokens,
+            api_calls = out.usage.api_calls,
+            tool_call_count = out.tool_calls.len(),
+            "engine.model.stream.done"
+        );
+        Ok(out)
     }
-
-    // The terminal `Done` carries the authoritative output; fall back to streamed usage if a
-    // provider somehow closed the stream without one.
-    let mut out = done.unwrap_or_default();
-    if out.usage == UsageDelta::default() && streamed_usage != UsageDelta::default() {
-        out.usage = streamed_usage;
-    }
-
-    // Emit any channel the provider did not stream incrementally, exactly once.
-    if !streamed_text && !out.text.is_empty() {
-        let text = out.text.clone();
-        events.emit(|seq| AgentEvent::TextDelta { seq, text });
-    }
-    if !streamed_reasoning {
-        if let Some(reasoning) = &out.reasoning {
-            if !reasoning.is_empty() {
-                let text = reasoning.clone();
-                events.emit(|seq| AgentEvent::ReasoningDelta { seq, text });
-            }
-        }
-    }
-    events.emit(|seq| AgentEvent::Usage {
-        seq,
-        delta: out.usage,
-    });
-    Ok(out)
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]

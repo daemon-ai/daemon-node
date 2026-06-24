@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::exec::ExecutionEnvironment;
 
@@ -146,9 +147,17 @@ impl CheckpointStore for LocalCheckpointStore {
         let ws_for_blocking = workspace.clone();
 
         // All fs/git work is synchronous; keep it off the async worker.
+        let span = tracing::debug_span!(
+            "checkpoint.capture",
+            session,
+            call_id,
+            tool,
+            checkpoint_id = %id
+        );
         let kind = tokio::task::spawn_blocking(move || {
             capture_blocking(&ws_for_blocking, &snapshots_root, &id_for_blocking)
         })
+        .instrument(span)
         .await
         .ok()
         .flatten()?;
@@ -163,15 +172,39 @@ impl CheckpointStore for LocalCheckpointStore {
             kind,
         };
         if let Err(e) = self.append_ledger(&record) {
-            tracing::warn!(error = %e, "checkpoint ledger append failed");
+            tracing::warn!(
+                error = %e,
+                session,
+                call_id,
+                tool,
+                checkpoint_id = %record.id,
+                "checkpoint.capture.failed"
+            );
             return None;
         }
+        tracing::debug!(
+            session,
+            call_id,
+            tool,
+            checkpoint_id = %record.id,
+            kind = ?record.kind,
+            "checkpoint.capture"
+        );
         Some(record)
     }
 
     async fn restore(&self, record: &CheckpointRecord) -> std::io::Result<()> {
+        let span = tracing::debug_span!(
+            "checkpoint.restore",
+            session = %record.session,
+            call_id = %record.call_id,
+            tool = %record.tool,
+            checkpoint_id = %record.id,
+            kind = ?record.kind
+        );
         let record = record.clone();
         tokio::task::spawn_blocking(move || restore_blocking(&record))
+            .instrument(span)
             .await
             .map_err(std::io::Error::other)?
     }
@@ -191,11 +224,7 @@ impl CheckpointStore for LocalCheckpointStore {
 }
 
 /// Capture the workspace, git-first then snapshot-fallback. Returns `None` only on a hard failure.
-fn capture_blocking(
-    workspace: &Path,
-    snapshots_root: &Path,
-    id: &str,
-) -> Option<CheckpointKind> {
+fn capture_blocking(workspace: &Path, snapshots_root: &Path, id: &str) -> Option<CheckpointKind> {
     if workspace.join(".git").exists() {
         if let Some(reference) = git_stash_create(workspace) {
             return Some(CheckpointKind::Git { reference });

@@ -17,8 +17,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fields;
 pub mod journal;
 pub mod metrics;
+pub mod spans;
 pub mod trace;
 
 pub use journal::{
@@ -26,6 +28,7 @@ pub use journal::{
     SegmentInput, TraceSigner, VerifyError, VerifyingKey, GENESIS_ROOT,
 };
 pub use metrics::{Dump, Metrics};
+pub use spans::{ingress_trace, restore_trace_span, trace_span, with_trace_span, SpanKind};
 pub use trace::{current_trace, set_trace, with_trace};
 
 use std::sync::Once;

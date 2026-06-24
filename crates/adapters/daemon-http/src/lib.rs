@@ -36,6 +36,7 @@ use daemon_api::{
 use daemon_common::SessionId;
 use daemon_delivery::{serve_delivery, Projector};
 use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId};
+use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -106,7 +107,23 @@ async fn api_dispatch(
     State(state): State<AppState>,
     Json(req): Json<ApiRequest>,
 ) -> Json<ApiResponse> {
-    Json(dispatch(state.api.as_ref(), req).await)
+    let trace = ingress_trace(None);
+    let response = with_trace_span(
+        trace,
+        fields::span::API_HTTP_REQUEST,
+        SpanKind::Boundary,
+        async {
+            tracing::debug!(
+                trace_id = %trace,
+                api_variant = ?std::mem::discriminant(&req),
+                event = fields::event::API_REQUEST,
+                "api request received over http"
+            );
+            dispatch(state.api.as_ref(), req).await
+        },
+    )
+    .await;
+    Json(response)
 }
 
 /// `POST /tenants/{tenant}/submit` — a routed submit. The adapter derives the `Origin` from its own
@@ -119,14 +136,30 @@ async fn submit_routed_tenant(
     Path(tenant): Path<String>,
     Json(command): Json<AgentCommand>,
 ) -> Json<ApiResponse> {
-    let origin = Origin::new(
-        TransportId::new(format!("http/{tenant}")),
-        OriginScope::Api { key: tenant },
-    );
-    match state.api.submit_routed(origin, command).await {
-        Ok(session) => Json(ApiResponse::Routed { session }),
-        Err(e) => Json(ApiResponse::Error(e)),
-    }
+    let trace = ingress_trace(None);
+    let response = with_trace_span(
+        trace,
+        fields::span::API_HTTP_REQUEST,
+        SpanKind::Boundary,
+        async {
+            let origin = Origin::new(
+                TransportId::new(format!("http/{tenant}")),
+                OriginScope::Api { key: tenant },
+            );
+            tracing::debug!(
+                trace_id = %trace,
+                event = fields::event::API_REQUEST,
+                operation = "submit_routed",
+                "tenant routed submit received over http"
+            );
+            match state.api.submit_routed(origin, command).await {
+                Ok(session) => ApiResponse::Routed { session },
+                Err(e) => ApiResponse::Error(e),
+            }
+        },
+    )
+    .await;
+    Json(response)
 }
 
 /// A [`Projector`] that forwards every projected `(session, entry)` into an mpsc channel — the
@@ -331,7 +364,10 @@ async fn fs_watch_sse(
         async move {
             loop {
                 tokio::time::sleep(poll).await;
-                match api.fs_watch_after(root.clone(), dir.clone(), after_seq, 0).await {
+                match api
+                    .fs_watch_after(root.clone(), dir.clone(), after_seq, 0)
+                    .await
+                {
                     Ok(page) if !page.events.is_empty() => {
                         let event = Event::default()
                             .json_data(&page.events)
