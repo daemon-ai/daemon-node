@@ -50,6 +50,33 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map a long-lived **stored** provider key onto the requested [`CredMode`] (B4 mode-awareness).
+///
+/// A store-backed source holds a long-lived provider key (the GUI-set secret), not an OAuth/STS
+/// session, so the three modes are honored as:
+/// - `Bearer` — thread the stored key as the request bearer (compensating control is the audit);
+/// - `Proxied` — return the stored key to the authority, which retains it and resolves uses without
+///   it ever leaving (the authority puts no secret on the lease);
+/// - `Native` — mint a short-lived token via an OAuth/STS exchange, which a store-backed profile
+///   cannot do, so it is **refused** with a clear error rather than mislabelling the long-lived key
+///   as a short-lived `Native` token (real OAuth/STS provisioning is deferred — ties to G3).
+fn stored_secret_for_mode(
+    mode: CredMode,
+    profile: &str,
+    secret: impl FnOnce() -> String,
+) -> Result<Provisioned, CredError> {
+    match mode {
+        CredMode::Bearer | CredMode::Proxied => Ok(Provisioned {
+            secret: secret(),
+            fresh: false,
+        }),
+        CredMode::Native => Err(CredError::Other(format!(
+            "native (short-lived) credentials require an OAuth/STS-backed source; \
+             profile '{profile}' is store-backed — use Bearer or Proxied"
+        ))),
+    }
+}
+
 /// An in-memory credential store (ephemeral nodes; secrets do not survive a restart). Holds a
 /// per-profile key pool so multi-key rotation can be exercised without a file backend.
 #[derive(Default)]
@@ -215,16 +242,13 @@ impl CredentialSource for StoreCredentialSource {
         &self.profile
     }
 
-    fn provision(&self, _cap_id: &CredId, _mode: CredMode) -> Result<Provisioned, CredError> {
-        // The stored key is handed over as-is (a real provider key used as the request bearer); the
-        // mode-specific minting/STS dance is the stub's domain and out of scope for the GUI path.
-        let secret = self
-            .store
-            .get(self.profile.as_str())
-            .unwrap_or_else(|| self.fallback.clone());
-        Ok(Provisioned {
-            secret,
-            fresh: false,
+    fn provision(&self, _cap_id: &CredId, mode: CredMode) -> Result<Provisioned, CredError> {
+        // Honor the requested mode: the stored long-lived key backs Bearer/Proxied; Native (a
+        // short-lived OAuth/STS token) is refused for a store-backed profile (B4 mode-awareness).
+        stored_secret_for_mode(mode, self.profile.as_str(), || {
+            self.store
+                .get(self.profile.as_str())
+                .unwrap_or_else(|| self.fallback.clone())
         })
     }
 
@@ -305,7 +329,12 @@ impl CredentialSource for PooledStoreCredentialSource {
         &self.profile
     }
 
-    fn provision(&self, cap_id: &CredId, _mode: CredMode) -> Result<Provisioned, CredError> {
+    fn provision(&self, cap_id: &CredId, mode: CredMode) -> Result<Provisioned, CredError> {
+        // Native (short-lived OAuth/STS) is not provisionable from a store-backed key pool; Bearer
+        // and Proxied both draw a live key from the pool (B4 mode-awareness).
+        if matches!(mode, CredMode::Native) {
+            return stored_secret_for_mode(mode, self.profile.as_str(), String::new);
+        }
         let now = now_ms();
         let keys = self.pool();
         let mut st = self.state.lock().unwrap();
@@ -422,5 +451,44 @@ mod tests {
             source.provision(&cap, CredMode::Bearer).unwrap().secret,
             "sk-fallback"
         );
+    }
+
+    #[test]
+    fn store_source_is_mode_aware() {
+        use std::sync::Arc;
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("opus", "sk-real").unwrap();
+        let source = StoreCredentialSource::new(store, "opus", "sk-fallback");
+        let cap = CredId::new("c1");
+        // Bearer + Proxied both hand the authority the stored long-lived key.
+        assert_eq!(
+            source.provision(&cap, CredMode::Bearer).unwrap().secret,
+            "sk-real"
+        );
+        assert_eq!(
+            source.provision(&cap, CredMode::Proxied).unwrap().secret,
+            "sk-real"
+        );
+        // Native (short-lived OAuth/STS) is refused for a store-backed profile.
+        let err = source.provision(&cap, CredMode::Native).unwrap_err();
+        assert!(
+            matches!(err, CredError::Other(ref m) if m.contains("OAuth/STS")),
+            "Native must be refused with a clear error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pooled_source_is_mode_aware() {
+        use std::sync::Arc;
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("grok", "key-a").unwrap();
+        let source = PooledStoreCredentialSource::new(store, "grok", "sk-fallback");
+        let cap = CredId::new("c1");
+        assert_eq!(
+            source.provision(&cap, CredMode::Proxied).unwrap().secret,
+            "key-a"
+        );
+        let err = source.provision(&cap, CredMode::Native).unwrap_err();
+        assert!(matches!(err, CredError::Other(_)), "Native must be refused");
     }
 }

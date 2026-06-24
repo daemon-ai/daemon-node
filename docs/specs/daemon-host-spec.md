@@ -311,7 +311,11 @@ uniquely addressable and its depth is recoverable from the id. The `ManagedUnit:
 `locate_*` recursion seam is now **vestigial on the durable in-process path** (the graph already spans
 every depth) and is retained only for the deferred cross-node remote-host proxy; correspondingly,
 lifecycle commands that only made sense for the live in-memory fleet (`pause` / `resume` / `scale`)
-are reported `Unsupported` for durable sessions. The projection DTO
+are currently reported `Unsupported` for durable sessions. (This is correct for an *engine leaf* but a
+known gap for an *orchestrator*: a durable operator-pause/resume hold over a delegation subtree, and a
+`scale` concurrency cap over the durable child graph, are specified as a design in
+[`daemon-supervision-spec.md` §7](daemon-supervision-spec.md) — not yet implemented; the engine-leaf
+`Ack::Unsupported` invariant is unchanged either way.) The projection DTO
 (`TreeReport`/`UnitNode`/`UnitState`/`ManageEventView`) lives in `daemon-protocol` and is re-exported
 by `daemon-api`, so the management contract can carry the seam without depending on the consumer
 surface and the cddl wire mirror is unchanged.

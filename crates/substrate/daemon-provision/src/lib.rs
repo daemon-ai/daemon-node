@@ -242,6 +242,12 @@ impl CutWriter {
 pub struct ChildGuard(Option<tokio::process::Child>);
 
 impl ChildGuard {
+    /// A guard owning no process — for in-process cuts (e.g. a [`CutChannel`] over a duplex pipe in
+    /// tests) where the "child" side is a task, not a spawned OS process. `shutdown`/drop are no-ops.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
     /// Gracefully stop the child: signal it, then reap it.
     pub async fn shutdown(&mut self) {
         if let Some(mut child) = self.0.take() {

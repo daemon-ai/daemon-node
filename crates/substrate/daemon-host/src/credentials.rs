@@ -240,3 +240,54 @@ impl CredentialProvider for BrokeredCredentialProvider {
             .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credstore::{CredentialStore, MemCredentialStore, PooledStoreCredentialSource};
+    use daemon_common::CredMode;
+    use daemon_credentials::{CapabilitySigner, CredentialAuthority};
+
+    /// The engine's `Recovery::Rotate` path (`provider.rotate` → broker → authority → source) cycles
+    /// the pooled key: after rotating the served key, the next brokered acquire selects another key
+    /// from the store's pool (B4 pooled-key rotation, end-to-end through the owner broker).
+    #[tokio::test]
+    async fn rotate_through_broker_cycles_pooled_keys() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("grok", "key-a").unwrap();
+        store.add_key("grok", "key-b").unwrap();
+
+        let signer = Arc::new(CapabilitySigner::generate());
+        let source = Arc::new(PooledStoreCredentialSource::new(store, "grok", "sk-fallback"));
+        let scope = CredScope::new(["grok"], ["chat"], Some(1_000));
+        let authority = Arc::new(CredentialAuthority::new(
+            scope.clone(),
+            CredMode::Bearer,
+            60_000,
+            signer,
+            source,
+        ));
+        // Drive through the engine-facing port, exactly as the engine does.
+        let provider = BrokeredCredentialProvider::new(
+            Arc::new(OwnerBroker::new(authority)) as Arc<dyn CredentialBroker>,
+            None,
+        );
+        let grok = ProfileRef::new("grok");
+
+        let first = provider.acquire(&grok, &scope).await.unwrap();
+        assert_eq!(
+            first.secret.as_ref().unwrap().expose(),
+            "key-a",
+            "the first acquire serves the primary pooled key"
+        );
+
+        // A rotatable failure rotates the served key; the next acquire prefers the other pooled key.
+        provider.rotate(&grok, &first.cap_id).await;
+        let second = provider.acquire(&grok, &scope).await.unwrap();
+        assert_eq!(
+            second.secret.as_ref().unwrap().expose(),
+            "key-b",
+            "rotation cycles to a different pooled key"
+        );
+    }
+}

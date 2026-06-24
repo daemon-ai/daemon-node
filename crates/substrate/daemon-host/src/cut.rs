@@ -26,7 +26,7 @@ use daemon_common::{
     LeaseSecret, MerkleRoot, PartitionId, ProfileRef, SessionId, SnapshotBlob, TraceId, UnitId,
     UsageDelta,
 };
-use daemon_core::CredentialProvider;
+use daemon_core::{CredentialBuilder, CredentialProvider, EmbeddedCredentialPool};
 use daemon_provision::{ChildGuard, CutChannel, CutReader, CutWriter, Placement};
 use daemon_store::{
     Activation, Checkpoint, JobCommand, JobCompletion, JournalPage, SessionStatus, SessionStore,
@@ -680,21 +680,39 @@ pub async fn serve_credentials(channel: CutChannel, broker: Arc<dyn CredentialBr
             let broker = broker.clone();
             // Serve under the restored trace so the audit at this hop (and every hop up) correlates.
             tokio::spawn(with_trace(trace, async move {
-                let body = match call {
-                    CredCall::Acquire {
-                        requester,
-                        profile,
-                        scope,
-                    } => CredReplyBody::Lease(broker.acquire(requester, &profile, &scope).await),
-                    CredCall::Use { requester, lease } => {
-                        CredReplyBody::Secret(broker.use_capability(requester, &lease).await)
-                    }
-                };
+                let body = serve_cred_call(broker.as_ref(), call).await;
                 let _ = writer
                     .send(&encode(&CutFrame::CredReply { id, body }))
                     .await;
             }));
         }
+    }
+}
+
+/// Serve one brokered [`CredCall`] against `broker` (serve-or-forward), mapping the broker's verdict
+/// to the wire [`CredReplyBody`]. Shared by [`serve_credentials`] (a dedicated credential cut) and
+/// [`PlacedUnit`]'s multiplexed reader (the placement cut), so both speak the identical broker
+/// surface — the only difference is which channel the reply rides.
+async fn serve_cred_call(broker: &dyn CredentialBroker, call: CredCall) -> CredReplyBody {
+    match call {
+        CredCall::Acquire {
+            requester,
+            profile,
+            scope,
+        } => CredReplyBody::Lease(broker.acquire(requester, &profile, &scope).await),
+        CredCall::Use { requester, lease } => {
+            CredReplyBody::Secret(broker.use_capability(requester, &lease).await)
+        }
+    }
+}
+
+/// The reply a placement-cut reader sends when no [`CredentialBroker`] is installed at this hop: a
+/// faithful `NoAuthority` (rather than dropping the frame and stranding the caller), so the
+/// descendant's [`CutCredentialClient`] can fall back to its embedded pool instead of hanging.
+fn no_authority_reply(call: &CredCall) -> CredReplyBody {
+    match call {
+        CredCall::Acquire { .. } => CredReplyBody::Lease(Err(CredError::NoAuthority)),
+        CredCall::Use { .. } => CredReplyBody::Secret(Err(CredError::NoAuthority)),
     }
 }
 
@@ -805,11 +823,161 @@ impl CredentialProvider for RemoteCredentialClient {
     async fn rotate(&self, _profile: &ProfileRef, _cap_id: &CredId) {}
 }
 
+/// The descendant-side credential client over the **multiplexed** placement cut.
+///
+/// Unlike [`RemoteCredentialClient`] (which owns a dedicated channel and its own reader), this
+/// shares the placement cut's [`CutWriter`] with the [`RemoteStoreClient`] and has its pending
+/// [`CredReplyBody`]s routed by the shared [`drive_placed_child`] reader loop (mirroring
+/// [`RemoteStoreClient::complete`]). It is both a [`CredentialBroker`] and the engine's
+/// [`CredentialProvider`], so the placed child acquires brokered, attenuated, short-lived leases
+/// from the parent without opening a second OS channel.
+pub struct CutCredentialClient {
+    writer: CutWriter,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<CredReplyBody>>>>,
+    next_id: AtomicU64,
+}
+
+impl CutCredentialClient {
+    /// A client that frames [`CredCall`]s onto the shared placement-cut `writer`.
+    pub fn new(writer: CutWriter) -> Arc<Self> {
+        Arc::new(Self {
+            writer,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(0),
+        })
+    }
+
+    /// Complete a pending credential call with the reply the drive loop demultiplexed off the cut.
+    pub fn complete(&self, id: u64, body: CredReplyBody) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
+            let _ = tx.send(body);
+        }
+    }
+
+    async fn call(&self, call: CredCall) -> Result<CredReplyBody, CredError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        if self
+            .writer
+            .send(&encode(&CutFrame::CredCall { id, call }))
+            .await
+            .is_err()
+        {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(CredError::NoAuthority);
+        }
+        rx.await.map_err(|_| CredError::NoAuthority)
+    }
+}
+
+#[async_trait]
+impl CredentialBroker for CutCredentialClient {
+    async fn acquire(
+        &self,
+        requester: Option<UnitId>,
+        profile: &ProfileRef,
+        scope: &CredScope,
+    ) -> Result<CapabilityLease, CredError> {
+        match self
+            .call(CredCall::Acquire {
+                requester,
+                profile: profile.clone(),
+                scope: scope.clone(),
+            })
+            .await?
+        {
+            CredReplyBody::Lease(r) => r,
+            CredReplyBody::Secret(_) => Err(CredError::Other("unexpected credential reply".into())),
+        }
+    }
+
+    async fn use_capability(
+        &self,
+        requester: Option<UnitId>,
+        lease: &CapabilityLease,
+    ) -> Result<LeaseSecret, CredError> {
+        match self
+            .call(CredCall::Use {
+                requester,
+                lease: lease.clone(),
+            })
+            .await?
+        {
+            CredReplyBody::Secret(r) => r,
+            CredReplyBody::Lease(_) => Err(CredError::Other("unexpected credential reply".into())),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for CutCredentialClient {
+    async fn acquire(
+        &self,
+        profile: &ProfileRef,
+        scope: &CredScope,
+    ) -> Result<CapabilityLease, CredError> {
+        CredentialBroker::acquire(self, None, profile, scope).await
+    }
+
+    async fn release(&self, _lease: &CapabilityLease) {}
+
+    async fn rotate(&self, _profile: &ProfileRef, _cap_id: &CredId) {}
+}
+
+/// A [`CredentialProvider`] that prefers the brokered placement cut and falls back to a local
+/// embedded L1 pool when the parent serves no authority (`CredError::NoAuthority`, e.g. an older
+/// parent that does not broker credentials, or a closed cut). A real owner verdict
+/// (`ScopeDenied`/`Fenced`/`Expired`/…) is *not* masked — only the "no broker at all" case falls
+/// back — so a placed child whose parent does broker credentials runs strictly under the cut.
+struct CutOrEmbeddedCredentials {
+    cut: Arc<CutCredentialClient>,
+    embedded: Arc<dyn CredentialProvider>,
+}
+
+#[async_trait]
+impl CredentialProvider for CutOrEmbeddedCredentials {
+    async fn acquire(
+        &self,
+        profile: &ProfileRef,
+        scope: &CredScope,
+    ) -> Result<CapabilityLease, CredError> {
+        match CredentialProvider::acquire(self.cut.as_ref(), profile, scope).await {
+            Err(CredError::NoAuthority) => self.embedded.acquire(profile, scope).await,
+            other => other,
+        }
+    }
+
+    async fn release(&self, lease: &CapabilityLease) {
+        CredentialProvider::release(self.cut.as_ref(), lease).await;
+        self.embedded.release(lease).await;
+    }
+
+    async fn rotate(&self, profile: &ProfileRef, cap_id: &CredId) {
+        CredentialProvider::rotate(self.cut.as_ref(), profile, cap_id).await;
+        self.embedded.rotate(profile, cap_id).await;
+    }
+}
+
+/// Build the [`CredentialBuilder`] a placed child dresses its engine with: a fresh
+/// [`CutOrEmbeddedCredentials`] per engine, brokering over `cut` with a per-engine embedded pool as
+/// the no-authority fallback.
+fn cut_credential_builder(cut: &Arc<CutCredentialClient>) -> CredentialBuilder {
+    let cut = cut.clone();
+    Arc::new(move || {
+        Arc::new(CutOrEmbeddedCredentials {
+            cut: cut.clone(),
+            embedded: Arc::new(EmbeddedCredentialPool::single_key()),
+        }) as Arc<dyn CredentialProvider>
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Parent-side proxy: the placed unit
 // ---------------------------------------------------------------------------
 
 type HandlerSlot = Arc<Mutex<Option<Arc<dyn ManageRequestHandler>>>>;
+type BrokerSlot = Arc<Mutex<Option<Arc<dyn CredentialBroker>>>>;
 
 /// The parent-side [`ManagedUnit`] proxy for a child placed across a cut (host-spec §9).
 ///
@@ -823,6 +991,12 @@ pub struct PlacedUnit {
     store: Arc<dyn SessionStore>,
     events: broadcast::Sender<ManageEvent>,
     handler: HandlerSlot,
+    /// The credential authority this parent serves the child's brokered [`CredCall`]s against
+    /// (host-spec §6). `None` => the parent owns no authority for this child, so each `CredCall` is
+    /// answered `NoAuthority` and the child falls back to its embedded pool. Typically a
+    /// [`RelayBroker`](crate::credentials::RelayBroker) attenuated to the child's profile/scope with
+    /// the parent's [`OwnerBroker`](crate::credentials::OwnerBroker) upstream.
+    broker: BrokerSlot,
     child: Arc<AsyncMutex<ChildGuard>>,
     /// The last (nonzero) trace id observed on a frame *originated by the child* — the proof that
     /// the parent-set trace was restored on the far side of the cut and stamped back out.
@@ -857,14 +1031,16 @@ impl PlacedUnit {
         let (writer, mut reader) = channel.split();
         let (events, _) = broadcast::channel::<ManageEvent>(256);
         let handler: HandlerSlot = Arc::new(Mutex::new(None));
+        let broker: BrokerSlot = Arc::new(Mutex::new(None));
         let child_trace = Arc::new(AtomicU64::new(0));
 
-        // The parent-side cut reader: relay the child's events up, and serve its brokered store and
-        // escalated-request traffic against the parent's authority.
+        // The parent-side cut reader: relay the child's events up, and serve its brokered store,
+        // escalated-request, and credential traffic against the parent's authority.
         let out = events.clone();
         let store_for_reader = store.clone();
         let writer_for_reader = writer.clone();
         let handler_for_reader = handler.clone();
+        let broker_for_reader = broker.clone();
         let child_trace_for_reader = child_trace.clone();
         // Establish a trace scope so `set_trace` (restore-on-receive) governs the replies this loop
         // sends back to the child (a served `StoreReply` correlates with the brokered `StoreCall`).
@@ -904,6 +1080,28 @@ impl PlacedUnit {
                             .send(&encode(&CutFrame::RequestReply { id, body }))
                             .await;
                     }
+                    CutFrame::CredCall { id, call } => {
+                        let installed = broker_for_reader.lock().unwrap().clone();
+                        let writer = writer_for_reader.clone();
+                        match installed {
+                            // Serve on its own task (under the restored trace) so a relay's upward
+                            // forward — which awaits an even-higher hop — never blocks this reader.
+                            Some(broker) => {
+                                tokio::spawn(with_trace(trace, async move {
+                                    let body = serve_cred_call(broker.as_ref(), call).await;
+                                    let _ = writer
+                                        .send(&encode(&CutFrame::CredReply { id, body }))
+                                        .await;
+                                }));
+                            }
+                            None => {
+                                let body = no_authority_reply(&call);
+                                let _ = writer
+                                    .send(&encode(&CutFrame::CredReply { id, body }))
+                                    .await;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -915,9 +1113,27 @@ impl PlacedUnit {
             store,
             events,
             handler,
+            broker,
             child: Arc::new(AsyncMutex::new(child)),
             child_trace,
         }
+    }
+
+    /// Serve the child's brokered [`CredCall`]s against `broker` (host-spec §6). Without this the
+    /// parent owns no credential authority for the child and each acquire is answered `NoAuthority`
+    /// (the child then falls back to its embedded pool). Pass a
+    /// [`RelayBroker`](crate::credentials::RelayBroker) attenuated to the child's grant with the
+    /// parent's owner upstream, so the descendant can never exceed what this hop is itself granted.
+    pub fn with_credential_broker(self, broker: Arc<dyn CredentialBroker>) -> Self {
+        *self.broker.lock().unwrap() = Some(broker);
+        self
+    }
+
+    /// Install (or replace) the child's credential broker after construction (mirrors
+    /// [`PlacedUnit::install_request_handler`]). The shared slot is read per `CredCall`, so this
+    /// takes effect for all subsequent brokered acquires.
+    pub fn install_credential_broker(&self, broker: Arc<dyn CredentialBroker>) {
+        *self.broker.lock().unwrap() = Some(broker);
     }
 
     /// The last nonzero [`TraceId`] observed on a child-originated frame. After driving the child
@@ -1014,12 +1230,26 @@ async fn emit(writer: &CutWriter, event: ManageEvent) {
 /// every durable operation brokered back to the parent. Runs until the parent closes the cut.
 pub async fn run_placed_child(
     channel: CutChannel,
-    factory: Arc<dyn EngineFactory>,
+    factory: CoreEngineFactory,
     partition: PartitionId,
+    profile: ProfileRef,
 ) {
     let (writer, reader) = channel.split();
     let client = Arc::new(RemoteStoreClient::new(writer.clone()));
-    drive_placed_child(writer, reader, client, factory, partition).await;
+    // Acquire credentials over the same multiplexed cut (closing B2's deferral): the engine brokers
+    // each turn's lease from the parent, falling back to its embedded pool only when the parent
+    // serves no authority.
+    let cred = CutCredentialClient::new(writer.clone());
+    let factory = factory.with_credentials(cut_credential_builder(&cred), profile);
+    drive_placed_child(
+        writer,
+        reader,
+        client,
+        Some(cred),
+        Arc::new(factory) as Arc<dyn EngineFactory>,
+        partition,
+    )
+    .await;
 }
 
 /// Like [`run_placed_child`], but the child journals its durable history **through the parent's
@@ -1032,12 +1262,19 @@ pub async fn run_placed_child_journaled(
     factory: CoreEngineFactory,
     partition: PartitionId,
     signer: Arc<TraceSigner>,
+    profile: ProfileRef,
 ) {
     let (writer, reader) = channel.split();
     let client = Arc::new(RemoteStoreClient::new(writer.clone()));
-    let factory = Arc::new(factory.with_journal(client.clone() as Arc<dyn SessionStore>, signer))
-        as Arc<dyn EngineFactory>;
-    drive_placed_child(writer, reader, client, factory, partition).await;
+    // Broker credentials over the cut (as in `run_placed_child`) *and* journal through the parent's
+    // store under the seed-derived signer.
+    let cred = CutCredentialClient::new(writer.clone());
+    let factory = Arc::new(
+        factory
+            .with_credentials(cut_credential_builder(&cred), profile)
+            .with_journal(client.clone() as Arc<dyn SessionStore>, signer),
+    ) as Arc<dyn EngineFactory>;
+    drive_placed_child(writer, reader, client, Some(cred), factory, partition).await;
 }
 
 /// The shared placed-child drive loop, parameterised over an already-built brokered store client and
@@ -1046,6 +1283,7 @@ async fn drive_placed_child(
     writer: CutWriter,
     mut reader: CutReader,
     client: Arc<RemoteStoreClient>,
+    cred: Option<Arc<CutCredentialClient>>,
     factory: Arc<dyn EngineFactory>,
     partition: PartitionId,
 ) {
@@ -1058,6 +1296,13 @@ async fn drive_placed_child(
         };
         match frame {
             CutFrame::StoreReply { id, body } => client.complete(id, body),
+            // Demultiplex the parent's brokered credential replies to the cut credential client
+            // (the same channel the store replies ride).
+            CutFrame::CredReply { id, body } => {
+                if let Some(cred) = &cred {
+                    cred.complete(id, body);
+                }
+            }
             CutFrame::RunTurn { session, fence } => {
                 let manager = manager.clone();
                 let writer = writer.clone();
@@ -1112,5 +1357,163 @@ async fn drive_placed_child(
             CutFrame::Cancel { .. } | CutFrame::Shutdown => break,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod cred_cut_tests {
+    //! Credential brokering over the *multiplexed* placement cut: a [`PlacedUnit`] serves the
+    //! child's [`CutFrame::CredCall`]s against an installed broker, and the descendant's
+    //! [`CutCredentialClient`] acquires an attenuated, fenced lease — proving B2's deferred piece
+    //! works over the real frame codec (the dedicated-channel path is covered by the conformance
+    //! `credentials` suite).
+
+    use super::*;
+    use crate::credentials::{FenceGuard, OwnerBroker, RelayBroker};
+    use daemon_common::{CredMode, CredScope, FenceToken, ProfileRef, UnitId};
+    use daemon_credentials::{CapabilitySigner, CredentialAuthority, StubCredentialSource};
+    use daemon_provision::{ChildGuard, CutChannel};
+    use daemon_store::InMemoryStore;
+    use std::sync::Mutex as StdMutex;
+
+    /// A connected pair of in-process cut channels (parent end, child end) over a duplex pipe — a
+    /// cut without spawning a process, so the broker chain runs over the real frame codec.
+    fn cut_pair() -> (CutChannel, CutChannel) {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        (
+            CutChannel::from_parts(Box::new(ar), Box::new(aw)),
+            CutChannel::from_parts(Box::new(br), Box::new(bw)),
+        )
+    }
+
+    /// The child-side reply pump: route `CredReply`s off the cut into `cred` (the stand-in for
+    /// [`drive_placed_child`]'s reader loop in a focused test).
+    fn pump_child(mut reader: CutReader, cred: Arc<CutCredentialClient>) {
+        tokio::spawn(async move {
+            while let Some(bytes) = reader.recv().await {
+                let Some(Wire { trace, frame }) = decode(&bytes) else {
+                    continue;
+                };
+                set_trace(trace);
+                if let CutFrame::CredReply { id, body } = frame {
+                    cred.complete(id, body);
+                }
+            }
+        });
+    }
+
+    fn owner(mode: CredMode, grant: CredScope) -> Arc<CredentialAuthority> {
+        let signer = Arc::new(CapabilitySigner::generate());
+        let source = Arc::new(StubCredentialSource::minting("openai", "sk-configured"));
+        Arc::new(CredentialAuthority::new(grant, mode, 60_000, signer, source))
+    }
+
+    fn placed_with_broker(
+        parent: CutChannel,
+        broker: Arc<dyn CredentialBroker>,
+    ) -> PlacedUnit {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+        PlacedUnit::new(
+            UnitId::new("child"),
+            Placement {
+                channel: parent,
+                child: ChildGuard::none(),
+            },
+            store,
+        )
+        .with_credential_broker(broker)
+    }
+
+    /// A placed child acquires a Bearer lease from the parent's owner broker over the multiplexed
+    /// cut — the key is minted at the authority and handed back across the frame codec.
+    #[tokio::test]
+    async fn placed_child_acquires_bearer_lease_over_the_cut() {
+        let grant = CredScope::new(["openai"], ["chat"], Some(1_000));
+        let authority = owner(CredMode::Bearer, grant.clone());
+        let broker = Arc::new(OwnerBroker::new(authority)) as Arc<dyn CredentialBroker>;
+
+        let (parent, child) = cut_pair();
+        // Keep the placed unit (and its serving reader) alive for the test.
+        let _placed = placed_with_broker(parent, broker);
+
+        let (cw, cr) = child.split();
+        let cred = CutCredentialClient::new(cw);
+        pump_child(cr, cred.clone());
+
+        let lease = CredentialProvider::acquire(cred.as_ref(), &ProfileRef::new("openai"), &grant)
+            .await
+            .expect("the parent broker mints a lease over the cut");
+        let key = lease
+            .secret
+            .as_ref()
+            .expect("Bearer carries a usable key")
+            .expose()
+            .to_string();
+        assert!(
+            key.starts_with("sk-fresh-"),
+            "a minting source issues a fresh per-grant key, got {key:?}"
+        );
+    }
+
+    /// A stale incarnation cannot acquire over the cut: the superseded relay hop rejects with
+    /// `Fenced`, exactly as the dual-ownership store fence does across a cut.
+    #[tokio::test]
+    async fn stale_fence_acquire_over_the_cut_is_rejected() {
+        let grant = CredScope::new(["openai"], ["chat"], None);
+        let authority = owner(CredMode::Native, grant.clone());
+        let upstream = Arc::new(OwnerBroker::new(authority)) as Arc<dyn CredentialBroker>;
+
+        // The parent serves through a relay bound to an incarnation fence.
+        let live = Arc::new(StdMutex::new(FenceToken(1)));
+        let guard = FenceGuard::new(FenceToken(1), live.clone());
+        let relay = Arc::new(RelayBroker::new(upstream, grant.clone()).with_fence(guard))
+            as Arc<dyn CredentialBroker>;
+
+        let (parent, child) = cut_pair();
+        let _placed = placed_with_broker(parent, relay);
+
+        let (cw, cr) = child.split();
+        let cred = CutCredentialClient::new(cw);
+        pump_child(cr, cred.clone());
+
+        // While the relay's incarnation is current, the acquire succeeds.
+        CredentialProvider::acquire(cred.as_ref(), &ProfileRef::new("openai"), &grant)
+            .await
+            .expect("the current incarnation acquires");
+
+        // A newer activation supersedes the relay; the stale hop must now reject.
+        *live.lock().unwrap() = FenceToken(2);
+        let err = CredentialProvider::acquire(cred.as_ref(), &ProfileRef::new("openai"), &grant)
+            .await
+            .expect_err("the superseded hop must reject the acquire");
+        assert_eq!(err, CredError::Fenced);
+    }
+
+    /// With no broker installed, the parent answers `NoAuthority` (rather than stranding the child),
+    /// so the descendant can fall back to a local pool instead of hanging.
+    #[tokio::test]
+    async fn no_broker_yields_no_authority_over_the_cut() {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+        let (parent, child) = cut_pair();
+        let _placed = PlacedUnit::new(
+            UnitId::new("child"),
+            Placement {
+                channel: parent,
+                child: ChildGuard::none(),
+            },
+            store,
+        );
+
+        let (cw, cr) = child.split();
+        let cred = CutCredentialClient::new(cw);
+        pump_child(cr, cred.clone());
+
+        let grant = CredScope::new(["openai"], ["chat"], None);
+        let err = CredentialProvider::acquire(cred.as_ref(), &ProfileRef::new("openai"), &grant)
+            .await
+            .expect_err("a broker-less parent answers NoAuthority");
+        assert_eq!(err, CredError::NoAuthority);
     }
 }

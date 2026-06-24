@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use daemon_common::{FenceToken, JournalStreamId, MerkleRoot, TraceId};
-use daemon_credentials::CredentialAuditEvent;
+use daemon_credentials::{CredentialAuditEvent, CredentialAuthority};
 use daemon_protocol::TranscriptBlock;
 use daemon_store::SessionStore;
 use daemon_supervision::ManageEvent;
@@ -311,6 +311,46 @@ impl JournalFeeder {
     }
 }
 
+/// Drain the owner authority's pending credential-audit records into `sink` (host-spec §6), then
+/// seal the segment when anything was recorded — so grant/use/revoke/rotate land in the durable,
+/// tamper-evident transcript on the **production** path (today only conformance drains the audit).
+/// Returns the number of records journaled. Best-effort: a store error on one record is swallowed so
+/// a journaling hiccup never blocks credential issuance.
+pub async fn drain_credential_audit(authority: &CredentialAuthority, sink: &JournalSink) -> usize {
+    let events = authority.take_audit();
+    if events.is_empty() {
+        return 0;
+    }
+    for event in &events {
+        let _ = sink.record_credential(event).await;
+    }
+    let _ = sink.seal().await;
+    events.len()
+}
+
+/// Spawn a background task that periodically [`drain_credential_audit`]s `authority` into a
+/// per-node credential journal stream over `store`, sealed under `signer`. The handle is aborted on
+/// node shutdown; on each tick the accumulated audit is folded into the verifiable chain. Returns
+/// the join handle so the caller can abort it.
+pub fn spawn_credential_audit_drain(
+    authority: Arc<CredentialAuthority>,
+    store: Arc<dyn SessionStore>,
+    signer: Arc<TraceSigner>,
+    stream: JournalStreamId,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let sink = Arc::new(JournalSink::new(store, signer, stream));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // Skip the immediate first tick so the loop period is honored.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            drain_credential_audit(&authority, &sink).await;
+        }
+    })
+}
+
 /// Drain a unit's **management** event stream into `sink`, recording each event and sealing the
 /// segment at the terminal boundary (the management-only journaling path; the rich transcript path
 /// drives the sink through a [`crate::transcript::BlockCoalescer`]).
@@ -325,4 +365,56 @@ pub async fn journal_stream(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod cred_audit_tests {
+    use super::*;
+    use daemon_common::{CredScope, ProfileRef, UnitId};
+    use daemon_credentials::{AcquireCtx, CapabilitySigner, StubCredentialSource};
+    use daemon_store::InMemoryStore;
+
+    /// An owner authority's credential audit (request/grant) is drained into the verifiable journal
+    /// and the segment is sealed — the production-path wiring (today only conformance drained it).
+    #[tokio::test]
+    async fn drain_records_audit_into_the_journal() {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+        let signer = Arc::new(TraceSigner::generate());
+        let stream = JournalStreamId::unit(&UnitId::new("node-credentials"));
+
+        // Generate audit: an acquire pushes a `Request` then a `Grant`.
+        let cap_signer = Arc::new(CapabilitySigner::generate());
+        let source = Arc::new(StubCredentialSource::minting("openai", "sk-configured"));
+        let scope = CredScope::new(["openai"], ["chat"], Some(1_000));
+        let authority = CredentialAuthority::new(
+            scope.clone(),
+            daemon_common::CredMode::Bearer,
+            60_000,
+            cap_signer,
+            source,
+        );
+        let ctx = AcquireCtx::default();
+        authority
+            .acquire(&ctx, &ProfileRef::new("openai"), &scope)
+            .expect("acquire mints a lease");
+
+        let sink = JournalSink::new(store.clone(), signer, stream.clone());
+        let n = drain_credential_audit(&authority, &sink).await;
+        assert_eq!(n, 2, "request + grant are drained");
+        assert!(
+            authority.take_audit().is_empty(),
+            "the audit log is drained"
+        );
+
+        // The drained records landed in the durable, sealed segment 0 as `cred.*` entries.
+        let segment = store
+            .load_trace_segment(&stream, 0)
+            .await
+            .expect("the sealed segment is durable");
+        assert_eq!(segment.entries.len(), 2);
+        assert!(
+            segment.committed.is_some(),
+            "the segment is sealed after the drain"
+        );
+    }
 }

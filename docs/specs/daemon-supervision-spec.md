@@ -311,3 +311,86 @@ spec.
 5. Supervisors route by `UnitId`, never a retained handle (durable activation key, lifecycle doc §4).
 6. `Delegate` attenuates: a child's toolset/credential scope never exceeds its parent's (§7, §16.2).
 7. The host adapter MUST satisfy the §4 mapping table for `UnitKind = Engine`.
+
+---
+
+## 7. Durable operator lifecycle — `Pause` / `Resume` / `Scale` (design, not yet implemented)
+
+> **Status: design-only (B3).** Today `Pause`/`Resume`/`Scale` are `Ack::Unsupported` at the engine
+> leaf (§4 table, invariant #7) **and** report `ApiError::Unsupported` on the durable `ControlApi`
+> path (`FleetViewImpl::{pause,resume,scale}` return `false`/error; conformance asserts this). That
+> is correct for the *engine leaf* but is a **gap**, not an end state, for an *orchestrator*: an
+> operator genuinely wants to hold a whole delegation subtree and to cap its fan-out. This section
+> specifies the durable orchestrator semantics that would supersede the current "vestigial on the
+> durable path" stance for `UnitKind != Engine`. **No code ships in this phase.**
+
+### 7.1 Why the leaf stays `Unsupported`
+
+A `daemon-core` engine is a single conversation with no scheduler of its own: there is nothing to
+"pause" between turns and nothing to "scale". The leaf therefore keeps `Ack::Unsupported` for all
+three commands — invariant #7 is unchanged. Durable operator lifecycle is an **orchestrator/node**
+concept (the thing that owns scheduling: the activation manager + the job outbox), not a leaf one.
+
+### 7.2 `Pause` / `Resume`: a durable operator-hold distinct from delegation `Suspended`
+
+`SessionStatus::Suspended { job_id }` already exists, but it means *"waiting on a background job"* —
+an automatic, internal state the activation lifecycle sets and clears. Operator-pause is a **separate,
+explicit, durable** hold an operator places on an orchestrator subtree; overloading `Suspended` would
+conflate "blocked on a child" with "an operator stopped me". The design adds an orthogonal durable
+flag rather than a new `SessionStatus` variant:
+
+- **Store state.** A durable `operator_paused_at_ms: Option<u64>` per session row (a new column /
+  field, defaulting `None`), set/cleared atomically by the node. It is independent of `status`, so a
+  session can be `Active`/`Ready`/`Suspended` *and* operator-paused.
+- **Activation gate.** The `ActivationManager` wake path consults it: `scan_resumable` (which today
+  selects `Ready | Active`) and the `dequeue_wake` consumer skip any session that is operator-paused
+  **or has an operator-paused ancestor** (the hold is subtree-wide). A paused session that is woken
+  (e.g. by a child completion) records the wake durably but does **not** activate until resumed — the
+  wake hint is retained, not dropped, so `Resume` replays it.
+- **Outbox gate.** The `FleetJobWorker` / `JobOutboxDispatcher` consults it before materializing a
+  delegation: a `JobCommand` whose owning session (or subtree root) is operator-paused is **left
+  enqueued** (peeked, not popped, or popped-and-requeued), so no new durable child is spawned under a
+  paused parent. Already-running leaf turns are not force-killed (that is `Cancel`); pause is a
+  *scheduling* hold that quiesces the subtree at the next phase boundary.
+- **Resume.** Clearing `operator_paused_at_ms` re-admits the subtree: the node enqueues a wake for
+  each paused-but-resumable session (and the dispatcher re-examines the held jobs on its next tick),
+  so progress continues exactly where it stopped — crash-safe, because the flag and the wake/job
+  outboxes are all durable.
+
+### 7.3 `Scale`: target concurrency over the durable child graph
+
+There is **no fixed worker pool** to resize: every delegation spawns exactly one durable child
+session, and the single shared `ActivationManager` drives them all (lifecycle-persistence §3.1a). So
+`Scale { target }` is not "set N workers" but **"cap the orchestrator's concurrently-active direct
+children at N"**:
+
+- **Store state.** A durable `child_concurrency_cap: Option<u32>` per orchestrator session
+  (`None` = unbounded, the current behavior).
+- **Dispatcher honor.** When materializing a queued delegation job, the dispatcher counts the
+  parent's children whose `status` is `Active` (via `children_of` + `status`); if the count is at the
+  cap it leaves the job enqueued (as in the pause gate) until a child completes and frees a slot.
+- **Lowering the cap** below the current active count never preempts running children (no mid-turn
+  kill); it only throttles *new* materializations until the active count drains under the cap.
+- **Relation to `Budget`.** `Scale` bounds *concurrency*; the credential authority's cost ceiling
+  (§16, `CredentialAuthority::charge`) bounds *spend*. They compose — neither subsumes the other.
+
+### 7.4 Surface + conformance changes
+
+- **`FleetViewImpl` (`crates/node/daemon-node/src/lib.rs`).** `pause(id)`/`resume(id)` would set/clear
+  `operator_paused_at_ms` for the session and return `true` for an orchestrator (`UnitKind !=
+  Engine`); `scale(id, n)` would set `child_concurrency_cap`. For a leaf session these stay
+  `Unsupported`/`false` (no scheduling to hold), preserving the §4 mapping.
+- **`ControlApi` (`Pause`/`Resume`/`Scale`).** Route to the above; an orchestrator returns success
+  instead of `ApiError::Unsupported`.
+- **Conformance (`tests/daemon-conformance/src/lib.rs`).** The current assertion that
+  `pause`/`resume`/`scale` are `Unsupported` for an *orchestrator* session would be **replaced** by:
+  pause holds the subtree (a queued/woken delegation does not advance while paused; the durable graph
+  is unchanged), resume re-admits it to completion, and a `Scale { n }` cap bounds the orchestrator's
+  concurrently-active children. The leaf-Unsupported assertions (and invariant #7) **remain** — only
+  the orchestrator-path expectation changes.
+
+### 7.5 Out of scope for the design
+
+Cross-node pause propagation (a paused subtree spanning a remote-host proxy) rides the deferred
+cross-node distribution work; this design covers the in-process durable graph only. Mid-turn
+preemption stays `Cancel`'s job, not `Pause`'s.

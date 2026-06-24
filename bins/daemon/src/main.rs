@@ -1177,7 +1177,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 
     // Credentials: an owner authority brokered into *every* engine, uniformly across the durable,
     // interactive, and fleet-child construction paths (host-spec §6).
-    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key, credential_store.clone());
+    let (owner, cred_authority) =
+        build_owner_broker(&cfg.profile, &cfg.credential_key, credential_store.clone());
     let cred_profile = ProfileRef::new(cfg.profile.clone());
     let credentials: CredentialBuilder = {
         let owner = owner.clone();
@@ -1186,6 +1187,23 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 as Arc<dyn CredentialProvider>
         })
     };
+
+    // B4 audit-to-journal: drain the owner authority's credential audit (request/grant/use/revoke/
+    // rotate) into the verifiable journal on the production path — keyed to a per-node credential
+    // stream and sealed under the node's seed-derived signer (the same seal key the placed-child and
+    // transport paths use), so "who acquired which credential when" rides the tamper-evident chain.
+    let cred_audit_signer = Arc::new(
+        cfg.journal_seed
+            .map(|seed| daemon_telemetry::TraceSigner::from_seed(&seed))
+            .unwrap_or_else(daemon_telemetry::TraceSigner::generate),
+    );
+    let cred_audit_drain = daemon_host::spawn_credential_audit_drain(
+        cred_authority,
+        store.clone(),
+        cred_audit_signer,
+        JournalStreamId::unit(&UnitId::new("node-credentials")),
+        std::time::Duration::from_secs(5),
+    );
 
     // Model management: the daemon owns search + acquisition + caching + catalog for the local
     // engines (unified across llama.cpp + mistral.rs). Built unconditionally so the `ModelApi`
@@ -1468,6 +1486,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if let Some(matrix_server) = matrix_server {
         matrix_server.abort();
     }
+    cred_audit_drain.abort();
     handle.shutdown().await;
     let _ = std::fs::remove_file(&cfg.socket_path);
     Ok(())
@@ -1525,11 +1544,14 @@ fn build_routing_registry(cfg: &RoutingConfig) -> Option<RoutingRegistry> {
 /// (host-spec §7). The authority hands over the stored provider key (the GUI-set secret, falling
 /// back to the configured key) as the request bearer for `profile`, so a real provider call carries
 /// the live credential. Bearer mode + non-minting: the stored key is the secret, no STS dance.
+///
+/// Returns both the broker (injected into every engine) and the underlying [`CredentialAuthority`]
+/// so the host can drain its audit log into the verifiable journal (B4 audit-to-journal).
 fn build_owner_broker(
     profile: &str,
     fallback_key: &str,
     store: Arc<dyn CredentialStore>,
-) -> Arc<dyn CredentialBroker> {
+) -> (Arc<dyn CredentialBroker>, Arc<CredentialAuthority>) {
     let signer = Arc::new(CapabilitySigner::generate());
     // The pooled source selects/rotates among the profile's key pool (multi-key) on a rotatable
     // failure, falling back to the launch-configured key when the pool is empty.
@@ -1542,7 +1564,8 @@ fn build_owner_broker(
         signer,
         source,
     ));
-    Arc::new(OwnerBroker::new(authority))
+    let broker = Arc::new(OwnerBroker::new(authority.clone())) as Arc<dyn CredentialBroker>;
+    (broker, authority)
 }
 
 /// Run as a transport server: host a completing engine unit + an authoritative store, reachable as
@@ -1560,7 +1583,7 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
     cred_store
         .set(&cfg.profile, &cfg.credential_key)
         .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
-    let owner = build_owner_broker(&cfg.profile, &cfg.credential_key, cred_store);
+    let (owner, _cred_authority) = build_owner_broker(&cfg.profile, &cfg.credential_key, cred_store);
     let credentials: CredentialBuilder = {
         let owner = owner.clone();
         Arc::new(move || {
@@ -1656,8 +1679,9 @@ fn build_placed_child_tools(_cfg: &NodeConfig) -> ToolRegistry {
 /// bespoke literal. When the node's journal seed is configured (passed down via `DAEMON_JOURNAL_SEED`
 /// by the spawning parent), the child journals its durable transcript **through the parent's brokered
 /// store**, sealed under the node's seed-derived signer so the chain verifies under the node's
-/// published verifying key. Credentials stay on the embedded L1 pool — brokering them over the cut
-/// is a separate channel, deferred.
+/// published verifying key. Credentials are brokered over the *same* multiplexed cut: the engine
+/// acquires each turn's lease from the parent (falling back to its embedded pool only when the
+/// parent serves no authority).
 async fn run_as_placed_child() {
     let cfg = match NodeConfig::load() {
         Ok(cfg) => cfg,
@@ -1668,20 +1692,21 @@ async fn run_as_placed_child() {
     };
     // B2: the placed child runs the node's **configured** provider (genai / local / mock), built
     // through the same `build_providers` seam as the in-process node, plus the always-on core tools —
-    // not a hardcoded `MockProvider`. Credential brokering over the cut is deferred, so a real
-    // provider resolves its API key from the environment (`Request.auth` is unset on this path).
+    // not a hardcoded `MockProvider`. Credentials are brokered over the multiplexed cut (wired by
+    // `run_placed_child*`), so a real provider resolves its API key from the parent's authority.
     let provider = build_placed_child_provider(&cfg).await;
     let registry = build_placed_child_tools(&cfg);
     let profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new("placed child"))
         .with_config(cfg.engine);
     let factory = CoreEngineFactory::from_profile(profile);
     let channel = CutChannel::from_stdio();
+    let cred_profile = ProfileRef::new(cfg.profile.clone());
 
     match cfg.journal_seed {
         Some(seed) => {
             let signer = Arc::new(daemon_telemetry::TraceSigner::from_seed(&seed));
-            run_placed_child_journaled(channel, factory, cfg.partition, signer).await;
+            run_placed_child_journaled(channel, factory, cfg.partition, signer, cred_profile).await;
         }
-        None => run_placed_child(channel, Arc::new(factory), cfg.partition).await,
+        None => run_placed_child(channel, factory, cfg.partition, cred_profile).await,
     }
 }

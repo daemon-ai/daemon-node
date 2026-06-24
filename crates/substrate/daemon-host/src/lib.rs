@@ -78,11 +78,15 @@ pub use credstore::{
 };
 pub use cut::{
     run_placed_child, run_placed_child_journaled, serve_credentials, CredCall, CredReplyBody,
-    CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient, StoreCall, StoreReplyBody,
+    CutCredentialClient, CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient, StoreCall,
+    StoreReplyBody,
 };
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
-pub use journal::{journal_stream, JournalFeeder, JournalSink};
+pub use journal::{
+    drain_credential_audit, journal_stream, spawn_credential_audit_drain, JournalFeeder,
+    JournalSink,
+};
 pub use node_api::{
     decode_overlay, encode_overlay, AccountProvisioning, AcpDiscovery, CloudCatalog, DeliveryHost,
     DurableProfileResolver, ModelProviderFactory, NodeApiImpl, ProvisionedAccount,
