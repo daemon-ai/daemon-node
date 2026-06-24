@@ -592,6 +592,15 @@ distribution = {
   ? head_seq: (uint / null),
   ? source: (tstr / null),
 }
+profile-spec = any                       ; full ProfileSpec schema lives in Rust/profile.rs today
+profile-info = any
+credential-info = any
+model-descriptor = any
+curator-entry = any
+curator-change = any
+command-spec = any
+command-invocation = any
+command-output = any
 
 ; ----- interactive auth (SSO / OAuth2), wire v13 (daemon-interactive-auth-spec) -----
 ; the client-driven, browser-redirect login seam. The client owns the browser + the redirect_uri; the
@@ -629,6 +638,7 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "Respond": { session: session-id, response: host-response } }
             / "Health"
             / "Stats"
+            / "Telemetry"
             / "Sessions"
             / { "Assign": { session: session-id } }
             / { "Cancel": { session: session-id } }
@@ -655,6 +665,12 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "ApprovalsPending": { ? session: (session-id / null) } }                               ; HITL inbox -> Approvals
             / { "ApprovalDecide": { session: session-id, request_id: tstr, allow: bool } }             ; answer + wake -> Ok
             ; ----- profile distributions + versioning (wire v6) -----
+            / "ProfileList"                                                                            ; -> Profiles
+            / { "ProfileGet": { id: tstr } }                                                           ; -> Profile
+            / { "ProfileCreate": { spec: profile-spec } }                                              ; -> ProfileId
+            / { "ProfileUpdate": { spec: profile-spec } }                                              ; -> Ok
+            / { "ProfileDelete": { id: tstr } }                                                        ; -> Ok
+            / { "ProfileSelect": { id: tstr } }                                                        ; -> Ok
             / { "ProfileClone": { source: tstr, new_id: tstr } }                                       ; local copy -> Ok
             / { "ProfileExport": { id: tstr } }                                                        ; -> Distribution
             / { "ProfileImport": { dist: distribution, ? new_id: (tstr / null) } }                     ; -> ProfileId
@@ -664,6 +680,16 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "SkillHistory": { name: tstr } }                                                       ; -> Revisions
             / { "SkillAt": { name: tstr, seq: uint } }                                                 ; -> SkillBundle
             / { "SkillRevert": { name: tstr, seq: uint } }                                             ; bundled rejected -> Ok
+            / { "CuratorList": { ? profile: (tstr / null) } }                                          ; -> CuratorSkills
+            / { "CuratorPin": { ? profile: (tstr / null), name: tstr } }                                ; -> Ok
+            / { "CuratorUnpin": { ? profile: (tstr / null), name: tstr } }                              ; -> Ok
+            / { "CuratorArchive": { ? profile: (tstr / null), name: tstr } }                            ; -> Ok
+            / { "CuratorRestore": { ? profile: (tstr / null), name: tstr } }                            ; -> Ok
+            / { "CuratorRun": { ? profile: (tstr / null) } }                                           ; -> CuratorRun
+            ; ----- credentials (CredentialApi) -----
+            / { "CredentialSet": { profile: tstr, secret: tstr } }                                      ; -> Ok
+            / "CredentialList"                                                                         ; -> Credentials
+            / { "CredentialRemove": { profile: tstr } }                                                ; -> Ok
             ; ----- model management (ModelApi) -----
             / { "ModelSearch": { query: search-query } }
             / { "ModelFiles": { repo: tstr, revision: (tstr / null), engine: model-engine } }
@@ -679,6 +705,8 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "ModelQuantize": { repo: tstr, revision: (tstr / null), target_quant: tstr, source_file: (tstr / null) } }
             / "ModelQuantizes"
             / { "ModelInspect": { id: model-id } }
+            / "Models"                                                                                 ; -> Models
+            / { "ModelCurrent": { profile: (tstr / null) } }                                           ; -> ModelCurrent
             ; ----- interactive auth (AuthApi), wire v13 -----
             / { "AuthBegin": auth-begin-request }      ; mint authorization URL + park flow -> AuthBegun
             / { "AuthComplete": auth-complete-request } ; finish from captured redirect -> AuthCompleted
@@ -707,6 +735,8 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "ProviderRegister": { provider: provider-info } }                       ; -> Ok
             / "ToolList"                                                                ; -> Tools
             / { "ToolRegister": { tool: tool-info } }                                   ; -> Ok
+            / "CommandList"                                                            ; -> Commands
+            / { "CommandInvoke": { invocation: command-invocation } }                   ; -> CommandOutput
             / "ConfigGet"                                                               ; -> Config
             / { "ConfigSet": { config: node-config-view } }                             ; -> Ok
             / "CronList"                                                                ; -> CronJobs
@@ -746,6 +776,7 @@ api-response = "Ok"
              / { "Drained": [* outbound] }
              / { "Health": health-report }
              / { "Stats": stats-report }
+             / { "Telemetry": any }
              / { "Sessions": [* session-info] }
              / { "Approvals": [* approval-info] }
              / { "Fleet": fleet-report }
@@ -766,11 +797,18 @@ api-response = "Ok"
              / { "ModelQuantizeStarted": quantize-id }
              / { "ModelQuantizes": [* quantize-status] }
              / { "ModelInspect": gguf-info }
+             / { "Profiles": [* profile-info] }
+             / { "Profile": (profile-spec / null) }
+             / { "Credentials": [* credential-info] }
+             / { "Models": [* model-descriptor] }
+             / { "ModelCurrent": (model-descriptor / null) }
              ; ----- profile distributions + versioning (wire v6) -----
              / { "Distribution": distribution }
              / { "ProfileId": tstr }
              / { "Revisions": [* revision] }
              / { "SkillBundle": skill-bundle }
+             / { "CuratorSkills": [* curator-entry] }
+             / { "CuratorRun": [* curator-change] }
              ; ----- interactive auth (AuthApi), wire v13 -----
              / { "AuthBegun": auth-begin-response }
              / { "AuthCompleted": auth-complete-response }
@@ -786,6 +824,8 @@ api-response = "Ok"
              ; ----- long-tail surfaces (wire v14) -----
              / { "Providers": [* provider-info] }
              / { "Tools": [* tool-info] }
+             / { "Commands": [* command-spec] }
+             / { "CommandOutput": command-output }
              / { "Config": node-config-view }
              / { "CronJobs": [* cron-job] }
              / { "CronId": tstr }

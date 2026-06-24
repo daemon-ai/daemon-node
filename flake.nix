@@ -247,6 +247,7 @@
                 rustToolchain
                 fenix.packages.${system}.rust-analyzer
                 pkgs.rust-cbindgen
+                pkgs.python3Packages.zcbor
               ]
               ++ engineNativeInputs
               ++ lib.optionals (lib.hasAttr "cargo-deny" pkgs) [

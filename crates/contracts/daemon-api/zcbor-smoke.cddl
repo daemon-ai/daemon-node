@@ -1,0 +1,108 @@
+; zcbor-smoke.cddl — representative subset of daemon-api.cddl for C codegen feasibility.
+;
+; This is not the published contract; daemon-api.cddl is. The smoke schema intentionally covers the
+; first daemon-app integration slice and the schema patterns we need zcbor to handle before we wire
+; generated code into a Qt client.
+
+session-id = tstr
+profile-ref = tstr
+req-id = uint
+
+user-msg = { "text": tstr, ? "attachments": [* blob-ref] }
+blob-ref = { "hash": bstr, "size": uint }
+
+agent-command-start-turn = { "StartTurn": { "input": user-msg, "request_id": req-id } }
+agent-command-steer = { "Steer": { "text": tstr, "request_id": req-id } }
+agent-command-shutdown = "Shutdown"
+agent-command = agent-command-start-turn
+              / agent-command-steer
+              / agent-command-shutdown
+
+service-health = {
+  "name": tstr,
+  "ok": bool,
+  "restarts": uint,
+  "detail": (tstr / null),
+}
+
+health-report = {
+  "all_ok": bool,
+  "services": [* service-health],
+}
+
+session-state = "Active" / "Ready" / "Completed" / "Unknown"
+lifecycle = "Durable" / "Live"
+session-role = "Primary" / "ManagedChild" / "EphemeralSubagent"
+
+session-info = {
+  "session": session-id,
+  "state": session-state,
+  ? "bound_profile": (profile-ref / null),
+  ? "title": (tstr / null),
+  ? "lifecycle": lifecycle,
+  ? "role": session-role,
+  ? "parent": (session-id / null),
+  ? "pinned": bool,
+  ? "archived": bool,
+}
+
+session-scope = "TopLevel" / { "ByProfile": profile-ref } / "Archived" / "All"
+session-query = {
+  ? "scope": session-scope,
+  ? "after": (session-id / null),
+  ? "limit": uint,
+}
+
+session-page = {
+  "sessions": [* session-info],
+  ? "next_cursor": (session-id / null),
+}
+
+direction = "Inbound" / "Outbound"
+disposition = "Context" / "Transport"
+origin = { "transport": tstr, "scope": tstr }
+session-payload = { "Command": agent-command }
+session-log-entry = {
+  "seq": uint,
+  "direction": direction,
+  "origin": origin,
+  "disposition": disposition,
+  "payload": session-payload,
+}
+log-page-view = {
+  "entries": [* session-log-entry],
+  "next_seq": uint,
+  "head_seq": uint,
+}
+
+fs-root-id = tstr
+fs-root-kind = tstr
+fs-root = { "id": fs-root-id, "label": tstr, "kind": fs-root-kind, ? "session": (session-id / null) }
+
+request-health = "Health"
+request-sessions-query = { "SessionsQuery": { "query": session-query } }
+request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint, "max": uint } }
+request-submit = { "Submit": { "session": session-id, "command": agent-command, ? "profile": (profile-ref / null) } }
+request-profile-list = "ProfileList"
+request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
+request-fs-roots = "FsRoots"
+
+api-request = request-health
+            / request-sessions-query
+            / request-subscribe
+            / request-submit
+            / request-profile-list
+            / request-model-current
+            / request-fs-roots
+
+response-health = { "Health": health-report }
+response-session-page = { "SessionPage": session-page }
+response-log-page = { "LogPage": log-page-view }
+response-fs-roots = { "FsRoots": [* fs-root] }
+response-ok = "Ok"
+
+api-response = response-health
+             / response-session-page
+             / response-log-page
+             / response-fs-roots
+             / response-ok

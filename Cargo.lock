@@ -11575,6 +11575,10 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "daemon-api",
+ "daemon-common",
+ "daemon-protocol",
+ "serde",
 ]
 
 [[package]]
