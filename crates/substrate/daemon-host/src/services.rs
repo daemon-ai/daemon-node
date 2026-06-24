@@ -111,6 +111,17 @@ pub fn job_worker_tick(worker: Arc<dyn crate::JobWorker>) -> TickFn {
     })
 }
 
+/// `CronScheduler` tick (I15): fire every due scheduled job once over an injected
+/// [`CronScheduler`](crate::CronScheduler) — the seam the binary uses to drive cron with the node's
+/// `CronWorker` (materialize an isolated session + enqueue its wake) without `daemon-host` depending
+/// on `daemon-node`/`daemon-schedule`.
+pub fn schedule_tick(scheduler: Arc<dyn crate::CronScheduler>) -> TickFn {
+    Arc::new(move || {
+        let scheduler = scheduler.clone();
+        Box::pin(async move { scheduler.tick_once().await })
+    })
+}
+
 /// `RecoveryScanner` tick: re-activate any resumable session whose wake was lost.
 pub fn scan_tick(manager: ActivationManager) -> TickFn {
     Arc::new(move || {

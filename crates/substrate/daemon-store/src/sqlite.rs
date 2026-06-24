@@ -14,8 +14,8 @@
 use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint,
     JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval, SessionMeta,
-    SessionRole, SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, TraceEntry,
-    TraceSegment,
+    SessionRole, SessionSearchHit, SessionStatus, SessionStore, StoredCronJob, StoredCronRun,
+    StoredCronSuggestion, StoreError, StoreStats, TraceEntry, TraceSegment, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -71,6 +71,45 @@ CREATE TABLE IF NOT EXISTS chat_routes (
 CREATE TABLE IF NOT EXISTS acp_catalog (
     name  TEXT PRIMARY KEY,
     entry BLOB NOT NULL
+);
+
+-- I15 cron backing. `spec` is the opaque host CBOR of the wire CronSpec (protocol-free). The
+-- scheduler's hot path is the `cron_due` query, indexed on `next_fire_unix` filtered by `paused`.
+CREATE TABLE IF NOT EXISTS cron_jobs (
+    id             TEXT PRIMARY KEY,
+    schedule       TEXT NOT NULL,
+    spec           BLOB NOT NULL,
+    next_fire_unix INTEGER,
+    paused         INTEGER NOT NULL DEFAULT 0,
+    last_run_unix  INTEGER,
+    last_ok        INTEGER,
+    last_detail    TEXT,
+    fire_count     INTEGER NOT NULL DEFAULT 0,
+    created_unix   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cron_jobs_due ON cron_jobs (paused, next_fire_unix);
+
+CREATE TABLE IF NOT EXISTS cron_runs (
+    rowseq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id        TEXT NOT NULL,
+    started_unix  INTEGER NOT NULL,
+    finished_unix INTEGER,
+    ok            INTEGER NOT NULL,
+    detail        TEXT,
+    session       TEXT,
+    manual        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS cron_runs_job ON cron_runs (job_id, rowseq);
+
+CREATE TABLE IF NOT EXISTS cron_suggestions (
+    id           TEXT PRIMARY KEY,
+    title        TEXT NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT '',
+    spec         BLOB NOT NULL,
+    dedup_key    TEXT NOT NULL UNIQUE,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_unix INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS enqueued_jobs (
@@ -213,6 +252,8 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         // Roster session-action flags (pin/archive) for the GUI session-actions surface.
         "ALTER TABLE session_meta ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE session_meta ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        // I15: the cron job that fired this (isolated) session, set by the cron worker.
+        "ALTER TABLE session_meta ADD COLUMN scheduled_job TEXT",
         // Delegation child-lifetime marker on the durable outbox (managed vs ephemeral subagent).
         "ALTER TABLE job_outbox ADD COLUMN lifetime TEXT",
     ];
@@ -242,6 +283,49 @@ fn role_from_str(s: &str) -> Option<SessionRole> {
         "ephemeral_subagent" => Some(SessionRole::EphemeralSubagent),
         _ => None,
     }
+}
+
+/// Map a `cron_jobs` row to a [`StoredCronJob`] (column order matches every cron_jobs SELECT).
+fn cron_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCronJob> {
+    Ok(StoredCronJob {
+        id: row.get::<_, String>(0)?,
+        schedule: row.get::<_, String>(1)?,
+        spec: row.get::<_, Vec<u8>>(2)?,
+        next_fire_unix: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+        paused: row.get::<_, i64>(4)? != 0,
+        last_run_unix: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+        last_ok: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+        last_detail: row.get::<_, Option<String>>(7)?,
+        fire_count: row.get::<_, i64>(8)? as u32,
+        created_unix: row.get::<_, i64>(9)? as u64,
+    })
+}
+
+/// Map a `cron_runs` row to a [`StoredCronRun`] (column order matches every cron_runs SELECT).
+fn cron_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCronRun> {
+    Ok(StoredCronRun {
+        job_id: row.get::<_, String>(0)?,
+        started_unix: row.get::<_, i64>(1)? as u64,
+        finished_unix: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+        ok: row.get::<_, i64>(3)? != 0,
+        detail: row.get::<_, Option<String>>(4)?,
+        session: row.get::<_, Option<String>>(5)?.map(SessionId::new),
+        manual: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+/// Map a `cron_suggestions` row to a [`StoredCronSuggestion`] (column order matches the SELECTs).
+fn cron_suggestion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCronSuggestion> {
+    Ok(StoredCronSuggestion {
+        id: row.get::<_, String>(0)?,
+        title: row.get::<_, String>(1)?,
+        description: row.get::<_, String>(2)?,
+        source: row.get::<_, String>(3)?,
+        spec: row.get::<_, Vec<u8>>(4)?,
+        dedup_key: row.get::<_, String>(5)?,
+        status: row.get::<_, String>(6)?,
+        created_unix: row.get::<_, i64>(7)? as u64,
+    })
 }
 
 fn lifetime_to_str(lifetime: ChildLifetime) -> &'static str {
@@ -1015,11 +1099,12 @@ impl SessionStore for SqliteStore {
         let role = meta.role.map(role_to_str);
         let parent = meta.parent.as_ref().map(|p| p.as_str());
         let last_activity = meta.last_activity_ms.map(|v| v as i64);
+        let scheduled_job = meta.scheduled_job.as_ref().map(|j| j.as_str());
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
-             last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9",
+             last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10",
             params![
                 id.as_str(),
                 bound,
@@ -1029,7 +1114,8 @@ impl SessionStore for SqliteStore {
                 role,
                 parent,
                 meta.pinned as i64,
-                meta.archived as i64
+                meta.archived as i64,
+                scheduled_job
             ],
         )
         .map_err(sql_err)?;
@@ -1039,7 +1125,7 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived \
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job \
              FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
@@ -1051,6 +1137,7 @@ impl SessionStore for SqliteStore {
                 let parent: Option<String> = row.get(5)?;
                 let pinned: i64 = row.get(6)?;
                 let archived: i64 = row.get(7)?;
+                let scheduled_job: Option<String> = row.get(8)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
@@ -1060,6 +1147,7 @@ impl SessionStore for SqliteStore {
                     parent: parent.map(SessionId::new),
                     pinned: pinned != 0,
                     archived: archived != 0,
+                    scheduled_job: scheduled_job.map(JobId::from),
                 })
             },
         )
@@ -1166,6 +1254,185 @@ impl SessionStore for SqliteStore {
     async fn acp_remove(&self, name: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM acp_catalog WHERE name = ?1", params![name])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn cron_list(&self) -> Vec<StoredCronJob> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix \
+             FROM cron_jobs ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], cron_job_from_row);
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn cron_get(&self, id: &str) -> Option<StoredCronJob> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix \
+             FROM cron_jobs WHERE id = ?1",
+            params![id],
+            cron_job_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    async fn cron_set(&self, job: StoredCronJob) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(id) DO UPDATE SET schedule = ?2, spec = ?3, next_fire_unix = ?4, paused = ?5, \
+             last_run_unix = ?6, last_ok = ?7, last_detail = ?8, fire_count = ?9, created_unix = ?10",
+            params![
+                job.id,
+                job.schedule,
+                job.spec,
+                job.next_fire_unix.map(|v| v as i64),
+                job.paused as i64,
+                job.last_run_unix.map(|v| v as i64),
+                job.last_ok.map(|v| v as i64),
+                job.last_detail,
+                job.fire_count as i64,
+                job.created_unix as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn cron_remove(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
+            .map_err(sql_err)?;
+        conn.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![id])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn cron_due(&self, now_unix: u64) -> Vec<StoredCronJob> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix \
+             FROM cron_jobs WHERE paused = 0 AND next_fire_unix IS NOT NULL AND next_fire_unix <= ?1 \
+             ORDER BY next_fire_unix",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![now_unix as i64], cron_job_from_row);
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn cron_runs_list(&self, id: &str, max: usize) -> Vec<StoredCronRun> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT job_id, started_unix, finished_unix, ok, detail, session, manual \
+             FROM cron_runs WHERE job_id = ?1 ORDER BY rowseq DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![id, max as i64], cron_run_from_row);
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn cron_run_append(&self, run: StoredCronRun) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_unix, finished_unix, ok, detail, session, manual) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run.job_id,
+                run.started_unix as i64,
+                run.finished_unix.map(|v| v as i64),
+                run.ok as i64,
+                run.detail,
+                run.session.as_ref().map(|s| s.as_str()),
+                run.manual as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        // Bounded retention: drop all but the most recent CRON_RUN_RETENTION rows for this job.
+        conn.execute(
+            "DELETE FROM cron_runs WHERE job_id = ?1 AND rowseq NOT IN \
+             (SELECT rowseq FROM cron_runs WHERE job_id = ?1 ORDER BY rowseq DESC LIMIT ?2)",
+            params![run.job_id, CRON_RUN_RETENTION as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn cron_suggestions_list(&self) -> Vec<StoredCronSuggestion> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, title, description, source, spec, dedup_key, status, created_unix \
+             FROM cron_suggestions ORDER BY created_unix",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], cron_suggestion_from_row);
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn cron_suggestion_get(&self, id: &str) -> Option<StoredCronSuggestion> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, title, description, source, spec, dedup_key, status, created_unix \
+             FROM cron_suggestions WHERE id = ?1",
+            params![id],
+            cron_suggestion_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    async fn cron_suggestion_set(&self, s: StoredCronSuggestion) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cron_suggestions (id, title, description, source, spec, dedup_key, status, created_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(id) DO UPDATE SET title = ?2, description = ?3, source = ?4, spec = ?5, \
+             dedup_key = ?6, status = ?7, created_unix = ?8",
+            params![
+                s.id,
+                s.title,
+                s.description,
+                s.source,
+                s.spec,
+                s.dedup_key,
+                s.status,
+                s.created_unix as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn cron_suggestion_remove(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM cron_suggestions WHERE id = ?1", params![id])
             .map_err(sql_err)?;
         Ok(())
     }

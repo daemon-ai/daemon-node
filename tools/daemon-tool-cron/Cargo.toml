@@ -1,0 +1,22 @@
+[package]
+name = "daemon-tool-cron"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+daemon-core = { workspace = true }
+# The shared cron operations surface (validate/create/list/…); the tool is a thin agent veneer over it.
+daemon-host = { workspace = true }
+daemon-api = { workspace = true }
+async-trait = { workspace = true }
+# Parse the JSON tool-call args into a CronSpec.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+daemon-store = { workspace = true }
+tokio = { workspace = true }

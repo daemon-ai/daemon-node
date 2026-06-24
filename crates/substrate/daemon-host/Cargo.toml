@@ -18,6 +18,8 @@ daemon-api = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }
+# I15 cron: schedule parsing + next-fire (croner) for the CronOps create/update/list surface.
+daemon-schedule = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-telemetry = { workspace = true }

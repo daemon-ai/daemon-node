@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use daemon_api::{ApiRequest, ApiResponse, JournalRecordPayload};
+use daemon_api::{ApiRequest, ApiResponse, CronSpec, JournalRecordPayload};
 use daemon_common::{
     DownloadId, ModelEngine, ModelId, ModelRef, ModelSource, ReqId, SearchQuery, SearchSort,
     SessionId, UnitId,
@@ -164,6 +164,99 @@ enum Command {
     Curator {
         #[command(subcommand)]
         cmd: CuratorCmd,
+    },
+    /// Manage scheduled (cron) jobs and the consent-first suggestion catalog (I15).
+    Cron {
+        #[command(subcommand)]
+        cmd: CronCmd,
+    },
+}
+
+/// Scheduled-job management: create/list/update/pause/resume/run-now/remove + recent runs, plus the
+/// consent-first suggestion catalog (`suggest list|accept|dismiss`). Mirrors the operator `cron_*`
+/// control ops; the same `CronOps` backs the agent `cron` tool.
+#[derive(Subcommand)]
+enum CronCmd {
+    /// Create a scheduled job from a name + schedule (+ optional agent prompt).
+    Create {
+        /// The job name.
+        name: String,
+        /// The schedule: a cron expression (`"0 9 * * *"`), `@every <dur>`, or an ISO timestamp.
+        schedule: String,
+        /// The agent prompt the fired session runs (omit for an empty prompt).
+        #[arg(long, default_value = "")]
+        prompt: String,
+        /// An IANA timezone for the schedule (defaults to the node's).
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Auto-delete after this many fires (omit for unlimited).
+        #[arg(long)]
+        repeat: Option<u32>,
+        /// Create the job paused (disabled) instead of armed.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// List all scheduled jobs with their next fire time.
+    List,
+    /// Replace a job's schedule (+ optional prompt), recomputing its next fire.
+    Update {
+        /// The job id.
+        id: String,
+        /// The job name.
+        name: String,
+        /// The new schedule.
+        schedule: String,
+        /// The agent prompt (omit for an empty prompt).
+        #[arg(long, default_value = "")]
+        prompt: String,
+    },
+    /// Pause a job (clears its next fire).
+    Pause {
+        /// The job id.
+        id: String,
+    },
+    /// Resume a paused job (recomputes its next fire from now).
+    Resume {
+        /// The job id.
+        id: String,
+    },
+    /// Fire a job now (out of band), without advancing its schedule.
+    Run {
+        /// The job id.
+        id: String,
+    },
+    /// Remove a job.
+    Remove {
+        /// The job id.
+        id: String,
+    },
+    /// Show a job's recent runs.
+    Runs {
+        /// The job id.
+        id: String,
+    },
+    /// Work with the consent-first suggestion catalog.
+    Suggest {
+        #[command(subcommand)]
+        cmd: CronSuggestCmd,
+    },
+}
+
+/// The suggestion-catalog verbs: list pending proposals, accept one (creates the job), or dismiss
+/// one (latched by `dedup_key` so it is never re-offered).
+#[derive(Subcommand)]
+enum CronSuggestCmd {
+    /// List pending suggestions (seeds the starter catalog on first use).
+    List,
+    /// Accept a suggestion: create its backing job (prints the new job id).
+    Accept {
+        /// The suggestion id.
+        id: String,
+    },
+    /// Dismiss a suggestion (latched so it is never re-offered).
+    Dismiss {
+        /// The suggestion id.
+        id: String,
     },
 }
 
@@ -731,7 +824,60 @@ async fn main() -> anyhow::Result<()> {
         Command::VerifyingKey => render(client.call(ApiRequest::VerifyingKey).await?),
         Command::Model { cmd } => run_model(&client, cmd).await?,
         Command::Curator { cmd } => run_curator(&client, cmd).await?,
+        Command::Cron { cmd } => run_cron(&client, cmd).await?,
     }
+    Ok(())
+}
+
+/// Dispatch a `cron` subcommand over the api mirror.
+async fn run_cron(client: &ApiClient, cmd: CronCmd) -> anyhow::Result<()> {
+    let req = match cmd {
+        CronCmd::Create {
+            name,
+            schedule,
+            prompt,
+            timezone,
+            repeat,
+            disabled,
+        } => ApiRequest::CronCreate {
+            spec: CronSpec {
+                name,
+                schedule,
+                payload: prompt.into_bytes(),
+                enabled: !disabled,
+                timezone,
+                repeat,
+                ..CronSpec::default()
+            },
+        },
+        CronCmd::List => ApiRequest::CronList,
+        CronCmd::Update {
+            id,
+            name,
+            schedule,
+            prompt,
+        } => ApiRequest::CronUpdate {
+            id,
+            spec: CronSpec {
+                name,
+                schedule,
+                payload: prompt.into_bytes(),
+                enabled: true,
+                ..CronSpec::default()
+            },
+        },
+        CronCmd::Pause { id } => ApiRequest::CronPause { id, paused: true },
+        CronCmd::Resume { id } => ApiRequest::CronPause { id, paused: false },
+        CronCmd::Run { id } => ApiRequest::CronTrigger { id },
+        CronCmd::Remove { id } => ApiRequest::CronDelete { id },
+        CronCmd::Runs { id } => ApiRequest::CronRuns { id },
+        CronCmd::Suggest { cmd } => match cmd {
+            CronSuggestCmd::List => ApiRequest::CronSuggestions,
+            CronSuggestCmd::Accept { id } => ApiRequest::CronAcceptSuggestion { id },
+            CronSuggestCmd::Dismiss { id } => ApiRequest::CronDismissSuggestion { id },
+        },
+    };
+    render(client.call(req).await?);
     Ok(())
 }
 
@@ -1270,13 +1416,42 @@ fn render(resp: ApiResponse) {
         ApiResponse::Config(c) => println!("config ({}):\n{}", c.format, c.body),
         ApiResponse::CronJobs(jobs) => {
             for j in jobs {
-                println!("  - {} {} ({})", j.id, j.spec.name, j.spec.schedule);
+                let next = j
+                    .next_fire_unix
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "  - {} {} ({}){} next={} fires={}",
+                    j.id,
+                    j.spec.name,
+                    j.spec.schedule,
+                    if j.paused { " [paused]" } else { "" },
+                    next,
+                    j.fire_count,
+                );
             }
         }
         ApiResponse::CronId(id) => println!("cron: {id}"),
         ApiResponse::CronRuns(runs) => {
             for r in runs {
-                println!("  - started={} ok={}", r.started_unix, r.ok);
+                let session = r
+                    .session
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("-");
+                println!(
+                    "  - started={} ok={} trigger={:?} session={}",
+                    r.started_unix, r.ok, r.trigger, session
+                );
+            }
+        }
+        ApiResponse::CronSuggestions(suggestions) => {
+            println!("cron suggestions: {}", suggestions.len());
+            for s in suggestions {
+                println!(
+                    "  - {} \"{}\" [{}] ({})",
+                    s.id, s.title, s.spec.schedule, s.source
+                );
             }
         }
         ApiResponse::ChatRoutes(routes) => {

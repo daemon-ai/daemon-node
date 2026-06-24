@@ -78,6 +78,12 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 gguf-rs = "0.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# I15 cron backing: croner parses/evaluates full cron expressions (incl. L/W/# extensions) and is
+# timezone-aware via chrono/chrono-tz. Pure Rust (no native deps), isolated to `daemon-schedule`.
+# `chrono` is already in the tree (transitive); `chrono-tz` adds the IANA database for per-job tz.
+croner = "3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
 # SKILL.md frontmatter parsing (the skills subsystem): a delimited YAML block at the top of each
 # bundle. Isolated to `daemon-skills`; `serde_yaml` is a small pure-Rust parser over `unsafe-libyaml`.
 serde_yaml = "0.9"
@@ -121,6 +127,7 @@ daemon-providers = { path = "crates/providers/daemon-providers" }
 daemon-infer = { path = "crates/providers/daemon-infer", default-features = false }
 daemon-models = { path = "crates/providers/daemon-models" }
 daemon-store = { path = "crates/substrate/daemon-store" }
+daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
 daemon-provision = { path = "crates/substrate/daemon-provision" }
 daemon-credentials = { path = "crates/substrate/daemon-credentials" }
@@ -146,6 +153,7 @@ daemon-tool-shell = { path = "tools/daemon-tool-shell" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }
 daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
 daemon-tool-orchestrate = { path = "tools/daemon-tool-orchestrate" }
+daemon-tool-cron = { path = "tools/daemon-tool-cron" }
 daemon-tool-web = { path = "tools/daemon-tool-web" }
 daemon-tool-browser = { path = "tools/daemon-tool-browser" }
 daemon-tool-todo = { path = "tools/daemon-tool-todo" }

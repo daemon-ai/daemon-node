@@ -326,6 +326,15 @@ impl Engine {
         self.next_trigger = Some(TurnTrigger::Steer);
     }
 
+    /// Arm the next turn's [`TurnTrigger`] explicitly (a one-shot override consumed at the start of
+    /// the next `run_turn`). The seam the host uses to mark a cron-fired session's turn as
+    /// [`TurnTrigger::Scheduled`] (I15): the incarnation reads `SessionMeta::scheduled_job` on wake
+    /// and sets it here before running, so the turn reports its scheduled origin instead of the
+    /// default `User`. Has no effect if a turn is already mid-flight.
+    pub fn set_next_trigger(&mut self, trigger: TurnTrigger) {
+        self.next_trigger = Some(trigger);
+    }
+
     /// Rewind the conversation to `anchor` (conversation-rewind spec §2/§4): truncate the turns after
     /// the anchor, reconstruct the engine state for that point (clear transient/in-flight state), bump
     /// the [`Epoch`] to fence late arrivals from the abandoned turn, and emit [`AgentEvent::Rewound`].

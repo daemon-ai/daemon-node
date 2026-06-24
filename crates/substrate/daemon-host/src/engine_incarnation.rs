@@ -64,6 +64,11 @@ pub struct CoreEngineFactory {
     /// store; on a parent's hydrate it materializes a child's returned artifacts into the parent's
     /// `inbox/`. `None` disables artifact capture/materialization (the legacy `child:{id}` marker).
     content: Option<ContentTransfer>,
+    /// The constrained profile a **cron-fired** session (`session_meta.scheduled_job.is_some()`)
+    /// runs its turn under (I15/G3): an orchestrator-free, `cron`-tool-free toolset so a scheduled
+    /// run cannot self-schedule or self-delegate (runaway prevention). When set it overrides the
+    /// resolver/fallback for any scheduled session; `None` leaves cron sessions on the default path.
+    cron_profile: Option<EngineProfile>,
 }
 
 /// The node-side content-transfer handles threaded into a durable incarnation (blob store +
@@ -93,6 +98,7 @@ impl CoreEngineFactory {
             background: None,
             resolver: None,
             content: None,
+            cron_profile: None,
         }
     }
 
@@ -108,6 +114,7 @@ impl CoreEngineFactory {
             background: None,
             resolver: None,
             content: None,
+            cron_profile: None,
         }
     }
 
@@ -119,6 +126,7 @@ impl CoreEngineFactory {
             background: None,
             resolver: None,
             content: None,
+            cron_profile: None,
         }
     }
 
@@ -141,6 +149,15 @@ impl CoreEngineFactory {
     /// profile. Requires the journal store (the source of the session metadata) to be set too.
     pub fn with_session_resolver(mut self, resolver: DurableProfileResolver) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// Inject the constrained cron-run profile (I15/G3): a cron-fired session
+    /// (`session_meta.scheduled_job.is_some()`) hydrates under this orchestrator-free, `cron`-free
+    /// toolset instead of the resolver/fallback profile, so a scheduled run cannot self-schedule or
+    /// self-delegate. Leave unset to run cron sessions on the default profile path.
+    pub fn with_cron_profile(mut self, profile: EngineProfile) -> Self {
+        self.cron_profile = Some(profile);
         self
     }
 
@@ -169,6 +186,7 @@ impl EngineFactory for CoreEngineFactory {
             background: self.background.clone(),
             resolver: self.resolver.clone(),
             content: self.content.clone(),
+            cron_profile: self.cron_profile.clone(),
             completion_payload: None,
         })
     }
@@ -189,6 +207,9 @@ pub struct CoreIncarnation {
     /// Node-side content transfer (blob store + workspace roots) for capturing/materializing
     /// delegated artifacts; `None` disables it.
     content: Option<ContentTransfer>,
+    /// The constrained cron-run profile (I15/G3): used in place of the resolver/fallback when this
+    /// incarnation hydrates a cron-fired session, so the run carries no `cron`/`orchestrate` tools.
+    cron_profile: Option<EngineProfile>,
     /// The structured completion payload captured at `Step::Completed` (a CBOR `DelegationResult`
     /// over the child's `outbox/`), surfaced via [`Incarnation::completion_payload`]. `None` => no
     /// artifacts captured (the store falls back to the legacy `child:{id}` marker).
@@ -290,18 +311,46 @@ impl Incarnation for CoreIncarnation {
         }
         let snap = Snapshot::decode(&snapshot)?;
         let session_id = snap.session_id.clone();
+        // I15: read the cron origin once — it drives both the profile selection here (a cron-fired
+        // session runs under the constrained cron profile) and the `TurnTrigger::Scheduled` arming
+        // below, so we avoid a second `session_meta` round-trip.
+        let scheduled_job = if let Some(store) = self.journal.as_ref().map(|cfg| &cfg.store) {
+            store
+                .session_meta(&session_id)
+                .await
+                .and_then(|m| m.scheduled_job)
+        } else {
+            None
+        };
         // A background child (§4.3) hydrates under its constrained review profile (skills-only /
-        // memory-only tools + bounded budget + nudges off), not the parent's full profile. Otherwise,
-        // when a per-session resolver + journal store are wired, re-resolve this session's profile
-        // from its persisted bound profile + overlay (unified resolution: a durable session honors
-        // its own model/tools/approval override, restored on rehydration). Falls back to the
-        // factory's fixed profile when no binding is recorded (e.g. delegated orchestrator children).
+        // memory-only tools + bounded budget + nudges off), not the parent's full profile. A
+        // cron-fired session (I15/G3) hydrates under the constrained cron profile (no `cron`/
+        // `orchestrate` tools) so it cannot self-schedule. Otherwise, when a per-session resolver +
+        // journal store are wired, re-resolve this session's profile from its persisted bound profile
+        // + overlay (unified resolution: a durable session honors its own model/tools/approval
+        // override). Falls back to the factory's fixed profile when no binding is recorded (e.g.
+        // delegated orchestrator children).
         let profile = if let Some(bg_profile) = self
             .background
             .as_ref()
             .and_then(|bg| bg.profile_for(&snap.session_id))
         {
             bg_profile
+        } else if scheduled_job.is_some() {
+            // I15/G3 + Phase 2 shaping: a cron-fired session resolves its bound profile overlaid with
+            // the run's persisted `SessionOverlay` (model/provider/tool-allowlist/workdir) through the
+            // SAME unified resolver the live/durable paths use. That resolver is G3-safe **by
+            // construction** — it builds the session tool registry from fs+shell+node-extras+skills and
+            // never wires the `cron`/`orchestrate` tools — so honoring the overlay cannot let a
+            // scheduled run self-schedule or self-delegate. Falls back to the explicitly-constrained
+            // `cron_profile` (then the factory default) when no resolver/binding is wired.
+            if let Some(resolved) = self.resolve_session_profile(&snap.session_id).await {
+                resolved
+            } else if let Some(cron_profile) = &self.cron_profile {
+                cron_profile.clone()
+            } else {
+                self.profile.clone()
+            }
         } else if let Some(resolved) = self.resolve_session_profile(&snap.session_id).await {
             resolved
         } else {
@@ -322,6 +371,12 @@ impl Incarnation for CoreIncarnation {
             })
             .collect();
         engine.apply_completions(completions);
+        // I15: a cron-fired session carries `SessionMeta::scheduled_job` (read above). Arm the next
+        // turn's trigger as `TurnTrigger::Scheduled { job }` so the fired turn reports its scheduled
+        // origin instead of the durable wake path's default `User`. One-shot (consumed by `run_turn`).
+        if let Some(job) = scheduled_job {
+            engine.set_next_trigger(daemon_protocol::TurnTrigger::Scheduled { job });
+        }
         self.engine = Some(engine);
         Ok(())
     }
@@ -565,6 +620,7 @@ mod tests {
             background: None,
             resolver: None,
             content: Some(ContentTransfer { blobs, roots }),
+            cron_profile: None,
             completion_payload: None,
         }
     }

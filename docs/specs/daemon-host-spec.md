@@ -646,3 +646,60 @@ These are the host's CI gates before any fleet deployment.
   management protocol and the cross-node lease protocol are deferred detail.
 - **Distribution mechanism** for fleets-of-fleets (Elfo/Kameo libp2p vs message bus vs gRPC) —
   explicitly deferred until cross-node is needed.
+
+---
+
+## 12. Scheduled jobs — the cron backing (I15 + Phase 2)
+
+The node runs a **5th resident service**, the `CronScheduler` (the node's `CronWorker`), alongside the
+recovery/dispatch/scan/job-worker services (§5). It never builds an engine itself: a due job is fired
+onto the **durable** activation path and the existing wake-outbox dispatcher runs the turn. One shared
+`CronOps` surface (durable store CRUD + schedule validation via `daemon-schedule`) backs both the
+operator `cron_*` control ops and the agent-facing `cron` tool, so there is one job engine, not two.
+
+### 12.1 The contract (`CronSpec`)
+
+A job carries its schedule (`croner` cron expression, `@every <dur>`/ISO interval, or a one-shot ISO
+timestamp), `payload` (the seed prompt), and policy/shaping fields: `enabled`/`timezone`/`repeat`/
+`jitter_secs`, `overlap` (skip|allow|queue) and `catch_up` (grace|skip|always), `script`/`no_agent`
+(run a workspace-contained script instead of an LLM turn), `context_from` (output chaining),
+`skills` (preloaded skill bodies, wire v16), the run-shaping overrides `model`/`provider`/
+`enabled_toolsets`/`workdir`, `deliver` (result routing), and `origin` (the creating chat, wire v17).
+Every field past v14 is additive (`#[serde(default)]`); the store keeps the spec as opaque CBOR.
+
+### 12.2 Firing (G3 safety)
+
+`fire()` materializes an isolated `cron_{id}_{ts}` durable session: it seeds the engine with the
+(skills- and `context_from`-prefixed) payload, stamps `SessionMeta { scheduled_job, role =
+EphemeralSubagent, bound_profile = target, overlay }`, records an in-flight `CronRun`, and
+`enqueue_wake`s it. On hydrate the incarnation reads `scheduled_job` and arms the next turn as
+`TurnTrigger::Scheduled { job }`. A cron-fired session **never** carries the `cron`/`orchestrate`
+tools (G3): it hydrates under the constrained cron base profile, and the unified resolver path is
+G3-safe by construction (it builds the session registry from fs+shell+node-extras+skills only). The
+`cron` tool additionally refuses every action inside a `cron_*` session (defense in depth).
+
+### 12.3 Outcome capture, delivery, and shaping (Phase 2)
+
+- **Outcome.** When a fired session settles, `reconcile()` reads its **real** final assistant message
+  read-only from the verifiable journal (the same coalesced `TranscriptBlock::Message{Assistant}` the
+  history surface serves) into `CronRun.detail` + `job.last_ok`/`last_detail`, deriving `ok` from
+  whether output was produced. This is what `context_from` chains downstream and what `deliver` sends.
+  A run whose entire output is the `[SILENT]` sentinel is recorded `ok` but never delivered.
+- **Delivery.** `deliver` is a **post-settle push** that reuses the §5.9.3 outbound surface — there is
+  no parallel cron delivery path. The directive resolves to `DeliveryTarget`s the same way a live
+  submit does: `"origin"` → the job's captured `Origin::primary_target()` (v17; `None` ⇒ store-only),
+  `"all"` → every live `Primary`, `"<transport>:<chat>"` → a direct target. The captured text is
+  carried as one assistant `TextDelta` `SessionLogEntry` and handed to the registered `DeliverySink`
+  for each target's transport (the same call the per-session pump makes). The agent `cron` tool stamps
+  the creating session's `Origin` (resolved from its routing pin) at create time; CLI/operator creates
+  default to none.
+- **Shaping.** `model`/`provider`/`enabled_toolsets`/`workdir` are projected into a `SessionOverlay`
+  written to `SessionMeta.overlay` at fire time, and applied on top of the cron base at hydrate via
+  the same overlay resolver the live/durable paths use (`WorkspaceBinding::Bound` → exec root).
+
+### 12.4 Suggestions + blueprints (consent-first)
+
+`CronOps` seeds a consent-first suggestion catalog on first read: a starter set plus any installed
+`metadata.daemon.blueprint` skill (the skill→suggestion bridge). Accepting a suggestion creates its
+backing job; accepted/dismissed suggestions latch out of the pending list by `dedup_key`. No job is
+ever created without an explicit accept.

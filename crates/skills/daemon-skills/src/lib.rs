@@ -1,7 +1,7 @@
 //! `daemon-skills` — the filesystem skills subsystem (a Rust port of hermes' skills).
 //!
 //! A *skill* is a directory bundle under `<profile_home>/skills/<category>/<name>/` whose `SKILL.md`
-//! carries a YAML frontmatter (`name`, `description`, `version`, `platforms`, `metadata.hermes.*`)
+//! carries a YAML frontmatter (`name`, `description`, `version`, `platforms`, `metadata.daemon.*`)
 //! plus a markdown body, optionally beside `references/`, `templates/`, `scripts/`, `assets/`. The
 //! subsystem implements **progressive disclosure** (hermes `prompt_builder.build_skills_system_prompt`):
 //!
@@ -79,10 +79,47 @@ impl From<std::io::Error> for SkillError {
     }
 }
 
-/// The `metadata.hermes.*` conditional-visibility hints (offer-time tool/toolset gating + curation
+/// A `metadata.daemon.blueprint` block: a skill that additionally declares a cron automation
+/// (ported from Hermes' blueprint skills). Its presence marks the skill *runnable* — installing it
+/// registers a consent-first cron **suggestion** (never auto-schedules), which `accept` compiles
+/// into a cron job that preloads this skill. Parsed best-effort; only `schedule` is required.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct SkillBlueprint {
+    /// The schedule expression (cron / `@every <dur>` / ISO timestamp) — presence marks the skill an
+    /// automation. Empty is treated as "no blueprint".
+    #[serde(default)]
+    pub schedule: String,
+    /// Delivery routing for each run (`origin`/`all`/`local`/`<transport>:<chat>`); empty = origin.
+    #[serde(default)]
+    pub deliver: Option<String>,
+    /// The per-run task instruction; `None` lets the run rely on the skill body alone.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Run a script only (no LLM turn).
+    #[serde(default)]
+    pub no_agent: bool,
+    /// Per-job model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-job provider override.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Restrict the run's toolset to these tool names.
+    #[serde(default)]
+    pub enabled_toolsets: Option<Vec<String>>,
+}
+
+impl SkillBlueprint {
+    /// Whether this block actually declares an automation (a non-empty schedule).
+    pub fn is_runnable(&self) -> bool {
+        !self.schedule.trim().is_empty()
+    }
+}
+
+/// The `metadata.daemon.*` conditional-visibility hints (offer-time tool/toolset gating + curation
 /// tags). Parsed best-effort; unknown keys are ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct HermesMeta {
+pub struct DaemonMeta {
     /// Curation/search tags.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -101,12 +138,15 @@ pub struct HermesMeta {
     /// The skill is shown as a fallback only when none of these tools are present.
     #[serde(default)]
     pub fallback_for_tools: Vec<String>,
+    /// An optional cron automation this skill declares (the blueprint bridge).
+    #[serde(default)]
+    pub blueprint: Option<SkillBlueprint>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawMetadata {
     #[serde(default)]
-    hermes: HermesMeta,
+    daemon: DaemonMeta,
 }
 
 /// The parsed `SKILL.md` frontmatter (the subset the index + tools need).
@@ -127,15 +167,25 @@ pub struct SkillFrontmatter {
     /// Optional OS gate (`macos`, `linux`, `windows`); empty means all platforms.
     #[serde(default)]
     pub platforms: Vec<String>,
-    /// Hermes-namespaced conditional-visibility metadata.
+    /// daemon-namespaced conditional-visibility metadata.
     #[serde(default)]
     metadata: RawMetadata,
 }
 
 impl SkillFrontmatter {
-    /// The `metadata.hermes.*` hints.
-    pub fn hermes(&self) -> &HermesMeta {
-        &self.metadata.hermes
+    /// The `metadata.daemon.*` hints.
+    pub fn daemon(&self) -> &DaemonMeta {
+        &self.metadata.daemon
+    }
+
+    /// The skill's runnable cron blueprint, if it declares one (`metadata.daemon.blueprint` with a
+    /// non-empty `schedule`). `None` for an ordinary (non-automation) skill.
+    pub fn blueprint(&self) -> Option<&SkillBlueprint> {
+        self.metadata
+            .daemon
+            .blueprint
+            .as_ref()
+            .filter(|b| b.is_runnable())
     }
 }
 

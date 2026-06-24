@@ -1,6 +1,6 @@
 use super::*;
 
-const ARXIV: &str = "---\nname: arxiv\ndescription: \"Search arXiv papers by keyword, author, category, or ID.\"\nversion: 1.0.0\nplatforms: [linux, macos, windows]\nmetadata:\n  hermes:\n    tags: [Research, Arxiv, Papers]\n    related_skills: [ocr-and-documents]\n---\n\n# arXiv\n\n## When to Use\nWhen searching academic papers.\n";
+const ARXIV: &str = "---\nname: arxiv\ndescription: \"Search arXiv papers by keyword, author, category, or ID.\"\nversion: 1.0.0\nplatforms: [linux, macos, windows]\nmetadata:\n  daemon:\n    tags: [Research, Arxiv, Papers]\n    related_skills: [ocr-and-documents]\n---\n\n# arXiv\n\n## When to Use\nWhen searching academic papers.\n";
 
 fn store() -> (tempfile::TempDir, SkillStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -15,8 +15,27 @@ fn parses_frontmatter_fields() {
     assert!(fm.description.starts_with("Search arXiv"));
     assert_eq!(fm.version.as_deref(), Some("1.0.0"));
     assert_eq!(fm.platforms, vec!["linux", "macos", "windows"]);
-    assert_eq!(fm.hermes().tags, vec!["Research", "Arxiv", "Papers"]);
-    assert_eq!(fm.hermes().related_skills, vec!["ocr-and-documents"]);
+    assert_eq!(fm.daemon().tags, vec!["Research", "Arxiv", "Papers"]);
+    assert_eq!(fm.daemon().related_skills, vec!["ocr-and-documents"]);
+    assert!(fm.blueprint().is_none(), "plain skill has no blueprint");
+}
+
+#[test]
+fn parses_blueprint_metadata() {
+    const BLUEPRINT: &str = "---\nname: morning-routine\ndescription: \"Daily morning routine.\"\nmetadata:\n  daemon:\n    blueprint:\n      schedule: \"0 9 * * *\"\n      deliver: origin\n      prompt: \"Run the morning routine.\"\n---\n\n# Morning routine\n\nDo the thing.\n";
+    let fm = parse_frontmatter(BLUEPRINT).expect("parse");
+    let bp = fm.blueprint().expect("runnable blueprint");
+    assert_eq!(bp.schedule, "0 9 * * *");
+    assert_eq!(bp.deliver.as_deref(), Some("origin"));
+    assert_eq!(bp.prompt.as_deref(), Some("Run the morning routine."));
+    assert!(!bp.no_agent);
+}
+
+#[test]
+fn blueprint_without_schedule_is_not_runnable() {
+    const NO_SCHED: &str = "---\nname: x\ndescription: \"y\"\nmetadata:\n  daemon:\n    blueprint:\n      prompt: \"hi\"\n---\n\n# X\n\nbody\n";
+    let fm = parse_frontmatter(NO_SCHED).expect("parse");
+    assert!(fm.blueprint().is_none(), "empty schedule is not runnable");
 }
 
 #[test]

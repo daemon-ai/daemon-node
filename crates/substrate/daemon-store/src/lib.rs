@@ -99,6 +99,12 @@ pub struct SessionMeta {
     /// explicit archived scope; `false` on legacy rows.
     #[serde(default)]
     pub archived: bool,
+    /// The cron job that fired this session, when it is a scheduled-job run (I15). The host stamps
+    /// this on the isolated `cron_{id}_{ts}` session the cron worker materializes; the incarnation
+    /// reads it to set `TurnTrigger::Scheduled { job }` before the first turn. `None` for every
+    /// non-cron session (and legacy rows).
+    #[serde(default)]
+    pub scheduled_job: Option<JobId>,
 }
 
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
@@ -177,6 +183,84 @@ pub struct AcpEntry {
     pub name: String,
     /// The opaque host descriptor (CBOR of the wire `AcpAgentEntry`).
     pub entry: Vec<u8>,
+}
+
+/// Bounded retention for cron run history: the most recent N runs kept per job (both backends).
+pub const CRON_RUN_RETENTION: usize = 50;
+
+/// A durable scheduled-job row (I15). The store stays protocol-free: the typed schedule policy
+/// (overlap/catch-up) and the full spec ride as the opaque host-encoded `spec` CBOR blob (the wire
+/// `CronSpec`), while the columns the scheduler indexes on — `id`, `next_fire_unix` (the due-query
+/// key), `paused` (the due filter), and the run bookkeeping — are typed. `schedule` is duplicated
+/// out of the spec as a column purely so a backend could re-derive next-fire without decoding the
+/// blob; the host treats `spec` as authoritative.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredCronJob {
+    /// The opaque job id (primary key for upsert/lookup/delete).
+    pub id: String,
+    /// The human schedule expression (mirrored from the spec for column-level queries).
+    pub schedule: String,
+    /// The opaque host descriptor (CBOR of the wire `CronSpec`).
+    pub spec: Vec<u8>,
+    /// Unix seconds of the next scheduled fire (`None` = not yet computed / one-shot exhausted). The
+    /// `cron_due` query keys on this.
+    pub next_fire_unix: Option<u64>,
+    /// Whether the job is paused (excluded from `cron_due`).
+    pub paused: bool,
+    /// Unix seconds the job last fired, when it has.
+    pub last_run_unix: Option<u64>,
+    /// Whether the last completed run succeeded, when one has completed.
+    pub last_ok: Option<bool>,
+    /// A rendered detail of the last run (error text or summary), when present.
+    pub last_detail: Option<String>,
+    /// How many times the job has fired (for `repeat` accounting / auto-delete).
+    pub fire_count: u32,
+    /// Unix seconds the job was created.
+    pub created_unix: u64,
+}
+
+/// One durable recorded run of a scheduled job (I15). Keyed by `job_id` (the wire `CronRun` omits it
+/// — the store indexes runs under their job). Append-only with bounded retention.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredCronRun {
+    /// The job this run belongs to.
+    pub job_id: String,
+    /// Unix seconds the run started.
+    pub started_unix: u64,
+    /// Unix seconds the run finished, when it has completed.
+    pub finished_unix: Option<u64>,
+    /// Whether the run succeeded.
+    pub ok: bool,
+    /// A rendered outcome detail, when present.
+    pub detail: Option<String>,
+    /// The isolated `cron_{id}_{ts}` session the run fired, when an agent turn was materialized.
+    pub session: Option<SessionId>,
+    /// Whether the run was an explicit `cron_trigger` ("run now") rather than a scheduled fire.
+    pub manual: bool,
+}
+
+/// A durable consent-first cron suggestion (I15): a catalog starter or filled blueprint awaiting an
+/// operator decision. `spec` is the opaque host-encoded CBOR of the wire `CronSpec` that
+/// `cron_create` runs on accept. `dedup_key` is unique — once accepted/dismissed, a suggestion with
+/// the same key is never re-offered. `status` is the host-encoded `SuggestionStatus`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredCronSuggestion {
+    /// The opaque suggestion id (primary key).
+    pub id: String,
+    /// A short title for the proposal.
+    pub title: String,
+    /// A human description of what the job does.
+    pub description: String,
+    /// Where the suggestion came from (e.g. `"catalog"`, `"blueprint"`).
+    pub source: String,
+    /// The opaque host descriptor (CBOR of the wire `CronSpec`) to create on accept.
+    pub spec: Vec<u8>,
+    /// A stable key; once accepted/dismissed, the same key is never re-offered (unique).
+    pub dedup_key: String,
+    /// The host-encoded lifecycle status (`"pending"` / `"accepted"` / `"dismissed"`).
+    pub status: String,
+    /// Unix seconds the suggestion was created.
+    pub created_unix: u64,
 }
 
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).
@@ -712,6 +796,64 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// List every durable scheduled job (I15). The cron scheduler loads these to compute next-fire.
+    /// Default: none (a store without durable cron — jobs are then process-lifetime only).
+    async fn cron_list(&self) -> Vec<StoredCronJob> {
+        Vec::new()
+    }
+
+    /// Read one scheduled job by id (`None` if absent). Default: `None`.
+    async fn cron_get(&self, _id: &str) -> Option<StoredCronJob> {
+        None
+    }
+
+    /// Upsert a scheduled job (keyed by [`StoredCronJob::id`]). Default: no-op.
+    async fn cron_set(&self, _job: StoredCronJob) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a scheduled job by id (idempotent). Default: no-op.
+    async fn cron_remove(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The jobs due at `now_unix`: enabled (`!paused`) jobs whose `next_fire_unix <= now`. The
+    /// scheduler's tick query. Default: none.
+    async fn cron_due(&self, _now_unix: u64) -> Vec<StoredCronJob> {
+        Vec::new()
+    }
+
+    /// List a job's most recent runs (newest first, capped at `max`). Default: none.
+    async fn cron_runs_list(&self, _id: &str, _max: usize) -> Vec<StoredCronRun> {
+        Vec::new()
+    }
+
+    /// Append a run record (bounded retention per job). Default: no-op.
+    async fn cron_run_append(&self, _run: StoredCronRun) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// List the durable cron suggestions (I15). Default: none.
+    async fn cron_suggestions_list(&self) -> Vec<StoredCronSuggestion> {
+        Vec::new()
+    }
+
+    /// Read one suggestion by id (`None` if absent). Default: `None`.
+    async fn cron_suggestion_get(&self, _id: &str) -> Option<StoredCronSuggestion> {
+        None
+    }
+
+    /// Upsert a suggestion (keyed by [`StoredCronSuggestion::id`]; `dedup_key` is unique). Default:
+    /// no-op.
+    async fn cron_suggestion_set(&self, _suggestion: StoredCronSuggestion) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a suggestion by id (idempotent). Default: no-op.
+    async fn cron_suggestion_remove(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List the durable manually-registered ACP agent catalog entries (I7). Default: none.
     async fn acp_list(&self) -> Vec<AcpEntry> {
         Vec::new()
@@ -852,6 +994,13 @@ struct Inner {
     /// Durable manually-registered ACP catalog entries, keyed by name (I7; the in-memory analogue of
     /// the SQLite `acp_catalog` table).
     acp_catalog: HashMap<String, AcpEntry>,
+    /// Durable scheduled jobs, keyed by id (I15; the in-memory analogue of the SQLite `cron_jobs`
+    /// table).
+    cron_jobs: HashMap<String, StoredCronJob>,
+    /// Durable cron run history, keyed by job id, newest last (I15; analogue of `cron_runs`).
+    cron_runs: HashMap<String, Vec<StoredCronRun>>,
+    /// Durable cron suggestions, keyed by id (I15; analogue of `cron_suggestions`).
+    cron_suggestions: HashMap<String, StoredCronSuggestion>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
     journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
@@ -1338,6 +1487,95 @@ impl SessionStore for InMemoryStore {
         Ok(())
     }
 
+    async fn cron_list(&self) -> Vec<StoredCronJob> {
+        self.inner.lock().unwrap().cron_jobs.values().cloned().collect()
+    }
+
+    async fn cron_get(&self, id: &str) -> Option<StoredCronJob> {
+        self.inner.lock().unwrap().cron_jobs.get(id).cloned()
+    }
+
+    async fn cron_set(&self, job: StoredCronJob) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .cron_jobs
+            .insert(job.id.clone(), job);
+        Ok(())
+    }
+
+    async fn cron_remove(&self, id: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.cron_jobs.remove(id);
+        inner.cron_runs.remove(id);
+        Ok(())
+    }
+
+    async fn cron_due(&self, now_unix: u64) -> Vec<StoredCronJob> {
+        let mut due: Vec<StoredCronJob> = self
+            .inner
+            .lock()
+            .unwrap()
+            .cron_jobs
+            .values()
+            .filter(|j| !j.paused && j.next_fire_unix.is_some_and(|t| t <= now_unix))
+            .cloned()
+            .collect();
+        // Earliest-due first, mirroring the SqliteStore `ORDER BY next_fire_unix`.
+        due.sort_by(|a, b| a.next_fire_unix.cmp(&b.next_fire_unix).then(a.id.cmp(&b.id)));
+        due
+    }
+
+    async fn cron_runs_list(&self, id: &str, max: usize) -> Vec<StoredCronRun> {
+        self.inner
+            .lock()
+            .unwrap()
+            .cron_runs
+            .get(id)
+            .map(|runs| runs.iter().rev().take(max).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    async fn cron_run_append(&self, run: StoredCronRun) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let runs = inner.cron_runs.entry(run.job_id.clone()).or_default();
+        runs.push(run);
+        // Bounded retention: keep the most recent CRON_RUN_RETENTION rows per job.
+        let len = runs.len();
+        if len > CRON_RUN_RETENTION {
+            runs.drain(0..len - CRON_RUN_RETENTION);
+        }
+        Ok(())
+    }
+
+    async fn cron_suggestions_list(&self) -> Vec<StoredCronSuggestion> {
+        self.inner
+            .lock()
+            .unwrap()
+            .cron_suggestions
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    async fn cron_suggestion_get(&self, id: &str) -> Option<StoredCronSuggestion> {
+        self.inner.lock().unwrap().cron_suggestions.get(id).cloned()
+    }
+
+    async fn cron_suggestion_set(&self, suggestion: StoredCronSuggestion) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .cron_suggestions
+            .insert(suggestion.id.clone(), suggestion);
+        Ok(())
+    }
+
+    async fn cron_suggestion_remove(&self, id: &str) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().cron_suggestions.remove(id);
+        Ok(())
+    }
+
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {
         self.inner
             .lock()
@@ -1714,6 +1952,7 @@ mod session_meta_tests {
             parent: Some(SessionId::new("p1")),
             pinned: true,
             archived: false,
+            scheduled_job: Some(JobId::from("cron-7")),
         }
     }
 
@@ -1750,5 +1989,92 @@ mod session_meta_tests {
         };
         store.set_session_meta(&id, updated.clone()).await.unwrap();
         assert_eq!(store.session_meta(&id).await.unwrap(), updated);
+    }
+
+    fn sample_job(id: &str, next_fire: Option<u64>) -> StoredCronJob {
+        StoredCronJob {
+            id: id.into(),
+            schedule: "0 9 * * *".into(),
+            spec: vec![0xCB, 0xA1, 0x02],
+            next_fire_unix: next_fire,
+            paused: false,
+            last_run_unix: None,
+            last_ok: None,
+            last_detail: None,
+            fire_count: 0,
+            created_unix: 1_700_000_000,
+        }
+    }
+
+    async fn cron_store_behaviour(store: &dyn SessionStore) {
+        // Upsert + get round-trip.
+        store.cron_set(sample_job("j1", Some(100))).await.unwrap();
+        store.cron_set(sample_job("j2", Some(300))).await.unwrap();
+        // A paused job is never due.
+        let mut paused = sample_job("j3", Some(50));
+        paused.paused = true;
+        store.cron_set(paused).await.unwrap();
+        assert_eq!(store.cron_get("j1").await.unwrap().schedule, "0 9 * * *");
+        assert_eq!(store.cron_list().await.len(), 3);
+
+        // cron_due: only enabled jobs with next_fire <= now.
+        let due: Vec<String> = store.cron_due(200).await.into_iter().map(|j| j.id).collect();
+        assert_eq!(due, vec!["j1".to_string()]); // j2 is future, j3 is paused
+        let due_all: Vec<String> = store.cron_due(1000).await.into_iter().map(|j| j.id).collect();
+        assert_eq!(due_all, vec!["j1".to_string(), "j2".to_string()]);
+
+        // Runs append + bounded retrieval (newest first).
+        for i in 0..3 {
+            store
+                .cron_run_append(StoredCronRun {
+                    job_id: "j1".into(),
+                    started_unix: 100 + i,
+                    finished_unix: Some(101 + i),
+                    ok: i % 2 == 0,
+                    detail: Some(format!("run-{i}")),
+                    session: Some(SessionId::new(format!("cron_j1_{i}"))),
+                    manual: false,
+                })
+                .await
+                .unwrap();
+        }
+        let runs = store.cron_runs_list("j1", 2).await;
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].started_unix, 102); // newest first
+
+        // Remove also clears runs.
+        store.cron_remove("j1").await.unwrap();
+        assert!(store.cron_get("j1").await.is_none());
+        assert!(store.cron_runs_list("j1", 10).await.is_empty());
+
+        // Suggestions round-trip.
+        store
+            .cron_suggestion_set(StoredCronSuggestion {
+                id: "s1".into(),
+                title: "Daily".into(),
+                description: "d".into(),
+                source: "catalog".into(),
+                spec: vec![1, 2, 3],
+                dedup_key: "catalog:daily".into(),
+                status: "pending".into(),
+                created_unix: 1_700_000_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.cron_suggestions_list().await.len(), 1);
+        assert_eq!(store.cron_suggestion_get("s1").await.unwrap().title, "Daily");
+        store.cron_suggestion_remove("s1").await.unwrap();
+        assert!(store.cron_suggestions_list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_cron_round_trips() {
+        cron_store_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_cron_round_trips() {
+        cron_store_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }

@@ -46,9 +46,9 @@ use daemon_core::{
 };
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
-    AgentCommand, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestHandler,
-    HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin, OriginScope,
-    SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId,
+    AgentCommand, AgentEvent, DeliveryTarget, Direction, Disposition, HostRequest,
+    HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin,
+    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId,
 };
 use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -274,6 +274,10 @@ pub struct NodeApiImpl {
     /// `blob_*` ops and `fs_write_from_blob`. `None` => those ops resolve to
     /// [`ApiError::Unsupported`] (a node with no configured blob store).
     blobs: Option<Arc<dyn crate::blob_store::BlobStore>>,
+    /// The cron operations surface (I15) backing the `cron_*` control ops + suggestions. `None` =>
+    /// every cron op resolves to its defaulted [`ApiError::Unsupported`] / empty list (a node built
+    /// without the cron backing). Shared with the agent `cron` tool, so both create through one path.
+    cron: Option<Arc<crate::cron::CronOps>>,
 }
 
 impl NodeApiImpl {
@@ -328,6 +332,7 @@ impl NodeApiImpl {
             fleet_events: None,
             workspace: None,
             blobs: None,
+            cron: None,
         }
     }
 
@@ -344,6 +349,14 @@ impl NodeApiImpl {
     /// those ops resolve to [`ApiError::Unsupported`].
     pub fn with_blobs(mut self, blobs: Arc<dyn crate::blob_store::BlobStore>) -> Self {
         self.blobs = Some(blobs);
+        self
+    }
+
+    /// Bind the cron operations surface (I15) backing the `cron_*` control ops + suggestions. The
+    /// same [`CronOps`](crate::cron::CronOps) is shared with the agent `cron` tool so both create
+    /// jobs through one validation path. Absent, the cron ops keep their defaulted behavior.
+    pub fn with_cron(mut self, cron: Arc<crate::cron::CronOps>) -> Self {
+        self.cron = Some(cron);
         self
     }
 
@@ -1642,6 +1655,79 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("acp remove: {e}")))
     }
 
+    // -- Cron (I15): every op delegates to the shared `CronOps`; absent it, the trait defaults
+    //    (empty list / `Unsupported`) stand. --
+
+    async fn cron_list(&self) -> Vec<daemon_api::CronJob> {
+        match &self.cron {
+            Some(cron) => cron.list().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn cron_create(&self, spec: daemon_api::CronSpec) -> Result<String, ApiError> {
+        match &self.cron {
+            Some(cron) => cron.create(spec).await,
+            None => Err(ApiError::Unsupported("cron_create".into())),
+        }
+    }
+
+    async fn cron_update(&self, id: String, spec: daemon_api::CronSpec) -> Result<(), ApiError> {
+        match &self.cron {
+            Some(cron) => cron.update(id, spec).await,
+            None => Err(ApiError::Unsupported("cron_update".into())),
+        }
+    }
+
+    async fn cron_delete(&self, id: String) -> Result<(), ApiError> {
+        match &self.cron {
+            Some(cron) => cron.delete(id).await,
+            None => Err(ApiError::Unsupported("cron_delete".into())),
+        }
+    }
+
+    async fn cron_trigger(&self, id: String) -> Result<(), ApiError> {
+        match &self.cron {
+            Some(cron) => cron.trigger(id).await,
+            None => Err(ApiError::Unsupported("cron_trigger".into())),
+        }
+    }
+
+    async fn cron_runs(&self, id: String) -> Vec<daemon_api::CronRun> {
+        match &self.cron {
+            Some(cron) => cron.runs(id).await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn cron_pause(&self, id: String, paused: bool) -> Result<(), ApiError> {
+        match &self.cron {
+            Some(cron) => cron.pause(id, paused).await,
+            None => Err(ApiError::Unsupported("cron_pause".into())),
+        }
+    }
+
+    async fn cron_suggestions(&self) -> Vec<daemon_api::CronSuggestion> {
+        match &self.cron {
+            Some(cron) => cron.suggestions().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn cron_accept_suggestion(&self, id: String) -> Result<String, ApiError> {
+        match &self.cron {
+            Some(cron) => cron.accept_suggestion(id).await,
+            None => Err(ApiError::Unsupported("cron_accept_suggestion".into())),
+        }
+    }
+
+    async fn cron_dismiss_suggestion(&self, id: String) -> Result<(), ApiError> {
+        match &self.cron {
+            Some(cron) => cron.dismiss_suggestion(id).await,
+            None => Err(ApiError::Unsupported("cron_dismiss_suggestion".into())),
+        }
+    }
+
     async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
         match &self.fleet {
             Some(fleet) => fleet.unit_events(&id, max).await,
@@ -2134,6 +2220,50 @@ impl DeliveryHost for NodeApiImpl {
 
     fn unregister_delivery_sink(&self, transport: &TransportId) {
         self.live.unregister_delivery_sink(transport);
+    }
+}
+
+impl NodeApiImpl {
+    /// Resolve a cron `deliver` directive to its concrete [`DeliveryTarget`]s, reusing the same
+    /// origin/routing surface a live submit uses: `"origin"` is the job's captured origin's
+    /// `primary_target()` (empty when no origin was captured — store-only fallback); `"all"` is every
+    /// live session's `Primary` target (broadcast to active conversations); anything else is parsed as
+    /// an explicit `"<transport>:<chat>"` direct target (split on the first `:`).
+    fn resolve_delivery(&self, deliver: &str, origin: Option<&Origin>) -> Vec<DeliveryTarget> {
+        match deliver.trim() {
+            "origin" => origin.map(|o| vec![o.primary_target()]).unwrap_or_default(),
+            "all" => self.live.all_primary_targets(),
+            spec => match spec.split_once(':') {
+                Some((transport, route)) if !transport.is_empty() && !route.is_empty() => {
+                    vec![DeliveryTarget::new(transport, route, SinkKind::Primary)]
+                }
+                _ => Vec::new(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl crate::CronDelivery for NodeApiImpl {
+    async fn deliver(&self, deliver: &str, origin: Option<&Origin>, text: &str) {
+        for target in self.resolve_delivery(deliver, origin) {
+            // Attribute the delivered entry to the job's creating origin when known, else to a
+            // host-internal origin on the target transport (a scheduled, principal-less push).
+            let entry_origin = origin
+                .cloned()
+                .unwrap_or_else(|| Origin::internal(target.transport.clone()));
+            // Carry the run's result as a single assistant text delta — the same outbound shape a
+            // live reply takes, so a registered sink projects it to a message unchanged.
+            let entry = SessionLogEntry::new(
+                0,
+                entry_origin,
+                SessionPayload::Event(AgentEvent::TextDelta {
+                    seq: 0,
+                    text: text.to_string(),
+                }),
+            );
+            self.live.push_to_target(target, entry).await;
+        }
     }
 }
 
@@ -3395,6 +3525,33 @@ impl LiveSessions {
         match self.sessions.get(session) {
             Some(s) => s.delivery.lock().unwrap().clone(),
             None => Vec::new(),
+        }
+    }
+
+    /// Every distinct `Primary` delivery target across all live sessions — the resolution of a cron
+    /// job's `deliver = "all"` (broadcast a run result to every active conversation's reply sink).
+    /// Deduplicated by `(transport, route)` so two sessions posting to the same chat deliver once.
+    fn all_primary_targets(&self) -> Vec<DeliveryTarget> {
+        let mut out: Vec<DeliveryTarget> = Vec::new();
+        for s in self.sessions.iter() {
+            for t in s.delivery.lock().unwrap().iter() {
+                if t.kind == SinkKind::Primary
+                    && !out
+                        .iter()
+                        .any(|e| e.transport == t.transport && e.route == t.route)
+                {
+                    out.push(t.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Push a synthesized outbound `entry` to the registered sink owning `target`'s transport
+    /// (post-settle cron delivery). A no-op when no sink is registered (pull-only transport).
+    async fn push_to_target(&self, target: DeliveryTarget, entry: SessionLogEntry) {
+        if let Some(sink) = self.sinks.get(&target.transport).map(|s| s.clone()) {
+            sink.deliver(target, entry).await;
         }
     }
 

@@ -34,6 +34,8 @@ pub mod auth;
 pub mod background;
 pub mod blob_store;
 pub mod config;
+pub mod cron;
+pub mod cron_catalog;
 pub mod credentials;
 pub mod credstore;
 pub mod cut;
@@ -63,6 +65,10 @@ pub use background::{
     BackgroundSpawner,
 };
 pub use config::HostConfig;
+pub use cron::{BlueprintSource, CronOps};
+pub use cron_catalog::{
+    blueprint_suggestion, blueprints, starter_suggestions, BlueprintSlot, CronBlueprint, SlotKind,
+};
 pub use credentials::{
     BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,
 };
@@ -117,6 +123,45 @@ use tokio_util::sync::CancellationToken;
 pub trait JobWorker: Send + Sync {
     /// Process every currently-pending durable job, returning when the outbox is drained.
     async fn process_jobs_once(&self) -> Result<(), ServiceError>;
+}
+
+/// The `CronScheduler`'s per-tick work: fire every due scheduled job once (I15). The default host
+/// has no scheduler (cron is `Unsupported`); the binary injects the node's `CronWorker` through this
+/// seam (`Host::with_cron_scheduler`) so a due job materializes an isolated `cron_{id}_{ts}` session
+/// and enqueues its wake — *without* `daemon-host` depending on `daemon-node`/`daemon-schedule`. The
+/// scheduler only computes next-fire and enqueues; the existing wake-outbox dispatcher runs the turn.
+#[async_trait]
+pub trait CronScheduler: Send + Sync {
+    /// Fire every job due at the current instant, advancing each job's next-fire first (at-most-once)
+    /// and recording a run. Returns when no more jobs are due.
+    async fn tick_once(&self) -> Result<(), ServiceError>;
+}
+
+/// The manual "run now" half of the cron backing (I15): fire a job immediately, out of band of the
+/// schedule. Injected into `NodeApiImpl`/the agent `cron` tool so `cron_trigger` materializes the
+/// same isolated session + run record as a scheduled fire, without advancing the schedule. Kept a
+/// separate seam from [`CronScheduler`] so a node can expose trigger without a resident ticker.
+#[async_trait]
+pub trait CronFiring: Send + Sync {
+    /// Fire job `id` now (manual), materializing an isolated cron session + enqueuing its wake +
+    /// recording a `manual` run. `Err` if the job is unknown or firing failed.
+    async fn fire_now(&self, id: &str) -> Result<(), ServiceError>;
+}
+
+/// The post-settle delivery half of the cron backing (Phase 2): push a finished cron run's captured
+/// result to the transport(s) named by its `CronSpec::deliver`, reusing the **same** in-process
+/// [`DeliverySink`](daemon_api::DeliverySink) registry the live per-session pump already drives — so
+/// there is one outbound path, not a parallel cron one. Injected into the node's `CronWorker` (the
+/// default node has none, so a run is store-only). The implementation owns resolution of the
+/// `deliver` directive — `"origin"` via the job's captured [`Origin`](daemon_protocol::Origin),
+/// `"all"` across every live `Primary`, or an explicit `"<transport>:<chat>"` — and the sink lookup.
+#[async_trait]
+pub trait CronDelivery: Send + Sync {
+    /// Resolve `deliver` against the job's captured `origin` and route `text` (the run's final
+    /// assistant message) to the registered sink(s). Best-effort: an unresolvable directive, a `None`
+    /// origin for `"origin"`, or a transport with no registered sink silently no-ops (the run is
+    /// already durably recorded; delivery is an additive push).
+    async fn deliver(&self, deliver: &str, origin: Option<&daemon_protocol::Origin>, text: &str);
 }
 
 /// The control-surface projection of the running orchestration fleet — the seam the GUI/TUI drives
@@ -177,6 +222,7 @@ pub struct Host {
     config: HostConfig,
     metrics: Metrics,
     job_worker: Option<Arc<dyn JobWorker>>,
+    cron_scheduler: Option<Arc<dyn CronScheduler>>,
 }
 
 impl Host {
@@ -193,6 +239,7 @@ impl Host {
             config,
             metrics: Metrics::new(),
             job_worker: None,
+            cron_scheduler: None,
         }
     }
 
@@ -200,6 +247,13 @@ impl Host {
     /// `FleetRuntime`) instead of the substrate's placeholder echo worker.
     pub fn with_job_worker(mut self, worker: Arc<dyn JobWorker>) -> Self {
         self.job_worker = Some(worker);
+        self
+    }
+
+    /// Drive a 5th resident `CronScheduler` service with an injected [`CronScheduler`] (the node's
+    /// `CronWorker`). Without it the host runs no scheduler and cron remains store-only.
+    pub fn with_cron_scheduler(mut self, scheduler: Arc<dyn CronScheduler>) -> Self {
+        self.cron_scheduler = Some(scheduler);
         self
     }
 
@@ -237,7 +291,7 @@ impl Host {
             Some(worker) => services::job_worker_tick(worker.clone()),
             None => services::job_tick(self.manager.clone()),
         };
-        Supervisor::new(cfg.meltdown)
+        let mut supervisor = Supervisor::new(cfg.meltdown)
             .child(services::interval_child(
                 "WakeOutboxDispatcher",
                 cfg.dispatch_interval,
@@ -269,7 +323,18 @@ impl Host {
                     self.manager.clone(),
                     self.metrics.clone(),
                 ),
-            ))
-            .start(cancel)
+            ));
+        // The 5th supervised service (I15): the cron scheduler, present only when a scheduler is
+        // injected. Coarser cadence (`schedule_interval`); fires due jobs through the wake outbox.
+        if let Some(scheduler) = &self.cron_scheduler {
+            supervisor = supervisor.child(services::interval_child(
+                "CronScheduler",
+                cfg.schedule_interval,
+                RestartPolicy::Permanent,
+                cfg.backoff,
+                services::schedule_tick(scheduler.clone()),
+            ));
+        }
+        supervisor.start(cancel)
     }
 }

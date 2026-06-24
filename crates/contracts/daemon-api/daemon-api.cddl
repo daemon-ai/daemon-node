@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 14)
+wire_version = uint                 ; daemon-common WireVersion (current = 17)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id  = tstr
@@ -494,9 +494,60 @@ provider-info    = { name: tstr, ? base_url: (tstr / null), ? available: bool }
 tool-info        = { name: tstr, ? description: (tstr / null) }
 node-config-view = { format: tstr, body: tstr }
 
-cron-spec = { name: tstr, schedule: tstr, ? target: (tstr / null), ? payload: bstr }
-cron-job  = { id: tstr, spec: cron-spec, ? next_fire_unix: (uint / null) }
-cron-run  = { started_unix: uint, ok: bool, ? detail: (tstr / null) }
+; ----- cron / scheduling (wire v15; I15; ControlApi::cron_*) -----
+overlap-policy   = "Skip" / "Allow" / "Queue"          ; default "Skip"
+catch-up-policy  = "Grace" / "Skip" / "Always"         ; default "Grace"
+run-trigger      = "Scheduled" / "Manual"              ; default "Scheduled"
+suggestion-status = "Pending" / "Accepted" / "Dismissed" ; default "Pending"
+cron-spec = {
+  name: tstr,
+  schedule: tstr,
+  ? target: (tstr / null),
+  ? payload: bstr,
+  ? enabled: bool,                    ; default true (paused job stays but never fires)
+  ? timezone: (tstr / null),          ; IANA tz for cron exprs; null = node default
+  ? repeat: (uint / null),            ; max fires before auto-delete; null = forever
+  ? jitter_secs: (uint / null),       ; random fire delay 0..=jitter_secs
+  ? overlap: overlap-policy,
+  ? catch_up: catch-up-policy,
+  ? script: (tstr / null),            ; node-scripts-relative path
+  ? no_agent: bool,                   ; run script only, no LLM (requires script)
+  ? context_from: [* tstr],           ; job ids whose last output is injected
+  ? deliver: (tstr / null),           ; delivery routing string; null = store-only
+  ? enabled_toolsets: ([* tstr] / null),
+  ? workdir: (tstr / null),
+  ? model: (tstr / null),
+  ? provider: (tstr / null),
+  ? skills: [* tstr],                 ; (wire v16) skills preloaded before an agent run
+  ? origin: (origin / null),          ; (wire v17) creating chat/session, for deliver="origin"
+}
+cron-job  = {
+  id: tstr,
+  spec: cron-spec,
+  ? next_fire_unix: (uint / null),
+  ? paused: bool,
+  ? last_run_unix: (uint / null),
+  ? last_ok: (bool / null),
+  ? last_detail: (tstr / null),
+  ? fire_count: uint,
+}
+cron-run  = {
+  started_unix: uint,
+  ok: bool,
+  ? detail: (tstr / null),
+  ? finished_unix: (uint / null),
+  ? session: (session-id / null),
+  ? trigger: run-trigger,
+}
+cron-suggestion = {
+  id: tstr,
+  title: tstr,
+  ? description: tstr,
+  ? source: tstr,
+  spec: cron-spec,
+  dedup_key: tstr,
+  ? status: suggestion-status,
+}
 
 ; ----- chat->session routing pins (wire v14; I5, §5.9; ControlApi::routing_*) -----
 ; A resolve-first override of the deterministic origin->session derivation: pin an inbound origin to
@@ -664,6 +715,11 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "CronDelete": { id: tstr } }                                            ; -> Ok
             / { "CronTrigger": { id: tstr } }                                           ; -> Ok
             / { "CronRuns": { id: tstr } }                                              ; -> CronRuns
+            ; ----- cron pause/resume + suggestions (wire v15; I15) -----
+            / { "CronPause": { id: tstr, paused: bool } }                               ; -> Ok
+            / "CronSuggestions"                                                         ; -> CronSuggestions
+            / { "CronAcceptSuggestion": { id: tstr } }                                  ; -> CronId
+            / { "CronDismissSuggestion": { id: tstr } }                                 ; -> Ok
             ; ----- chat->session routing pins (wire v14; I5, §5.9) -----
             / "RoutingListChats"                                                        ; -> ChatRoutes
             / { "RoutingGet": { origin: origin } }                                      ; -> ChatRoute
@@ -734,6 +790,7 @@ api-response = "Ok"
              / { "CronJobs": [* cron-job] }
              / { "CronId": tstr }
              / { "CronRuns": [* cron-run] }
+             / { "CronSuggestions": [* cron-suggestion] }   ; wire v15 (I15)
              ; ----- chat->session routing pins (wire v14; I5, §5.9) -----
              / { "ChatRoutes": [* chat-route] }
              / { "ChatRoute": (chat-route / null) }

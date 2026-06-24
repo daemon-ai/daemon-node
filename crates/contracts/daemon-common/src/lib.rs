@@ -401,7 +401,29 @@ impl WireVersion {
     /// both riding the existing `Submit` / event stream (no new op). Seals the durable journal at the
     /// rewound cursor (`JournalPageView::sealed_after`) and marks `daemon-core` sessions
     /// `SessionInfo::rewindable` (foreign ACP sessions report `false`).
-    pub const CURRENT: Self = Self(14);
+    ///
+    /// v15 (cron backing): fills in the I15 CronApi. Enriches the cron DTOs (`CronSpec` gains
+    /// `enabled`/`timezone`/`repeat`/`jitter_secs`/`overlap`/`catch_up`/`script`/`no_agent`/
+    /// `context_from`/`deliver`/`enabled_toolsets`/`workdir`/`model`/`provider`; `CronJob` gains run
+    /// bookkeeping `paused`/`last_run_unix`/`last_ok`/`last_detail`/`fire_count`; `CronRun` gains
+    /// `finished_unix`/`session`/`trigger`), adds the `OverlapPolicy`/`CatchUpPolicy`/`RunTrigger`/
+    /// `SuggestionStatus` enums and the consent-first `CronSuggestion` DTO, and adds the
+    /// `CronPause`/`CronSuggestions`/`CronAcceptSuggestion`/`CronDismissSuggestion` control ops. All
+    /// new fields are additive (`#[serde(default)]`); the backing scheduler fires isolated
+    /// `cron_{id}_{ts}` sessions through the wake outbox and reports `TurnTrigger::Scheduled`.
+    ///
+    /// v16 (cron skills): adds the additive `CronSpec::skills` field (an ordered list of skill names
+    /// the scheduler preloads — `skill_view` body injected ahead of the seed prompt — before a cron
+    /// run, mirroring Hermes' `cronjob` `skills` param). This completes the agent `cron` tool's
+    /// coverage of the cron surface and backs the `metadata.daemon.blueprint` skill→suggestion bridge.
+    /// Additive (`#[serde(default)]`).
+    ///
+    /// v17 (cron origin): adds the additive `CronSpec::origin` field — the originating
+    /// [`Origin`](daemon_protocol::Origin) (the chat/session that created the job) captured at create
+    /// time, so a run's `deliver = "origin"` can route its result back to the creator through the same
+    /// routing surface a live submit uses. Stamped by the agent `cron` tool from its calling session;
+    /// `None` for CLI/node-internal creations. Additive (`#[serde(default)]`).
+    pub const CURRENT: Self = Self(17);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

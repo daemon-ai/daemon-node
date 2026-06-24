@@ -647,6 +647,30 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// Pause or resume a scheduled job (I15): a paused job stays in the store but never fires;
+    /// resuming recomputes its next fire from now. Default: unsupported.
+    async fn cron_pause(&self, _id: String, _paused: bool) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("cron_pause".into()))
+    }
+
+    /// List pending cron-job suggestions (I15): consent-first proposals from the catalog/blueprints.
+    /// Default: empty.
+    async fn cron_suggestions(&self) -> Vec<CronSuggestion> {
+        Vec::new()
+    }
+
+    /// Accept a suggestion (I15): create the backing job and mark the suggestion accepted; returns
+    /// the new job id. Default: unsupported.
+    async fn cron_accept_suggestion(&self, _id: String) -> Result<String, ApiError> {
+        Err(ApiError::Unsupported("cron_accept_suggestion".into()))
+    }
+
+    /// Dismiss a suggestion (I15): latch it by `dedup_key` so it is never re-offered. Default:
+    /// unsupported.
+    async fn cron_dismiss_suggestion(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("cron_dismiss_suggestion".into()))
+    }
+
     // -- Filesystem / workspace surface (daemon-fs-surface-spec.md). Grouped (defaulted) here, not a
     //    new sub-trait, so every NodeApi implementor inherits the surface; a node with a workspace
     //    binds the real impl (backed by daemon-host's WorkspaceFs). --
@@ -1687,22 +1711,152 @@ pub struct NodeConfigView {
     pub body: String,
 }
 
-/// A scheduled-job spec (I15 stub DTO): when to fire and what to do.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How the scheduler treats a due job whose previous run is still in flight (I15). The default
+/// [`OverlapPolicy::Skip`] also closes the manual-trigger-vs-tick double-fire race: a job already
+/// running is not fired again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OverlapPolicy {
+    /// Skip this fire if the job's previous run has not finished (default).
+    #[default]
+    Skip,
+    /// Fire regardless — allow concurrent runs of the same job.
+    Allow,
+    /// Defer the fire until the in-flight run finishes, then run once.
+    Queue,
+}
+
+/// How the scheduler treats a job that is overdue when a tick observes it (I15) — e.g. after the
+/// node was down across the fire time. Within a grace window a missed fire still runs once; beyond
+/// it the schedule fast-forwards to the next future occurrence (no thundering herd).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CatchUpPolicy {
+    /// Fire once if overdue within the grace window; otherwise fast-forward (default).
+    #[default]
+    Grace,
+    /// Never fire a missed occurrence; always fast-forward to the next future fire.
+    Skip,
+    /// Always fire once for the most recent missed occurrence, regardless of how late.
+    Always,
+}
+
+/// What initiated a recorded cron run (I15): the scheduler's own clock, or an explicit operator/GUI
+/// "run now".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunTrigger {
+    /// Fired by the scheduler at its scheduled time (default).
+    #[default]
+    Scheduled,
+    /// Fired explicitly via `cron_trigger` (operator/GUI "run now").
+    Manual,
+}
+
+/// A scheduled-job spec (I15): when to fire and what to do. Beyond the schedule + payload the spec
+/// carries lifecycle (`enabled`/`repeat`), correctness policy (`overlap`/`catch_up`), spread
+/// (`jitter_secs`), locale (`timezone`), a script-only (`no_agent`) path, output-chaining
+/// (`context_from`), delivery routing (`deliver`), and per-job run shaping (`enabled_toolsets`,
+/// `workdir`, `model`/`provider`). All fields past `payload` are additive and default-friendly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronSpec {
     /// A human name for the job.
     pub name: String,
-    /// The schedule expression (cron syntax / ISO interval — runtime-defined).
+    /// The schedule expression (cron syntax via `croner`, `@every <dur>`/ISO interval, or a single
+    /// ISO timestamp for a one-shot — parsed by `daemon-schedule`).
     pub schedule: String,
     /// The session/profile the job drives, when it targets one.
     #[serde(default)]
     pub target: Option<String>,
-    /// The opaque payload/command the job submits when it fires.
+    /// The opaque payload/command the job submits when it fires (the agent prompt, unless
+    /// `no_agent`).
     #[serde(default)]
     pub payload: Vec<u8>,
+    /// Whether the scheduler considers this job. A paused job stays in the store but never fires.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// IANA timezone for cron-expression evaluation (e.g. `"Europe/Berlin"`); `None` uses the node
+    /// default. Interval/one-shot schedules are timezone-agnostic.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// Maximum number of fires before the job auto-deletes; `None` = forever.
+    #[serde(default)]
+    pub repeat: Option<u32>,
+    /// Random delay (0..=jitter_secs) applied to each fire, to spread herds of identically-scheduled
+    /// jobs; `None`/`0` = fire exactly on time.
+    #[serde(default)]
+    pub jitter_secs: Option<u32>,
+    /// Behavior when a due fire overlaps the job's previous still-running run.
+    #[serde(default)]
+    pub overlap: OverlapPolicy,
+    /// Behavior when the job is observed overdue (missed-fire catch-up).
+    #[serde(default)]
+    pub catch_up: CatchUpPolicy,
+    /// A node-scripts-relative path to run instead of (or before) an agent turn.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Run `script` only — no LLM turn. Requires `script`.
+    #[serde(default)]
+    pub no_agent: bool,
+    /// Job ids whose most recent run output is injected into this job's seed prompt (output
+    /// chaining).
+    #[serde(default)]
+    pub context_from: Vec<String>,
+    /// Delivery routing for the run result (e.g. `"origin"`, `"all"`, `"<transport>:<chat>"`);
+    /// `None` = store-only (no transport delivery).
+    #[serde(default)]
+    pub deliver: Option<String>,
+    /// Restrict the cron run's toolset to these tool names; `None` = the cron-run default policy.
+    #[serde(default)]
+    pub enabled_toolsets: Option<Vec<String>>,
+    /// Absolute working directory the run is bound to (context + exec root); `None` = node default.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Per-job model override; `None` = the bound profile's model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-job provider override; `None` = the bound profile's provider.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Ordered skill names the scheduler preloads (their `skill_view` body injected ahead of the
+    /// seed prompt) before an agent run, so a cron job carries the same skill context a chat would
+    /// (v16; mirrors Hermes' `cronjob` `skills`). Empty = none. Ignored for `no_agent` jobs.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// The originating context captured at create time — the chat/session that asked for the job — so
+    /// `deliver = "origin"` can route a run's result back to its creator (resolved through the same
+    /// routing surface a live submit uses). `None` for jobs created without a routable origin (e.g.
+    /// the CLI, or a node-internal creation). (wire v17)
+    #[serde(default)]
+    pub origin: Option<Origin>,
 }
 
-/// A scheduled job (I15 stub DTO): a [`CronSpec`] plus its id and next-fire time.
+impl Default for CronSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            schedule: String::new(),
+            target: None,
+            payload: Vec::new(),
+            enabled: true,
+            timezone: None,
+            repeat: None,
+            jitter_secs: None,
+            overlap: OverlapPolicy::default(),
+            catch_up: CatchUpPolicy::default(),
+            script: None,
+            no_agent: false,
+            context_from: Vec::new(),
+            deliver: None,
+            enabled_toolsets: None,
+            workdir: None,
+            model: None,
+            provider: None,
+            skills: Vec::new(),
+            origin: None,
+        }
+    }
+}
+
+/// A scheduled job (I15): a [`CronSpec`] plus its id, next-fire time, and run bookkeeping so a GUI
+/// list can show status without a `cron_runs` round-trip.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronJob {
     /// The opaque job id.
@@ -1712,9 +1866,24 @@ pub struct CronJob {
     /// Unix seconds of the next scheduled fire, when computed.
     #[serde(default)]
     pub next_fire_unix: Option<u64>,
+    /// Whether the job is currently paused (mirror of `!spec.enabled`, surfaced for convenience).
+    #[serde(default)]
+    pub paused: bool,
+    /// Unix seconds the job last fired, when it has.
+    #[serde(default)]
+    pub last_run_unix: Option<u64>,
+    /// Whether the last completed run succeeded, when one has completed.
+    #[serde(default)]
+    pub last_ok: Option<bool>,
+    /// A rendered detail of the last run (error text or summary), when present.
+    #[serde(default)]
+    pub last_detail: Option<String>,
+    /// How many times the job has fired (for `repeat` accounting).
+    #[serde(default)]
+    pub fire_count: u32,
 }
 
-/// One recorded run of a scheduled job (I15 stub DTO).
+/// One recorded run of a scheduled job (I15).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronRun {
     /// Unix seconds the run started.
@@ -1724,6 +1893,52 @@ pub struct CronRun {
     /// A rendered outcome detail, when present.
     #[serde(default)]
     pub detail: Option<String>,
+    /// Unix seconds the run finished, when it has completed.
+    #[serde(default)]
+    pub finished_unix: Option<u64>,
+    /// The isolated `cron_{id}_{ts}` session the run fired, when an agent turn was materialized.
+    #[serde(default)]
+    pub session: Option<SessionId>,
+    /// What initiated this run.
+    #[serde(default)]
+    pub trigger: RunTrigger,
+}
+
+/// The lifecycle of a [`CronSuggestion`] (I15): a consent-first proposal the operator accepts (which
+/// creates the job) or dismisses (latched by `dedup_key` so it is never re-offered).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SuggestionStatus {
+    /// Offered, awaiting an operator decision (default).
+    #[default]
+    Pending,
+    /// Accepted — the backing job was created.
+    Accepted,
+    /// Dismissed — latched so it is not re-offered.
+    Dismissed,
+}
+
+/// A ready-to-create cron job the node surfaces for operator consent (I15): catalog starters and
+/// filled blueprints compile to one of these. Accepting it calls `cron_create(spec)`; there is no
+/// second job engine.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronSuggestion {
+    /// The opaque suggestion id.
+    pub id: String,
+    /// A short title for the proposal.
+    pub title: String,
+    /// A human description of what the job does.
+    #[serde(default)]
+    pub description: String,
+    /// Where the suggestion came from (e.g. `"catalog"`, `"blueprint"`).
+    #[serde(default)]
+    pub source: String,
+    /// The exact spec `cron_create` runs when the suggestion is accepted.
+    pub spec: CronSpec,
+    /// A stable key; once dismissed/accepted, a suggestion with the same key is never re-offered.
+    pub dedup_key: String,
+    /// The proposal's lifecycle.
+    #[serde(default)]
+    pub status: SuggestionStatus,
 }
 
 /// A chat→session routing pin (I5; daemon-event-io-spec §5.9): an explicit binding of an inbound
@@ -2408,6 +2623,25 @@ pub enum ApiRequest {
         /// The job id.
         id: String,
     },
+    /// [`ControlApi::cron_pause`].
+    CronPause {
+        /// The job id.
+        id: String,
+        /// `true` to pause, `false` to resume.
+        paused: bool,
+    },
+    /// [`ControlApi::cron_suggestions`].
+    CronSuggestions,
+    /// [`ControlApi::cron_accept_suggestion`].
+    CronAcceptSuggestion {
+        /// The suggestion id.
+        id: String,
+    },
+    /// [`ControlApi::cron_dismiss_suggestion`].
+    CronDismissSuggestion {
+        /// The suggestion id.
+        id: String,
+    },
     /// [`ControlApi::routing_list_chats`] — all chat→session routing pins.
     RoutingListChats,
     /// [`ControlApi::routing_get`] — the pin for an origin.
@@ -2647,6 +2881,8 @@ pub enum ApiResponse {
     CronId(String),
     /// Recent runs of a scheduled job (cron_runs).
     CronRuns(Vec<CronRun>),
+    /// Pending cron-job suggestions (cron_suggestions).
+    CronSuggestions(Vec<CronSuggestion>),
     /// The chat→session routing pins (routing_list_chats).
     ChatRoutes(Vec<ChatRoute>),
     /// One origin's routing pin, if set (routing_get).
@@ -3194,6 +3430,15 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::CronDelete { id } => unit_or_err(api.cron_delete(id).await),
         ApiRequest::CronTrigger { id } => unit_or_err(api.cron_trigger(id).await),
         ApiRequest::CronRuns { id } => ApiResponse::CronRuns(api.cron_runs(id).await),
+        ApiRequest::CronPause { id, paused } => unit_or_err(api.cron_pause(id, paused).await),
+        ApiRequest::CronSuggestions => ApiResponse::CronSuggestions(api.cron_suggestions().await),
+        ApiRequest::CronAcceptSuggestion { id } => match api.cron_accept_suggestion(id).await {
+            Ok(id) => ApiResponse::CronId(id),
+            Err(e) => ApiResponse::Error(e),
+        },
+        ApiRequest::CronDismissSuggestion { id } => {
+            unit_or_err(api.cron_dismiss_suggestion(id).await)
+        }
         ApiRequest::RoutingListChats => ApiResponse::ChatRoutes(api.routing_list_chats().await),
         ApiRequest::RoutingGet { origin } => ApiResponse::ChatRoute(api.routing_get(origin).await),
         ApiRequest::RoutingSet { route } => unit_or_err(api.routing_set(route).await),
@@ -3406,6 +3651,100 @@ mod tests {
         let bytes = to_cbor(&resp);
         let back: ApiResponse = from_cbor(&bytes).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn cron_requests_and_responses_round_trip() {
+        // A fully-populated spec exercises every additive v15/v16/v17 field through CBOR.
+        let spec = CronSpec {
+            name: "nightly-digest".into(),
+            schedule: "0 9 * * *".into(),
+            target: Some("opus".into()),
+            payload: b"summarize today".to_vec(),
+            enabled: true,
+            timezone: Some("Europe/Berlin".into()),
+            repeat: Some(7),
+            jitter_secs: Some(30),
+            overlap: OverlapPolicy::Queue,
+            catch_up: CatchUpPolicy::Always,
+            script: Some("scripts/collect.sh".into()),
+            no_agent: false,
+            context_from: vec!["job-a".into(), "job-b".into()],
+            deliver: Some("origin".into()),
+            enabled_toolsets: Some(vec!["fs".into()]),
+            workdir: Some("/srv/proj".into()),
+            model: Some("gpt-5".into()),
+            provider: Some("genai".into()),
+            skills: vec!["briefing".into(), "calendar".into()],
+            origin: Some(Origin::new(
+                "slack",
+                daemon_protocol::OriginScope::Group {
+                    chat: "C123".into(),
+                    thread: None,
+                },
+            )),
+        };
+        let reqs = vec![
+            ApiRequest::CronList,
+            ApiRequest::CronCreate { spec: spec.clone() },
+            ApiRequest::CronUpdate {
+                id: "j1".into(),
+                spec: spec.clone(),
+            },
+            ApiRequest::CronPause {
+                id: "j1".into(),
+                paused: true,
+            },
+            ApiRequest::CronTrigger { id: "j1".into() },
+            ApiRequest::CronRuns { id: "j1".into() },
+            ApiRequest::CronSuggestions,
+            ApiRequest::CronAcceptSuggestion { id: "s1".into() },
+            ApiRequest::CronDismissSuggestion { id: "s1".into() },
+        ];
+        for req in reqs {
+            let bytes = to_cbor(&req);
+            let back: ApiRequest = from_cbor(&bytes).unwrap();
+            assert_eq!(req, back);
+        }
+
+        let job = CronJob {
+            id: "j1".into(),
+            spec: spec.clone(),
+            next_fire_unix: Some(1_900_000_000),
+            paused: false,
+            last_run_unix: Some(1_800_000_000),
+            last_ok: Some(true),
+            last_detail: Some("ok".into()),
+            fire_count: 3,
+        };
+        let run = CronRun {
+            started_unix: 1_800_000_000,
+            ok: false,
+            detail: Some("boom".into()),
+            finished_unix: Some(1_800_000_050),
+            session: Some(SessionId::new("cron_j1_20260624")),
+            trigger: RunTrigger::Manual,
+        };
+        let suggestion = CronSuggestion {
+            id: "s1".into(),
+            title: "Daily briefing".into(),
+            description: "A morning digest".into(),
+            source: "catalog".into(),
+            spec,
+            dedup_key: "catalog:daily-briefing".into(),
+            status: SuggestionStatus::Pending,
+        };
+        let resps = vec![
+            ApiResponse::CronJobs(vec![job]),
+            ApiResponse::CronId("j1".into()),
+            ApiResponse::CronRuns(vec![run]),
+            ApiResponse::CronSuggestions(vec![suggestion]),
+        ];
+        for resp in resps {
+            let bytes = to_cbor(&resp);
+            let back: ApiResponse = from_cbor(&bytes).unwrap();
+            assert_eq!(resp, back);
+        }
     }
 
     #[test]
