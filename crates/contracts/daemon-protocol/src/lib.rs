@@ -256,6 +256,10 @@ pub enum EndReason {
     Interrupted,
     /// The turn ran out of its assigned budget.
     BudgetExhausted,
+    /// The turn was stopped early because the model stopped making progress — it kept re-issuing the
+    /// same tool calls and getting the same results without converging (the §4.2 no-progress guard,
+    /// distinct from exhausting the full iteration budget).
+    NoProgress,
     /// The turn failed.
     Failed,
 }

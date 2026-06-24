@@ -27,6 +27,13 @@ use daemon_core::{
     ToolCall,
 };
 
+/// The conservative output-token cap applied when a model declares no published maximum (E5). Both
+/// provider families source their per-generation output cap from model metadata when known and fall
+/// back to this only for unknown models — so a large-output model is never silently clamped, while an
+/// unknown one still gets a sane bound. Cloud overrides come from [`genai_provider::known_max_output`];
+/// local overrides come from the configured worker cap (else this, bounded by the context window).
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
 /// A tool call as decoded off the wire, before §9 repair.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RawToolCall {

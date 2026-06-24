@@ -290,6 +290,9 @@ fn map_end_reason(end_reason: P17EndReason) -> daemon_supervision::EndReason {
         P17EndReason::Completed => EndReason::Completed,
         P17EndReason::Interrupted => EndReason::Interrupted,
         P17EndReason::BudgetExhausted => EndReason::BudgetExhausted,
+        // No supervision-level NoProgress reason; it is a benign early stop, mapped to the closest
+        // "stopped before completing" reason rather than a failure.
+        P17EndReason::NoProgress => EndReason::BudgetExhausted,
         P17EndReason::Failed => EndReason::Failed(FailureClass::Internal),
         // Suspended is filtered before this point.
         P17EndReason::Suspended => EndReason::Interrupted,

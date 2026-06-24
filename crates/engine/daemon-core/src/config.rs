@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 /// parent default (90). It is the hard stop that terminates a turn's model<->tool loop.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 90;
 
+/// The default no-progress guard: how many **consecutive identical** tool rounds (same calls + same
+/// results) end the turn early (§4.2 loop guardrail). Complements [`DEFAULT_MAX_ITERATIONS`] — the
+/// iteration cap bounds *total* rounds, this bounds a *stuck* model that keeps re-issuing the exact
+/// same call and getting the exact same result without converging. `3` lets a model retry twice
+/// before the engine concludes it is looping and ends `EndReason::NoProgress`.
+pub const DEFAULT_MAX_REPEATED_ROUNDS: u32 = 3;
+
 /// The default per-tool result-byte budget: a tool result longer than this is truncated by the ?12
 /// pipeline so one tool cannot dominate the model context.
 pub const DEFAULT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
@@ -51,13 +58,21 @@ pub struct Config {
     /// How many times `call_model` retries on a *rotatable* provider failure (quota/auth) before
     /// giving up. `1` reproduces the prior hardcoded single-retry behaviour.
     pub model_retry_attempts: u8,
-    /// A soft context-token budget hint for `build_context` (not yet enforced; reserved for the
-    /// compaction slice).
+    /// The effective context-token budget. When set it is the target `prepare_turn_context` compacts
+    /// the conversation to before a turn (the §10 pre-turn pressure check), and the C6 hard last-resort
+    /// cap drops oldest turns to it if the context engine's own compaction leaves the conversation over
+    /// budget. `None` => the engine's own threshold governs (a stateful engine like LCM sizes one from
+    /// the model window in `on_model`); the budgeted default then never reports over budget.
     pub context_budget_tokens: Option<u32>,
     /// The per-turn ReAct iteration cap (?20 iteration budget): the maximum number of model rounds in
     /// one turn's model->tools->model loop. On exhaustion the engine makes one final toolless summary
     /// call and ends the turn `BudgetExhausted`.
     pub max_iterations: u32,
+    /// The no-progress guard: how many **consecutive identical** tool rounds (same `(name,args)`
+    /// calls producing the same results) end the turn early with `EndReason::NoProgress` — a stuck
+    /// model that keeps repeating itself without converging, caught well before the `max_iterations`
+    /// hard stop. `0` disables the guard.
+    pub max_repeated_rounds: u32,
     /// The per-tool result-byte budget (?12 sanitize+budget); `0` disables truncation.
     pub tool_result_budget: usize,
     /// The tool-search activation threshold (bytes of deferrable tool schema). When the summed
@@ -99,6 +114,7 @@ impl Default for Config {
             model_retry_attempts: 1,
             context_budget_tokens: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_repeated_rounds: DEFAULT_MAX_REPEATED_ROUNDS,
             tool_result_budget: DEFAULT_TOOL_RESULT_BUDGET,
             tool_search_threshold_bytes: DEFAULT_TOOL_SEARCH_THRESHOLD_BYTES,
             model_max_retries: DEFAULT_MODEL_MAX_RETRIES,

@@ -425,7 +425,7 @@ async fn drive_generation(
             })
             .collect(),
         sampling: cfg.sampling,
-        max_tokens: cfg.max_tokens,
+        max_tokens: effective_max_output(cfg),
         constraint: req.constraint.as_ref().map(|c| protocol::Constraint {
             lark: c.lark.clone(),
             gbnf: c.gbnf.clone(),
@@ -524,6 +524,24 @@ async fn drive_generation(
         usage,
         &req.tool_names(),
     ))
+}
+
+/// The per-generation output-token cap to send the worker (E5). The configured cap wins; when unset
+/// (`0`) we apply the shared [`DEFAULT_MAX_OUTPUT_TOKENS`](crate::DEFAULT_MAX_OUTPUT_TOKENS) rather
+/// than leaving it to the backend's own low fallback (llama.cpp clamps an unset cap to 1024;
+/// mistral.rs uses an internal default), so a local generation is not silently truncated. The result
+/// is bounded by the configured context window when known; the backend further clamps it to the
+/// remaining window (`n_ctx - prompt_len`).
+fn effective_max_output(cfg: &WorkerConfig) -> u32 {
+    if cfg.max_tokens > 0 {
+        return cfg.max_tokens;
+    }
+    let n_ctx = cfg.params.n_ctx;
+    if n_ctx > 0 {
+        crate::DEFAULT_MAX_OUTPUT_TOKENS.min(n_ctx)
+    } else {
+        crate::DEFAULT_MAX_OUTPUT_TOKENS
+    }
 }
 
 /// Map one engine [`RequestMsg`] onto the worker protocol's [`protocol::Msg`].
@@ -719,5 +737,39 @@ fn default_capabilities(cfg: &WorkerConfig) -> Capabilities {
             tool_call_format: ToolCallFormat::Native,
             max_context,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> WorkerConfig {
+        WorkerConfig::new("daemon-infer", Engine::Llama, "model.gguf")
+    }
+
+    #[test]
+    fn configured_cap_wins() {
+        let mut c = cfg();
+        c.max_tokens = 2048;
+        c.params.n_ctx = 8192;
+        assert_eq!(effective_max_output(&c), 2048);
+    }
+
+    #[test]
+    fn unset_cap_uses_shared_default_not_the_backend_floor() {
+        let mut c = cfg();
+        c.max_tokens = 0;
+        c.params.n_ctx = 0;
+        // Not the llama.cpp 1024 floor / mistral.rs internal default.
+        assert_eq!(effective_max_output(&c), crate::DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn unset_cap_is_bounded_by_a_small_context_window() {
+        let mut c = cfg();
+        c.max_tokens = 0;
+        c.params.n_ctx = 2000;
+        assert_eq!(effective_max_output(&c), 2000);
     }
 }

@@ -42,19 +42,20 @@ pub struct GenAiProvider {
     pricing: Option<Pricing>,
 }
 
-/// The default output cap sent to providers that require one (e.g. Anthropic Messages).
-const DEFAULT_MAX_TOKENS: u32 = 4096; // TODO FIX THIS
-
 impl GenAiProvider {
     /// A provider for `model`, with the genai adapter inferred from the (optionally namespaced)
-    /// model name — the primary construction path. Uses genai's default endpoint and output cap.
+    /// model name — the primary construction path. Uses genai's default endpoint and the model's
+    /// published output-token cap ([`known_max_output`]) so a large-output model (e.g. Claude 4,
+    /// `o3`) is not silently clamped; unknown models fall back to [`DEFAULT_MAX_OUTPUT_TOKENS`].
     pub fn for_model(model: impl Into<String>) -> Self {
+        let model = model.into();
+        let max_tokens = known_max_output(&model).unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS);
         Self {
             client: Client::default(),
             adapter: None,
-            model: model.into(),
+            model,
             endpoint: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens,
             pricing: None,
         }
     }
@@ -368,6 +369,40 @@ fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
     }
 }
 
+/// The published **output**-token cap for a well-known cloud chat model (the max a single generation
+/// may emit — distinct from the context window in [`known_context_window`]), matched by id prefix so
+/// dated / `-latest` aliases resolve. Prefixes are ordered most-specific first because the first
+/// match wins. `None` for unknown models, in which case the caller applies
+/// [`DEFAULT_MAX_OUTPUT_TOKENS`](crate::DEFAULT_MAX_OUTPUT_TOKENS). Kept local to the provider so this
+/// crate stays free of the `daemon-api` catalog type (mirrors [`known_context_window`]).
+pub(crate) fn known_max_output(model: &str) -> Option<u32> {
+    const TABLE: &[(&str, u32)] = &[
+        // Anthropic Claude: 4.x families publish large output windows; 3.5 doubles 3.x.
+        ("claude-opus-4", 32_000),
+        ("claude-sonnet-4", 64_000),
+        ("claude-3-5-sonnet", 8_192),
+        ("claude-3-5-haiku", 8_192),
+        ("claude-3-opus", 4_096),
+        ("claude-3-haiku", 4_096),
+        ("claude-3-sonnet", 4_096),
+        // OpenAI: reasoning models (o*) allow very large completions; 4o/4.1 are mid-range.
+        ("gpt-4o-mini", 16_384),
+        ("gpt-4o", 16_384),
+        ("gpt-4.1", 32_768),
+        ("o4-mini", 100_000),
+        ("o3", 100_000),
+        ("o1", 100_000),
+        // Google Gemini.
+        ("gemini-2.5", 65_536),
+        ("gemini-2.0", 8_192),
+        ("gemini-1.5", 8_192),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|&(_, cap)| cap)
+}
+
 /// The published context window for a well-known cloud chat model, matched by id prefix so dated /
 /// `-latest` aliases resolve. `None` for unknown models (the engine then has no denominator). Kept
 /// local to the provider so this crate stays free of the `daemon-api` catalog type.
@@ -570,5 +605,47 @@ impl Provider for GenAiProvider {
         });
 
         Box::pin(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_max_output_resolves_by_prefix_most_specific_first() {
+        // Dated / -latest aliases resolve via the prefix.
+        assert_eq!(known_max_output("claude-sonnet-4-20250514"), Some(64_000));
+        assert_eq!(known_max_output("claude-opus-4-8"), Some(32_000));
+        assert_eq!(known_max_output("claude-3-5-sonnet-latest"), Some(8_192));
+        assert_eq!(known_max_output("claude-3-opus-20240229"), Some(4_096));
+        // gpt-4o-mini must win over the gpt-4o prefix (more specific first).
+        assert_eq!(known_max_output("gpt-4o-mini"), Some(16_384));
+        assert_eq!(known_max_output("gpt-4o-2024-08-06"), Some(16_384));
+        assert_eq!(known_max_output("o3-mini"), Some(100_000));
+        assert_eq!(known_max_output("gemini-2.5-pro"), Some(65_536));
+    }
+
+    #[test]
+    fn unknown_model_has_no_published_cap() {
+        assert_eq!(known_max_output("some-future-model"), None);
+    }
+
+    #[test]
+    fn for_model_sources_the_models_output_cap_not_the_flat_fallback() {
+        // A large-output model gets its real cap, not the conservative fallback.
+        assert_eq!(GenAiProvider::for_model("claude-sonnet-4").max_tokens, 64_000);
+        assert_eq!(GenAiProvider::for_model("o3").max_tokens, 100_000);
+        // An unknown model falls back to the shared conservative default.
+        assert_eq!(
+            GenAiProvider::for_model("some-future-model").max_tokens,
+            crate::DEFAULT_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    #[test]
+    fn with_max_tokens_overrides_the_sourced_cap() {
+        let p = GenAiProvider::for_model("claude-sonnet-4").with_max_tokens(123);
+        assert_eq!(p.max_tokens, 123);
     }
 }

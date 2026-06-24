@@ -801,6 +801,27 @@ impl Engine {
             let before = self.snapshot.conversation.turns.len();
             let conv = std::mem::take(&mut self.snapshot.conversation);
             self.snapshot.conversation = self.context.compact(conv, target).await;
+            // C6 hard last-resort cap: the context engine may return a conversation still over the
+            // effective budget (compaction freed nothing, or a stateful engine kept too much). As a
+            // backstop, deterministically drop the oldest turns until the estimate is within `target`
+            // (or a single turn remains), so a turn never proceeds wildly over budget and blows the
+            // model window. The provider-boundary §9 sequence repair fixes any tool-call/result
+            // pairing broken by the drop, so this is safe even mid-conversation.
+            let mut used_now = crate::context::estimate_tokens(&self.snapshot.conversation);
+            while used_now > target && self.snapshot.conversation.turns.len() > 1 {
+                self.snapshot.conversation.turns.remove(0);
+                used_now = crate::context::estimate_tokens(&self.snapshot.conversation);
+            }
+            if used_now > target {
+                // A single turn still exceeds the budget — cannot reduce further by dropping turns.
+                // Proceed (the §8 provider-overflow recovery is the last backstop) but make the
+                // unrecoverable-by-truncation case visible.
+                tracing::warn!(
+                    used = used_now,
+                    target,
+                    "context still over budget after compaction + hard truncation (single oversized turn)"
+                );
+            }
             dropped_turns = before.saturating_sub(self.snapshot.conversation.turns.len()) as u32;
             compacted = dropped_turns > 0;
             self.notify_session_switch(SwitchReason::Compaction).await;
@@ -976,6 +997,11 @@ impl Engine {
         let mut tool_rounds: u32 = 0;
         let mut used_skill_tool = false;
         let mut used_memory_tool = false;
+        // §4.2 no-progress guard: the signature of the previous tool round and how many consecutive
+        // identical rounds we have seen. A model that keeps re-issuing the same calls and getting the
+        // same results is looping; we end the turn before it burns the whole iteration budget.
+        let mut last_round_sig: Option<u64> = None;
+        let mut repeated_rounds: u32 = 0;
 
         let cancel = control.cancel_token();
         loop {
@@ -1120,6 +1146,10 @@ impl Engine {
                 }
             }
 
+            // §4.2 no-progress signature of this round (the tool calls + their results), computed
+            // before `calls` is moved into the recorded turn. Repeated identical rounds => looping.
+            let round_sig = round_signature(&calls);
+
             // The single-owner applier: record the assembled tool turn, then apply any extra effects.
             self.snapshot.conversation.turns.push(Turn::Tool(ToolTurn {
                 assistant: AssistantMsg {
@@ -1181,6 +1211,29 @@ impl Engine {
                 self.snapshot.waiting_for.push(job_id.clone());
                 return Ok(self.suspend(job_id, payload, events, true));
             }
+
+            // §4.2 no-progress guard: a tool round whose calls + results are byte-identical to the
+            // immediately preceding round is the model looping. Count consecutive repeats and, once
+            // they reach `max_repeated_rounds`, end the turn cleanly (`NoProgress`) instead of
+            // burning the rest of the iteration budget re-running the same work.
+            if last_round_sig == Some(round_sig) {
+                repeated_rounds += 1;
+            } else {
+                repeated_rounds = 0;
+            }
+            last_round_sig = Some(round_sig);
+            if self.config.max_repeated_rounds > 0
+                && repeated_rounds + 1 >= self.config.max_repeated_rounds
+            {
+                self.after_turn_memory().await;
+                self.context.after_response(&out.usage);
+                tracing::debug!(
+                    repeated_rounds = repeated_rounds + 1,
+                    "no-progress guard: identical tool round repeated; ending turn"
+                );
+                return Ok(self.finish_no_progress(events, &cancel, turn_usage).await);
+            }
+
             // §11 -> §10 post-round hooks (spec order) on the recorded tool turn, then loop — the
             // next `call_model` sees the tool results in context.
             self.after_turn_memory().await;
@@ -1195,6 +1248,33 @@ impl Engine {
         &mut self,
         events: &EventSink,
         cancel: &CancellationToken,
+        turn_usage: UsageDelta,
+    ) -> TurnOutcome {
+        self.finish_with_final_summary(EndReason::BudgetExhausted, events, cancel, turn_usage)
+            .await
+    }
+
+    /// Finalize a turn stopped early by the §4.2 no-progress guard: one final toolless summary call,
+    /// then `TurnFinished { NoProgress }`. Same shape as [`Self::finish_budget_exhausted`] — a stuck
+    /// loop is ended deliberately rather than left to exhaust the iteration budget.
+    async fn finish_no_progress(
+        &mut self,
+        events: &EventSink,
+        cancel: &CancellationToken,
+        turn_usage: UsageDelta,
+    ) -> TurnOutcome {
+        self.finish_with_final_summary(EndReason::NoProgress, events, cancel, turn_usage)
+            .await
+    }
+
+    /// Shared early-stop finalizer: make one final **toolless** model call so the model can produce a
+    /// closing message, fold its usage, and emit `TurnFinished { end_reason }`. Used by both the
+    /// iteration-budget and no-progress stops.
+    async fn finish_with_final_summary(
+        &mut self,
+        end_reason: EndReason,
+        events: &EventSink,
+        cancel: &CancellationToken,
         mut turn_usage: UsageDelta,
     ) -> TurnOutcome {
         let out = match self.call_model(events, false, cancel).await {
@@ -1204,7 +1284,7 @@ impl Engine {
         self.finalize_text(&out, events);
         turn_usage.add(&out.usage);
         let summary = TurnSummary {
-            end_reason: EndReason::BudgetExhausted,
+            end_reason,
             final_text: Some(out.text),
             usage: turn_usage,
         };
@@ -1418,6 +1498,24 @@ impl Engine {
             })
             .await;
     }
+}
+
+/// A stable hash of one tool round's calls and results (§4.2 no-progress guard). Hashes each call's
+/// `name` + `args` and its result's `ok` + `content`, but **not** the per-call `call_id` (freshly
+/// minted each round), so two rounds that issue the same calls and get the same results hash equal —
+/// the signal that the model is looping without converging.
+fn round_signature(calls: &[(crate::conversation::ToolCall, crate::conversation::ToolResult)]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    calls.len().hash(&mut hasher);
+    for (call, result) in calls {
+        call.name.hash(&mut hasher);
+        call.args.hash(&mut hasher);
+        result.ok.hash(&mut hasher);
+        result.content.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -2138,6 +2236,99 @@ mod tests {
         assert_eq!(provider.call_count(), 5);
     }
 
+    /// A tool that returns a *fixed* result every run (the inverse of `CounterTool`, whose result
+    /// changes each round) — so repeated identical calls yield byte-identical rounds, exercising the
+    /// §4.2 no-progress guard.
+    struct ConstantTool {
+        runs: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConstantTool {
+        fn name(&self) -> &str {
+            "constant"
+        }
+        fn schema(&self) -> &str {
+            "{}"
+        }
+        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> crate::tools::ToolOutcome {
+            self.runs.fetch_add(1, Ordering::Relaxed);
+            crate::tools::ToolOutcome::text(call.call_id.clone(), true, "same".to_string())
+        }
+    }
+
+    fn constant_engine(
+        provider: Arc<dyn Provider>,
+        runs: Arc<AtomicU64>,
+        max_iterations: u32,
+        max_repeated_rounds: u32,
+    ) -> Engine {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ConstantTool { runs }));
+        let config = Config {
+            max_iterations,
+            max_repeated_rounds,
+            ..Config::default()
+        };
+        Engine::fresh(
+            SessionId::new("react"),
+            SystemPrompt::new("test"),
+            provider,
+            Arc::new(registry),
+        )
+        .with_config(config)
+    }
+
+    /// A model that re-issues the identical tool call every round, where the tool returns the
+    /// identical result, is looping: the §4.2 no-progress guard ends the turn `NoProgress` after
+    /// `max_repeated_rounds` identical rounds — well before the (much larger) iteration budget.
+    #[tokio::test]
+    async fn no_progress_guard_ends_repeated_identical_rounds() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
+            name: "constant".into(),
+            args: "{}".into(),
+        }));
+        let mut engine = constant_engine(provider.clone(), runs.clone(), 90, 3);
+        engine.push_user(UserMsg::new("loop"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::NoProgress),
+            _ => panic!("expected a no-progress stop"),
+        }
+        // Stopped after 3 identical rounds, not the 90-round iteration budget.
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        // 3 loop rounds + 1 toolless summary round.
+        assert_eq!(provider.call_count(), 4);
+    }
+
+    /// With the guard disabled (`max_repeated_rounds = 0`), the same looping/constant scenario runs
+    /// all the way to the iteration cap — proving the guard, not the budget, is what stops it above.
+    #[tokio::test]
+    async fn no_progress_guard_disabled_runs_to_iteration_budget() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
+            name: "constant".into(),
+            args: "{}".into(),
+        }));
+        let mut engine = constant_engine(provider, runs.clone(), 4, 0);
+        engine.push_user(UserMsg::new("loop"));
+
+        let outcome = engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        match outcome {
+            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::BudgetExhausted),
+            _ => panic!("expected budget exhaustion"),
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
+    }
+
     /// Cancellation observed mid-loop (after a tool runs) finalizes the turn as `Interrupted` rather
     /// than looping back to the model.
     #[tokio::test]
@@ -2357,6 +2548,75 @@ mod tests {
             }
             conv
         }
+    }
+
+    /// A context engine that reports over-budget but whose `compact` frees **nothing** (returns the
+    /// conversation unchanged) — used to prove the C6 hard last-resort truncation in
+    /// `prepare_turn_context` reduces the context even when the engine's own compaction is a no-op.
+    struct StubbornContext;
+    #[async_trait::async_trait]
+    impl ContextEngine for StubbornContext {
+        fn before_turn(
+            &self,
+            _conv: &Conversation,
+            budget: Option<usize>,
+        ) -> crate::context::Pressure {
+            crate::context::Pressure {
+                used_tokens: 1_000_000,
+                budget_tokens: budget.or(Some(1)),
+            }
+        }
+        async fn compact(&self, conv: Conversation, _budget: usize) -> Conversation {
+            // Stubborn: frees nothing. Any reduction the engine observes is the C6 hard cap.
+            conv
+        }
+    }
+
+    /// When the §10 context engine reports over-budget but its `compact` frees nothing, the C6 hard
+    /// last-resort cap deterministically drops oldest turns so the turn does not proceed over budget
+    /// — observable as a non-zero `dropped_turns` on the `AgentEvent::Context` and a shorter
+    /// conversation, despite the engine's compaction being a no-op.
+    #[tokio::test]
+    async fn hard_cap_truncates_when_engine_compaction_frees_nothing() {
+        let mut engine = Engine::fresh(
+            SessionId::new("hard-cap"),
+            SystemPrompt::new("test"),
+            Arc::new(crate::provider::MockProvider::completing("done")),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_config(Config {
+            context_budget_tokens: Some(1),
+            ..Config::default()
+        })
+        .with_context_engine(Arc::new(StubbornContext));
+        engine.push_user(UserMsg::new("first"));
+        engine.push_user(UserMsg::new("second"));
+        engine.push_user(UserMsg::new("third"));
+        let before = engine.snapshot().conversation.turns.len();
+        let (sink, log) = collecting();
+
+        engine.run_turn(&NoopHost, &sink, &TurnControl::new()).await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| matches!(
+                e,
+                AgentEvent::Context { status, .. } if status.compacted && status.dropped_turns >= 1
+            )),
+            "expected the hard cap to drop turns, got: {log:?}"
+        );
+        // The conversation the turn ran on was truncated below the pre-turn turn count even though
+        // the engine's `compact` returned everything unchanged.
+        assert!(
+            engine
+                .snapshot()
+                .conversation
+                .turns
+                .iter()
+                .filter(|t| matches!(t, Turn::User(_)))
+                .count()
+                < before
+        );
     }
 
     /// Compaction at the pre-turn pressure check emits an `AgentEvent::Context { compacted: true,

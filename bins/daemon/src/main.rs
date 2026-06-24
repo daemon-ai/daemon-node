@@ -1600,6 +1600,56 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The configured provider builder for a placed child (B2), resolved through the same
+/// [`build_providers`] seam the in-process node uses so the child runs the real model rather than a
+/// mock. Builds the `ModelManager` (needed by the local engines for resolve-before-load; harmless for
+/// remote/mock) and seeds the active local model exactly as the node assembly does. Falls back to a
+/// completing mock if the model manager cannot be initialized, so the placement path never dies on a
+/// model-subsystem error.
+async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderBuilder {
+    let fallback = || -> daemon_core::ProviderBuilder {
+        Arc::new(|| Arc::new(MockProvider::completing("placed child done")) as Arc<dyn Provider>)
+    };
+    let manager = match ModelManager::new(ManagerConfig {
+        cache_dir: cfg.models.cache_dir.clone(),
+        registry_path: cfg.models.registry_path.clone(),
+        endpoint: cfg.models.endpoint.clone(),
+        quantize_worker_bin: Some(cfg.local.worker_bin.clone()),
+    })
+    .await
+    {
+        Ok(manager) => Arc::new(manager),
+        Err(e) => {
+            tracing::warn!(error = %e, "placed child: model manager init failed; using mock provider");
+            return fallback();
+        }
+    };
+    let active = manager.active_handle();
+    if matches!(
+        cfg.provider_kind,
+        ProviderKind::LlamaCpp | ProviderKind::MistralRs
+    ) {
+        if let Some(model_ref) = parse_model_ref(cfg.provider_kind, &cfg.model) {
+            active.set(cfg.profile.clone(), model_ref).await;
+        }
+    }
+    let providers = build_providers(cfg, &manager, &active);
+    providers
+        .builder_for(&ProfileRef::new(cfg.profile.clone()))
+        .unwrap_or_else(fallback)
+}
+
+/// The tool registry for a placed child (B2): the always-on, dependency-light core chat tools the
+/// node registers on every role (the `todo` planner + the `clarify` HITL ask). The heavier optional
+/// subsystems (skills / memory / MCP / Python / web / browser) and their per-session resolvers stay
+/// with the parent node; the placed child gets the real provider and the core toolset.
+fn build_placed_child_tools(_cfg: &NodeConfig) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(TodoTool::new()) as Arc<dyn Tool>);
+    registry.register(Arc::new(ClarifyTool::new()) as Arc<dyn Tool>);
+    registry
+}
+
 /// Run as the far side of a placement cut: a completing engine driven over the brokered store. The
 /// engine is built from a *dressed* [`EngineProfile`] (engine tunables applied, via
 /// [`CoreEngineFactory::from_profile`]) so it shares the host's construction seam rather than a
@@ -1616,12 +1666,14 @@ async fn run_as_placed_child() {
             return;
         }
     };
-    let profile = EngineProfile::new(
-        Arc::new(|| Arc::new(MockProvider::completing("placed child done")) as Arc<dyn Provider>),
-        Arc::new(ToolRegistry::new()),
-        SystemPrompt::new("placed child"),
-    )
-    .with_config(cfg.engine);
+    // B2: the placed child runs the node's **configured** provider (genai / local / mock), built
+    // through the same `build_providers` seam as the in-process node, plus the always-on core tools —
+    // not a hardcoded `MockProvider`. Credential brokering over the cut is deferred, so a real
+    // provider resolves its API key from the environment (`Request.auth` is unset on this path).
+    let provider = build_placed_child_provider(&cfg).await;
+    let registry = build_placed_child_tools(&cfg);
+    let profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new("placed child"))
+        .with_config(cfg.engine);
     let factory = CoreEngineFactory::from_profile(profile);
     let channel = CutChannel::from_stdio();
 
