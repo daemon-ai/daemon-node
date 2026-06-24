@@ -94,6 +94,8 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# read-mostly immutable snapshot publishing (routing/model catalog handles)
+arc-swap = "1"
 # verifiable-trace stack (Blockchain Commons): dcbor for deterministic CBOR,
 # bc-envelope for the Gordian Envelope digest tree + signing, bc-components for keys.
 dcbor = "0.25"

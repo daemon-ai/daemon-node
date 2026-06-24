@@ -640,7 +640,7 @@ impl SwitchInner {
     /// Resolve the active model and return a [`LocalProvider`] loaded for it, (re)building only when
     /// the active selection changed since the last call.
     async fn provider(&self) -> Result<Arc<LocalProvider>, Failure> {
-        let want = self.active.get(&self.profile).await;
+        let want = self.active.get(&self.profile);
         let mut cur = self.current.lock().await;
         if let Some((have, provider)) = cur.as_ref() {
             if *have == want {

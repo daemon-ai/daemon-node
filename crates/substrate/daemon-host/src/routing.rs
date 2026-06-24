@@ -187,7 +187,10 @@ pub fn origin_pin_key(origin: &Origin) -> String {
     match &origin.scope {
         OriginScope::Dm { user } => format!("{t}\u{1}dm\u{1}{user}"),
         OriginScope::Group { chat, thread } => {
-            format!("{t}\u{1}group\u{1}{chat}\u{1}{}", thread.as_deref().unwrap_or(""))
+            format!(
+                "{t}\u{1}group\u{1}{chat}\u{1}{}",
+                thread.as_deref().unwrap_or("")
+            )
         }
         OriginScope::Api { key } => format!("{t}\u{1}api\u{1}{key}"),
         OriginScope::Internal => format!("{t}\u{1}internal"),
@@ -442,9 +445,10 @@ mod tests {
     fn instances_derived_from_profile_bound_accounts() {
         use daemon_api::{BoundAccount, ProfileSpec, ProviderSelector};
 
-        let ops = ProfileSpec::new("ops-agent", ProviderSelector::Mock, "m").with_bound_accounts(
-            vec![BoundAccount::new("matrix/@ops:hs.org", "matrix/ops-agent/ops")],
-        );
+        let ops =
+            ProfileSpec::new("ops-agent", ProviderSelector::Mock, "m").with_bound_accounts(vec![
+                BoundAccount::new("matrix/@ops:hs.org", "matrix/ops-agent/ops"),
+            ]);
         let support = ProfileSpec::new("support", ProviderSelector::Mock, "m")
             .with_bound_accounts(vec![BoundAccount::new("matrix/@help:hs.org", "cred-help")]);
 
@@ -499,7 +503,10 @@ mod tests {
         // An unpinned origin on the same registry falls back to the deterministic path.
         let other = matrix("@ops:hs.org", "#general");
         let r2 = reg.resolve(&other);
-        assert_eq!(r2.session, session_id_for(&other, IsolationPolicy::PerThread));
+        assert_eq!(
+            r2.session,
+            session_id_for(&other, IsolationPolicy::PerThread)
+        );
         assert_eq!(r2.profile, Some(ProfileRef::new("node-default")));
     }
 
@@ -551,5 +558,42 @@ mod tests {
             reg.resolve(&matrix("@ops:hs", "#random")).profile,
             Some(ProfileRef::new("catch-all"))
         );
+    }
+
+    #[test]
+    fn arc_swap_routing_reads_complete_snapshots_during_swaps() {
+        let origin = matrix("@ops:hs", "#secops-1");
+        let snapshots = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            RoutingRegistry::new().with_default_profile(ProfileRef::new("old")),
+        ));
+
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let snapshots = snapshots.clone();
+                let origin = origin.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let profile = snapshots.load().resolve(&origin).profile;
+                        assert!(
+                            profile == Some(ProfileRef::new("old"))
+                                || profile == Some(ProfileRef::new("new"))
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..50 {
+            snapshots.store(std::sync::Arc::new(
+                RoutingRegistry::new().with_default_profile(ProfileRef::new("new")),
+            ));
+            snapshots.store(std::sync::Arc::new(
+                RoutingRegistry::new().with_default_profile(ProfileRef::new("old")),
+            ));
+        }
+
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 }

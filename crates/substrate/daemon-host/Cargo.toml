@@ -30,6 +30,7 @@ tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

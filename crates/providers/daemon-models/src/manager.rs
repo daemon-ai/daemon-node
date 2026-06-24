@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use daemon_common::{
     DownloadId, DownloadState, DownloadStatus, InstalledModel, ModelEngine, ModelFile, ModelId,
     ModelRef, ModelSource, QuantRecommendation, SearchPage, SearchQuery,
 };
-use tokio::sync::RwLock;
 
 use crate::acquire::{Downloader, ResolvedArtifact};
 use crate::cache::CacheConfig;
@@ -38,20 +38,33 @@ pub struct ManagerConfig {
 
 /// The per-profile active-model selection, shared with the local provider wiring so a runtime
 /// `model_activate` swaps which model new worker spawns load.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ActiveModels {
-    inner: Arc<RwLock<HashMap<String, ModelRef>>>,
+    inner: Arc<ArcSwap<HashMap<String, ModelRef>>>,
+}
+
+impl Default for ActiveModels {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        }
+    }
 }
 
 impl ActiveModels {
     /// The active model for `profile`, if one was activated.
-    pub async fn get(&self, profile: &str) -> Option<ModelRef> {
-        self.inner.read().await.get(profile).cloned()
+    pub fn get(&self, profile: &str) -> Option<ModelRef> {
+        self.inner.load().get(profile).cloned()
     }
 
     /// Set the active model for `profile`.
-    pub async fn set(&self, profile: impl Into<String>, model: ModelRef) {
-        self.inner.write().await.insert(profile.into(), model);
+    pub fn set(&self, profile: impl Into<String>, model: ModelRef) {
+        let profile = profile.into();
+        self.inner.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(profile.clone(), model.clone());
+            Arc::new(next)
+        });
     }
 }
 
@@ -268,7 +281,7 @@ impl ModelManager {
             .get(id)
             .await
             .ok_or_else(|| ModelError::Unknown(id.to_string()))?;
-        self.active.set(profile, record.model.clone()).await;
+        self.active.set(profile, record.model.clone());
         Ok(record)
     }
 
@@ -435,4 +448,38 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_common::ModelEngine;
+
+    fn model(repo: &str) -> ModelRef {
+        ModelRef::new(ModelEngine::Llama, ModelSource::hf_file(repo, "m.gguf"))
+    }
+
+    #[tokio::test]
+    async fn active_models_copy_on_write_reads_complete_snapshots() {
+        let active = ActiveModels::default();
+        active.set("default", model("org/old"));
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let active = active.clone();
+                tokio::spawn(async move {
+                    for _ in 0..100 {
+                        let seen = active.get("default");
+                        assert!(seen.is_some());
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+
+        active.set("default", model("org/new"));
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        assert_eq!(active.get("default"), Some(model("org/new")));
+    }
 }

@@ -1227,7 +1227,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         ProviderKind::LlamaCpp | ProviderKind::MistralRs
     ) {
         if let Some(model_ref) = parse_model_ref(cfg.provider_kind, &cfg.model) {
-            active.set(cfg.profile.clone(), model_ref).await;
+            active.set(cfg.profile.clone(), model_ref);
         }
     }
 
@@ -1653,7 +1653,7 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
         ProviderKind::LlamaCpp | ProviderKind::MistralRs
     ) {
         if let Some(model_ref) = parse_model_ref(cfg.provider_kind, &cfg.model) {
-            active.set(cfg.profile.clone(), model_ref).await;
+            active.set(cfg.profile.clone(), model_ref);
         }
     }
     let providers = build_providers(cfg, &manager, &active);

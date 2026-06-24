@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use daemon_common::{InstalledModel, ModelId, ModelRef, ModelSource};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -47,12 +48,9 @@ pub fn model_id(model: &ModelRef) -> ModelId {
 /// The installed-model catalog backed by an atomic JSON manifest.
 #[derive(Clone)]
 pub struct Registry {
-    inner: Arc<Mutex<State>>,
-}
-
-struct State {
     path: PathBuf,
-    models: BTreeMap<String, InstalledModel>,
+    models: Arc<ArcSwap<BTreeMap<String, InstalledModel>>>,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl Registry {
@@ -61,18 +59,20 @@ impl Registry {
         let path = path.into();
         let models = load(&path)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(State { path, models })),
+            path,
+            models: Arc::new(ArcSwap::from_pointee(models)),
+            persist_lock: Arc::new(Mutex::new(())),
         })
     }
 
     /// All installed models, ordered by id.
     pub async fn list(&self) -> Vec<InstalledModel> {
-        self.inner.lock().await.models.values().cloned().collect()
+        self.models.load().values().cloned().collect()
     }
 
     /// Look up an installed model by its catalog id.
     pub async fn get(&self, id: &ModelId) -> Option<InstalledModel> {
-        self.inner.lock().await.models.get(id.as_str()).cloned()
+        self.models.load().get(id.as_str()).cloned()
     }
 
     /// Find an installed model by its reference (the dedupe key acquisition checks).
@@ -83,18 +83,23 @@ impl Registry {
 
     /// Insert or replace a record, persisting the manifest atomically.
     pub async fn upsert(&self, record: InstalledModel) -> Result<()> {
-        let mut state = self.inner.lock().await;
-        state.models.insert(record.id.0.clone(), record);
-        persist(&state.path, &state.models)
+        let _guard = self.persist_lock.lock().await;
+        let mut next = (**self.models.load()).clone();
+        next.insert(record.id.0.clone(), record);
+        persist(&self.path, &next)?;
+        self.models.store(Arc::new(next));
+        Ok(())
     }
 
     /// Remove a record by id (returns the removed record), persisting the manifest. The on-disk
     /// artifact is *not* deleted here — the manager removes the cached files separately.
     pub async fn remove(&self, id: &ModelId) -> Result<Option<InstalledModel>> {
-        let mut state = self.inner.lock().await;
-        let removed = state.models.remove(id.as_str());
+        let _guard = self.persist_lock.lock().await;
+        let mut next = (**self.models.load()).clone();
+        let removed = next.remove(id.as_str());
         if removed.is_some() {
-            persist(&state.path, &state.models)?;
+            persist(&self.path, &next)?;
+            self.models.store(Arc::new(next));
         }
         Ok(removed)
     }
@@ -184,5 +189,56 @@ mod tests {
         reopened.remove(&id).await.unwrap();
         assert!(reopened.get(&id).await.is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_see_valid_snapshots_during_upsert() {
+        let path = temp_path("concurrent");
+        let reg = Registry::open(&path).await.unwrap();
+        let first = sample("org/first");
+        reg.upsert(first.clone()).await.unwrap();
+
+        let reader_reg = reg.clone();
+        let reader = tokio::spawn(async move {
+            for _ in 0..100 {
+                let listed = reader_reg.list().await;
+                assert!(!listed.is_empty());
+                assert!(reader_reg.find(&first.model).await.is_some());
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let second = sample("org/second");
+        reg.upsert(second.clone()).await.unwrap();
+        reader.await.unwrap();
+        assert!(reg.find(&second.model).await.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn failed_persist_does_not_publish_snapshot() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "daemon-models-test-{}-persist-failure-dir",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let existing = sample("org/existing");
+        let mut models = BTreeMap::new();
+        models.insert(existing.id.0.clone(), existing.clone());
+        let reg = Registry {
+            path: dir.clone(),
+            models: Arc::new(ArcSwap::from_pointee(models)),
+            persist_lock: Arc::new(Mutex::new(())),
+        };
+
+        let new = sample("org/new");
+        assert!(reg.upsert(new.clone()).await.is_err());
+        assert!(reg.find(&existing.model).await.is_some());
+        assert!(reg.find(&new.model).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("json.tmp"));
     }
 }

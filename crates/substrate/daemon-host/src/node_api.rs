@@ -21,6 +21,7 @@ use crate::profiles::ProfileStore;
 use crate::routing::RoutingRegistry;
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
@@ -224,16 +225,16 @@ pub struct NodeApiImpl {
     /// to resolve an inbound `Origin` to (session, profile, delivery). Empty by default — a pure
     /// passthrough: `PerThread` naming, node active-default profile, origin-seeded delivery.
     ///
-    /// Held behind an `RwLock<Arc<…>>` so it is *hot-swappable*: a profile/auth change can rebuild
-    /// the routing table live (via [`NodeApiImpl::rebuild_routing`]) without restarting the node.
-    /// `submit_routed` clones the inner `Arc` under a brief read lock, so an in-flight resolve never
-    /// blocks a swap.
-    routing: Arc<std::sync::RwLock<Arc<RoutingRegistry>>>,
+    /// Held behind an [`ArcSwap`] so it is *hot-swappable*: a profile/auth change can rebuild the
+    /// routing table live (via [`NodeApiImpl::rebuild_routing`]) without restarting the node. An
+    /// in-flight `submit_routed` resolves against one immutable snapshot while a swap publishes the
+    /// next snapshot without taking a read lock.
+    routing: Arc<ArcSwap<RoutingRegistry>>,
     /// The pin-free *base* routing registry (the static [`NodeApiImpl::with_routing`] table, or empty
     /// for the passthrough/builder cases). The live `routing` above is this base with the durable
     /// chat→session pins (`chat_pins`) layered on by [`NodeApiImpl::rebuild_routing`]; keeping the
     /// base separate lets a pin reload re-layer pins without losing the operator's binding table.
-    routing_base: Arc<std::sync::RwLock<Arc<RoutingRegistry>>>,
+    routing_base: Arc<ArcSwap<RoutingRegistry>>,
     /// The resolve-first chat→session pins (§5.9, I5) loaded from the durable `chat_routes` store,
     /// keyed by canonical origin key. Re-layered onto a freshly-built registry on every rebuild;
     /// refreshed from the store by [`NodeApiImpl::load_routing_pins`] at boot and after a `routing_*`
@@ -321,8 +322,8 @@ impl NodeApiImpl {
             session_modes,
             revisions: None,
             skills: None,
-            routing: Arc::new(std::sync::RwLock::new(Arc::new(RoutingRegistry::new()))),
-            routing_base: Arc::new(std::sync::RwLock::new(Arc::new(RoutingRegistry::new()))),
+            routing: Arc::new(ArcSwap::from_pointee(RoutingRegistry::new())),
+            routing_base: Arc::new(ArcSwap::from_pointee(RoutingRegistry::new())),
             chat_pins: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             routing_builder: None,
             acp: None,
@@ -418,8 +419,8 @@ impl NodeApiImpl {
     /// inbound-routing capability). Call during assembly; absent, routed submits fall back to
     /// `PerThread` naming with the node's active default profile.
     pub fn with_routing(mut self, routing: RoutingRegistry) -> Self {
-        self.routing_base = Arc::new(std::sync::RwLock::new(Arc::new(routing.clone())));
-        self.routing = Arc::new(std::sync::RwLock::new(Arc::new(routing)));
+        self.routing_base = Arc::new(ArcSwap::from_pointee(routing.clone()));
+        self.routing = Arc::new(ArcSwap::from_pointee(routing));
         self
     }
 
@@ -437,7 +438,7 @@ impl NodeApiImpl {
     /// for an explicit refresh; an in-flight `submit_routed` resolve (which clones the inner `Arc`) is
     /// unaffected. The swap re-layers the current chat→session pins on top of the new base.
     pub fn swap_routing(&self, routing: RoutingRegistry) {
-        *self.routing_base.write().unwrap() = Arc::new(routing);
+        self.routing_base.store(Arc::new(routing));
         self.rebuild_routing();
     }
 
@@ -448,10 +449,10 @@ impl NodeApiImpl {
     fn rebuild_routing(&self) {
         let mut reg = match &self.routing_builder {
             Some(builder) => builder(),
-            None => (**self.routing_base.read().unwrap()).clone(),
+            None => (*self.routing_base.load_full()).clone(),
         };
         reg.set_pins(self.chat_pins.read().unwrap().clone());
-        *self.routing.write().unwrap() = Arc::new(reg);
+        self.routing.store(Arc::new(reg));
     }
 
     /// Reload the durable chat→session routing pins (§5.9, I5) from the store into the in-memory pin
@@ -471,11 +472,6 @@ impl NodeApiImpl {
         }
         *self.chat_pins.write().unwrap() = map;
         self.rebuild_routing();
-    }
-
-    /// A snapshot of the current routing registry (clones the inner `Arc` under a brief read lock).
-    fn routing(&self) -> Arc<RoutingRegistry> {
-        self.routing.read().unwrap().clone()
     }
 
     /// Attach the §12 tool-checkpoint store so the `Checkpoint{List,Rewind}` ops can list rewind
@@ -2081,7 +2077,8 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<SessionId, ApiError> {
         // Resolve the origin through the §5.9 routing registry: session name, the profile that runs
         // it (agent selection), and where its replies post.
-        let resolved = self.routing().resolve(&origin);
+        let routing = self.routing.load();
+        let resolved = routing.resolve(&origin);
         self.claim(&resolved.session, Lifecycle::Live)?;
         // For session-opening commands, bind the resolved profile (sticky on first `ensure`) and seed
         // the resolved `Primary` before submitting, so routing owns agent-selection + delivery. Other
