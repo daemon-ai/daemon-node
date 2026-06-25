@@ -598,9 +598,36 @@ credential-info = any
 model-descriptor = any
 curator-entry = any
 curator-change = any
-command-spec = any
-command-invocation = any
-command-output = any
+; ----- command catalog (thin-client slash-command surface) -----
+; Concrete mirror of daemon-api's CommandSpec/CommandInvocation/CommandOutput. The daemon owns the
+; catalog + handlers; clients render menus/autocomplete from command-spec and dispatch
+; command-invocation, never modeling commands locally. Unit enums serialize as their variant name;
+; #[serde(default)] fields carry no skip_serializing_if, so every field is present on the wire
+; (Option fields as null).
+command-scope = "Session" / "Node"
+command-surface = "Cli" / "Gui" / "Chat"
+command-access = "User" / "Admin"
+command-spec = {
+  name: tstr,
+  aliases: [* tstr],
+  summary: tstr,
+  category: tstr,
+  args_hint: tstr,
+  subcommands: [* tstr],
+  scope: command-scope,
+  surfaces: [* command-surface],
+  side_effecting: bool,
+  confirm: bool,
+  min_access: command-access,
+  source: tstr,
+}
+command-invocation = {
+  name: tstr,
+  args: tstr,
+  session: (session-id / null),
+  origin: (origin / null),
+}
+command-output = { text: tstr, ephemeral: bool }
 
 ; ----- interactive auth (SSO / OAuth2), wire v13 (daemon-interactive-auth-spec) -----
 ; the client-driven, browser-redirect login seam. The client owns the browser + the redirect_uri; the

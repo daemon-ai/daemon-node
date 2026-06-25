@@ -79,6 +79,32 @@ fs-root-id = tstr
 fs-root-kind = tstr
 fs-root = { "id": fs-root-id, "label": tstr, "kind": fs-root-kind, ? "session": (session-id / null) }
 
+; command catalog (thin-client slash-command surface)
+command-scope = "Session" / "Node"
+command-surface = "Cli" / "Gui" / "Chat"
+command-access = "User" / "Admin"
+command-spec = {
+  "name": tstr,
+  "aliases": [* tstr],
+  "summary": tstr,
+  "category": tstr,
+  "args_hint": tstr,
+  "subcommands": [* tstr],
+  "scope": command-scope,
+  "surfaces": [* command-surface],
+  "side_effecting": bool,
+  "confirm": bool,
+  "min_access": command-access,
+  "source": tstr,
+}
+command-invocation = {
+  "name": tstr,
+  "args": tstr,
+  "session": (session-id / null),
+  "origin": (origin / null),
+}
+command-output = { "text": tstr, "ephemeral": bool }
+
 request-health = "Health"
 request-sessions-query = { "SessionsQuery": { "query": session-query } }
 request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint, "max": uint } }
@@ -86,6 +112,8 @@ request-submit = { "Submit": { "session": session-id, "command": agent-command, 
 request-profile-list = "ProfileList"
 request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-fs-roots = "FsRoots"
+request-command-list = "CommandList"
+request-command-invoke = { "CommandInvoke": { "invocation": command-invocation } }
 
 api-request = request-health
             / request-sessions-query
@@ -94,15 +122,21 @@ api-request = request-health
             / request-profile-list
             / request-model-current
             / request-fs-roots
+            / request-command-list
+            / request-command-invoke
 
 response-health = { "Health": health-report }
 response-session-page = { "SessionPage": session-page }
 response-log-page = { "LogPage": log-page-view }
 response-fs-roots = { "FsRoots": [* fs-root] }
+response-commands = { "Commands": [* command-spec] }
+response-command-output = { "CommandOutput": command-output }
 response-ok = "Ok"
 
 api-response = response-health
              / response-session-page
              / response-log-page
              / response-fs-roots
+             / response-commands
+             / response-command-output
              / response-ok
