@@ -7,7 +7,9 @@
 //!   the published `daemon-api.cddl` are the complete non-Rust contract (daemon-ffi-spec §3.6).
 //! - `cddl` — check the `daemon-api` mirror CDDL artifact covers the Rust wire enum variants.
 //! - `api-fixtures` — write canonical CBOR request/response fixtures for non-Rust clients.
-//! - `zcbor-spike` — run zcbor codegen over a representative CDDL subset.
+//! - `gen-zcbor` — generate the client zcbor C codec from a CDDL (the artifact `daemon-app` vendors).
+//! - `verify-codec` — decode every CBOR fixture with the generated C codec, proving the CDDL/zcbor
+//!   path stays byte-compatible with the serde/ciborium runtime wire format.
 
 #![forbid(unsafe_code)]
 
@@ -15,14 +17,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() -> anyhow::Result<()> {
-    let sub = std::env::args().nth(1).unwrap_or_default();
-    match sub.as_str() {
+    let args: Vec<String> = std::env::args().collect();
+    let sub = args.get(1).map(String::as_str).unwrap_or_default();
+    match sub {
         "gen-headers" => gen_headers(),
         "cddl" => check_cddl(),
         "api-fixtures" => gen_api_fixtures(),
-        "zcbor-spike" => run_zcbor_spike(),
+        "gen-zcbor" => gen_zcbor(&args[2..]),
+        "verify-codec" => verify_codec(),
         other => {
-            eprintln!("usage: xtask <gen-headers|cddl|api-fixtures|zcbor-spike>");
+            eprintln!(
+                "usage: xtask <gen-headers|cddl|api-fixtures|gen-zcbor|verify-codec>\n\
+                 \n  gen-zcbor [--cddl <path>] [--out <dir>]  generate the client zcbor C codec\
+                 \n  verify-codec                             decode every CBOR fixture with it"
+            );
             anyhow::bail!("unknown xtask subcommand: {other:?}");
         }
     }
@@ -262,6 +270,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         },
     )?;
     write_cbor(&out, "request-fs-roots.cbor", &ApiRequest::FsRoots)?;
+    write_cbor(&out, "request-command-list.cbor", &ApiRequest::CommandList)?;
+    write_cbor(&out, "response-ok.cbor", &ApiResponse::Ok)?;
     write_cbor(
         &out,
         "response-health.cbor",
@@ -285,34 +295,131 @@ fn write_cbor<T: serde::Serialize>(dir: &Path, name: &str, value: &T) -> anyhow:
     Ok(())
 }
 
-fn run_zcbor_spike() -> anyhow::Result<()> {
-    let root = workspace_root();
-    let schema = root.join("crates/contracts/daemon-api/zcbor-smoke.cddl");
-    let out = root.join("target/zcbor-spike");
-    std::fs::create_dir_all(out.join("src"))?;
-    std::fs::create_dir_all(out.join("include"))?;
-    let status = Command::new("zcbor")
-        .arg("code")
-        .arg("--cddl")
-        .arg(&schema)
-        .arg("--entry-types")
-        .arg("api-request")
-        .arg("api-response")
-        .arg("--decode")
-        .arg("--encode")
-        .arg("--default-max-qty")
-        .arg("16")
-        .arg("--output-c")
-        .arg(out.join("src/daemon_api_smoke.c"))
-        .arg("--output-h")
-        .arg(out.join("include/daemon_api_smoke.h"))
-        .arg("--output-h-types")
-        .arg(out.join("include/daemon_api_smoke_types.h"))
+/// Base name passed to the codegen script; the generated entry types are `api_request`/`api_response`.
+const ZCBOR_BASENAME: &str = "daemon_api_smoke";
+
+fn codegen_script(root: &Path) -> PathBuf {
+    root.join("crates/contracts/daemon-api/zcbor-codegen.sh")
+}
+
+/// The currently zcbor-generatable CDDL. The full `daemon-api.cddl` is not yet generatable (zcbor
+/// requires quoted map keys; the full mirror uses CDDL barewords and `any` members), so the smoke
+/// subset is the live surface. Growing it toward full coverage is provable step-by-step by
+/// `verify-codec`.
+fn default_cddl(root: &Path) -> PathBuf {
+    root.join("crates/contracts/daemon-api/zcbor-smoke.cddl")
+}
+
+/// Run the canonical codegen script. `extra` forwards flags such as `--copy-sources`.
+fn run_codegen(root: &Path, cddl: &Path, out: &Path, extra: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new("bash")
+        .arg(codegen_script(root))
+        .arg(cddl)
+        .arg(out)
+        .args(extra)
         .status()
         .map_err(|e| {
-            anyhow::anyhow!("failed to run zcbor (is it in the daemon flake shell?): {e}")
+            anyhow::anyhow!("running zcbor-codegen.sh (is zcbor on PATH / in the flake shell?): {e}")
         })?;
     anyhow::ensure!(status.success(), "zcbor codegen failed with {status}");
-    println!("generated zcbor smoke codec in {}", out.display());
+    Ok(())
+}
+
+/// `gen-zcbor [--cddl <path>] [--out <dir>]` — (re)generate the client CBOR codec.
+///
+/// A thin dev wrapper over `zcbor-codegen.sh`. daemon-node owns generation because the CDDL is
+/// authoritative here and zcbor lives in this flake; the output is the committed artifact
+/// `daemon-app` vendors (no Python/zcbor in the Qt build). The superproject's pure
+/// `packages.daemon-zcbor-codec` derivation invokes the same script.
+fn gen_zcbor(args: &[String]) -> anyhow::Result<()> {
+    let root = workspace_root();
+    let mut cddl = default_cddl(&root);
+    let mut out = root.join("target/zcbor-codec");
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--cddl" => {
+                cddl = PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--cddl needs a path"))?,
+                )
+            }
+            "--out" => {
+                out = PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--out needs a path"))?,
+                )
+            }
+            other => anyhow::bail!("unknown gen-zcbor arg: {other:?}"),
+        }
+    }
+    run_codegen(&root, &cddl, &out, &[])?;
+    println!(
+        "generated zcbor codec from {} in {}",
+        cddl.display(),
+        out.display()
+    );
+    Ok(())
+}
+
+/// `verify-codec` — prove the generated C codec accepts real ciborium wire bytes.
+///
+/// Closes the loop the syntactic `cddl` gate cannot: generate the codec from the CDDL, compile its
+/// decoder with the zcbor runtime, then decode every `fixtures/cbor/*.cbor` (each emitted by
+/// `api-fixtures` through ciborium — the runtime truth) and assert success + full consumption. Any
+/// drift between the serde wire format and the CDDL/zcbor path fails here.
+fn verify_codec() -> anyhow::Result<()> {
+    let root = workspace_root();
+
+    let fixtures_dir = root.join("crates/contracts/daemon-api/fixtures/cbor");
+    if !fixtures_dir.exists() {
+        gen_api_fixtures()?;
+    }
+    let mut fixtures: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", fixtures_dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|ext| ext == "cbor").unwrap_or(false))
+        .collect();
+    fixtures.sort();
+    anyhow::ensure!(
+        !fixtures.is_empty(),
+        "no CBOR fixtures in {}",
+        fixtures_dir.display()
+    );
+
+    let work = std::env::temp_dir().join(format!("daemon-verify-codec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let codec = work.join("codec");
+    std::fs::create_dir_all(&codec)?;
+    // `--copy-sources` drops the zcbor C runtime flat alongside the generated codec.
+    run_codegen(&root, &default_cddl(&root), &codec, &["--copy-sources"])?;
+
+    let harness_c = work.join("verify_codec.c");
+    std::fs::write(&harness_c, include_str!("verify_codec.c"))?;
+    let bin = work.join("verify-codec");
+
+    let status = Command::new("cc")
+        .arg(&harness_c)
+        .arg(codec.join(format!("{ZCBOR_BASENAME}_decode.c")))
+        .arg(codec.join("zcbor_decode.c"))
+        .arg(codec.join("zcbor_common.c"))
+        .arg(format!("-I{}", codec.display()))
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run cc (is it in the flake shell?): {e}"))?;
+    anyhow::ensure!(status.success(), "compiling the verify harness failed with {status}");
+
+    let status = Command::new(&bin).args(&fixtures).status()?;
+    anyhow::ensure!(
+        status.success(),
+        "codec verification failed: a fixture did not decode with the generated codec"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+    println!(
+        "verified {} fixtures decode with the generated zcbor codec",
+        fixtures.len()
+    );
     Ok(())
 }

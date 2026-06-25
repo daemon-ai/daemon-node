@@ -60,6 +60,10 @@ session-page = {
 
 direction = "Inbound" / "Outbound"
 disposition = "Context" / "Transport"
+; NOTE: `scope` is simplified to tstr here. The real daemon-api origin-scope is a union of single-key
+; maps (Dm/Group/Api/Internal); zcbor collides on the generated helper names for that pattern under
+; our codegen flags, and the only tested fixture carries origin=null, so the map shape is unexercised.
+; Modeling the full origin-scope is part of growing this subset toward the full daemon-api.cddl.
 origin = { "transport": tstr, "scope": tstr }
 session-payload = { "Command": agent-command }
 session-log-entry = {
@@ -108,7 +112,7 @@ command-output = { "text": tstr, "ephemeral": bool }
 request-health = "Health"
 request-sessions-query = { "SessionsQuery": { "query": session-query } }
 request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint, "max": uint } }
-request-submit = { "Submit": { "session": session-id, "command": agent-command, ? "profile": (profile-ref / null) } }
+request-submit = { "Submit": { "session": session-id, "command": agent-command, ? "origin": (origin / null), ? "profile": (profile-ref / null) } }
 request-profile-list = "ProfileList"
 request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-fs-roots = "FsRoots"
