@@ -139,6 +139,11 @@ response-fs-roots = { "FsRoots": [* fs-root] }
 response-commands = { "Commands": [* command-spec] }
 response-command-output = { "CommandOutput": command-output }
 response-ok = "Ok"
+; NOTE: the `Error` arm ({ "Error": api-error }) is intentionally omitted. api-error is a union of
+; single-key maps ({"UnknownSession": tstr} / {"Unsupported": tstr} / ...), which trips the same zcbor
+; helper-name collision (decode_repeated_api_error_map) as origin-scope. It blocks daemon-app's
+; codec-error-surface; unblocking needs the zcbor union-of-single-key-maps workaround (tracked with
+; the cddl-growth effort), not just a fixture.
 
 api-response = response-health
              / response-session-page

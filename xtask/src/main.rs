@@ -219,7 +219,10 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 }
 
 fn gen_api_fixtures() -> anyhow::Result<()> {
-    use daemon_api::{ApiRequest, ApiResponse, HealthReport, ServiceHealth};
+    use daemon_api::{
+        ApiRequest, ApiResponse, CommandInvocation, CommandOutput, HealthReport, LogPageView,
+        ServiceHealth, SessionPage,
+    };
     use daemon_common::{ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, UserMsg};
 
@@ -271,7 +274,41 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     )?;
     write_cbor(&out, "request-fs-roots.cbor", &ApiRequest::FsRoots)?;
     write_cbor(&out, "request-command-list.cbor", &ApiRequest::CommandList)?;
+    write_cbor(
+        &out,
+        "request-command-invoke.cbor",
+        &ApiRequest::CommandInvoke {
+            invocation: CommandInvocation {
+                name: "help".into(),
+                ..Default::default()
+            },
+        },
+    )?;
     write_cbor(&out, "response-ok.cbor", &ApiResponse::Ok)?;
+    write_cbor(
+        &out,
+        "response-session-page.cbor",
+        &ApiResponse::SessionPage(SessionPage {
+            sessions: Vec::new(),
+            next_cursor: None,
+        }),
+    )?;
+    write_cbor(
+        &out,
+        "response-log-page.cbor",
+        &ApiResponse::LogPage(LogPageView {
+            entries: Vec::new(),
+            next_seq: 0,
+            head_seq: 0,
+        }),
+    )?;
+    write_cbor(&out, "response-fs-roots.cbor", &ApiResponse::FsRoots(Vec::new()))?;
+    write_cbor(&out, "response-commands.cbor", &ApiResponse::Commands(Vec::new()))?;
+    write_cbor(
+        &out,
+        "response-command-output.cbor",
+        &ApiResponse::CommandOutput(CommandOutput::default()),
+    )?;
     write_cbor(
         &out,
         "response-health.cbor",
@@ -422,6 +459,24 @@ int main(int argc, char **argv) {
 }
 "#;
 
+/// Extract the member rule names of a CDDL union rule (`api-request` / `api-response`). The members
+/// are `request-*` / `response-*` identifiers; the prefix is derived from the entry (drop `api-`).
+fn cddl_union_members(cddl: &str, entry: &str) -> Vec<String> {
+    let Some(start) = cddl.find(&format!("{entry} =")) else {
+        return Vec::new();
+    };
+    let tail = &cddl[start..];
+    let block = &tail[..tail.find("\n\n").unwrap_or(tail.len())];
+    let prefix = format!("{}-", entry.strip_prefix("api-").unwrap_or(entry));
+    let mut members = Vec::new();
+    for token in block.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        if token.starts_with(&prefix) && !members.iter().any(|m| m == token) {
+            members.push(token.to_string());
+        }
+    }
+    members
+}
+
 /// `verify-codec` — prove the generated C codec accepts real ciborium wire bytes.
 ///
 /// Closes the loop the syntactic `cddl` gate cannot: generate the codec from the CDDL, compile its
@@ -446,6 +501,24 @@ fn verify_codec() -> anyhow::Result<()> {
         !fixtures.is_empty(),
         "no CBOR fixtures in {}",
         fixtures_dir.display()
+    );
+
+    // Coverage: every api-request/api-response variant in the client CDDL must have a fixture
+    // (named after its rule, e.g. `request-submit` -> `request-submit.cbor`), so the decode proof
+    // below exercises the whole client surface, not just whatever fixtures happen to exist.
+    let cddl_text = read_to_string(&default_cddl(&root))?;
+    let mut missing = Vec::new();
+    for entry in ["api-request", "api-response"] {
+        for rule in cddl_union_members(&cddl_text, entry) {
+            if !fixtures_dir.join(format!("{rule}.cbor")).exists() {
+                missing.push(rule);
+            }
+        }
+    }
+    anyhow::ensure!(
+        missing.is_empty(),
+        "client cddl variants without a fixture: {}",
+        missing.join(", ")
     );
 
     let work = std::env::temp_dir().join(format!("daemon-verify-codec-{}", std::process::id()));
