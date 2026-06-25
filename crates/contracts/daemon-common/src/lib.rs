@@ -423,7 +423,16 @@ impl WireVersion {
     /// time, so a run's `deliver = "origin"` can route its result back to the creator through the same
     /// routing surface a live submit uses. Stamped by the agent `cron` tool from its calling session;
     /// `None` for CLI/node-internal creations. Additive (`#[serde(default)]`).
-    pub const CURRENT: Self = Self(17);
+    ///
+    /// v18 (messaging adapters): retires the Rust-only `Room*` CRUD ops and introduces the typed
+    /// messaging-adapter management surface (daemon-messaging-adapter-spec.md) — the `Conv*`/`Member*`
+    /// ops plus `TransportAdapters`/`TransportInstances`, and the `conversation-*` / `participant` /
+    /// `contact-info` / `presence` / `*-details` / `adapter-*` group defs. Breaking (Room ops removed).
+    ///
+    /// v19 (rooms behavior): adds the additive `ConvDelete` + `ConvHistory` ops — conversation
+    /// deletion and the durable, verifiable per-conversation transcript read (a merged room history
+    /// keyed by `(transport, conv)`, returned as a `Journal` page). Additive (new request variants).
+    pub const CURRENT: Self = Self(19);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

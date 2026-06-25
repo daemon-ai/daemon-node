@@ -2036,6 +2036,7 @@ dependencies = [
  "daemon-providers",
  "daemon-provision",
  "daemon-pytool-client",
+ "daemon-rooms",
  "daemon-skills",
  "daemon-store",
  "daemon-supervision",
@@ -2139,10 +2140,12 @@ dependencies = [
  "daemon-delivery",
  "daemon-host",
  "daemon-ingest",
+ "daemon-matrix",
  "daemon-node",
  "daemon-orchestration",
  "daemon-protocol",
  "daemon-provision",
+ "daemon-rooms",
  "daemon-skills",
  "daemon-store",
  "daemon-supervision",
@@ -2563,6 +2566,25 @@ dependencies = [
  "daemon-pytool",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "daemon-rooms"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-common",
+ "daemon-delivery",
+ "daemon-host",
+ "daemon-ingest",
+ "daemon-protocol",
+ "daemon-store",
+ "daemon-telemetry",
+ "futures",
+ "serde",
  "tokio",
  "tracing",
 ]

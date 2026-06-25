@@ -984,6 +984,12 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
             node_api = node_api.with_routing(routing);
         }
     }
+    // Transport-adapter registry seam (daemon-transport-adapter-spec.md §3.4): the declarative
+    // companion to routing. `NodeApiImpl::with_adapters(AdapterRegistry::new().with_adapter(..))`
+    // installs the node's self-describing events-IO adapters so `transport_adapters` enumerates them
+    // for the GUI "Add channel" picker. No adapter implements `TransportAdapter` yet (the `serve`
+    // spawns still live in `bins/daemon`), so the registry stays empty/inert here; populating it +
+    // driving lifecycle from the registry is deferred (spec §7 P1).
     // Bind the live cloud-model discovery hook when the binary provided one.
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {
         node_api = node_api.with_cloud_catalog(cloud_catalog);

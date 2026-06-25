@@ -128,6 +128,13 @@ const MATRIX_ENABLE_ENV: &str = "DAEMON_MATRIX_ENABLE";
 /// The per-account store root, relative to `data_dir` (default `matrix`).
 const MATRIX_STORE_ROOT_ENV: &str = "DAEMON_MATRIX_STORE_ROOT";
 
+// --- Rooms transport (`daemon-rooms`) tuning (DAEMON_ROOMS_*) ----------------------------------
+/// Spawn the internal Rooms loopback transport (`false` by default — opt-in, like `matrix`). Rooms +
+/// membership are durable in the store, never in this config.
+const ROOMS_ENABLE_ENV: &str = "DAEMON_ROOMS_ENABLE";
+/// The per-Room cascade turn budget (echo-storm cap; `0` = unbounded). Default mirrors `RoomsConfig`.
+const ROOMS_MAX_TURNS_ENV: &str = "DAEMON_ROOMS_MAX_TURNS";
+
 // --- Python tools (`daemon-pytool`) tuning (DAEMON_PYTHON_*) -----------------------------------
 /// Register Python tools discovered from the `daemon_pytool` worker (`false` by default — opt-in,
 /// like `metta`/`web`).
@@ -688,6 +695,9 @@ pub struct NodeConfig {
     /// The Matrix chat transport (`daemon-matrix`) config (`enabled = false` by default — opt-in).
     /// Accounts/sessions come from `bound_accounts` + the credential store, not from here.
     pub matrix: daemon_matrix::MatrixConfig,
+    /// The internal Rooms loopback transport (`daemon-rooms`) config (`enabled = false` by default —
+    /// opt-in). Rooms + membership are durable in the store, not in this config.
+    pub rooms: daemon_rooms::RoomsConfig,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -732,6 +742,7 @@ struct FileConfig {
     skills: Option<FileSkillsConfig>,
     routing: Option<FileRoutingConfig>,
     matrix: Option<FileMatrixConfig>,
+    rooms: Option<FileRoomsConfig>,
 }
 
 /// The `[matrix]` TOML table — the Matrix transport surface (every field optional). Carries **no**
@@ -752,6 +763,15 @@ struct FileMatrixRoute {
     room_glob: Option<String>,
     dm_only: Option<bool>,
     mention_gating: Option<bool>,
+}
+
+/// The `[rooms]` TOML table — the internal Rooms loopback transport surface (every field optional).
+/// Rooms + membership themselves are durable in the store, not declared here.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileRoomsConfig {
+    enabled: Option<bool>,
+    max_turns: Option<u32>,
 }
 
 /// The `[routing]` TOML table — the general host routing table (§5.9; every field optional).
@@ -1156,6 +1176,7 @@ impl NodeConfig {
         let skills = Self::resolve_skills(file.skills.unwrap_or_default())?;
         let routing = Self::resolve_routing(file.routing.unwrap_or_default())?;
         let matrix = Self::resolve_matrix(file.matrix.unwrap_or_default(), &data_dir);
+        let rooms = Self::resolve_rooms(file.rooms.unwrap_or_default());
 
         Ok(Self {
             partition,
@@ -1189,7 +1210,26 @@ impl NodeConfig {
             nesting_depth,
             routing,
             matrix,
+            rooms,
         })
+    }
+
+    /// Resolve the `[rooms]` table (env overriding TOML overriding defaults). Rooms carry no secrets
+    /// and no per-room declarations here — the durable Rooms + membership live in the store.
+    fn resolve_rooms(file: FileRoomsConfig) -> daemon_rooms::RoomsConfig {
+        let defaults = daemon_rooms::RoomsConfig::default();
+        let mut enabled = file.enabled.unwrap_or(defaults.enabled);
+        if let Some(s) = env_string(ROOMS_ENABLE_ENV) {
+            enabled = parse_bool(&s);
+        }
+        let max_turns = env_string(ROOMS_MAX_TURNS_ENV)
+            .and_then(|s| s.parse().ok())
+            .or(file.max_turns)
+            .unwrap_or(defaults.max_turns);
+        daemon_rooms::RoomsConfig {
+            enabled,
+            max_turns,
+        }
     }
 
     /// Resolve the `[matrix]` table (env overriding TOML overriding defaults). `store_root` is made

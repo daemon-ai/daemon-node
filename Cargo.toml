@@ -141,6 +141,7 @@ daemon-mcp-client = { path = "crates/adapters/daemon-mcp-client" }
 daemon-delivery = { path = "crates/adapters/daemon-delivery" }
 daemon-ingest = { path = "crates/adapters/daemon-ingest" }
 daemon-matrix = { path = "crates/adapters/daemon-matrix" }
+daemon-rooms = { path = "crates/adapters/daemon-rooms" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { path = "crates/node/daemon-node" }

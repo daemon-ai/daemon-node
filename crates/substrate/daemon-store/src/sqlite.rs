@@ -13,9 +13,10 @@
 
 use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint,
-    JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval, SessionMeta,
-    SessionRole, SessionSearchHit, SessionStatus, SessionStore, StoredCronJob, StoredCronRun,
-    StoredCronSuggestion, StoreError, StoreStats, TraceEntry, TraceSegment, CRON_RUN_RETENTION,
+    JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval, Room,
+    RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
+    StoredCronJob, StoredCronRun, StoredCronSuggestion, StoreError, StoreStats, TraceEntry,
+    TraceSegment, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -67,6 +68,25 @@ CREATE TABLE IF NOT EXISTS chat_routes (
     profile    TEXT,
     descriptor BLOB NOT NULL
 );
+
+-- daemon-rooms-spec.md: first-class Rooms (the internal loopback transport). `descriptor` is the
+-- opaque host CBOR of the wire Room metadata (protocol-free, mirroring `chat_routes`); membership is
+-- the companion `room_members` table, keyed `(room_id, member)`.
+CREATE TABLE IF NOT EXISTS rooms (
+    id         TEXT PRIMARY KEY,
+    name       TEXT,
+    policy     TEXT NOT NULL,
+    descriptor BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS room_members (
+    room_id    TEXT NOT NULL,
+    member     TEXT NOT NULL,
+    profile    TEXT,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (room_id, member)
+);
+CREATE INDEX IF NOT EXISTS room_members_room ON room_members (room_id);
 
 CREATE TABLE IF NOT EXISTS acp_catalog (
     name  TEXT PRIMARY KEY,
@@ -1219,6 +1239,118 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM chat_routes WHERE key = ?1", params![key])
             .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn room_list(&self) -> Vec<Room> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT id, name, policy, descriptor FROM rooms ORDER BY id")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(Room {
+                id: row.get::<_, String>(0)?,
+                name: row.get::<_, Option<String>>(1)?,
+                policy: row.get::<_, String>(2)?,
+                descriptor: row.get::<_, Vec<u8>>(3)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn room_get(&self, id: &str) -> Option<Room> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, policy, descriptor FROM rooms WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Room {
+                    id: row.get::<_, String>(0)?,
+                    name: row.get::<_, Option<String>>(1)?,
+                    policy: row.get::<_, String>(2)?,
+                    descriptor: row.get::<_, Vec<u8>>(3)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    async fn room_set(&self, room: Room) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO rooms (id, name, policy, descriptor) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET name = ?2, policy = ?3, descriptor = ?4",
+            params![room.id, room.name, room.policy, room.descriptor],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn room_remove(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM room_members WHERE room_id = ?1", params![id])
+            .map_err(sql_err)?;
+        conn.execute("DELETE FROM rooms WHERE id = ?1", params![id])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn room_members(&self, room_id: &str) -> Vec<RoomMember> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT room_id, member, profile, session_id FROM room_members \
+             WHERE room_id = ?1 ORDER BY member",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![room_id], |row| {
+            Ok(RoomMember {
+                room_id: row.get::<_, String>(0)?,
+                member: row.get::<_, String>(1)?,
+                profile: row.get::<_, Option<String>>(2)?.map(ProfileRef::new),
+                session_id: SessionId::new(row.get::<_, String>(3)?),
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn room_member_set(&self, member: RoomMember) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let profile = member.profile.as_ref().map(|p| p.as_str());
+        conn.execute(
+            "INSERT INTO room_members (room_id, member, profile, session_id) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(room_id, member) DO UPDATE SET profile = ?3, session_id = ?4",
+            params![
+                member.room_id,
+                member.member,
+                profile,
+                member.session_id.as_str()
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn room_member_remove(&self, room_id: &str, member: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM room_members WHERE room_id = ?1 AND member = ?2",
+            params![room_id, member],
+        )
+        .map_err(sql_err)?;
         Ok(())
     }
 

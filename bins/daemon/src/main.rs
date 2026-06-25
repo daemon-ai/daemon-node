@@ -1489,8 +1489,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         vec![]
     };
 
-    let AssembledNode { node, handle, .. } = assemble(NodeAssembly {
-        store,
+    let AssembledNode { node, handle, signer, .. } = assemble(NodeAssembly {
+        store: store.clone(),
         partition: cfg.partition,
         host_config,
         providers,
@@ -1548,19 +1548,32 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // configured bind address (like the MCP surface). It shares the same `Arc<dyn NodeApi>`, so it is
     // just another transport over the one canonical interface — JSON dispatch plus SSE/WS streaming
     // over the merged session event log.
-    // Optionally spawn the Matrix chat transport (the `daemon-matrix` adapter), toggled on by
-    // `[matrix].enabled`. It drives the same `Arc<dyn NodeApi>` as a client and consumes the host's
-    // in-process `AccountProvisioning` seam (enumerate bound accounts + resolve/write-back session
-    // blobs); both `node` coercions come off the one concrete `NodeApiImpl`.
-    let matrix_server = if cfg.matrix.enabled {
-        tracing::info!("spawning matrix transport (daemon-matrix)");
-        let api: Arc<dyn daemon_api::NodeApi> = node.clone();
+    // Build the transport-adapter registry and drive it from the node (registry-driven lifecycle,
+    // daemon-messaging-adapter-spec.md §12.1). Each enabled adapter is registered; `set_adapters`
+    // installs the registry on the assembled node and `spawn_adapters` runs every adapter's `serve`
+    // with the node as its `api`. The same registry then backs `transport_adapters` /
+    // `transport_instances` enumeration and the generic `conv_*`/`member_*` management forwarding.
+    //
+    // Rooms drives the same `Arc<dyn NodeApi>` as an in-process client; its "homeserver" is the daemon
+    // itself (no external accounts/credentials), so it consumes only the durable store. Matrix
+    // additionally consumes the host's in-process `AccountProvisioning` seam (the node itself).
+    let mut adapter_registry = daemon_host::AdapterRegistry::new();
+    if cfg.rooms.enabled {
+        tracing::info!("registering internal rooms transport (daemon-rooms)");
+        adapter_registry = adapter_registry.with_adapter(daemon_rooms::RoomsAdapter::new(
+            store,
+            signer.clone(),
+            cfg.rooms.clone(),
+        ));
+    }
+    if cfg.matrix.enabled {
+        tracing::info!("registering matrix transport (daemon-matrix)");
         let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
-        let mcfg = cfg.matrix.clone();
-        Some(tokio::spawn(daemon_matrix::serve(api, provisioning, mcfg)))
-    } else {
-        None
-    };
+        adapter_registry = adapter_registry
+            .with_adapter(daemon_matrix::MatrixAdapter::new(provisioning, cfg.matrix.clone()));
+    }
+    node.set_adapters(adapter_registry);
+    let adapter_tasks = node.spawn_adapters();
 
     let http_server = match &cfg.http_addr {
         Some(addr) => {
@@ -1582,8 +1595,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if let Some(http_server) = http_server {
         http_server.abort();
     }
-    if let Some(matrix_server) = matrix_server {
-        matrix_server.abort();
+    for task in &adapter_tasks {
+        task.abort();
     }
     cred_audit_drain.abort();
     handle.shutdown().await;

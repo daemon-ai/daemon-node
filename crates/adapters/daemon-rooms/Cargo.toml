@@ -1,0 +1,38 @@
+[package]
+name = "daemon-rooms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The internal Rooms transport (daemon-rooms-spec.md): a first-class N-participant conversation backed
+# by an *internal loopback transport*, structurally identical to `daemon-matrix` but the "homeserver"
+# is the daemon itself. The RoomRouter fans an inbound post out to each member's session via the
+# reusable `daemon-ingest` gate (inbound) and catches each member's `TurnFinished` through a
+# `daemon-delivery` loopback `Projector`, re-injecting it (gated by the floor-control policy) as the
+# others' next inbound post (outbound). Depends only on the contracts + the two reusable halves + the
+# async runtime, so — like `daemon-ingest`/`daemon-delivery` — it carries no host or substrate types.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# the durable Room + membership store this adapter persists to / loads from at bring-up.
+daemon-store = { workspace = true }
+# the verifiable-journal writer (JournalSink) + signer used to persist the merged per-room transcript
+# (the same encoding the host's history read decodes/verifies). Mirrors `daemon-matrix`'s host dep.
+daemon-host = { workspace = true }
+daemon-telemetry = { workspace = true }
+# the typed Room descriptor (kind/title/topic/policy) the adapter CBOR-encodes into the store's
+# protocol-free `Room.descriptor` opaque column.
+serde = { workspace = true }
+# the two reusable transport-agnostic halves this adapter plugs into (the inbound gate + the outbound
+# pull-delivery projector), exactly as `daemon-matrix` does.
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

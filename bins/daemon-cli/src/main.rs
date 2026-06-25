@@ -9,13 +9,16 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use daemon_api::{ApiRequest, ApiResponse, CronSpec, JournalRecordPayload};
+use daemon_api::{
+    AccountSettingsValues, ApiRequest, ApiResponse, ChannelJoinDetails, ContactInfo,
+    CreateConversationDetails, CronSpec, JournalRecordPayload, MemberRole, Participant,
+};
 use daemon_common::{
-    DownloadId, ModelEngine, ModelId, ModelRef, ModelSource, ReqId, SearchQuery, SearchSort,
-    SessionId, UnitId,
+    DownloadId, ModelEngine, ModelId, ModelRef, ModelSource, ProfileRef, ReqId, SearchQuery,
+    SearchSort, SessionId, UnitId,
 };
 use daemon_host::ApiClient;
-use daemon_protocol::{AgentCommand, UserMsg};
+use daemon_protocol::{AgentCommand, TransportId, UserMsg};
 
 /// Operate a running `daemon` host node over its api socket.
 #[derive(Parser)]
@@ -169,6 +172,195 @@ enum Command {
     Cron {
         #[command(subcommand)]
         cmd: CronCmd,
+    },
+    /// List the registered transport adapters + their live instances (messaging-adapter framework).
+    Transports,
+    /// Manage conversations on a messaging transport (`room`, `matrix`, …). Aliased as `room`.
+    #[command(alias = "room")]
+    Conv {
+        #[command(subcommand)]
+        cmd: ConvCmd,
+    },
+    /// Administer membership of a conversation (invite/remove/ban/set-role).
+    Member {
+        #[command(subcommand)]
+        cmd: MemberCmd,
+    },
+}
+
+/// Conversation management over the messaging-adapter interface (`conv_*` ops). `transport` is the
+/// adapter family (`room`, `matrix`); `conv` is the adapter-opaque conversation id.
+#[derive(Subcommand)]
+enum ConvCmd {
+    /// List conversations on a transport.
+    List {
+        /// The transport family (e.g. `room`).
+        transport: String,
+    },
+    /// Show one conversation by id.
+    Get {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+    },
+    /// Create a conversation (Rooms reads `id`/`name`/`policy`/`kind` from these).
+    Create {
+        /// The transport family.
+        transport: String,
+        /// The conversation id (defaults to `name`, else generated).
+        #[arg(long)]
+        id: Option<String>,
+        /// A human name/title.
+        #[arg(long)]
+        name: Option<String>,
+        /// The floor policy (`addressed_only` | `free_for_all` | `round_robin`).
+        #[arg(long)]
+        policy: Option<String>,
+        /// The conversation kind (`GroupDm` | `Channel` | `Dm` | `Thread`).
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Join (or create-if-absent) a channel by name.
+    Join {
+        /// The transport family.
+        transport: String,
+        /// The channel name / id.
+        name: String,
+    },
+    /// Leave a conversation.
+    Leave {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+    },
+    /// Send a message into a conversation, optionally attributed to a member.
+    Send {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The message text.
+        text: String,
+        /// Attribute the post to this member handle (an agent participant with `--from-profile`).
+        #[arg(long)]
+        from: Option<String>,
+        /// The profile the `--from` member runs under (makes it an agent participant).
+        #[arg(long)]
+        from_profile: Option<String>,
+    },
+    /// Set a conversation's topic (omit to clear).
+    Topic {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The new topic.
+        topic: Option<String>,
+    },
+    /// Set a conversation's title (omit to clear).
+    Title {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The new title.
+        title: Option<String>,
+    },
+    /// Set a conversation's description (omit to clear).
+    Describe {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The new description.
+        description: Option<String>,
+    },
+    /// Delete/destroy a conversation.
+    Delete {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+    },
+    /// Read a conversation's durable, verifiable transcript (the merged room history).
+    History {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// Return entries with cursor strictly greater than this (0 from the start).
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Maximum entries (0 = all).
+        #[arg(long, default_value_t = 0)]
+        max: u32,
+    },
+}
+
+/// Membership administration over the messaging-adapter interface (`member_*` ops). A `--profile`
+/// makes the target an agent participant (`Participant::Agent`); otherwise it is a contact.
+#[derive(Subcommand)]
+enum MemberCmd {
+    /// Invite/add a participant to a conversation.
+    Invite {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The member handle.
+        member: String,
+        /// The profile the member runs under (agent participant).
+        #[arg(long)]
+        profile: Option<String>,
+        /// An optional invitation message.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Remove/kick a participant.
+    Remove {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The member handle.
+        member: String,
+        /// The profile the member runs under (agent participant).
+        #[arg(long)]
+        profile: Option<String>,
+        /// An optional reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Ban a participant.
+    Ban {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The member handle.
+        member: String,
+        /// The profile the member runs under (agent participant).
+        #[arg(long)]
+        profile: Option<String>,
+        /// An optional reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Set a participant's role/affiliation.
+    SetRole {
+        /// The transport family.
+        transport: String,
+        /// The conversation id.
+        conv: String,
+        /// The member handle.
+        member: String,
+        /// The role (`none` | `voice` | `halfop` | `op` | `founder`).
+        role: String,
+        /// The profile the member runs under (agent participant).
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -825,7 +1017,201 @@ async fn main() -> anyhow::Result<()> {
         Command::Model { cmd } => run_model(&client, cmd).await?,
         Command::Curator { cmd } => run_curator(&client, cmd).await?,
         Command::Cron { cmd } => run_cron(&client, cmd).await?,
+        Command::Transports => render(client.call(ApiRequest::TransportInstances).await?),
+        Command::Conv { cmd } => run_conv(&client, cmd).await?,
+        Command::Member { cmd } => run_member(&client, cmd).await?,
     }
+    Ok(())
+}
+
+/// Build a [`Participant`] from a member handle and an optional profile: with a profile it is an
+/// agent participant (`Participant::Agent`), otherwise a contact.
+fn participant(member: String, profile: Option<String>) -> Participant {
+    match profile {
+        Some(p) => Participant::Agent {
+            profile: ProfileRef::new(p),
+            member,
+        },
+        None => Participant::Contact(ContactInfo {
+            id: member,
+            ..ContactInfo::default()
+        }),
+    }
+}
+
+/// Parse a [`MemberRole`] from its CLI label.
+fn parse_role(role: &str) -> anyhow::Result<MemberRole> {
+    Ok(match role.to_ascii_lowercase().as_str() {
+        "none" => MemberRole::None,
+        "voice" => MemberRole::Voice,
+        "halfop" => MemberRole::HalfOp,
+        "op" => MemberRole::Op,
+        "founder" => MemberRole::Founder,
+        other => anyhow::bail!("unknown role {other:?} (none|voice|halfop|op|founder)"),
+    })
+}
+
+/// Dispatch a `conv` subcommand over the api mirror.
+async fn run_conv(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> {
+    let req = match cmd {
+        ConvCmd::List { transport } => ApiRequest::ConvList {
+            transport: TransportId::new(transport),
+        },
+        ConvCmd::Get { transport, conv } => ApiRequest::ConvGet {
+            transport: TransportId::new(transport),
+            conv,
+        },
+        ConvCmd::Create {
+            transport,
+            id,
+            name,
+            policy,
+            kind,
+        } => {
+            let mut values = AccountSettingsValues::default();
+            if let Some(id) = id {
+                values.values.insert("id".into(), id);
+            }
+            if let Some(name) = name {
+                values.values.insert("name".into(), name);
+            }
+            if let Some(policy) = policy {
+                values.values.insert("policy".into(), policy);
+            }
+            if let Some(kind) = kind {
+                values.values.insert("kind".into(), kind);
+            }
+            ApiRequest::ConvCreate {
+                transport: TransportId::new(transport),
+                details: CreateConversationDetails {
+                    extras: values,
+                    ..CreateConversationDetails::default()
+                },
+            }
+        }
+        ConvCmd::Join { transport, name } => ApiRequest::ConvJoin {
+            transport: TransportId::new(transport),
+            details: ChannelJoinDetails {
+                name: Some(name),
+                ..ChannelJoinDetails::default()
+            },
+        },
+        ConvCmd::Leave { transport, conv } => ApiRequest::ConvLeave {
+            transport: TransportId::new(transport),
+            conv,
+        },
+        ConvCmd::Send {
+            transport,
+            conv,
+            text,
+            from,
+            from_profile,
+        } => ApiRequest::ConvSend {
+            transport: TransportId::new(transport),
+            conv,
+            from: from.map(|m| participant(m, from_profile)),
+            message: UserMsg::new(text),
+        },
+        ConvCmd::Topic {
+            transport,
+            conv,
+            topic,
+        } => ApiRequest::ConvSetTopic {
+            transport: TransportId::new(transport),
+            conv,
+            topic,
+        },
+        ConvCmd::Title {
+            transport,
+            conv,
+            title,
+        } => ApiRequest::ConvSetTitle {
+            transport: TransportId::new(transport),
+            conv,
+            title,
+        },
+        ConvCmd::Describe {
+            transport,
+            conv,
+            description,
+        } => ApiRequest::ConvSetDescription {
+            transport: TransportId::new(transport),
+            conv,
+            description,
+        },
+        ConvCmd::Delete { transport, conv } => ApiRequest::ConvDelete {
+            transport: TransportId::new(transport),
+            conv,
+        },
+        ConvCmd::History {
+            transport,
+            conv,
+            after,
+            max,
+        } => ApiRequest::ConvHistory {
+            transport: TransportId::new(transport),
+            conv,
+            after_cursor: after,
+            max,
+        },
+    };
+    render(client.call(req).await?);
+    Ok(())
+}
+
+/// Dispatch a `member` subcommand over the api mirror.
+async fn run_member(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()> {
+    let req = match cmd {
+        MemberCmd::Invite {
+            transport,
+            conv,
+            member,
+            profile,
+            message,
+        } => ApiRequest::MemberInvite {
+            transport: TransportId::new(transport),
+            conv,
+            who: participant(member, profile),
+            message,
+        },
+        MemberCmd::Remove {
+            transport,
+            conv,
+            member,
+            profile,
+            reason,
+        } => ApiRequest::MemberRemove {
+            transport: TransportId::new(transport),
+            conv,
+            who: participant(member, profile),
+            reason,
+        },
+        MemberCmd::Ban {
+            transport,
+            conv,
+            member,
+            profile,
+            reason,
+        } => ApiRequest::MemberBan {
+            transport: TransportId::new(transport),
+            conv,
+            who: participant(member, profile),
+            reason,
+        },
+        MemberCmd::SetRole {
+            transport,
+            conv,
+            member,
+            role,
+            profile,
+        } => ApiRequest::MemberSetRole {
+            transport: TransportId::new(transport),
+            conv,
+            who: participant(member, profile),
+            role: parse_role(&role)?,
+        },
+    };
+    render(client.call(req).await?);
     Ok(())
 }
 
@@ -1489,6 +1875,53 @@ fn render(resp: ApiResponse) {
                 println!("  - {} {} session={}", r.transport.as_str(), r.room, session);
             }
         }
+        ApiResponse::TransportInstances(instances) => {
+            println!("transport instances: {}", instances.len());
+            for i in instances {
+                println!(
+                    "  - {} [{}] {:?}/{:?}",
+                    i.transport.as_str(),
+                    i.family,
+                    i.connection,
+                    i.presence
+                );
+            }
+        }
+        ApiResponse::Conversations(convs) => {
+            println!("conversations: {}", convs.len());
+            for c in convs {
+                let title = c.title.unwrap_or_else(|| "(untitled)".to_string());
+                println!(
+                    "  - {}/{} [{:?}] \"{}\" members={}",
+                    c.transport.as_str(),
+                    c.id,
+                    c.kind,
+                    title,
+                    c.members.len()
+                );
+            }
+        }
+        ApiResponse::Conversation(conv) => match conv {
+            Some(c) => {
+                println!("conversation: {}/{} [{:?}]", c.transport.as_str(), c.id, c.kind);
+                if let Some(t) = &c.title {
+                    println!("  title: {t}");
+                }
+                if let Some(t) = &c.topic {
+                    println!("  topic: {t}");
+                }
+                println!("  members: {}", c.members.len());
+                for m in &c.members {
+                    let session = m
+                        .session
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!("    - {} [{:?}] session={}", m.contact.id, m.role, session);
+                }
+            }
+            None => println!("conversation: not found"),
+        },
         ApiResponse::Error(e) => println!("error: {e}"),
         // Filesystem-surface responses (daemon-fs-surface-spec.md) and any other variant: the CLI
         // has no first-class fs command yet, so render the debug form generically.

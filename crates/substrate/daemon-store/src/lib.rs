@@ -174,6 +174,39 @@ pub struct ChatRoute {
     pub descriptor: Vec<u8>,
 }
 
+/// A durable Room/Chat row (daemon-rooms-spec.md): a first-class N-participant conversation backed by
+/// the internal loopback transport. Like [`ChatRoute`] the store stays protocol-free — the typed
+/// floor-control policy and any extra metadata ride as the opaque host-encoded `descriptor` blob (the
+/// CBOR of the wire `Room`); `id` / `name` / `policy` are the typed columns the host indexes and
+/// lists. Membership lives in the companion [`RoomMember`] rows (the `room_members` table).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Room {
+    /// The room id (primary key for upsert/lookup/delete).
+    pub id: String,
+    /// A human-readable room name, when set.
+    pub name: Option<String>,
+    /// The floor-control policy tag (mirrored from the descriptor for column-level listing; the host
+    /// treats `descriptor` as authoritative).
+    pub policy: String,
+    /// The opaque host descriptor (CBOR of the wire `Room` metadata) for round-trip.
+    pub descriptor: Vec<u8>,
+}
+
+/// A durable Room membership row (daemon-rooms-spec.md): one participant of a [`Room`], binding a
+/// `member` handle to a `profile` + per-member `session_id`. Keyed by `(room_id, member)`, mirroring
+/// the typed-columns shape of [`ChatRoute`] (the store stays protocol-free).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMember {
+    /// The room this membership belongs to (part of the `(room_id, member)` primary key).
+    pub room_id: String,
+    /// The adapter-opaque member handle within the room (part of the primary key).
+    pub member: String,
+    /// The profile this member's session runs under (`None` = registry default precedence).
+    pub profile: Option<ProfileRef>,
+    /// The resolved per-member session id.
+    pub session_id: SessionId,
+}
+
 /// A durable manually-registered ACP agent catalog entry (I7): the operator-persisted half of the
 /// ACP discovery catalog (auto-discovered builtins are re-probed each scan and need no persistence).
 /// `entry` is the opaque host-encoded CBOR of the wire `AcpAgentEntry`; the store stays protocol-free.
@@ -793,6 +826,43 @@ pub trait SessionStore: Send + Sync {
 
     /// Remove a routing pin by key (idempotent). Default: no-op.
     async fn routing_remove(&self, _key: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// List every durable Room (daemon-rooms-spec.md). The Rooms adapter loads these at bring-up to
+    /// reconstruct the loopback transports. Default: none (a store without durable rooms — rooms are
+    /// then in-memory only for the process lifetime, mirroring the `routing_*` default).
+    async fn room_list(&self) -> Vec<Room> {
+        Vec::new()
+    }
+
+    /// Read one Room by id (`None` if absent). Default: `None`.
+    async fn room_get(&self, _id: &str) -> Option<Room> {
+        None
+    }
+
+    /// Upsert a Room (keyed by [`Room::id`]). Default: no-op.
+    async fn room_set(&self, _room: Room) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a Room by id (idempotent; its membership rows cascade). Default: no-op.
+    async fn room_remove(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// List a Room's members (the membership table the RoomRouter fans posts out to). Default: none.
+    async fn room_members(&self, _room_id: &str) -> Vec<RoomMember> {
+        Vec::new()
+    }
+
+    /// Upsert a Room member (keyed by `(room_id, member)`). Default: no-op.
+    async fn room_member_set(&self, _member: RoomMember) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a Room member by `(room_id, member)` (idempotent). Default: no-op.
+    async fn room_member_remove(&self, _room_id: &str, _member: &str) -> Result<(), StoreError> {
         Ok(())
     }
 

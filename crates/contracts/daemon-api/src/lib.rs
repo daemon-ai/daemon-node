@@ -29,7 +29,7 @@ use daemon_common::{
 use std::collections::BTreeMap;
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
-    RewindAnchor, TranscriptBlock, TransportId,
+    RewindAnchor, TranscriptBlock, TransportId, UserMsg,
 };
 pub use daemon_common::{
     Author, BlobRef, ByteRange, Revision, RevisionKind, SkillBundle, WorkspaceBinding,
@@ -542,6 +542,184 @@ pub trait ControlApi: Send + Sync {
     /// session for each when one exists. Default: empty (a transport with no room enumeration).
     async fn transport_rooms(&self, _transport: TransportId) -> Vec<RoomInfo> {
         Vec::new()
+    }
+
+    // -- Transport adapters: the events-IO adapter framework (daemon-transport-adapter-spec.md) ---
+    //
+    // The declarative layer over the transport adapters: enumerate the available adapter families
+    // (capabilities + account-setup schema, for the GUI "Add channel" picker) and the configured
+    // instances with live connection/presence state (for the status bar + unified roster).
+    // Read-only; defaults empty so a node without an `AdapterRegistry` inherits the surface, exactly
+    // like the `transport_rooms` / `room_*` defaults.
+
+    /// The events-IO transport adapters this node knows (families + capabilities + setup schema).
+    /// Default: empty.
+    async fn transport_adapters(&self) -> Vec<AdapterInfo> {
+        Vec::new()
+    }
+
+    /// The configured transport instances (accounts) with their live connection/presence state.
+    /// Default: empty.
+    async fn transport_instances(&self) -> Vec<TransportInstanceInfo> {
+        Vec::new()
+    }
+
+    // -- Rooms: the internal loopback transport CRUD (daemon-rooms-spec.md) ----------------------
+    //
+    // A Room is a first-class N-participant conversation backed by the internal loopback transport
+    // (the `daemon-rooms` adapter). These ops are the Room-entity counterpart of the `routing_*`
+    // pins above (which only bind an existing chat to a session): they create/destroy Rooms, edit
+    // membership, and inject a post the RoomRouter fans out. Defaults: empty / unsupported (a node
+    // built without the Rooms adapter), exactly like the `routing_*` / `transport_rooms` defaults.
+
+    // -- Messaging-adapter management (daemon-messaging-adapter-spec.md §6.2): forwarded generically
+    //    by the host to the owning adapter's `MessagingProtocol` feature interfaces. Defaults are
+    //    empty / `Unsupported` (a node with no messaging adapter registered). --
+
+    /// List the conversations a transport owns (`SupportsConversations::list`). Default: empty.
+    async fn conv_list(&self, _transport: TransportId) -> Vec<ConversationInfo> {
+        Vec::new()
+    }
+
+    /// Read one conversation by id (`SupportsConversations::get`). Default: `None`.
+    async fn conv_get(&self, _transport: TransportId, _conv: String) -> Option<ConversationInfo> {
+        None
+    }
+
+    /// Fetch the typed create-conversation form for a transport. Default: empty.
+    async fn conv_create_details(&self, _transport: TransportId) -> CreateConversationDetails {
+        CreateConversationDetails::default()
+    }
+
+    /// Create a conversation. Default: unsupported.
+    async fn conv_create(
+        &self,
+        _transport: TransportId,
+        _details: CreateConversationDetails,
+    ) -> Result<ConversationInfo, ApiError> {
+        Err(ApiError::Unsupported("conv_create".into()))
+    }
+
+    /// Fetch the typed channel-join form for a transport. Default: empty.
+    async fn conv_join_details(&self, _transport: TransportId) -> ChannelJoinDetails {
+        ChannelJoinDetails::default()
+    }
+
+    /// Join a channel. Default: unsupported.
+    async fn conv_join(
+        &self,
+        _transport: TransportId,
+        _details: ChannelJoinDetails,
+    ) -> Result<ConversationInfo, ApiError> {
+        Err(ApiError::Unsupported("conv_join".into()))
+    }
+
+    /// Leave a conversation. Default: unsupported.
+    async fn conv_leave(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_leave".into()))
+    }
+
+    /// Send a message into a conversation, optionally attributed to a specific participant
+    /// (`from = None` is the account/operator). Default: unsupported.
+    async fn conv_send(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _from: Option<Participant>,
+        _message: UserMsg,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_send".into()))
+    }
+
+    /// Set a conversation's topic. Default: unsupported.
+    async fn conv_set_topic(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _topic: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_set_topic".into()))
+    }
+
+    /// Set a conversation's title. Default: unsupported.
+    async fn conv_set_title(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _title: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_set_title".into()))
+    }
+
+    /// Set a conversation's description. Default: unsupported.
+    async fn conv_set_description(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _description: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_set_description".into()))
+    }
+
+    /// Delete/destroy a conversation (`SupportsConversations::delete`). Default: unsupported.
+    async fn conv_delete(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_delete".into()))
+    }
+
+    /// Read a conversation's durable, verifiable transcript — the merged conversation history keyed by
+    /// `(transport, conv)` (daemon-messaging-adapter-spec.md). Default: empty.
+    async fn conv_history(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _after_cursor: u64,
+        _max: u32,
+    ) -> JournalPageView {
+        JournalPageView::default()
+    }
+
+    /// Invite/add a participant to a conversation (`SupportsMembership::invite`). Default: unsupported.
+    async fn member_invite(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _message: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_invite".into()))
+    }
+
+    /// Remove/kick a participant. Default: unsupported.
+    async fn member_remove(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _reason: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_remove".into()))
+    }
+
+    /// Ban a participant. Default: unsupported.
+    async fn member_ban(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _reason: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_ban".into()))
+    }
+
+    /// Set a participant's role/affiliation. Default: unsupported.
+    async fn member_set_role(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _role: MemberRole,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_set_role".into()))
     }
 
     // -- ACP discovery + registry (catalog-style; the daemon probes its own PATH/endpoints) --
@@ -2114,6 +2292,586 @@ pub struct RoomInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Transport-adapter framework DTOs (daemon-transport-adapter-spec.md)
+//
+// The declarative layer over events-IO transport adapters: the descriptor + capabilities a GUI
+// reads to render the "Add channel" picker and capability-gate affordances, and the live per-account
+// connection/presence state for the status bar + unified roster. All inert in the skeleton (the
+// `transport_adapters` / `transport_instances` ControlApi methods default empty).
+// ---------------------------------------------------------------------------
+
+/// The live connection state of a transport instance (the Pidgin `PurpleConnectionState` analogue),
+/// surfaced per account so the GUI status bar can show a status dot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionState {
+    /// Not connected (disabled, signed out, or never started).
+    #[default]
+    Offline,
+    /// A connect/login attempt is in flight.
+    Connecting,
+    /// Connected and serving.
+    Connected,
+    /// Failed (the adapter logs the specifics; this carries only the coarse state).
+    Error,
+}
+
+/// A normalized presence primitive (libpurple `PurplePresencePrimitive` / Kopete `OnlineStatus`
+/// category / Adium `AIStatusSummary`). Each adapter maps its wire-format presence into this so the
+/// unified roster sorts/filters uniformly across transports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresenceState {
+    /// Presence is unknown / not reported by this transport.
+    #[default]
+    Unknown,
+    /// Offline.
+    Offline,
+    /// Available / online.
+    Available,
+    /// Idle.
+    Idle,
+    /// Away.
+    Away,
+    /// Busy / do-not-disturb.
+    Busy,
+}
+
+/// What an events-IO transport adapter can do — the capability descriptor generic UI reads to
+/// capability-gate affordances (join channel, invite, set topic, send file) instead of switching on
+/// a transport-family string. The daemon analogue of libpurple's `implements_*()` probes / Kopete's
+/// `Capability` flags / Adium's per-service bool flags (daemon-transport-adapter-spec.md §3.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterCapabilities {
+    /// Supports group/channel conversations (`OriginScope::Group`).
+    pub rooms: bool,
+    /// Supports 1:1 direct messages (`OriginScope::Dm`).
+    pub direct_messages: bool,
+    /// Reports per-account / peer presence.
+    pub presence: bool,
+    /// Supports live room/conversation enumeration (not merely routing pins).
+    pub room_enumeration: bool,
+    /// Supports file/attachment transfer.
+    pub file_transfer: bool,
+    /// Drives an interactive login (the `AuthApi` flow).
+    pub interactive_auth: bool,
+}
+
+/// The typed account-setup form for an adapter — the generalisation of
+/// [`AuthProviderInfo::params_schema`] beyond interactive-auth flows. An adapter with no login (the
+/// HTTP surface, the internal Rooms loopback) still describes its instance config (a listen address,
+/// a room-id prefix) with the same [`AuthParamField`] shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSettingsSchema {
+    /// The fields the client collects to configure one account/instance of this adapter.
+    pub fields: Vec<AuthParamField>,
+}
+
+/// A self-describing events-IO transport adapter (the declarative analogue of libpurple's
+/// `PurpleProtocol` / Kopete's `Kopete::Protocol` / Adium's `AIService`). Enumerated by
+/// [`ControlApi::transport_adapters`] so the GUI renders the "Add channel" picker and
+/// capability-gates UI (daemon-transport-adapter-spec.md §3).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterInfo {
+    /// The transport family / adapter id (`"matrix"`, `"room"`, `"http"`, `"a2a"`).
+    pub family: String,
+    /// A human display name (`"Matrix"`, `"Rooms (internal)"`).
+    pub display_name: String,
+    /// What this adapter supports (drives capability-gated affordances).
+    pub capabilities: AdapterCapabilities,
+    /// The account-setup form for a new instance of this adapter.
+    #[serde(default)]
+    pub account_schema: AccountSettingsSchema,
+}
+
+/// One configured transport instance (account) plus its live status — what the GUI status bar and
+/// the unified conversation roster render (the Pidgin/Kopete per-account status-icon analogue).
+/// Closes the per-account connection-state gap (`EIO-9`) the channels user stories track.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportInstanceInfo {
+    /// The instance-qualified transport id (e.g. `matrix/@bot:hs.org`, `room`).
+    pub transport: TransportId,
+    /// The adapter family this instance belongs to.
+    pub family: String,
+    /// A human label for the account (e.g. the resolved `@user:hs.org`).
+    pub display_name: String,
+    /// The live connection state.
+    #[serde(default)]
+    pub connection: ConnectionState,
+    /// The reported presence (or `Unknown`).
+    #[serde(default)]
+    pub presence: PresenceState,
+    /// The profile this instance is bound to, when one is.
+    #[serde(default)]
+    pub bound_profile: Option<ProfileRef>,
+}
+
+/// A self-describing events-IO transport adapter — the declarative analogue of libpurple's
+/// `PurpleProtocol`, Kopete's `Kopete::Protocol`, and Adium's `AIService`
+/// (daemon-transport-adapter-spec.md §3.1). It adds *identity + capabilities + a lifecycle entry
+/// point* on top of the existing per-adapter mechanics: `serve` is expected to wire the reusable
+/// `daemon-ingest` (inbound) + `daemon-delivery` (outbound) halves exactly as the bespoke
+/// `serve(api, cfg)` functions do today — this trait does **not** reimplement them. Co-located with
+/// the capability DTOs so an adapter crate (which already depends on `daemon-api`) implements it
+/// without a new dependency, and the host `AdapterRegistry` can hold `Arc<dyn TransportAdapter>`.
+///
+/// Skeleton status: the trait + the optional capability marker traits below are declared but not yet
+/// implemented by any adapter; the registry enumerates `info()` only. Retrofitting
+/// `daemon-matrix`/`daemon-rooms`/`daemon-http` and driving `serve` from the registry is deferred
+/// (spec §7 P1).
+#[async_trait]
+pub trait TransportAdapter: Send + Sync {
+    /// The transport family / adapter id (`"matrix"`, `"room"`, `"http"`, `"a2a"`).
+    fn family(&self) -> &str;
+
+    /// The descriptor the GUI reads (display name, capabilities, account-setup schema).
+    fn info(&self) -> AdapterInfo;
+
+    /// Drive the transport until shutdown, wiring `daemon-ingest`/`daemon-delivery`.
+    /// Registry-spawned via [`crate`]-side `AdapterRegistry::spawn_all`.
+    async fn serve(self: std::sync::Arc<Self>, api: std::sync::Arc<dyn NodeApi>);
+
+    /// Configured instances (accounts) with live connection/presence state (the daemon analogue of
+    /// libpurple's account manager). Default: empty.
+    async fn instances(&self) -> Vec<TransportInstanceInfo> {
+        Vec::new()
+    }
+
+    /// Is this transport a messaging protocol (the libpurple `PurpleProtocol` analogue)? Generic
+    /// (non-chat) transports return `None` (daemon-messaging-adapter-spec.md §3.1).
+    fn messaging(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn MessagingProtocol>> {
+        None
+    }
+}
+
+/// A messaging protocol — the faithful port of libpurple's `PurpleProtocol`: a [`TransportAdapter`]
+/// that additionally validates accounts and exposes the optional conversation / membership / roster /
+/// contacts / directory / file-transfer feature interfaces (daemon-messaging-adapter-spec.md §3.1.1).
+#[async_trait]
+pub trait MessagingProtocol: TransportAdapter {
+    /// Validate proposed account settings (← `validate_account`). Default: Ok.
+    async fn validate_account(&self, _settings: &AccountSettingsValues) -> Result<(), ApiError> {
+        Ok(())
+    }
+
+    fn conversations(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsConversations>> { None }
+    fn membership(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsMembership>> { None }
+    fn roster(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsRoster>> { None }
+    fn contacts(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsContacts>> { None }
+    fn directory(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsDirectory>> { None }
+    fn file_transfer(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsFileTransfer>> { None }
+}
+
+/// Per-verb capability probe for [`SupportsConversations`] (← libpurple's `implements_*`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationOps {
+    pub create: bool,
+    pub join_channel: bool,
+    pub leave: bool,
+    pub delete: bool,
+    pub send: bool,
+    pub set_topic: bool,
+    pub set_title: bool,
+    pub set_description: bool,
+}
+
+/// Conversation management (← `purpleprotocolconversation.h`). Methods default to
+/// `Err(ApiError::Unsupported)` / empty; an adapter overrides what it supports and reports it in
+/// [`ConversationOps`]. There is deliberately no `invite` verb here (membership is [`SupportsMembership`]).
+#[async_trait]
+pub trait SupportsConversations: Send + Sync {
+    fn supported(&self) -> ConversationOps;
+
+    async fn list(&self, _transport: TransportId) -> Vec<ConversationInfo> { Vec::new() }
+    async fn get(&self, _transport: TransportId, _conv: String) -> Option<ConversationInfo> { None }
+
+    async fn create_details(&self, _transport: TransportId) -> CreateConversationDetails {
+        CreateConversationDetails::default()
+    }
+    async fn create(&self, _transport: TransportId, _details: CreateConversationDetails) -> Result<ConversationInfo, ApiError> {
+        Err(ApiError::Unsupported("conv_create".into()))
+    }
+
+    async fn channel_join_details(&self, _transport: TransportId) -> ChannelJoinDetails {
+        ChannelJoinDetails::default()
+    }
+    async fn join_channel(&self, _transport: TransportId, _details: ChannelJoinDetails) -> Result<ConversationInfo, ApiError> {
+        Err(ApiError::Unsupported("conv_join".into()))
+    }
+
+    async fn leave(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_leave".into()))
+    }
+    async fn delete(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_delete".into()))
+    }
+    async fn send(&self, _transport: TransportId, _conv: String, _from: Option<Participant>, _message: UserMsg) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_send".into()))
+    }
+    async fn set_topic(&self, _transport: TransportId, _conv: String, _topic: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_set_topic".into()))
+    }
+    async fn set_title(&self, _transport: TransportId, _conv: String, _title: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_set_title".into()))
+    }
+    async fn set_description(&self, _transport: TransportId, _conv: String, _description: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("conv_set_description".into()))
+    }
+}
+
+/// Per-verb probe for [`SupportsMembership`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipOps {
+    pub invite: bool,
+    pub remove: bool,
+    pub ban: bool,
+    pub set_role: bool,
+}
+
+/// Membership administration of an existing conversation (daemon-messaging-adapter-spec.md §3.2.1):
+/// invite is first-class cross-protocol (libpurple 2 `chat_invite`, Adium, Kopete); kick/ban/role are
+/// optional. Methods default to `Err(ApiError::Unsupported)`.
+#[async_trait]
+pub trait SupportsMembership: Send + Sync {
+    fn supported(&self) -> MembershipOps;
+    async fn invite(&self, _transport: TransportId, _conv: String, _who: Participant, _message: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_invite".into()))
+    }
+    async fn remove(&self, _transport: TransportId, _conv: String, _who: Participant, _reason: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_remove".into()))
+    }
+    async fn ban(&self, _transport: TransportId, _conv: String, _who: Participant, _reason: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_ban".into()))
+    }
+    async fn set_role(&self, _transport: TransportId, _conv: String, _who: Participant, _role: MemberRole) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("member_set_role".into()))
+    }
+}
+
+/// Per-verb probe for [`SupportsRoster`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterOps { pub add: bool, pub update: bool, pub remove: bool }
+
+/// Account-level server-side contact list (← `purpleprotocolroster.h`). Defined; no adapter yet.
+#[async_trait]
+pub trait SupportsRoster: Send + Sync {
+    fn supported(&self) -> RosterOps;
+    async fn add(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("roster_add".into()))
+    }
+    async fn update(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("roster_update".into()))
+    }
+    async fn remove(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("roster_remove".into()))
+    }
+}
+
+/// Per-verb probe for [`SupportsContacts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactsOps { pub get_profile: bool, pub action_menu: bool, pub set_alias: bool }
+
+/// Remote-contact operations (← `purpleprotocolcontacts.h`). Defined; no adapter yet.
+#[async_trait]
+pub trait SupportsContacts: Send + Sync {
+    fn supported(&self) -> ContactsOps;
+    async fn get_profile(&self, _transport: TransportId, _contact: ContactInfo) -> Result<String, ApiError> {
+        Err(ApiError::Unsupported("contact_get_profile".into()))
+    }
+    fn action_menu(&self, _transport: TransportId, _contact: ContactInfo) -> Option<ActionMenu> { None }
+    async fn set_alias(&self, _transport: TransportId, _contact: ContactInfo, _alias: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("contact_set_alias".into()))
+    }
+}
+
+/// Contact/room directory search (← `purpleprotocoldirectory.h`; also the libpurple roomlist successor).
+#[async_trait]
+pub trait SupportsDirectory: Send + Sync {
+    fn supported(&self) -> bool;
+    async fn search_contacts(&self, _transport: TransportId, _query: Option<String>) -> Result<Vec<ContactInfo>, ApiError> {
+        Err(ApiError::Unsupported("directory_search".into()))
+    }
+}
+
+/// Per-verb probe for [`SupportsFileTransfer`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferOps { pub send: bool, pub receive: bool }
+
+/// File transfer (← `purpleprotocolfiletransfer.h`). Defined; no adapter yet.
+#[async_trait]
+pub trait SupportsFileTransfer: Send + Sync {
+    fn supported(&self) -> FileTransferOps;
+    async fn send(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("file_transfer_send".into()))
+    }
+    async fn receive(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("file_transfer_receive".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messaging-adapter data model (daemon-messaging-adapter-spec.md §5)
+// ---------------------------------------------------------------------------
+
+/// ← PurpleConversationType.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationType {
+    /// Unset / unknown (faithful round-trip; libpurple keeps `*_UNSET`).
+    #[default]
+    Unset,
+    /// A 1:1 direct message.
+    Dm,
+    /// A group direct message (a protocol-bounded number of participants).
+    GroupDm,
+    /// A multi-user channel.
+    Channel,
+    /// A thread within a conversation.
+    Thread,
+}
+
+/// ← PurpleTypingState.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypingState {
+    /// Not typing.
+    #[default]
+    None,
+    /// Currently typing.
+    Typing,
+    /// Typed but paused.
+    Paused,
+}
+
+/// Normalized presence primitive (← `PurplePresencePrimitive`, the faithful 8-value set).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresencePrimitive {
+    /// Offline / unknown.
+    #[default]
+    Offline,
+    /// Online and available.
+    Available,
+    /// Online but idle.
+    Idle,
+    /// Online but invisible to others.
+    Invisible,
+    /// Away from the device.
+    Away,
+    /// Do not disturb.
+    DoNotDisturb,
+    /// Streaming.
+    Streaming,
+    /// Out of office.
+    OutOfOffice,
+}
+
+/// ← PurplePresence: a primitive plus optional status decorations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Presence {
+    /// The presence primitive.
+    pub primitive: PresencePrimitive,
+    /// A free-text status message, when set.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// A mood emoji, when set.
+    #[serde(default)]
+    pub emoji: Option<String>,
+    /// Whether the peer is on a mobile device.
+    #[serde(default)]
+    pub mobile: bool,
+    /// Unix seconds since which the peer has been idle (`None` = not idle).
+    #[serde(default)]
+    pub idle_since: Option<u64>,
+}
+
+/// ← PurpleContactInfoPermission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactPermission {
+    /// Unset.
+    #[default]
+    Unset,
+    /// Allowed to contact the user.
+    Allow,
+    /// Denied.
+    Deny,
+}
+
+/// ← PurpleContactInfo: the information used wherever a remote party is referenced.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactInfo {
+    /// The adapter-opaque contact id.
+    pub id: String,
+    /// A human display name, when known.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The contact's presence.
+    #[serde(default)]
+    pub presence: Presence,
+    /// Whether the contact may message the user.
+    #[serde(default)]
+    pub permission: ContactPermission,
+}
+
+/// A per-participant role/affiliation (← Adium `AIGroupChatFlags` / libpurple badges / XMPP affiliations).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberRole {
+    /// No special role.
+    #[default]
+    None,
+    /// Voice.
+    Voice,
+    /// Half-operator.
+    HalfOp,
+    /// Operator.
+    Op,
+    /// Founder/owner.
+    Founder,
+}
+
+/// Who an [`SupportsMembership`] op targets, and the [`SupportsConversations::send`] author. `Contact`
+/// is the faithful libpurple identity (a human/remote contact); `Agent` is the delineated daemon
+/// extension — an agent bound as a participant (`member` is its in-conversation handle, `profile`
+/// resolves to a session).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Participant {
+    /// A human/remote contact.
+    Contact(ContactInfo),
+    /// A daemon agent participant.
+    Agent {
+        /// The profile the agent runs under.
+        profile: ProfileRef,
+        /// The in-conversation member handle.
+        member: String,
+    },
+}
+
+/// One occupant of a conversation (← PurpleConversationMember). Observed state the protocol populates
+/// from sync; `session` is the daemon extension binding the member to an engine incarnation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMember {
+    /// The participant's contact info.
+    pub contact: ContactInfo,
+    /// A conversation-local alias.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// A conversation-local nickname.
+    #[serde(default)]
+    pub nickname: Option<String>,
+    /// The member's typing state.
+    #[serde(default)]
+    pub typing: TypingState,
+    /// The member's observed role/affiliation.
+    #[serde(default)]
+    pub role: MemberRole,
+    /// The engine session this member drives, when it is a daemon agent (daemon extension).
+    #[serde(default)]
+    pub session: Option<SessionId>,
+}
+
+/// A conversation as the host/GUI sees it — the `list`/`get` projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationInfo {
+    /// The transport that owns the conversation.
+    pub transport: TransportId,
+    /// The adapter-opaque conversation id within `transport`.
+    pub id: String,
+    /// The conversation kind.
+    pub kind: ConversationType,
+    /// A human title, when set.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The topic, when set.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// A description, when set.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The observed members/occupants.
+    #[serde(default)]
+    pub members: Vec<ConversationMember>,
+}
+
+/// Filled values for an adapter-described settings form (the companion to [`AccountSettingsSchema`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSettingsValues {
+    /// The filled `key -> value` pairs (keyed by [`AuthParamField::key`]).
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+}
+
+/// ← PurpleCreateConversationDetails: the typed common core plus adapter-described extras the UI fills
+/// before `create` (e.g. the Rooms floor policy rides in `extras`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateConversationDetails {
+    /// Max participants (`0` = unlimited).
+    #[serde(default)]
+    pub max_participants: u32,
+    /// The initial participants (create-time only).
+    #[serde(default)]
+    pub participants: Vec<ContactInfo>,
+    /// The adapter-provided extras form.
+    #[serde(default)]
+    pub extras_schema: AccountSettingsSchema,
+    /// The filled extras (e.g. room name + policy).
+    #[serde(default)]
+    pub extras: AccountSettingsValues,
+}
+
+/// ← PurpleChannelJoinDetails.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelJoinDetails {
+    /// The channel name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Max channel-name length (`0` = no limit).
+    #[serde(default)]
+    pub name_max_length: u32,
+    /// The user's channel nickname.
+    #[serde(default)]
+    pub nickname: Option<String>,
+    /// Whether per-channel nicknames are supported.
+    #[serde(default)]
+    pub nickname_supported: bool,
+    /// Max nickname length.
+    #[serde(default)]
+    pub nickname_max_length: u32,
+    /// The channel password.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Whether passwords are supported.
+    #[serde(default)]
+    pub password_supported: bool,
+    /// Max password length.
+    #[serde(default)]
+    pub password_max_length: u32,
+    /// The adapter-provided extras form.
+    #[serde(default)]
+    pub extras_schema: AccountSettingsSchema,
+    /// The filled extras.
+    #[serde(default)]
+    pub extras: AccountSettingsValues,
+}
+
+/// Minimal avatar carrier for the (deferred) avatar/file interfaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    /// The content-addressed image blob.
+    pub blob: BlobRef,
+}
+
+/// Minimal contact action-menu carrier (← `BirbActionMenu`; deferred).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionMenu {
+    /// The action labels.
+    pub items: Vec<String>,
+}
+
+/// Minimal file-transfer carrier (← `PurpleFileTransfer`; deferred).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransfer {
+    /// The file name.
+    pub name: String,
+    /// The content-addressed blob.
+    pub blob: BlobRef,
+}
+
+// ---------------------------------------------------------------------------
 // Verifiable journal read DTOs (the non-destructive reconnect / scroll-back surface)
 // ---------------------------------------------------------------------------
 
@@ -2812,6 +3570,162 @@ pub enum ApiRequest {
         /// The transport instance.
         transport: TransportId,
     },
+    /// [`ControlApi::transport_adapters`] — the available adapter families + capabilities + schema.
+    TransportAdapters,
+    /// [`ControlApi::transport_instances`] — the configured instances + live connection/presence.
+    TransportInstances,
+    /// [`ControlApi::conv_list`] — a transport's conversations.
+    ConvList {
+        /// The owning transport.
+        transport: TransportId,
+    },
+    /// [`ControlApi::conv_get`] — one conversation by id.
+    ConvGet {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+    },
+    /// [`ControlApi::conv_create_details`] — the typed create form.
+    ConvCreateDetails {
+        /// The owning transport.
+        transport: TransportId,
+    },
+    /// [`ControlApi::conv_create`] — create a conversation.
+    ConvCreate {
+        /// The owning transport.
+        transport: TransportId,
+        /// The filled create details.
+        details: CreateConversationDetails,
+    },
+    /// [`ControlApi::conv_join_details`] — the typed join form.
+    ConvJoinDetails {
+        /// The owning transport.
+        transport: TransportId,
+    },
+    /// [`ControlApi::conv_join`] — join a channel.
+    ConvJoin {
+        /// The owning transport.
+        transport: TransportId,
+        /// The filled join details.
+        details: ChannelJoinDetails,
+    },
+    /// [`ControlApi::conv_leave`] — leave a conversation.
+    ConvLeave {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+    },
+    /// [`ControlApi::conv_send`] — send into a conversation.
+    ConvSend {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// The author (`None` = the account/operator).
+        #[serde(default)]
+        from: Option<Participant>,
+        /// The message.
+        message: UserMsg,
+    },
+    /// [`ControlApi::conv_set_topic`].
+    ConvSetTopic {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// The new topic (`None` clears).
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    /// [`ControlApi::conv_set_title`].
+    ConvSetTitle {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// The new title.
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// [`ControlApi::conv_set_description`].
+    ConvSetDescription {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// The new description.
+        #[serde(default)]
+        description: Option<String>,
+    },
+    /// [`ControlApi::conv_delete`] — delete/destroy a conversation.
+    ConvDelete {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+    },
+    /// [`ControlApi::conv_history`] — the conversation's durable verifiable transcript.
+    ConvHistory {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// Return entries with cursor strictly greater than this (`0` from the start).
+        #[serde(default)]
+        after_cursor: u64,
+        /// Max entries (`0` = all).
+        #[serde(default)]
+        max: u32,
+    },
+    /// [`ControlApi::member_invite`] — invite/add a participant.
+    MemberInvite {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// Who to invite.
+        who: Participant,
+        /// An optional invite message.
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// [`ControlApi::member_remove`] — remove/kick a participant.
+    MemberRemove {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// Who to remove.
+        who: Participant,
+        /// An optional reason.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// [`ControlApi::member_ban`] — ban a participant.
+    MemberBan {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// Who to ban.
+        who: Participant,
+        /// An optional reason.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// [`ControlApi::member_set_role`] — set a participant's role.
+    MemberSetRole {
+        /// The owning transport.
+        transport: TransportId,
+        /// The conversation id.
+        conv: String,
+        /// Whose role to set.
+        who: Participant,
+        /// The new role.
+        role: MemberRole,
+    },
     /// [`ControlApi::fs_roots`].
     FsRoots,
     /// [`ControlApi::fs_list`].
@@ -3031,6 +3945,18 @@ pub enum ApiResponse {
     ChatRoute(Option<ChatRoute>),
     /// A transport instance's rooms (transport_rooms).
     Rooms(Vec<RoomInfo>),
+    /// A transport's conversations (conv_list).
+    Conversations(Vec<ConversationInfo>),
+    /// One conversation, if present (conv_get / conv_create / conv_join).
+    Conversation(Option<ConversationInfo>),
+    /// The typed create-conversation form (conv_create_details).
+    ConvCreateDetails(CreateConversationDetails),
+    /// The typed channel-join form (conv_join_details).
+    ConvJoinDetails(ChannelJoinDetails),
+    /// The available transport adapters (transport_adapters).
+    Adapters(Vec<AdapterInfo>),
+    /// The configured transport instances + live status (transport_instances).
+    TransportInstances(Vec<TransportInstanceInfo>),
     /// A failure (the interface's `ApiError`, round-tripped faithfully).
     Error(ApiError),
     /// The browsable filesystem roots (fs_roots).
@@ -3600,6 +4526,69 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::TransportRooms { transport } => {
             ApiResponse::Rooms(api.transport_rooms(transport).await)
         }
+        ApiRequest::ConvList { transport } => {
+            ApiResponse::Conversations(api.conv_list(transport).await)
+        }
+        ApiRequest::ConvGet { transport, conv } => {
+            ApiResponse::Conversation(api.conv_get(transport, conv).await)
+        }
+        ApiRequest::ConvCreateDetails { transport } => {
+            ApiResponse::ConvCreateDetails(api.conv_create_details(transport).await)
+        }
+        ApiRequest::ConvCreate { transport, details } => {
+            match api.conv_create(transport, details).await {
+                Ok(info) => ApiResponse::Conversation(Some(info)),
+                Err(e) => ApiResponse::Error(e),
+            }
+        }
+        ApiRequest::ConvJoinDetails { transport } => {
+            ApiResponse::ConvJoinDetails(api.conv_join_details(transport).await)
+        }
+        ApiRequest::ConvJoin { transport, details } => {
+            match api.conv_join(transport, details).await {
+                Ok(info) => ApiResponse::Conversation(Some(info)),
+                Err(e) => ApiResponse::Error(e),
+            }
+        }
+        ApiRequest::ConvLeave { transport, conv } => {
+            unit_or_err(api.conv_leave(transport, conv).await)
+        }
+        ApiRequest::ConvSend { transport, conv, from, message } => {
+            unit_or_err(api.conv_send(transport, conv, from, message).await)
+        }
+        ApiRequest::ConvSetTopic { transport, conv, topic } => {
+            unit_or_err(api.conv_set_topic(transport, conv, topic).await)
+        }
+        ApiRequest::ConvSetTitle { transport, conv, title } => {
+            unit_or_err(api.conv_set_title(transport, conv, title).await)
+        }
+        ApiRequest::ConvSetDescription { transport, conv, description } => {
+            unit_or_err(api.conv_set_description(transport, conv, description).await)
+        }
+        ApiRequest::ConvDelete { transport, conv } => {
+            unit_or_err(api.conv_delete(transport, conv).await)
+        }
+        ApiRequest::ConvHistory { transport, conv, after_cursor, max } => {
+            ApiResponse::Journal(api.conv_history(transport, conv, after_cursor, max).await)
+        }
+        ApiRequest::MemberInvite { transport, conv, who, message } => {
+            unit_or_err(api.member_invite(transport, conv, who, message).await)
+        }
+        ApiRequest::MemberRemove { transport, conv, who, reason } => {
+            unit_or_err(api.member_remove(transport, conv, who, reason).await)
+        }
+        ApiRequest::MemberBan { transport, conv, who, reason } => {
+            unit_or_err(api.member_ban(transport, conv, who, reason).await)
+        }
+        ApiRequest::MemberSetRole { transport, conv, who, role } => {
+            unit_or_err(api.member_set_role(transport, conv, who, role).await)
+        }
+        ApiRequest::TransportAdapters => {
+            ApiResponse::Adapters(api.transport_adapters().await)
+        }
+        ApiRequest::TransportInstances => {
+            ApiResponse::TransportInstances(api.transport_instances().await)
+        }
         ApiRequest::FsRoots => ApiResponse::FsRoots(api.fs_roots().await),
         ApiRequest::FsList {
             root,
@@ -3755,6 +4744,88 @@ mod tests {
             let bytes = to_cbor(&req);
             let back: ApiRequest = from_cbor(&bytes).unwrap();
             assert_eq!(req, back);
+        }
+    }
+
+    #[test]
+    fn messaging_requests_and_responses_round_trip() {
+        let transport = TransportId::new("room");
+        let who = Participant::Agent {
+            profile: ProfileRef::new("opus"),
+            member: "@bot".into(),
+        };
+        let reqs = vec![
+            ApiRequest::ConvList { transport: transport.clone() },
+            ApiRequest::ConvGet { transport: transport.clone(), conv: "r1".into() },
+            ApiRequest::ConvCreateDetails { transport: transport.clone() },
+            ApiRequest::ConvCreate { transport: transport.clone(), details: CreateConversationDetails::default() },
+            ApiRequest::ConvJoinDetails { transport: transport.clone() },
+            ApiRequest::ConvJoin { transport: transport.clone(), details: ChannelJoinDetails::default() },
+            ApiRequest::ConvLeave { transport: transport.clone(), conv: "r1".into() },
+            ApiRequest::ConvSend { transport: transport.clone(), conv: "r1".into(), from: Some(who.clone()), message: UserMsg::new("hi") },
+            ApiRequest::ConvSetTopic { transport: transport.clone(), conv: "r1".into(), topic: Some("t".into()) },
+            ApiRequest::ConvSetTitle { transport: transport.clone(), conv: "r1".into(), title: None },
+            ApiRequest::ConvSetDescription { transport: transport.clone(), conv: "r1".into(), description: Some("d".into()) },
+            ApiRequest::ConvDelete { transport: transport.clone(), conv: "r1".into() },
+            ApiRequest::ConvHistory { transport: transport.clone(), conv: "r1".into(), after_cursor: 0, max: 16 },
+            ApiRequest::MemberInvite { transport: transport.clone(), conv: "r1".into(), who: who.clone(), message: None },
+            ApiRequest::MemberRemove { transport: transport.clone(), conv: "r1".into(), who: who.clone(), reason: Some("bye".into()) },
+            ApiRequest::MemberBan { transport: transport.clone(), conv: "r1".into(), who: who.clone(), reason: None },
+            ApiRequest::MemberSetRole { transport: transport.clone(), conv: "r1".into(), who: who.clone(), role: MemberRole::Op },
+            ApiRequest::TransportAdapters,
+            ApiRequest::TransportInstances,
+        ];
+        for req in reqs {
+            let bytes = to_cbor(&req);
+            let back: ApiRequest = from_cbor(&bytes).unwrap();
+            assert_eq!(req, back);
+        }
+
+        let info = ConversationInfo {
+            transport: transport.clone(),
+            id: "r1".into(),
+            kind: ConversationType::GroupDm,
+            title: Some("Room 1".into()),
+            topic: None,
+            description: None,
+            members: vec![ConversationMember {
+                contact: ContactInfo {
+                    id: "@bot".into(),
+                    display_name: None,
+                    presence: Presence::default(),
+                    permission: ContactPermission::Unset,
+                },
+                alias: None,
+                nickname: None,
+                typing: TypingState::None,
+                role: MemberRole::Op,
+                session: Some(SessionId::new("sess-1")),
+            }],
+        };
+        let resps = vec![
+            ApiResponse::Conversations(vec![info.clone()]),
+            ApiResponse::Conversation(Some(info.clone())),
+            ApiResponse::ConvCreateDetails(CreateConversationDetails::default()),
+            ApiResponse::ConvJoinDetails(ChannelJoinDetails::default()),
+            ApiResponse::TransportInstances(vec![TransportInstanceInfo {
+                transport: transport.clone(),
+                family: "room".into(),
+                display_name: "Rooms".into(),
+                connection: ConnectionState::Connected,
+                presence: PresenceState::Unknown,
+                bound_profile: None,
+            }]),
+            ApiResponse::Adapters(vec![AdapterInfo {
+                family: "room".into(),
+                display_name: "Rooms".into(),
+                capabilities: AdapterCapabilities::default(),
+                account_schema: AccountSettingsSchema::default(),
+            }]),
+        ];
+        for resp in resps {
+            let bytes = to_cbor(&resp);
+            let back: ApiResponse = from_cbor(&bytes).unwrap();
+            assert_eq!(resp, back);
         }
     }
 

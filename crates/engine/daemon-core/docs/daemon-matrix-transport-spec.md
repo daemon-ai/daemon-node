@@ -6,6 +6,11 @@ outbound through a `daemon-delivery` `Projector`; see §10 for what is landed vs
 [`daemon-event-io-spec.md`](./daemon-event-io-spec.md); this doc is the concrete **P5 chat transport**
 that spec deferred, and the first real consumer of its §5.9 bidirectional-routing capability.
 
+> Matrix is also a reference implementor of the typed messaging-adapter interface in
+> [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md): it implements the base
+> `TransportAdapter` + `instances()` and a `SupportsConversations` subset (`send`, `set_topic`), with
+> `supported()` reporting the rest off — proving the interface generalizes beyond the internal Rooms loopback.
+
 A Matrix room is itself a bidirectional, ordered, server-synchronized event log with native inbound
 meta (typing / receipts / reactions) and a reply target. That is exactly the shape of the merged
 session log (event-io §5.4), so Matrix is the *ideal* validator of the "surface input events into

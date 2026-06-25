@@ -113,7 +113,8 @@ daemon/                              # cargo workspace root
 │   │   ├── daemon-mcp-client/
 │   │   ├── daemon-delivery/
 │   │   ├── daemon-ingest/
-│   │   └── daemon-matrix/
+│   │   ├── daemon-matrix/
+│   │   └── daemon-rooms/           #   internal Rooms loopback transport (N-party chat; reuses ingest/delivery)
 │   │
 │   ├── coprocessor/
 │   │   ├── daemon-metta/

@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapters;
 pub mod agent_session;
 pub mod auth;
 pub mod background;
@@ -104,6 +105,7 @@ pub use blob_store::{BlobError, BlobStore, FileBlobStore, MAX_BLOB_SIZE};
 pub use commands::{
     access_allows, caller_access, Builtin, CommandRegistry, Entry as CommandEntry, Owner as CommandOwner,
 };
+pub use adapters::AdapterRegistry;
 pub use socket::{serve_api_unix, ApiClient};
 pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};
 pub use streamjson::StreamJsonCodec;

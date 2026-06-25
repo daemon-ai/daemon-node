@@ -14,10 +14,12 @@
 #![recursion_limit = "512"]
 
 mod account;
+pub mod adapter;
 mod auth;
 pub mod config;
 mod inbound;
 mod login;
+mod mapping;
 mod outbound;
 
 use std::collections::HashMap;
@@ -33,6 +35,7 @@ use daemon_host::AccountProvisioning;
 use daemon_protocol::TransportId;
 
 pub use account::{Account, StoredSession};
+pub use adapter::MatrixAdapter;
 pub use auth::{sso_begin, sso_complete, MatrixAuthFlowFactory, MatrixLogin, SsoSession};
 pub use config::{MatrixConfig, MatrixRoute};
 pub use inbound::{on_room_message, InboundCtx};
@@ -43,6 +46,14 @@ use account::{account_store_dir, bare_account, build_client};
 
 /// The transport family this adapter provisions (`AccountProvisioning::bound_accounts`).
 pub(crate) const FAMILY: &str = "matrix";
+
+/// The shared registry of live, session-restored clients keyed by their instance-qualified
+/// transport id (`matrix/@bot:hs.org`). Populated by [`serve`] at bring-up and read by the
+/// `MessagingProtocol` feature-trait method bodies (which only hold `&self`, so they recover the
+/// account's [`Client`] from here). A `tokio::sync::RwLock` (not std) so the read in an `async`
+/// verb body never blocks the runtime, and writers (bring-up) don't hold a guard across an await.
+pub(crate) type LiveClients =
+    Arc<tokio::sync::RwLock<HashMap<TransportId, Client>>>;
 
 /// Persist refreshed session tokens back to the credential subsystem (spec §6.2: the credential
 /// store is authoritative over the SDK's session copy). matrix-sdk refreshes tokens in-memory (the
@@ -91,6 +102,7 @@ pub async fn serve(
     api: Arc<dyn NodeApi>,
     provisioning: Arc<dyn AccountProvisioning>,
     cfg: MatrixConfig,
+    live_clients: LiveClients,
 ) {
     if !cfg.enabled {
         return;
@@ -166,6 +178,16 @@ pub async fn serve(
     if brought_up.is_empty() {
         tracing::warn!("matrix: no accounts could be brought up; exiting");
         return;
+    }
+
+    // Publish the live clients so the adapter's `SupportsConversations`/`SupportsMembership` method
+    // bodies (which only have `&self`) can resolve the per-account `Client` to execute management
+    // verbs against (send / set_topic / create / m.room.member invite·kick·ban·power-levels).
+    {
+        let mut guard = live_clients.write().await;
+        for acct in &brought_up {
+            guard.insert(acct.transport.clone(), acct.client.clone());
+        }
     }
 
     let projector = Arc::new(MatrixProjector::new(

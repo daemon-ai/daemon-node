@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 17)
+wire_version = uint                 ; daemon-common WireVersion (current = 19)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id  = tstr
@@ -658,6 +658,48 @@ auth-complete-response = {
   bound_profile: (tstr / null),
 }
 
+; ----- transport-adapter framework + messaging data model (wire v18) -----
+account-settings-schema = { ? fields: [* auth-param-field] }
+account-settings-values = { ? values: { * tstr => tstr } }
+adapter-capabilities = {
+  rooms: bool, direct_messages: bool, presence: bool,
+  room_enumeration: bool, file_transfer: bool, interactive_auth: bool,
+}
+adapter-info = { family: tstr, display_name: tstr, capabilities: adapter-capabilities, ? account_schema: account-settings-schema }
+connection-state = "Offline" / "Connecting" / "Connected" / "Error"
+presence-state = "Unknown" / "Offline" / "Available" / "Idle" / "Away" / "Busy"
+transport-instance-info = {
+  transport: transport-id, family: tstr, display_name: tstr,
+  ? connection: connection-state, ? presence: presence-state, ? bound_profile: (profile-ref / null),
+}
+conversation-type = "Unset" / "Dm" / "GroupDm" / "Channel" / "Thread"
+member-role = "None" / "Voice" / "HalfOp" / "Op" / "Founder"
+typing-state = "None" / "Typing" / "Paused"
+presence-primitive = "Offline" / "Available" / "Idle" / "Invisible" / "Away" / "DoNotDisturb" / "Streaming" / "OutOfOffice"
+presence = { primitive: presence-primitive, ? message: (tstr / null), ? emoji: (tstr / null), ? mobile: bool, ? idle_since: (uint / null) }
+contact-permission = "Unset" / "Allow" / "Deny"
+contact-info = { id: tstr, ? display_name: (tstr / null), ? presence: presence, ? permission: contact-permission }
+participant = { "Contact": contact-info } / { "Agent": { profile: profile-ref, member: tstr } }
+conversation-member = {
+  contact: contact-info, ? alias: (tstr / null), ? nickname: (tstr / null),
+  ? typing: typing-state, ? role: member-role, ? session: (session-id / null),
+}
+conversation-info = {
+  transport: transport-id, id: tstr, kind: conversation-type,
+  ? title: (tstr / null), ? topic: (tstr / null), ? description: (tstr / null),
+  ? members: [* conversation-member],
+}
+create-conversation-details = {
+  ? max_participants: uint, ? participants: [* contact-info],
+  ? extras_schema: account-settings-schema, ? extras: account-settings-values,
+}
+channel-join-details = {
+  ? name: (tstr / null), ? name_max_length: uint,
+  ? nickname: (tstr / null), ? nickname_supported: bool, ? nickname_max_length: uint,
+  ? password: (tstr / null), ? password_supported: bool, ? password_max_length: uint,
+  ? extras_schema: account-settings-schema, ? extras: account-settings-values,
+}
+
 api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null), ? profile: (profile-ref / null) } }  ; profile wire v14 ("open chat as agent X")
             ; routing (wire v7): submit by origin; the host resolves session + profile + delivery -> Routed
             / { "SubmitRouted": { origin: origin, command: agent-command } }
@@ -784,6 +826,27 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "RoutingBindChat": { origin: origin, session: session-id, ? profile: (profile-ref / null) } }  ; -> Ok
             / { "RoutingUnbindChat": { origin: origin } }                               ; -> Ok
             / { "TransportRooms": { transport: transport-id } }                         ; -> Rooms
+            ; ----- transport-adapter framework (wire v18; daemon-transport-adapter-spec.md) -----
+            / "TransportAdapters"                                                        ; -> Adapters
+            / "TransportInstances"                                                       ; -> TransportInstances
+            ; ----- messaging-adapter management (wire v18; daemon-messaging-adapter-spec.md) -----
+            / { "ConvList": { transport: transport-id } }                                ; -> Conversations
+            / { "ConvGet": { transport: transport-id, conv: tstr } }                     ; -> Conversation
+            / { "ConvCreateDetails": { transport: transport-id } }                       ; -> ConvCreateDetails
+            / { "ConvCreate": { transport: transport-id, details: create-conversation-details } }  ; -> Conversation
+            / { "ConvJoinDetails": { transport: transport-id } }                         ; -> ConvJoinDetails
+            / { "ConvJoin": { transport: transport-id, details: channel-join-details } } ; -> Conversation
+            / { "ConvLeave": { transport: transport-id, conv: tstr } }                   ; -> Ok
+            / { "ConvSend": { transport: transport-id, conv: tstr, ? from: (participant / null), message: user-msg } }  ; -> Ok
+            / { "ConvSetTopic": { transport: transport-id, conv: tstr, ? topic: (tstr / null) } }        ; -> Ok
+            / { "ConvSetTitle": { transport: transport-id, conv: tstr, ? title: (tstr / null) } }        ; -> Ok
+            / { "ConvSetDescription": { transport: transport-id, conv: tstr, ? description: (tstr / null) } }  ; -> Ok
+            / { "ConvDelete": { transport: transport-id, conv: tstr } }                  ; -> Ok
+            / { "ConvHistory": { transport: transport-id, conv: tstr, ? after_cursor: uint, ? max: uint } }  ; -> Journal
+            / { "MemberInvite": { transport: transport-id, conv: tstr, who: participant, ? message: (tstr / null) } }  ; -> Ok
+            / { "MemberRemove": { transport: transport-id, conv: tstr, who: participant, ? reason: (tstr / null) } }  ; -> Ok
+            / { "MemberBan": { transport: transport-id, conv: tstr, who: participant, ? reason: (tstr / null) } }  ; -> Ok
+            / { "MemberSetRole": { transport: transport-id, conv: tstr, who: participant, role: member-role } }  ; -> Ok
             ; ----- filesystem / workspace surface (wire v14; daemon-fs-surface-spec.md) -----
             / "FsRoots"                                                                  ; -> FsRoots
             / { "FsList": { root: fs-root-id, dir: tstr, ? show_ignored: bool } }        ; -> FsList
@@ -862,6 +925,13 @@ api-response = "Ok"
              / { "ChatRoutes": [* chat-route] }
              / { "ChatRoute": (chat-route / null) }
              / { "Rooms": [* room-info] }
+             ; ----- transport-adapter framework + messaging management (wire v18) -----
+             / { "Adapters": [* adapter-info] }
+             / { "TransportInstances": [* transport-instance-info] }
+             / { "Conversations": [* conversation-info] }
+             / { "Conversation": (conversation-info / null) }
+             / { "ConvCreateDetails": create-conversation-details }
+             / { "ConvJoinDetails": channel-join-details }
              / { "Error": api-error }
              ; ----- filesystem / workspace surface (wire v14) -----
              / { "FsRoots": [* fs-root] }

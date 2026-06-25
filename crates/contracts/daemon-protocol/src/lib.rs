@@ -1029,6 +1029,103 @@ impl Origin {
 }
 
 // ---------------------------------------------------------------------------
+// Rooms: the internal loopback transport primitive (daemon-rooms-spec.md)
+// ---------------------------------------------------------------------------
+//
+// A Room is an N-participant conversation backed by an *internal loopback transport* — structurally a
+// chat transport (the `daemon-matrix` shape) whose "homeserver" is the daemon itself. Its identity is
+// `TransportId("room/<RoomId>")` + `OriginScope::Group { chat: <RoomId> }`, so every routing /
+// `session_id_for` / `DeliveryTarget` primitive above applies unchanged; the only novel logic is the
+// floor-control policy (whose turn it is). DM/session-to-session is a 2-participant Room, a group chat
+// is an N-participant Room, and the user observes as a `Spectator`. See `daemon-rooms-spec.md`.
+
+/// Stable identity of a [`Room`-backed](crate) N-participant conversation. The loopback transport
+/// instance a Room presents as is `TransportId("room/<RoomId>")`; its routing scope is
+/// `OriginScope::Group { chat: <RoomId> }` (mirrors `TransportId`'s hand-rolled newtype shape).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RoomId(pub String);
+
+impl RoomId {
+    /// Construct a room id from its stable handle.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The room id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The loopback transport instance this room presents as (`room/<id>`), the `TransportId` the
+    /// RoomRouter fans inbound posts out under and the outbound `Projector` re-injects through.
+    pub fn transport(&self) -> TransportId {
+        TransportId::new(format!("room/{}", self.0))
+    }
+}
+
+impl From<&str> for RoomId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for RoomId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// One participant of a [`RoomId`]-keyed Room: an agent (or the user) bound to a profile and a
+/// resolved per-member session. The membership table maps `(room, member) -> (ProfileRef,
+/// SessionId)`; the RoomRouter fans an inbound post out to each member's session via `submit_from`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMember {
+    /// The adapter-opaque member handle within the room (the speaker label / `@name`).
+    pub member: String,
+    /// The profile this member's session runs under (`None` = the registry's default precedence).
+    pub profile: Option<ProfileRef>,
+    /// The resolved per-member session id (the engine incarnation this participant drives).
+    pub session: SessionId,
+}
+
+impl RoomMember {
+    /// Construct a room member binding.
+    pub fn new(member: impl Into<String>, profile: Option<ProfileRef>, session: SessionId) -> Self {
+        Self {
+            member: member.into(),
+            profile,
+            session,
+        }
+    }
+}
+
+/// The floor-control / turn policy of a Room — the single genuinely novel piece of logic the
+/// RoomRouter applies before fanning a post out (echo-storm prevention is a `max_turns` budget the
+/// router enforces orthogonally to this choice). Each variant decides *whose* `TurnFinished` is
+/// re-injected as the next inbound post. The stub set; the policy engine lives in `daemon-rooms`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RoomPolicy {
+    /// Members take the floor in a fixed rotation (the default group-chat shape).
+    RoundRobin,
+    /// Only an explicitly addressed (mentioned) member opens a turn; others stay observers.
+    AddressedOnly,
+    /// One moderator member arbitrates who may speak next.
+    Moderator {
+        /// The member handle holding the floor-granting role.
+        profile: String,
+    },
+    /// No arbitration — every member turns on every post (bounded only by the turn budget).
+    FreeForAll,
+}
+
+impl Default for RoomPolicy {
+    fn default() -> Self {
+        RoomPolicy::AddressedOnly
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Durable transcript blocks (the verifiable journal's chat-entry payload)
 // ---------------------------------------------------------------------------
 

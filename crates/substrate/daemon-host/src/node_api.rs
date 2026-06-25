@@ -25,8 +25,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
-    from_cbor, to_cbor, AcpAgentEntry, AcpSource, ApiError, ApprovalInfo, ApprovalMode, AuthApi,
-    AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse,
+    from_cbor, to_cbor, AcpAgentEntry, AcpSource, AdapterInfo, ApiError, ApprovalInfo, ApprovalMode,
+    AuthApi, AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse,
     AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, CommandInvocation,
     CommandOutput, CommandScope, CommandSpec, ControlApi,
     CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, FsContent, FsEntry,
@@ -36,6 +36,8 @@ use daemon_api::{
     ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
     SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole,
     SessionScope, SessionSearchHit, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
+    ChannelJoinDetails, ConversationInfo, CreateConversationDetails, MemberRole,
+    Participant, SupportsConversations, SupportsMembership, TransportInstanceInfo,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -50,7 +52,7 @@ use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, AgentEvent, DeliveryTarget, Direction, Disposition, HostRequest,
     HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin,
-    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId,
+    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId, UserMsg,
 };
 use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -247,6 +249,15 @@ pub struct NodeApiImpl {
     /// `None` => routing is static (an explicit [`NodeApiImpl::with_routing`] table or the empty
     /// passthrough).
     routing_builder: Option<RoutingBuilder>,
+    /// The transport-adapter registry (daemon-transport-adapter-spec.md §3.4): the node's
+    /// self-describing events-IO adapters, enumerated read-only by `transport_adapters`. Empty by
+    /// default (skeleton: lifecycle still lives in `bins/daemon`; this only feeds the descriptor
+    /// enumeration). Installed by the assembling binary via [`NodeApiImpl::with_adapters`].
+    adapters: Arc<ArcSwap<crate::adapters::AdapterRegistry>>,
+    /// The lazily-opened verifiable-journal writer for the `node-management` stream: management
+    /// mutations (`conv_*`/`member_*`) are recorded + sealed onto it so the audit chains per op.
+    /// `None` until the first mutation (and stays `None` when journaling is disabled).
+    mgmt_journal: Arc<std::sync::Mutex<Option<Arc<JournalSink>>>>,
     /// The ACP-discovery hook (I7), injected by the binary (which owns the ACP runtime). `None` =>
     /// `acp_discover` yields nothing and the catalog is just the durable manual registrations.
     acp: Option<Arc<dyn AcpDiscovery>>,
@@ -334,6 +345,8 @@ impl NodeApiImpl {
             routing_base: Arc::new(ArcSwap::from_pointee(RoutingRegistry::new())),
             chat_pins: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             routing_builder: None,
+            adapters: Arc::new(ArcSwap::from_pointee(crate::adapters::AdapterRegistry::new())),
+            mgmt_journal: Arc::new(std::sync::Mutex::new(None)),
             acp: None,
             last_acp: Arc::new(std::sync::RwLock::new(Vec::new())),
             checkpoints: None,
@@ -447,6 +460,96 @@ impl NodeApiImpl {
         self.routing_base = Arc::new(ArcSwap::from_pointee(routing.clone()));
         self.routing = Arc::new(ArcSwap::from_pointee(routing));
         self
+    }
+
+    /// Install the transport-adapter registry (daemon-transport-adapter-spec.md §3.4): the node's
+    /// self-describing events-IO adapters, enumerated read-only by `transport_adapters`. Call during
+    /// assembly; absent, the node reports no adapters (the inert default). Lifecycle (`serve`) is not
+    /// yet driven from here — that is deferred (spec §7 P1).
+    pub fn with_adapters(mut self, adapters: crate::adapters::AdapterRegistry) -> Self {
+        self.adapters = Arc::new(ArcSwap::from_pointee(adapters));
+        self
+    }
+
+    /// Install (or replace) the transport-adapter registry **after** the node `Arc` exists — the
+    /// runtime-injection counterpart of [`with_adapters`]. Required for adapters that must hold the
+    /// assembled node as a seam (e.g. the Matrix adapter's `AccountProvisioning = node`), which cannot
+    /// be built before the node and so cannot ride the consuming builder.
+    pub fn set_adapters(&self, adapters: crate::adapters::AdapterRegistry) {
+        self.adapters.store(Arc::new(adapters));
+    }
+
+    /// Drive every registered adapter's [`serve`](daemon_api::TransportAdapter::serve) loop with this
+    /// node as their `api`, returning the spawned task handles (the binary aborts them on shutdown).
+    /// Registry-driven lifecycle (daemon-messaging-adapter-spec.md §12.1). Adapters do not hold an
+    /// `Arc<dyn NodeApi>` themselves, so handing `self.clone()` here introduces no reference cycle.
+    pub fn spawn_adapters(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        self.adapters.load_full().spawn_all(self.clone())
+    }
+
+    /// Resolve the conversation-management feature for `transport` through the adapter registry
+    /// (`adapter_for_transport -> messaging -> conversations`).
+    fn conversations_for(
+        &self,
+        transport: &TransportId,
+    ) -> Result<Arc<dyn SupportsConversations>, ApiError> {
+        self.adapters
+            .load_full()
+            .adapter_for_transport(transport)
+            .and_then(|a| a.messaging())
+            .and_then(|m| m.conversations())
+            .ok_or_else(|| {
+                ApiError::Unsupported(format!(
+                    "transport {} has no conversation support",
+                    transport.as_str()
+                ))
+            })
+    }
+
+    /// Resolve the membership-administration feature for `transport`.
+    fn membership_for(
+        &self,
+        transport: &TransportId,
+    ) -> Result<Arc<dyn SupportsMembership>, ApiError> {
+        self.adapters
+            .load_full()
+            .adapter_for_transport(transport)
+            .and_then(|a| a.messaging())
+            .and_then(|m| m.membership())
+            .ok_or_else(|| {
+                ApiError::Unsupported(format!(
+                    "transport {} has no membership support",
+                    transport.as_str()
+                ))
+            })
+    }
+
+    /// Journal + seal one management mutation onto the verifiable `node-management` stream (a sealed
+    /// dCBOR entry per mutating `conv_*`/`member_*` op). No-op when journaling is disabled.
+    async fn audit_management(&self, kind: &str, detail: String) {
+        // Reuse one long-lived sink so the chain links per op (each `seal` advances to the next
+        // segment); only build it on the first mutation, and only when journaling is enabled.
+        let sink = {
+            let mut guard = self.mgmt_journal.lock().unwrap();
+            if guard.is_none() {
+                let Some(signer) = self.verifier.clone() else {
+                    return;
+                };
+                *guard = Some(Arc::new(JournalSink::new(
+                    self.store.clone(),
+                    signer,
+                    JournalStreamId::unit(&UnitId::new("node-management")),
+                )));
+            }
+            guard.as_ref().unwrap().clone()
+        };
+        if let Err(e) = sink.record_management(kind.to_string(), detail).await {
+            tracing::warn!(error = %e, kind, "management audit: record failed");
+            return;
+        }
+        if let Err(e) = sink.seal().await {
+            tracing::warn!(error = %e, kind, "management audit: seal failed");
+        }
     }
 
     /// Install the routing *rebuild hook* (the §5.9 hot-reload seam): a closure that rebuilds the
@@ -1096,6 +1199,14 @@ fn room_label(scope: &OriginScope) -> String {
     }
 }
 
+/// A human label for a [`Participant`] (the management-audit detail; never a secret payload).
+fn participant_label(who: &Participant) -> String {
+    match who {
+        Participant::Contact(c) => c.id.clone(),
+        Participant::Agent { member, profile } => format!("{member} (profile {})", profile.as_str()),
+    }
+}
+
 /// Unix-millis now (roster `last_activity_ms` stamp).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1629,6 +1740,263 @@ impl ControlApi for NodeApiImpl {
                 session: Some(r.session.clone()),
             })
             .collect()
+    }
+
+    async fn transport_adapters(&self) -> Vec<AdapterInfo> {
+        // Read-only enumeration from the host adapter registry (daemon-transport-adapter-spec.md
+        // §3.4). Empty until the assembling binary installs adapters via `with_adapters`; lifecycle
+        // (`serve`) still runs from `bins/daemon` in the skeleton. `transport_instances` (live
+        // per-account connection/presence) is deferred and inherits the empty `ControlApi` default.
+        self.adapters.load().infos()
+    }
+
+    async fn transport_instances(&self) -> Vec<TransportInstanceInfo> {
+        // Live per-account connection/presence, aggregated across every registered adapter.
+        self.adapters.load_full().instances().await
+    }
+
+    // ----- messaging-adapter management (daemon-messaging-adapter-spec.md §6): forwarded generically
+    // through the registry to the addressed transport's `MessagingProtocol` feature traits; mutating
+    // ops are sealed onto the verifiable `node-management` stream. -----
+
+    async fn conv_list(&self, transport: TransportId) -> Vec<ConversationInfo> {
+        match self.conversations_for(&transport) {
+            Ok(c) => c.list(transport).await,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn conv_get(&self, transport: TransportId, conv: String) -> Option<ConversationInfo> {
+        self.conversations_for(&transport).ok()?.get(transport, conv).await
+    }
+
+    async fn conv_create_details(&self, transport: TransportId) -> CreateConversationDetails {
+        match self.conversations_for(&transport) {
+            Ok(c) => c.create_details(transport).await,
+            Err(_) => CreateConversationDetails::default(),
+        }
+    }
+
+    async fn conv_create(
+        &self,
+        transport: TransportId,
+        details: CreateConversationDetails,
+    ) -> Result<ConversationInfo, ApiError> {
+        let info = self.conversations_for(&transport)?.create(transport, details).await?;
+        self.audit_management(
+            "mgmt.conv.create",
+            format!("transport={} conv={} kind={:?}", info.transport.as_str(), info.id, info.kind),
+        )
+        .await;
+        Ok(info)
+    }
+
+    async fn conv_join_details(&self, transport: TransportId) -> ChannelJoinDetails {
+        match self.conversations_for(&transport) {
+            Ok(c) => c.channel_join_details(transport).await,
+            Err(_) => ChannelJoinDetails::default(),
+        }
+    }
+
+    async fn conv_join(
+        &self,
+        transport: TransportId,
+        details: ChannelJoinDetails,
+    ) -> Result<ConversationInfo, ApiError> {
+        let info = self.conversations_for(&transport)?.join_channel(transport, details).await?;
+        self.audit_management(
+            "mgmt.conv.join",
+            format!("transport={} conv={}", info.transport.as_str(), info.id),
+        )
+        .await;
+        Ok(info)
+    }
+
+    async fn conv_leave(&self, transport: TransportId, conv: String) -> Result<(), ApiError> {
+        self.conversations_for(&transport)?
+            .leave(transport.clone(), conv.clone())
+            .await?;
+        self.audit_management(
+            "mgmt.conv.leave",
+            format!("transport={} conv={}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn conv_send(
+        &self,
+        transport: TransportId,
+        conv: String,
+        from: Option<Participant>,
+        message: UserMsg,
+    ) -> Result<(), ApiError> {
+        self.conversations_for(&transport)?
+            .send(transport.clone(), conv.clone(), from, message)
+            .await?;
+        self.audit_management(
+            "mgmt.conv.send",
+            format!("transport={} conv={}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn conv_set_topic(
+        &self,
+        transport: TransportId,
+        conv: String,
+        topic: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.conversations_for(&transport)?
+            .set_topic(transport.clone(), conv.clone(), topic.clone())
+            .await?;
+        self.audit_management(
+            "mgmt.conv.set_topic",
+            format!("transport={} conv={} topic={:?}", transport.as_str(), conv, topic),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn conv_set_title(
+        &self,
+        transport: TransportId,
+        conv: String,
+        title: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.conversations_for(&transport)?
+            .set_title(transport.clone(), conv.clone(), title.clone())
+            .await?;
+        self.audit_management(
+            "mgmt.conv.set_title",
+            format!("transport={} conv={} title={:?}", transport.as_str(), conv, title),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn conv_set_description(
+        &self,
+        transport: TransportId,
+        conv: String,
+        description: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.conversations_for(&transport)?
+            .set_description(transport.clone(), conv.clone(), description.clone())
+            .await?;
+        self.audit_management(
+            "mgmt.conv.set_description",
+            format!("transport={} conv={}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn conv_delete(&self, transport: TransportId, conv: String) -> Result<(), ApiError> {
+        self.conversations_for(&transport)?
+            .delete(transport.clone(), conv.clone())
+            .await?;
+        self.audit_management(
+            "mgmt.conv.delete",
+            format!("transport={} conv={}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn conv_history(
+        &self,
+        transport: TransportId,
+        conv: String,
+        after_cursor: u64,
+        max: u32,
+    ) -> JournalPageView {
+        // The merged conversation transcript is a verifiable journal stream keyed generically as
+        // `conv:<transport>:<conv>` (the same id the messaging adapter writes its posts to); reuse the
+        // shared history reader so the blocks are decoded + segment-verified like any other stream.
+        let stream = JournalStreamId::unit(&UnitId::new(format!(
+            "conv:{}:{}",
+            transport.as_str(),
+            conv
+        )));
+        self.read_history(stream, after_cursor, max).await
+    }
+
+    async fn member_invite(
+        &self,
+        transport: TransportId,
+        conv: String,
+        who: Participant,
+        message: Option<String>,
+    ) -> Result<(), ApiError> {
+        let label = participant_label(&who);
+        self.membership_for(&transport)?
+            .invite(transport.clone(), conv.clone(), who, message)
+            .await?;
+        self.audit_management(
+            "mgmt.member.invite",
+            format!("transport={} conv={} who={label}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn member_remove(
+        &self,
+        transport: TransportId,
+        conv: String,
+        who: Participant,
+        reason: Option<String>,
+    ) -> Result<(), ApiError> {
+        let label = participant_label(&who);
+        self.membership_for(&transport)?
+            .remove(transport.clone(), conv.clone(), who, reason)
+            .await?;
+        self.audit_management(
+            "mgmt.member.remove",
+            format!("transport={} conv={} who={label}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn member_ban(
+        &self,
+        transport: TransportId,
+        conv: String,
+        who: Participant,
+        reason: Option<String>,
+    ) -> Result<(), ApiError> {
+        let label = participant_label(&who);
+        self.membership_for(&transport)?
+            .ban(transport.clone(), conv.clone(), who, reason)
+            .await?;
+        self.audit_management(
+            "mgmt.member.ban",
+            format!("transport={} conv={} who={label}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn member_set_role(
+        &self,
+        transport: TransportId,
+        conv: String,
+        who: Participant,
+        role: MemberRole,
+    ) -> Result<(), ApiError> {
+        let label = participant_label(&who);
+        self.membership_for(&transport)?
+            .set_role(transport.clone(), conv.clone(), who, role)
+            .await?;
+        self.audit_management(
+            "mgmt.member.set_role",
+            format!("transport={} conv={} who={label} role={role:?}", transport.as_str(), conv),
+        )
+        .await;
+        Ok(())
     }
 
     async fn acp_discover(&self) -> Vec<AcpAgentEntry> {
