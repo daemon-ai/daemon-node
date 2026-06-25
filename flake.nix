@@ -95,7 +95,11 @@
           name = "source";
           filter =
             path: type:
-            (craneLib.filterCargoSources path type) || (builtins.match ".*\\.(gbnf|lark)$" path != null);
+            (craneLib.filterCargoSources path type)
+            # `daemon-infer` embeds .gbnf/.lark grammars via include_str!; the codec toolchain
+            # (`xtask verify-codec` / the superproject codegen derivation) needs the CDDL, the
+            # canonical codegen script, and the ciborium fixtures it decodes.
+            || (builtins.match ".*\\.(gbnf|lark|cddl|cbor|sh)$" path != null);
         };
 
         # hyperon (MeTTa) is a *git* dependency (no crates.io release). crane's default vendoring would
@@ -223,6 +227,21 @@
 
         checks = {
           inherit daemon daemon-cli;
+          # Prove the generated zcbor C codec round-trips real ciborium wire bytes (`xtask
+          # verify-codec`): generate the codec, compile its decoder + the zcbor runtime, and decode
+          # every fixture. This is the loop the syntactic `cddl` parity gate cannot close. Needs
+          # zcbor (codegen) + cc (from stdenv) at build time.
+          verify-codec = craneLib.mkCargoDerivation (
+            commonArgs
+            // {
+              pname = "daemon-verify-codec";
+              version = "0.0.0";
+              inherit cargoArtifacts;
+              doInstallCargoArtifacts = false;
+              buildPhaseCargoCommand = "cargo run -p xtask -- verify-codec";
+              nativeBuildInputs = [ pkgs.python3Packages.zcbor ];
+            }
+          );
         };
 
         devShells = {
