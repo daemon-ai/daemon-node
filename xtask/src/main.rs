@@ -296,18 +296,18 @@ fn write_cbor<T: serde::Serialize>(dir: &Path, name: &str, value: &T) -> anyhow:
 }
 
 /// Base name passed to the codegen script; the generated entry types are `api_request`/`api_response`.
-const ZCBOR_BASENAME: &str = "daemon_api_smoke";
+const ZCBOR_BASENAME: &str = "daemon_api_client";
 
 fn codegen_script(root: &Path) -> PathBuf {
     root.join("crates/contracts/daemon-api/zcbor-codegen.sh")
 }
 
-/// The currently zcbor-generatable CDDL. The full `daemon-api.cddl` is not yet generatable (zcbor
-/// requires quoted map keys; the full mirror uses CDDL barewords and `any` members), so the smoke
-/// subset is the live surface. Growing it toward full coverage is provable step-by-step by
-/// `verify-codec`.
+/// The currently zcbor-generatable CDDL: the client view of `daemon-api`. The full `daemon-api.cddl`
+/// is not yet generatable (zcbor requires quoted map keys; the full mirror uses CDDL barewords and
+/// `any` members), so this client subset is the live surface. Growing it toward full coverage is
+/// provable step-by-step by `verify-codec`.
 fn default_cddl(root: &Path) -> PathBuf {
-    root.join("crates/contracts/daemon-api/zcbor-smoke.cddl")
+    root.join("crates/contracts/daemon-api/daemon-api-client.cddl")
 }
 
 /// Run the canonical codegen script. `extra` forwards flags such as `--copy-sources`.
@@ -370,7 +370,7 @@ const VERIFY_CODEC_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 
-#include "daemon_api_smoke_decode.h"
+#include "daemon_api_client_decode.h"
 
 static unsigned char buf[1u << 20];
 

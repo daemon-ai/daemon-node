@@ -1,8 +1,11 @@
-; zcbor-smoke.cddl — representative subset of daemon-api.cddl for C codegen feasibility.
+; daemon-api-client.cddl — the client view of daemon-api, in zcbor-generatable form.
 ;
-; This is not the published contract; daemon-api.cddl is. The smoke schema intentionally covers the
-; first daemon-app integration slice and the schema patterns we need zcbor to handle before we wire
-; generated code into a Qt client.
+; This is the same wire contract as daemon-api.cddl (the authoritative full mirror), restricted to
+; the api-request/api-response variants the GUI/TUI client exercises and rewritten in zcbor's dialect
+; (quoted map keys, no `any`). It exists only because the full daemon-api.cddl is not yet
+; zcbor-generatable (barewords + `any` + unions-of-single-key-maps); the goal is to converge on one
+; file. `xtask cddl` keeps the full mirror complete; `xtask verify-codec` proves this subset stays
+; byte-compatible with the serde wire format.
 
 session-id = tstr
 profile-ref = tstr

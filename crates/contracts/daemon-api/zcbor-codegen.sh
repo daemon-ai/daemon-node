@@ -17,7 +17,7 @@ cddl="${1:?usage: zcbor-codegen.sh <cddl> <out-dir> [extra zcbor args...]}"
 out="${2:?usage: zcbor-codegen.sh <cddl> <out-dir> [extra zcbor args...]}"
 shift 2
 
-base="daemon_api_smoke"
+base="daemon_api_client"
 mkdir -p "$out"
 exec zcbor code \
   --cddl "$cddl" \
