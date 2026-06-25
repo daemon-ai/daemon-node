@@ -200,6 +200,23 @@ CREATE TABLE IF NOT EXISTS memoria_kg (
     source_memory_id TEXT
 );
 
+-- Provider audit log (bank-co-located), port of `hermes_memory_provider/audit.py` L19-L40.
+-- Fire-and-forget mutation trail; failures never break a memory operation.
+CREATE TABLE IF NOT EXISTS audit_log (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     REAL NOT NULL,
+    action        TEXT NOT NULL,
+    memory_id     TEXT,
+    bank          TEXT,
+    scope         TEXT,
+    profile       TEXT,
+    session_id    TEXT,
+    source_tool   TEXT,
+    tokens_used   INTEGER,
+    reason        TEXT,
+    metadata_json TEXT
+);
+
 -- ── FTS5 (bundled SQLite) + sync triggers ──────────────────────────────────────
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_episodes
     USING fts5(content, content='episodic_memory', content_rowid='rowid');

@@ -9,15 +9,16 @@
 //! [`Engine::consolidate`] is a minimal WM->episodic promotion (no LLM summarization/degradation).
 //! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain port-spec P1 work.
 
-use crate::config::{MnemosyneConfig, RecallMode};
+use crate::config::{MnemosyneConfig, RecallMode, RecallScope};
 use crate::dynamics::{typed_memory, weibull};
 use crate::error::Result;
 use crate::knowledge::{annotations, entities, episodic_graph, temporal, veracity};
 use crate::recall::query_cache::QueryCache;
 use crate::recall::{mmr, polyphonic, query_intent, scoring, synonyms};
 use crate::store::Store;
-use crate::{binary_vectors, sanitize, util};
-use rusqlite::{params, Connection};
+use crate::{binary_vectors, memoria, sanitize, util};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -65,6 +66,20 @@ pub struct SleepGroup {
     pub veracity: String,
     /// Aggregated `valid_until` (earliest member expiry, if any).
     pub valid_until: Option<String>,
+}
+
+/// A heuristic sleep-time conflict: an older memory that a newer, near-identical one supersedes
+/// (`beam.py` `_detect_conflicts` L3634). The older id is invalidated with the newer as replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SleepConflict {
+    /// The older memory id (flagged superseded).
+    pub older_id: String,
+    /// The newer memory id (the replacement).
+    pub newer_id: String,
+    /// The older memory content (for optional LLM validation).
+    pub older_content: String,
+    /// The newer memory content (for optional LLM validation).
+    pub newer_content: String,
 }
 
 /// Bank statistics (`beam.py` `stats`).
@@ -322,7 +337,14 @@ impl Engine {
         vector: Option<&[f32]>,
         model: &str,
     ) -> Result<String> {
-        let (content, _meta) = sanitize::sanitize_content(content);
+        // Sanitize first (`beam.py` L2874-L2880): binary/oversized/high-entropy payloads spill to the
+        // blob store, leaving a placeholder + `{"_blob": {...}}` metadata persisted on the row.
+        let (content, blob_meta) = sanitize::sanitize_content(content);
+        let metadata_json = if blob_meta.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+            "{}".to_string()
+        } else {
+            serde_json::to_string(&serde_json::json!({ "_blob": blob_meta }))?
+        };
         let id = util::memory_id(&format!("{}:{}", self.config.session_id, content));
         let memory_type = typed_memory::classify(&content).as_str();
         let now = util::now_iso();
@@ -330,12 +352,20 @@ impl Engine {
         // so recall + degradation can reason over when an event occurred, not just when it was stored.
         let temporal = temporal::extract_temporal(&content);
         let temporal_tags_json = serde_json::to_string(&temporal.temporal_tags)?;
+        // Multi-agent identity columns (`beam.py` ctor L2616-L2618 / write L2974): stamp the row with
+        // the configured author and the channel (defaulting to the session, per the BEAM ctor).
+        let channel_id = self
+            .config
+            .channel_id
+            .clone()
+            .unwrap_or_else(|| self.config.session_id.clone());
         let conn = self.store.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO working_memory \
              (id, content, source, timestamp, session_id, importance, metadata_json, veracity, \
-              memory_type, scope, event_date, event_date_precision, temporal_tags) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, ?9, ?10, ?11, ?12)",
+              memory_type, scope, event_date, event_date_precision, temporal_tags, \
+              author_id, author_type, channel_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 content,
@@ -343,12 +373,16 @@ impl Engine {
                 now,
                 self.config.session_id,
                 args.importance,
+                metadata_json,
                 args.veracity,
                 memory_type,
                 args.scope,
                 temporal.event_date,
                 temporal.event_date_precision,
                 temporal_tags_json,
+                self.config.author_id,
+                self.config.author_type,
+                channel_id,
             ],
         )?;
         if let Some(vector) = vector {
@@ -360,6 +394,13 @@ impl Engine {
             )?;
         }
         self.ingest_knowledge(&conn, &id, &content, &args.veracity)?;
+        // Always-on MEMORIA regex extraction (`beam.py` L3027-L3033): populate the specialist
+        // tables for structured retrieval. Best-effort — extraction must never block storage.
+        if let Err(e) = memoria::extract_and_store(&conn, &self.config.session_id, &content, 0, &id)
+        {
+            tracing::debug!(error = %e, "memoria extraction failed (non-fatal)");
+        }
+        self.audit(&conn, "remember", Some(&id), None);
         // Invalidate the enhanced-recall query cache (`beam.py` L3041-L3043). Only touched when the
         // cache was actually opened (enhanced recall used), so Base mode pays nothing.
         if let Some(cache) = self.query_cache.get() {
@@ -546,11 +587,66 @@ impl Engine {
         top_k: usize,
         query_vector: Option<&[f32]>,
     ) -> Result<Vec<MemoryRow>> {
-        match self.config.recall_mode {
-            RecallMode::Base => self.recall_base(query, top_k, query_vector, scoring::DEFAULT_WEIGHTS),
-            RecallMode::Enhanced => self.recall_enhanced(query, top_k, query_vector),
-            RecallMode::Polyphonic => self.recall_polyphonic(query, top_k, query_vector),
+        self.recall_with_scope(query, top_k, query_vector, &self.config_scope())
+    }
+
+    /// The recall scope derived from the engine config (`beam.py` instance `author_id`/`channel_id`).
+    /// The provider seam recalls with this; the `mnemosyne_recall` tool may override it per call.
+    pub fn config_scope(&self) -> RecallScope {
+        RecallScope {
+            author_id: self.config.author_id.clone(),
+            author_type: self.config.author_type.clone(),
+            channel_id: self.config.channel_id.clone(),
         }
+    }
+
+    /// As [`Engine::recall_with_vector`], but with an explicit multi-agent identity [`RecallScope`]
+    /// (the `mnemosyne_recall` tool's author/channel overrides). An empty scope is today's behavior.
+    pub fn recall_with_scope(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_vector: Option<&[f32]>,
+        scope: &RecallScope,
+    ) -> Result<Vec<MemoryRow>> {
+        match self.config.recall_mode {
+            RecallMode::Base => {
+                self.recall_base(query, top_k, query_vector, scoring::DEFAULT_WEIGHTS, scope)
+            }
+            RecallMode::Enhanced => self.recall_enhanced(query, top_k, query_vector, scope),
+            RecallMode::Polyphonic => self.recall_polyphonic(query, top_k, query_vector, scope),
+        }
+    }
+
+    /// Build the recall scope SQL fragment (a leading ` AND ...`) plus its bound params for the
+    /// given [`RecallScope`], mirroring `beam.py` L5182-L5220: a broad branch (channel / author-only
+    /// / session) followed by exact author/channel filters.
+    fn scope_clause(&self, scope: &RecallScope) -> (String, Vec<Value>) {
+        let mut clause = String::new();
+        let mut p: Vec<Value> = Vec::new();
+        if let Some(channel) = &scope.channel_id {
+            clause.push_str(" AND (session_id = ? OR scope = 'global' OR channel_id = ?)");
+            p.push(Value::Text(self.config.session_id.clone()));
+            p.push(Value::Text(channel.clone()));
+        } else if scope.author_id.is_some() || scope.author_type.is_some() {
+            clause.push_str(" AND (1=1)");
+        } else {
+            clause.push_str(" AND (session_id = ? OR scope = 'global')");
+            p.push(Value::Text(self.config.session_id.clone()));
+        }
+        if let Some(author) = &scope.author_id {
+            clause.push_str(" AND author_id = ?");
+            p.push(Value::Text(author.clone()));
+        }
+        if let Some(author_type) = &scope.author_type {
+            clause.push_str(" AND author_type = ?");
+            p.push(Value::Text(author_type.clone()));
+        }
+        if let Some(channel) = &scope.channel_id {
+            clause.push_str(" AND channel_id = ?");
+            p.push(Value::Text(channel.clone()));
+        }
+        (clause, p)
     }
 
     /// The base hybrid cross-tier recall with explicit `(vec, fts, importance)` weights. This is the
@@ -561,22 +657,25 @@ impl Engine {
         top_k: usize,
         query_vector: Option<&[f32]>,
         weights: (f64, f64, f64),
+        scope: &RecallScope,
     ) -> Result<Vec<MemoryRow>> {
         let q_tokens = tokenize(query);
         let q_entities = entities::extract_entities_regex(query);
         let floor = scoring::lexical_floor(q_tokens.len());
         let conn = self.store.conn.lock().unwrap();
 
-        let mut scored =
-            self.gather_working(&conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights)?;
-        let episodic = self
-            .gather_episodic(&conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights)?;
+        let mut scored = self.gather_working(
+            &conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights, scope,
+        )?;
+        let episodic = self.gather_episodic(
+            &conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights, scope,
+        )?;
         scored.extend(episodic);
 
         // Graph expansion: pull in memories that mention a query entity (or sit within two graph
         // hops of one) but were missed by the lexical/FTS/vector gates (`beam.py` L5760-L5793).
         let present: HashSet<String> = scored.iter().map(|r| r.id.clone()).collect();
-        let injected = self.inject_entity_candidates(&conn, &q_entities, &present)?;
+        let injected = self.inject_entity_candidates(&conn, &q_entities, &present, scope)?;
         scored.extend(injected);
 
         // Cross-tier dedup by normalized content, keeping the higher-scoring row (`beam.py` L6003).
@@ -586,6 +685,11 @@ impl Engine {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // MEMORIA structured-fact supplement (`beam.py` L6006-L6059): a high-relevance hit from the
+        // specialist tables enters as an extra candidate (capped at 0.6) plus its source rows
+        // (capped at 0.59), then we re-sort. Best-effort and only for query-shaped inputs.
+        self.supplement_with_memoria(&conn, query, &q_tokens, &mut scored)?;
 
         // Diversity rerank for multi-token queries (`beam.py` L6061), else a plain top-k slice.
         let selected: Vec<MemoryRow> = if q_tokens.len() >= 4 && scored.len() > 1 {
@@ -604,6 +708,84 @@ impl Engine {
         Ok(selected)
     }
 
+    /// Fold a high-relevance MEMORIA structured-fact hit into the candidate set
+    /// (`beam.py` L6006-L6059). The hit's lexical relevance must clear `0.35`; it then enters as a
+    /// `tier="memoria"` row scored `min(0.6, rel*0.6)` plus its originating `working_memory` rows as
+    /// `tier="memoria_source"` rows scored `min(0.59, 0.2 + rel*0.8)` (content truncated to 500).
+    /// Candidates are re-sorted by score afterward. Best-effort: failures are swallowed.
+    fn supplement_with_memoria(
+        &self,
+        conn: &Connection,
+        query: &str,
+        q_tokens: &[String],
+        scored: &mut Vec<MemoryRow>,
+    ) -> Result<()> {
+        let result = match memoria::memoria_retrieve(conn, &self.config.session_id, query, 3) {
+            Some(r) if r.source != "fallback" && !r.context.is_empty() => r,
+            _ => return Ok(()),
+        };
+        let rel = lexical_relevance(q_tokens, &result.context);
+        if rel < 0.35 {
+            return Ok(());
+        }
+        let memoria_score = round4((rel * 0.6).min(0.6));
+        scored.push(MemoryRow {
+            id: format!("memoria_{}", result.source),
+            content: format!("[MEMORIA {}]\n{}", result.source, result.context),
+            source: format!("memoria_{}", result.source),
+            timestamp: String::new(),
+            importance: 0.5,
+            veracity: "unknown".to_string(),
+            trust_tier: String::new(),
+            tier: Tier::Working,
+            tier_level: 1,
+            score: memoria_score,
+        });
+
+        let source_score = round4((0.2 + rel * 0.8).min(0.59));
+        for sid in &result.source_memory_ids {
+            if sid.is_empty() {
+                continue;
+            }
+            let row = conn.query_row(
+                "SELECT id, content, source, timestamp, importance, veracity FROM working_memory WHERE id = ?1",
+                params![sid],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        r.get::<_, f64>(4)?,
+                        r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    ))
+                },
+            );
+            if let Ok((id, content, source, timestamp, importance, veracity)) = row {
+                let truncated: String = content.chars().take(500).collect();
+                scored.push(MemoryRow {
+                    id: format!("memoria_source_{id}"),
+                    content: truncated,
+                    source,
+                    timestamp,
+                    importance,
+                    veracity,
+                    trust_tier: String::new(),
+                    tier: Tier::Working,
+                    tier_level: 1,
+                    score: source_score,
+                });
+            }
+        }
+
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(())
+    }
+
     /// Enhanced recall (`beam.py` `recall_enhanced` L6177-L6328): classify the query intent and bias
     /// the hybrid weights, synonym-expand the query, consult the 5-tier query cache, run base recall
     /// over the expanded query, Weibull-rescore by memory type (`score*0.7 + wb*0.3`), MMR-diversify,
@@ -614,6 +796,7 @@ impl Engine {
         query: &str,
         top_k: usize,
         query_vector: Option<&[f32]>,
+        scope: &RecallScope,
     ) -> Result<Vec<MemoryRow>> {
         // 1. Intent classification -> weight bias.
         let intent = query_intent::classify_intent(query);
@@ -633,7 +816,7 @@ impl Engine {
         }
 
         // 4. Base recall over the expanded query, gathering a wider pool.
-        let mut results = self.recall_base(&expanded, top_k * 2, query_vector, weights)?;
+        let mut results = self.recall_base(&expanded, top_k * 2, query_vector, weights, scope)?;
 
         // 5. Weibull re-scoring by memory type.
         self.weibull_rescore(&mut results)?;
@@ -699,6 +882,7 @@ impl Engine {
         query: &str,
         top_k: usize,
         query_vector: Option<&[f32]>,
+        scope: &RecallScope,
     ) -> Result<Vec<MemoryRow>> {
         use polyphonic::VoiceHit;
         let conn = self.store.conn.lock().unwrap();
@@ -706,10 +890,9 @@ impl Engine {
         // Voice 1: vector (cosine over stored embeddings, normalized to [0, 1], top 20).
         let mut vector_hits: Vec<VoiceHit> = Vec::new();
         if let Some(q) = query_vector {
-            let stored = load_embeddings(&conn)?;
-            let mut sims: Vec<(String, f64)> = stored
-                .iter()
-                .map(|(id, v)| (id.clone(), (daemon_core::cosine(q, v) as f64 + 1.0) / 2.0))
+            let mut sims: Vec<(String, f64)> = cosine_sim_map(&conn, q)?
+                .into_iter()
+                .map(|(id, cos)| (id, (cos + 1.0) / 2.0))
                 .collect();
             sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             sims.truncate(20);
@@ -765,13 +948,16 @@ impl Engine {
         let mut temporal_hits: Vec<VoiceHit> = Vec::new();
         if has_temporal_keyword(query) {
             let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
-            let mut stmt = conn.prepare(
+            let (scope_sql, scope_params) = self.scope_clause(scope);
+            let sql = format!(
                 "SELECT id, timestamp, importance FROM working_memory \
-                 WHERE timestamp > ?1 AND superseded_by IS NULL \
-                   AND (session_id = ?2 OR scope = 'global') \
+                 WHERE timestamp > ? AND superseded_by IS NULL{scope_sql} \
                  ORDER BY timestamp DESC LIMIT 20",
-            )?;
-            let rows = stmt.query_map(params![week_ago, self.config.session_id], |r| {
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bind: Vec<Value> = vec![Value::Text(week_ago)];
+            bind.extend(scope_params);
+            let rows = stmt.query_map(params_from_iter(bind), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
             })?;
             for row in rows.flatten() {
@@ -792,9 +978,9 @@ impl Engine {
 
         let mut out: Vec<MemoryRow> = Vec::new();
         for f in diversified {
-            let row = match self.fetch_working(&conn, &f.memory_id)? {
+            let row = match self.fetch_working(&conn, &f.memory_id, scope)? {
                 Some(r) => Some(r),
-                None => self.fetch_episodic(&conn, &f.memory_id)?,
+                None => self.fetch_episodic(&conn, &f.memory_id, scope)?,
             };
             if let Some(mut r) = row {
                 r.score = f.combined_score;
@@ -835,10 +1021,11 @@ impl Engine {
         floor: f64,
         query_vector: Option<&[f32]>,
         weights: (f64, f64, f64),
+        scope: &RecallScope,
     ) -> Result<Vec<MemoryRow>> {
         // Base candidates: the recency/importance fallback scan (limit 2000, `beam.py` L5262), plus
         // any FTS5 hits that fall outside that window.
-        let mut rows = self.scan_working(conn, 2000)?;
+        let mut rows = self.scan_working(conn, 2000, scope)?;
         let mut seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
         let fts = self.fts_search(
             conn,
@@ -849,14 +1036,14 @@ impl Engine {
         )?;
         for id in fts.keys() {
             if seen.insert(id.clone()) {
-                if let Some(row) = self.fetch_working(conn, id)? {
+                if let Some(row) = self.fetch_working(conn, id, scope)? {
                     rows.push(row);
                 }
             }
         }
 
-        let stored = match query_vector {
-            Some(_) => load_embeddings(conn)?,
+        let sims = match query_vector {
+            Some(q) => cosine_sim_map(conn, q)?,
             None => HashMap::new(),
         };
         let (_vw, _fw, iw) = weights;
@@ -865,10 +1052,7 @@ impl Engine {
         for mut row in rows {
             let lexical = lexical_relevance(q_tokens, &row.content);
             let nfts = fts.get(&row.id).copied().unwrap_or(0.0);
-            let vec_sim = match (query_vector, stored.get(&row.id)) {
-                (Some(q), Some(v)) => daemon_core::cosine(q, v) as f64,
-                _ => 0.0,
-            };
+            let vec_sim = sims.get(&row.id).copied().unwrap_or(0.0);
             if lexical < floor && vec_sim < VEC_SIM_FLOOR && nfts <= 0.0 {
                 continue;
             }
@@ -896,8 +1080,9 @@ impl Engine {
         floor: f64,
         query_vector: Option<&[f32]>,
         weights: (f64, f64, f64),
+        scope: &RecallScope,
     ) -> Result<Vec<MemoryRow>> {
-        let mut rows = self.scan_episodic(conn, 2000)?;
+        let mut rows = self.scan_episodic(conn, 2000, scope)?;
         let mut seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
         let fts = self.fts_search(
             conn,
@@ -909,7 +1094,7 @@ impl Engine {
         )?;
         for id in fts.keys() {
             if seen.insert(id.clone()) {
-                if let Some(row) = self.fetch_episodic(conn, id)? {
+                if let Some(row) = self.fetch_episodic(conn, id, scope)? {
                     rows.push(row);
                 }
             }
@@ -918,8 +1103,8 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let stored = match query_vector {
-            Some(_) => load_embeddings(conn)?,
+        let sims = match query_vector {
+            Some(q) => cosine_sim_map(conn, q)?,
             None => HashMap::new(),
         };
         let binaries = self.load_binary_vectors(conn)?;
@@ -929,10 +1114,7 @@ impl Engine {
         for mut row in rows {
             let lexical = lexical_relevance(q_tokens, &row.content);
             let nfts = fts.get(&row.id).copied().unwrap_or(0.0);
-            let sim = match (query_vector, stored.get(&row.id)) {
-                (Some(q), Some(v)) => daemon_core::cosine(q, v) as f64,
-                _ => 0.0,
-            };
+            let sim = sims.get(&row.id).copied().unwrap_or(0.0);
             // Weak-signal gate (`beam.py` L5720): drop unless lexical, FTS, or vector say keep.
             if lexical < floor && sim < VEC_SIM_FLOOR && nfts <= 0.0 {
                 continue;
@@ -1241,6 +1423,13 @@ impl Engine {
                     group.ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
                 conn.execute(&sql, id_params.as_slice())?;
 
+                self.audit(
+                    &conn,
+                    "consolidate",
+                    Some(&ep_id),
+                    Some(&format!("{} items from {}", group.ids.len(), group.source)),
+                );
+
                 report.items_consolidated += group.ids.len();
                 report.summaries_created += 1;
                 if llm {
@@ -1279,7 +1468,140 @@ impl Engine {
     /// uses the split form to inject LLM summaries; this is the standalone/no-LLM entrypoint.
     pub fn sleep(&self, force: bool) -> Result<SleepReport> {
         let groups = self.sleep_plan(force)?;
+        // No LLM in this path: run heuristic conflict detection and invalidate all detected pairs
+        // (the `LLM_CONFLICT_DETECTION_ENABLED == False` branch, `beam.py` L7727-L7731).
+        let _ = self.resolve_sleep_conflicts(&groups);
         self.finish_sleep(&groups, &HashMap::new())
+    }
+
+    /// Heuristic embedding-cosine conflict detection over the claimed sleep groups
+    /// (`beam.py` `_detect_conflicts` L3634, run per group before summarization L7705). For each
+    /// in-group pair (rows are timestamp-ASC, so the first is older) all four heuristics must hold:
+    /// timestamps `>= 1h` apart, cosine `> 0.88` over L2-normalized stored embeddings, `>= 2`
+    /// overlapping significant tokens, and an edit-distance ratio `> 0.3` (not near-duplicates).
+    /// Distinct from the ingest-time `(subject, predicate)` veracity path.
+    pub fn heuristic_sleep_conflicts(&self, groups: &[SleepGroup]) -> Result<Vec<SleepConflict>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut out = Vec::new();
+        for g in groups {
+            if g.ids.len() < 2 {
+                continue;
+            }
+            out.extend(self.detect_conflicts(&conn, &g.ids, &g.contents)?);
+        }
+        Ok(out)
+    }
+
+    /// Detect heuristic conflicts and invalidate every detected pair (older superseded by newer),
+    /// returning the count resolved. Used by the no-LLM [`Engine::sleep`] path; the LLM-gated path
+    /// in `tools::run_sleep` validates each pair before invalidating.
+    pub fn resolve_sleep_conflicts(&self, groups: &[SleepGroup]) -> Result<usize> {
+        let conflicts = self.heuristic_sleep_conflicts(groups)?;
+        let mut resolved = 0;
+        for c in &conflicts {
+            if self.invalidate(&c.older_id, Some(&c.newer_id))? {
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn detect_conflicts(
+        &self,
+        conn: &Connection,
+        ids: &[String],
+        contents: &[String],
+    ) -> Result<Vec<SleepConflict>> {
+        let n = ids.len();
+        if n < 2 {
+            return Ok(Vec::new());
+        }
+        // Fetch timestamps + embeddings for the claimed ids in one pass each.
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let id_params: Vec<Value> = ids.iter().map(|s| Value::Text(s.clone())).collect();
+
+        let mut timestamps: HashMap<String, String> = HashMap::new();
+        {
+            let sql = format!("SELECT id, timestamp FROM working_memory WHERE id IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(id_params.iter().cloned()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+            })?;
+            for row in rows.flatten() {
+                timestamps.insert(row.0, row.1);
+            }
+        }
+
+        let mut embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT memory_id, embedding_json FROM memory_embeddings WHERE memory_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(id_params.iter().cloned()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows.flatten() {
+                if let Ok(v) = serde_json::from_str::<Vec<f32>>(&row.1) {
+                    embeddings.insert(row.0, v);
+                }
+            }
+        }
+
+        let mut conflicts = Vec::new();
+        for i in 0..n {
+            let a_id = &ids[i];
+            let a_vec = match embeddings.get(a_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            for j in (i + 1)..n {
+                let b_id = &ids[j];
+                let b_vec = match embeddings.get(b_id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                // Heuristic 1: timestamps >= 1 hour apart.
+                let (ta, tb) = match (timestamps.get(a_id), timestamps.get(b_id)) {
+                    (Some(ta), Some(tb)) => (ta, tb),
+                    _ => continue,
+                };
+                let hours = match hours_between(ta, tb) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                if hours < 1.0 {
+                    continue;
+                }
+                // Heuristic 2: cosine similarity > threshold.
+                if a_vec.len() != b_vec.len()
+                    || a_vec.iter().all(|x| *x == 0.0)
+                    || b_vec.iter().all(|x| *x == 0.0)
+                {
+                    continue;
+                }
+                if (daemon_core::cosine(a_vec, b_vec) as f64) <= 0.88 {
+                    continue;
+                }
+                // Heuristic 3: >= 2 overlapping significant tokens.
+                let tokens_a = significant_tokens(&contents[i]);
+                let tokens_b = significant_tokens(&contents[j]);
+                if tokens_a.intersection(&tokens_b).count() < 2 {
+                    continue;
+                }
+                // Heuristic 4: not near-duplicates (edit-distance ratio > 0.3).
+                if edit_dist_ratio(&contents[i], &contents[j]) <= 0.3 {
+                    continue;
+                }
+                conflicts.push(SleepConflict {
+                    older_id: a_id.clone(),
+                    newer_id: b_id.clone(),
+                    older_content: contents[i].clone(),
+                    newer_content: contents[j].clone(),
+                });
+            }
+        }
+        Ok(conflicts)
     }
 
     /// Tiered episodic degradation (`beam.py` `degrade_episodic` L7241-L7366): tier 1 rows older than
@@ -1364,14 +1686,49 @@ impl Engine {
     /// Fetch a single live memory by id, working tier first then episodic (`beam.py` `get`).
     pub fn get(&self, id: &str) -> Result<Option<MemoryRow>> {
         let conn = self.store.conn.lock().unwrap();
-        if let Some(row) = self.fetch_working(&conn, id)? {
+        let scope = RecallScope::default();
+        if let Some(row) = self.fetch_working(&conn, id, &scope)? {
             return Ok(Some(row));
         }
-        self.fetch_episodic(&conn, id)
+        self.fetch_episodic(&conn, id, &scope)
     }
 
     /// Update a memory's `content` and/or `importance` in whichever tier holds it (`beam.py`
     /// `update`). FTS stays in sync via the content-update triggers. Returns whether a row changed.
+    /// Fire-and-forget audit-log insert into the bank-co-located `audit_log`
+    /// (`hermes_memory_provider/audit.py` `record` L69-L106). Uses the already-held connection (the
+    /// audit table lives in the same bank DB) and swallows any error — auditing must never break a
+    /// memory mutation. `timestamp` is unix epoch seconds (Python `time.time()`).
+    fn audit(&self, conn: &Connection, action: &str, memory_id: Option<&str>, reason: Option<&str>) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let none = Option::<String>::None;
+        let res = conn.execute(
+            "INSERT INTO audit_log \
+             (timestamp, action, memory_id, bank, scope, profile, session_id, source_tool, \
+              tokens_used, reason, metadata_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                ts,
+                action,
+                memory_id,
+                self.config.bank,
+                none,
+                none,
+                self.config.session_id,
+                none,
+                Option::<i64>::None,
+                reason,
+                none,
+            ],
+        );
+        if let Err(e) = res {
+            tracing::debug!(error = %e, action, "audit log insert failed (non-fatal)");
+        }
+    }
+
     pub fn update(&self, id: &str, content: Option<&str>, importance: Option<f64>) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
         let mut changed = false;
@@ -1389,6 +1746,9 @@ impl Engine {
                 )? > 0;
             }
         }
+        if changed {
+            self.audit(&conn, "update", Some(id), None);
+        }
         Ok(changed)
     }
 
@@ -1399,6 +1759,9 @@ impl Engine {
         let mut deleted = conn.execute("DELETE FROM working_memory WHERE id = ?1", params![id])?;
         deleted += conn.execute("DELETE FROM episodic_memory WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", params![id])?;
+        if deleted > 0 {
+            self.audit(&conn, "forget", Some(id), None);
+        }
         Ok(deleted > 0)
     }
 
@@ -1417,6 +1780,10 @@ impl Engine {
                 ),
                 params![id, now, replacement_id],
             )? > 0;
+        }
+        if changed {
+            let reason = replacement_id.map(|r| format!("superseded_by={r}"));
+            self.audit(&conn, "invalidate", Some(id), reason.as_deref());
         }
         Ok(changed)
     }
@@ -1459,6 +1826,7 @@ impl Engine {
                     params![id, now, validator],
                 )?;
             }
+            self.audit(&conn, "validate", Some(id), Some(action));
         }
         match action {
             "correct" => {
@@ -1750,32 +2118,47 @@ impl Engine {
         Ok(map)
     }
 
-    /// Recency/importance fallback scan over working memory (the candidate floor, scope-filtered).
-    fn scan_working(&self, conn: &Connection, limit: usize) -> Result<Vec<MemoryRow>> {
-        let mut stmt = conn.prepare(
+    /// Recency/importance fallback scan over working memory (the candidate floor), filtered by the
+    /// multi-agent recall [`RecallScope`].
+    fn scan_working(
+        &self,
+        conn: &Connection,
+        limit: usize,
+        scope: &RecallScope,
+    ) -> Result<Vec<MemoryRow>> {
+        let (scope_sql, scope_params) = self.scope_clause(scope);
+        let sql = format!(
             "SELECT id, content, source, timestamp, importance, veracity, trust_tier \
              FROM working_memory \
-             WHERE (valid_until IS NULL) AND superseded_by IS NULL \
-               AND (session_id = ?1 OR scope = 'global') \
-             ORDER BY importance DESC, timestamp DESC LIMIT ?2",
-        )?;
+             WHERE (valid_until IS NULL) AND superseded_by IS NULL{scope_sql} \
+             ORDER BY importance DESC, timestamp DESC LIMIT ?",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bind = scope_params;
+        bind.push(Value::Integer(limit as i64));
         let rows = stmt
-            .query_map(params![self.config.session_id, limit as i64], |r| {
-                Ok(working_row(r))
-            })?
+            .query_map(params_from_iter(bind), |r| Ok(working_row(r)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// Fetch a single working row by id (for FTS hits beyond the fallback window), scope-filtered.
-    fn fetch_working(&self, conn: &Connection, id: &str) -> Result<Option<MemoryRow>> {
-        let mut stmt = conn.prepare(
+    fn fetch_working(
+        &self,
+        conn: &Connection,
+        id: &str,
+        scope: &RecallScope,
+    ) -> Result<Option<MemoryRow>> {
+        let (scope_sql, scope_params) = self.scope_clause(scope);
+        let sql = format!(
             "SELECT id, content, source, timestamp, importance, veracity, trust_tier \
              FROM working_memory \
-             WHERE id = ?1 AND (valid_until IS NULL) AND superseded_by IS NULL \
-               AND (session_id = ?2 OR scope = 'global')",
-        )?;
-        let mut rows = stmt.query_map(params![id, self.config.session_id], |r| Ok(working_row(r)))?;
+             WHERE id = ? AND (valid_until IS NULL) AND superseded_by IS NULL{scope_sql}",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bind = vec![Value::Text(id.to_string())];
+        bind.extend(scope_params);
+        let mut rows = stmt.query_map(params_from_iter(bind), |r| Ok(working_row(r)))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -1783,32 +2166,45 @@ impl Engine {
     }
 
     /// Recency/importance fallback scan over episodic memory, scope-filtered.
-    fn scan_episodic(&self, conn: &Connection, limit: usize) -> Result<Vec<MemoryRow>> {
-        let mut stmt = conn.prepare(
+    fn scan_episodic(
+        &self,
+        conn: &Connection,
+        limit: usize,
+        scope: &RecallScope,
+    ) -> Result<Vec<MemoryRow>> {
+        let (scope_sql, scope_params) = self.scope_clause(scope);
+        let sql = format!(
             "SELECT id, content, source, timestamp, importance, veracity, trust_tier, tier \
              FROM episodic_memory \
-             WHERE (valid_until IS NULL) AND superseded_by IS NULL \
-               AND (session_id = ?1 OR scope = 'global') \
-             ORDER BY importance DESC, timestamp DESC LIMIT ?2",
-        )?;
+             WHERE (valid_until IS NULL) AND superseded_by IS NULL{scope_sql} \
+             ORDER BY importance DESC, timestamp DESC LIMIT ?",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bind = scope_params;
+        bind.push(Value::Integer(limit as i64));
         let rows = stmt
-            .query_map(params![self.config.session_id, limit as i64], |r| {
-                Ok(episodic_row(r))
-            })?
+            .query_map(params_from_iter(bind), |r| Ok(episodic_row(r)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// Fetch a single episodic row by id (for FTS hits beyond the fallback window), scope-filtered.
-    fn fetch_episodic(&self, conn: &Connection, id: &str) -> Result<Option<MemoryRow>> {
-        let mut stmt = conn.prepare(
+    fn fetch_episodic(
+        &self,
+        conn: &Connection,
+        id: &str,
+        scope: &RecallScope,
+    ) -> Result<Option<MemoryRow>> {
+        let (scope_sql, scope_params) = self.scope_clause(scope);
+        let sql = format!(
             "SELECT id, content, source, timestamp, importance, veracity, trust_tier, tier \
              FROM episodic_memory \
-             WHERE id = ?1 AND (valid_until IS NULL) AND superseded_by IS NULL \
-               AND (session_id = ?2 OR scope = 'global')",
-        )?;
-        let mut rows =
-            stmt.query_map(params![id, self.config.session_id], |r| Ok(episodic_row(r)))?;
+             WHERE id = ? AND (valid_until IS NULL) AND superseded_by IS NULL{scope_sql}",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bind = vec![Value::Text(id.to_string())];
+        bind.extend(scope_params);
+        let mut rows = stmt.query_map(params_from_iter(bind), |r| Ok(episodic_row(r)))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -1908,6 +2304,7 @@ impl Engine {
         conn: &Connection,
         q_entities: &[String],
         present: &HashSet<String>,
+        scope: &RecallScope,
     ) -> Result<Vec<MemoryRow>> {
         if q_entities.is_empty() {
             return Ok(Vec::new());
@@ -1955,7 +2352,7 @@ impl Engine {
             if present.contains(&id) {
                 continue;
             }
-            if let Some(mut row) = self.fetch_working(conn, &id)? {
+            if let Some(mut row) = self.fetch_working(conn, &id, scope)? {
                 let decay = scoring::recency_decay(age_hours(&row.timestamp));
                 let base = (0.6 + 0.2 * row.importance) * (0.7 + 0.3 * decay);
                 row.score = base * scoring::veracity_multiplier(&row.veracity);
@@ -2025,6 +2422,50 @@ fn load_embeddings(conn: &Connection) -> Result<HashMap<String, Vec<f32>>> {
         if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&json) {
             map.insert(id, vec);
         }
+    }
+    Ok(map)
+}
+
+/// Cosine-similarity map `memory_id -> cos(query, embedding)` over `memory_embeddings`.
+///
+/// With the `vec-ext` feature this routes through sqlite-vec's native `vec_distance_cosine`
+/// scalar (`sim = 1 - distance`) so the vector math runs inside SQLite; otherwise it loads the
+/// f32 BLOBs (here JSON arrays) into Rust and uses [`daemon_core::cosine`]. Both paths are
+/// behaviour-equivalent (modulo float precision), and the native path silently falls back to the
+/// Rust path on any error (e.g. a stray dimension mismatch) so callers always get a full map.
+fn cosine_sim_map(conn: &Connection, query: &[f32]) -> Result<HashMap<String, f64>> {
+    #[cfg(feature = "vec-ext")]
+    {
+        match native_cosine_sim_map(conn, query) {
+            Ok(map) => return Ok(map),
+            Err(e) => {
+                tracing::debug!(error = %e, "native vec0 cosine failed; falling back to f32-BLOB");
+            }
+        }
+    }
+    let stored = load_embeddings(conn)?;
+    Ok(stored
+        .iter()
+        .map(|(id, v)| (id.clone(), daemon_core::cosine(query, v) as f64))
+        .collect())
+}
+
+/// Native sqlite-vec cosine path: `1 - vec_distance_cosine(query, embedding)` computed in SQLite.
+#[cfg(feature = "vec-ext")]
+fn native_cosine_sim_map(conn: &Connection, query: &[f32]) -> Result<HashMap<String, f64>> {
+    let qjson = serde_json::to_string(query).unwrap_or_else(|_| "[]".to_string());
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, \
+         1.0 - vec_distance_cosine(vec_f32(?1), vec_f32(embedding_json)) \
+         FROM memory_embeddings",
+    )?;
+    let mut map = HashMap::new();
+    let rows = stmt.query_map(params![qjson], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+    })?;
+    for row in rows {
+        let (id, sim) = row?;
+        map.insert(id, sim);
     }
     Ok(map)
 }
@@ -2157,6 +2598,68 @@ fn lexical_relevance(query_tokens: &[String], content: &str) -> f64 {
     (num / query_tokens.len() as f64).min(1.0)
 }
 
+/// Round to four decimal places (the MEMORIA supplement's `round(x, 4)`, `beam.py` L6021/L6048).
+fn round4(x: f64) -> f64 {
+    (x * 10_000.0).round() / 10_000.0
+}
+
+/// Absolute hours between two ISO-8601 timestamps, or `None` if either fails to parse
+/// (`beam.py` `_detect_conflicts` heuristic 1 L3718-L3726).
+fn hours_between(a: &str, b: &str) -> Option<f64> {
+    let ta = chrono::DateTime::parse_from_rfc3339(a).ok()?;
+    let tb = chrono::DateTime::parse_from_rfc3339(b).ok()?;
+    Some((tb - ta).num_seconds().abs() as f64 / 3600.0)
+}
+
+/// Significant content tokens for conflict overlap: `[A-Za-z]{3,}` lowercased, minus the
+/// `_detect_conflicts` stop-word set (`beam.py` L3677-L3694).
+fn significant_tokens(text: &str) -> HashSet<String> {
+    const STOP: &[&str] = &[
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+        "from", "as", "is", "was", "are", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "need", "this", "that", "these", "those", "it", "its", "they", "them", "their", "we", "us",
+        "our", "you", "your", "he", "she", "him", "her", "his", "not", "no", "nor", "so", "if",
+        "then", "than", "too", "very", "just", "about", "also", "more", "some", "any", "each",
+        "every", "all", "both", "what", "when", "where", "why", "how", "which", "who", "whom",
+        "get", "got", "make", "made", "take", "took", "use", "used", "like", "said", "says",
+        "know", "knew", "think", "thinks", "thought", "see", "saw", "seen", "come", "came", "give",
+        "gave", "tell", "told",
+    ];
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"[A-Za-z]{3,}").unwrap());
+    re.find_iter(&text.to_lowercase())
+        .map(|m| m.as_str().to_string())
+        .filter(|w| !STOP.contains(&w.as_str()))
+        .collect()
+}
+
+/// Normalized edit distance in `[0, 1]` (0 = identical, 1 = completely different). Mirrors the
+/// `_detect_conflicts` near-duplicate gate (`beam.py` L3696-L3703); Python uses
+/// `difflib.SequenceMatcher.ratio()`, this port uses a normalized Levenshtein distance.
+fn edit_dist_ratio(s1: &str, s2: &str) -> f64 {
+    if s1.is_empty() && s2.is_empty() {
+        return 0.0;
+    }
+    if s1.is_empty() || s2.is_empty() {
+        return 1.0;
+    }
+    let a: Vec<char> = s1.chars().collect();
+    let b: Vec<char> = s2.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let dist = prev[b.len()];
+    dist as f64 / a.len().max(b.len()) as f64
+}
+
 /// Temporal cue words that activate the polyphonic temporal voice (`polyphonic_recall.py`
 /// `_temporal_voice` L628-L633).
 fn has_temporal_keyword(query: &str) -> bool {
@@ -2244,6 +2747,293 @@ mod tests {
         assert!(
             !s2.recall("gamma", 5).unwrap().is_empty(),
             "global row visible across sessions"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "vec-ext")]
+    #[test]
+    fn native_vec_cosine_matches_f32_fallback() {
+        let e = engine();
+        for (txt, v) in [
+            ("alpha vector one", vec![1.0f32, 0.0, 0.0]),
+            ("beta vector two", vec![0.0f32, 1.0, 0.0]),
+            ("gamma vector three", vec![0.5f32, 0.5, 0.7]),
+        ] {
+            let id = e.remember(txt, &RememberArgs::default()).unwrap();
+            let conn = e.store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) VALUES (?1, ?2)",
+                params![id, serde_json::to_string(&v).unwrap()],
+            )
+            .unwrap();
+        }
+        let query = vec![0.9f32, 0.1, 0.2];
+        let conn = e.store.conn.lock().unwrap();
+        let native = super::native_cosine_sim_map(&conn, &query).unwrap();
+        let stored = super::load_embeddings(&conn).unwrap();
+        let manual: std::collections::HashMap<String, f64> = stored
+            .iter()
+            .map(|(id, v)| (id.clone(), daemon_core::cosine(&query, v) as f64))
+            .collect();
+        assert_eq!(native.len(), manual.len());
+        for (id, m) in &manual {
+            let n = native.get(id).copied().unwrap();
+            assert!((n - m).abs() < 1e-5, "id={id} native={n} manual={m}");
+        }
+    }
+
+    #[test]
+    fn mutations_write_audit_log_rows() {
+        let e = engine();
+        let id = e
+            .remember("audit me please now", &RememberArgs::default())
+            .unwrap();
+        e.update(&id, Some("audit me later instead"), None).unwrap();
+        e.invalidate(&id, None).unwrap();
+
+        let conn = e.store.conn.lock().unwrap();
+        let actions: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT action FROM audit_log ORDER BY event_id ASC")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect();
+            rows
+        };
+        assert!(actions.contains(&"remember".to_string()), "{actions:?}");
+        assert!(actions.contains(&"update".to_string()), "{actions:?}");
+        assert!(actions.contains(&"invalidate".to_string()), "{actions:?}");
+        // The audit rows carry the bank + session for filtering.
+        let (bank, session): (String, String) = conn
+            .query_row(
+                "SELECT bank, session_id FROM audit_log WHERE action='remember' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bank, e.config.bank);
+        assert_eq!(session, e.config.session_id);
+    }
+
+    #[test]
+    fn sleep_detects_embedding_cosine_conflict_and_invalidates_older() {
+        let e = engine();
+        // Two near-identical-but-different memories from the same source, >1h apart, with similar
+        // (high-cosine) embeddings and >=2 shared significant tokens, but not near-duplicate text.
+        let older_ts = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        let newer_ts = (chrono::Utc::now() - chrono::Duration::hours(40)).to_rfc3339();
+        let va = [1.0f32, 0.02, 0.0];
+        let vb = [0.999f32, 0.04, 0.0];
+        let conn = e.store.conn.lock().unwrap();
+        for (id, ts, content, vec) in [
+            (
+                "old1",
+                &older_ts,
+                "Production database runs PostgreSQL version 13 on the primary cluster node",
+                va,
+            ),
+            (
+                "new1",
+                &newer_ts,
+                "Production database migrated to PostgreSQL version 16 across every cluster replica",
+                vb,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json, veracity, memory_type, scope) \
+                 VALUES (?1, ?2, 'conversation', ?3, ?4, 0.5, '{}', 'stated', 'fact', 'session')",
+                params![id, content, ts, e.config.session_id],
+            )
+            .unwrap();
+            let emb = serde_json::to_string(&vec).unwrap();
+            conn.execute(
+                "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?1, ?2, 'mock')",
+                params![id, emb],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let group = SleepGroup {
+            source: "conversation".to_string(),
+            ids: vec!["old1".to_string(), "new1".to_string()],
+            contents: vec![
+                "Production database runs PostgreSQL version 13 on the primary cluster node"
+                    .to_string(),
+                "Production database migrated to PostgreSQL version 16 across every cluster replica"
+                    .to_string(),
+            ],
+            scope: "session".to_string(),
+            veracity: "stated".to_string(),
+            valid_until: None,
+        };
+        let conflicts = e
+            .heuristic_sleep_conflicts(std::slice::from_ref(&group))
+            .unwrap();
+        assert_eq!(conflicts.len(), 1, "expected one conflict, got {conflicts:?}");
+        assert_eq!(conflicts[0].older_id, "old1");
+        assert_eq!(conflicts[0].newer_id, "new1");
+
+        let resolved = e.resolve_sleep_conflicts(&[group]).unwrap();
+        assert_eq!(resolved, 1);
+        // The older row is now superseded by the newer.
+        let conn = e.store.conn.lock().unwrap();
+        let superseded: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM working_memory WHERE id = 'old1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded.as_deref(), Some("new1"));
+    }
+
+    #[test]
+    fn sleep_does_not_flag_near_duplicate_or_close_in_time() {
+        let e = engine();
+        // Near-duplicate content (edit ratio <= 0.3) must NOT be flagged even with high cosine.
+        let older_ts = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        let newer_ts = (chrono::Utc::now() - chrono::Duration::hours(40)).to_rfc3339();
+        let v = [1.0f32, 0.0, 0.0];
+        let conn = e.store.conn.lock().unwrap();
+        for (id, ts, content) in [
+            ("d1", &older_ts, "The deployment pipeline uses GitHub Actions for builds"),
+            ("d2", &newer_ts, "The deployment pipeline uses GitHub Actions for build"),
+        ] {
+            conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json, veracity, memory_type, scope) \
+                 VALUES (?1, ?2, 'conversation', ?3, ?4, 0.5, '{}', 'stated', 'fact', 'session')",
+                params![id, content, ts, e.config.session_id],
+            )
+            .unwrap();
+            let emb = serde_json::to_string(&v).unwrap();
+            conn.execute(
+                "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?1, ?2, 'mock')",
+                params![id, emb],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let group = SleepGroup {
+            source: "conversation".to_string(),
+            ids: vec!["d1".to_string(), "d2".to_string()],
+            contents: vec![
+                "The deployment pipeline uses GitHub Actions for builds".to_string(),
+                "The deployment pipeline uses GitHub Actions for build".to_string(),
+            ],
+            scope: "session".to_string(),
+            veracity: "stated".to_string(),
+            valid_until: None,
+        };
+        assert!(
+            e.heuristic_sleep_conflicts(&[group]).unwrap().is_empty(),
+            "near-duplicate text must not be flagged as a conflict"
+        );
+    }
+
+    #[test]
+    fn memoria_supplement_surfaces_structured_fact_in_recall() {
+        // A stored metric fact should be folded into recall as a `memoria` candidate when the query
+        // is a structured question with enough lexical overlap (`beam.py` L6006-L6059).
+        let e = engine();
+        e.remember(
+            "The dashboard API response time of 250ms was measured during load testing.",
+            &RememberArgs::default(),
+        )
+        .unwrap();
+
+        let hits = e
+            .recall("What is the API response time in production?", 5)
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.id.starts_with("memoria_")
+                && r.content.contains("[MEMORIA")
+                && r.content.contains("250ms")),
+            "expected a MEMORIA supplement row, got {hits:?}"
+        );
+        // The score cap is 0.6 for the memoria row.
+        let memoria_row = hits
+            .iter()
+            .find(|r| r.id.starts_with("memoria_memoria"))
+            .expect("memoria row present");
+        assert!(memoria_row.score <= 0.6 + 1e-9, "score {}", memoria_row.score);
+    }
+
+    #[test]
+    fn author_and_channel_scope_widen_recall_across_sessions() {
+        // Two sessions over a shared bank, each stamping a different author. The default
+        // session-scoped recall must not cross sessions, but an author-scoped recall (no channel)
+        // widens to all sessions for that author, and a channel-scoped recall sees its channel.
+        let dir = std::env::temp_dir().join(format!("mnemosyne-idscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = |sid: &str, author: &str, channel: Option<&str>| MnemosyneConfig {
+            data_dir: dir.clone(),
+            session_id: sid.to_string(),
+            author_id: Some(author.to_string()),
+            author_type: Some("agent".to_string()),
+            channel_id: channel.map(|c| c.to_string()),
+            ..MnemosyneConfig::default()
+        };
+        // Both rows authored by "abdias" but written from different sessions; s2 also on a channel.
+        let s1 = Engine::open(cfg("s1", "abdias", None)).expect("open s1");
+        let s2 = Engine::open(cfg("s2", "abdias", Some("team-x"))).expect("open s2");
+        s1.remember("alpha kubernetes deploy note", &RememberArgs::default())
+            .unwrap();
+        s2.remember("beta kubernetes rollout note", &RememberArgs::default())
+            .unwrap();
+
+        // Default (empty) scope stays session-local: s1 cannot see s2's row.
+        let empty = RecallScope::default();
+        assert!(
+            s1.recall_with_scope("kubernetes", 5, None, &empty)
+                .unwrap()
+                .iter()
+                .all(|r| r.content.contains("alpha")),
+            "default scope must remain session-local"
+        );
+
+        // Author-only scope widens to every session for that author (the `(1=1)` branch).
+        let author_scope = RecallScope {
+            author_id: Some("abdias".to_string()),
+            ..RecallScope::default()
+        };
+        let hits = s1
+            .recall_with_scope("kubernetes", 5, None, &author_scope)
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.content.contains("alpha"))
+                && hits.iter().any(|r| r.content.contains("beta")),
+            "author scope should surface rows from both sessions, got {hits:?}"
+        );
+
+        // A different author sees nothing.
+        let other_author = RecallScope {
+            author_id: Some("someone-else".to_string()),
+            ..RecallScope::default()
+        };
+        assert!(
+            s1.recall_with_scope("kubernetes", 5, None, &other_author)
+                .unwrap()
+                .is_empty(),
+            "unknown author must match no rows"
+        );
+
+        // Channel scope surfaces the channel's row.
+        let channel_scope = RecallScope {
+            channel_id: Some("team-x".to_string()),
+            ..RecallScope::default()
+        };
+        let hits = s1
+            .recall_with_scope("kubernetes", 5, None, &channel_scope)
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.content.contains("beta")),
+            "channel scope should surface the channel row, got {hits:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

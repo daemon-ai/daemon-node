@@ -23,18 +23,20 @@ impl Store {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Auto-extensions only attach to connections opened *after* registration.
+        register_vec_extension();
         let conn = Connection::open(path)?;
         Self::init(conn)
     }
 
     /// Open an ephemeral in-memory store (tests).
     pub fn open_in_memory() -> Result<Self> {
+        register_vec_extension();
         let conn = Connection::open_in_memory()?;
         Self::init(conn)
     }
 
     fn init(conn: Connection) -> Result<Self> {
-        register_vec_extension();
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch(schema::SCHEMA)?;
         Ok(Self {
@@ -54,7 +56,8 @@ fn register_vec_extension() {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| unsafe {
         use rusqlite::auto_extension::{register_auto_extension, RawAutoExtension};
-        let raw: RawAutoExtension = std::mem::transmute(sqlite_vec::sqlite3_vec_init as usize);
+        let raw: RawAutoExtension =
+            std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const () as usize);
         let _ = register_auto_extension(raw);
     });
 }

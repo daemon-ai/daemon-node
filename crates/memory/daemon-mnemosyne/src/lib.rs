@@ -19,6 +19,7 @@
 
 pub mod aaak;
 pub mod binary_vectors;
+pub mod chat_normalize;
 pub mod config;
 pub mod dynamics;
 pub mod embeddings;
@@ -27,6 +28,7 @@ pub mod error;
 pub mod extract;
 pub mod tools;
 pub mod knowledge;
+pub mod memoria;
 pub mod provider;
 pub mod recall;
 pub mod sanitize;

@@ -184,7 +184,7 @@ impl MemoryProvider for MnemosyneProvider {
         // Turn-counter auto-sleep (`__init__.py` L1690): every N persisted turns, run a
         // consolidation pass (summarizing through the LLM when present).
         let turns = self.turns.fetch_add(1, Ordering::Relaxed) + 1;
-        if turns % AUTO_SLEEP_EVERY_TURNS == 0 {
+        if turns.is_multiple_of(AUTO_SLEEP_EVERY_TURNS) {
             self.run_sleep(false).await;
         }
     }

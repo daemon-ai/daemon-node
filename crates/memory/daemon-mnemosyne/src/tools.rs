@@ -34,7 +34,7 @@ pub fn defs() -> Vec<ToolDef> {
         ),
         def(
             "mnemosyne_recall",
-            r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"}},"required":["query"]}"#,
+            r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"},"author_id":{"type":"string"},"author_type":{"type":"string"},"channel_id":{"type":"string"}},"required":["query"]}"#,
         ),
         def(
             "mnemosyne_get",
@@ -107,7 +107,7 @@ pub fn defs() -> Vec<ToolDef> {
         ),
         def(
             "mnemosyne_shared_recall",
-            r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"}},"required":["query"]}"#,
+            r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"},"author_id":{"type":"string"},"author_type":{"type":"string"},"channel_id":{"type":"string"}},"required":["query"]}"#,
         ),
         def(
             "mnemosyne_shared_forget",
@@ -149,6 +149,29 @@ pub async fn run_sleep(engine: &Engine, extractor: &Extractor, force: bool) -> c
     let groups: Vec<SleepGroup> = engine.sleep_plan(force)?;
     if groups.is_empty() {
         return engine.finish_sleep(&groups, &HashMap::new());
+    }
+    // Heuristic embedding-cosine conflict detection, before summarization (`beam.py` L7705-L7731).
+    // When the LLM gate is on, each pair is validated before invalidation; otherwise all detected
+    // pairs are invalidated (older superseded by newer).
+    if let Ok(conflicts) = engine.heuristic_sleep_conflicts(&groups) {
+        let gate = engine.llm_conflict_detection() && extractor.available();
+        for c in &conflicts {
+            let confirmed = if gate {
+                crate::knowledge::conflict::validate_conflict_pair(
+                    extractor,
+                    &c.older_content,
+                    &c.newer_content,
+                )
+                .await
+                .map(|v| v.is_conflict)
+                .unwrap_or(false)
+            } else {
+                true
+            };
+            if confirmed {
+                let _ = engine.invalidate(&c.older_id, Some(&c.newer_id));
+            }
+        }
     }
     let mut summaries = HashMap::new();
     for group in &groups {
@@ -199,7 +222,19 @@ pub async fn dispatch(
             let query = s(&args, "query").unwrap_or("");
             let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             let query_vec = embedder.embed_query(query).await;
-            match engine.recall_with_vector(query, top_k, query_vec.as_deref()) {
+            // Multi-agent identity overrides default to the engine's configured scope (`beam.py`
+            // `recall` author/channel params L5030-L5032 default to the instance attrs).
+            let mut scope = engine.config_scope();
+            if let Some(v) = s(&args, "author_id") {
+                scope.author_id = Some(v.to_string());
+            }
+            if let Some(v) = s(&args, "author_type") {
+                scope.author_type = Some(v.to_string());
+            }
+            if let Some(v) = s(&args, "channel_id") {
+                scope.channel_id = Some(v.to_string());
+            }
+            match engine.recall_with_scope(query, top_k, query_vec.as_deref(), &scope) {
                 Ok(rows) => {
                     let results: Vec<Value> = rows
                         .iter()

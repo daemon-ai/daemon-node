@@ -36,6 +36,34 @@ pub struct MnemosyneConfig {
     pub recall_mode: RecallMode,
     /// Enable the opt-in tier-2 LLM conflict detector in sleep (`MNEMOSYNE_LLM_CONFLICT_DETECTION`).
     pub llm_conflict_detection: bool,
+    /// Multi-agent identity: the original writer (`MNEMOSYNE_AUTHOR_ID`, `beam.py` ctor L2616). When
+    /// set it both stamps new rows and widens recall scope to all sessions for that author.
+    pub author_id: Option<String>,
+    /// Multi-agent identity: author type — `human`/`agent`/`system` (`MNEMOSYNE_AUTHOR_TYPE`).
+    pub author_type: Option<String>,
+    /// Multi-agent identity: channel/group id (`MNEMOSYNE_CHANNEL_ID`, `beam.py` ctor L2618). Writes
+    /// default it to `session_id`; recall only filters on it when explicitly set.
+    pub channel_id: Option<String>,
+}
+
+/// The multi-agent identity scope applied to a recall (`beam.py` `recall` author/channel params
+/// L5030-L5032, scope clause L5182-L5220). All-`None` reproduces the default
+/// `session_id OR scope='global'` behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecallScope {
+    /// Filter to a specific author (and, with no channel, widen to all sessions for that author).
+    pub author_id: Option<String>,
+    /// Filter to a specific author type.
+    pub author_type: Option<String>,
+    /// Filter to a specific channel/group (widens recall to `session OR global OR channel`).
+    pub channel_id: Option<String>,
+}
+
+impl RecallScope {
+    /// Whether any identity filter is set (an empty scope keeps the default session behavior).
+    pub fn is_empty(&self) -> bool {
+        self.author_id.is_none() && self.author_type.is_none() && self.channel_id.is_none()
+    }
 }
 
 impl Default for MnemosyneConfig {
@@ -56,8 +84,16 @@ impl Default for MnemosyneConfig {
             working_memory_ttl_hours: 168.0,
             recall_mode: recall_mode_from_env(),
             llm_conflict_detection: env_flag("MNEMOSYNE_LLM_CONFLICT_DETECTION"),
+            author_id: env_opt("MNEMOSYNE_AUTHOR_ID"),
+            author_type: env_opt("MNEMOSYNE_AUTHOR_TYPE"),
+            channel_id: env_opt("MNEMOSYNE_CHANNEL_ID"),
         }
     }
+}
+
+/// The non-empty value of the named env var, else `None`.
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// True if the named env var is set to `1` (the Mnemosyne flag convention).
