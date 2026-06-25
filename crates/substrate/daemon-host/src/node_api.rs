@@ -36,8 +36,9 @@ use daemon_api::{
     ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
     SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole,
     SessionScope, SessionSearchHit, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
-    ChannelJoinDetails, ConversationInfo, CreateConversationDetails, MemberRole,
-    Participant, SupportsConversations, SupportsMembership, TransportInstanceInfo,
+    ActionMenu, ChannelJoinDetails, ContactInfo, ConversationInfo, CreateConversationDetails,
+    MemberRole, Participant, SupportsContacts, SupportsConversations, SupportsDirectory,
+    SupportsMembership, TransportInstanceInfo,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -519,6 +520,42 @@ impl NodeApiImpl {
             .ok_or_else(|| {
                 ApiError::Unsupported(format!(
                     "transport {} has no membership support",
+                    transport.as_str()
+                ))
+            })
+    }
+
+    /// Resolve the remote-contacts feature for `transport`.
+    fn contacts_for(
+        &self,
+        transport: &TransportId,
+    ) -> Result<Arc<dyn SupportsContacts>, ApiError> {
+        self.adapters
+            .load_full()
+            .adapter_for_transport(transport)
+            .and_then(|a| a.messaging())
+            .and_then(|m| m.contacts())
+            .ok_or_else(|| {
+                ApiError::Unsupported(format!(
+                    "transport {} has no contacts support",
+                    transport.as_str()
+                ))
+            })
+    }
+
+    /// Resolve the contact/user-directory feature for `transport`.
+    fn directory_for(
+        &self,
+        transport: &TransportId,
+    ) -> Result<Arc<dyn SupportsDirectory>, ApiError> {
+        self.adapters
+            .load_full()
+            .adapter_for_transport(transport)
+            .and_then(|a| a.messaging())
+            .and_then(|m| m.directory())
+            .ok_or_else(|| {
+                ApiError::Unsupported(format!(
+                    "transport {} has no directory support",
                     transport.as_str()
                 ))
             })
@@ -1997,6 +2034,48 @@ impl ControlApi for NodeApiImpl {
         )
         .await;
         Ok(())
+    }
+
+    async fn contact_get_profile(
+        &self,
+        transport: TransportId,
+        contact: ContactInfo,
+    ) -> Result<String, ApiError> {
+        self.contacts_for(&transport)?.get_profile(transport, contact).await
+    }
+
+    async fn contact_action_menu(
+        &self,
+        transport: TransportId,
+        contact: ContactInfo,
+    ) -> Option<ActionMenu> {
+        self.contacts_for(&transport).ok()?.action_menu(transport, contact)
+    }
+
+    async fn contact_set_alias(
+        &self,
+        transport: TransportId,
+        contact: ContactInfo,
+        alias: Option<String>,
+    ) -> Result<(), ApiError> {
+        let id = contact.id.clone();
+        self.contacts_for(&transport)?
+            .set_alias(transport.clone(), contact, alias.clone())
+            .await?;
+        self.audit_management(
+            "mgmt.contact.set_alias",
+            format!("transport={} contact={id} alias={alias:?}", transport.as_str()),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn directory_search(
+        &self,
+        transport: TransportId,
+        query: Option<String>,
+    ) -> Result<Vec<ContactInfo>, ApiError> {
+        self.directory_for(&transport)?.search_contacts(transport, query).await
     }
 
     async fn acp_discover(&self) -> Vec<AcpAgentEntry> {

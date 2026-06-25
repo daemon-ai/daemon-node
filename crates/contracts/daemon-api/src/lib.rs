@@ -722,6 +722,44 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("member_set_role".into()))
     }
 
+    /// Fetch a remote contact's profile text (`SupportsContacts::get_profile`). Default: unsupported.
+    async fn contact_get_profile(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Result<String, ApiError> {
+        Err(ApiError::Unsupported("contact_get_profile".into()))
+    }
+
+    /// The contact's action menu (`SupportsContacts::action_menu`). Default: `None`.
+    async fn contact_action_menu(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Option<ActionMenu> {
+        None
+    }
+
+    /// Set a local alias for a contact (`SupportsContacts::set_alias`). Default: unsupported.
+    async fn contact_set_alias(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+        _alias: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("contact_set_alias".into()))
+    }
+
+    /// Search the transport's contact/user directory (`SupportsDirectory::search_contacts`).
+    /// Default: unsupported.
+    async fn directory_search(
+        &self,
+        _transport: TransportId,
+        _query: Option<String>,
+    ) -> Result<Vec<ContactInfo>, ApiError> {
+        Err(ApiError::Unsupported("directory_search".into()))
+    }
+
     // -- ACP discovery + registry (catalog-style; the daemon probes its own PATH/endpoints) --
 
     /// Trigger a server-side ACP discovery scan (PATH + well-known locations + the curated
@@ -3726,6 +3764,38 @@ pub enum ApiRequest {
         /// The new role.
         role: MemberRole,
     },
+    /// [`ControlApi::contact_get_profile`] — fetch a remote contact's profile.
+    ContactGetProfile {
+        /// The owning transport.
+        transport: TransportId,
+        /// The contact whose profile to fetch.
+        contact: ContactInfo,
+    },
+    /// [`ControlApi::contact_set_alias`] — set a local alias for a contact.
+    ContactSetAlias {
+        /// The owning transport.
+        transport: TransportId,
+        /// The contact to alias.
+        contact: ContactInfo,
+        /// The new alias (`None` clears).
+        #[serde(default)]
+        alias: Option<String>,
+    },
+    /// [`ControlApi::contact_action_menu`] — the contact's action menu.
+    ContactActionMenu {
+        /// The owning transport.
+        transport: TransportId,
+        /// The contact.
+        contact: ContactInfo,
+    },
+    /// [`ControlApi::directory_search`] — search the transport's contact/user directory.
+    DirectorySearch {
+        /// The owning transport.
+        transport: TransportId,
+        /// The search query (`None`/empty = an unfiltered listing where the transport allows it).
+        #[serde(default)]
+        query: Option<String>,
+    },
     /// [`ControlApi::fs_roots`].
     FsRoots,
     /// [`ControlApi::fs_list`].
@@ -3949,6 +4019,12 @@ pub enum ApiResponse {
     Conversations(Vec<ConversationInfo>),
     /// One conversation, if present (conv_get / conv_create / conv_join).
     Conversation(Option<ConversationInfo>),
+    /// A remote contact's profile text (contact_get_profile).
+    ContactProfile(String),
+    /// A list of contacts (directory_search).
+    Contacts(Vec<ContactInfo>),
+    /// A contact's action menu, if any (contact_action_menu).
+    ActionMenu(Option<ActionMenu>),
     /// The typed create-conversation form (conv_create_details).
     ConvCreateDetails(CreateConversationDetails),
     /// The typed channel-join form (conv_join_details).
@@ -4583,6 +4659,24 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::MemberSetRole { transport, conv, who, role } => {
             unit_or_err(api.member_set_role(transport, conv, who, role).await)
         }
+        ApiRequest::ContactGetProfile { transport, contact } => {
+            match api.contact_get_profile(transport, contact).await {
+                Ok(profile) => ApiResponse::ContactProfile(profile),
+                Err(e) => ApiResponse::Error(e),
+            }
+        }
+        ApiRequest::ContactSetAlias { transport, contact, alias } => {
+            unit_or_err(api.contact_set_alias(transport, contact, alias).await)
+        }
+        ApiRequest::ContactActionMenu { transport, contact } => {
+            ApiResponse::ActionMenu(api.contact_action_menu(transport, contact).await)
+        }
+        ApiRequest::DirectorySearch { transport, query } => {
+            match api.directory_search(transport, query).await {
+                Ok(contacts) => ApiResponse::Contacts(contacts),
+                Err(e) => ApiResponse::Error(e),
+            }
+        }
         ApiRequest::TransportAdapters => {
             ApiResponse::Adapters(api.transport_adapters().await)
         }
@@ -4772,6 +4866,10 @@ mod tests {
             ApiRequest::MemberRemove { transport: transport.clone(), conv: "r1".into(), who: who.clone(), reason: Some("bye".into()) },
             ApiRequest::MemberBan { transport: transport.clone(), conv: "r1".into(), who: who.clone(), reason: None },
             ApiRequest::MemberSetRole { transport: transport.clone(), conv: "r1".into(), who: who.clone(), role: MemberRole::Op },
+            ApiRequest::ContactGetProfile { transport: transport.clone(), contact: ContactInfo { id: "@alice:hs".into(), ..ContactInfo::default() } },
+            ApiRequest::ContactSetAlias { transport: transport.clone(), contact: ContactInfo { id: "@alice:hs".into(), ..ContactInfo::default() }, alias: Some("Ali".into()) },
+            ApiRequest::ContactActionMenu { transport: transport.clone(), contact: ContactInfo { id: "@alice:hs".into(), ..ContactInfo::default() } },
+            ApiRequest::DirectorySearch { transport: transport.clone(), query: Some("ali".into()) },
             ApiRequest::TransportAdapters,
             ApiRequest::TransportInstances,
         ];
@@ -4821,6 +4919,10 @@ mod tests {
                 capabilities: AdapterCapabilities::default(),
                 account_schema: AccountSettingsSchema::default(),
             }]),
+            ApiResponse::ContactProfile("display_name: Alice".into()),
+            ApiResponse::Contacts(vec![info.members[0].contact.clone()]),
+            ApiResponse::ActionMenu(Some(ActionMenu { items: vec!["Block".into()] })),
+            ApiResponse::ActionMenu(None),
         ];
         for resp in resps {
             let bytes = to_cbor(&resp);

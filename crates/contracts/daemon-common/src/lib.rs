@@ -432,7 +432,13 @@ impl WireVersion {
     /// v19 (rooms behavior): adds the additive `ConvDelete` + `ConvHistory` ops — conversation
     /// deletion and the durable, verifiable per-conversation transcript read (a merged room history
     /// keyed by `(transport, conv)`, returned as a `Journal` page). Additive (new request variants).
-    pub const CURRENT: Self = Self(19);
+    ///
+    /// v20 (contacts + directory): adds the additive messaging-adapter Contacts/Directory ops
+    /// (`ContactGetProfile`/`ContactSetAlias`/`ContactActionMenu`/`DirectorySearch`) and their
+    /// `ContactProfile`/`Contacts`/`ActionMenu` responses plus the `action-menu` group def, forwarding
+    /// to the `SupportsContacts`/`SupportsDirectory` feature traits (Matrix implements get_profile +
+    /// directory search). `SupportsRoster` remains defined-but-unplumbed. Additive (new variants).
+    pub const CURRENT: Self = Self(20);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

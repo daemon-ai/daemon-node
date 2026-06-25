@@ -35,4 +35,7 @@ anyhow = { workspace = true }
 # `JoinedRoomBuilder` / `EventFactory` sync-injection helpers used to drive the inbound path.
 matrix-sdk = { workspace = true, features = ["testing"] }
 matrix-sdk-test = "0.18"
+# Raw mock for the full `/profile/{user}` endpoint (no prebuilt MatrixMockServer builder for it);
+# pinned to the same 0.6 line matrix-sdk's `testing` feature already pulls in.
+wiremock = "0.6"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

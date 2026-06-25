@@ -186,6 +186,16 @@ enum Command {
         #[command(subcommand)]
         cmd: MemberCmd,
     },
+    /// Remote-contact operations on a messaging transport (`get-profile`, `set-alias`).
+    Contact {
+        #[command(subcommand)]
+        cmd: ContactCmd,
+    },
+    /// Search a transport's contact/user directory.
+    Directory {
+        #[command(subcommand)]
+        cmd: DirectoryCmd,
+    },
 }
 
 /// Conversation management over the messaging-adapter interface (`conv_*` ops). `transport` is the
@@ -361,6 +371,42 @@ enum MemberCmd {
         /// The profile the member runs under (agent participant).
         #[arg(long)]
         profile: Option<String>,
+    },
+}
+
+/// Remote-contact operations over the messaging-adapter interface (`contact_*` ops). `transport` is
+/// the instance id (`matrix/@user:hs`); `contact` is the contact id (a Matrix MXID `@user:hs`).
+#[derive(Subcommand)]
+enum ContactCmd {
+    /// Fetch a remote contact's profile.
+    GetProfile {
+        /// The transport instance (`matrix/@user:hs`).
+        transport: String,
+        /// The contact id (MXID).
+        contact: String,
+    },
+    /// Set a local alias for a contact (where the transport supports it).
+    SetAlias {
+        /// The transport instance.
+        transport: String,
+        /// The contact id (MXID).
+        contact: String,
+        /// The new alias (omit to clear).
+        #[arg(long)]
+        alias: Option<String>,
+    },
+}
+
+/// Contact/user-directory search over the messaging-adapter interface (`directory_search`).
+#[derive(Subcommand)]
+enum DirectoryCmd {
+    /// Search the directory for contacts/users.
+    Search {
+        /// The transport instance (`matrix/@user:hs`).
+        transport: String,
+        /// The search query (omit for an unfiltered listing where supported).
+        #[arg(long)]
+        query: Option<String>,
     },
 }
 
@@ -1020,6 +1066,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Transports => render(client.call(ApiRequest::TransportInstances).await?),
         Command::Conv { cmd } => run_conv(&client, cmd).await?,
         Command::Member { cmd } => run_member(&client, cmd).await?,
+        Command::Contact { cmd } => run_contact(&client, cmd).await?,
+        Command::Directory { cmd } => run_directory(&client, cmd).await?,
     }
     Ok(())
 }
@@ -1209,6 +1257,46 @@ async fn run_member(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()> {
             conv,
             who: participant(member, profile),
             role: parse_role(&role)?,
+        },
+    };
+    render(client.call(req).await?);
+    Ok(())
+}
+
+/// Dispatch a `contact` subcommand over the api mirror. The `contact` arg is the contact id (an MXID
+/// on Matrix), wrapped as a `Participant::Contact` carrier.
+async fn run_contact(client: &ApiClient, cmd: ContactCmd) -> anyhow::Result<()> {
+    let req = match cmd {
+        ContactCmd::GetProfile { transport, contact } => ApiRequest::ContactGetProfile {
+            transport: TransportId::new(transport),
+            contact: ContactInfo {
+                id: contact,
+                ..ContactInfo::default()
+            },
+        },
+        ContactCmd::SetAlias {
+            transport,
+            contact,
+            alias,
+        } => ApiRequest::ContactSetAlias {
+            transport: TransportId::new(transport),
+            contact: ContactInfo {
+                id: contact,
+                ..ContactInfo::default()
+            },
+            alias,
+        },
+    };
+    render(client.call(req).await?);
+    Ok(())
+}
+
+/// Dispatch a `directory` subcommand over the api mirror.
+async fn run_directory(client: &ApiClient, cmd: DirectoryCmd) -> anyhow::Result<()> {
+    let req = match cmd {
+        DirectoryCmd::Search { transport, query } => ApiRequest::DirectorySearch {
+            transport: TransportId::new(transport),
+            query,
         },
     };
     render(client.call(req).await?);
@@ -1921,6 +2009,23 @@ fn render(resp: ApiResponse) {
                 }
             }
             None => println!("conversation: not found"),
+        },
+        ApiResponse::ContactProfile(profile) => println!("profile:\n{profile}"),
+        ApiResponse::Contacts(contacts) => {
+            println!("contacts: {}", contacts.len());
+            for c in contacts {
+                let name = c.display_name.unwrap_or_else(|| "(no name)".to_string());
+                println!("  - {} \"{}\"", c.id, name);
+            }
+        }
+        ApiResponse::ActionMenu(menu) => match menu {
+            Some(m) => {
+                println!("action menu: {} item(s)", m.items.len());
+                for item in m.items {
+                    println!("  - {item}");
+                }
+            }
+            None => println!("action menu: none"),
         },
         ApiResponse::Error(e) => println!("error: {e}"),
         // Filesystem-surface responses (daemon-fs-surface-spec.md) and any other variant: the CLI

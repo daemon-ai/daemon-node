@@ -71,6 +71,18 @@ fn role_from_matrix(role: RoomMemberRole) -> MemberRole {
     }
 }
 
+/// Build a [`ContactInfo`] from a Matrix user id + optional display name (the directory-search /
+/// user-directory projection; `daemon-matrix-bifrost-port-reference.md` §4.3). Presence/permission
+/// are unknown from a directory hit, so they default.
+pub(crate) fn contact_from(id: String, display_name: Option<String>) -> ContactInfo {
+    ContactInfo {
+        id,
+        display_name,
+        presence: Presence::default(),
+        permission: ContactPermission::Unset,
+    }
+}
+
 /// Map an outbound [`MemberRole`] to a Matrix power level for `set_role`
 /// (Founder=100, Op=50, HalfOp=25, Voice/None=0).
 pub(crate) fn role_to_power(role: MemberRole) -> i32 {

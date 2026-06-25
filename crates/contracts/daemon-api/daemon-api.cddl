@@ -6,7 +6,7 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
-wire_version = uint                 ; daemon-common WireVersion (current = 19)
+wire_version = uint                 ; daemon-common WireVersion (current = 20)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id  = tstr
@@ -679,6 +679,7 @@ presence-primitive = "Offline" / "Available" / "Idle" / "Invisible" / "Away" / "
 presence = { primitive: presence-primitive, ? message: (tstr / null), ? emoji: (tstr / null), ? mobile: bool, ? idle_since: (uint / null) }
 contact-permission = "Unset" / "Allow" / "Deny"
 contact-info = { id: tstr, ? display_name: (tstr / null), ? presence: presence, ? permission: contact-permission }
+action-menu = { ? items: [* tstr] }
 participant = { "Contact": contact-info } / { "Agent": { profile: profile-ref, member: tstr } }
 conversation-member = {
   contact: contact-info, ? alias: (tstr / null), ? nickname: (tstr / null),
@@ -847,6 +848,11 @@ api-request = { "Submit": { session: session-id, command: agent-command, ? origi
             / { "MemberRemove": { transport: transport-id, conv: tstr, who: participant, ? reason: (tstr / null) } }  ; -> Ok
             / { "MemberBan": { transport: transport-id, conv: tstr, who: participant, ? reason: (tstr / null) } }  ; -> Ok
             / { "MemberSetRole": { transport: transport-id, conv: tstr, who: participant, role: member-role } }  ; -> Ok
+            ; ----- contacts + directory (wire v20; daemon-messaging-adapter-spec.md §3.4/§3.5) -----
+            / { "ContactGetProfile": { transport: transport-id, contact: contact-info } }  ; -> ContactProfile
+            / { "ContactSetAlias": { transport: transport-id, contact: contact-info, ? alias: (tstr / null) } }  ; -> Ok
+            / { "ContactActionMenu": { transport: transport-id, contact: contact-info } }  ; -> ActionMenu
+            / { "DirectorySearch": { transport: transport-id, ? query: (tstr / null) } }   ; -> Contacts
             ; ----- filesystem / workspace surface (wire v14; daemon-fs-surface-spec.md) -----
             / "FsRoots"                                                                  ; -> FsRoots
             / { "FsList": { root: fs-root-id, dir: tstr, ? show_ignored: bool } }        ; -> FsList
@@ -928,11 +934,15 @@ api-response = "Ok"
              ; ----- transport-adapter framework + messaging management (wire v18) -----
              / { "Adapters": [* adapter-info] }
              / { "TransportInstances": [* transport-instance-info] }
-             / { "Conversations": [* conversation-info] }
-             / { "Conversation": (conversation-info / null) }
-             / { "ConvCreateDetails": create-conversation-details }
-             / { "ConvJoinDetails": channel-join-details }
-             / { "Error": api-error }
+            / { "Conversations": [* conversation-info] }
+            / { "Conversation": (conversation-info / null) }
+            / { "ConvCreateDetails": create-conversation-details }
+            / { "ConvJoinDetails": channel-join-details }
+            ; ----- contacts + directory (wire v20) -----
+            / { "ContactProfile": tstr }
+            / { "Contacts": [* contact-info] }
+            / { "ActionMenu": (action-menu / null) }
+            / { "Error": api-error }
              ; ----- filesystem / workspace surface (wire v14) -----
              / { "FsRoots": [* fs-root] }
              / { "FsList": [* fs-entry] }
