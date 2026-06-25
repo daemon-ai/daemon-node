@@ -362,6 +362,66 @@ fn gen_zcbor(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The verify-codec harness: decode every ciborium-produced fixture with the zcbor-generated decoder.
+/// A `response-*` filename is decoded as `api_response`, anything else as `api_request`; success
+/// means the generated decoder accepted the bytes (ZCBOR_SUCCESS) and consumed all of them.
+const VERIFY_CODEC_C: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "daemon_api_smoke_decode.h"
+
+static unsigned char buf[1u << 20];
+
+int main(int argc, char **argv) {
+    int failures = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *path = argv[i];
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            fprintf(stderr, "FAIL %s: cannot open\n", path);
+            failures++;
+            continue;
+        }
+        size_t n = fread(buf, 1, sizeof buf, f);
+        fclose(f);
+
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+
+        size_t consumed = 0;
+        int ret;
+        if (strncmp(base, "response", 8) == 0) {
+            struct api_response_r *r = calloc(1, sizeof *r);
+            ret = cbor_decode_api_response(buf, n, r, &consumed);
+            free(r);
+        } else {
+            struct api_request_r *r = calloc(1, sizeof *r);
+            ret = cbor_decode_api_request(buf, n, r, &consumed);
+            free(r);
+        }
+
+        if (ret != 0) {
+            fprintf(stderr, "FAIL %s: zcbor decode error %d\n", base, ret);
+            failures++;
+        } else if (consumed != n) {
+            fprintf(stderr, "FAIL %s: decoded %zu of %zu bytes\n", base, consumed, n);
+            failures++;
+        } else {
+            fprintf(stderr, "ok   %s (%zu bytes)\n", base, n);
+        }
+    }
+
+    if (failures) {
+        fprintf(stderr, "%d fixture(s) failed to decode\n", failures);
+        return 1;
+    }
+    fprintf(stderr, "all fixtures decoded with the generated zcbor codec\n");
+    return 0;
+}
+"#;
+
 /// `verify-codec` — prove the generated C codec accepts real ciborium wire bytes.
 ///
 /// Closes the loop the syntactic `cddl` gate cannot: generate the codec from the CDDL, compile its
@@ -396,7 +456,7 @@ fn verify_codec() -> anyhow::Result<()> {
     run_codegen(&root, &default_cddl(&root), &codec, &["--copy-sources"])?;
 
     let harness_c = work.join("verify_codec.c");
-    std::fs::write(&harness_c, include_str!("verify_codec.c"))?;
+    std::fs::write(&harness_c, VERIFY_CODEC_C)?;
     let bin = work.join("verify-codec");
 
     let status = Command::new("cc")
