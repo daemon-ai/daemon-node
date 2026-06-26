@@ -371,7 +371,10 @@ fn run_generation<'a>(
     let reused = common as u64;
 
     // Evict the divergent tail (and any tokens generated last turn beyond the common prefix).
-    if let Err(e) = session.ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None) {
+    if let Err(e) = session
+        .ctx
+        .clear_kv_cache_seq(Some(0), Some(common as u32), None)
+    {
         session.ctx.clear_kv_cache();
         session.cached_tokens.clear();
         return Err(BackendError::transient(format!("kv cache trim: {e}")));
@@ -545,7 +548,11 @@ fn fallback_prompt(req: &GenerateRequest) -> String {
 /// prepending a GBNF grammar sampler when the request carries a [`Constraint::Gbnf`]. The grammar
 /// sampler is applied first so it masks invalid tokens before the selection samplers run. A
 /// [`Constraint::Lark`] is for the mistral.rs engine — ignored here (with a warning).
-fn build_sampler(model: &LlamaModel, s: &Sampling, constraint: Option<&Constraint>) -> LlamaSampler {
+fn build_sampler(
+    model: &LlamaModel,
+    s: &Sampling,
+    constraint: Option<&Constraint>,
+) -> LlamaSampler {
     let grammar = match constraint.map(|c| &c.gbnf) {
         Some(Some(g)) => Some(LlamaSampler::grammar(model, g, "root")),
         Some(None) => {

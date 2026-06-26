@@ -54,15 +54,21 @@ pub fn fuse(voices: &[(&str, Vec<VoiceHit>)]) -> Vec<Fused> {
             continue;
         }
         let mut sorted = hits.clone();
-        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for (idx, hit) in sorted.iter().enumerate() {
             let rank = idx + 1;
             let contribution = rrf_contribution(rank);
-            let entry = combined.entry(hit.memory_id.clone()).or_insert_with(|| Fused {
-                memory_id: hit.memory_id.clone(),
-                combined_score: 0.0,
-                voices: Vec::new(),
-            });
+            let entry = combined
+                .entry(hit.memory_id.clone())
+                .or_insert_with(|| Fused {
+                    memory_id: hit.memory_id.clone(),
+                    combined_score: 0.0,
+                    voices: Vec::new(),
+                });
             entry.combined_score += contribution;
             if !entry.voices.iter().any(|v| v == voice_name) {
                 entry.voices.push((*voice_name).to_string());
@@ -87,7 +93,9 @@ pub fn diversity_rerank(fused: Vec<Fused>, top_k: usize) -> Vec<Fused> {
         if selected.len() >= top_k {
             break;
         }
-        let diverse = selected.iter().all(|sel| voice_jaccard(&cand.voices, &sel.voices) <= 0.8);
+        let diverse = selected
+            .iter()
+            .all(|sel| voice_jaccard(&cand.voices, &sel.voices) <= 0.8);
         if diverse {
             selected.push(cand);
         }
@@ -110,7 +118,10 @@ mod tests {
     use super::*;
 
     fn hit(id: &str, score: f64) -> VoiceHit {
-        VoiceHit { memory_id: id.to_string(), score }
+        VoiceHit {
+            memory_id: id.to_string(),
+            score,
+        }
     }
 
     #[test]
@@ -129,8 +140,16 @@ mod tests {
     #[test]
     fn diversity_drops_same_voice_set() {
         let fused = vec![
-            Fused { memory_id: "a".into(), combined_score: 0.5, voices: vec!["vector".into()] },
-            Fused { memory_id: "b".into(), combined_score: 0.4, voices: vec!["vector".into()] },
+            Fused {
+                memory_id: "a".into(),
+                combined_score: 0.5,
+                voices: vec!["vector".into()],
+            },
+            Fused {
+                memory_id: "b".into(),
+                combined_score: 0.4,
+                voices: vec!["vector".into()],
+            },
         ];
         // Identical voice sets -> Jaccard 1.0 > 0.8 -> second dropped.
         let out = diversity_rerank(fused, 10);

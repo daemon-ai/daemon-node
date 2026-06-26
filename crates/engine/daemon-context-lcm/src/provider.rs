@@ -21,7 +21,7 @@ use daemon_common::SessionId;
 use daemon_core::tools::ToolDef;
 use daemon_core::{
     CommandCx, CommandError, CommandInvocation, CommandOutput, CommandProvider,
-    CommandProviderHandle, CommandSpec, Conversation, ContextEngine, ModelInfo, Pressure, Provider,
+    CommandProviderHandle, CommandSpec, ContextEngine, Conversation, ModelInfo, Pressure, Provider,
     Turn,
 };
 use serde_json::Value;
@@ -185,7 +185,16 @@ impl LcmContextEngine {
     /// string (§10.7). The tools read the durable store, so recovery works regardless of what is
     /// currently in-context.
     pub async fn call_tool(&self, name: &str, args: Value) -> String {
-        let (session_id, tokenizer, threshold_tokens, context_length, last_prompt_tokens, compaction_count, session_ignored, session_stateless) = {
+        let (
+            session_id,
+            tokenizer,
+            threshold_tokens,
+            context_length,
+            last_prompt_tokens,
+            compaction_count,
+            session_ignored,
+            session_stateless,
+        ) = {
             let state = self.state.lock().expect("lcm state poisoned");
             (
                 effective_session(&state.session_id),
@@ -541,7 +550,8 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_summarizes_and_assembles_summary_plus_tail() {
-        let lcm = LcmContextEngine::open_in_memory(aux_with("a terse summary of the past")).unwrap();
+        let lcm =
+            LcmContextEngine::open_in_memory(aux_with("a terse summary of the past")).unwrap();
         lcm.on_model(&model());
         lcm.on_session_start(&SessionId::new("s1"));
         let c = convo(50); // 100 turns; fresh tail keeps 32
@@ -656,17 +666,23 @@ mod tests {
         };
         // Incarnation 1: compact a long conversation, then close.
         let compacted = {
-            let lcm =
-                LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
-                    .unwrap();
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("s"),
+            )
+            .unwrap();
             lcm.on_model(&model());
             let out = lcm.compact(convo(50), 100).await;
             out
         };
         let count1 = {
-            let reader =
-                LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("probe"), aux_with("s"))
-                    .unwrap();
+            let reader = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
             reader.store().message_count("s1").unwrap()
         };
         // Incarnation 2: rehydrate from the compacted snapshot and run before_turn -> reconcile.
@@ -676,7 +692,10 @@ mod tests {
         lcm2.on_model(&model());
         lcm2.before_turn(&compacted, None);
         let count2 = lcm2.store().message_count("s1").unwrap();
-        assert_eq!(count2, count1, "reconcile rebuilt the tail without duplication");
+        assert_eq!(
+            count2, count1,
+            "reconcile rebuilt the tail without duplication"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -690,7 +709,9 @@ mod tests {
         lcm.on_model(&model());
         lcm.on_session_start(&SessionId::new("s1"));
         let mut c = Conversation::new(SystemPrompt::new("sys"));
-        c.push_user(UserMsg::new("here is my api_key=ABCDEF0123456789 please keep it"));
+        c.push_user(UserMsg::new(
+            "here is my api_key=ABCDEF0123456789 please keep it", // gitleaks:allow (test fixture)
+        ));
         lcm.before_turn(&c, None);
         let rows = lcm.store().session_messages("s1").unwrap();
         let body = rows[0].content.as_deref().unwrap();
@@ -708,9 +729,12 @@ mod tests {
             large_output_transcript_gc_enabled: true,
             ..LcmConfig::default()
         };
-        let lcm =
-            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("summary"))
-                .unwrap();
+        let lcm = LcmContextEngine::open_for_session(
+            cfg.clone(),
+            &SessionId::new("s1"),
+            aux_with("summary"),
+        )
+        .unwrap();
         lcm.on_model(&model());
         let big_b64 = "QUJDREVG".repeat(700); // > 4096 base64 chars
         let mut c = Conversation::new(SystemPrompt::new("sys"));
@@ -743,7 +767,10 @@ mod tests {
             .find(|r| r.role == "tool")
             .expect("the tool result row");
         let body = tool_row.content.as_deref().unwrap();
-        assert!(body.starts_with("[GC'd externalized tool output:"), "GC'd: {body}");
+        assert!(
+            body.starts_with("[GC'd externalized tool output:"),
+            "GC'd: {body}"
+        );
         assert!(!body.contains(&big_b64), "payload bytes left the row");
 
         // The original payload is recoverable from disk via the ref.
@@ -753,7 +780,10 @@ mod tests {
             &reference,
         )
         .unwrap();
-        assert_eq!(recovered, big_b64, "the externalized run is the base64 payload itself");
+        assert_eq!(
+            recovered, big_b64,
+            "the externalized run is the base64 payload itself"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -768,11 +798,22 @@ mod tests {
         lcm.on_session_start(&SessionId::new("s1"));
         let c = convo(50); // would normally compact
         let pressure = lcm.before_turn(&c, None);
-        assert!(!pressure.over_budget(), "ignored session reports no budget pressure");
+        assert!(
+            !pressure.over_budget(),
+            "ignored session reports no budget pressure"
+        );
         let compacted = lcm.compact(c.clone(), 100).await;
-        assert_eq!(compacted.turns.len(), c.turns.len(), "no compaction for ignored session");
+        assert_eq!(
+            compacted.turns.len(),
+            c.turns.len(),
+            "no compaction for ignored session"
+        );
         assert_eq!(lcm.store().message_count("s1").unwrap(), 0, "no ingest");
-        assert_eq!(lcm.store().summary_count("s1").unwrap(), 0, "no summary nodes");
+        assert_eq!(
+            lcm.store().summary_count("s1").unwrap(),
+            0,
+            "no summary nodes"
+        );
     }
 
     #[tokio::test]
@@ -787,7 +828,11 @@ mod tests {
         let mut c = Conversation::new(SystemPrompt::new("sys"));
         c.push_user(UserMsg::new("hello"));
         lcm.before_turn(&c, None);
-        assert_eq!(lcm.store().message_count("scratch-1").unwrap(), 0, "stateless = no writes");
+        assert_eq!(
+            lcm.store().message_count("scratch-1").unwrap(),
+            0,
+            "stateless = no writes"
+        );
     }
 
     #[tokio::test]
@@ -805,7 +850,11 @@ mod tests {
         lcm.before_turn(&c, None);
         let rows = lcm.store().session_messages("s1").unwrap();
         assert_eq!(rows.len(), 1, "the /debug turn was filtered");
-        assert!(rows[0].content.as_deref().unwrap().contains("real substantive"));
+        assert!(rows[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("real substantive"));
     }
 
     #[tokio::test]
@@ -818,11 +867,15 @@ mod tests {
         lcm.on_model(&model()); // max_context 1000 -> no preset
         lcm.on_session_start(&SessionId::new("s1"));
         let status: serde_json::Value =
-            serde_json::from_str(&lcm.call_tool("lcm_status", serde_json::json!({})).await).unwrap();
+            serde_json::from_str(&lcm.call_tool("lcm_status", serde_json::json!({})).await)
+                .unwrap();
         assert_eq!(status["protection"]["sensitive_patterns_enabled"], true);
         assert_eq!(status["filters"]["session_ignored"], false);
         assert_eq!(status["context_length"], 1000);
-        assert!(status["preset_suggestion"].is_null(), "1000-token window has no preset");
+        assert!(
+            status["preset_suggestion"].is_null(),
+            "1000-token window has no preset"
+        );
     }
 
     #[tokio::test]
@@ -834,18 +887,29 @@ mod tests {
             bank: "default".to_string(),
             ..LcmConfig::default()
         };
-        let s1 = LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
-            .unwrap();
-        let s2 = LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s2"), aux_with("s"))
-            .unwrap();
+        let s1 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        let s2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s2"), aux_with("s"))
+                .unwrap();
         s1.on_model(&model());
         s2.on_model(&model());
         let (_r1, _r2) = tokio::join!(s1.compact(convo(50), 100), s2.compact(convo(40), 100));
 
         let reader =
-            LcmContextEngine::open_for_session(cfg, &SessionId::new("reader"), aux_with("s")).unwrap();
-        assert_eq!(reader.store().summary_count("s1").unwrap(), 1, "s1 attributed");
-        assert_eq!(reader.store().summary_count("s2").unwrap(), 1, "s2 attributed");
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("reader"), aux_with("s"))
+                .unwrap();
+        assert_eq!(
+            reader.store().summary_count("s1").unwrap(),
+            1,
+            "s1 attributed"
+        );
+        assert_eq!(
+            reader.store().summary_count("s2").unwrap(),
+            1,
+            "s2 attributed"
+        );
         assert_eq!(
             reader.store().summary_count("reader").unwrap(),
             0,
@@ -867,9 +931,12 @@ mod tests {
             bank: "default".to_string(),
             ..LcmConfig::default()
         };
-        let a =
-            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("alpha"), aux_with("s"))
-                .unwrap();
+        let a = LcmContextEngine::open_for_session(
+            cfg.clone(),
+            &SessionId::new("alpha"),
+            aux_with("s"),
+        )
+        .unwrap();
         let b =
             LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("beta"), aux_with("s"))
                 .unwrap();
@@ -889,11 +956,19 @@ mod tests {
         // Summary nodes attributed to the right session, none leaked to a third.
         assert_eq!(store.summary_count("alpha").unwrap(), 1, "alpha attributed");
         assert_eq!(store.summary_count("beta").unwrap(), 1, "beta attributed");
-        assert_eq!(store.summary_count("reader").unwrap(), 0, "no cross-attribution");
+        assert_eq!(
+            store.summary_count("reader").unwrap(),
+            0,
+            "no cross-attribution"
+        );
         // Raw messages ingested under each session are disjoint and non-empty.
         assert!(store.message_count("alpha").unwrap() > 0, "alpha ingested");
         assert!(store.message_count("beta").unwrap() > 0, "beta ingested");
-        assert_eq!(store.message_count("reader").unwrap(), 0, "reader ingested nothing");
+        assert_eq!(
+            store.message_count("reader").unwrap(),
+            0,
+            "reader ingested nothing"
+        );
         // Every persisted node carries the session id it belongs to.
         for sid in ["alpha", "beta"] {
             for node in store.get_session_nodes(sid, None, 100).unwrap() {
@@ -937,7 +1012,9 @@ mod tests {
         async fn chat(&self, _req: Request) -> std::result::Result<ModelOutput, Failure> {
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
             if n == 0 {
-                Err(Failure::ContextOverflow("prompt exceeds the model window".into()))
+                Err(Failure::ContextOverflow(
+                    "prompt exceeds the model window".into(),
+                ))
             } else {
                 Ok(ModelOutput {
                     text: "done after compaction".into(),
@@ -975,7 +1052,10 @@ mod tests {
             .await
             .expect("turn completes after a single compact + retry");
 
-        assert!(matches!(outcome, TurnOutcome::Completed(_)), "turn completed");
+        assert!(
+            matches!(outcome, TurnOutcome::Completed(_)),
+            "turn completed"
+        );
         assert_eq!(
             provider.calls.load(Ordering::Relaxed),
             2,

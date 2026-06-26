@@ -302,8 +302,16 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             head_seq: 0,
         }),
     )?;
-    write_cbor(&out, "response-fs-roots.cbor", &ApiResponse::FsRoots(Vec::new()))?;
-    write_cbor(&out, "response-commands.cbor", &ApiResponse::Commands(Vec::new()))?;
+    write_cbor(
+        &out,
+        "response-fs-roots.cbor",
+        &ApiResponse::FsRoots(Vec::new()),
+    )?;
+    write_cbor(
+        &out,
+        "response-commands.cbor",
+        &ApiResponse::Commands(Vec::new()),
+    )?;
     write_cbor(
         &out,
         "response-command-output.cbor",
@@ -356,7 +364,9 @@ fn run_codegen(root: &Path, cddl: &Path, out: &Path, extra: &[&str]) -> anyhow::
         .args(extra)
         .status()
         .map_err(|e| {
-            anyhow::anyhow!("running zcbor-codegen.sh (is zcbor on PATH / in the flake shell?): {e}")
+            anyhow::anyhow!(
+                "running zcbor-codegen.sh (is zcbor on PATH / in the flake shell?): {e}"
+            )
         })?;
     anyhow::ensure!(status.success(), "zcbor codegen failed with {status}");
     Ok(())
@@ -542,7 +552,10 @@ fn verify_codec() -> anyhow::Result<()> {
         .arg(&bin)
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run cc (is it in the flake shell?): {e}"))?;
-    anyhow::ensure!(status.success(), "compiling the verify harness failed with {status}");
+    anyhow::ensure!(
+        status.success(),
+        "compiling the verify harness failed with {status}"
+    );
 
     let status = Command::new(&bin).args(&fixtures).status()?;
     anyhow::ensure!(

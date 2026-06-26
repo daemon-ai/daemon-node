@@ -25,20 +25,20 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use daemon_activation::ActivationManager;
 use daemon_api::{
-    from_cbor, to_cbor, AcpAgentEntry, AcpSource, AdapterInfo, ApiError, ApprovalInfo, ApprovalMode,
-    AuthApi, AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest, AuthCompleteResponse,
-    AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange, ChatRoute, CommandInvocation,
-    CommandOutput, CommandScope, CommandSpec, ControlApi,
-    CredentialApi, CredentialInfo, DeliverySink, Distribution, FleetReport, FsContent, FsEntry,
-    FsRevision, FsRoot, FsRootId, FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView,
-    HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle,
-    LogPageView, LogStream, ManageEventView, ModelApi, ModelDescriptor, Outbound, ProfileApi,
-    ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail,
-    SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole,
-    SessionScope, SessionSearchHit, SessionState, StatsReport, TelemetryDump, TreeReport, UnitNode,
-    ActionMenu, ChannelJoinDetails, ContactInfo, ConversationInfo, CreateConversationDetails,
-    MemberRole, Participant, SupportsContacts, SupportsConversations, SupportsDirectory,
-    SupportsMembership, TransportInstanceInfo,
+    from_cbor, to_cbor, AcpAgentEntry, AcpSource, ActionMenu, AdapterInfo, ApiError, ApprovalInfo,
+    ApprovalMode, AuthApi, AuthBeginRequest, AuthBeginResponse, AuthCompleteRequest,
+    AuthCompleteResponse, AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange,
+    ChannelJoinDetails, ChatRoute, CommandInvocation, CommandOutput, CommandScope, CommandSpec,
+    ContactInfo, ControlApi, ConversationInfo, CreateConversationDetails, CredentialApi,
+    CredentialInfo, DeliverySink, Distribution, FleetReport, FsContent, FsEntry, FsRevision,
+    FsRoot, FsRootId, FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView, HealthReport,
+    JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle, LogPageView,
+    LogStream, ManageEventView, MemberRole, ModelApi, ModelDescriptor, Outbound, Participant,
+    ProfileApi, ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi,
+    SessionDetail, SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery,
+    SessionRole, SessionScope, SessionSearchHit, SessionState, StatsReport, SupportsContacts,
+    SupportsConversations, SupportsDirectory, SupportsMembership, TelemetryDump,
+    TransportInstanceInfo, TreeReport, UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -346,7 +346,9 @@ impl NodeApiImpl {
             routing_base: Arc::new(ArcSwap::from_pointee(RoutingRegistry::new())),
             chat_pins: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             routing_builder: None,
-            adapters: Arc::new(ArcSwap::from_pointee(crate::adapters::AdapterRegistry::new())),
+            adapters: Arc::new(ArcSwap::from_pointee(
+                crate::adapters::AdapterRegistry::new(),
+            )),
             mgmt_journal: Arc::new(std::sync::Mutex::new(None)),
             acp: None,
             last_acp: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -526,10 +528,7 @@ impl NodeApiImpl {
     }
 
     /// Resolve the remote-contacts feature for `transport`.
-    fn contacts_for(
-        &self,
-        transport: &TransportId,
-    ) -> Result<Arc<dyn SupportsContacts>, ApiError> {
+    fn contacts_for(&self, transport: &TransportId) -> Result<Arc<dyn SupportsContacts>, ApiError> {
         self.adapters
             .load_full()
             .adapter_for_transport(transport)
@@ -1201,8 +1200,8 @@ fn map_role(role: Option<StoreRole>) -> SessionRole {
 }
 
 /// Encode a wire [`ChatRoute`] into the protocol-free store row (§5.9, I5): the canonical origin key
-/// + typed `session`/`profile` columns, with the full wire descriptor (origin + isolation) carried
-/// as the opaque CBOR `descriptor` blob for faithful round-trip.
+/// plus typed `session`/`profile` columns, with the full wire descriptor (origin + isolation)
+/// carried as the opaque CBOR `descriptor` blob for faithful round-trip.
 fn store_route_from_wire(route: &ChatRoute) -> daemon_store::ChatRoute {
     daemon_store::ChatRoute {
         key: crate::routing::origin_pin_key(&route.origin),
@@ -1240,7 +1239,9 @@ fn room_label(scope: &OriginScope) -> String {
 fn participant_label(who: &Participant) -> String {
     match who {
         Participant::Contact(c) => c.id.clone(),
-        Participant::Agent { member, profile } => format!("{member} (profile {})", profile.as_str()),
+        Participant::Agent { member, profile } => {
+            format!("{member} (profile {})", profile.as_str())
+        }
     }
 }
 
@@ -1804,7 +1805,10 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn conv_get(&self, transport: TransportId, conv: String) -> Option<ConversationInfo> {
-        self.conversations_for(&transport).ok()?.get(transport, conv).await
+        self.conversations_for(&transport)
+            .ok()?
+            .get(transport, conv)
+            .await
     }
 
     async fn conv_create_details(&self, transport: TransportId) -> CreateConversationDetails {
@@ -1819,10 +1823,18 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         details: CreateConversationDetails,
     ) -> Result<ConversationInfo, ApiError> {
-        let info = self.conversations_for(&transport)?.create(transport, details).await?;
+        let info = self
+            .conversations_for(&transport)?
+            .create(transport, details)
+            .await?;
         self.audit_management(
             "mgmt.conv.create",
-            format!("transport={} conv={} kind={:?}", info.transport.as_str(), info.id, info.kind),
+            format!(
+                "transport={} conv={} kind={:?}",
+                info.transport.as_str(),
+                info.id,
+                info.kind
+            ),
         )
         .await;
         Ok(info)
@@ -1840,7 +1852,10 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         details: ChannelJoinDetails,
     ) -> Result<ConversationInfo, ApiError> {
-        let info = self.conversations_for(&transport)?.join_channel(transport, details).await?;
+        let info = self
+            .conversations_for(&transport)?
+            .join_channel(transport, details)
+            .await?;
         self.audit_management(
             "mgmt.conv.join",
             format!("transport={} conv={}", info.transport.as_str(), info.id),
@@ -1890,7 +1905,12 @@ impl ControlApi for NodeApiImpl {
             .await?;
         self.audit_management(
             "mgmt.conv.set_topic",
-            format!("transport={} conv={} topic={:?}", transport.as_str(), conv, topic),
+            format!(
+                "transport={} conv={} topic={:?}",
+                transport.as_str(),
+                conv,
+                topic
+            ),
         )
         .await;
         Ok(())
@@ -1907,7 +1927,12 @@ impl ControlApi for NodeApiImpl {
             .await?;
         self.audit_management(
             "mgmt.conv.set_title",
-            format!("transport={} conv={} title={:?}", transport.as_str(), conv, title),
+            format!(
+                "transport={} conv={} title={:?}",
+                transport.as_str(),
+                conv,
+                title
+            ),
         )
         .await;
         Ok(())
@@ -2030,7 +2055,11 @@ impl ControlApi for NodeApiImpl {
             .await?;
         self.audit_management(
             "mgmt.member.set_role",
-            format!("transport={} conv={} who={label} role={role:?}", transport.as_str(), conv),
+            format!(
+                "transport={} conv={} who={label} role={role:?}",
+                transport.as_str(),
+                conv
+            ),
         )
         .await;
         Ok(())
@@ -2041,7 +2070,9 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         contact: ContactInfo,
     ) -> Result<String, ApiError> {
-        self.contacts_for(&transport)?.get_profile(transport, contact).await
+        self.contacts_for(&transport)?
+            .get_profile(transport, contact)
+            .await
     }
 
     async fn contact_action_menu(
@@ -2049,7 +2080,9 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         contact: ContactInfo,
     ) -> Option<ActionMenu> {
-        self.contacts_for(&transport).ok()?.action_menu(transport, contact)
+        self.contacts_for(&transport)
+            .ok()?
+            .action_menu(transport, contact)
     }
 
     async fn contact_set_alias(
@@ -2064,7 +2097,10 @@ impl ControlApi for NodeApiImpl {
             .await?;
         self.audit_management(
             "mgmt.contact.set_alias",
-            format!("transport={} contact={id} alias={alias:?}", transport.as_str()),
+            format!(
+                "transport={} contact={id} alias={alias:?}",
+                transport.as_str()
+            ),
         )
         .await;
         Ok(())
@@ -2075,7 +2111,9 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         query: Option<String>,
     ) -> Result<Vec<ContactInfo>, ApiError> {
-        self.directory_for(&transport)?.search_contacts(transport, query).await
+        self.directory_for(&transport)?
+            .search_contacts(transport, query)
+            .await
     }
 
     async fn acp_discover(&self) -> Vec<AcpAgentEntry> {
@@ -2536,7 +2574,9 @@ impl ControlApi for NodeApiImpl {
             )));
         }
         match &entry.owner {
-            crate::commands::Owner::Builtin(builtin) => self.run_builtin(*builtin, &invocation).await,
+            crate::commands::Owner::Builtin(builtin) => {
+                self.run_builtin(*builtin, &invocation).await
+            }
             crate::commands::Owner::Provider(provider) => {
                 let core_inv = daemon_core::CommandInvocation {
                     name: invocation.name.clone(),
@@ -2664,7 +2704,8 @@ impl NodeApiImpl {
                     .session
                     .clone()
                     .ok_or_else(|| ApiError::Other("model requires a session".into()))?;
-                self.set_session_model(session, args.to_string(), None).await?;
+                self.set_session_model(session, args.to_string(), None)
+                    .await?;
                 Ok(CommandOutput {
                     text: format!("session model set to {args}"),
                     ephemeral: true,
@@ -2712,7 +2753,8 @@ impl NodeApiImpl {
                     .session
                     .clone()
                     .ok_or_else(|| ApiError::Other("approval requires a session".into()))?;
-                self.approval_decide(session, args.to_string(), allow).await?;
+                self.approval_decide(session, args.to_string(), allow)
+                    .await?;
                 Ok(CommandOutput {
                     text: format!(
                         "request {args} {}",
@@ -2728,19 +2770,26 @@ impl NodeApiImpl {
 /// Resolve the requested [`ApprovalMode`] from a `/mode` invocation: the `yolo`/`fast` aliases map
 /// directly, otherwise the first argument is parsed (`yolo`/`auto`, `fast`/`accept`, `ask`, `deny`).
 fn resolve_approval_mode(name: &str, args: &str) -> Result<ApprovalMode, ApiError> {
-    let key = match name.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
+    let key = match name
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "yolo" => "yolo".to_string(),
         "fast" => "fast".to_string(),
-        _ => args.split_whitespace().next().unwrap_or("").to_ascii_lowercase(),
+        _ => args
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
     };
     match key.as_str() {
         "yolo" | "auto" | "autoallow" | "auto-allow" => Ok(ApprovalMode::AutoAllow),
         "fast" | "accept" | "acceptedits" | "accept-edits" => Ok(ApprovalMode::AcceptEdits),
         "ask" | "default" => Ok(ApprovalMode::Ask),
         "deny" | "reject" => Ok(ApprovalMode::Deny),
-        "" => Err(ApiError::Other(
-            "usage: /mode <yolo|fast|ask|deny>".into(),
-        )),
+        "" => Err(ApiError::Other("usage: /mode <yolo|fast|ask|deny>".into())),
         other => Err(ApiError::Other(format!("unknown approval mode: {other}"))),
     }
 }

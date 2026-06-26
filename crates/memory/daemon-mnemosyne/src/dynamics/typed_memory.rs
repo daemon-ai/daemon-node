@@ -85,12 +85,15 @@ impl MemoryType {
     /// Confidence-booster keywords for a type (`CONFIDENCE_BOOSTERS`, `typed_memory.py` L174-L188).
     fn boosters(self) -> &'static [&'static str] {
         match self {
-            MemoryType::Fact => {
-                &["verified", "confirmed", "official", "documented", "according to", "data shows"]
-            }
-            MemoryType::Preference => {
-                &["always", "never", "absolutely", "definitely", "strongly"]
-            }
+            MemoryType::Fact => &[
+                "verified",
+                "confirmed",
+                "official",
+                "documented",
+                "according to",
+                "data shows",
+            ],
+            MemoryType::Preference => &["always", "never", "absolutely", "definitely", "strongly"],
             MemoryType::Decision => &["final", "official", "approved", "agreed", "consensus"],
             MemoryType::Commitment => &["promise", "guarantee", "committed", "deadline", "sla"],
             MemoryType::Goal => &["target", "objective", "kpi", "okr", "success metric"],
@@ -116,125 +119,381 @@ fn type_patterns() -> &'static [(Regex, MemoryType, f64)] {
     PATTERNS.get_or_init(|| {
         let raw: &[(&str, MemoryType, f64)] = &[
             // FACT
-            (r"\b(is|are|was|were)\s+(a|an|the)\s+\w+", MemoryType::Fact, 0.6),
+            (
+                r"\b(is|are|was|were)\s+(a|an|the)\s+\w+",
+                MemoryType::Fact,
+                0.6,
+            ),
             (r"\b(has|have|had)\s+\d+", MemoryType::Fact, 0.7),
-            (r"\b(contains|consists?|comprises?)\b", MemoryType::Fact, 0.8),
+            (
+                r"\b(contains|consists?|comprises?)\b",
+                MemoryType::Fact,
+                0.8,
+            ),
             (r"\b(version|v)\s*\d+\.?\d*", MemoryType::Fact, 0.9),
-            (r"\b(API|endpoint|URL|database|DB)\s+(is|at|points?\s+to)", MemoryType::Fact, 0.8),
-            (r"\b(created|modified|updated)\s+(on|at)\s+\d{4}", MemoryType::Fact, 0.8),
+            (
+                r"\b(API|endpoint|URL|database|DB)\s+(is|at|points?\s+to)",
+                MemoryType::Fact,
+                0.8,
+            ),
+            (
+                r"\b(created|modified|updated)\s+(on|at)\s+\d{4}",
+                MemoryType::Fact,
+                0.8,
+            ),
             // PREFERENCE
-            (r"\b(prefer|likes?|enjoys?|loves?|hates?|dislikes?)\b", MemoryType::Preference, 0.8),
-            (r"\b(want|wants|wanted)\s+(to|the|a|an)\b", MemoryType::Preference, 0.6),
-            (r"\b(rather|instead|alternative)\b", MemoryType::Preference, 0.5),
-            (r"\b(dark\s+mode|light\s+mode|theme|color\s+scheme)\b", MemoryType::Preference, 0.9),
-            (r"\b(usually|typically|normally|generally)\b", MemoryType::Preference, 0.6),
+            (
+                r"\b(prefer|likes?|enjoys?|loves?|hates?|dislikes?)\b",
+                MemoryType::Preference,
+                0.8,
+            ),
+            (
+                r"\b(want|wants|wanted)\s+(to|the|a|an)\b",
+                MemoryType::Preference,
+                0.6,
+            ),
+            (
+                r"\b(rather|instead|alternative)\b",
+                MemoryType::Preference,
+                0.5,
+            ),
+            (
+                r"\b(dark\s+mode|light\s+mode|theme|color\s+scheme)\b",
+                MemoryType::Preference,
+                0.9,
+            ),
+            (
+                r"\b(usually|typically|normally|generally)\b",
+                MemoryType::Preference,
+                0.6,
+            ),
             // DECISION
-            (r"\b(decided|chose|selected|picked|opted)\b", MemoryType::Decision, 0.9),
-            (r"\b(going\s+with|settled\s+on|locked\s+in)\b", MemoryType::Decision, 0.8),
-            (r"\b(choose|select|pick)\s+(between|from|among)\b", MemoryType::Decision, 0.7),
-            (r"\b(final\s+decision|final\s+call|final\s+choice)\b", MemoryType::Decision, 0.9),
-            (r"\b(will\s+use|using|adopt|adopting)\s+(the|a|an)?\s*\w+", MemoryType::Decision, 0.7),
+            (
+                r"\b(decided|chose|selected|picked|opted)\b",
+                MemoryType::Decision,
+                0.9,
+            ),
+            (
+                r"\b(going\s+with|settled\s+on|locked\s+in)\b",
+                MemoryType::Decision,
+                0.8,
+            ),
+            (
+                r"\b(choose|select|pick)\s+(between|from|among)\b",
+                MemoryType::Decision,
+                0.7,
+            ),
+            (
+                r"\b(final\s+decision|final\s+call|final\s+choice)\b",
+                MemoryType::Decision,
+                0.9,
+            ),
+            (
+                r"\b(will\s+use|using|adopt|adopting)\s+(the|a|an)?\s*\w+",
+                MemoryType::Decision,
+                0.7,
+            ),
             // COMMITMENT
             (
                 r"\b(will|shall|must|need\s+to)\s+\w+\s+(by|before|until)\b",
                 MemoryType::Commitment,
                 0.8,
             ),
-            (r"\b(deadline|due\s+date|due|milestone)\b", MemoryType::Commitment, 0.9),
-            (r"\b(promise|committed|pledged|obligated)\b", MemoryType::Commitment, 0.9),
-            (r"\b(deliver|ship|release|deploy)\s+(by|before|on)\b", MemoryType::Commitment, 0.8),
+            (
+                r"\b(deadline|due\s+date|due|milestone)\b",
+                MemoryType::Commitment,
+                0.9,
+            ),
+            (
+                r"\b(promise|committed|pledged|obligated)\b",
+                MemoryType::Commitment,
+                0.9,
+            ),
+            (
+                r"\b(deliver|ship|release|deploy)\s+(by|before|on)\b",
+                MemoryType::Commitment,
+                0.8,
+            ),
             (
                 r"\b(EOD|COB|end\s+of\s+day|close\s+of\s+business)\b",
                 MemoryType::Commitment,
                 0.7,
             ),
-            (r"\b(tomorrow|next\s+week|Monday|Friday)\s+(by|at)\b", MemoryType::Commitment, 0.6),
+            (
+                r"\b(tomorrow|next\s+week|Monday|Friday)\s+(by|at)\b",
+                MemoryType::Commitment,
+                0.6,
+            ),
             // GOAL
-            (r"\b(goal|objective|target|aim|purpose)\b", MemoryType::Goal, 0.9),
-            (r"\b(achieve|reach|hit|attain|accomplish)\s+\d+", MemoryType::Goal, 0.8),
-            (r"\b(KPI|metric|OKR|success\s+criteria)\b", MemoryType::Goal, 0.9),
-            (r"\b(roadmap|plan|strategy)\s+(for|to)\b", MemoryType::Goal, 0.7),
+            (
+                r"\b(goal|objective|target|aim|purpose)\b",
+                MemoryType::Goal,
+                0.9,
+            ),
+            (
+                r"\b(achieve|reach|hit|attain|accomplish)\s+\d+",
+                MemoryType::Goal,
+                0.8,
+            ),
+            (
+                r"\b(KPI|metric|OKR|success\s+criteria)\b",
+                MemoryType::Goal,
+                0.9,
+            ),
+            (
+                r"\b(roadmap|plan|strategy)\s+(for|to)\b",
+                MemoryType::Goal,
+                0.7,
+            ),
             (
                 r"\b(reach|get\s+to|grow\s+to)\s+\d+[KkMm]?\s+(users|customers|revenue)\b",
                 MemoryType::Goal,
                 0.8,
             ),
             // EVENT
-            (r"\b(meeting|call|discussion|conversation)\s+(with|about)\b", MemoryType::Event, 0.7),
-            (r"\b(happened|occurred|took\s+place|went\s+down)\b", MemoryType::Event, 0.8),
-            (r"\b(yesterday|last\s+week|last\s+month|earlier\s+today)\b", MemoryType::Event, 0.6),
-            (r"\b(scheduled|planned|booked|set\s+up)\s+(for|at)\b", MemoryType::Event, 0.7),
-            (r"\b(incident|outage|bug|issue)\s+#?\d+", MemoryType::Event, 0.8),
-            (r"\b( launched|released|shipped|deployed)\s+(on|at)\b", MemoryType::Event, 0.8),
+            (
+                r"\b(meeting|call|discussion|conversation)\s+(with|about)\b",
+                MemoryType::Event,
+                0.7,
+            ),
+            (
+                r"\b(happened|occurred|took\s+place|went\s+down)\b",
+                MemoryType::Event,
+                0.8,
+            ),
+            (
+                r"\b(yesterday|last\s+week|last\s+month|earlier\s+today)\b",
+                MemoryType::Event,
+                0.6,
+            ),
+            (
+                r"\b(scheduled|planned|booked|set\s+up)\s+(for|at)\b",
+                MemoryType::Event,
+                0.7,
+            ),
+            (
+                r"\b(incident|outage|bug|issue)\s+#?\d+",
+                MemoryType::Event,
+                0.8,
+            ),
+            (
+                r"\b( launched|released|shipped|deployed)\s+(on|at)\b",
+                MemoryType::Event,
+                0.8,
+            ),
             // INSTRUCTION
-            (r"\b(always|never|must|should|shall|do\s+not|don't)\b", MemoryType::Instruction, 0.7),
-            (r"\b(rule|policy|guideline|procedure|protocol)\b", MemoryType::Instruction, 0.9),
-            (r"\b(how\s+to|steps?\s+to|guide\s+to|tutorial)\b", MemoryType::Instruction, 0.8),
-            (r"\b(remember\s+to|make\s+sure|ensure|verify)\b", MemoryType::Instruction, 0.6),
-            (r"\b(first|then|next|finally)\s*,?\s*\w+", MemoryType::Instruction, 0.5),
+            (
+                r"\b(always|never|must|should|shall|do\s+not|don't)\b",
+                MemoryType::Instruction,
+                0.7,
+            ),
+            (
+                r"\b(rule|policy|guideline|procedure|protocol)\b",
+                MemoryType::Instruction,
+                0.9,
+            ),
+            (
+                r"\b(how\s+to|steps?\s+to|guide\s+to|tutorial)\b",
+                MemoryType::Instruction,
+                0.8,
+            ),
+            (
+                r"\b(remember\s+to|make\s+sure|ensure|verify)\b",
+                MemoryType::Instruction,
+                0.6,
+            ),
+            (
+                r"\b(first|then|next|finally)\s*,?\s*\w+",
+                MemoryType::Instruction,
+                0.5,
+            ),
             (r"\b(if\s+.+\s+then\s+.+)", MemoryType::Instruction, 0.7),
             // RELATIONSHIP
-            (r"\b(manages?|reports?\s+to|supervises?|leads?)\b", MemoryType::Relationship, 0.9),
-            (r"\b(owns?|belongs?\s+to|part\s+of|member\s+of)\b", MemoryType::Relationship, 0.8),
+            (
+                r"\b(manages?|reports?\s+to|supervises?|leads?)\b",
+                MemoryType::Relationship,
+                0.9,
+            ),
+            (
+                r"\b(owns?|belongs?\s+to|part\s+of|member\s+of)\b",
+                MemoryType::Relationship,
+                0.8,
+            ),
             (
                 r"\b(works?\s+with|collaborates?\s+with|partners?\s+with)\b",
                 MemoryType::Relationship,
                 0.8,
             ),
-            (r"\b(depends?\s+on|requires?|needs?)\b", MemoryType::Relationship, 0.7),
-            (r"\b(related\s+to|connected\s+to|associated\s+with)\b", MemoryType::Relationship, 0.6),
+            (
+                r"\b(depends?\s+on|requires?|needs?)\b",
+                MemoryType::Relationship,
+                0.7,
+            ),
+            (
+                r"\b(related\s+to|connected\s+to|associated\s+with)\b",
+                MemoryType::Relationship,
+                0.6,
+            ),
             (
                 r"\b(is\s+a|is\s+an)\s+(type\s+of|kind\s+of|form\s+of)\b",
                 MemoryType::Relationship,
                 0.7,
             ),
             // CONTEXT
-            (r"\b(currently|right\s+now|at\s+the\s+moment|presently)\b", MemoryType::Context, 0.7),
-            (r"\b(working\s+on|focusing\s+on|dealing\s+with)\b", MemoryType::Context, 0.8),
-            (r"\b(status|state|phase|stage)\s+(is|of)\b", MemoryType::Context, 0.7),
-            (r"\b(in\s+progress|ongoing|active|pending|blocked)\b", MemoryType::Context, 0.8),
-            (r"\b(environment|setup|configuration|settings?)\b", MemoryType::Context, 0.6),
-            (r"\b(today|this\s+week|this\s+sprint|this\s+quarter)\b", MemoryType::Context, 0.5),
+            (
+                r"\b(currently|right\s+now|at\s+the\s+moment|presently)\b",
+                MemoryType::Context,
+                0.7,
+            ),
+            (
+                r"\b(working\s+on|focusing\s+on|dealing\s+with)\b",
+                MemoryType::Context,
+                0.8,
+            ),
+            (
+                r"\b(status|state|phase|stage)\s+(is|of)\b",
+                MemoryType::Context,
+                0.7,
+            ),
+            (
+                r"\b(in\s+progress|ongoing|active|pending|blocked)\b",
+                MemoryType::Context,
+                0.8,
+            ),
+            (
+                r"\b(environment|setup|configuration|settings?)\b",
+                MemoryType::Context,
+                0.6,
+            ),
+            (
+                r"\b(today|this\s+week|this\s+sprint|this\s+quarter)\b",
+                MemoryType::Context,
+                0.5,
+            ),
             // LEARNING
-            (r"\b(learned|realized|discovered|found\s+out)\b", MemoryType::Learning, 0.8),
-            (r"\b(lesson|takeaway|insight|finding)\b", MemoryType::Learning, 0.9),
-            (r"\b(turns?\s+out|surprisingly|interestingly)\b", MemoryType::Learning, 0.7),
-            (r"\b(should\s+have|could\s+have|would\s+have)\b", MemoryType::Learning, 0.6),
+            (
+                r"\b(learned|realized|discovered|found\s+out)\b",
+                MemoryType::Learning,
+                0.8,
+            ),
+            (
+                r"\b(lesson|takeaway|insight|finding)\b",
+                MemoryType::Learning,
+                0.9,
+            ),
+            (
+                r"\b(turns?\s+out|surprisingly|interestingly)\b",
+                MemoryType::Learning,
+                0.7,
+            ),
+            (
+                r"\b(should\s+have|could\s+have|would\s+have)\b",
+                MemoryType::Learning,
+                0.6,
+            ),
             (
                 r"\b(best\s+practice|lessons?\s+learned|post[-\s]?mortem)\b",
                 MemoryType::Learning,
                 0.9,
             ),
             // OBSERVATION
-            (r"\b(noticed|observed|saw|seems?)\b", MemoryType::Observation, 0.7),
-            (r"\b(pattern|trend|correlation|tends?\s+to)\b", MemoryType::Observation, 0.9),
-            (r"\b(often|frequently|sometimes|rarely|usually)\s+\w+", MemoryType::Observation, 0.6),
-            (r"\b(appears?|looks?\s+like|seems?\s+like)\b", MemoryType::Observation, 0.6),
+            (
+                r"\b(noticed|observed|saw|seems?)\b",
+                MemoryType::Observation,
+                0.7,
+            ),
+            (
+                r"\b(pattern|trend|correlation|tends?\s+to)\b",
+                MemoryType::Observation,
+                0.9,
+            ),
+            (
+                r"\b(often|frequently|sometimes|rarely|usually)\s+\w+",
+                MemoryType::Observation,
+                0.6,
+            ),
+            (
+                r"\b(appears?|looks?\s+like|seems?\s+like)\b",
+                MemoryType::Observation,
+                0.6,
+            ),
             (
                 r"\b(increasing|decreasing|growing|shrinking|stable)\b",
                 MemoryType::Observation,
                 0.7,
             ),
-            (r"\b(every\s+time|whenever|each\s+time)\b", MemoryType::Observation, 0.8),
+            (
+                r"\b(every\s+time|whenever|each\s+time)\b",
+                MemoryType::Observation,
+                0.8,
+            ),
             // ERROR
-            (r"\b(error|bug|issue|problem|failure|crash)\b", MemoryType::Error, 0.7),
-            (r"\b(broke|broken|failed|failing|doesn't\s+work)\b", MemoryType::Error, 0.8),
+            (
+                r"\b(error|bug|issue|problem|failure|crash)\b",
+                MemoryType::Error,
+                0.7,
+            ),
+            (
+                r"\b(broke|broken|failed|failing|doesn't\s+work)\b",
+                MemoryType::Error,
+                0.8,
+            ),
             (
                 r"\b(do\s+not|never|avoid|watch\s+out|be\s+careful)\s+\w+\s+(error|bug|issue)\b",
                 MemoryType::Error,
                 0.9,
             ),
-            (r"\b(deprecated|obsolete|legacy|outdated)\b", MemoryType::Error, 0.8),
-            (r"\b(exception|timeout|crash|hang|freeze)\b", MemoryType::Error, 0.8),
-            (r"\b(workaround|hotfix|patch|kludge)\b", MemoryType::Error, 0.7),
+            (
+                r"\b(deprecated|obsolete|legacy|outdated)\b",
+                MemoryType::Error,
+                0.8,
+            ),
+            (
+                r"\b(exception|timeout|crash|hang|freeze)\b",
+                MemoryType::Error,
+                0.8,
+            ),
+            (
+                r"\b(workaround|hotfix|patch|kludge)\b",
+                MemoryType::Error,
+                0.7,
+            ),
             // ARTIFACT
-            (r"\b(document|doc|spreadsheet|sheet|slide)\b", MemoryType::Artifact, 0.6),
-            (r"\b(file|folder|directory|path)\s+(name|called|at)\b", MemoryType::Artifact, 0.7),
-            (r"\b(PR|pull\s+request|issue|ticket|ticket)\s+#?\d+", MemoryType::Artifact, 0.9),
-            (r"\b(commit|branch|tag|release)\s+[a-f0-9]{7,40}\b", MemoryType::Artifact, 0.9),
-            (r"\b(repo|repository|project|codebase)\s+(at|on|in)\b", MemoryType::Artifact, 0.7),
-            (r"\b(link|URL|href|reference)\s+(to|for)\b", MemoryType::Artifact, 0.6),
-            (r"\b(README|CHANGELOG|LICENSE|CONTRIBUTING)\b", MemoryType::Artifact, 0.9),
+            (
+                r"\b(document|doc|spreadsheet|sheet|slide)\b",
+                MemoryType::Artifact,
+                0.6,
+            ),
+            (
+                r"\b(file|folder|directory|path)\s+(name|called|at)\b",
+                MemoryType::Artifact,
+                0.7,
+            ),
+            (
+                r"\b(PR|pull\s+request|issue|ticket|ticket)\s+#?\d+",
+                MemoryType::Artifact,
+                0.9,
+            ),
+            (
+                r"\b(commit|branch|tag|release)\s+[a-f0-9]{7,40}\b",
+                MemoryType::Artifact,
+                0.9,
+            ),
+            (
+                r"\b(repo|repository|project|codebase)\s+(at|on|in)\b",
+                MemoryType::Artifact,
+                0.7,
+            ),
+            (
+                r"\b(link|URL|href|reference)\s+(to|for)\b",
+                MemoryType::Artifact,
+                0.6,
+            ),
+            (
+                r"\b(README|CHANGELOG|LICENSE|CONTRIBUTING)\b",
+                MemoryType::Artifact,
+                0.9,
+            ),
         ];
         raw.iter()
             .map(|(pat, ty, conf)| {
@@ -306,19 +565,55 @@ mod tests {
     #[test]
     fn labeled_corpus_matches_python() {
         let cases: &[(&str, MemoryType)] = &[
-            ("The API endpoint is at https://api.example.com/v2", MemoryType::Fact),
-            ("I prefer dark mode for all my applications", MemoryType::Preference),
-            ("We decided to go with PostgreSQL instead of MongoDB", MemoryType::Decision),
-            ("I will deliver the report by Friday EOD", MemoryType::Commitment),
+            (
+                "The API endpoint is at https://api.example.com/v2",
+                MemoryType::Fact,
+            ),
+            (
+                "I prefer dark mode for all my applications",
+                MemoryType::Preference,
+            ),
+            (
+                "We decided to go with PostgreSQL instead of MongoDB",
+                MemoryType::Decision,
+            ),
+            (
+                "I will deliver the report by Friday EOD",
+                MemoryType::Commitment,
+            ),
             ("Our goal is to reach 10K users by Q4", MemoryType::Goal),
-            ("We had a meeting with the CEO yesterday at 2pm", MemoryType::Event),
-            ("Always validate user input before processing", MemoryType::Instruction),
-            ("Alice manages Bob and reports to Charlie", MemoryType::Relationship),
-            ("Currently working on the authentication module", MemoryType::Context),
-            ("Key lesson: users need simpler onboarding", MemoryType::Learning),
-            ("I noticed traffic peaks every Friday afternoon", MemoryType::Observation),
-            ("Critical bug: null pointer exception in login flow", MemoryType::Error),
-            ("See the Q3 budget spreadsheet for details", MemoryType::Artifact),
+            (
+                "We had a meeting with the CEO yesterday at 2pm",
+                MemoryType::Event,
+            ),
+            (
+                "Always validate user input before processing",
+                MemoryType::Instruction,
+            ),
+            (
+                "Alice manages Bob and reports to Charlie",
+                MemoryType::Relationship,
+            ),
+            (
+                "Currently working on the authentication module",
+                MemoryType::Context,
+            ),
+            (
+                "Key lesson: users need simpler onboarding",
+                MemoryType::Learning,
+            ),
+            (
+                "I noticed traffic peaks every Friday afternoon",
+                MemoryType::Observation,
+            ),
+            (
+                "Critical bug: null pointer exception in login flow",
+                MemoryType::Error,
+            ),
+            (
+                "See the Q3 budget spreadsheet for details",
+                MemoryType::Artifact,
+            ),
         ];
         for (content, want) in cases {
             assert_eq!(classify(content), *want, "misclassified: {content:?}");

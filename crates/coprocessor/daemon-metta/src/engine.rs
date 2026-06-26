@@ -145,7 +145,7 @@ fn tokenize(src: &str) -> Result<Vec<Token>, EngineError> {
                 let mut s = String::from("\"");
                 chars.next();
                 let mut closed = false;
-                while let Some(nc) = chars.next() {
+                for nc in chars.by_ref() {
                     s.push(nc);
                     if nc == '"' {
                         closed = true;
@@ -353,7 +353,14 @@ mod hyperon_engine {
     /// Symbols whose presence makes an expression side-effecting; rejected when `allow_grounded` is
     /// false (SKILL §Separate external action from symbolic evaluation).
     const GROUNDED_DENYLIST: &[&str] = &[
-        "fileio", "read-file", "write-file", "println!", "print", "system", "shell", "http",
+        "fileio",
+        "read-file",
+        "write-file",
+        "println!",
+        "print",
+        "system",
+        "shell",
+        "http",
     ];
 
     /// The real MeTTa engine. Holds one runner; records are (re)loaded into a fresh runner per eval
@@ -396,8 +403,16 @@ mod hyperon_engine {
             let metta = Metta::new(None);
             Self::load_records(&metta, records);
 
-            let max_steps = if bounds.max_steps == 0 { 1_000 } else { bounds.max_steps };
-            let max_results = if bounds.max_results == 0 { 100 } else { bounds.max_results } as usize;
+            let max_steps = if bounds.max_steps == 0 {
+                1_000
+            } else {
+                bounds.max_steps
+            };
+            let max_results = if bounds.max_results == 0 {
+                100
+            } else {
+                bounds.max_results
+            } as usize;
             let deadline = (bounds.timeout_ms > 0).then(|| {
                 std::time::Instant::now() + std::time::Duration::from_millis(bounds.timeout_ms)
             });
@@ -426,9 +441,7 @@ mod hyperon_engine {
                         break;
                     }
                 }
-                state
-                    .run_step()
-                    .map_err(|e| EngineError::Internal(e))?;
+                state.run_step().map_err(|e| EngineError::Internal(e))?;
                 steps += 1;
             }
 
@@ -442,7 +455,11 @@ mod hyperon_engine {
                 results.truncate(max_results);
                 truncated = true;
             }
-            Ok(EvalResult { results, steps, truncated })
+            Ok(EvalResult {
+                results,
+                steps,
+                truncated,
+            })
         }
 
         fn match_pattern(
@@ -522,14 +539,18 @@ mod tests {
         let mut e = FallbackEngine::new();
         let out = e.eval("(+ 1 2)", &[], Bounds::default(), false).unwrap();
         assert_eq!(out.results, vec!["3".to_string()]);
-        let nested = e.eval("(* (+ 1 2) 4)", &[], Bounds::default(), false).unwrap();
+        let nested = e
+            .eval("(* (+ 1 2) 4)", &[], Bounds::default(), false)
+            .unwrap();
         assert_eq!(nested.results, vec!["12".to_string()]);
     }
 
     #[test]
     fn fallback_rejects_non_arithmetic() {
         let mut e = FallbackEngine::new();
-        let err = e.eval("(double 2)", &[], Bounds::default(), false).unwrap_err();
+        let err = e
+            .eval("(double 2)", &[], Bounds::default(), false)
+            .unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)));
     }
 }

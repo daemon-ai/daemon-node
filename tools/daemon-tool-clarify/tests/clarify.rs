@@ -6,7 +6,9 @@ use daemon_common::{Budget, SessionId};
 use daemon_core::events::EventSink;
 use daemon_core::exec::LocalEnvironment;
 use daemon_core::{Tool, ToolCall, ToolOutcome, TurnCx};
-use daemon_protocol::{HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody};
+use daemon_protocol::{
+    HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody,
+};
 use daemon_tool_clarify::ClarifyTool;
 
 /// A host that records the request kind and replies with a canned body.
@@ -68,7 +70,10 @@ async fn free_form_input_question() {
     let out = run(&tool, &host, r#"{"question":"favorite color?"}"#).await;
     assert!(out.result.ok);
     assert!(out.result.content.contains("user answer: blue"));
-    assert!(host.saw_choice.lock().unwrap().is_none(), "no options => Input, not Choice");
+    assert!(
+        host.saw_choice.lock().unwrap().is_none(),
+        "no options => Input, not Choice"
+    );
 }
 
 #[tokio::test]

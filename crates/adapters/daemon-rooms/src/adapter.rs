@@ -29,7 +29,8 @@ use daemon_api::{
     ChannelJoinDetails, ConnectionState, ContactInfo, ContactPermission, ConversationInfo,
     ConversationMember, ConversationOps, ConversationType, CreateConversationDetails, MemberRole,
     MembershipOps, MessagingProtocol, NodeApi, Participant, Presence, PresenceState,
-    SupportsConversations, SupportsMembership, TransportAdapter, TransportInstanceInfo, TypingState,
+    SupportsConversations, SupportsMembership, TransportAdapter, TransportInstanceInfo,
+    TypingState,
 };
 use daemon_common::{JournalStreamId, SessionId, UnitId};
 use daemon_host::journal::JournalSink;
@@ -137,7 +138,10 @@ impl RoomRuntime {
         let mut table = self.membership.lock().unwrap();
         for (rid, members) in fetched {
             for m in members {
-                table.upsert(rid.clone(), RoomMember::new(m.member, m.profile, m.session_id));
+                table.upsert(
+                    rid.clone(),
+                    RoomMember::new(m.member, m.profile, m.session_id),
+                );
             }
         }
     }
@@ -267,7 +271,8 @@ impl RoomRuntime {
 
     /// An external/operator `ConvSend` post (starts a fresh cascade).
     async fn external_post(&self, room: RoomId, sender: String, text: String) {
-        self.post(room, sender, text, TranscriptRole::User, true).await;
+        self.post(room, sender, text, TranscriptRole::User, true)
+            .await;
     }
 
     /// Re-inject a member session's finished-turn reply back into its Room (continues the cascade).
@@ -572,7 +577,11 @@ impl SupportsConversations for RoomsAdapter {
             extras: details.extras,
             ..CreateConversationDetails::default()
         };
-        create.extras.values.entry("id".to_string()).or_insert_with(|| id.clone());
+        create
+            .extras
+            .values
+            .entry("id".to_string())
+            .or_insert_with(|| id.clone());
         create.extras.values.entry("name".to_string()).or_insert(id);
         self.create(transport, create).await
     }
@@ -590,7 +599,10 @@ impl SupportsConversations for RoomsAdapter {
             .map_err(|e| ApiError::Other(format!("store: {e}")))?;
         // Drop the live membership so the running loop stops fanning posts to the gone room (its
         // delivery subscription, floor state, and transcript sink become inert with no members).
-        self.membership.lock().unwrap().remove_room(&RoomId::new(conv));
+        self.membership
+            .lock()
+            .unwrap()
+            .remove_room(&RoomId::new(conv));
         Ok(())
     }
 
@@ -624,7 +636,8 @@ impl SupportsConversations for RoomsAdapter {
         conv: String,
         topic: Option<String>,
     ) -> Result<(), ApiError> {
-        self.mutate_descriptor(&conv, |_room, desc| desc.topic = topic).await
+        self.mutate_descriptor(&conv, |_room, desc| desc.topic = topic)
+            .await
     }
 
     async fn set_title(
@@ -646,7 +659,8 @@ impl SupportsConversations for RoomsAdapter {
         conv: String,
         description: Option<String>,
     ) -> Result<(), ApiError> {
-        self.mutate_descriptor(&conv, |_room, desc| desc.description = description).await
+        self.mutate_descriptor(&conv, |_room, desc| desc.description = description)
+            .await
     }
 }
 
@@ -692,10 +706,10 @@ impl SupportsMembership for RoomsAdapter {
             })
             .await
             .map_err(|e| ApiError::Other(format!("store: {e}")))?;
-        self.membership
-            .lock()
-            .unwrap()
-            .upsert(RoomId::new(conv), RoomMember::new(member, Some(profile), session));
+        self.membership.lock().unwrap().upsert(
+            RoomId::new(conv),
+            RoomMember::new(member, Some(profile), session),
+        );
         Ok(())
     }
 

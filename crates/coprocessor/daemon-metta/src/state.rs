@@ -242,14 +242,16 @@ impl MettaState {
     /// Commit a mutation: append it to the journal (if durable), then apply it (bumping snapshot).
     fn commit(&mut self, mutation: Mutation) -> Result<(), StateError> {
         if let Some(path) = &self.journal_path {
-            let line = serde_json::to_string(&mutation).map_err(|e| StateError::Persist(e.to_string()))?;
+            let line =
+                serde_json::to_string(&mutation).map_err(|e| StateError::Persist(e.to_string()))?;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
                 .map_err(|e| StateError::Persist(e.to_string()))?;
             writeln!(file, "{line}").map_err(|e| StateError::Persist(e.to_string()))?;
-            file.flush().map_err(|e| StateError::Persist(e.to_string()))?;
+            file.flush()
+                .map_err(|e| StateError::Persist(e.to_string()))?;
         }
         self.apply(mutation);
         Ok(())
@@ -270,7 +272,11 @@ impl MettaState {
         match mutation {
             Mutation::Assert(record) => {
                 // Keep `next_id` ahead of any replayed `rec-N` id so live ids never collide.
-                if let Some(n) = record.id.strip_prefix("rec-").and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(n) = record
+                    .id
+                    .strip_prefix("rec-")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     self.next_id = self.next_id.max(n + 1);
                 }
                 self.records.insert(record.id.clone(), record.clone());
@@ -283,14 +289,21 @@ impl MettaState {
                 }
             }
             Mutation::DefineProcedure { id, version } => {
-                let proc = self.procedures.entry(id.clone()).or_insert_with(|| Procedure {
-                    id: id.clone(),
-                    versions: Vec::new(),
-                    active_version: None,
-                });
+                let proc = self
+                    .procedures
+                    .entry(id.clone())
+                    .or_insert_with(|| Procedure {
+                        id: id.clone(),
+                        versions: Vec::new(),
+                        active_version: None,
+                    });
                 proc.versions.push(version.clone());
             }
-            Mutation::Promote { id, version, evidence } => {
+            Mutation::Promote {
+                id,
+                version,
+                evidence,
+            } => {
                 if let Some(proc) = self.procedures.get_mut(id) {
                     if let Some(v) = proc.versions.iter_mut().find(|v| v.version == *version) {
                         v.status = Status::Active;
@@ -305,7 +318,11 @@ impl MettaState {
                     proc.active_version = Some(*version);
                 }
             }
-            Mutation::Rollback { id, target_version, retired_version } => {
+            Mutation::Rollback {
+                id,
+                target_version,
+                retired_version,
+            } => {
                 if let Some(proc) = self.procedures.get_mut(id) {
                     for v in proc.versions.iter_mut() {
                         if v.version == *retired_version {
@@ -384,7 +401,10 @@ impl MettaState {
         let mut removed = Vec::new();
         for id in targets {
             if self.records.contains_key(id) {
-                self.commit(Mutation::Retract { id: id.clone(), hard })?;
+                self.commit(Mutation::Retract {
+                    id: id.clone(),
+                    hard,
+                })?;
                 removed.push(id.clone());
             }
         }
@@ -392,7 +412,12 @@ impl MettaState {
     }
 
     /// Resolve a [`RetractTarget`] to concrete ids the caller's `matcher` selected (for `Pattern`).
-    pub fn resolve_retract_ids<F>(&self, target: &RetractTarget, space: Space, matcher: F) -> Vec<String>
+    pub fn resolve_retract_ids<F>(
+        &self,
+        target: &RetractTarget,
+        space: Space,
+        matcher: F,
+    ) -> Vec<String>
     where
         F: Fn(&Record) -> bool,
     {
@@ -538,7 +563,11 @@ mod tests {
             .unwrap();
         assert!(replay2, "second assert with same key is a no-op");
         assert_eq!(ids1, ids2);
-        assert_eq!(s.snapshot(), snap_after_first, "no new snapshot on idempotent retry");
+        assert_eq!(
+            s.snapshot(),
+            snap_after_first,
+            "no new snapshot on idempotent retry"
+        );
     }
 
     #[test]
@@ -548,12 +577,24 @@ mod tests {
             .unwrap();
         let current = s.snapshot();
         let err = s
-            .assert_atoms(&["(b)".into()], Space::Semantic, &prov(), None, Some(current - 1))
+            .assert_atoms(
+                &["(b)".into()],
+                Space::Semantic,
+                &prov(),
+                None,
+                Some(current - 1),
+            )
             .unwrap_err();
         assert!(matches!(err, StateError::SnapshotMismatch { .. }));
         // The correct snapshot succeeds.
-        s.assert_atoms(&["(b)".into()], Space::Semantic, &prov(), None, Some(current))
-            .unwrap();
+        s.assert_atoms(
+            &["(b)".into()],
+            Space::Semantic,
+            &prov(),
+            None,
+            Some(current),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -584,13 +625,17 @@ mod tests {
     #[test]
     fn procedure_lifecycle_define_promote_rollback() {
         let mut s = MettaState::in_memory();
-        let v1 = s.define_procedure("proc-1", "(= (f) 1)", None, &[]).unwrap();
+        let v1 = s
+            .define_procedure("proc-1", "(= (f) 1)", None, &[])
+            .unwrap();
         assert_eq!(v1, 1);
         assert_eq!(s.procedure("proc-1").unwrap().active_version, None);
         s.promote("proc-1", &["traj-1".into()], Some(1)).unwrap();
         assert_eq!(s.procedure("proc-1").unwrap().active_version, Some(1));
         // A second candidate, promoted, then rolled back to v1.
-        let v2 = s.define_procedure("proc-1", "(= (f) 2)", None, &[]).unwrap();
+        let v2 = s
+            .define_procedure("proc-1", "(= (f) 2)", None, &[])
+            .unwrap();
         assert_eq!(v2, 2);
         s.promote("proc-1", &[], Some(2)).unwrap();
         assert_eq!(s.procedure("proc-1").unwrap().active_version, Some(2));
@@ -599,7 +644,11 @@ mod tests {
         let proc = s.procedure("proc-1").unwrap();
         assert_eq!(proc.active_version, Some(1));
         assert_eq!(
-            proc.versions.iter().find(|v| v.version == 2).unwrap().status,
+            proc.versions
+                .iter()
+                .find(|v| v.version == 2)
+                .unwrap()
+                .status,
             Status::Retired
         );
     }
@@ -609,9 +658,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut s = MettaState::open(dir.path()).unwrap();
-            s.assert_atoms(&["(a)".into(), "(b)".into()], Space::Semantic, &prov(), None, None)
+            s.assert_atoms(
+                &["(a)".into(), "(b)".into()],
+                Space::Semantic,
+                &prov(),
+                None,
+                None,
+            )
+            .unwrap();
+            s.define_procedure("proc-1", "(= (f) 1)", None, &[])
                 .unwrap();
-            s.define_procedure("proc-1", "(= (f) 1)", None, &[]).unwrap();
             s.promote("proc-1", &["e".into()], Some(1)).unwrap();
         }
         // Reopen: the replay must reproduce the snapshot, records, and active procedure version.

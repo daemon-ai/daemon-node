@@ -85,9 +85,7 @@ impl QueryCache {
         let Ok(mut stmt) = conn.prepare("SELECT normalized, results_json FROM query_cache") else {
             return;
         };
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        });
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
         if let Ok(rows) = rows {
             for row in rows.flatten() {
                 if let Ok(results) = serde_json::from_str::<Vec<MemoryRow>>(&row.1) {
@@ -200,7 +198,8 @@ impl QueryCache {
         s.tier1.insert(normalized.clone(), results.clone());
         s.insert_times.insert(normalized.clone(), Instant::now());
         if let Some(emb) = embedding {
-            s.tier23.insert(normalized.clone(), (emb.to_vec(), results.clone()));
+            s.tier23
+                .insert(normalized.clone(), (emb.to_vec(), results.clone()));
         }
         s.tier4.insert(normalized.clone(), results.clone());
 
@@ -256,8 +255,11 @@ impl QueryCache {
         }
         let total = s.tier1.len();
         if total > self.max_size {
-            let mut by_age: Vec<(String, Instant)> =
-                s.insert_times.iter().map(|(k, t)| (k.clone(), *t)).collect();
+            let mut by_age: Vec<(String, Instant)> = s
+                .insert_times
+                .iter()
+                .map(|(k, t)| (k.clone(), *t))
+                .collect();
             by_age.sort_by_key(|(_, t)| *t);
             for (key, _) in by_age.into_iter().take(total - self.max_size) {
                 s.tier1.remove(&key);
@@ -294,10 +296,16 @@ fn cosine_padded(a: &[f32], b: &[f32]) -> f64 {
 
 /// Word-level Jaccard similarity (`query_cache.py` `_jaccard_words` L159-L165).
 fn jaccard_words(a: &str, b: &str) -> f64 {
-    let wa: std::collections::HashSet<String> =
-        a.to_lowercase().split_whitespace().map(String::from).collect();
-    let wb: std::collections::HashSet<String> =
-        b.to_lowercase().split_whitespace().map(String::from).collect();
+    let wa: std::collections::HashSet<String> = a
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let wb: std::collections::HashSet<String> = b
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     if wa.is_empty() || wb.is_empty() {
         return 0.0;
     }

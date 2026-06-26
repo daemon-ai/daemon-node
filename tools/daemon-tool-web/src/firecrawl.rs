@@ -76,7 +76,9 @@ impl WebFetchBackend for FirecrawlFetch {
             .map_err(|e| WebError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(WebError::Http(format!("firecrawl returned status {status}")));
+            return Err(WebError::Http(format!(
+                "firecrawl returned status {status}"
+            )));
         }
         let parsed: FirecrawlResponse = resp
             .json()

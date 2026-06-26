@@ -81,8 +81,11 @@ impl Tool for ClarifyTool {
             return ToolOutcome::text(call.call_id.clone(), false, "clarify: empty question");
         }
         let options = args.options.unwrap_or_default();
-        let non_empty_options: Vec<String> =
-            options.iter().filter(|o| !o.trim().is_empty()).cloned().collect();
+        let non_empty_options: Vec<String> = options
+            .iter()
+            .filter(|o| !o.trim().is_empty())
+            .cloned()
+            .collect();
 
         let kind = if non_empty_options.is_empty() {
             HostRequestKind::Input {

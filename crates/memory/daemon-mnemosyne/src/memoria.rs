@@ -103,28 +103,124 @@ lazy_re!(
 );
 
 const EVENT_KEYWORDS: &[&str] = &[
-    "meeting", "call", "scheduled", "happened", "occurred", "plan to", "will be on", "due on",
-    "release", "deadline", "launched", "deployed", "released", "published", "posted", "started",
-    "began", "finished", "completed", "ended", "event", "conference", "workshop", "appointment",
+    "meeting",
+    "call",
+    "scheduled",
+    "happened",
+    "occurred",
+    "plan to",
+    "will be on",
+    "due on",
+    "release",
+    "deadline",
+    "launched",
+    "deployed",
+    "released",
+    "published",
+    "posted",
+    "started",
+    "began",
+    "finished",
+    "completed",
+    "ended",
+    "event",
+    "conference",
+    "workshop",
+    "appointment",
 ];
 const TRANSIENT_KEYWORDS: &[&str] = &[
-    "forecast", "weather", "temperature", "rain", "snow", "wind", "humidity", "chance",
-    "regenrisiko", "zum", "heute", "morgen", "gestern", "today", "tomorrow", "yesterday", "week",
+    "forecast",
+    "weather",
+    "temperature",
+    "rain",
+    "snow",
+    "wind",
+    "humidity",
+    "chance",
+    "regenrisiko",
+    "zum",
+    "heute",
+    "morgen",
+    "gestern",
+    "today",
+    "tomorrow",
+    "yesterday",
+    "week",
     "month",
 ];
 const METRIC_CTX_STOP: &[&str] = &[
     "the", "and", "for", "was", "of", "to", "a", "an", "in", "on", "at", "by", "is", "are", "has",
     "had", "not", "but", "or",
 ];
-const INSTRUCTION_FALSE_POSITIVES: &[&str] =
-    &["i think you should leave", "should behave", "their work style"];
+const INSTRUCTION_FALSE_POSITIVES: &[&str] = &[
+    "i think you should leave",
+    "should behave",
+    "their work style",
+];
 const FACT_MATCH_STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could", "did", "do", "does", "for",
-    "from", "had", "has", "have", "how", "i", "in", "is", "it", "its", "me", "my", "of", "on",
-    "or", "our", "related", "should", "that", "the", "their", "there", "this", "to", "totally",
-    "unrelated", "use", "uses", "was", "we", "what", "when", "where", "which", "who", "why",
-    "with", "you", "your", "again", "into", "not", "please", "somewhere", "supposed", "them",
-    "then", "they", "whatever",
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "related",
+    "should",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "to",
+    "totally",
+    "unrelated",
+    "use",
+    "uses",
+    "was",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
+    "again",
+    "into",
+    "not",
+    "please",
+    "somewhere",
+    "supposed",
+    "them",
+    "then",
+    "they",
+    "whatever",
 ];
 
 // ── Write path ───────────────────────────────────────────────────────────────────────────────
@@ -244,7 +340,9 @@ fn extract_metrics(
         let clean_pre = md_bold.replace_all(&clean_pre, " ");
         let clean_pre = md_italic.replace_all(&clean_pre, " ");
         let clean_pre = md_ops.replace_all(&clean_pre, " ").into_owned();
-        let trim_set: &[char] = &['.', ',', ':', ';', '!', '?', '(', ')', '[', ']', '"', '\'', '`', '*', '_'];
+        let trim_set: &[char] = &[
+            '.', ',', ':', ';', '!', '?', '(', ')', '[', ']', '"', '\'', '`', '*', '_',
+        ];
         let ctx_words: Vec<String> = clean_pre
             .split_whitespace()
             .map(|w| w.trim_matches(trim_set))
@@ -316,9 +414,13 @@ fn extract_dates(
         let ctx_lower = ctx.to_lowercase();
         let has_event = EVENT_KEYWORDS.iter().any(|kw| ctx_lower.contains(kw));
         if !has_event {
-            insert_fact(conn, session, msg_idx, "date", "iso_date", dt, &ctx, 0.5, src)?;
+            insert_fact(
+                conn, session, msg_idx, "date", "iso_date", dt, &ctx, 0.5, src,
+            )?;
         } else {
-            insert_fact(conn, session, msg_idx, "date", "iso_date", dt, &ctx, 0.7, src)?;
+            insert_fact(
+                conn, session, msg_idx, "date", "iso_date", dt, &ctx, 0.7, src,
+            )?;
             let desc: String = ctx.chars().take(120).collect();
             insert_timeline(conn, session, dt, msg_idx, &desc, "iso_date", src)?;
         }
@@ -327,7 +429,17 @@ fn extract_dates(
         let m = cap.get(1).unwrap();
         let dt = m.as_str().trim();
         let ctx = context_snippet(content, m.start(), 60);
-        insert_fact(conn, session, msg_idx, "date", "named_date", dt, &ctx, 0.7, src)?;
+        insert_fact(
+            conn,
+            session,
+            msg_idx,
+            "date",
+            "named_date",
+            dt,
+            &ctx,
+            0.7,
+            src,
+        )?;
     }
     Ok(())
 }
@@ -420,7 +532,9 @@ fn extract_decisions(
 ) -> Result<()> {
     for cap in decision_re().captures_iter(content) {
         let decision = cap.get(1).unwrap().as_str().trim();
-        insert_kg(conn, session, "user", "decision", decision, msg_idx, 0.65, src)?;
+        insert_kg(
+            conn, session, "user", "decision", decision, msg_idx, 0.65, src,
+        )?;
     }
     Ok(())
 }
@@ -435,7 +549,9 @@ fn extract_entities(
     for cap in entity_re().captures_iter(content) {
         let entity = cap.get(1).unwrap().as_str().trim();
         let action = cap.get(2).unwrap().as_str().trim();
-        insert_kg(conn, session, entity, "requires", action, msg_idx, 0.65, src)?;
+        insert_kg(
+            conn, session, entity, "requires", action, msg_idx, 0.65, src,
+        )?;
     }
     Ok(())
 }
@@ -474,7 +590,9 @@ fn extract_instructions(
     msg_idx: i64,
     src: &str,
 ) -> Result<()> {
-    let bare_q = re(r"(?i)^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b");
+    let bare_q = re(
+        r"(?i)^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b",
+    );
     let store = |m_start: usize, instr: &str| -> Result<()> {
         let instr = instr.trim();
         let instr_lower = instr.to_lowercase();
@@ -617,52 +735,126 @@ fn classify_ability(query: &str) -> String {
     let any = |kws: &[&str]| kws.iter().any(|k| q.contains(k));
 
     if any(&[
-        "how many days", "how many weeks", "how many months", "how long", "how much time",
-        "what date", "what day", "when did", "when does", "what is the deadline",
-        "how many years", "between which dates", "timeline", "how far apart",
+        "how many days",
+        "how many weeks",
+        "how many months",
+        "how long",
+        "how much time",
+        "what date",
+        "what day",
+        "when did",
+        "when does",
+        "what is the deadline",
+        "how many years",
+        "between which dates",
+        "timeline",
+        "how far apart",
     ]) {
         return "TR".into();
     }
     if any(&[
-        "list the order", "walk me through", "order in which", "chronological", "in what order",
+        "list the order",
+        "walk me through",
+        "order in which",
+        "chronological",
+        "in what order",
         "sequence of events",
     ]) {
         return "EO".into();
     }
     if any(&[
-        "have i", "did i", "am i", "has this", "contradict", "contradiction", "conflict",
+        "have i",
+        "did i",
+        "am i",
+        "has this",
+        "contradict",
+        "contradiction",
+        "conflict",
     ]) {
         return "CR".into();
     }
     if any(&[
-        "how many", "what is the", "what are the", "what was the", "what were the", "what was my",
-        "when does", "what is", "what was", "what version", "which version", "when was",
-        "when were", "how much", "how big", "how large", "how fast",
+        "how many",
+        "what is the",
+        "what are the",
+        "what was the",
+        "what were the",
+        "what was my",
+        "when does",
+        "what is",
+        "what was",
+        "what version",
+        "which version",
+        "when was",
+        "when were",
+        "how much",
+        "how big",
+        "how large",
+        "how fast",
     ]) && !any(&[
-        "how many days", "how many weeks", "how many months", "how many years", "how far apart",
+        "how many days",
+        "how many weeks",
+        "how many months",
+        "how many years",
+        "how far apart",
     ]) {
         return "IE".into();
     }
     if any(&[
-        "my preference", "my preferences", "what do i like", "what do i prefer",
-        "what do i hate", "what do i dislike", "what do i love", "what do i want",
-        "what do i need", "what do i tend", "do i like", "do i prefer", "do i hate",
-        "do i dislike", "do i love", "do i want", "do i need", "my favorite", "my favourite",
-        "my fav", "things i like", "things i love", "things i hate", "things i dislike",
-        "things i prefer", "things i tend", "things i don", "things i avoid", "what i like",
-        "what i love", "what i hate", "what i dislike", "what i prefer", "what i tend",
-        "what i don", "what i avoid", "preferences",
+        "my preference",
+        "my preferences",
+        "what do i like",
+        "what do i prefer",
+        "what do i hate",
+        "what do i dislike",
+        "what do i love",
+        "what do i want",
+        "what do i need",
+        "what do i tend",
+        "do i like",
+        "do i prefer",
+        "do i hate",
+        "do i dislike",
+        "do i love",
+        "do i want",
+        "do i need",
+        "my favorite",
+        "my favourite",
+        "my fav",
+        "things i like",
+        "things i love",
+        "things i hate",
+        "things i dislike",
+        "things i prefer",
+        "things i tend",
+        "things i don",
+        "things i avoid",
+        "what i like",
+        "what i love",
+        "what i hate",
+        "what i dislike",
+        "what i prefer",
+        "what i tend",
+        "what i don",
+        "what i avoid",
+        "preferences",
     ]) {
         return "PF".into();
     }
     if any(&[
-        "tell me about my background", "previous development", "work experience",
+        "tell me about my background",
+        "previous development",
+        "work experience",
         "personal background",
     ]) {
         return "ABS".into();
     }
     if any(&[
-        "across my", "across all", "in my project", "in my sessions", "across sessions",
+        "across my",
+        "across all",
+        "in my project",
+        "in my sessions",
+        "across sessions",
     ]) {
         return "MR".into();
     }
@@ -708,8 +900,8 @@ fn fact_retrieve(
     let mut facts: Vec<(String, String, String, String, Option<String>)> = Vec::new();
     let mut seen: Vec<(String, String)> = Vec::new();
     let push = |rows: Vec<(String, String, String, String, Option<String>)>,
-                    facts: &mut Vec<(String, String, String, String, Option<String>)>,
-                    seen: &mut Vec<(String, String)>| {
+                facts: &mut Vec<(String, String, String, String, Option<String>)>,
+                seen: &mut Vec<(String, String)>| {
         for row in rows {
             let fk = (row.1.clone(), row.2.clone());
             if !seen.contains(&fk) {
@@ -874,8 +1066,18 @@ fn timeline_retrieve(
         .filter_map(|c| c.get(1).map(|m| m.as_str()))
         .collect();
     let months = [
-        "january", "february", "march", "april", "may", "june", "july", "august", "september",
-        "october", "november", "december",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
     ];
     let q_lower = query.to_lowercase();
     let month_hit = months.iter().find(|m| q_lower.contains(**m));
@@ -900,7 +1102,10 @@ fn timeline_retrieve(
     let mut lines = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&sql) {
         if let Ok(rows) = stmt.query_map(params_from_iter(binds), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
         }) {
             for (date, desc) in rows.flatten() {
                 let d: String = desc.chars().take(120).collect();
@@ -1036,7 +1241,8 @@ fn chrono_retrieve(conn: &Connection, session: &str, top_k: usize) -> Option<Mem
         "SELECT value, message_idx FROM memoria_facts \
          WHERE fact_type='sequence' AND session_id = ? ORDER BY message_idx ASC LIMIT ?",
     ) {
-        if let Ok(rows) = stmt.query_map(params![session, top_k as i64], |r| r.get::<_, String>(0)) {
+        if let Ok(rows) = stmt.query_map(params![session, top_k as i64], |r| r.get::<_, String>(0))
+        {
             for (i, value) in rows.flatten().enumerate() {
                 lines.push(format!("[{}] {value}", i + 1));
             }
@@ -1067,9 +1273,9 @@ fn instruction_retrieve(
              WHERE (instruction LIKE ? OR topic LIKE ?) AND session_id = ? AND active = 1 LIMIT ?",
         ) {
             let like = format!("%{word}%");
-            if let Ok(rows) =
-                stmt.query_map(params![like, like, session, top_k as i64], |r| r.get::<_, String>(0))
-            {
+            if let Ok(rows) = stmt.query_map(params![like, like, session, top_k as i64], |r| {
+                r.get::<_, String>(0)
+            }) {
                 for instr in rows.flatten() {
                     matched = true;
                     let t: String = instr.chars().take(120).collect();
@@ -1229,8 +1435,14 @@ mod tests {
     #[test]
     fn ability_classifier_routes_questions() {
         assert_eq!(classify_ability("How many days until launch?"), "TR");
-        assert_eq!(classify_ability("What version of Postgres are we on?"), "IE");
-        assert_eq!(classify_ability("Walk me through the order of events"), "EO");
+        assert_eq!(
+            classify_ability("What version of Postgres are we on?"),
+            "IE"
+        );
+        assert_eq!(
+            classify_ability("Walk me through the order of events"),
+            "EO"
+        );
         assert_eq!(classify_ability("Have I ever used Redis?"), "CR");
         assert_eq!(classify_ability("what do i prefer for testing?"), "PF");
         assert_eq!(classify_ability("just a statement, not a question"), "");
@@ -1248,8 +1460,8 @@ mod tests {
             "mem-1",
         )
         .unwrap();
-        let got = memoria_retrieve(&conn, "sess", "What is the response time?", 3)
-            .expect("a fact hit");
+        let got =
+            memoria_retrieve(&conn, "sess", "What is the response time?", 3).expect("a fact hit");
         assert_eq!(got.source, "memoria_facts");
         assert!(got.context.contains("250ms"), "ctx: {}", got.context);
         assert_eq!(got.source_memory_ids, vec!["mem-1".to_string()]);
@@ -1268,8 +1480,8 @@ mod tests {
         )
         .unwrap();
 
-        let ver = memoria_retrieve(&conn, "sess", "What version of PostgreSQL?", 3)
-            .expect("version hit");
+        let ver =
+            memoria_retrieve(&conn, "sess", "What version of PostgreSQL?", 3).expect("version hit");
         assert!(ver.context.contains("14.2"), "ctx: {}", ver.context);
 
         let tl = memoria_retrieve(&conn, "sess", "What date is the release?", 3);
@@ -1291,7 +1503,11 @@ mod tests {
         .unwrap();
         let got = memoria_retrieve(&conn, "sess", "Have I used MongoDB?", 3).expect("negation hit");
         assert_eq!(got.source, "memoria_kg_negation");
-        assert!(got.context.to_lowercase().contains("mongodb"), "ctx: {}", got.context);
+        assert!(
+            got.context.to_lowercase().contains("mongodb"),
+            "ctx: {}",
+            got.context
+        );
     }
 
     #[test]

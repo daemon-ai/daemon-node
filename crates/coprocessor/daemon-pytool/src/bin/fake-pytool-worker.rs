@@ -13,9 +13,7 @@
 #![forbid(unsafe_code)]
 
 use daemon_provision::CutChannel;
-use daemon_pytool::protocol::{
-    self, Command, Concurrency, Event, ToolManifest, PROTOCOL_VERSION,
-};
+use daemon_pytool::protocol::{self, Command, Concurrency, Event, ToolManifest, PROTOCOL_VERSION};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

@@ -21,31 +21,31 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+pub use daemon_common::{
+    Author, BlobRef, ByteRange, Revision, RevisionKind, SkillBundle, WorkspaceBinding,
+};
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile,
     ModelId, ModelRef, ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage,
     SearchQuery, SessionId, UnitId, UsageDelta, WireVersion,
 };
-use std::collections::BTreeMap;
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
     RewindAnchor, TranscriptBlock, TransportId, UserMsg,
-};
-pub use daemon_common::{
-    Author, BlobRef, ByteRange, Revision, RevisionKind, SkillBundle, WorkspaceBinding,
 };
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub mod profile;
+pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
     Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
     ProviderSelector, SessionOverlay, ToolsOverride,
 };
-pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 
 /// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
 /// shape a streaming transport (in-process, socket, HTTP/WS) returns from [`SessionApi::subscribe`].
@@ -980,11 +980,7 @@ pub trait ControlApi: Send + Sync {
     }
 
     /// A live push stream of changes under `dir` (transport capability). Default: empty stream.
-    async fn fs_watch(
-        &self,
-        _root: FsRootId,
-        _dir: String,
-    ) -> Result<FsWatchStream, ApiError> {
+    async fn fs_watch(&self, _root: FsRootId, _dir: String) -> Result<FsWatchStream, ApiError> {
         Ok(stream::empty().boxed())
     }
 
@@ -1531,18 +1527,13 @@ pub struct TelemetryDump {
 /// (session surface, `submit`) lifecycle. The two are mutually exclusive for a given id; the unified
 /// roster surfaces both so a GUI sees in-progress interactive chats *and* durable sessions in one
 /// list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Lifecycle {
     /// Durable-managed (a `session_record` row; driven via [`ControlApi::assign`]).
+    #[default]
     Durable,
     /// Live-interactive (an in-memory submit/poll chat; driven via [`SessionApi::submit`]).
     Live,
-}
-
-impl Default for Lifecycle {
-    fn default() -> Self {
-        Self::Durable
-    }
 }
 
 /// A session's identity + lifecycle state + roster metadata. Enriched for the GUI roster: it carries
@@ -1598,9 +1589,10 @@ fn default_rewindable() -> bool {
 /// The scope filter for [`ControlApi::sessions_query`] — the GUI roster query. The tree is the lazy
 /// drill-down for children, so the default `TopLevel` returns only `Primary` conversations (the
 /// inbox); the by-profile / by-transport scopes back the per-agent / per-transport views.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SessionScope {
     /// Only top-level (`Primary`) conversations — the inbox. Children are reached via `tree()`.
+    #[default]
     TopLevel,
     /// Sessions bound to a specific profile (the per-agent view).
     ByProfile(ProfileRef),
@@ -1611,12 +1603,6 @@ pub enum SessionScope {
     Archived,
     /// Every session regardless of role (explicit opt-in; can be large in a fleets-of-fleets node).
     All,
-}
-
-impl Default for SessionScope {
-    fn default() -> Self {
-        Self::TopLevel
-    }
 }
 
 /// A scoped, paginated roster query. The cursor is the last session id from the previous page
@@ -2334,8 +2320,9 @@ pub struct RoomInfo {
 //
 // The declarative layer over events-IO transport adapters: the descriptor + capabilities a GUI
 // reads to render the "Add channel" picker and capability-gate affordances, and the live per-account
-// connection/presence state for the status bar + unified roster. All inert in the skeleton (the
-// `transport_adapters` / `transport_instances` ControlApi methods default empty).
+// connection/presence state for the status bar + unified roster. Populated by the adapters registered
+// in the host `AdapterRegistry` (e.g. `daemon-matrix`, `daemon-rooms`); the `transport_adapters` /
+// `transport_instances` ControlApi methods default empty only on a node with no registry.
 // ---------------------------------------------------------------------------
 
 /// The live connection state of a transport instance (the Pidgin `PurpleConnectionState` analogue),
@@ -2451,10 +2438,10 @@ pub struct TransportInstanceInfo {
 /// the capability DTOs so an adapter crate (which already depends on `daemon-api`) implements it
 /// without a new dependency, and the host `AdapterRegistry` can hold `Arc<dyn TransportAdapter>`.
 ///
-/// Skeleton status: the trait + the optional capability marker traits below are declared but not yet
-/// implemented by any adapter; the registry enumerates `info()` only. Retrofitting
-/// `daemon-matrix`/`daemon-rooms`/`daemon-http` and driving `serve` from the registry is deferred
-/// (spec §7 P1).
+/// Status: `daemon-matrix` and `daemon-rooms` implement this trait (and the `MessagingProtocol`
+/// specialization + feature traits below); they are registered in the host `AdapterRegistry`, which
+/// enumerates `info()`/`instances()` and drives `serve` via `AdapterRegistry::spawn_all`. Only
+/// `daemon-http` (and the future `daemon-a2a`) remain to be retrofitted onto the trait.
 #[async_trait]
 pub trait TransportAdapter: Send + Sync {
     /// The transport family / adapter id (`"matrix"`, `"room"`, `"http"`, `"a2a"`).
@@ -2490,12 +2477,28 @@ pub trait MessagingProtocol: TransportAdapter {
         Ok(())
     }
 
-    fn conversations(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsConversations>> { None }
-    fn membership(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsMembership>> { None }
-    fn roster(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsRoster>> { None }
-    fn contacts(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsContacts>> { None }
-    fn directory(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsDirectory>> { None }
-    fn file_transfer(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsFileTransfer>> { None }
+    fn conversations(
+        self: std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<dyn SupportsConversations>> {
+        None
+    }
+    fn membership(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsMembership>> {
+        None
+    }
+    fn roster(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsRoster>> {
+        None
+    }
+    fn contacts(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsContacts>> {
+        None
+    }
+    fn directory(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn SupportsDirectory>> {
+        None
+    }
+    fn file_transfer(
+        self: std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<dyn SupportsFileTransfer>> {
+        None
+    }
 }
 
 /// Per-verb capability probe for [`SupportsConversations`] (← libpurple's `implements_*`).
@@ -2518,20 +2521,32 @@ pub struct ConversationOps {
 pub trait SupportsConversations: Send + Sync {
     fn supported(&self) -> ConversationOps;
 
-    async fn list(&self, _transport: TransportId) -> Vec<ConversationInfo> { Vec::new() }
-    async fn get(&self, _transport: TransportId, _conv: String) -> Option<ConversationInfo> { None }
+    async fn list(&self, _transport: TransportId) -> Vec<ConversationInfo> {
+        Vec::new()
+    }
+    async fn get(&self, _transport: TransportId, _conv: String) -> Option<ConversationInfo> {
+        None
+    }
 
     async fn create_details(&self, _transport: TransportId) -> CreateConversationDetails {
         CreateConversationDetails::default()
     }
-    async fn create(&self, _transport: TransportId, _details: CreateConversationDetails) -> Result<ConversationInfo, ApiError> {
+    async fn create(
+        &self,
+        _transport: TransportId,
+        _details: CreateConversationDetails,
+    ) -> Result<ConversationInfo, ApiError> {
         Err(ApiError::Unsupported("conv_create".into()))
     }
 
     async fn channel_join_details(&self, _transport: TransportId) -> ChannelJoinDetails {
         ChannelJoinDetails::default()
     }
-    async fn join_channel(&self, _transport: TransportId, _details: ChannelJoinDetails) -> Result<ConversationInfo, ApiError> {
+    async fn join_channel(
+        &self,
+        _transport: TransportId,
+        _details: ChannelJoinDetails,
+    ) -> Result<ConversationInfo, ApiError> {
         Err(ApiError::Unsupported("conv_join".into()))
     }
 
@@ -2541,16 +2556,37 @@ pub trait SupportsConversations: Send + Sync {
     async fn delete(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("conv_delete".into()))
     }
-    async fn send(&self, _transport: TransportId, _conv: String, _from: Option<Participant>, _message: UserMsg) -> Result<(), ApiError> {
+    async fn send(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _from: Option<Participant>,
+        _message: UserMsg,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("conv_send".into()))
     }
-    async fn set_topic(&self, _transport: TransportId, _conv: String, _topic: Option<String>) -> Result<(), ApiError> {
+    async fn set_topic(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _topic: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("conv_set_topic".into()))
     }
-    async fn set_title(&self, _transport: TransportId, _conv: String, _title: Option<String>) -> Result<(), ApiError> {
+    async fn set_title(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _title: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("conv_set_title".into()))
     }
-    async fn set_description(&self, _transport: TransportId, _conv: String, _description: Option<String>) -> Result<(), ApiError> {
+    async fn set_description(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _description: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("conv_set_description".into()))
     }
 }
@@ -2570,23 +2606,51 @@ pub struct MembershipOps {
 #[async_trait]
 pub trait SupportsMembership: Send + Sync {
     fn supported(&self) -> MembershipOps;
-    async fn invite(&self, _transport: TransportId, _conv: String, _who: Participant, _message: Option<String>) -> Result<(), ApiError> {
+    async fn invite(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _message: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("member_invite".into()))
     }
-    async fn remove(&self, _transport: TransportId, _conv: String, _who: Participant, _reason: Option<String>) -> Result<(), ApiError> {
+    async fn remove(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _reason: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("member_remove".into()))
     }
-    async fn ban(&self, _transport: TransportId, _conv: String, _who: Participant, _reason: Option<String>) -> Result<(), ApiError> {
+    async fn ban(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _reason: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("member_ban".into()))
     }
-    async fn set_role(&self, _transport: TransportId, _conv: String, _who: Participant, _role: MemberRole) -> Result<(), ApiError> {
+    async fn set_role(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _who: Participant,
+        _role: MemberRole,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("member_set_role".into()))
     }
 }
 
 /// Per-verb probe for [`SupportsRoster`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RosterOps { pub add: bool, pub update: bool, pub remove: bool }
+pub struct RosterOps {
+    pub add: bool,
+    pub update: bool,
+    pub remove: bool,
+}
 
 /// Account-level server-side contact list (← `purpleprotocolroster.h`). Defined; no adapter yet.
 #[async_trait]
@@ -2605,17 +2669,33 @@ pub trait SupportsRoster: Send + Sync {
 
 /// Per-verb probe for [`SupportsContacts`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContactsOps { pub get_profile: bool, pub action_menu: bool, pub set_alias: bool }
+pub struct ContactsOps {
+    pub get_profile: bool,
+    pub action_menu: bool,
+    pub set_alias: bool,
+}
 
-/// Remote-contact operations (← `purpleprotocolcontacts.h`). Defined; no adapter yet.
+/// Remote-contact operations (← `purpleprotocolcontacts.h`). Implemented by `daemon-matrix`
+/// (`get_profile`); `action_menu`/`set_alias` off there.
 #[async_trait]
 pub trait SupportsContacts: Send + Sync {
     fn supported(&self) -> ContactsOps;
-    async fn get_profile(&self, _transport: TransportId, _contact: ContactInfo) -> Result<String, ApiError> {
+    async fn get_profile(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Result<String, ApiError> {
         Err(ApiError::Unsupported("contact_get_profile".into()))
     }
-    fn action_menu(&self, _transport: TransportId, _contact: ContactInfo) -> Option<ActionMenu> { None }
-    async fn set_alias(&self, _transport: TransportId, _contact: ContactInfo, _alias: Option<String>) -> Result<(), ApiError> {
+    fn action_menu(&self, _transport: TransportId, _contact: ContactInfo) -> Option<ActionMenu> {
+        None
+    }
+    async fn set_alias(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+        _alias: Option<String>,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("contact_set_alias".into()))
     }
 }
@@ -2624,14 +2704,21 @@ pub trait SupportsContacts: Send + Sync {
 #[async_trait]
 pub trait SupportsDirectory: Send + Sync {
     fn supported(&self) -> bool;
-    async fn search_contacts(&self, _transport: TransportId, _query: Option<String>) -> Result<Vec<ContactInfo>, ApiError> {
+    async fn search_contacts(
+        &self,
+        _transport: TransportId,
+        _query: Option<String>,
+    ) -> Result<Vec<ContactInfo>, ApiError> {
         Err(ApiError::Unsupported("directory_search".into()))
     }
 }
 
 /// Per-verb probe for [`SupportsFileTransfer`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileTransferOps { pub send: bool, pub receive: bool }
+pub struct FileTransferOps {
+    pub send: bool,
+    pub receive: bool,
+}
 
 /// File transfer (← `purpleprotocolfiletransfer.h`). Defined; no adapter yet.
 #[async_trait]
@@ -4465,10 +4552,12 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             Ok(dist) => ApiResponse::Distribution(dist),
             Err(e) => ApiResponse::Error(e),
         },
-        ApiRequest::ProfileImport { dist, new_id } => match api.profile_import(dist, new_id).await {
-            Ok(id) => ApiResponse::ProfileId(id),
-            Err(e) => ApiResponse::Error(e),
-        },
+        ApiRequest::ProfileImport { dist, new_id } => {
+            match api.profile_import(dist, new_id).await {
+                Ok(id) => ApiResponse::ProfileId(id),
+                Err(e) => ApiResponse::Error(e),
+            }
+        }
         ApiRequest::ProfileHistory { id } => match api.profile_history(id).await {
             Ok(revs) => ApiResponse::Revisions(revs),
             Err(e) => ApiResponse::Error(e),
@@ -4629,45 +4718,71 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         ApiRequest::ConvLeave { transport, conv } => {
             unit_or_err(api.conv_leave(transport, conv).await)
         }
-        ApiRequest::ConvSend { transport, conv, from, message } => {
-            unit_or_err(api.conv_send(transport, conv, from, message).await)
-        }
-        ApiRequest::ConvSetTopic { transport, conv, topic } => {
-            unit_or_err(api.conv_set_topic(transport, conv, topic).await)
-        }
-        ApiRequest::ConvSetTitle { transport, conv, title } => {
-            unit_or_err(api.conv_set_title(transport, conv, title).await)
-        }
-        ApiRequest::ConvSetDescription { transport, conv, description } => {
-            unit_or_err(api.conv_set_description(transport, conv, description).await)
-        }
+        ApiRequest::ConvSend {
+            transport,
+            conv,
+            from,
+            message,
+        } => unit_or_err(api.conv_send(transport, conv, from, message).await),
+        ApiRequest::ConvSetTopic {
+            transport,
+            conv,
+            topic,
+        } => unit_or_err(api.conv_set_topic(transport, conv, topic).await),
+        ApiRequest::ConvSetTitle {
+            transport,
+            conv,
+            title,
+        } => unit_or_err(api.conv_set_title(transport, conv, title).await),
+        ApiRequest::ConvSetDescription {
+            transport,
+            conv,
+            description,
+        } => unit_or_err(api.conv_set_description(transport, conv, description).await),
         ApiRequest::ConvDelete { transport, conv } => {
             unit_or_err(api.conv_delete(transport, conv).await)
         }
-        ApiRequest::ConvHistory { transport, conv, after_cursor, max } => {
-            ApiResponse::Journal(api.conv_history(transport, conv, after_cursor, max).await)
-        }
-        ApiRequest::MemberInvite { transport, conv, who, message } => {
-            unit_or_err(api.member_invite(transport, conv, who, message).await)
-        }
-        ApiRequest::MemberRemove { transport, conv, who, reason } => {
-            unit_or_err(api.member_remove(transport, conv, who, reason).await)
-        }
-        ApiRequest::MemberBan { transport, conv, who, reason } => {
-            unit_or_err(api.member_ban(transport, conv, who, reason).await)
-        }
-        ApiRequest::MemberSetRole { transport, conv, who, role } => {
-            unit_or_err(api.member_set_role(transport, conv, who, role).await)
-        }
+        ApiRequest::ConvHistory {
+            transport,
+            conv,
+            after_cursor,
+            max,
+        } => ApiResponse::Journal(api.conv_history(transport, conv, after_cursor, max).await),
+        ApiRequest::MemberInvite {
+            transport,
+            conv,
+            who,
+            message,
+        } => unit_or_err(api.member_invite(transport, conv, who, message).await),
+        ApiRequest::MemberRemove {
+            transport,
+            conv,
+            who,
+            reason,
+        } => unit_or_err(api.member_remove(transport, conv, who, reason).await),
+        ApiRequest::MemberBan {
+            transport,
+            conv,
+            who,
+            reason,
+        } => unit_or_err(api.member_ban(transport, conv, who, reason).await),
+        ApiRequest::MemberSetRole {
+            transport,
+            conv,
+            who,
+            role,
+        } => unit_or_err(api.member_set_role(transport, conv, who, role).await),
         ApiRequest::ContactGetProfile { transport, contact } => {
             match api.contact_get_profile(transport, contact).await {
                 Ok(profile) => ApiResponse::ContactProfile(profile),
                 Err(e) => ApiResponse::Error(e),
             }
         }
-        ApiRequest::ContactSetAlias { transport, contact, alias } => {
-            unit_or_err(api.contact_set_alias(transport, contact, alias).await)
-        }
+        ApiRequest::ContactSetAlias {
+            transport,
+            contact,
+            alias,
+        } => unit_or_err(api.contact_set_alias(transport, contact, alias).await),
         ApiRequest::ContactActionMenu { transport, contact } => {
             ApiResponse::ActionMenu(api.contact_action_menu(transport, contact).await)
         }
@@ -4677,9 +4792,7 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
                 Err(e) => ApiResponse::Error(e),
             }
         }
-        ApiRequest::TransportAdapters => {
-            ApiResponse::Adapters(api.transport_adapters().await)
-        }
+        ApiRequest::TransportAdapters => ApiResponse::Adapters(api.transport_adapters().await),
         ApiRequest::TransportInstances => {
             ApiResponse::TransportInstances(api.transport_instances().await)
         }
@@ -4742,7 +4855,10 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             hash,
             base_revision,
             force,
-        } => match api.fs_write_from_blob(root, path, hash, base_revision, force).await {
+        } => match api
+            .fs_write_from_blob(root, path, hash, base_revision, force)
+            .await
+        {
             Ok(rev) => ApiResponse::FsWrite(rev),
             Err(e) => ApiResponse::Error(e),
         },
@@ -4849,27 +4965,112 @@ mod tests {
             member: "@bot".into(),
         };
         let reqs = vec![
-            ApiRequest::ConvList { transport: transport.clone() },
-            ApiRequest::ConvGet { transport: transport.clone(), conv: "r1".into() },
-            ApiRequest::ConvCreateDetails { transport: transport.clone() },
-            ApiRequest::ConvCreate { transport: transport.clone(), details: CreateConversationDetails::default() },
-            ApiRequest::ConvJoinDetails { transport: transport.clone() },
-            ApiRequest::ConvJoin { transport: transport.clone(), details: ChannelJoinDetails::default() },
-            ApiRequest::ConvLeave { transport: transport.clone(), conv: "r1".into() },
-            ApiRequest::ConvSend { transport: transport.clone(), conv: "r1".into(), from: Some(who.clone()), message: UserMsg::new("hi") },
-            ApiRequest::ConvSetTopic { transport: transport.clone(), conv: "r1".into(), topic: Some("t".into()) },
-            ApiRequest::ConvSetTitle { transport: transport.clone(), conv: "r1".into(), title: None },
-            ApiRequest::ConvSetDescription { transport: transport.clone(), conv: "r1".into(), description: Some("d".into()) },
-            ApiRequest::ConvDelete { transport: transport.clone(), conv: "r1".into() },
-            ApiRequest::ConvHistory { transport: transport.clone(), conv: "r1".into(), after_cursor: 0, max: 16 },
-            ApiRequest::MemberInvite { transport: transport.clone(), conv: "r1".into(), who: who.clone(), message: None },
-            ApiRequest::MemberRemove { transport: transport.clone(), conv: "r1".into(), who: who.clone(), reason: Some("bye".into()) },
-            ApiRequest::MemberBan { transport: transport.clone(), conv: "r1".into(), who: who.clone(), reason: None },
-            ApiRequest::MemberSetRole { transport: transport.clone(), conv: "r1".into(), who: who.clone(), role: MemberRole::Op },
-            ApiRequest::ContactGetProfile { transport: transport.clone(), contact: ContactInfo { id: "@alice:hs".into(), ..ContactInfo::default() } },
-            ApiRequest::ContactSetAlias { transport: transport.clone(), contact: ContactInfo { id: "@alice:hs".into(), ..ContactInfo::default() }, alias: Some("Ali".into()) },
-            ApiRequest::ContactActionMenu { transport: transport.clone(), contact: ContactInfo { id: "@alice:hs".into(), ..ContactInfo::default() } },
-            ApiRequest::DirectorySearch { transport: transport.clone(), query: Some("ali".into()) },
+            ApiRequest::ConvList {
+                transport: transport.clone(),
+            },
+            ApiRequest::ConvGet {
+                transport: transport.clone(),
+                conv: "r1".into(),
+            },
+            ApiRequest::ConvCreateDetails {
+                transport: transport.clone(),
+            },
+            ApiRequest::ConvCreate {
+                transport: transport.clone(),
+                details: CreateConversationDetails::default(),
+            },
+            ApiRequest::ConvJoinDetails {
+                transport: transport.clone(),
+            },
+            ApiRequest::ConvJoin {
+                transport: transport.clone(),
+                details: ChannelJoinDetails::default(),
+            },
+            ApiRequest::ConvLeave {
+                transport: transport.clone(),
+                conv: "r1".into(),
+            },
+            ApiRequest::ConvSend {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                from: Some(who.clone()),
+                message: UserMsg::new("hi"),
+            },
+            ApiRequest::ConvSetTopic {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                topic: Some("t".into()),
+            },
+            ApiRequest::ConvSetTitle {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                title: None,
+            },
+            ApiRequest::ConvSetDescription {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                description: Some("d".into()),
+            },
+            ApiRequest::ConvDelete {
+                transport: transport.clone(),
+                conv: "r1".into(),
+            },
+            ApiRequest::ConvHistory {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                after_cursor: 0,
+                max: 16,
+            },
+            ApiRequest::MemberInvite {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                who: who.clone(),
+                message: None,
+            },
+            ApiRequest::MemberRemove {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                who: who.clone(),
+                reason: Some("bye".into()),
+            },
+            ApiRequest::MemberBan {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                who: who.clone(),
+                reason: None,
+            },
+            ApiRequest::MemberSetRole {
+                transport: transport.clone(),
+                conv: "r1".into(),
+                who: who.clone(),
+                role: MemberRole::Op,
+            },
+            ApiRequest::ContactGetProfile {
+                transport: transport.clone(),
+                contact: ContactInfo {
+                    id: "@alice:hs".into(),
+                    ..ContactInfo::default()
+                },
+            },
+            ApiRequest::ContactSetAlias {
+                transport: transport.clone(),
+                contact: ContactInfo {
+                    id: "@alice:hs".into(),
+                    ..ContactInfo::default()
+                },
+                alias: Some("Ali".into()),
+            },
+            ApiRequest::ContactActionMenu {
+                transport: transport.clone(),
+                contact: ContactInfo {
+                    id: "@alice:hs".into(),
+                    ..ContactInfo::default()
+                },
+            },
+            ApiRequest::DirectorySearch {
+                transport: transport.clone(),
+                query: Some("ali".into()),
+            },
             ApiRequest::TransportAdapters,
             ApiRequest::TransportInstances,
         ];
@@ -4921,7 +5122,9 @@ mod tests {
             }]),
             ApiResponse::ContactProfile("display_name: Alice".into()),
             ApiResponse::Contacts(vec![info.members[0].contact.clone()]),
-            ApiResponse::ActionMenu(Some(ActionMenu { items: vec!["Block".into()] })),
+            ApiResponse::ActionMenu(Some(ActionMenu {
+                items: vec!["Block".into()],
+            })),
             ApiResponse::ActionMenu(None),
         ];
         for resp in resps {
@@ -5328,10 +5531,7 @@ mod tests {
                 children: vec![SessionId::new("c1")],
                 checkpoints: 2,
             })),
-            ApiResponse::SessionsByProfile(vec![(
-                ProfileRef::new("agent-x"),
-                vec![sample_info()],
-            )]),
+            ApiResponse::SessionsByProfile(vec![(ProfileRef::new("agent-x"), vec![sample_info()])]),
             ApiResponse::SessionSearch(vec![SessionSearchHit {
                 session: SessionId::new("s1"),
                 title: "hello".into(),

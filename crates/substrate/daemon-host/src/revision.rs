@@ -60,7 +60,9 @@ impl FileRevisionLog {
     }
 
     fn blob_path(&self, kind: RevisionKind, id: &str, hex: &str) -> PathBuf {
-        self.artifact_dir(kind, id).join("blobs").join(format!("{hex}.bin"))
+        self.artifact_dir(kind, id)
+            .join("blobs")
+            .join(format!("{hex}.bin"))
     }
 
     fn read_index(&self, kind: RevisionKind, id: &str) -> Result<Vec<IndexLine>, RevisionError> {
@@ -192,7 +194,10 @@ fn from_hex(hex: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, slot) in out.iter_mut().enumerate() {
         let j = i * 2;
-        if let Some(byte) = hex.get(j..j + 2).and_then(|p| u8::from_str_radix(p, 16).ok()) {
+        if let Some(byte) = hex
+            .get(j..j + 2)
+            .and_then(|p| u8::from_str_radix(p, 16).ok())
+        {
             *slot = byte;
         }
     }
@@ -234,7 +239,13 @@ mod tests {
         let log = FileRevisionLog::open(&dir).unwrap();
 
         let r1 = log
-            .append(RevisionKind::Profile, "opus", b"v1", Author::Operator, "create")
+            .append(
+                RevisionKind::Profile,
+                "opus",
+                b"v1",
+                Author::Operator,
+                "create",
+            )
             .unwrap();
         assert_eq!(r1.seq, 1);
         assert_eq!(r1.parent, None);
@@ -253,12 +264,24 @@ mod tests {
         let hist = log.history(RevisionKind::Profile, "opus").unwrap();
         assert_eq!(hist.len(), 2);
         assert_eq!(log.get_at(RevisionKind::Profile, "opus", 1).unwrap(), b"v1");
-        assert_eq!(log.head(RevisionKind::Profile, "opus").unwrap().unwrap().seq, 2);
+        assert_eq!(
+            log.head(RevisionKind::Profile, "opus")
+                .unwrap()
+                .unwrap()
+                .seq,
+            2
+        );
 
         // Non-destructive revert: re-append v1's content as a new head; history still grows.
         let blob = log.get_at(RevisionKind::Profile, "opus", 1).unwrap();
         let r3 = log
-            .append(RevisionKind::Profile, "opus", &blob, Author::Operator, "revert to 1")
+            .append(
+                RevisionKind::Profile,
+                "opus",
+                &blob,
+                Author::Operator,
+                "revert to 1",
+            )
             .unwrap();
         assert_eq!(r3.seq, 3);
         assert_eq!(log.get_at(RevisionKind::Profile, "opus", 3).unwrap(), b"v1");
@@ -268,7 +291,13 @@ mod tests {
 
         // Survives reopen (durable).
         let reopened = FileRevisionLog::open(&dir).unwrap();
-        assert_eq!(reopened.history(RevisionKind::Profile, "opus").unwrap().len(), 3);
+        assert_eq!(
+            reopened
+                .history(RevisionKind::Profile, "opus")
+                .unwrap()
+                .len(),
+            3
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -278,8 +307,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("daemon-revlog-iso-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let log = FileRevisionLog::open(&dir).unwrap();
-        log.append(RevisionKind::Profile, "a", b"pa", Author::Operator, "c").unwrap();
-        log.append(RevisionKind::Skill, "a", b"sa", Author::Operator, "c").unwrap();
+        log.append(RevisionKind::Profile, "a", b"pa", Author::Operator, "c")
+            .unwrap();
+        log.append(RevisionKind::Skill, "a", b"sa", Author::Operator, "c")
+            .unwrap();
         assert_eq!(log.history(RevisionKind::Profile, "a").unwrap().len(), 1);
         assert_eq!(log.history(RevisionKind::Skill, "a").unwrap().len(), 1);
         assert!(log.head(RevisionKind::Profile, "b").unwrap().is_none());

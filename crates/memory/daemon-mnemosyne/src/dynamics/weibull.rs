@@ -91,6 +91,9 @@ mod tests {
         assert_eq!(weibull_boost(None, "fact"), 0.0);
         // A known age defers to the survival function.
         assert_eq!(weibull_boost(Some(0.0), "event"), 1.0);
-        assert!((weibull_boost(Some(720.0), "fact") - weibull_decay_factor(720.0, "fact")).abs() < 1e-12);
+        assert!(
+            (weibull_boost(Some(720.0), "fact") - weibull_decay_factor(720.0, "fact")).abs()
+                < 1e-12
+        );
     }
 }

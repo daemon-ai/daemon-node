@@ -44,8 +44,22 @@ const FILLER_WORDS: &[&str] = &[
 
 /// Fragment-starting verbs that take an implicit subject (`chat_normalize.py` L48-L53).
 const FRAGMENT_STARTERS: &[&str] = &[
-    "going", "coming", "thinking", "wondering", "feeling", "trying", "hoping", "planning",
-    "working", "looking", "checking", "running", "testing", "building", "fixing", "deploying",
+    "going",
+    "coming",
+    "thinking",
+    "wondering",
+    "feeling",
+    "trying",
+    "hoping",
+    "planning",
+    "working",
+    "looking",
+    "checking",
+    "running",
+    "testing",
+    "building",
+    "fixing",
+    "deploying",
 ];
 
 fn contraction_rules() -> &'static [(Regex, &'static str)] {
@@ -189,7 +203,10 @@ mod tests {
         // "omgggg" (4 g) is not in the filler set; collapses to "omg", then single short word -> None.
         assert_eq!(normalize_chat("omgggg", true), None);
         // "soooo cool" -> "so cool"
-        assert_eq!(normalize_chat("soooo cool", true).as_deref(), Some("so cool"));
+        assert_eq!(
+            normalize_chat("soooo cool", true).as_deref(),
+            Some("so cool")
+        );
     }
 
     #[test]

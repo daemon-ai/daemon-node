@@ -180,8 +180,8 @@ mod tests {
         "balanced)",
         "(a))",
         "\"unterminated string",
-        "$",          // variable needs at least one char
-        "(a (b)",     // missing close
+        "$",      // variable needs at least one char
+        "(a (b)", // missing close
     ];
 
     #[test]
@@ -200,9 +200,15 @@ mod tests {
 
     #[test]
     fn artifacts_are_present_and_shaped() {
-        assert!(METTA_GBNF.contains("root"), "gbnf must define the root rule");
+        assert!(
+            METTA_GBNF.contains("root"),
+            "gbnf must define the root rule"
+        );
         assert!(METTA_GBNF.contains("expression"));
-        assert!(METTA_LARK.contains("start:"), "lark must define the start rule");
+        assert!(
+            METTA_LARK.contains("start:"),
+            "lark must define the start rule"
+        );
         assert!(METTA_LARK.contains("VARIABLE"));
         // The artifacts are non-trivial.
         assert!(METTA_GBNF.len() > 200);

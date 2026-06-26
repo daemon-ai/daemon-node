@@ -44,7 +44,8 @@ pub trait BlobStore: Send + Sync {
 
     /// Read a blob by hash. A full read (`range == None`) is verified against `hash`; a ranged read
     /// returns the slice **unverified** (it cannot be checked against the whole-content hash).
-    async fn get(&self, hash: &ContentHash, range: Option<ByteRange>) -> Result<Vec<u8>, BlobError>;
+    async fn get(&self, hash: &ContentHash, range: Option<ByteRange>)
+        -> Result<Vec<u8>, BlobError>;
 
     /// Whether a blob with `hash` is present.
     async fn has(&self, hash: &ContentHash) -> bool;
@@ -87,7 +88,11 @@ impl BlobStore for FileBlobStore {
         Ok(BlobRef::new(hash, len))
     }
 
-    async fn get(&self, hash: &ContentHash, range: Option<ByteRange>) -> Result<Vec<u8>, BlobError> {
+    async fn get(
+        &self,
+        hash: &ContentHash,
+        range: Option<ByteRange>,
+    ) -> Result<Vec<u8>, BlobError> {
         let path = self.blob_path(hash);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
@@ -108,7 +113,11 @@ impl BlobStore for FileBlobStore {
                 let start = r.offset as usize;
                 let end = (r.offset.saturating_add(r.len)) as usize;
                 if start > bytes.len() || end > bytes.len() {
-                    return Err(BlobError::Range(r.offset, r.offset + r.len, bytes.len() as u64));
+                    return Err(BlobError::Range(
+                        r.offset,
+                        r.offset + r.len,
+                        bytes.len() as u64,
+                    ));
                 }
                 Ok(bytes[start..end].to_vec())
             }
@@ -181,7 +190,9 @@ mod tests {
         assert_eq!(mid, b"234");
         // Out-of-bounds range errors.
         assert!(matches!(
-            store.get(&r.hash, Some(ByteRange { offset: 8, len: 5 })).await,
+            store
+                .get(&r.hash, Some(ByteRange { offset: 8, len: 5 }))
+                .await,
             Err(BlobError::Range(..))
         ));
         // Missing hash.

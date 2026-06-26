@@ -39,7 +39,11 @@ pub fn aggregate_veracity(source_veracities: &[String]) -> String {
         return "unknown".to_string();
     }
     let non_unknown: Vec<&str> = valid.iter().copied().filter(|v| *v != "unknown").collect();
-    let candidates = if non_unknown.is_empty() { &valid } else { &non_unknown };
+    let candidates = if non_unknown.is_empty() {
+        &valid
+    } else {
+        &non_unknown
+    };
 
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for v in candidates {
@@ -175,7 +179,9 @@ pub fn consolidate_fact(
              WHERE subject = ?1 AND predicate = ?2 AND object != ?3",
         )?;
         let rows = stmt
-            .query_map(params![subject, predicate, object], |r| r.get::<_, String>(0))?
+            .query_map(params![subject, predicate, object], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };

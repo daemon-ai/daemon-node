@@ -83,7 +83,8 @@ pub fn apply_automatic_transitions(
         };
         // No-op when already in the target state. Never auto-reactivate an archived skill (its body
         // is out of discovery; restoring it is an explicit operator/curator action).
-        if target == u.state || (u.state == SkillState::Archived && target != SkillState::Archived) {
+        if target == u.state || (u.state == SkillState::Archived && target != SkillState::Archived)
+        {
             continue;
         }
         out.push(CuratorTransition {
@@ -122,7 +123,9 @@ mod tests {
         map.insert("ancient".into(), agent(SkillState::Active, at_days(50))); // 150d idle
         let t = apply_automatic_transitions(&map, now, cfg);
         assert_eq!(t.len(), 2);
-        assert!(t.iter().any(|x| x.name == "aging" && x.to == SkillState::Stale));
+        assert!(t
+            .iter()
+            .any(|x| x.name == "aging" && x.to == SkillState::Stale));
         assert!(t
             .iter()
             .any(|x| x.name == "ancient" && x.to == SkillState::Archived));

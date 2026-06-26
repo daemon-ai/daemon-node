@@ -103,7 +103,10 @@ mod tests {
         assert_eq!(role_to_power(MemberRole::Founder), 100);
         assert_eq!(role_to_power(MemberRole::Op), 50);
         assert_eq!(role_to_power(MemberRole::None), 0);
-        assert_eq!(role_from_matrix(RoomMemberRole::Administrator), MemberRole::Founder);
+        assert_eq!(
+            role_from_matrix(RoomMemberRole::Administrator),
+            MemberRole::Founder
+        );
         assert_eq!(role_from_matrix(RoomMemberRole::Moderator), MemberRole::Op);
         assert_eq!(role_from_matrix(RoomMemberRole::User), MemberRole::None);
     }

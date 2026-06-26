@@ -219,8 +219,7 @@ impl WorkspaceFs {
 
     /// Contain a root-relative path against the resolved base (rejects `..`/absolute escapes).
     fn contained(base: &Path, rel: &str) -> Result<PathBuf, ApiError> {
-        contain(base, Path::new(rel))
-            .map_err(|e| ApiError::Other(format!("path not allowed: {e}")))
+        contain(base, Path::new(rel)).map_err(|e| ApiError::Other(format!("path not allowed: {e}")))
     }
 
     /// List one directory's children (root-relative `dir`, "" = the root). Entries matching the
@@ -330,7 +329,11 @@ impl WorkspaceFs {
     }
 
     /// The current etag of a file (or `None` if it does not exist).
-    pub async fn revision(&self, root: &FsRootId, path: &str) -> Result<Option<FsRevision>, ApiError> {
+    pub async fn revision(
+        &self,
+        root: &FsRootId,
+        path: &str,
+    ) -> Result<Option<FsRevision>, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, path)?;
         match tokio::fs::metadata(&abs).await {
@@ -413,10 +416,7 @@ impl WorkspaceFs {
             } else {
                 format!("(?i){needle}")
             };
-            Some(
-                regex::Regex::new(&pat)
-                    .map_err(|e| ApiError::Other(format!("bad regex: {e}")))?,
-            )
+            Some(regex::Regex::new(&pat).map_err(|e| ApiError::Other(format!("bad regex: {e}")))?)
         } else {
             None
         };
@@ -523,7 +523,10 @@ impl WorkspaceFs {
                     continue;
                 }
                 if let Ok(meta) = item.metadata().await {
-                    current.insert(name, (mtime_ms(&meta), if meta.is_dir() { 0 } else { meta.len() }));
+                    current.insert(
+                        name,
+                        (mtime_ms(&meta), if meta.is_dir() { 0 } else { meta.len() }),
+                    );
                 }
             }
         }
@@ -593,7 +596,10 @@ mod tests {
         let roots = WorkspaceRoots::new(PathBuf::from("/ws"));
         assert_eq!(roots.isolated_root("abc"), PathBuf::from("/ws/abc"));
         // Path-namespaced child ids collapse to one safe segment (no traversal).
-        assert_eq!(roots.isolated_root("parent/c1"), PathBuf::from("/ws/parent_c1"));
+        assert_eq!(
+            roots.isolated_root("parent/c1"),
+            PathBuf::from("/ws/parent_c1")
+        );
     }
 
     #[test]
@@ -633,7 +639,10 @@ mod tests {
         assert!(!content.truncated);
 
         // A stale base revision is rejected with Conflict.
-        let stale = FsRevision { mtime_ms: 1, size: 1 };
+        let stale = FsRevision {
+            mtime_ms: 1,
+            size: 1,
+        };
         let err = fs
             .write(&root, "a/b.txt", b"x", Some(stale))
             .await
@@ -650,7 +659,8 @@ mod tests {
     async fn contain_rejects_escape_and_host_is_read_only() {
         let base = temp_base("escape");
         let fs = WorkspaceFs::new(std::sync::Arc::new(
-            WorkspaceRoots::new(base.clone()).with_browse_roots(vec![("home".into(), base.clone())]),
+            WorkspaceRoots::new(base.clone())
+                .with_browse_roots(vec![("home".into(), base.clone())]),
         ));
         // Escapes above the root are rejected.
         assert!(fs.read(&FsRootId::Workspace, "../secret", 0).await.is_err());

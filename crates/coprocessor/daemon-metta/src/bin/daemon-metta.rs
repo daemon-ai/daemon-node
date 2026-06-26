@@ -33,7 +33,10 @@ async fn main() {
         Some(dir) => match MettaState::open(dir) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("daemon-metta: failed to open state dir {}: {e}", dir.display());
+                eprintln!(
+                    "daemon-metta: failed to open state dir {}: {e}",
+                    dir.display()
+                );
                 MettaState::in_memory()
             }
         },
@@ -69,7 +72,10 @@ async fn main() {
     let engine = ready_rx.await.unwrap_or_else(|_| "unknown".into());
     let ready = Event::Ready {
         engine,
-        spaces: Space::all().iter().map(|s| s.as_str().to_string()).collect(),
+        spaces: Space::all()
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect(),
     };
     if let Ok(bytes) = protocol::encode(&ready) {
         let _ = writer.send(&bytes).await;

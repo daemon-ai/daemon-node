@@ -225,12 +225,20 @@ impl SkillManageTool {
             }
             "edit" => {
                 let content = a.content.as_deref().ok_or_else(|| missing("content"))?;
-                self.store.edit(&a.name, content).map_err(|e| e.to_string())?;
+                self.store
+                    .edit(&a.name, content)
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("edited skill `{}`", a.name))
             }
             "patch" => {
-                let old = a.old_string.as_deref().ok_or_else(|| missing("old_string"))?;
-                let new = a.new_string.as_deref().ok_or_else(|| missing("new_string"))?;
+                let old = a
+                    .old_string
+                    .as_deref()
+                    .ok_or_else(|| missing("old_string"))?;
+                let new = a
+                    .new_string
+                    .as_deref()
+                    .ok_or_else(|| missing("new_string"))?;
                 self.store
                     .patch(&a.name, old, new, a.file_path.as_deref(), a.replace_all)
                     .map_err(|e| e.to_string())?;
@@ -242,7 +250,10 @@ impl SkillManageTool {
             }
             "write_file" => {
                 let path = a.file_path.as_deref().ok_or_else(|| missing("file_path"))?;
-                let content = a.file_content.as_deref().ok_or_else(|| missing("file_content"))?;
+                let content = a
+                    .file_content
+                    .as_deref()
+                    .ok_or_else(|| missing("file_content"))?;
                 self.store
                     .write_file(&a.name, path, content)
                     .map_err(|e| e.to_string())?;

@@ -187,6 +187,8 @@ mod tests {
 
     #[derive(Clone)]
     struct CaptureLayer {
+        // Test-only capture buffer; the tuple shape is local and self-explanatory.
+        #[allow(clippy::type_complexity)]
         spans: Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>,
     }
 

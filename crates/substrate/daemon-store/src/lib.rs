@@ -110,9 +110,10 @@ pub struct SessionMeta {
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
 /// child roles are reached only by walking the tree. The `ManagedChild` vs `EphemeralSubagent` split
 /// lets clients keep long-lived children stable while coalescing transient-subagent churn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SessionRole {
     /// A top-level conversation (the only role listed in the `TopLevel` roster scope).
+    #[default]
     Primary,
     /// A long-lived child an agent owns/manages; stable, low churn; always in the tree.
     ManagedChild,
@@ -120,27 +121,16 @@ pub enum SessionRole {
     EphemeralSubagent,
 }
 
-impl Default for SessionRole {
-    fn default() -> Self {
-        Self::Primary
-    }
-}
-
 /// The lifetime an agent declares when delegating a child: a long-lived managed child vs a transient
 /// subagent. The source of truth for the [`SessionRole`] child distinction, recorded at the
 /// delegation seam (today every child is created identically, with no managed-vs-ephemeral marker).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ChildLifetime {
     /// A long-lived child the parent manages (becomes [`SessionRole::ManagedChild`]).
+    #[default]
     Persistent,
     /// A transient subagent spun up for a bounded task (becomes [`SessionRole::EphemeralSubagent`]).
     Ephemeral,
-}
-
-impl Default for ChildLifetime {
-    fn default() -> Self {
-        Self::Persistent
-    }
 }
 
 impl ChildLifetime {
@@ -502,7 +492,12 @@ fn snippet_around(body: &str, needle: &str) -> String {
         return body.chars().take(64).collect();
     };
     const PAD: usize = 24;
-    let start = body[..pos].char_indices().rev().nth(PAD).map(|(i, _)| i).unwrap_or(0);
+    let start = body[..pos]
+        .char_indices()
+        .rev()
+        .nth(PAD)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
     let match_end = pos + needle.len();
     let tail_len = body[match_end..]
         .char_indices()
@@ -798,7 +793,11 @@ pub trait SessionStore: Send + Sync {
     /// when a session's profile binding is first established and whenever its overlay changes. The
     /// resolver reads it back at engine construction so a live override survives restart. Default:
     /// no-op (a non-authoritative proxy store).
-    async fn set_session_meta(&self, _id: &SessionId, _meta: SessionMeta) -> Result<(), StoreError> {
+    async fn set_session_meta(
+        &self,
+        _id: &SessionId,
+        _meta: SessionMeta,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -915,7 +914,10 @@ pub trait SessionStore: Send + Sync {
 
     /// Upsert a suggestion (keyed by [`StoredCronSuggestion::id`]; `dedup_key` is unique). Default:
     /// no-op.
-    async fn cron_suggestion_set(&self, _suggestion: StoredCronSuggestion) -> Result<(), StoreError> {
+    async fn cron_suggestion_set(
+        &self,
+        _suggestion: StoredCronSuggestion,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -1304,7 +1306,11 @@ impl SessionStore for InMemoryStore {
         let mut inner = self.inner.lock().unwrap();
         // The reverse index drives the tree projection (audit), but we deliberately do *not* write a
         // `delegations` entry: `mark_completed` finds no job, so the child self-closes (no wake).
-        inner.child_index.entry(parent).or_default().push(child.clone());
+        inner
+            .child_index
+            .entry(parent)
+            .or_default()
+            .push(child.clone());
         inner.background_edges.insert(child, work_label);
         Ok(())
     }
@@ -1383,7 +1389,11 @@ impl SessionStore for InMemoryStore {
             session_id: session.clone(),
             epoch,
             job_id: job_id.clone(),
-            payload: if allow { b"allow".to_vec() } else { b"deny".to_vec() },
+            payload: if allow {
+                b"allow".to_vec()
+            } else {
+                b"deny".to_vec()
+            },
         };
         // Completion durable + session Ready, then publish the wake (one transaction).
         if Self::apply_completion_locked(&mut inner, &completion) {
@@ -1409,7 +1419,7 @@ impl SessionStore for InMemoryStore {
             None => inner
                 .pending_approvals
                 .values()
-                .flat_map(|rows| unanswered(rows))
+                .flat_map(unanswered)
                 .collect(),
         }
     }
@@ -1518,7 +1528,13 @@ impl SessionStore for InMemoryStore {
     }
 
     async fn routing_list(&self) -> Vec<ChatRoute> {
-        self.inner.lock().unwrap().chat_routes.values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .chat_routes
+            .values()
+            .cloned()
+            .collect()
     }
 
     async fn routing_get(&self, key: &str) -> Option<ChatRoute> {
@@ -1540,7 +1556,13 @@ impl SessionStore for InMemoryStore {
     }
 
     async fn acp_list(&self) -> Vec<AcpEntry> {
-        self.inner.lock().unwrap().acp_catalog.values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .acp_catalog
+            .values()
+            .cloned()
+            .collect()
     }
 
     async fn acp_set(&self, entry: AcpEntry) -> Result<(), StoreError> {
@@ -1558,7 +1580,13 @@ impl SessionStore for InMemoryStore {
     }
 
     async fn cron_list(&self) -> Vec<StoredCronJob> {
-        self.inner.lock().unwrap().cron_jobs.values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .cron_jobs
+            .values()
+            .cloned()
+            .collect()
     }
 
     async fn cron_get(&self, id: &str) -> Option<StoredCronJob> {
@@ -1592,7 +1620,11 @@ impl SessionStore for InMemoryStore {
             .cloned()
             .collect();
         // Earliest-due first, mirroring the SqliteStore `ORDER BY next_fire_unix`.
-        due.sort_by(|a, b| a.next_fire_unix.cmp(&b.next_fire_unix).then(a.id.cmp(&b.id)));
+        due.sort_by(|a, b| {
+            a.next_fire_unix
+                .cmp(&b.next_fire_unix)
+                .then(a.id.cmp(&b.id))
+        });
         due
     }
 
@@ -1632,7 +1664,10 @@ impl SessionStore for InMemoryStore {
         self.inner.lock().unwrap().cron_suggestions.get(id).cloned()
     }
 
-    async fn cron_suggestion_set(&self, suggestion: StoredCronSuggestion) -> Result<(), StoreError> {
+    async fn cron_suggestion_set(
+        &self,
+        suggestion: StoredCronSuggestion,
+    ) -> Result<(), StoreError> {
         self.inner
             .lock()
             .unwrap()
@@ -2088,9 +2123,19 @@ mod session_meta_tests {
         assert_eq!(store.cron_list().await.len(), 3);
 
         // cron_due: only enabled jobs with next_fire <= now.
-        let due: Vec<String> = store.cron_due(200).await.into_iter().map(|j| j.id).collect();
+        let due: Vec<String> = store
+            .cron_due(200)
+            .await
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
         assert_eq!(due, vec!["j1".to_string()]); // j2 is future, j3 is paused
-        let due_all: Vec<String> = store.cron_due(1000).await.into_iter().map(|j| j.id).collect();
+        let due_all: Vec<String> = store
+            .cron_due(1000)
+            .await
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
         assert_eq!(due_all, vec!["j1".to_string(), "j2".to_string()]);
 
         // Runs append + bounded retrieval (newest first).
@@ -2132,7 +2177,10 @@ mod session_meta_tests {
             .await
             .unwrap();
         assert_eq!(store.cron_suggestions_list().await.len(), 1);
-        assert_eq!(store.cron_suggestion_get("s1").await.unwrap().title, "Daily");
+        assert_eq!(
+            store.cron_suggestion_get("s1").await.unwrap().title,
+            "Daily"
+        );
         store.cron_suggestion_remove("s1").await.unwrap();
         assert!(store.cron_suggestions_list().await.is_empty());
     }

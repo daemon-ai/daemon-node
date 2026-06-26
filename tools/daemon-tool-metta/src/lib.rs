@@ -176,9 +176,21 @@ fn space_or_default(name: Option<String>) -> Result<Space, String> {
 /// Build [`Bounds`] from the loose per-op fields, filling any `0` (omitted) field from `defaults`.
 fn bounds(max_steps: u64, timeout_ms: u64, max_results: u64, defaults: Bounds) -> Bounds {
     Bounds {
-        max_steps: if max_steps == 0 { defaults.max_steps } else { max_steps },
-        timeout_ms: if timeout_ms == 0 { defaults.timeout_ms } else { timeout_ms },
-        max_results: if max_results == 0 { defaults.max_results } else { max_results },
+        max_steps: if max_steps == 0 {
+            defaults.max_steps
+        } else {
+            max_steps
+        },
+        timeout_ms: if timeout_ms == 0 {
+            defaults.timeout_ms
+        } else {
+            timeout_ms
+        },
+        max_results: if max_results == 0 {
+            defaults.max_results
+        } else {
+            max_results
+        },
     }
 }
 
@@ -250,9 +262,7 @@ impl MettaArgs {
                 let target = match (ids.is_empty(), pattern) {
                     (false, _) => RetractTarget::Ids(ids),
                     (true, Some(p)) => RetractTarget::Pattern(p),
-                    (true, None) => {
-                        return Err("retract needs either `ids` or `pattern`".into())
-                    }
+                    (true, None) => return Err("retract needs either `ids` or `pattern`".into()),
                 };
                 MettaCommand::Retract {
                     request_id: 0,
@@ -513,13 +523,19 @@ mod tests {
     fn parses_each_op_into_a_command() {
         let cases = [
             (r#"{"op":"inspect"}"#, "Inspect"),
-            (r#"{"op":"match","pattern":"(p $x)","space":"semantic"}"#, "Match"),
+            (
+                r#"{"op":"match","pattern":"(p $x)","space":"semantic"}"#,
+                "Match",
+            ),
             (r#"{"op":"eval","expression":"(+ 1 2)"}"#, "Eval"),
             (
                 r#"{"op":"assert","atoms":["(p a)"],"space":"semantic","idempotency_key":"k"}"#,
                 "Assert",
             ),
-            (r#"{"op":"retract","ids":["rec-1"],"space":"semantic"}"#, "Retract"),
+            (
+                r#"{"op":"retract","ids":["rec-1"],"space":"semantic"}"#,
+                "Retract",
+            ),
             (r#"{"op":"define","program":"(= (f) 1)"}"#, "Define"),
             (r#"{"op":"test","program_or_id":"proc-1"}"#, "Test"),
             (r#"{"op":"explain","target":"rec-1"}"#, "Explain"),
@@ -537,15 +553,21 @@ mod tests {
 
     #[test]
     fn retract_requires_ids_or_pattern() {
-        let args: MettaArgs = serde_json::from_str(r#"{"op":"retract","space":"semantic"}"#).unwrap();
+        let args: MettaArgs =
+            serde_json::from_str(r#"{"op":"retract","space":"semantic"}"#).unwrap();
         assert!(args.into_command(Bounds::default()).is_err());
     }
 
     #[test]
     fn draft_request_is_grammar_constrained() {
         let req = draft_metta_request("system", "draft a rule for doubling");
-        let c = req.constraint.expect("draft request must carry a grammar constraint");
-        assert!(c.lark.is_some() && c.gbnf.is_some(), "both dialects present");
+        let c = req
+            .constraint
+            .expect("draft request must carry a grammar constraint");
+        assert!(
+            c.lark.is_some() && c.gbnf.is_some(),
+            "both dialects present"
+        );
         assert_eq!(req.messages.len(), 1);
     }
 

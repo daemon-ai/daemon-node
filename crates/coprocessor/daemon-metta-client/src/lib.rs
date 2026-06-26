@@ -132,7 +132,9 @@ impl MettaCoprocessor {
         worker.next_request_id += 1;
         cmd.set_request_id(request_id);
 
-        let result = worker.round_trip(&cmd, request_id, self.inner.cfg.op_timeout).await;
+        let result = worker
+            .round_trip(&cmd, request_id, self.inner.cfg.op_timeout)
+            .await;
 
         if let Err(ref failure) = result {
             if failure.should_replace_worker() {

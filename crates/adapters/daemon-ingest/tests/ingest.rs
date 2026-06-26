@@ -146,7 +146,9 @@ async fn busy_ambient_still_observes() {
     let session = session_id_for(&origin("#a"), IsolationPolicy::PerThread);
 
     ing.note_turn_started(&session);
-    ing.receive(ambient("#a", "mid-turn chatter")).await.unwrap();
+    ing.receive(ambient("#a", "mid-turn chatter"))
+        .await
+        .unwrap();
 
     let cmds = api.commands.lock().unwrap();
     assert_eq!(cmds.len(), 1, "ambient surfaces as Observe even while busy");
@@ -167,7 +169,10 @@ async fn ambient_fold_prepends_into_next_start_turn() {
     // Two ambient messages buffer silently in Fold mode (no submit).
     ing.receive(ambient("#a", "ctx-1")).await.unwrap();
     ing.receive(ambient("#a", "ctx-2")).await.unwrap();
-    assert!(api.commands.lock().unwrap().is_empty(), "fold buffers, no submit");
+    assert!(
+        api.commands.lock().unwrap().is_empty(),
+        "fold buffers, no submit"
+    );
 
     // The next addressed message opens a turn carrying the folded context, oldest first.
     ing.receive(addressed("#a", "do it")).await.unwrap();
@@ -194,7 +199,11 @@ async fn busy_queue_holds_then_flushes_on_finish() {
     // Two more addressed messages arrive mid-turn: queued, nothing submitted yet.
     ing.receive(addressed("#a", "second")).await.unwrap();
     ing.receive(addressed("#a", "third")).await.unwrap();
-    assert_eq!(api.commands.lock().unwrap().len(), 1, "only the first StartTurn so far");
+    assert_eq!(
+        api.commands.lock().unwrap().len(),
+        1,
+        "only the first StartTurn so far"
+    );
 
     // Turn finishes: the queued messages flush as a single follow-up StartTurn.
     ing.note_turn_finished(&session).await.unwrap();
@@ -260,7 +269,9 @@ async fn busy_steer_injects_steer() {
     let session = session_id_for(&origin("#a"), IsolationPolicy::PerThread);
 
     ing.note_turn_started(&session);
-    ing.receive(addressed("#a", "also consider X")).await.unwrap();
+    ing.receive(addressed("#a", "also consider X"))
+        .await
+        .unwrap();
 
     let cmds = api.commands.lock().unwrap();
     assert_eq!(cmds.len(), 1);

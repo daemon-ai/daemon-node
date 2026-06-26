@@ -87,8 +87,15 @@ async fn invalid_args_reported() {
 #[tokio::test]
 async fn navigate_rejects_unsafe_url() {
     let tool = unlaunchable_tool();
-    let outcome = run_tool(&tool, r#"{"op":"navigate","url":"http://localhost:9000/x"}"#).await;
-    assert!(!outcome.result.ok, "loopback host must be rejected pre-launch");
+    let outcome = run_tool(
+        &tool,
+        r#"{"op":"navigate","url":"http://localhost:9000/x"}"#,
+    )
+    .await;
+    assert!(
+        !outcome.result.ok,
+        "loopback host must be rejected pre-launch"
+    );
     assert!(!outcome.result.content.contains("navigated"));
 }
 

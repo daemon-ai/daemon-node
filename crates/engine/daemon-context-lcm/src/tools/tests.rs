@@ -107,7 +107,12 @@ async fn call_with(fx: &Fixture, config: &LcmConfig, name: &str, args: Value) ->
 #[tokio::test]
 async fn grep_returns_message_and_summary_hits_for_current_session() {
     let fx = Fixture::new("");
-    let out = call(&fx, "lcm_grep", json!({"query": "blue green", "sort": "recency"})).await;
+    let out = call(
+        &fx,
+        "lcm_grep",
+        json!({"query": "blue green", "sort": "recency"}),
+    )
+    .await;
     assert_eq!(out["session_scope"], "current");
     let results = out["results"].as_array().unwrap();
     assert!(results.iter().any(|r| r["type"] == "message"));
@@ -148,7 +153,12 @@ async fn grep_all_scope_is_raw_only_across_sessions() {
 #[tokio::test]
 async fn grep_requires_session_id_for_session_scope() {
     let fx = Fixture::new("");
-    let out = call(&fx, "lcm_grep", json!({"query": "x", "session_scope": "session"})).await;
+    let out = call(
+        &fx,
+        "lcm_grep",
+        json!({"query": "x", "session_scope": "session"}),
+    )
+    .await;
     assert_eq!(out["status"], "error");
 }
 
@@ -175,7 +185,10 @@ async fn load_session_pages_with_cursor_and_char_truncation() {
     )
     .await;
     assert_eq!(page2["has_more"], false);
-    assert_eq!(page2["messages"].as_array().unwrap()[0]["role"], "assistant");
+    assert_eq!(
+        page2["messages"].as_array().unwrap()[0]["role"],
+        "assistant"
+    );
 }
 
 #[tokio::test]
@@ -207,12 +220,7 @@ async fn expand_store_id_recovers_exact_content_cross_session() {
 async fn expand_node_pages_sources_within_token_budget() {
     let fx = Fixture::new("");
     // A tiny budget forces single-source truncation + pagination.
-    let out = call(
-        &fx,
-        "lcm_expand",
-        json!({"node_id": 1, "max_tokens": 2}),
-    )
-    .await;
+    let out = call(&fx, "lcm_expand", json!({"node_id": 1, "max_tokens": 2})).await;
     assert_eq!(out["type"], "node_expansion");
     assert_eq!(out["pagination"]["total_sources"], 2);
     assert_eq!(out["pagination"]["has_more"], true);
@@ -248,11 +256,18 @@ async fn doctor_is_healthy_on_a_consistent_store() {
     let out = call(&fx, "lcm_doctor", json!({})).await;
     assert_eq!(out["overall"], "healthy");
     let checks = out["checks"].as_array().unwrap();
-    assert!(checks.iter().any(|c| c["check"] == "database_integrity" && c["status"] == "ok"));
-    assert!(checks.iter().any(|c| c["check"] == "messages_fts_integrity" && c["status"] == "ok"));
+    assert!(checks
+        .iter()
+        .any(|c| c["check"] == "database_integrity" && c["status"] == "ok"));
+    assert!(checks
+        .iter()
+        .any(|c| c["check"] == "messages_fts_integrity" && c["status"] == "ok"));
     // The full ported catalog: 13 always-on checks plus `context_pressure` (emitted because the
     // fixture's `ToolCx` carries a `context_length`). No check is `skipped` anymore.
-    let names: Vec<&str> = checks.iter().map(|c| c["check"].as_str().unwrap()).collect();
+    let names: Vec<&str> = checks
+        .iter()
+        .map(|c| c["check"].as_str().unwrap())
+        .collect();
     for expected in [
         "database_integrity",
         "schema_core_tables",
@@ -268,9 +283,15 @@ async fn doctor_is_healthy_on_a_consistent_store() {
         "lifecycle_fragmentation",
         "context_pressure",
     ] {
-        assert!(names.contains(&expected), "doctor is missing the {expected} check");
+        assert!(
+            names.contains(&expected),
+            "doctor is missing the {expected} check"
+        );
     }
-    assert!(out.get("skipped").is_none(), "no checks are skipped anymore");
+    assert!(
+        out.get("skipped").is_none(),
+        "no checks are skipped anymore"
+    );
     // Every check on a clean, low-pressure store passes.
     assert!(
         checks.iter().all(|c| c["status"] == "ok"),
@@ -307,7 +328,10 @@ async fn doctor_ported_checks_carry_structured_detail() {
     let src = find("source_lineage_hygiene");
     assert_eq!(src["status"], "ok");
     assert_eq!(src["detail"]["messages_total"], 3);
-    assert_eq!(src["detail"]["normalization_mode"], "backcompat-normalization");
+    assert_eq!(
+        src["detail"]["normalization_mode"],
+        "backcompat-normalization"
+    );
 
     // lifecycle_fragmentation is read-only and, with no lifecycle rows bound, not fragmented.
     let frag = find("lifecycle_fragmentation");
@@ -328,11 +352,18 @@ async fn doctor_config_validation_warns_on_out_of_range_settings() {
     };
     let out = call_with(&fx, &config, "lcm_doctor", json!({})).await;
     let checks = out["checks"].as_array().unwrap();
-    let cfg = checks.iter().find(|c| c["check"] == "config_validation").unwrap();
+    let cfg = checks
+        .iter()
+        .find(|c| c["check"] == "config_validation")
+        .unwrap();
     assert_eq!(cfg["status"], "warn");
     let warnings = cfg["detail"].as_array().unwrap();
-    assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("fresh_tail_count")));
-    assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("incremental_max_depth")));
+    assert!(warnings
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("fresh_tail_count")));
+    assert!(warnings
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("incremental_max_depth")));
     assert_eq!(out["overall"], "warnings");
 }
 
@@ -360,17 +391,41 @@ async fn expand_and_describe_externalized_ref_round_trip() {
     )
     .unwrap();
 
-    let expanded = call_with(&fx, &config, "lcm_expand", json!({"externalized_ref": reference})).await;
+    let expanded = call_with(
+        &fx,
+        &config,
+        "lcm_expand",
+        json!({"externalized_ref": reference}),
+    )
+    .await;
     assert_eq!(expanded["type"], "externalized_payload");
-    assert!(expanded["content"].as_str().unwrap().contains("RECOVERED-PAYLOAD-"));
+    assert!(expanded["content"]
+        .as_str()
+        .unwrap()
+        .contains("RECOVERED-PAYLOAD-"));
 
-    let described = call_with(&fx, &config, "lcm_describe", json!({"externalized_ref": reference})).await;
+    let described = call_with(
+        &fx,
+        &config,
+        "lcm_describe",
+        json!({"externalized_ref": reference}),
+    )
+    .await;
     assert_eq!(described["type"], "externalized_payload");
     assert_eq!(described["kind"], "tool_output");
     assert_eq!(described["tool_call_id"], "c1");
-    assert!(described.get("content").is_none(), "describe is metadata-only");
+    assert!(
+        described.get("content").is_none(),
+        "describe is metadata-only"
+    );
 
-    let missing = call_with(&fx, &config, "lcm_expand", json!({"externalized_ref": "nope.json"})).await;
+    let missing = call_with(
+        &fx,
+        &config,
+        "lcm_expand",
+        json!({"externalized_ref": "nope.json"}),
+    )
+    .await;
     assert_eq!(missing["status"], "error");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -386,13 +441,22 @@ async fn doctor_reports_payload_and_sensitive_checks() {
     };
     let out = call_with(&fx, &config, "lcm_doctor", json!({})).await;
     let checks = out["checks"].as_array().unwrap();
-    let storage = checks.iter().find(|c| c["check"] == "payload_storage").unwrap();
+    let storage = checks
+        .iter()
+        .find(|c| c["check"] == "payload_storage")
+        .unwrap();
     assert_eq!(storage["status"], "ok", "ephemeral payload storage is ok");
-    let sens = checks.iter().find(|c| c["check"] == "sensitive_pattern_handling").unwrap();
+    let sens = checks
+        .iter()
+        .find(|c| c["check"] == "sensitive_pattern_handling")
+        .unwrap();
     assert_eq!(sens["status"], "warn", "unknown pattern name warns");
     assert_eq!(out["overall"], "warnings");
     // The full catalog ships — there is no longer a `skipped` list of unported checks.
-    assert!(out.get("skipped").is_none(), "no checks are skipped anymore");
+    assert!(
+        out.get("skipped").is_none(),
+        "no checks are skipped anymore"
+    );
 }
 
 #[tokio::test]

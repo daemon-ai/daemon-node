@@ -192,7 +192,10 @@ async fn durable_state_survives_respawn() {
             })
             .await;
         assert!(
-            explained.results.iter().any(|l| l.contains("active=Some(1)")),
+            explained
+                .results
+                .iter()
+                .any(|l| l.contains("active=Some(1)")),
             "promoted procedure version survived respawn: {:?}",
             explained.results
         );

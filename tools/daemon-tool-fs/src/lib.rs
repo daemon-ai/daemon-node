@@ -69,7 +69,12 @@ impl FsTool {
     /// The §12 edit-approval gate for a file-mutating op. `Ok(())` proceeds; `Err(outcome)` is the
     /// early-return result — a policy/operator rejection, or a durable-HITL defer that suspends the
     /// turn (carrying an [`Effect::AwaitDecision`] so the engine re-runs this call on approval).
-    async fn gate(call: &ToolCall, cx: &TurnCx<'_>, path: &str, prompt: String) -> Result<(), ToolOutcome> {
+    async fn gate(
+        call: &ToolCall,
+        cx: &TurnCx<'_>,
+        path: &str,
+        prompt: String,
+    ) -> Result<(), ToolOutcome> {
         match approve_path(cx, path, prompt.clone()).await {
             Gate::Proceed => Ok(()),
             Gate::Reject(reason) => Err(ToolOutcome::text(
@@ -180,8 +185,9 @@ impl Tool for FsTool {
                     );
                 }
                 let edited = original.replacen(&find, &replace, 1);
-                let prompt =
-                    format!("approve edit to {path}: replace {find:?} with {replace:?} (1 occurrence)");
+                let prompt = format!(
+                    "approve edit to {path}: replace {find:?} with {replace:?} (1 occurrence)"
+                );
                 if let Err(out) = Self::gate(call, cx, &path, prompt).await {
                     return out;
                 }

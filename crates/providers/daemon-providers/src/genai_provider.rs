@@ -11,8 +11,8 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamEvent, ContentPart,
-    MessageContent, StreamEnd, Tool, ToolCall as GenToolCall, ToolResponse,
+    CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamEvent,
+    ContentPart, MessageContent, StreamEnd, Tool, ToolCall as GenToolCall, ToolResponse,
 };
 use genai::embed::{EmbedOptions, EmbedRequest};
 use genai::resolver::{AuthData, Endpoint};
@@ -435,7 +435,10 @@ fn usage_from(usage: &genai::chat::Usage, pricing: Option<&Pricing>) -> UsageDel
         .and_then(|d| d.cache_creation_tokens)
         .unwrap_or(0)
         .max(0) as u64;
-    let reasoning = completion.and_then(|d| d.reasoning_tokens).unwrap_or(0).max(0) as u64;
+    let reasoning = completion
+        .and_then(|d| d.reasoning_tokens)
+        .unwrap_or(0)
+        .max(0) as u64;
     let mut delta = UsageDelta {
         input_tokens: usage.prompt_tokens.unwrap_or(0).max(0) as u64,
         output_tokens: usage.completion_tokens.unwrap_or(0).max(0) as u64,
@@ -634,7 +637,10 @@ mod tests {
     #[test]
     fn for_model_sources_the_models_output_cap_not_the_flat_fallback() {
         // A large-output model gets its real cap, not the conservative fallback.
-        assert_eq!(GenAiProvider::for_model("claude-sonnet-4").max_tokens, 64_000);
+        assert_eq!(
+            GenAiProvider::for_model("claude-sonnet-4").max_tokens,
+            64_000
+        );
         assert_eq!(GenAiProvider::for_model("o3").max_tokens, 100_000);
         // An unknown model falls back to the shared conservative default.
         assert_eq!(

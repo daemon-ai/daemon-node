@@ -126,7 +126,11 @@ impl TransportAdapter for MatrixAdapter {
             .bound_accounts(FAMILY)
             .into_iter()
             .map(|acct| {
-                let connection = if self.provisioning.account_credential(&acct.credential_ref).is_some() {
+                let connection = if self
+                    .provisioning
+                    .account_credential(&acct.credential_ref)
+                    .is_some()
+                {
                     ConnectionState::Connected
                 } else {
                     ConnectionState::Offline
@@ -235,7 +239,11 @@ impl SupportsConversations for MatrixAdapter {
 
         request.is_direct = matches!(v.get("kind").map(String::as_str), Some("dm") | Some("Dm"));
         let public = matches!(v.get("visibility").map(String::as_str), Some("public"));
-        request.visibility = if public { Visibility::Public } else { Visibility::Private };
+        request.visibility = if public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
         request.preset = Some(if public {
             create_room::v3::RoomPreset::PublicChat
         } else {
@@ -484,7 +492,11 @@ mod tests {
         fn account_credential(&self, _credential_ref: &str) -> Option<String> {
             None
         }
-        fn store_account_credential(&self, _credential_ref: &str, _blob: &str) -> Result<(), ApiError> {
+        fn store_account_credential(
+            &self,
+            _credential_ref: &str,
+            _blob: &str,
+        ) -> Result<(), ApiError> {
             Ok(())
         }
     }
@@ -512,7 +524,10 @@ mod tests {
         assert!(mem.invite && mem.remove && mem.ban && mem.set_role);
         let contacts = SupportsContacts::supported(&*adapter);
         assert!(contacts.get_profile && !contacts.action_menu && !contacts.set_alias);
-        assert!(SupportsDirectory::supported(&*adapter), "directory search is on");
+        assert!(
+            SupportsDirectory::supported(&*adapter),
+            "directory search is on"
+        );
     }
 
     #[tokio::test]
@@ -524,12 +539,14 @@ mod tests {
         let transport = TransportId::new("matrix/@bot:localhost");
         let adapter = adapter_with(&transport, client).await;
 
-        let contacts = SupportsDirectory::search_contacts(&*adapter, transport, Some("test".into()))
-            .await
-            .expect("directory search succeeds against the mock");
+        let contacts =
+            SupportsDirectory::search_contacts(&*adapter, transport, Some("test".into()))
+                .await
+                .expect("directory search succeeds against the mock");
         assert!(
-            contacts.iter().any(|c| c.id == "@test:example.me"
-                && c.display_name.as_deref() == Some("Test")),
+            contacts
+                .iter()
+                .any(|c| c.id == "@test:example.me" && c.display_name.as_deref() == Some("Test")),
             "expected the mapped directory hit, got {contacts:?}"
         );
     }
@@ -566,7 +583,10 @@ mod tests {
         .await
         .expect("get_profile succeeds against the mock");
         assert!(profile.contains("display_name: Alice"), "got: {profile}");
-        assert!(profile.contains("avatar_url: mxc://localhost/avatar"), "got: {profile}");
+        assert!(
+            profile.contains("avatar_url: mxc://localhost/avatar"),
+            "got: {profile}"
+        );
     }
 
     #[tokio::test]

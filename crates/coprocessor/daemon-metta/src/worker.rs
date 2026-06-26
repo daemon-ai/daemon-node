@@ -52,8 +52,9 @@ impl Worker {
                 // hydrates the ids via `match` (SKILL §Separate the semantic index from memory).
                 let mut resp = OpResponse::ok(request_id, Vec::new());
                 resp.snapshot = self.state.snapshot();
-                resp.warnings
-                    .push("semantic_candidates is served by the host embedding/memory provider".into());
+                resp.warnings.push(
+                    "semantic_candidates is served by the host embedding/memory provider".into(),
+                );
                 Some(Event::Reply(resp))
             }
             Command::Match {
@@ -181,7 +182,10 @@ impl Worker {
     ) -> Event {
         let records: Vec<&_> = self.state.records_in(space).collect();
         let start = Instant::now();
-        match self.engine.eval(expression, &records, bounds, allow_grounded) {
+        match self
+            .engine
+            .eval(expression, &records, bounds, allow_grounded)
+        {
             Ok(r) => {
                 let mut resp = OpResponse::ok(request_id, r.results);
                 resp.truncated = r.truncated;
@@ -205,10 +209,13 @@ impl Worker {
         idempotency_key: Option<&str>,
         expected_snapshot: Option<u64>,
     ) -> Event {
-        match self
-            .state
-            .assert_atoms(atoms, space, &provenance, idempotency_key, expected_snapshot)
-        {
+        match self.state.assert_atoms(
+            atoms,
+            space,
+            &provenance,
+            idempotency_key,
+            expected_snapshot,
+        ) {
             Ok((ids, replayed)) => {
                 let mut resp = OpResponse::ok(request_id, ids.clone());
                 resp.committed_ids = ids;
@@ -270,7 +277,8 @@ impl Worker {
             return Event::Error {
                 request_id: Some(request_id),
                 class: ErrorClass::BadRequest,
-                message: "define may only write status=candidate (promotion is a separate op)".into(),
+                message: "define may only write status=candidate (promotion is a separate op)"
+                    .into(),
             };
         }
         // An explicit id may be supplied in metadata `{"id": "..."}`; else generate one.
@@ -280,7 +288,8 @@ impl Worker {
             .unwrap_or_else(|| format!("proc-{:06}", self.state.snapshot()));
         match self.state.define_procedure(&id, program, metadata, tests) {
             Ok(version) => {
-                let mut resp = OpResponse::ok(request_id, vec![format!("{id} v{version} (candidate)")]);
+                let mut resp =
+                    OpResponse::ok(request_id, vec![format!("{id} v{version} (candidate)")]);
                 resp.committed_ids = vec![id];
                 resp.snapshot = self.state.snapshot();
                 Event::Reply(resp)
@@ -360,10 +369,16 @@ impl Worker {
                 results.push(format!("source: {src}"));
             }
             if !record.provenance.derived_from.is_empty() {
-                results.push(format!("derived-from: {}", record.provenance.derived_from.join(", ")));
+                results.push(format!(
+                    "derived-from: {}",
+                    record.provenance.derived_from.join(", ")
+                ));
             }
         } else if let Some(proc) = self.state.procedure(target) {
-            results.push(format!("procedure {}: active={:?}", proc.id, proc.active_version));
+            results.push(format!(
+                "procedure {}: active={:?}",
+                proc.id, proc.active_version
+            ));
             for v in &proc.versions {
                 results.push(format!("v{} [{:?}]: {}", v.version, v.status, v.program));
             }
@@ -389,8 +404,10 @@ impl Worker {
     ) -> Event {
         match self.state.promote(candidate_id, evidence, expected_version) {
             Ok(version) => {
-                let mut resp =
-                    OpResponse::ok(request_id, vec![format!("{candidate_id} v{version} active")]);
+                let mut resp = OpResponse::ok(
+                    request_id,
+                    vec![format!("{candidate_id} v{version} active")],
+                );
                 resp.committed_ids = vec![candidate_id.to_string()];
                 resp.snapshot = self.state.snapshot();
                 Event::Reply(resp)
@@ -399,12 +416,19 @@ impl Worker {
         }
     }
 
-    fn rollback(&mut self, request_id: u64, procedure_id: &str, target_version: Option<u64>) -> Event {
+    fn rollback(
+        &mut self,
+        request_id: u64,
+        procedure_id: &str,
+        target_version: Option<u64>,
+    ) -> Event {
         match self.state.rollback(procedure_id, target_version) {
             Ok((restored, retired)) => {
                 let mut resp = OpResponse::ok(
                     request_id,
-                    vec![format!("{procedure_id}: restored v{restored}, retired v{retired}")],
+                    vec![format!(
+                        "{procedure_id}: restored v{restored}, retired v{retired}"
+                    )],
                 );
                 resp.committed_ids = vec![procedure_id.to_string()];
                 resp.snapshot = self.state.snapshot();

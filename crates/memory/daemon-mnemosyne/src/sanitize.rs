@@ -222,13 +222,15 @@ mod tests {
     fn data_uri_is_extracted() {
         with_temp_blob_dir(|| {
             // "hello world" base64 -> aGVsbG8gd29ybGQ=
-            let (content, meta) =
-                sanitize_content("data:text/plain;base64,aGVsbG8gd29ybGQ=");
+            let (content, meta) = sanitize_content("data:text/plain;base64,aGVsbG8gd29ybGQ=");
             assert!(content.starts_with("[Binary content extracted: text/plain, 11 bytes"));
             assert_eq!(meta["extraction_reason"], "data_uri");
             assert_eq!(meta["mime"], "text/plain");
             assert_eq!(meta["original_size"], 11);
-            assert!(meta["blob_ref"].as_str().unwrap().starts_with("blob://sha256/"));
+            assert!(meta["blob_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("blob://sha256/"));
         });
     }
 
@@ -264,7 +266,10 @@ mod tests {
                 s.push(alphabet[i % alphabet.len()]);
             }
             let (content, meta) = sanitize_content(&s);
-            assert!(content.starts_with("[Encoded content extracted:"), "got: {content}");
+            assert!(
+                content.starts_with("[Encoded content extracted:"),
+                "got: {content}"
+            );
             assert_eq!(meta["extraction_reason"], "high_entropy");
             assert!(meta["entropy"].as_f64().unwrap() > ENTROPY_THRESHOLD);
         });

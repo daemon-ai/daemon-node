@@ -23,7 +23,6 @@ use daemon_api::{
     ManageEventView, MemoryProviderSel, OverlapPolicy, ProfileSpec, SessionOverlay, SubagentPhase,
     TreeEvent, WorkspaceBinding,
 };
-use daemon_schedule::Schedule;
 use daemon_common::{Budget, JournalStreamId, PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{
     ApprovalPolicy, Config, ContextEngine, ContextEngineBuilder, CredentialBuilder, EngineProfile,
@@ -41,6 +40,7 @@ use daemon_host::{
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
+use daemon_schedule::Schedule;
 use daemon_supervision::{DelegationSpec, ManageRequestHandler, ManagedUnit};
 use daemon_telemetry::TraceSigner;
 
@@ -304,7 +304,10 @@ fn constrained_registry(
 /// inherits the node's provider + credentials, but starts from a clean base (no memory/context/index
 /// — the reviewer drives its tools directly). A kind is registered only when its tools are present;
 /// the returned registry may be empty (spawn is then a no-op).
-fn background_registry(a: &NodeAssembly, skill_tools: &[Arc<dyn Tool>]) -> BackgroundProfileRegistry {
+fn background_registry(
+    a: &NodeAssembly,
+    skill_tools: &[Arc<dyn Tool>],
+) -> BackgroundProfileRegistry {
     let mut registry = BackgroundProfileRegistry::new();
     let bg_config = Config {
         max_iterations: BACKGROUND_MAX_ITERATIONS,
@@ -320,7 +323,11 @@ fn background_registry(a: &NodeAssembly, skill_tools: &[Arc<dyn Tool>]) -> Backg
     // memory review child still draws the `mnemosyne_*` tools from `extra_tools`.
     let skill_pool: Vec<Arc<dyn Tool>> = skill_tools.to_vec();
     // A clean base carrying only the node's provider (orchestrator selection) + brokered credentials.
-    let base = |pool: &[Arc<dyn Tool>], names: &[&str], prefix: Option<&str>, persona: &str| -> EngineProfile {
+    let base = |pool: &[Arc<dyn Tool>],
+                names: &[&str],
+                prefix: Option<&str>,
+                persona: &str|
+     -> EngineProfile {
         let profile = EngineProfile::new(
             provider_for(&a.providers, ORCHESTRATOR_PROFILE),
             Arc::new(constrained_registry(pool, names, prefix)),
@@ -345,15 +352,19 @@ fn background_registry(a: &NodeAssembly, skill_tools: &[Arc<dyn Tool>]) -> Backg
             ),
         );
     }
-    if a
-        .extra_tools
+    if a.extra_tools
         .iter()
         .any(|t| tool_matches(t, &[], Some(MEMORY_TOOL_PREFIX)))
     {
         registry = registry.with(
             "memory_review",
             BackgroundProfile::new(
-                base(&a.extra_tools, &[], Some(MEMORY_TOOL_PREFIX), "memory curator"),
+                base(
+                    &a.extra_tools,
+                    &[],
+                    Some(MEMORY_TOOL_PREFIX),
+                    "memory curator",
+                ),
                 MEMORY_REVIEW_PROMPT,
             ),
         );
@@ -462,11 +473,12 @@ impl SessionFactoryCtx {
         if let Some(mode) = overlay.approval_mode {
             config.approval_policy = approval_mode_to_policy(mode);
         }
-        let mut profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new(persona))
-            .with_config(config)
-            // Scope the §10/§11 subsystem stores to the profile's own id (its on-disk key), so two
-            // rooms routed to two profiles get isolated context/memory banks under their own homes.
-            .with_profile_ref(ProfileRef::new(&spec.id));
+        let mut profile =
+            EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new(persona))
+                .with_config(config)
+                // Scope the §10/§11 subsystem stores to the profile's own id (its on-disk key), so two
+                // rooms routed to two profiles get isolated context/memory banks under their own homes.
+                .with_profile_ref(ProfileRef::new(&spec.id));
         if spec.budget.tokens.is_some() || spec.budget.wall_ms.is_some() {
             profile = profile.with_budget(Budget {
                 tokens: spec.budget.tokens,
@@ -512,8 +524,10 @@ impl SessionFactoryCtx {
             profile = profile.with_prompt_block(index);
         }
         if let Some(credentials) = &self.credentials {
-            profile =
-                profile.with_credentials(credentials.clone(), ProfileRef::new(spec.credential_profile()));
+            profile = profile.with_credentials(
+                credentials.clone(),
+                ProfileRef::new(spec.credential_profile()),
+            );
             // A configured fallback credential profile composes a failover chain on top of the
             // per-profile multi-key pool: the engine re-keys to it when the primary is exhausted.
             if let Some(fallback) = spec.fallback_credential_profile() {
@@ -591,7 +605,10 @@ fn core_tool_registry(extra: &[Arc<dyn Tool>]) -> ToolRegistry {
 /// Like [`core_tool_registry`] but additionally registers the launch agent's resolved `skill_*`
 /// tools. The role engines (fleet child, orchestrator, fixed session) run as the launch agent, so
 /// they carry that agent's per-profile skills rather than a node-global set.
-fn core_tool_registry_with_skills(extra: &[Arc<dyn Tool>], skills: &[Arc<dyn Tool>]) -> ToolRegistry {
+fn core_tool_registry_with_skills(
+    extra: &[Arc<dyn Tool>],
+    skills: &[Arc<dyn Tool>],
+) -> ToolRegistry {
     let mut registry = core_tool_registry(extra);
     for tool in skills {
         registry.register(tool.clone());
@@ -661,7 +678,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         dress(
             EngineProfile::new(
                 provider_for(&a.providers, CHILD_PROFILE),
-                Arc::new(core_tool_registry_with_skills(&a.extra_tools, &launch_skill_tools)),
+                Arc::new(core_tool_registry_with_skills(
+                    &a.extra_tools,
+                    &launch_skill_tools,
+                )),
                 SystemPrompt::new("fleet child"),
             ),
             &a,
@@ -711,14 +731,13 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     if let Some(skills) = &a.skills {
         let provider = skills.clone();
         let profile_id = a.profile.as_str().to_string();
-        let loader: CronSkillLoader = Arc::new(move |name: &str| {
-            provider.for_profile(&profile_id).view(name, None).ok()
-        });
+        let loader: CronSkillLoader =
+            Arc::new(move |name: &str| provider.for_profile(&profile_id).view(name, None).ok());
         cron_worker = cron_worker.with_skill_loader(loader);
     }
     let cron_worker = Arc::new(cron_worker);
-    let mut cron_ops_builder =
-        daemon_host::CronOps::new(a.store.clone()).with_firing(cron_worker.clone() as Arc<dyn CronFiring>);
+    let mut cron_ops_builder = daemon_host::CronOps::new(a.store.clone())
+        .with_firing(cron_worker.clone() as Arc<dyn CronFiring>);
     // The `metadata.daemon.blueprint` skill bridge: scan the launch profile's skills (cheaply, on
     // each suggestion seed) and offer any runnable blueprint as a consent-first cron suggestion.
     if let Some(skills) = &a.skills {
@@ -1063,6 +1082,9 @@ pub enum ForeignProtocol {
 /// How to construct a child brain. `Core` is the in-process reference engine; `Foreign` launches an
 /// external agent process. Both are presented up the tree as a `UnitKind::Engine` `ManagedUnit`, so
 /// the fleet/orchestrator (and the GUI above it) cannot tell them apart.
+// Built once per child at placement time, not stored in bulk - the variant size delta is irrelevant
+// here, and boxing would leak into this pub enum's construction/match sites for no real benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum AgentBackend {
     /// The in-process reference engine, built from a shared [`EngineProfile`].
     Core(EngineProfile),
@@ -1149,12 +1171,15 @@ impl ChildSpawner for ProfileChildSpawner {
                 let engine = profile.fresh(session.clone());
                 // Thread the durable seal/rollback handles into the managed engine so a rewind on it
                 // matches the live path (the §17⇄management seam fix); `None` store => engine-only.
-                let rewind = self.rewind_store.clone().map(|store| daemon_host::RewindHooks {
-                    store,
-                    checkpoints: self.rewind_checkpoints.clone(),
-                    journaled: feeder.is_some(),
-                    session,
-                });
+                let rewind = self
+                    .rewind_store
+                    .clone()
+                    .map(|store| daemon_host::RewindHooks {
+                        store,
+                        checkpoints: self.rewind_checkpoints.clone(),
+                        journaled: feeder.is_some(),
+                        session,
+                    });
                 Arc::new(EngineUnit::spawn_rewindable(id, engine, feeder, rewind))
             }
             AgentBackend::Foreign(launch) => {
@@ -1255,11 +1280,7 @@ impl FleetJobWorker {
     /// Give the worker the workspace roots + content store so it materializes a delegation's
     /// attachment paths (read from the parent's workspace, round-tripped through the content store)
     /// into the child's `inbox/` before the child's first turn. No-op transfer when unset.
-    pub fn with_workspace(
-        mut self,
-        roots: Arc<WorkspaceRoots>,
-        blobs: Arc<dyn BlobStore>,
-    ) -> Self {
+    pub fn with_workspace(mut self, roots: Arc<WorkspaceRoots>, blobs: Arc<dyn BlobStore>) -> Self {
         self.workspace_roots = Some(roots);
         self.blobs = Some(blobs);
         self
@@ -1269,7 +1290,12 @@ impl FleetJobWorker {
     /// `inbox/`, round-tripping each through the content store (dedup + integrity; federation-ready).
     /// Best-effort: a missing/contained-rejected path or store error is skipped, never failing the
     /// job. No-op when no workspace/blob store is wired or there are no attachments.
-    async fn materialize_attachments(&self, parent: &SessionId, child: &SessionId, paths: &[String]) {
+    async fn materialize_attachments(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        paths: &[String],
+    ) {
         let (Some(roots), Some(blobs)) = (&self.workspace_roots, &self.blobs) else {
             return;
         };
@@ -1282,7 +1308,8 @@ impl FleetJobWorker {
             return;
         }
         for path in paths {
-            let Ok(src) = daemon_core::exec::contain(&parent_root, std::path::Path::new(path)) else {
+            let Ok(src) = daemon_core::exec::contain(&parent_root, std::path::Path::new(path))
+            else {
                 continue;
             };
             let Ok(bytes) = std::fs::read(&src) else {
@@ -1311,7 +1338,12 @@ impl FleetJobWorker {
     /// Push the spawn marker for a freshly-created durable child onto the fleet bus (role from the
     /// job's `ChildLifetime`, active count = the parent's current durable child total). A no-op when
     /// no bus is wired.
-    async fn emit_spawn(&self, parent: &SessionId, child: &SessionId, role: daemon_api::SessionRole) {
+    async fn emit_spawn(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        role: daemon_api::SessionRole,
+    ) {
         let Some(events) = &self.events else {
             return;
         };
@@ -1565,7 +1597,13 @@ impl CronWorker {
     /// Whether a job's most recent run is still in flight: it has no `finished_unix` and its cron
     /// session is not yet settled (still `Active`/`Suspended`). Used for `OverlapPolicy` dedup.
     async fn in_flight(&self, job_id: &str) -> bool {
-        let Some(run) = self.store.cron_runs_list(job_id, 1).await.into_iter().next() else {
+        let Some(run) = self
+            .store
+            .cron_runs_list(job_id, 1)
+            .await
+            .into_iter()
+            .next()
+        else {
             return false;
         };
         if run.finished_unix.is_some() {
@@ -1584,7 +1622,13 @@ impl CronWorker {
     /// Reconcile a job's latest in-flight run: if the cron session has settled (`Ready`/`Completed`/
     /// gone), stamp the run `finished` and fold the outcome into the job's `last_*` bookkeeping.
     async fn reconcile(&self, job: &daemon_store::StoredCronJob) {
-        let Some(mut run) = self.store.cron_runs_list(&job.id, 1).await.into_iter().next() else {
+        let Some(mut run) = self
+            .store
+            .cron_runs_list(&job.id, 1)
+            .await
+            .into_iter()
+            .next()
+        else {
             return;
         };
         if run.finished_unix.is_some() {
@@ -1701,7 +1745,13 @@ impl CronWorker {
         }
         // Then chained upstream outputs (the latest run detail of each referenced job).
         for upstream in &spec.context_from {
-            if let Some(run) = self.store.cron_runs_list(upstream, 1).await.into_iter().next() {
+            if let Some(run) = self
+                .store
+                .cron_runs_list(upstream, 1)
+                .await
+                .into_iter()
+                .next()
+            {
                 if let Some(detail) = run.detail {
                     let snippet = cap_on_boundary(detail, CRON_CONTEXT_CHARS);
                     prefix.push_str(&format!("# Context from job `{upstream}`\n{snippet}\n\n"));
@@ -1724,8 +1774,8 @@ impl CronWorker {
         let Ok(path) = daemon_core::exec::contain(dir, std::path::Path::new(rel)) else {
             return (false, format!("script path escapes scripts dir: {rel}"));
         };
-        let out = tokio::task::spawn_blocking(move || std::process::Command::new(&path).output())
-            .await;
+        let out =
+            tokio::task::spawn_blocking(move || std::process::Command::new(&path).output()).await;
         match out {
             Ok(Ok(output)) => {
                 let mut detail = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1840,7 +1890,11 @@ impl CronWorker {
     /// Advance a job's `next_fire` past `now` (fast-forwarding stale misses so a long downtime fires
     /// at most once), applying jitter. Returns the updated job; `next_fire` is `None` when the
     /// schedule is exhausted (a past one-shot).
-    fn advanced(job: &daemon_store::StoredCronJob, schedule: &Schedule, now: u64) -> daemon_store::StoredCronJob {
+    fn advanced(
+        job: &daemon_store::StoredCronJob,
+        schedule: &Schedule,
+        now: u64,
+    ) -> daemon_store::StoredCronJob {
         let mut next = schedule.next_after(now);
         // Fast-forward: keep advancing while the computed fire is not strictly in the future, so a
         // multi-period downtime collapses to a single next occurrence (no thundering herd).
@@ -1889,7 +1943,8 @@ impl CronScheduler for CronWorker {
 
             // Should this occurrence actually fire? (overlap dedup + catch-up grace)
             let blocked_by_overlap = in_flight && matches!(spec.overlap, OverlapPolicy::Skip);
-            let fire = !blocked_by_overlap && Self::should_fire(&spec, &schedule, scheduled_fire, now);
+            let fire =
+                !blocked_by_overlap && Self::should_fire(&spec, &schedule, scheduled_fire, now);
 
             // Persist the advance first (at-most-once) unless we are firing — in which case `fire`
             // writes the updated job (fire_count/last_run) and we layer the new next_fire on top.
@@ -1899,7 +1954,8 @@ impl CronScheduler for CronWorker {
                 if let Some(mut latest) = self.store.cron_get(&job.id).await {
                     latest.next_fire_unix = advanced.next_fire_unix;
                     // repeat / auto-delete: a job that has reached its fire cap is removed.
-                    if spec.repeat.is_some_and(|max| latest.fire_count >= max) || exhausted_oneshot {
+                    if spec.repeat.is_some_and(|max| latest.fire_count >= max) || exhausted_oneshot
+                    {
                         let _ = self.store.cron_remove(&job.id).await;
                     } else {
                         let _ = self.store.cron_set(latest).await;
@@ -1977,9 +2033,7 @@ impl FleetViewImpl {
         let meta = self.store.session_meta(session).await.unwrap_or_default();
         let role = match meta.role {
             Some(daemon_store::SessionRole::Primary) | None => daemon_api::SessionRole::Primary,
-            Some(daemon_store::SessionRole::ManagedChild) => {
-                daemon_api::SessionRole::ManagedChild
-            }
+            Some(daemon_store::SessionRole::ManagedChild) => daemon_api::SessionRole::ManagedChild,
             Some(daemon_store::SessionRole::EphemeralSubagent) => {
                 daemon_api::SessionRole::EphemeralSubagent
             }
@@ -2259,7 +2313,8 @@ mod tests {
             Arc::new(|_profile: Option<&ProfileRef>, id: &SessionId| {
                 let aux: Arc<dyn Provider> = Arc::new(MockProvider::completing("summary"));
                 Arc::new(
-                    LcmContextEngine::open_for_session(LcmConfig::in_memory(), id, aux).expect("lcm"),
+                    LcmContextEngine::open_for_session(LcmConfig::in_memory(), id, aux)
+                        .expect("lcm"),
                 ) as Arc<dyn ContextEngine>
             });
         let memory_builder: MemoryBuilder = {
@@ -2316,7 +2371,10 @@ mod tests {
                 "{}"
             }
             async fn run(&self, call: &ToolCall, _cx: &daemon_core::TurnCx<'_>) -> ToolOutcome {
-                let out = self.lcm.call_tool("lcm_status", serde_json::Value::Null).await;
+                let out = self
+                    .lcm
+                    .call_tool("lcm_status", serde_json::Value::Null)
+                    .await;
                 ToolOutcome::text(call.call_id.clone(), true, out)
             }
         }
@@ -2343,7 +2401,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cas);
         let roots = Arc::new(WorkspaceRoots::new(ws.clone()));
         let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(cas.clone()).unwrap());
-        let store: Arc<dyn daemon_store::SessionStore> = Arc::new(daemon_store::InMemoryStore::new());
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
         let profile = EngineProfile::new(
             Arc::new(|| Arc::new(MockProvider::completing("x")) as Arc<dyn Provider>),
             Arc::new(ToolRegistry::new()),
@@ -2387,13 +2446,14 @@ mod tests {
 
     #[tokio::test]
     async fn seed_prompt_preloads_skill_bodies_ahead_of_payload() {
-        let store: Arc<dyn daemon_store::SessionStore> = Arc::new(daemon_store::InMemoryStore::new());
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
         let loader: CronSkillLoader = Arc::new(|name: &str| match name {
             "briefing" => Some("BRIEFING BODY".to_string()),
             _ => None,
         });
-        let worker = CronWorker::new(store, PartitionId::DEFAULT, mock_profile())
-            .with_skill_loader(loader);
+        let worker =
+            CronWorker::new(store, PartitionId::DEFAULT, mock_profile()).with_skill_loader(loader);
         let spec = CronSpec {
             name: "j".into(),
             schedule: "0 9 * * *".into(),
@@ -2414,7 +2474,8 @@ mod tests {
 
     #[tokio::test]
     async fn seed_prompt_is_just_payload_without_skills_or_context() {
-        let store: Arc<dyn daemon_store::SessionStore> = Arc::new(daemon_store::InMemoryStore::new());
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
         let worker = CronWorker::new(store, PartitionId::DEFAULT, mock_profile());
         let spec = CronSpec {
             name: "j".into(),
@@ -2455,7 +2516,9 @@ mod tests {
         );
         assert_eq!(
             overlay.workspace,
-            Some(daemon_common::WorkspaceBinding::Bound(PathBuf::from("/srv/proj")))
+            Some(daemon_common::WorkspaceBinding::Bound(PathBuf::from(
+                "/srv/proj"
+            )))
         );
     }
 

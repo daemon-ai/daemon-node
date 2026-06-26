@@ -153,15 +153,21 @@ impl Tool for BrowserTool {
             Op::Type { selector, text } => {
                 self.simple(id, self.browser.type_text(&selector, &text).await, "type")
             }
-            Op::PressKey { selector, key } => {
-                self.simple(id, self.browser.press_key(&selector, &key).await, "press_key")
-            }
+            Op::PressKey { selector, key } => self.simple(
+                id,
+                self.browser.press_key(&selector, &key).await,
+                "press_key",
+            ),
             Op::WaitFor {
                 selector,
                 timeout_ms,
             } => {
                 let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000));
-                self.simple(id, self.browser.wait_for(&selector, timeout).await, "wait_for")
+                self.simple(
+                    id,
+                    self.browser.wait_for(&selector, timeout).await,
+                    "wait_for",
+                )
             }
             Op::Screenshot { full_page } => match self.browser.screenshot(full_page).await {
                 Ok(path) => {
@@ -214,7 +220,9 @@ impl BrowserTool {
             }
         }
         match self.browser.navigate(url).await {
-            Ok(current) => ToolOutcome::text(id.to_string(), true, format!("navigated to {current}")),
+            Ok(current) => {
+                ToolOutcome::text(id.to_string(), true, format!("navigated to {current}"))
+            }
             Err(e) => ToolOutcome::text(id.to_string(), false, format!("browser navigate: {e}")),
         }
     }

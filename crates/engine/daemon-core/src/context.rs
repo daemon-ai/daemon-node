@@ -178,9 +178,7 @@ pub trait ContextEngine: Send + Sync {
     /// [`ToolRegistry`](crate::tools), surfaced here so the node command registry can fold it in.
     /// A concrete engine that also `impl`s [`CommandProvider`](crate::command::CommandProvider)
     /// overrides this to `Some(self)`.
-    fn command_provider(
-        self: Arc<Self>,
-    ) -> Option<crate::command::CommandProviderHandle> {
+    fn command_provider(self: Arc<Self>) -> Option<crate::command::CommandProviderHandle> {
         None
     }
 }

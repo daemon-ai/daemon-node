@@ -118,7 +118,8 @@ pub async fn summarize_with_escalation(
     req: SummaryRequest<'_>,
 ) -> (String, Level) {
     // L1 — detailed summary over the fallback chain.
-    if let Some(text) = call_summary_llm_chain(aux_chain, breakers, build_l1_prompt(&req), timeout).await
+    if let Some(text) =
+        call_summary_llm_chain(aux_chain, breakers, build_l1_prompt(&req), timeout).await
     {
         let text = strip_reasoning_blocks(&text);
         if !text.is_empty() && tok.count_text(&text) < req.source_tokens {
@@ -173,7 +174,11 @@ async fn call_summary_llm_chain(
 
 /// Build the request to the aux provider and await its text under `timeout`. `Err(())` on any
 /// transport failure or timeout (the caller maps that to a breaker failure + L3).
-async fn call_summary_llm(aux: &dyn Provider, prompt: String, timeout: Duration) -> Result<String, ()> {
+async fn call_summary_llm(
+    aux: &dyn Provider,
+    prompt: String,
+    timeout: Duration,
+) -> Result<String, ()> {
     let request = Request {
         system: String::new(),
         messages: vec![RequestMsg {
@@ -260,7 +265,8 @@ fn build_l2_prompt(req: &SummaryRequest<'_>, budget: usize) -> String {
 /// `char_budget = max_tokens * 4`; keep 40% head + 40% tail with a marker between. Operates on char
 /// boundaries so multi-byte text is never split.
 fn deterministic_truncate(text: &str, max_tokens: usize) -> String {
-    const MARKER: &str = "\n\n[...deterministic truncation — details available via lcm_expand...]\n\n";
+    const MARKER: &str =
+        "\n\n[...deterministic truncation — details available via lcm_expand...]\n\n";
     let char_budget = max_tokens.saturating_mul(4);
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= char_budget {
@@ -278,7 +284,13 @@ fn deterministic_truncate(text: &str, max_tokens: usize) -> String {
 /// `<REASONING_SCRATCHPAD>` paired blocks (case-insensitive), then trims. Shared with
 /// [`crate::extraction`] (the extraction aux call strips reasoning the same way).
 pub(crate) fn strip_reasoning_blocks(text: &str) -> String {
-    const TAGS: [&str; 5] = ["think", "thinking", "reasoning", "thought", "reasoning_scratchpad"];
+    const TAGS: [&str; 5] = [
+        "think",
+        "thinking",
+        "reasoning",
+        "thought",
+        "reasoning_scratchpad",
+    ];
     let mut out = text.to_string();
     for tag in TAGS {
         out = strip_tag(&out, tag);
@@ -434,7 +446,9 @@ mod tests {
         assert!(breakers[0].is_open());
         let aux: Vec<Arc<dyn Provider>> = vec![
             Arc::new(FixedAux { reply: None }),
-            Arc::new(FixedAux { reply: Some("fallback summary".into()) }),
+            Arc::new(FixedAux {
+                reply: Some("fallback summary".into()),
+            }),
         ];
         let tok = Tokenizer::heuristic();
         let (text, level) = summarize_with_escalation(
@@ -444,7 +458,10 @@ mod tests {
             0.5,
             512,
             Duration::from_secs(5),
-            req("a long source that exceeds the fallback summary length", 1000),
+            req(
+                "a long source that exceeds the fallback summary length",
+                1000,
+            ),
         )
         .await;
         assert_eq!(level, Level::L1);

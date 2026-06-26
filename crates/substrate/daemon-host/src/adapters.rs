@@ -6,11 +6,11 @@
 //! read-only enumeration the GUI reads to render the "Add channel" picker and capability-gate UI
 //! ([`daemon_api::ControlApi::transport_adapters`]).
 //!
-//! Skeleton status: the registry stores `Arc<dyn TransportAdapter>` and reports each adapter's
-//! [`AdapterInfo`] via [`AdapterRegistry::infos`]. It does **not** yet drive adapter *lifecycle*
-//! (the `serve` spawns still live in `bins/daemon`); retrofitting adapters onto the trait and moving
-//! lifecycle here is deferred (spec §7 P1). A node that registers no adapters yields an empty list,
-//! so the surface is inert by default — exactly like an empty `RoutingRegistry`.
+//! Status: the registry stores `Arc<dyn TransportAdapter>`, reports each adapter's [`AdapterInfo`] via
+//! [`AdapterRegistry::infos`] / live instances via [`AdapterRegistry::instances`], and drives adapter
+//! *lifecycle* via [`AdapterRegistry::spawn_all`] (called by `NodeApiImpl::spawn_adapters`, used from
+//! `bins/daemon`, which registers `daemon-rooms`/`daemon-matrix`). A node that registers no adapters
+//! yields an empty list, so the surface is inert by default — exactly like an empty `RoutingRegistry`.
 
 use daemon_api::{AdapterInfo, NodeApi, TransportAdapter, TransportInstanceInfo};
 use daemon_protocol::TransportId;
@@ -53,16 +53,16 @@ impl AdapterRegistry {
 
     /// The adapter whose [`family`](TransportAdapter::family) equals `family`, if any.
     pub fn adapter_for_family(&self, family: &str) -> Option<Arc<dyn TransportAdapter>> {
-        self.adapters
-            .iter()
-            .find(|a| a.family() == family)
-            .cloned()
+        self.adapters.iter().find(|a| a.family() == family).cloned()
     }
 
     /// The adapter that owns `transport` — the one whose family is the transport id itself (the
     /// management-addressable form, e.g. `"room"` / `"matrix"`) or a `family/...` / `family:...`
     /// sub-instance of it (e.g. a Room's internal `room/<id>` loopback id).
-    pub fn adapter_for_transport(&self, transport: &TransportId) -> Option<Arc<dyn TransportAdapter>> {
+    pub fn adapter_for_transport(
+        &self,
+        transport: &TransportId,
+    ) -> Option<Arc<dyn TransportAdapter>> {
         let t = transport.as_str();
         self.adapters
             .iter()

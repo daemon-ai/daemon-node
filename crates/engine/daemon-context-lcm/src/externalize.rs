@@ -152,7 +152,8 @@ pub fn maybe_externalize_payload(
     }
     match store_payload(dir, body, meta) {
         Ok(reference) => {
-            let placeholder = payload_placeholder(meta, body.chars().count(), body.len(), &reference);
+            let placeholder =
+                payload_placeholder(meta, body.chars().count(), body.len(), &reference);
             Some((placeholder, reference))
         }
         Err(e) => {
@@ -176,7 +177,12 @@ pub fn ingest_payload_placeholder(
 }
 
 /// The §9.1 generic / tool-output threshold placeholder (tool output when a `tool_call_id` is set).
-pub fn payload_placeholder(meta: &PayloadMeta<'_>, chars: usize, bytes: usize, reference: &str) -> String {
+pub fn payload_placeholder(
+    meta: &PayloadMeta<'_>,
+    chars: usize,
+    bytes: usize,
+    reference: &str,
+) -> String {
     match meta.tool_call_id {
         Some(id) => format!(
             "[Externalized tool output: tool_call_id={id}; chars={chars}; bytes={bytes}; ref={reference}]"
@@ -313,24 +319,47 @@ mod tests {
 
     #[test]
     fn ref_regex_captures_every_family() {
-        let p_ingest = ingest_payload_placeholder("data_uri", "content", 10, 20, "data_uri_abc_10.json");
+        let p_ingest =
+            ingest_payload_placeholder("data_uri", "content", 10, 20, "data_uri_abc_10.json");
         let p_tool = payload_placeholder(
-            &PayloadMeta { kind: "tool_output", field: "content", role: "tool", tool_call_id: Some("c1") },
+            &PayloadMeta {
+                kind: "tool_output",
+                field: "content",
+                role: "tool",
+                tool_call_id: Some("c1"),
+            },
             10,
             20,
             "tool_output_def_10.json",
         );
         let p_payload = payload_placeholder(
-            &PayloadMeta { kind: "payload", field: "content", role: "assistant", tool_call_id: None },
+            &PayloadMeta {
+                kind: "payload",
+                field: "content",
+                role: "assistant",
+                tool_call_id: None,
+            },
             10,
             20,
             "payload_ghi_10.json",
         );
         let p_gc = gc_placeholder(true, "tool_output_def_10.json");
-        assert_eq!(extract_ref(&p_ingest).as_deref(), Some("data_uri_abc_10.json"));
-        assert_eq!(extract_ref(&p_tool).as_deref(), Some("tool_output_def_10.json"));
-        assert_eq!(extract_ref(&p_payload).as_deref(), Some("payload_ghi_10.json"));
-        assert_eq!(extract_ref(&p_gc).as_deref(), Some("tool_output_def_10.json"));
+        assert_eq!(
+            extract_ref(&p_ingest).as_deref(),
+            Some("data_uri_abc_10.json")
+        );
+        assert_eq!(
+            extract_ref(&p_tool).as_deref(),
+            Some("tool_output_def_10.json")
+        );
+        assert_eq!(
+            extract_ref(&p_payload).as_deref(),
+            Some("payload_ghi_10.json")
+        );
+        assert_eq!(
+            extract_ref(&p_gc).as_deref(),
+            Some("tool_output_def_10.json")
+        );
         assert!(contains_externalized_ref(&p_ingest));
         assert!(!contains_externalized_ref("just some text"));
     }
@@ -338,9 +367,16 @@ mod tests {
     #[test]
     fn threshold_gate_respects_enabled_and_size() {
         let dir = tmp("thresh");
-        let meta = PayloadMeta { kind: "tool_output", field: "content", role: "tool", tool_call_id: Some("c1") };
+        let meta = PayloadMeta {
+            kind: "tool_output",
+            field: "content",
+            role: "tool",
+            tool_call_id: Some("c1"),
+        };
         // Disabled -> None even when large.
-        assert!(maybe_externalize_payload(Some(&dir), &"a".repeat(100), false, 10, &meta).is_none());
+        assert!(
+            maybe_externalize_payload(Some(&dir), &"a".repeat(100), false, 10, &meta).is_none()
+        );
         // Enabled but under threshold -> None.
         assert!(maybe_externalize_payload(Some(&dir), "short", true, 10_000, &meta).is_none());
         // Enabled + over threshold -> Some.

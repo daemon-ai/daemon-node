@@ -156,7 +156,11 @@ mod tests {
 
     #[test]
     fn orphaned_tool_call_gets_synthetic_result() {
-        let out = repair_message_sequence(vec![user("hi"), assistant_calls("calling", &["a", "b"]), tool("a", "ok")]);
+        let out = repair_message_sequence(vec![
+            user("hi"),
+            assistant_calls("calling", &["a", "b"]),
+            tool("a", "ok"),
+        ]);
         // b had no result -> synthesized.
         assert_eq!(out.len(), 4);
         assert_eq!(out[3].role, "tool");
@@ -166,13 +170,21 @@ mod tests {
 
     #[test]
     fn orphaned_tool_result_is_dropped() {
-        let out = repair_message_sequence(vec![user("hi"), tool("ghost", "no call"), assistant("done")]);
+        let out = repair_message_sequence(vec![
+            user("hi"),
+            tool("ghost", "no call"),
+            assistant("done"),
+        ]);
         assert_eq!(out, vec![user("hi"), assistant("done")]);
     }
 
     #[test]
     fn empty_tool_result_is_coerced() {
-        let out = repair_message_sequence(vec![user("hi"), assistant_calls("c", &["a"]), tool("a", "  ")]);
+        let out = repair_message_sequence(vec![
+            user("hi"),
+            assistant_calls("c", &["a"]),
+            tool("a", "  "),
+        ]);
         assert_eq!(out[2].content, MISSING_RESULT);
     }
 

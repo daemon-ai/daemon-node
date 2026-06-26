@@ -310,7 +310,11 @@ impl Engine {
                 params![winner_fact_id, now, loser_fact_id],
             )?;
         }
-        let resolution = if confirmed { "llm_confirmed" } else { "llm_rejected" };
+        let resolution = if confirmed {
+            "llm_confirmed"
+        } else {
+            "llm_rejected"
+        };
         conn.execute(
             "UPDATE conflicts SET resolution = ?1, resolved_at = ?2 WHERE id = ?3",
             params![resolution, now, conflict_id],
@@ -433,7 +437,11 @@ impl Engine {
         for fact in episodic_graph::extract_facts(content, memory_id) {
             episodic_graph::store_fact(conn, &fact, memory_id, &self.config.session_id)?;
             // Regex facts are inferred unless the memory itself was stated/tool/imported.
-            let fact_veracity = if veracity == "unknown" { "inferred" } else { veracity };
+            let fact_veracity = if veracity == "unknown" {
+                "inferred"
+            } else {
+                veracity
+            };
             veracity::consolidate_fact(
                 conn,
                 &fact.subject,
@@ -488,7 +496,11 @@ impl Engine {
     /// statements become `fact` annotations. Annotation/fact stores dedupe, so re-ingesting an item
     /// the regex pass already captured is a no-op upsert. Best-effort: a malformed item is skipped,
     /// never failing the turn.
-    pub fn ingest_extracted(&self, memory_id: &str, extracted: &crate::extract::Extracted) -> Result<()> {
+    pub fn ingest_extracted(
+        &self,
+        memory_id: &str,
+        extracted: &crate::extract::Extracted,
+    ) -> Result<()> {
         let conn = self.store.conn.lock().unwrap();
         let now = util::now_iso();
 
@@ -665,10 +677,24 @@ impl Engine {
         let conn = self.store.conn.lock().unwrap();
 
         let mut scored = self.gather_working(
-            &conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights, scope,
+            &conn,
+            &q_tokens,
+            &q_entities,
+            top_k,
+            floor,
+            query_vector,
+            weights,
+            scope,
         )?;
         let episodic = self.gather_episodic(
-            &conn, &q_tokens, &q_entities, top_k, floor, query_vector, weights, scope,
+            &conn,
+            &q_tokens,
+            &q_entities,
+            top_k,
+            floor,
+            query_vector,
+            weights,
+            scope,
         )?;
         scored.extend(episodic);
 
@@ -693,8 +719,10 @@ impl Engine {
 
         // Diversity rerank for multi-token queries (`beam.py` L6061), else a plain top-k slice.
         let selected: Vec<MemoryRow> = if q_tokens.len() >= 4 && scored.len() > 1 {
-            let items: Vec<(String, f64)> =
-                scored.iter().map(|r| (r.content.clone(), r.score)).collect();
+            let items: Vec<(String, f64)> = scored
+                .iter()
+                .map(|r| (r.content.clone(), r.score))
+                .collect();
             mmr::mmr_rerank(&items, mmr::DEFAULT_LAMBDA, top_k)
                 .into_iter()
                 .map(|i| scored[i].clone())
@@ -822,10 +850,16 @@ impl Engine {
         self.weibull_rescore(&mut results)?;
 
         // 6-7. Sort, then MMR-diversify down to `top_k`.
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let final_results: Vec<MemoryRow> = if results.len() > 1 {
-            let items: Vec<(String, f64)> =
-                results.iter().map(|r| (r.content.clone(), r.score)).collect();
+            let items: Vec<(String, f64)> = results
+                .iter()
+                .map(|r| (r.content.clone(), r.score))
+                .collect();
             mmr::mmr_rerank(&items, mmr::DEFAULT_LAMBDA, top_k)
                 .into_iter()
                 .map(|i| results[i].clone())
@@ -896,7 +930,13 @@ impl Engine {
                 .collect();
             sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             sims.truncate(20);
-            vector_hits = sims.into_iter().map(|(id, s)| VoiceHit { memory_id: id, score: s }).collect();
+            vector_hits = sims
+                .into_iter()
+                .map(|(id, s)| VoiceHit {
+                    memory_id: id,
+                    score: s,
+                })
+                .collect();
         }
 
         // Voice 2: graph (entity-seeded gists @0.6 + fact subjects @conf*0.5, then ctx-edge
@@ -908,13 +948,19 @@ impl Engine {
         for ent in &q_entities {
             for (mid, _text) in episodic_graph::find_gists_by_participant(&conn, ent)? {
                 if seen_graph.insert(mid.clone()) {
-                    graph_hits.push(VoiceHit { memory_id: mid.clone(), score: 0.6 });
+                    graph_hits.push(VoiceHit {
+                        memory_id: mid.clone(),
+                        score: 0.6,
+                    });
                 }
                 seed_ids.insert(mid);
             }
             for (mid, conf) in self.facts_for_subject(&conn, ent, 0.0)? {
                 if seen_graph.insert(mid.clone()) {
-                    graph_hits.push(VoiceHit { memory_id: mid.clone(), score: conf * 0.5 });
+                    graph_hits.push(VoiceHit {
+                        memory_id: mid.clone(),
+                        score: conf * 0.5,
+                    });
                 }
                 seed_ids.insert(mid);
             }
@@ -939,7 +985,10 @@ impl Engine {
             }
             for (mid, conf) in self.facts_for_subject(&conn, &word, 0.5)? {
                 if seen_fact.insert(mid.clone()) {
-                    fact_hits.push(VoiceHit { memory_id: mid, score: conf });
+                    fact_hits.push(VoiceHit {
+                        memory_id: mid,
+                        score: conf,
+                    });
                 }
             }
         }
@@ -958,13 +1007,20 @@ impl Engine {
             let mut bind: Vec<Value> = vec![Value::Text(week_ago)];
             bind.extend(scope_params);
             let rows = stmt.query_map(params_from_iter(bind), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
             })?;
             for row in rows.flatten() {
                 let (id, ts, imp) = row;
                 let age_days = age_hours(&ts).unwrap_or(0.0) / 24.0;
                 let tscore = (-age_days / 7.0).exp() * imp;
-                temporal_hits.push(VoiceHit { memory_id: id, score: tscore });
+                temporal_hits.push(VoiceHit {
+                    memory_id: id,
+                    score: tscore,
+                });
             }
         }
 
@@ -1059,7 +1115,8 @@ impl Engine {
             let relevance = scoring::blend_fts(lexical, nfts, floor);
             let decay = scoring::recency_decay(age_hours(&row.timestamp));
             let bonuses = self.knowledge_bonuses(conn, &row.id, q_entities)?;
-            let mut base = scoring::working_memory_score(relevance, row.importance, iw, vec_sim, decay);
+            let mut base =
+                scoring::working_memory_score(relevance, row.importance, iw, vec_sim, decay);
             base += bonuses.graph_bonus + bonuses.fact_bonus;
             base = bonuses.apply_multipliers(base);
             row.score = base * scoring::veracity_multiplier(&row.veracity);
@@ -1173,7 +1230,9 @@ impl Engine {
                     importance: r.get(4)?,
                     veracity: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     trust_tier: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                    scope: r.get::<_, Option<String>>(7)?.unwrap_or_else(|| "global".into()),
+                    scope: r
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "global".into()),
                     memory_type: r
                         .get::<_, Option<String>>(8)?
                         .unwrap_or_else(|| "unknown".into()),
@@ -1181,7 +1240,9 @@ impl Engine {
                     event_date_precision: r
                         .get::<_, Option<String>>(10)?
                         .unwrap_or_else(|| "unknown".into()),
-                    temporal_tags: r.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".into()),
+                    temporal_tags: r
+                        .get::<_, Option<String>>(11)?
+                        .unwrap_or_else(|| "[]".into()),
                 })
             })?;
             for row in rows {
@@ -1195,8 +1256,10 @@ impl Engine {
         let now = util::now_iso();
         let mut count = 0usize;
         for seed in &pending {
-            let ep_id =
-                util::memory_id(&format!("episodic:{}:{}", self.config.session_id, seed.content));
+            let ep_id = util::memory_id(&format!(
+                "episodic:{}:{}",
+                self.config.session_id, seed.content
+            ));
             let binary = embeddings
                 .get(&seed.wm_id)
                 .map(|v| binary_vectors::maximally_informative_binarization(v));
@@ -1364,7 +1427,10 @@ impl Engine {
                 g.veracity = veracity::aggregate_veracity(vs);
             }
         }
-        Ok(order.into_iter().filter_map(|s| groups.remove(&s)).collect())
+        Ok(order
+            .into_iter()
+            .filter_map(|s| groups.remove(&s))
+            .collect())
     }
 
     /// Write the episodic summaries for the claimed [`SleepGroup`]s (`beam.py` sleep L7784-L7824),
@@ -1383,14 +1449,16 @@ impl Engine {
                 let (summary, llm) = match summaries.get(&group.source) {
                     Some(s) if !s.trim().is_empty() => (s.trim().to_string(), true),
                     _ => (
-                        format!("[{}] {}", group.source, crate::aaak::summarize_group(&group.contents)),
+                        format!(
+                            "[{}] {}",
+                            group.source,
+                            crate::aaak::summarize_group(&group.contents)
+                        ),
                         false,
                     ),
                 };
-                let ep_id = util::memory_id(&format!(
-                    "episodic:{}:{}",
-                    self.config.session_id, summary
-                ));
+                let ep_id =
+                    util::memory_id(&format!("episodic:{}:{}", self.config.session_id, summary));
                 let summary_of = serde_json::to_string(&group.ids)?;
                 conn.execute(
                     "INSERT OR IGNORE INTO episodic_memory \
@@ -1410,17 +1478,15 @@ impl Engine {
                     ],
                 )?;
                 self.ingest_knowledge(&conn, &ep_id, &summary, &group.veracity)?;
-                let placeholders = group
-                    .ids
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let placeholders = group.ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
                     "UPDATE working_memory SET consolidation_claimed_at = NULL WHERE id IN ({placeholders})"
                 );
-                let id_params: Vec<&dyn rusqlite::ToSql> =
-                    group.ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                let id_params: Vec<&dyn rusqlite::ToSql> = group
+                    .ids
+                    .iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .collect();
                 conn.execute(&sql, id_params.as_slice())?;
 
                 self.audit(
@@ -1522,10 +1588,14 @@ impl Engine {
 
         let mut timestamps: HashMap<String, String> = HashMap::new();
         {
-            let sql = format!("SELECT id, timestamp FROM working_memory WHERE id IN ({placeholders})");
+            let sql =
+                format!("SELECT id, timestamp FROM working_memory WHERE id IN ({placeholders})");
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(id_params.iter().cloned()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
             })?;
             for row in rows.flatten() {
                 timestamps.insert(row.0, row.1);
@@ -1649,7 +1719,10 @@ impl Engine {
                  ORDER BY created_at ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(
-                params![format!("-{TIER3_DAYS} days"), (DEGRADE_BATCH_SIZE / 2) as i64],
+                params![
+                    format!("-{TIER3_DAYS} days"),
+                    (DEGRADE_BATCH_SIZE / 2) as i64
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -1673,7 +1746,10 @@ impl Engine {
     /// `_refresh_episodic_embedding` invalidation path C18.b) so recall falls back to lexical/FTS
     /// until a fresh embedding is computed.
     fn invalidate_episodic_embedding(&self, conn: &Connection, id: &str) -> Result<()> {
-        conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+            params![id],
+        )?;
         conn.execute(
             "UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?1",
             params![id],
@@ -1699,7 +1775,13 @@ impl Engine {
     /// (`hermes_memory_provider/audit.py` `record` L69-L106). Uses the already-held connection (the
     /// audit table lives in the same bank DB) and swallows any error — auditing must never break a
     /// memory mutation. `timestamp` is unix epoch seconds (Python `time.time()`).
-    fn audit(&self, conn: &Connection, action: &str, memory_id: Option<&str>, reason: Option<&str>) {
+    fn audit(
+        &self,
+        conn: &Connection,
+        action: &str,
+        memory_id: Option<&str>,
+        reason: Option<&str>,
+    ) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
@@ -1758,7 +1840,10 @@ impl Engine {
         let conn = self.store.conn.lock().unwrap();
         let mut deleted = conn.execute("DELETE FROM working_memory WHERE id = ?1", params![id])?;
         deleted += conn.execute("DELETE FROM episodic_memory WHERE id = ?1", params![id])?;
-        conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+            params![id],
+        )?;
         if deleted > 0 {
             self.audit(&conn, "forget", Some(id), None);
         }
@@ -1897,7 +1982,10 @@ impl Engine {
     pub fn scratchpad_write(&self, content: &str) -> Result<String> {
         let conn = self.store.conn.lock().unwrap();
         let now = util::now_iso();
-        let id = util::memory_id(&format!("scratch:{}:{}:{}", self.config.session_id, now, content));
+        let id = util::memory_id(&format!(
+            "scratch:{}:{}:{}",
+            self.config.session_id, now, content
+        ));
         conn.execute(
             "INSERT OR REPLACE INTO scratchpad (id, content, session_id) VALUES (?1, ?2, ?3)",
             params![id, content, self.config.session_id],
@@ -1966,7 +2054,10 @@ impl Engine {
                 if content.is_empty() {
                     continue;
                 }
-                let importance = row.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                let importance = row
+                    .get("importance")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5);
                 let scope = row
                     .get("scope")
                     .and_then(|v| v.as_str())
@@ -1996,14 +2087,24 @@ impl Engine {
 
     /// Graph neighbours of a memory within `depth` hops (`beam.py` `graph_query` /
     /// `episodic_graph::find_related_memories`).
-    pub fn graph_query(&self, memory_id: &str, depth: usize) -> Result<Vec<episodic_graph::Related>> {
+    pub fn graph_query(
+        &self,
+        memory_id: &str,
+        depth: usize,
+    ) -> Result<Vec<episodic_graph::Related>> {
         let conn = self.store.conn.lock().unwrap();
         episodic_graph::find_related_memories(&conn, memory_id, depth.max(1), "", 0.0)
     }
 
     /// Add a manual graph edge between two memories (`beam.py` `graph_link` /
     /// `episodic_graph::add_edge`).
-    pub fn graph_link(&self, source: &str, target: &str, edge_type: &str, weight: f64) -> Result<()> {
+    pub fn graph_link(
+        &self,
+        source: &str,
+        target: &str,
+        edge_type: &str,
+        weight: f64,
+    ) -> Result<()> {
         let conn = self.store.conn.lock().unwrap();
         episodic_graph::add_edge(
             &conn,
@@ -2035,7 +2136,15 @@ impl Engine {
     ) -> Result<i64> {
         let conn = self.store.conn.lock().unwrap();
         crate::knowledge::triples::add(
-            &conn, subject, predicate, object, valid_from, valid_until, source, confidence, supersede,
+            &conn,
+            subject,
+            predicate,
+            object,
+            valid_from,
+            valid_until,
+            source,
+            confidence,
+            supersede,
         )
     }
 
@@ -2072,9 +2181,14 @@ impl Engine {
         body: &str,
         source: &str,
         confidence: f64,
-    ) -> Result<(crate::knowledge::canonical::CanonicalRow, crate::knowledge::canonical::Status)> {
+    ) -> Result<(
+        crate::knowledge::canonical::CanonicalRow,
+        crate::knowledge::canonical::Status,
+    )> {
         let conn = self.store.conn.lock().unwrap();
-        crate::knowledge::canonical::remember(&conn, owner_id, category, name, body, source, confidence)
+        crate::knowledge::canonical::remember(
+            &conn, owner_id, category, name, body, source, confidence,
+        )
     }
 
     /// Read live canonical facts for an owner (`canonical::current`).
@@ -2213,10 +2327,13 @@ impl Engine {
 
     /// Load the packed MIB `binary_vector` blobs for episodic rows, keyed by memory id.
     fn load_binary_vectors(&self, conn: &Connection) -> Result<HashMap<String, Vec<u8>>> {
-        let mut stmt = conn
-            .prepare("SELECT id, binary_vector FROM episodic_memory WHERE binary_vector IS NOT NULL")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, binary_vector FROM episodic_memory WHERE binary_vector IS NOT NULL",
+        )?;
         let mut map = HashMap::new();
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
         for row in rows {
             let (id, blob) = row?;
             map.insert(id, blob);
@@ -2323,7 +2440,10 @@ impl Engine {
         if !all_mentions.is_empty() {
             let mut value_to_memories: HashMap<String, Vec<String>> = HashMap::new();
             for ann in &all_mentions {
-                value_to_memories.entry(ann.value.clone()).or_default().push(ann.memory_id.clone());
+                value_to_memories
+                    .entry(ann.value.clone())
+                    .or_default()
+                    .push(ann.memory_id.clone());
             }
             let known: Vec<String> = value_to_memories.keys().cloned().collect();
             for entity in q_entities {
@@ -2476,11 +2596,27 @@ fn working_row(r: &rusqlite::Row<'_>) -> MemoryRow {
     MemoryRow {
         id: r.get(0).unwrap_or_default(),
         content: r.get(1).unwrap_or_default(),
-        source: r.get::<_, Option<String>>(2).ok().flatten().unwrap_or_default(),
-        timestamp: r.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default(),
+        source: r
+            .get::<_, Option<String>>(2)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        timestamp: r
+            .get::<_, Option<String>>(3)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         importance: r.get(4).unwrap_or(0.5),
-        veracity: r.get::<_, Option<String>>(5).ok().flatten().unwrap_or_default(),
-        trust_tier: r.get::<_, Option<String>>(6).ok().flatten().unwrap_or_default(),
+        veracity: r
+            .get::<_, Option<String>>(5)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        trust_tier: r
+            .get::<_, Option<String>>(6)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         tier: Tier::Working,
         tier_level: 1,
         score: 0.0,
@@ -2493,11 +2629,27 @@ fn episodic_row(r: &rusqlite::Row<'_>) -> MemoryRow {
     MemoryRow {
         id: r.get(0).unwrap_or_default(),
         content: r.get(1).unwrap_or_default(),
-        source: r.get::<_, Option<String>>(2).ok().flatten().unwrap_or_default(),
-        timestamp: r.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default(),
+        source: r
+            .get::<_, Option<String>>(2)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        timestamp: r
+            .get::<_, Option<String>>(3)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         importance: r.get(4).unwrap_or(0.5),
-        veracity: r.get::<_, Option<String>>(5).ok().flatten().unwrap_or_default(),
-        trust_tier: r.get::<_, Option<String>>(6).ok().flatten().unwrap_or_default(),
+        veracity: r
+            .get::<_, Option<String>>(5)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        trust_tier: r
+            .get::<_, Option<String>>(6)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         tier: Tier::Episodic,
         tier_level: r.get::<_, Option<i64>>(7).ok().flatten().unwrap_or(1),
         score: 0.0,
@@ -2664,7 +2816,14 @@ fn edit_dist_ratio(s1: &str, s2: &str) -> f64 {
 /// `_temporal_voice` L628-L633).
 fn has_temporal_keyword(query: &str) -> bool {
     const TEMPORAL_KEYWORDS: &[&str] = &[
-        "yesterday", "today", "recent", "last", "latest", "this week", "this month", "ago",
+        "yesterday",
+        "today",
+        "recent",
+        "last",
+        "latest",
+        "this week",
+        "this month",
+        "ago",
         "before",
     ];
     let lower = query.to_lowercase();
@@ -2875,7 +3034,11 @@ mod tests {
         let conflicts = e
             .heuristic_sleep_conflicts(std::slice::from_ref(&group))
             .unwrap();
-        assert_eq!(conflicts.len(), 1, "expected one conflict, got {conflicts:?}");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "expected one conflict, got {conflicts:?}"
+        );
         assert_eq!(conflicts[0].older_id, "old1");
         assert_eq!(conflicts[0].newer_id, "new1");
 
@@ -2902,8 +3065,16 @@ mod tests {
         let v = [1.0f32, 0.0, 0.0];
         let conn = e.store.conn.lock().unwrap();
         for (id, ts, content) in [
-            ("d1", &older_ts, "The deployment pipeline uses GitHub Actions for builds"),
-            ("d2", &newer_ts, "The deployment pipeline uses GitHub Actions for build"),
+            (
+                "d1",
+                &older_ts,
+                "The deployment pipeline uses GitHub Actions for builds",
+            ),
+            (
+                "d2",
+                &newer_ts,
+                "The deployment pipeline uses GitHub Actions for build",
+            ),
         ] {
             conn.execute(
                 "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json, veracity, memory_type, scope) \
@@ -2961,7 +3132,11 @@ mod tests {
             .iter()
             .find(|r| r.id.starts_with("memoria_memoria"))
             .expect("memoria row present");
-        assert!(memoria_row.score <= 0.6 + 1e-9, "score {}", memoria_row.score);
+        assert!(
+            memoria_row.score <= 0.6 + 1e-9,
+            "score {}",
+            memoria_row.score
+        );
     }
 
     #[test]
@@ -3140,13 +3315,20 @@ mod tests {
     #[test]
     fn consolidation_populates_episodic_and_is_idempotent() {
         let e = engine();
-        e.remember("blue-green deployment rollout strategy", &RememberArgs::default())
-            .unwrap();
+        e.remember(
+            "blue-green deployment rollout strategy",
+            &RememberArgs::default(),
+        )
+        .unwrap();
         e.remember("margherita pizza for lunch", &RememberArgs::default())
             .unwrap();
 
         assert_eq!(e.consolidate().unwrap(), 2, "both WM rows promoted");
-        assert_eq!(e.consolidate().unwrap(), 0, "already-consolidated rows are skipped");
+        assert_eq!(
+            e.consolidate().unwrap(),
+            0,
+            "already-consolidated rows are skipped"
+        );
 
         let conn = e.store.conn.lock().unwrap();
         let n: i64 = conn
@@ -3166,8 +3348,11 @@ mod tests {
     #[test]
     fn episodic_recall_after_consolidation_dedups_cross_tier() {
         let e = engine();
-        e.remember("the deployment uses a blue-green rollout", &RememberArgs::default())
-            .unwrap();
+        e.remember(
+            "the deployment uses a blue-green rollout",
+            &RememberArgs::default(),
+        )
+        .unwrap();
         e.consolidate().unwrap();
 
         // The content now lives in BOTH tiers; recall must surface it exactly once (cross-tier dedup).
@@ -3176,7 +3361,11 @@ mod tests {
             .iter()
             .filter(|h| h.content.contains("blue-green"))
             .collect();
-        assert_eq!(matches.len(), 1, "cross-tier duplicate collapsed to one row");
+        assert_eq!(
+            matches.len(),
+            1,
+            "cross-tier duplicate collapsed to one row"
+        );
     }
 
     #[test]
@@ -3209,7 +3398,10 @@ mod tests {
     fn remember_extracts_entities_and_facts() {
         let e = engine();
         let id = e
-            .remember("Maya works at Acme and uses Postgres", &RememberArgs::default())
+            .remember(
+                "Maya works at Acme and uses Postgres",
+                &RememberArgs::default(),
+            )
             .unwrap();
         let c = e.store.conn.lock().unwrap();
 
@@ -3244,8 +3436,11 @@ mod tests {
     fn entity_and_fact_match_reorders_recall() {
         let e = engine();
         // The entity-/fact-bearing memory (capitalized "Acme" -> entity + `works_at` fact)...
-        e.remember("Maya works at Acme on infrastructure", &RememberArgs::default())
-            .unwrap();
+        e.remember(
+            "Maya works at Acme on infrastructure",
+            &RememberArgs::default(),
+        )
+        .unwrap();
         // ...and a lexical-only distractor that mentions "acme" lowercase (no entity extracted).
         e.remember("the acme deadline is approaching", &RememberArgs::default())
             .unwrap();
@@ -3257,7 +3452,9 @@ mod tests {
         assert!(
             hits[0].content.contains("Maya"),
             "entity+fact match should rank first, got {:?}",
-            hits.iter().map(|h| (&h.content, h.score)).collect::<Vec<_>>()
+            hits.iter()
+                .map(|h| (&h.content, h.score))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3321,7 +3518,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(fact_ann, 1, "LLM statement should land as a fact annotation");
+        assert_eq!(
+            fact_ann, 1,
+            "LLM statement should land as a fact annotation"
+        );
     }
 
     #[test]
@@ -3383,8 +3583,11 @@ mod tests {
             .unwrap();
         {
             let c = e.store.conn.lock().unwrap();
-            c.execute("UPDATE working_memory SET pinned = 1 WHERE id = ?1", params![id])
-                .unwrap();
+            c.execute(
+                "UPDATE working_memory SET pinned = 1 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
         }
         // force=false: the row is fresh (after the cutoff) AND pinned -> nothing consolidates.
         let report = e.sleep(false).expect("sleep");
@@ -3418,7 +3621,11 @@ mod tests {
         assert_eq!(t2, 1, "tier2 row should promote to tier3");
         let c = e.store.conn.lock().unwrap();
         let tier1: i64 = c
-            .query_row("SELECT tier FROM episodic_memory WHERE id='old1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT tier FROM episodic_memory WHERE id='old1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(tier1, 2);
         let (tier2, len): (i64, i64) = c
@@ -3429,13 +3636,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tier2, 3);
-        assert!(len as usize <= TIER3_MAX_CHARS + 8, "tier3 content compressed");
+        assert!(
+            len as usize <= TIER3_MAX_CHARS + 8,
+            "tier3 content compressed"
+        );
     }
 
     #[test]
     fn tool_backing_methods_round_trip() {
         let e = engine();
-        let id = e.remember("a fact to manage", &RememberArgs::default()).unwrap();
+        let id = e
+            .remember("a fact to manage", &RememberArgs::default())
+            .unwrap();
         assert!(e.get(&id).unwrap().is_some());
         assert!(e.update(&id, Some("an updated fact"), Some(0.9)).unwrap());
         assert_eq!(e.get(&id).unwrap().unwrap().content, "an updated fact");
@@ -3449,7 +3661,10 @@ mod tests {
         // Triples + canonical.
         e.triple_add("Ada", "uses", "Rust", None, None, "tool", 1.0, true)
             .unwrap();
-        assert_eq!(e.triple_query(Some("Ada"), None, None, None).unwrap().len(), 1);
+        assert_eq!(
+            e.triple_query(Some("Ada"), None, None, None).unwrap().len(),
+            1
+        );
         let (_row, status) = e
             .canonical_remember("ada", "identity", "lang", "Rust", "tool", 1.0)
             .unwrap();
@@ -3469,8 +3684,10 @@ mod tests {
     #[test]
     fn export_import_round_trips_rows() {
         let e = engine();
-        e.remember("portable memory one", &RememberArgs::default()).unwrap();
-        e.remember("portable memory two", &RememberArgs::default()).unwrap();
+        e.remember("portable memory one", &RememberArgs::default())
+            .unwrap();
+        e.remember("portable memory two", &RememberArgs::default())
+            .unwrap();
         let bundle = e.export().unwrap();
 
         let e2 = engine();
@@ -3493,15 +3710,29 @@ mod tests {
     fn enhanced_recall_uses_synonym_expansion() {
         // Enhanced recall expands "db" -> the `database` synonym group, so a query that shares no
         // surface token with the stored row still surfaces it (base recall alone would miss "db").
-        let cfg = MnemosyneConfig { recall_mode: RecallMode::Enhanced, ..MnemosyneConfig::default() };
+        let cfg = MnemosyneConfig {
+            recall_mode: RecallMode::Enhanced,
+            ..MnemosyneConfig::default()
+        };
         let e = Engine::open_in_memory(cfg).unwrap();
-        e.remember("the database password rotation is monthly", &RememberArgs::default())
+        e.remember(
+            "the database password rotation is monthly",
+            &RememberArgs::default(),
+        )
+        .unwrap();
+        e.remember("lunch was margherita pizza", &RememberArgs::default())
             .unwrap();
-        e.remember("lunch was margherita pizza", &RememberArgs::default()).unwrap();
 
         let hits = e.recall("db password", 5).unwrap();
-        assert!(!hits.is_empty(), "enhanced recall should surface via synonym expansion");
-        assert!(hits[0].content.contains("password"), "got: {}", hits[0].content);
+        assert!(
+            !hits.is_empty(),
+            "enhanced recall should surface via synonym expansion"
+        );
+        assert!(
+            hits[0].content.contains("password"),
+            "got: {}",
+            hits[0].content
+        );
         // A second identical query is served from the cache and stays consistent.
         let again = e.recall("db password", 5).unwrap();
         assert_eq!(again[0].content, hits[0].content);
@@ -3512,15 +3743,23 @@ mod tests {
         // The default (Base) mode must not synonym-expand: "db" shares no token with the row, so a
         // base recall returns nothing (proving enhanced behavior is opt-in, no base regression).
         let e = engine();
-        e.remember("the database password rotation is monthly", &RememberArgs::default())
-            .unwrap();
-        assert!(e.recall("db", 5).unwrap().is_empty(), "base recall must not expand synonyms");
+        e.remember(
+            "the database password rotation is monthly",
+            &RememberArgs::default(),
+        )
+        .unwrap();
+        assert!(
+            e.recall("db", 5).unwrap().is_empty(),
+            "base recall must not expand synonyms"
+        );
     }
 
     #[test]
     fn polyphonic_recall_fuses_voices() {
-        let cfg =
-            MnemosyneConfig { recall_mode: RecallMode::Polyphonic, ..MnemosyneConfig::default() };
+        let cfg = MnemosyneConfig {
+            recall_mode: RecallMode::Polyphonic,
+            ..MnemosyneConfig::default()
+        };
         let e = Engine::open_in_memory(cfg).unwrap();
         let acme_vec = [1.0f32, 0.0, 0.0];
         e.remember_with_vector(
@@ -3541,6 +3780,9 @@ mod tests {
         // "Acme" hits the graph/fact voices (fact subject "Acme") and the vector voice (parallel
         // query vector); RRF fusion should surface the Acme row.
         let hits = e.recall_with_vector("Acme", 5, Some(&acme_vec)).unwrap();
-        assert!(hits.iter().any(|h| h.content == "Acme is a company"), "polyphonic fused result");
+        assert!(
+            hits.iter().any(|h| h.content == "Acme is a company"),
+            "polyphonic fused result"
+        );
     }
 }

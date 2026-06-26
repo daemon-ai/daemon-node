@@ -168,7 +168,8 @@ impl FileProfileStore {
     }
 
     fn write_spec(&self, spec: &ProfileSpec) -> Result<(), ProfileError> {
-        let bytes = serde_json::to_vec_pretty(spec).map_err(|e| ProfileError::Codec(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec_pretty(spec).map_err(|e| ProfileError::Codec(e.to_string()))?;
         std::fs::write(self.profile_path(&spec.id), bytes)?;
         Ok(())
     }
@@ -184,7 +185,9 @@ impl ProfileStore for FileProfileStore {
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 match Self::read_spec(&path) {
                     Ok(spec) => out.push(spec),
-                    Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping unreadable profile"),
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "skipping unreadable profile")
+                    }
                 }
             }
         }
@@ -222,7 +225,7 @@ impl ProfileStore for FileProfileStore {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
-        if self.active()? .as_deref() == Some(id) {
+        if self.active()?.as_deref() == Some(id) {
             let _ = std::fs::remove_file(self.active_path());
         }
         Ok(())
@@ -251,7 +254,13 @@ impl ProfileStore for FileProfileStore {
 /// Restrict a profile id to a filename-safe slug so it can key an on-disk file.
 fn sanitize(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -276,7 +285,10 @@ mod tests {
         let mut updated = sample("opus");
         updated.model = "claude-3-5-sonnet-latest".into();
         s.update(updated).unwrap();
-        assert_eq!(s.get("opus").unwrap().unwrap().model, "claude-3-5-sonnet-latest");
+        assert_eq!(
+            s.get("opus").unwrap().unwrap().model,
+            "claude-3-5-sonnet-latest"
+        );
         s.delete("opus").unwrap();
         assert!(s.get("opus").unwrap().is_none());
         assert!(s.active().unwrap().is_none());
@@ -291,7 +303,10 @@ mod tests {
         assert!(!s.seed(sample("opus")).unwrap());
         assert_eq!(s.active().unwrap().as_deref(), Some("opus"));
         let reopened = FileProfileStore::open(&dir).unwrap();
-        assert_eq!(reopened.get("opus").unwrap().unwrap().model, "claude-opus-4-8");
+        assert_eq!(
+            reopened.get("opus").unwrap().unwrap().model,
+            "claude-opus-4-8"
+        );
         assert_eq!(reopened.list().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

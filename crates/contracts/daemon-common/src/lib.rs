@@ -1243,20 +1243,16 @@ pub struct SkillBundle {
 /// filesystem surface resolve the *same* directory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WorkspaceBinding {
     /// An isolated per-session sandbox under the node's configured `workspace_root`
     /// (`<workspace_root>/<session_id>`). The default — good for ephemeral / parallel / untrusted
     /// agents.
+    #[default]
     Isolated,
     /// Bind the session to an operator-specified directory directly, edited in place (the
     /// "work on my repo" case). Containment still keeps the agent inside it.
     Bound(PathBuf),
-}
-
-impl Default for WorkspaceBinding {
-    fn default() -> Self {
-        Self::Isolated
-    }
 }
 
 /// Which versioned artifact a revision history tracks. One [`RevisionLog`] keys its history by
@@ -1515,7 +1511,10 @@ mod pricing_tests {
         // cache_read: 600_000 * 300_000 / 1e6 = 180_000
         // cache_write: 100_000 * 3_750_000 / 1e6 = 375_000
         // output: 500_000 * 15_000_000 / 1e6 = 7_500_000
-        assert_eq!(usage.estimate_cost_micros(&pricing), 900_000 + 180_000 + 375_000 + 7_500_000);
+        assert_eq!(
+            usage.estimate_cost_micros(&pricing),
+            900_000 + 180_000 + 375_000 + 7_500_000
+        );
     }
 
     #[test]

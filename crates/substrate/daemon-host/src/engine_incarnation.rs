@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
 use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, SessionId};
 use daemon_core::{
-    Completion, Conversation, DelegateTool, Engine, EngineProfile, EventSink, Failure, MockProvider,
-    Provider, Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
+    Completion, Conversation, DelegateTool, Engine, EngineProfile, EventSink, Failure,
+    MockProvider, Provider, Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
 };
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, Outbound,
@@ -361,7 +361,8 @@ impl Incarnation for CoreIncarnation {
         // session's `inbox/` before the engine folds the completions (the engine sees only the
         // summary text; the files land on disk). Best-effort; no-op without content transfer.
         for completion in &unapplied {
-            self.materialize_artifacts(&session_id, &completion.payload).await;
+            self.materialize_artifacts(&session_id, &completion.payload)
+                .await;
         }
         let completions = unapplied
             .into_iter()

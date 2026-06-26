@@ -36,10 +36,10 @@ pub mod background;
 pub mod blob_store;
 pub mod commands;
 pub mod config;
-pub mod cron;
-pub mod cron_catalog;
 pub mod credentials;
 pub mod credstore;
+pub mod cron;
+pub mod cron_catalog;
 pub mod cut;
 pub mod engine_incarnation;
 pub mod foreign;
@@ -57,6 +57,7 @@ pub mod transcript;
 pub mod unit;
 pub mod workspace_fs;
 
+pub use adapters::AdapterRegistry;
 pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
 pub use auth::{
@@ -66,11 +67,12 @@ pub use background::{
     background_child_id, background_kind_of, BackgroundProfile, BackgroundProfileRegistry,
     BackgroundSpawner,
 };
-pub use config::HostConfig;
-pub use cron::{BlueprintSource, CronOps};
-pub use cron_catalog::{
-    blueprint_suggestion, blueprints, starter_suggestions, BlueprintSlot, CronBlueprint, SlotKind,
+pub use blob_store::{BlobError, BlobStore, FileBlobStore, MAX_BLOB_SIZE};
+pub use commands::{
+    access_allows, caller_access, Builtin, CommandRegistry, Entry as CommandEntry,
+    Owner as CommandOwner,
 };
+pub use config::HostConfig;
 pub use credentials::{
     BrokeredCredentialProvider, CredentialBroker, FenceGuard, OwnerBroker, RelayBroker,
 };
@@ -78,10 +80,14 @@ pub use credstore::{
     CredentialStore, FileCredentialStore, MemCredentialStore, PooledStoreCredentialSource,
     StoreCredentialSource,
 };
+pub use cron::{BlueprintSource, CronOps};
+pub use cron_catalog::{
+    blueprint_suggestion, blueprints, starter_suggestions, BlueprintSlot, CronBlueprint, SlotKind,
+};
 pub use cut::{
     run_placed_child, run_placed_child_journaled, serve_credentials, CredCall, CredReplyBody,
-    CutCredentialClient, CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient, StoreCall,
-    StoreReplyBody,
+    CutCredentialClient, CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient,
+    StoreCall, StoreReplyBody,
 };
 pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
@@ -101,13 +107,7 @@ pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
     TransportPattern,
 };
-pub use blob_store::{BlobError, BlobStore, FileBlobStore, MAX_BLOB_SIZE};
-pub use commands::{
-    access_allows, caller_access, Builtin, CommandRegistry, Entry as CommandEntry, Owner as CommandOwner,
-};
-pub use adapters::AdapterRegistry;
 pub use socket::{serve_api_unix, ApiClient};
-pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
@@ -115,6 +115,7 @@ pub use supervisor::{
 };
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use unit::{EngineUnit, RewindHooks};
+pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};
 
 use async_trait::async_trait;
 use daemon_activation::{ActivationManager, EngineFactory};

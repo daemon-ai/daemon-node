@@ -123,7 +123,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 fn glob_inner(pat: &[u8], text: &[u8]) -> bool {
     match pat.first() {
         None => text.is_empty(),
-        Some(b'*') => glob_inner(&pat[1..], text) || (!text.is_empty() && glob_inner(pat, &text[1..])),
+        Some(b'*') => {
+            glob_inner(&pat[1..], text) || (!text.is_empty() && glob_inner(pat, &text[1..]))
+        }
         Some(b'?') => !text.is_empty() && glob_inner(&pat[1..], &text[1..]),
         Some(&c) => !text.is_empty() && text[0] == c && glob_inner(&pat[1..], &text[1..]),
     }

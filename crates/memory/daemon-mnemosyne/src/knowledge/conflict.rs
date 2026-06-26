@@ -81,7 +81,9 @@ pub async fn validate_conflict_pair(
     if !extractor.available() {
         return None;
     }
-    let raw = extractor.summarize(build_prompt(older_content, newer_content)).await?;
+    let raw = extractor
+        .summarize(build_prompt(older_content, newer_content))
+        .await?;
     parse_verdict(&raw)
 }
 
@@ -112,7 +114,9 @@ mod tests {
     async fn injected_provider_validates() {
         let json = r#"{"is_conflict": true, "confidence": 0.8, "correct_fact": "B"}"#;
         let e = Extractor::with_provider(Arc::new(MockProvider::completing(json)));
-        let v = validate_conflict_pair(&e, "old", "new").await.expect("verdict");
+        let v = validate_conflict_pair(&e, "old", "new")
+            .await
+            .expect("verdict");
         assert!(v.is_conflict);
     }
 }

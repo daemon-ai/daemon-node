@@ -24,7 +24,14 @@ pub struct Temporal {
 
 /// Named times of day (`temporal_parser.py` `NAMED_TIMES` L48-L57) — tag-only signals.
 const NAMED_TIMES: &[&str] = &[
-    "morning", "afternoon", "evening", "night", "midnight", "noon", "dawn", "dusk",
+    "morning",
+    "afternoon",
+    "evening",
+    "night",
+    "midnight",
+    "noon",
+    "dawn",
+    "dusk",
 ];
 
 /// Day name -> weekday (`temporal_parser.py` `DAY_MAP` L34).
@@ -169,11 +176,9 @@ pub fn parse_nl_date(text: &str, reference: NaiveDate) -> Option<(NaiveDate, Str
 
     // ---- Absolute: ISO ----
     if let Some(m) = p.iso.captures(text) {
-        if let Some(d) = NaiveDate::from_ymd_opt(
-            m[1].parse().ok()?,
-            m[2].parse().ok()?,
-            m[3].parse().ok()?,
-        ) {
+        if let Some(d) =
+            NaiveDate::from_ymd_opt(m[1].parse().ok()?, m[2].parse().ok()?, m[3].parse().ok()?)
+        {
             return Some((d, "day".into(), day_tags(d)));
         }
     }
@@ -241,7 +246,12 @@ pub fn parse_nl_date(text: &str, reference: NaiveDate) -> Option<(NaiveDate, Str
             return Some((
                 d,
                 "day".into(),
-                vec![iso(d), week_tag(d), day_name.to_string(), qualifier.to_string()],
+                vec![
+                    iso(d),
+                    week_tag(d),
+                    day_name.to_string(),
+                    qualifier.to_string(),
+                ],
             ));
         }
     }
@@ -271,8 +281,16 @@ pub fn parse_nl_date(text: &str, reference: NaiveDate) -> Option<(NaiveDate, Str
         let num: i64 = m[1].parse().ok()?;
         let unit = &m[2];
         let d = (reference.and_hms_opt(0, 0, 0)? - unit_delta(num, unit)?).date();
-        let precision = if unit == "day" || unit == "hour" { "day" } else { "week" };
-        return Some((d, precision.into(), vec![iso(d), format!("{num}-{unit}s-ago")]));
+        let precision = if unit == "day" || unit == "hour" {
+            "day"
+        } else {
+            "week"
+        };
+        return Some((
+            d,
+            precision.into(),
+            vec![iso(d), format!("{num}-{unit}s-ago")],
+        ));
     }
 
     // ---- in N units (future) ----
@@ -280,15 +298,25 @@ pub fn parse_nl_date(text: &str, reference: NaiveDate) -> Option<(NaiveDate, Str
         let num: i64 = m[1].parse().ok()?;
         let unit = &m[2];
         let d = (reference.and_hms_opt(0, 0, 0)? + unit_delta(num, unit)?).date();
-        let precision = if unit == "day" || unit == "hour" { "day" } else { "week" };
-        return Some((d, precision.into(), vec![iso(d), format!("in-{num}-{unit}s")]));
+        let precision = if unit == "day" || unit == "hour" {
+            "day"
+        } else {
+            "week"
+        };
+        return Some((
+            d,
+            precision.into(),
+            vec![iso(d), format!("in-{num}-{unit}s")],
+        ));
     }
 
     // ---- Vague ----
     if word(&lower, "recently") || word(&lower, "lately") || lower.contains("not long ago") {
         return Some((reference, "relative".into(), vec!["recently".into()]));
     }
-    if lower.contains("a while ago") || lower.contains("some time ago") || lower.contains("long ago")
+    if lower.contains("a while ago")
+        || lower.contains("some time ago")
+        || lower.contains("long ago")
     {
         return Some((reference, "relative".into(), vec!["vague".into()]));
     }
@@ -297,13 +325,24 @@ pub fn parse_nl_date(text: &str, reference: NaiveDate) -> Option<(NaiveDate, Str
 }
 
 /// Build the `this|last|next week|month|year` result (`temporal_parser.py` L233-L281).
-fn week_month_year(reference: NaiveDate, qualifier: &str, unit: &str) -> (NaiveDate, String, Vec<String>) {
+fn week_month_year(
+    reference: NaiveDate,
+    qualifier: &str,
+    unit: &str,
+) -> (NaiveDate, String, Vec<String>) {
     match (qualifier, unit) {
-        ("this", "week") => (reference, "week".into(), vec![week_tag(reference), "this-week".into()]),
+        ("this", "week") => (
+            reference,
+            "week".into(),
+            vec![week_tag(reference), "this-week".into()],
+        ),
         ("this", "month") => (
             reference,
             "month".into(),
-            vec![format!("{}-{:02}", reference.year(), reference.month()), "this-month".into()],
+            vec![
+                format!("{}-{:02}", reference.year(), reference.month()),
+                "this-month".into(),
+            ],
         ),
         ("this", "year") => (
             reference,
@@ -320,11 +359,22 @@ fn week_month_year(reference: NaiveDate, qualifier: &str, unit: &str) -> (NaiveD
             } else {
                 first_of_month(reference.year(), reference.month() - 1)
             };
-            (d, "month".into(), vec![format!("{}-{:02}", d.year(), d.month()), "last-month".into()])
+            (
+                d,
+                "month".into(),
+                vec![
+                    format!("{}-{:02}", d.year(), d.month()),
+                    "last-month".into(),
+                ],
+            )
         }
         ("last", "year") => {
             let d = first_of_month(reference.year() - 1, 1);
-            (d, "year".into(), vec![d.year().to_string(), "last-year".into()])
+            (
+                d,
+                "year".into(),
+                vec![d.year().to_string(), "last-year".into()],
+            )
         }
         ("next", "week") => {
             let d = reference + Duration::weeks(1);
@@ -336,11 +386,22 @@ fn week_month_year(reference: NaiveDate, qualifier: &str, unit: &str) -> (NaiveD
             } else {
                 first_of_month(reference.year(), reference.month() + 1)
             };
-            (d, "month".into(), vec![format!("{}-{:02}", d.year(), d.month()), "next-month".into()])
+            (
+                d,
+                "month".into(),
+                vec![
+                    format!("{}-{:02}", d.year(), d.month()),
+                    "next-month".into(),
+                ],
+            )
         }
         ("next", "year") => {
             let d = first_of_month(reference.year() + 1, 1);
-            (d, "year".into(), vec![d.year().to_string(), "next-year".into()])
+            (
+                d,
+                "year".into(),
+                vec![d.year().to_string(), "next-year".into()],
+            )
         }
         _ => (reference, "unknown".into(), Vec::new()),
     }
@@ -362,7 +423,9 @@ fn unit_delta(num: i64, unit: &str) -> Option<Duration> {
 
 /// Whole-word containment (`\b<word>\b`), avoiding substring false-positives.
 fn word(haystack: &str, w: &str) -> bool {
-    haystack.split(|c: char| !c.is_alphanumeric()).any(|t| t == w)
+    haystack
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|t| t == w)
 }
 
 /// Extract temporal info using the current UTC date as the reference.
@@ -420,7 +483,10 @@ mod tests {
         assert_eq!(t.event_date.as_deref(), Some("2026-05-20"));
         assert_eq!(t.event_date_precision, "day");
         assert!(t.temporal_tags.contains(&"wednesday".to_string()));
-        assert!(t.temporal_tags.iter().any(|x| x.starts_with("week-21-2026")));
+        assert!(t
+            .temporal_tags
+            .iter()
+            .any(|x| x.starts_with("week-21-2026")));
     }
 
     #[test]
@@ -455,20 +521,35 @@ mod tests {
         let y = parse_nl_date("yesterday", refd()).unwrap();
         assert_eq!(iso(y.0), "2026-05-17");
         assert!(y.2.contains(&"yesterday".to_string()));
-        assert_eq!(iso(parse_nl_date("tomorrow", refd()).unwrap().0), "2026-05-19");
+        assert_eq!(
+            iso(parse_nl_date("tomorrow", refd()).unwrap().0),
+            "2026-05-19"
+        );
     }
 
     #[test]
     fn relative_weekdays() {
         // Reference is Monday 2026-05-18.
         // last Monday -> previous week's Monday (7 days back).
-        assert_eq!(iso(parse_nl_date("last monday", refd()).unwrap().0), "2026-05-11");
+        assert_eq!(
+            iso(parse_nl_date("last monday", refd()).unwrap().0),
+            "2026-05-11"
+        );
         // this Friday -> most recent Friday on/before ref => 2026-05-15.
-        assert_eq!(iso(parse_nl_date("this friday", refd()).unwrap().0), "2026-05-15");
+        assert_eq!(
+            iso(parse_nl_date("this friday", refd()).unwrap().0),
+            "2026-05-15"
+        );
         // next Friday -> upcoming Friday => 2026-05-22.
-        assert_eq!(iso(parse_nl_date("next friday", refd()).unwrap().0), "2026-05-22");
+        assert_eq!(
+            iso(parse_nl_date("next friday", refd()).unwrap().0),
+            "2026-05-22"
+        );
         // next Monday when ref is Monday -> +7.
-        assert_eq!(iso(parse_nl_date("next monday", refd()).unwrap().0), "2026-05-25");
+        assert_eq!(
+            iso(parse_nl_date("next monday", refd()).unwrap().0),
+            "2026-05-25"
+        );
     }
 
     #[test]

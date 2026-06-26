@@ -1733,8 +1733,9 @@ mod node_interface {
         use daemon_host::{MemCredentialStore, MemProfileStore};
         let resolver: daemon_node::ProviderResolver = Arc::new(|spec: &daemon_api::ProfileSpec| {
             let reply = format!("[{}] hello from {}", spec.id, spec.model);
-            let builder: daemon_core::ProviderBuilder =
-                Arc::new(move || Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
             builder
         });
         let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
@@ -1787,8 +1788,12 @@ mod node_interface {
         std::fs::create_dir_all(&dir).unwrap();
         let store: Arc<dyn SessionStore> =
             Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-        let AssembledNode { node, handle, signer, .. } =
-            assemble_over(store.clone(), 0, [0x5d; 32], fast_host_config());
+        let AssembledNode {
+            node,
+            handle,
+            signer,
+            ..
+        } = assemble_over(store.clone(), 0, [0x5d; 32], fast_host_config());
 
         // Register the Rooms adapter (enabled) + a Matrix adapter (off; enumeration only), then drive
         // lifecycle from the node exactly as `bins/daemon` does.
@@ -1798,7 +1803,11 @@ mod node_interface {
         };
         let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
         let registry = daemon_host::AdapterRegistry::new()
-            .with_adapter(daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg))
+            .with_adapter(daemon_rooms::RoomsAdapter::new(
+                store.clone(),
+                signer,
+                rooms_cfg,
+            ))
             .with_adapter(daemon_matrix::MatrixAdapter::new(
                 provisioning,
                 daemon_matrix::MatrixConfig::default(),
@@ -1835,7 +1844,10 @@ mod node_interface {
         // ConvCreate("room", …) then ConvList("room") returns it.
         let mut details = daemon_api::CreateConversationDetails::default();
         details.extras.values.insert("id".into(), "r1".into());
-        details.extras.values.insert("name".into(), "Room One".into());
+        details
+            .extras
+            .values
+            .insert("name".into(), "Room One".into());
         details
             .extras
             .values
@@ -1982,10 +1994,15 @@ mod node_interface {
         let mut rr = daemon_api::CreateConversationDetails::default();
         rr.extras.values.insert("id".into(), "r2".into());
         rr.extras.values.insert("name".into(), "Round Robin".into());
-        rr.extras.values.insert("policy".into(), "round_robin".into());
+        rr.extras
+            .values
+            .insert("policy".into(), "round_robin".into());
         assert!(matches!(
             client
-                .call(ApiRequest::ConvCreate { transport: room.clone(), details: rr })
+                .call(ApiRequest::ConvCreate {
+                    transport: room.clone(),
+                    details: rr
+                })
                 .await
                 .unwrap(),
             ApiResponse::Conversation(Some(_))
@@ -2009,7 +2026,11 @@ mod node_interface {
             ));
         }
         let r2 = conv_get(&client, &room, "r2").await;
-        let sessions: Vec<_> = r2.members.iter().filter_map(|m| m.session.clone()).collect();
+        let sessions: Vec<_> = r2
+            .members
+            .iter()
+            .filter_map(|m| m.session.clone())
+            .collect();
         assert_eq!(sessions.len(), 2, "two agent members bound");
 
         // An operator post kicks off the round-robin cascade: member A opens a turn; its reply
@@ -2032,7 +2053,10 @@ mod node_interface {
             while Instant::now() < deadline && opened.len() < sessions.len() {
                 for s in &sessions {
                     if let ApiResponse::Drained(items) = client
-                        .call(ApiRequest::Poll { session: s.clone(), max: 0 })
+                        .call(ApiRequest::Poll {
+                            session: s.clone(),
+                            max: 0,
+                        })
                         .await
                         .unwrap()
                     {
@@ -2081,7 +2105,10 @@ mod node_interface {
         // Delete the room: it disappears from `get`.
         assert!(matches!(
             client
-                .call(ApiRequest::ConvDelete { transport: room.clone(), conv: "r2".into() })
+                .call(ApiRequest::ConvDelete {
+                    transport: room.clone(),
+                    conv: "r2".into()
+                })
                 .await
                 .unwrap(),
             ApiResponse::Ok
@@ -2089,7 +2116,10 @@ mod node_interface {
         assert!(
             matches!(
                 client
-                    .call(ApiRequest::ConvGet { transport: room.clone(), conv: "r2".into() })
+                    .call(ApiRequest::ConvGet {
+                        transport: room.clone(),
+                        conv: "r2".into()
+                    })
                     .await
                     .unwrap(),
                 ApiResponse::Conversation(None)
@@ -2177,7 +2207,13 @@ mod node_interface {
 
         // Write + read round-trips in the workspace root.
         let rev = node
-            .fs_write(FsRootId::Workspace, "notes/hello.txt".into(), b"hi".to_vec(), None, false)
+            .fs_write(
+                FsRootId::Workspace,
+                "notes/hello.txt".into(),
+                b"hi".to_vec(),
+                None,
+                false,
+            )
             .await
             .expect("write");
         assert_eq!(rev.size, 2);
@@ -2198,11 +2234,23 @@ mod node_interface {
 
         // The sensitive-path gate blocks a dotenv write unless forced.
         let blocked = node
-            .fs_write(FsRootId::Workspace, ".env".into(), b"SECRET=1".to_vec(), None, false)
+            .fs_write(
+                FsRootId::Workspace,
+                ".env".into(),
+                b"SECRET=1".to_vec(),
+                None,
+                false,
+            )
             .await;
         assert!(blocked.is_err(), "a .env write should be gated");
         let forced = node
-            .fs_write(FsRootId::Workspace, ".env".into(), b"SECRET=1".to_vec(), None, true)
+            .fs_write(
+                FsRootId::Workspace,
+                ".env".into(),
+                b"SECRET=1".to_vec(),
+                None,
+                true,
+            )
             .await;
         assert!(forced.is_ok(), "force overrides the sensitive-path gate");
 
@@ -2262,7 +2310,10 @@ mod node_interface {
         });
 
         // put -> get round-trip.
-        let r = node.blob_put(b"content-addressed".to_vec()).await.expect("put");
+        let r = node
+            .blob_put(b"content-addressed".to_vec())
+            .await
+            .expect("put");
         assert_eq!(r.size, 17);
         assert_eq!(
             node.blob_get(r.hash, None).await.expect("get"),
@@ -2275,20 +2326,41 @@ mod node_interface {
         assert_eq!(r.hash, r2.hash);
 
         // fs_read attaches a matching blob_ref for an untruncated read.
-        node.fs_write(FsRootId::Workspace, "doc.txt".into(), b"hi there".to_vec(), None, false)
+        node.fs_write(
+            FsRootId::Workspace,
+            "doc.txt".into(),
+            b"hi there".to_vec(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let read = node
+            .fs_read(FsRootId::Workspace, "doc.txt".into(), 0)
             .await
             .unwrap();
-        let read = node.fs_read(FsRootId::Workspace, "doc.txt".into(), 0).await.unwrap();
         let read_ref = read.blob_ref.expect("blob_ref attached");
         assert_eq!(read_ref.size, 8);
         // The attached ref resolves to the same bytes via the content store.
-        assert_eq!(node.blob_get(read_ref.hash, None).await.unwrap(), b"hi there");
+        assert_eq!(
+            node.blob_get(read_ref.hash, None).await.unwrap(),
+            b"hi there"
+        );
 
         // fs_write_from_blob materializes a blob into the workspace in place.
-        node.fs_write_from_blob(FsRootId::Workspace, "from_blob.txt".into(), r.hash, None, false)
-            .await
-            .expect("materialize");
-        assert_eq!(std::fs::read(ws.join("from_blob.txt")).unwrap(), b"content-addressed");
+        node.fs_write_from_blob(
+            FsRootId::Workspace,
+            "from_blob.txt".into(),
+            r.hash,
+            None,
+            false,
+        )
+        .await
+        .expect("materialize");
+        assert_eq!(
+            std::fs::read(ws.join("from_blob.txt")).unwrap(),
+            b"content-addressed"
+        );
 
         // Integrity: tampering with the on-disk blob fails a full get.
         let path = blobs.join(format!("{}.bin", r.hash.to_hex()));
@@ -2311,7 +2383,8 @@ mod node_interface {
         use daemon_protocol::{AgentCommand, UserMsg};
 
         let ws = std::env::temp_dir().join(format!("daemon-attach-it-ws-{}", std::process::id()));
-        let blobs = std::env::temp_dir().join(format!("daemon-attach-it-cas-{}", std::process::id()));
+        let blobs =
+            std::env::temp_dir().join(format!("daemon-attach-it-cas-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&blobs);
         std::fs::create_dir_all(&ws).unwrap();
@@ -2348,7 +2421,10 @@ mod node_interface {
         });
 
         // The client stages the attachment in the content store, then names it on the turn.
-        let r = node.blob_put(b"attached payload".to_vec()).await.expect("put");
+        let r = node
+            .blob_put(b"attached payload".to_vec())
+            .await
+            .expect("put");
         let att = BlobRef::new(r.hash, r.size).with_name("hello.txt");
         let session = SessionId::new("attach-session");
         node.submit(
@@ -2364,7 +2440,11 @@ mod node_interface {
         // The node materialized the blob into the session's inbox/ (visible via the fs surface, and
         // on disk where the agent's tools operate).
         let read = node
-            .fs_read(FsRootId::Session(session.clone()), "inbox/hello.txt".into(), 0)
+            .fs_read(
+                FsRootId::Session(session.clone()),
+                "inbox/hello.txt".into(),
+                0,
+            )
             .await
             .expect("read materialized attachment");
         assert_eq!(read.bytes, b"attached payload");
@@ -2516,11 +2596,7 @@ mod node_interface {
             enabled: true,
             ..daemon_api::CronSpec::default()
         };
-        let id = match client
-            .call(ApiRequest::CronCreate { spec })
-            .await
-            .unwrap()
-        {
+        let id = match client.call(ApiRequest::CronCreate { spec }).await.unwrap() {
             ApiResponse::CronId(id) => id,
             other => panic!("expected CronId, got {other:?}"),
         };
@@ -2611,7 +2687,10 @@ mod node_interface {
                     break session;
                 }
             }
-            assert!(Instant::now() < deadline, "cron_trigger never recorded a run");
+            assert!(
+                Instant::now() < deadline,
+                "cron_trigger never recorded a run"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -2762,7 +2841,9 @@ mod node_interface {
         // Dismiss -> latched.
         assert!(matches!(
             client
-                .call(ApiRequest::CronDismissSuggestion { id: dismiss_id.clone() })
+                .call(ApiRequest::CronDismissSuggestion {
+                    id: dismiss_id.clone()
+                })
                 .await
                 .unwrap(),
             ApiResponse::Ok
@@ -2771,7 +2852,9 @@ mod node_interface {
         // Neither the accepted nor the dismissed suggestion is re-offered (latched by dedup_key).
         let remaining = node.cron_suggestions().await;
         assert!(
-            !remaining.iter().any(|s| s.id == accept_id || s.id == dismiss_id),
+            !remaining
+                .iter()
+                .any(|s| s.id == accept_id || s.id == dismiss_id),
             "accepted/dismissed suggestions are latched out of the pending list"
         );
 
@@ -2973,7 +3056,10 @@ mod node_interface {
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "the assigned session never completed");
+            assert!(
+                Instant::now() < deadline,
+                "the assigned session never completed"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -2985,7 +3071,10 @@ mod node_interface {
             .find(|n| n.kind == daemon_api::UnitKind::Engine)
             .and_then(|n| n.session.clone())
             .expect("a managed child session is present in the tree");
-        assert_ne!(child, session, "the child is a distinct session from the parent");
+        assert_ne!(
+            child, session,
+            "the child is a distinct session from the parent"
+        );
 
         // The child carries role ManagedChild + parent in the roster (the A1 stamp).
         let all = node
@@ -3011,10 +3100,7 @@ mod node_interface {
         );
 
         // TopLevel (the inbox) excludes the managed child; the parent stays.
-        let top = node
-            .sessions_query(SessionQuery::default())
-            .await
-            .sessions;
+        let top = node.sessions_query(SessionQuery::default()).await.sessions;
         assert!(
             top.iter().all(|i| i.role == SessionRole::Primary),
             "TopLevel must contain only Primary conversations"
@@ -3035,7 +3121,10 @@ mod node_interface {
             ApiResponse::SessionPage(page) => page.sessions,
             other => panic!("expected SessionPage, got {other:?}"),
         };
-        assert_eq!(top, socket_top, "TopLevel roster must agree across transports");
+        assert_eq!(
+            top, socket_top,
+            "TopLevel roster must agree across transports"
+        );
 
         server.abort();
         handle.shutdown().await;
@@ -3054,7 +3143,9 @@ mod node_interface {
         let (node, handle) = assemble();
 
         // Several live top-level sessions.
-        let ids: Vec<SessionId> = (0..5).map(|n| SessionId::new(format!("page-{n}"))).collect();
+        let ids: Vec<SessionId> = (0..5)
+            .map(|n| SessionId::new(format!("page-{n}")))
+            .collect();
         for id in &ids {
             node.submit(
                 id.clone(),
@@ -3130,7 +3221,9 @@ mod node_interface {
         let (node, handle) = assemble();
         let profile = ProfileRef::new("openai");
 
-        let ids: Vec<SessionId> = (0..2).map(|n| SessionId::new(format!("byprof-{n}"))).collect();
+        let ids: Vec<SessionId> = (0..2)
+            .map(|n| SessionId::new(format!("byprof-{n}")))
+            .collect();
         for id in &ids {
             node.submit_as(
                 id.clone(),
@@ -3171,7 +3264,12 @@ mod node_interface {
         use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId, UserMsg};
 
         let (node, handle) = assemble();
-        let origin = Origin::new("telegram", OriginScope::Dm { user: "alice".into() });
+        let origin = Origin::new(
+            "telegram",
+            OriginScope::Dm {
+                user: "alice".into(),
+            },
+        );
         let pinned = SessionId::new("pinned-chat");
 
         node.routing_bind_chat(origin.clone(), pinned.clone(), None)
@@ -3183,7 +3281,10 @@ mod node_interface {
             .routing_get(origin.clone())
             .await
             .expect("a pinned route");
-        assert_eq!(got.session, pinned, "routing_get returns the pinned session");
+        assert_eq!(
+            got.session, pinned,
+            "routing_get returns the pinned session"
+        );
 
         // Resolve-first: a routed submit lands on the pinned session id.
         let resolved = node
@@ -3372,11 +3473,9 @@ mod node_interface {
         // (b)+(c) A live delta arrives promptly (a managed-child spawn passes the ephemeral filter).
         // No poll interval is involved: the bus pushes the delta as soon as the child is created.
         let pushed = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match stream.next().await {
-                    Some(ev) => return ev,
-                    None => panic!("the stream closed before a live delta"),
-                }
+            match stream.next().await {
+                Some(ev) => ev,
+                None => panic!("the stream closed before a live delta"),
             }
         })
         .await
@@ -3760,9 +3859,7 @@ mod node_interface {
     /// This is the demo gate that says "the GUI can be built against this surface."
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn phase0_gui_readiness_demo_gate() {
-        use daemon_api::{
-            ApiRequest, ApiResponse, Outbound, ProfileSpec, ProviderSelector,
-        };
+        use daemon_api::{ApiRequest, ApiResponse, Outbound, ProfileSpec, ProviderSelector};
         use daemon_common::ReqId;
         use daemon_protocol::{AgentCommand, AgentEvent, UserMsg};
 
@@ -3786,7 +3883,10 @@ mod node_interface {
         ));
         match client.call(ApiRequest::CredentialList).await.unwrap() {
             ApiResponse::Credentials(creds) => {
-                let opus = creds.iter().find(|c| c.profile == "opus").expect("opus credential");
+                let opus = creds
+                    .iter()
+                    .find(|c| c.profile == "opus")
+                    .expect("opus credential");
                 assert!(opus.present, "the set credential should report present");
                 assert_eq!(opus.hint, "…1234", "the listing is redacted to a tail hint");
                 assert!(!opus.hint.contains("abcd"), "the secret is never returned");
@@ -4024,7 +4124,9 @@ mod node_interface {
         );
         assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 3);
         // Roll-forward = revert to the later seq 2 (the sonnet model).
-        node.profile_revert("p1".into(), 2).await.expect("roll forward");
+        node.profile_revert("p1".into(), 2)
+            .await
+            .expect("roll forward");
         assert_eq!(
             node.profile_get("p1".into()).await.unwrap().unwrap().model,
             "claude-3-5-sonnet-latest"
@@ -4064,7 +4166,9 @@ mod node_interface {
             "tool writes are attributed to the agent"
         );
         // Revert the skill to its first revision (description v1).
-        node.skill_revert("mine".into(), 1).await.expect("skill revert");
+        node.skill_revert("mine".into(), 1)
+            .await
+            .expect("skill revert");
         assert!(p1_skills
             .view("mine", None)
             .unwrap()
@@ -4073,7 +4177,10 @@ mod node_interface {
         // Binary-bundled skills are read-only: revert is rejected.
         let bundled = daemon_skills::bundled_names();
         let bundled_name = bundled.iter().next().expect("at least one bundled skill");
-        let err = node.skill_revert(bundled_name.clone(), 1).await.unwrap_err();
+        let err = node
+            .skill_revert(bundled_name.clone(), 1)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, daemon_api::ApiError::Conflict(_)),
             "bundled skill revert should be rejected, got {err:?}"
@@ -4117,7 +4224,11 @@ mod node_interface {
             "the imported distribution reconstituted the local skill into the imported profile's dir"
         );
         assert_eq!(
-            node2.profile_history("imported".into()).await.unwrap().len(),
+            node2
+                .profile_history("imported".into())
+                .await
+                .unwrap()
+                .len(),
             1,
             "an imported profile seeds a fresh history"
         );
@@ -4262,7 +4373,10 @@ mod node_interface {
         node.curator_restore(Some("p1".into()), "beta".into())
             .await
             .expect("restore beta");
-        assert!(p1.find("beta").is_ok(), "restored beta is discoverable again");
+        assert!(
+            p1.find("beta").is_ok(),
+            "restored beta is discoverable again"
+        );
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -4283,8 +4397,8 @@ mod node_interface {
             ScopePattern, SessionBinding, TransportPattern,
         };
         use daemon_protocol::{
-            AgentCommand, AgentEvent, DeliveryTarget, IsolationPolicy, Origin, OriginScope, SinkKind,
-            TransportId, UserMsg,
+            AgentCommand, AgentEvent, DeliveryTarget, IsolationPolicy, Origin, OriginScope,
+            SinkKind, TransportId, UserMsg,
         };
 
         // Three profiles, each echoing its id+model through the mock provider so the reply reveals
@@ -4359,10 +4473,7 @@ mod node_interface {
         });
 
         // Drive a routed submit for `origin` and return (resolved session, final text).
-        async fn route_and_drain(
-            node: &Arc<NodeApiImpl>,
-            origin: Origin,
-        ) -> (SessionId, String) {
+        async fn route_and_drain(node: &Arc<NodeApiImpl>, origin: Origin) -> (SessionId, String) {
             let session = node
                 .submit_routed(
                     origin,
@@ -4418,14 +4529,26 @@ mod node_interface {
         let (session_secops, text_secops) = route_and_drain(&node, origin_secops.clone()).await;
 
         // 1+2. Each origin ran the agent the registry selected (account baseline + room override).
-        assert!(text_a.contains("[alpha]"), "account A -> alpha, got {text_a:?}");
-        assert!(text_b.contains("[beta]"), "account B -> beta, got {text_b:?}");
+        assert!(
+            text_a.contains("[alpha]"),
+            "account A -> alpha, got {text_a:?}"
+        );
+        assert!(
+            text_b.contains("[beta]"),
+            "account B -> beta, got {text_b:?}"
+        );
         assert!(
             text_secops.contains("[secops]"),
             "account A #secops -> override profile, got {text_secops:?}"
         );
-        assert_ne!(session_a, session_b, "distinct accounts -> distinct sessions");
-        assert_ne!(session_a, session_secops, "override room is its own session");
+        assert_ne!(
+            session_a, session_b,
+            "distinct accounts -> distinct sessions"
+        );
+        assert_ne!(
+            session_a, session_secops,
+            "override room is its own session"
+        );
 
         // 3. The Primary is the inverse of the opening origin (reply leaves the right account/room).
         let targets_a = node.delivery_targets(session_a.clone()).await;
@@ -4442,7 +4565,10 @@ mod node_interface {
             .await
             .expect("handover");
         let after = node.delivery_targets(session_a.clone()).await;
-        let primaries: Vec<_> = after.iter().filter(|t| t.kind == SinkKind::Primary).collect();
+        let primaries: Vec<_> = after
+            .iter()
+            .filter(|t| t.kind == SinkKind::Primary)
+            .collect();
         assert_eq!(primaries.len(), 1, "exactly one Primary after handover");
         assert_eq!(primaries[0].transport, TransportId::new("gui"));
         assert!(
@@ -4471,7 +4597,9 @@ mod node_interface {
         };
         use daemon_common::ReqId;
         use daemon_host::{MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
-        use daemon_protocol::{AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg};
+        use daemon_protocol::{
+            AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg,
+        };
 
         // An echoing resolver: the reply reveals which profile (agent) ran the session.
         fn echo_resolver() -> daemon_node::ProviderResolver {
@@ -4500,7 +4628,10 @@ mod node_interface {
             store
                 .create(
                     ProfileSpec::new("beta", ProviderSelector::GenAi, "model-b")
-                        .with_bound_accounts(vec![BoundAccount::new("matrix/@b:hs", "matrix/beta/b")]),
+                        .with_bound_accounts(vec![BoundAccount::new(
+                            "matrix/@b:hs",
+                            "matrix/beta/b",
+                        )]),
                 )
                 .expect("create beta");
             store.set_active("alpha").expect("set active");
@@ -4658,8 +4789,9 @@ mod node_interface {
     async fn interactive_auth_generic_begin_complete_binds_and_lists() {
         use async_trait::async_trait;
         use daemon_api::{
-            ApiError, AuthApi, AuthBeginRequest, AuthBindRequest, AuthCompleteRequest, AuthFlowKind,
-            AuthParamField, AuthProviderInfo, CredentialApi, ProfileSpec, ProviderSelector,
+            ApiError, AuthApi, AuthBeginRequest, AuthBindRequest, AuthCompleteRequest,
+            AuthFlowKind, AuthParamField, AuthProviderInfo, CredentialApi, ProfileSpec,
+            ProviderSelector,
         };
         use daemon_host::{
             AuthFlowFactory, AuthOutcome, MemCredentialStore, MemProfileStore, PendingAuthFlow,
@@ -4723,7 +4855,11 @@ mod node_interface {
 
         let profiles = Arc::new(MemProfileStore::new());
         profiles
-            .create(ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a"))
+            .create(ProfileSpec::new(
+                "alpha",
+                ProviderSelector::GenAi,
+                "model-a",
+            ))
             .expect("create alpha");
         let creds = Arc::new(MemCredentialStore::new());
 
@@ -4806,7 +4942,10 @@ mod node_interface {
         assert_eq!(done.credential_ref, "stub/acct");
         assert_eq!(done.account_label, "stub-user");
         assert_eq!(done.transport_instance.as_str(), "stub/stub-user");
-        assert_eq!(done.bound_profile.as_ref().map(|p| p.as_str()), Some("alpha"));
+        assert_eq!(
+            done.bound_profile.as_ref().map(|p| p.as_str()),
+            Some("alpha")
+        );
 
         let listed = node.credential_list().await;
         assert!(
@@ -4816,9 +4955,9 @@ mod node_interface {
 
         let alpha = profiles.get("alpha").unwrap().unwrap();
         assert!(
-            alpha.bound_accounts.iter().any(|a| a.transport_instance
-                == "stub/stub-user"
-                && a.credential_ref == "stub/acct"),
+            alpha.bound_accounts.iter().any(
+                |a| a.transport_instance == "stub/stub-user" && a.credential_ref == "stub/acct"
+            ),
             "alpha gained the bound account: {:?}",
             alpha.bound_accounts
         );
@@ -4830,7 +4969,10 @@ mod node_interface {
                 callback: "http://127.0.0.1:7777/cb?code=abc".into(),
             })
             .await;
-        assert!(reuse.is_err(), "a consumed flow_id cannot be completed twice");
+        assert!(
+            reuse.is_err(),
+            "a consumed flow_id cannot be completed twice"
+        );
 
         // (4b) a cancelled flow cannot complete.
         let begun2 = node
@@ -4878,9 +5020,8 @@ mod node_interface {
         let store = Arc::new(MemProfileStore::new());
         store
             .create(
-                ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a").with_bound_accounts(
-                    vec![BoundAccount::new("matrix/@a:hs", "matrix/alpha/a")],
-                ),
+                ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a")
+                    .with_bound_accounts(vec![BoundAccount::new("matrix/@a:hs", "matrix/alpha/a")]),
             )
             .expect("create alpha");
         store
@@ -4928,13 +5069,27 @@ mod node_interface {
 
         // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.
         let mut matrix = node.bound_accounts("matrix");
-        matrix.sort_by(|a, b| a.transport_instance.as_str().cmp(b.transport_instance.as_str()));
-        assert_eq!(matrix.len(), 2, "two matrix accounts, slack excluded: {matrix:?}");
+        matrix.sort_by(|a, b| {
+            a.transport_instance
+                .as_str()
+                .cmp(b.transport_instance.as_str())
+        });
+        assert_eq!(
+            matrix.len(),
+            2,
+            "two matrix accounts, slack excluded: {matrix:?}"
+        );
         assert_eq!(matrix[0].profile, ProfileRef::new("alpha"));
-        assert_eq!(matrix[0].transport_instance, TransportId::new("matrix/@a:hs"));
+        assert_eq!(
+            matrix[0].transport_instance,
+            TransportId::new("matrix/@a:hs")
+        );
         assert_eq!(matrix[0].credential_ref, "matrix/alpha/a");
         assert_eq!(matrix[1].profile, ProfileRef::new("beta"));
-        assert_eq!(matrix[1].transport_instance, TransportId::new("matrix/@b:hs"));
+        assert_eq!(
+            matrix[1].transport_instance,
+            TransportId::new("matrix/@b:hs")
+        );
         assert_eq!(matrix[1].credential_ref, "matrix/beta/b");
         assert_eq!(
             node.bound_accounts("slack").len(),
@@ -4989,7 +5144,9 @@ mod node_interface {
     async fn delivery_sink_push_honors_handover() {
         use daemon_api::{DeliverySink, Outbound, ProfileSpec, ProviderSelector, SessionApi};
         use daemon_common::ReqId;
-        use daemon_host::{DeliveryHost, MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
+        use daemon_host::{
+            DeliveryHost, MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry,
+        };
         use daemon_protocol::{
             AgentCommand, AgentEvent, DeliveryTarget, Origin, OriginScope, SessionLogEntry,
             SessionPayload, SinkKind, TransportId, UserMsg,
@@ -5031,8 +5188,9 @@ mod node_interface {
 
         let resolver: daemon_node::ProviderResolver = Arc::new(|spec: &ProfileSpec| {
             let reply = format!("[{}]", spec.id);
-            let builder: daemon_core::ProviderBuilder =
-                Arc::new(move || Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
             builder
         });
 
@@ -5132,7 +5290,11 @@ mod node_interface {
             wait_finished(&matrix_sink, 1).await,
             "the matrix sink should receive the first turn's TurnFinished via push"
         );
-        assert_eq!(gui_sink.turn_finished_count(), 0, "gui is not yet the Primary");
+        assert_eq!(
+            gui_sink.turn_finished_count(),
+            0,
+            "gui is not yet the Primary"
+        );
 
         // 2. Hand the Primary over to the GUI; the matrix account is demoted to Spectator.
         let gui = DeliveryTarget::new("gui", "panel-1", SinkKind::Primary);
@@ -5228,8 +5390,9 @@ mod node_interface {
 
         let resolver: daemon_node::ProviderResolver = Arc::new(|spec: &ProfileSpec| {
             let reply = format!("[{}]", spec.id);
-            let builder: daemon_core::ProviderBuilder =
-                Arc::new(move || Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
             builder
         });
 
@@ -5313,10 +5476,22 @@ mod node_interface {
         let session_b = drive_turn(&node, origin_b.clone(), 2).await;
 
         // 1. Owned-session discovery is scoped to the instance's Primary.
-        let owned_a = node.delivery_sessions(TransportId::new("matrix/@a:hs")).await;
-        assert_eq!(owned_a, vec![session_a.clone()], "@a:hs owns exactly session_a");
-        let owned_b = node.delivery_sessions(TransportId::new("matrix/@b:hs")).await;
-        assert_eq!(owned_b, vec![session_b.clone()], "@b:hs owns exactly session_b");
+        let owned_a = node
+            .delivery_sessions(TransportId::new("matrix/@a:hs"))
+            .await;
+        assert_eq!(
+            owned_a,
+            vec![session_a.clone()],
+            "@a:hs owns exactly session_a"
+        );
+        let owned_b = node
+            .delivery_sessions(TransportId::new("matrix/@b:hs"))
+            .await;
+        assert_eq!(
+            owned_b,
+            vec![session_b.clone()],
+            "@b:hs owns exactly session_b"
+        );
 
         // 2. The reusable pull subscriber discovers + projects @a:hs's owned session.
         let recorder = Arc::new(Recorder::default());
@@ -5346,7 +5521,9 @@ mod node_interface {
         // 3. Hand session_a over to a GUI; @a:hs is demoted, so it no longer owns the session, and a
         // subsequent live event makes the subscription halt (still-owns re-check fails).
         let gui = DeliveryTarget::new("gui", "panel-1", SinkKind::Primary);
-        node.handover(session_a.clone(), gui).await.expect("handover");
+        node.handover(session_a.clone(), gui)
+            .await
+            .expect("handover");
         assert!(
             node.delivery_sessions(TransportId::new("matrix/@a:hs"))
                 .await
@@ -5394,7 +5571,9 @@ mod node_interface {
     async fn routed_profiles_get_isolated_memory_banks() {
         use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
         use daemon_common::ReqId;
-        use daemon_core::{EngineProfile, MemoryBuilder, MemoryProvider, SystemPrompt, ToolRegistry};
+        use daemon_core::{
+            EngineProfile, MemoryBuilder, MemoryProvider, SystemPrompt, ToolRegistry,
+        };
         use daemon_host::{MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
         use daemon_protocol::{
             AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg,
@@ -5534,7 +5713,10 @@ mod node_interface {
             alpha_dir.is_dir() && beta_dir.is_dir(),
             "both per-profile bank dirs exist on disk"
         );
-        assert_ne!(alpha_dir, beta_dir, "two routed profiles -> two isolated banks");
+        assert_ne!(
+            alpha_dir, beta_dir,
+            "two routed profiles -> two isolated banks"
+        );
 
         handle.shutdown().await;
 
@@ -5576,8 +5758,12 @@ mod node_interface {
     async fn session_overlay_persists_and_restores_on_respawn() {
         use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
         use daemon_common::ReqId;
-        use daemon_host::{decode_overlay, MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
-        use daemon_protocol::{AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg};
+        use daemon_host::{
+            decode_overlay, MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry,
+        };
+        use daemon_protocol::{
+            AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg,
+        };
         use std::sync::Mutex;
 
         // A resolver that records every model id it is asked to build a provider for — our window
@@ -5588,14 +5774,19 @@ mod node_interface {
         let resolver: daemon_node::ProviderResolver = Arc::new(move |spec: &ProfileSpec| {
             seen2.lock().unwrap().push(spec.model.clone());
             let reply = spec.model.clone();
-            let builder: daemon_core::ProviderBuilder =
-                Arc::new(move || Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
             builder
         });
 
         let pstore = Arc::new(MemProfileStore::new());
         pstore
-            .create(ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a"))
+            .create(ProfileSpec::new(
+                "alpha",
+                ProviderSelector::GenAi,
+                "model-a",
+            ))
             .expect("create profile");
         pstore.set_active("alpha").expect("set active");
 
@@ -5665,7 +5856,10 @@ mod node_interface {
             .expect("set_session_model");
 
         // The override is durably recorded as host-level session metadata (bound profile + overlay).
-        let meta = store.session_meta(&session).await.expect("session meta recorded");
+        let meta = store
+            .session_meta(&session)
+            .await
+            .expect("session meta recorded");
         assert_eq!(
             meta.bound_profile.as_ref().map(|p| p.as_str()),
             Some("alpha"),
@@ -5693,7 +5887,10 @@ mod node_interface {
             )
             .await
             .expect("reopen the routed session");
-        assert_eq!(reopened, session, "the same origin resolves the same session");
+        assert_eq!(
+            reopened, session,
+            "the same origin resolves the same session"
+        );
 
         // Drive the reopened turn to completion so we know the rebuild happened.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -5794,8 +5991,12 @@ mod node_interface {
         let conv_has = |view: &ConvView, needle: &str| -> bool {
             view.turns.iter().any(|t| t.text.contains(needle))
         };
-        let started_count =
-            |events: &[AgentEvent]| events.iter().filter(|e| matches!(e, AgentEvent::TurnStarted { .. })).count();
+        let started_count = |events: &[AgentEvent]| {
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::TurnStarted { .. }))
+                .count()
+        };
 
         // ---------------------------- idle ----------------------------
         let (node, handle) = assemble();
@@ -5837,12 +6038,20 @@ mod node_interface {
             "exactly one turn ran (the StartTurn, not the prior Observe)"
         );
 
-        node.submit(idle.clone(), AgentCommand::Snapshot { request_id: ReqId(3) })
-            .await
-            .expect("snapshot");
-        drain_until(&node, &idle, &mut idle_events, |e| {
-            matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(3))
-        })
+        node.submit(
+            idle.clone(),
+            AgentCommand::Snapshot {
+                request_id: ReqId(3),
+            },
+        )
+        .await
+        .expect("snapshot");
+        drain_until(
+            &node,
+            &idle,
+            &mut idle_events,
+            |e| matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(3)),
+        )
         .await;
         let view = snapshot_view(&idle_events, ReqId(3));
         assert!(
@@ -5952,12 +6161,20 @@ mod node_interface {
             "the mid-turn Observe started no turn of its own: {busy_events:?}"
         );
 
-        node.submit(busy.clone(), AgentCommand::Snapshot { request_id: ReqId(3) })
-            .await
-            .expect("snapshot");
-        drain_until(&node, &busy, &mut busy_events, |e| {
-            matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(3))
-        })
+        node.submit(
+            busy.clone(),
+            AgentCommand::Snapshot {
+                request_id: ReqId(3),
+            },
+        )
+        .await
+        .expect("snapshot");
+        drain_until(
+            &node,
+            &busy,
+            &mut busy_events,
+            |e| matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(3)),
+        )
         .await;
         let view = snapshot_view(&busy_events, ReqId(3));
         assert!(
@@ -6031,7 +6248,10 @@ mod node_interface {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(started, 0, "an ambient reception via the gate starts no turn");
+        assert_eq!(
+            started, 0,
+            "an ambient reception via the gate starts no turn"
+        );
 
         // Addressed message -> StartTurn on the same session.
         let s2 = ing
@@ -6053,21 +6273,32 @@ mod node_interface {
             .iter()
             .filter(|e| matches!(e, AgentEvent::TurnStarted { .. }))
             .count();
-        assert_eq!(started_turns, 1, "the addressed reception ran exactly one turn");
+        assert_eq!(
+            started_turns, 1,
+            "the addressed reception ran exactly one turn"
+        );
 
-        node.submit(session.clone(), AgentCommand::Snapshot { request_id: ReqId(99) })
-            .await
-            .expect("snapshot");
-        drain_until(&node, &session, &mut events, |e| {
-            matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(99))
-        })
+        node.submit(
+            session.clone(),
+            AgentCommand::Snapshot {
+                request_id: ReqId(99),
+            },
+        )
+        .await
+        .expect("snapshot");
+        drain_until(
+            &node,
+            &session,
+            &mut events,
+            |e| matches!(e, AgentEvent::Snapshot { request_id, .. } if *request_id == ReqId(99)),
+        )
         .await;
         let view: ConvView = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::Snapshot { request_id, view, .. } if *request_id == ReqId(99) => {
-                    Some(view.clone())
-                }
+                AgentEvent::Snapshot {
+                    request_id, view, ..
+                } if *request_id == ReqId(99) => Some(view.clone()),
                 _ => None,
             })
             .expect("a Snapshot view");
@@ -6076,7 +6307,10 @@ mod node_interface {
             conv_has("launch code is 4242"),
             "the gate's Observe folded the ambient context into the conversation: {view:?}"
         );
-        assert!(conv_has("what is the code?"), "the addressed turn shares that conversation");
+        assert!(
+            conv_has("what is the code?"),
+            "the addressed turn shares that conversation"
+        );
         handle.shutdown().await;
     }
 
@@ -6128,7 +6362,10 @@ mod node_interface {
                 if events.iter().filter(|e| pred(e)).count() >= n {
                     return;
                 }
-                assert!(Instant::now() < deadline, "never reached {n} matching events");
+                assert!(
+                    Instant::now() < deadline,
+                    "never reached {n} matching events"
+                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -6208,7 +6445,9 @@ mod node_interface {
         // the flush completes regardless of the mock's branch.)
         release.notify_one();
         drain_until_count(&node, &session, &mut events, is_turn_finished, 1).await;
-        ing.note_turn_finished(&session).await.expect("flush queued");
+        ing.note_turn_finished(&session)
+            .await
+            .expect("flush queued");
         release.notify_one();
         drain_until_count(&node, &session, &mut events, is_turn_finished, 2).await;
 
@@ -6218,9 +6457,14 @@ mod node_interface {
             .count();
         assert_eq!(started_turns, 2, "first turn + the flushed queued turn");
 
-        node.submit(session.clone(), AgentCommand::Snapshot { request_id: ReqId(99) })
-            .await
-            .expect("snapshot");
+        node.submit(
+            session.clone(),
+            AgentCommand::Snapshot {
+                request_id: ReqId(99),
+            },
+        )
+        .await
+        .expect("snapshot");
         drain_until_count(
             &node,
             &session,
@@ -6232,9 +6476,9 @@ mod node_interface {
         let view: ConvView = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::Snapshot { request_id, view, .. } if *request_id == ReqId(99) => {
-                    Some(view.clone())
-                }
+                AgentEvent::Snapshot {
+                    request_id, view, ..
+                } if *request_id == ReqId(99) => Some(view.clone()),
                 _ => None,
             })
             .expect("a Snapshot view");
@@ -6251,7 +6495,9 @@ mod node_interface {
     /// sessions, each run by the right profile (the echoing resolver reveals which).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingest_gate_routes_distinct_origins_to_bound_profiles() {
-        use daemon_api::{BoundAccount, NodeApi, Outbound, ProfileSpec, ProviderSelector, SessionApi};
+        use daemon_api::{
+            BoundAccount, NodeApi, Outbound, ProfileSpec, ProviderSelector, SessionApi,
+        };
         use daemon_host::{MemProfileStore, ProfileStore};
         use daemon_ingest::{Ingestor, Reception};
         use daemon_protocol::{AgentEvent, Origin, OriginScope, UserMsg};
@@ -6273,8 +6519,9 @@ mod node_interface {
 
         let resolver: daemon_node::ProviderResolver = Arc::new(|spec: &ProfileSpec| {
             let reply = format!("[{}]", spec.id);
-            let builder: daemon_core::ProviderBuilder =
-                Arc::new(move || Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>);
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+            });
             builder
         });
 
@@ -6335,14 +6582,26 @@ mod node_interface {
             addressed: true,
         };
 
-        let sa = ing.receive(addressed("matrix/@a:hs")).await.expect("route a");
-        let sb = ing.receive(addressed("matrix/@b:hs")).await.expect("route b");
+        let sa = ing
+            .receive(addressed("matrix/@a:hs"))
+            .await
+            .expect("route a");
+        let sb = ing
+            .receive(addressed("matrix/@b:hs"))
+            .await
+            .expect("route b");
         assert_ne!(sa, sb, "the two instances derive distinct sessions");
 
         let ta = final_text_for(&node, &sa).await;
         let tb = final_text_for(&node, &sb).await;
-        assert!(ta.contains("[alpha]"), "@a:hs routed to alpha via the gate, got {ta:?}");
-        assert!(tb.contains("[beta]"), "@b:hs routed to beta via the gate, got {tb:?}");
+        assert!(
+            ta.contains("[alpha]"),
+            "@a:hs routed to alpha via the gate, got {ta:?}"
+        );
+        assert!(
+            tb.contains("[beta]"),
+            "@b:hs routed to beta via the gate, got {tb:?}"
+        );
         handle.shutdown().await;
     }
 
@@ -6498,9 +6757,9 @@ mod node_interface {
         while Instant::now() < deadline {
             let drained = node.poll(session.clone(), 0).await.expect("poll");
             if let Some(ev) = drained.iter().find_map(|o| match o {
-                Outbound::Event(AgentEvent::Rewound { to_cursor, epoch, .. }) => {
-                    Some((*to_cursor, *epoch))
-                }
+                Outbound::Event(AgentEvent::Rewound {
+                    to_cursor, epoch, ..
+                }) => Some((*to_cursor, *epoch)),
                 _ => None,
             }) {
                 rewound = Some(ev);
@@ -6522,7 +6781,10 @@ mod node_interface {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(sealed.is_some(), "session_history must flag the rewind seal");
+        assert!(
+            sealed.is_some(),
+            "session_history must flag the rewind seal"
+        );
 
         // A follow-up StartTurn replays from the rewound point (the engine is idle and accepts it).
         node.submit(
@@ -7222,7 +7484,11 @@ mod store_backends {
         assert_eq!(total.cost_micros, 2468);
 
         store
-            .index_session_text(&s, Some("Parser work".into()), "refactored the parser pipeline today")
+            .index_session_text(
+                &s,
+                Some("Parser work".into()),
+                "refactored the parser pipeline today",
+            )
             .await;
         store
             .index_session_text(
@@ -7236,7 +7502,10 @@ mod store_backends {
         assert_eq!(hits.len(), 1, "exactly one session mentions the parser");
         assert_eq!(hits[0].session_id, s);
         assert!(hits[0].snippet.to_lowercase().contains("parser"));
-        assert!(store.search_sessions("nonexistent-term", 10).await.is_empty());
+        assert!(store
+            .search_sessions("nonexistent-term", 10)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
@@ -7246,7 +7515,10 @@ mod store_backends {
 
     #[tokio::test]
     async fn sqlite_usage_and_search() {
-        usage_and_search_suite(Arc::new(SqliteStore::open_in_memory().expect("open sqlite"))).await;
+        usage_and_search_suite(Arc::new(
+            SqliteStore::open_in_memory().expect("open sqlite"),
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -7335,7 +7607,10 @@ mod store_backends {
 
     #[tokio::test]
     async fn sqlite_child_edge() {
-        child_edge_suite(Arc::new(SqliteStore::open_in_memory().expect("open sqlite"))).await;
+        child_edge_suite(Arc::new(
+            SqliteStore::open_in_memory().expect("open sqlite"),
+        ))
+        .await;
     }
 }
 
@@ -7347,7 +7622,10 @@ mod background_spawn {
 
     use daemon_activation::ActivationManager;
     use daemon_common::{Epoch, PartitionId, SessionId};
-    use daemon_core::{EngineProfile, MockProvider, Provider, ProviderBuilder, Snapshot, SystemPrompt, ToolRegistry};
+    use daemon_core::{
+        EngineProfile, MockProvider, Provider, ProviderBuilder, Snapshot, SystemPrompt,
+        ToolRegistry,
+    };
     use daemon_host::{
         background_kind_of, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
         CoreEngineFactory,
@@ -7384,7 +7662,8 @@ mod background_spawn {
         // The shared activation manager drives parent and child through one factory; the factory is
         // background-aware so the child hydrates under its constrained review profile.
         let factory = Arc::new(
-            CoreEngineFactory::from_profile(completing_profile("parent")).with_background(spawner.clone()),
+            CoreEngineFactory::from_profile(completing_profile("parent"))
+                .with_background(spawner.clone()),
         );
         let mgr = ActivationManager::new(store.clone(), factory, PARTITION);
 
@@ -7566,13 +7845,18 @@ mod web_tools {
     async fn web_tools_register_and_dispatch_through_pipeline() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(WebSearchTool::new(Arc::new(InjectionSearch))));
-        registry.register(Arc::new(WebExtractTool::new(vec![Arc::new(InjectionFetch)])));
+        registry.register(Arc::new(WebExtractTool::new(vec![Arc::new(
+            InjectionFetch,
+        )])));
 
         let search = dispatch(&registry, "web_search", r#"{"query":"anything"}"#).await;
         assert!(search.result.ok);
         // The §12 pipeline wrapped the external snippet in the untrusted fence.
         assert!(search.result.content.contains("UNTRUSTED_TOOL_OUTPUT"));
-        assert!(search.result.content.contains("ignore previous instructions"));
+        assert!(search
+            .result
+            .content
+            .contains("ignore previous instructions"));
 
         let extract = dispatch(
             &registry,
@@ -7589,7 +7873,9 @@ mod web_tools {
     #[tokio::test]
     async fn web_extract_rejects_loopback_through_pipeline() {
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(WebExtractTool::new(vec![Arc::new(InjectionFetch)])));
+        registry.register(Arc::new(WebExtractTool::new(vec![Arc::new(
+            InjectionFetch,
+        )])));
         let out = dispatch(
             &registry,
             "web_extract",
@@ -7786,8 +8072,8 @@ mod approval {
     use daemon_activation::ActivationManager;
     use daemon_common::{Epoch, JobId, PartitionId, SessionId, UsageDelta};
     use daemon_core::{
-        Capabilities, Failure, ModelOutput, Provider, Request, Snapshot, SystemPrompt,
-        ToolCall, ToolCallFormat, ToolRegistry,
+        Capabilities, Failure, ModelOutput, Provider, Request, Snapshot, SystemPrompt, ToolCall,
+        ToolCallFormat, ToolRegistry,
     };
     use daemon_host::CoreEngineFactory;
     use daemon_store::{
@@ -7883,7 +8169,10 @@ mod approval {
             store.status(&id).await,
             Some(SessionStatus::Suspended { .. })
         ));
-        assert!(store.dequeue_job().await.is_none(), "no runnable job parked");
+        assert!(
+            store.dequeue_job().await.is_none(),
+            "no runnable job parked"
+        );
         let pending = store.pending_approvals_of(Some(&id)).await;
         assert_eq!(pending.len(), 1, "exactly one parked approval");
         let request_id = pending[0].job_id.clone();
@@ -7908,7 +8197,9 @@ mod approval {
         seed(store.as_ref(), &id).await;
 
         mgr.wake(id.clone()).await.expect("first activation parks");
-        let request_id = store.pending_approvals_of(Some(&id)).await[0].job_id.clone();
+        let request_id = store.pending_approvals_of(Some(&id)).await[0]
+            .job_id
+            .clone();
         assert!(store
             .answer_approval(&id, &request_id, false)
             .await
@@ -7929,7 +8220,9 @@ mod approval {
             mgr.wake(id.clone()).await.expect("park");
         }
         // The original manager is gone; the parked approval is still listable + answerable.
-        let request_id = store.pending_approvals_of(Some(&id)).await[0].job_id.clone();
+        let request_id = store.pending_approvals_of(Some(&id)).await[0]
+            .job_id
+            .clone();
         assert!(store
             .answer_approval(&id, &request_id, true)
             .await
@@ -7977,7 +8270,10 @@ mod approval {
         assert_eq!(store.pending_approvals_of(None).await.len(), 1);
 
         // Answer (allow): records a wake + a completion, drops it from the pending list.
-        assert!(store.answer_approval(&id, &job_id, true).await.expect("answer"));
+        assert!(store
+            .answer_approval(&id, &job_id, true)
+            .await
+            .expect("answer"));
         assert!(store.pending_approvals_of(Some(&id)).await.is_empty());
         assert_eq!(store.dequeue_wake().await, Some(id.clone()));
         let act = store
@@ -7989,7 +8285,10 @@ mod approval {
         assert_eq!(act.unapplied[0].payload, b"allow");
 
         // Idempotent: a redelivered answer is a no-op (still answered, no extra wake/completion).
-        assert!(store.answer_approval(&id, &job_id, true).await.expect("re-answer"));
+        assert!(store
+            .answer_approval(&id, &job_id, true)
+            .await
+            .expect("re-answer"));
         assert!(store.dequeue_wake().await.is_none(), "no duplicate wake");
 
         // An unknown request answers false.

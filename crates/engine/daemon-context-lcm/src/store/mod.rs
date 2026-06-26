@@ -518,7 +518,9 @@ impl Store {
              ORDER BY rank LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![sanitized, session_id, limit], |r| r.get::<_, i64>(0))?
+            .query_map(params![sanitized, session_id, limit], |r| {
+                r.get::<_, i64>(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1032,11 +1034,15 @@ impl Store {
                 r.get::<_, i64>(3)?,
             ))
         };
-        let (messages_total, normalized_unknown_messages, legacy_blank_source_messages, attributed_messages) =
-            match session_id {
-                Some(sid) => conn.query_row(&sql, [sid], map)?,
-                None => conn.query_row(&sql, [], map)?,
-            };
+        let (
+            messages_total,
+            normalized_unknown_messages,
+            legacy_blank_source_messages,
+            attributed_messages,
+        ) = match session_id {
+            Some(sid) => conn.query_row(&sql, [sid], map)?,
+            None => conn.query_row(&sql, [], map)?,
+        };
         Ok(SourceStats {
             messages_total,
             attributed_messages,
@@ -1063,9 +1069,8 @@ impl Store {
             }
             Ok(set)
         };
-        let message_sessions = session_set(
-            "SELECT DISTINCT session_id FROM messages WHERE session_id IS NOT NULL",
-        )?;
+        let message_sessions =
+            session_set("SELECT DISTINCT session_id FROM messages WHERE session_id IS NOT NULL")?;
         let node_sessions = session_set(
             "SELECT DISTINCT session_id FROM summary_nodes WHERE session_id IS NOT NULL",
         )?;
@@ -1078,8 +1083,10 @@ impl Store {
              WHERE last_finalized_session_id IS NOT NULL",
         )?;
         let lcm_any: HashSet<String> = message_sessions.union(&node_sessions).cloned().collect();
-        let referenced: HashSet<String> =
-            lifecycle_current.union(&lifecycle_finalized).cloned().collect();
+        let referenced: HashSet<String> = lifecycle_current
+            .union(&lifecycle_finalized)
+            .cloned()
+            .collect();
         let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0));
         let diff = |a: &HashSet<String>, b: &HashSet<String>| a.difference(b).count() as i64;
         Ok(LifecycleFragmentation {
@@ -1095,7 +1102,10 @@ impl Store {
             lifecycle_current_missing_in_messages: diff(&lifecycle_current, &message_sessions),
             lifecycle_current_missing_in_nodes: diff(&lifecycle_current, &node_sessions),
             lifecycle_current_missing_in_lcm_any: diff(&lifecycle_current, &lcm_any),
-            lifecycle_last_finalized_missing_in_messages: diff(&lifecycle_finalized, &message_sessions),
+            lifecycle_last_finalized_missing_in_messages: diff(
+                &lifecycle_finalized,
+                &message_sessions,
+            ),
             lifecycle_last_finalized_missing_in_nodes: diff(&lifecycle_finalized, &node_sessions),
             lifecycle_last_finalized_missing_in_lcm_any: diff(&lifecycle_finalized, &lcm_any),
             message_sessions_without_lifecycle_current: diff(&message_sessions, &lifecycle_current),
@@ -1349,7 +1359,10 @@ mod tests {
             leaves.push(id);
         }
         assert_eq!(store.count_at_depth("s1", 0).unwrap(), 4);
-        assert_eq!(store.get_uncondensed_at_depth("s1", 0, 10).unwrap().len(), 4);
+        assert_eq!(
+            store.get_uncondensed_at_depth("s1", 0, 10).unwrap().len(),
+            4
+        );
 
         // Condense the four leaves into a D1 node.
         store
@@ -1369,7 +1382,10 @@ mod tests {
             .unwrap();
 
         // The leaves are now condensed; only the D1 node is uncondensed.
-        assert!(store.get_uncondensed_at_depth("s1", 0, 10).unwrap().is_empty());
+        assert!(store
+            .get_uncondensed_at_depth("s1", 0, 10)
+            .unwrap()
+            .is_empty());
         let frontier = store.get_uncondensed_frontier("s1").unwrap();
         assert_eq!(frontier.len(), 1);
         assert_eq!(frontier[0].depth, 1);

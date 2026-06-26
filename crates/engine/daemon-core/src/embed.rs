@@ -70,10 +70,7 @@ impl MockEmbedder {
 
     /// A hashing embedder that returns fixed vectors for the given `(text, vector)` pairs and hashes
     /// everything else. Pinned vectors must have length `dims`.
-    pub fn scripted(
-        dims: usize,
-        pairs: impl IntoIterator<Item = (String, Vec<f32>)>,
-    ) -> Self {
+    pub fn scripted(dims: usize, pairs: impl IntoIterator<Item = (String, Vec<f32>)>) -> Self {
         let mut me = Self::new(dims);
         me.scripted = pairs.into_iter().collect();
         me

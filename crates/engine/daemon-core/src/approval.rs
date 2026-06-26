@@ -117,7 +117,10 @@ mod tests {
         assert_eq!(ApprovalPolicy::Ask.decide_edit("a.txt"), Decision::Ask);
         assert_eq!(ApprovalPolicy::Deny.decide_edit("a.txt"), Decision::Deny);
         // Auto-allow runs ordinary edits but still asks for sensitive ones.
-        assert_eq!(ApprovalPolicy::AutoAllow.decide_edit("a.txt"), Decision::Allow);
+        assert_eq!(
+            ApprovalPolicy::AutoAllow.decide_edit("a.txt"),
+            Decision::Allow
+        );
         assert_eq!(
             ApprovalPolicy::AutoAllow.decide_edit("/app/.env"),
             Decision::Ask

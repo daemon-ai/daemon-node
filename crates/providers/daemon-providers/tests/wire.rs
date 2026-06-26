@@ -5,7 +5,9 @@
 //! The mock matches `POST` only (genai appends the adapter's path to our `with_endpoint` base, so we
 //! don't pin the exact path) and returns provider-shaped bodies that `genai` decodes.
 
-use daemon_core::{EmbeddingProvider, Failure, Provider, Request, RequestMsg, StreamEvent, ToolDef};
+use daemon_core::{
+    EmbeddingProvider, Failure, Provider, Request, RequestMsg, StreamEvent, ToolDef,
+};
 use daemon_providers::{GenAiEmbedder, GenAiProvider};
 use futures::StreamExt;
 use std::time::Duration;
@@ -396,5 +398,8 @@ async fn anthropic_cache_breakpoints_serialize_to_wire() {
         .as_array()
         .map(|parts| parts.iter().any(|p| p.get("cache_control").is_some()))
         .unwrap_or(false);
-    assert!(has_cc, "last message should carry a cache_control block: {last}");
+    assert!(
+        has_cc,
+        "last message should carry a cache_control block: {last}"
+    );
 }

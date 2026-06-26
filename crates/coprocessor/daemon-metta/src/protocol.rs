@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 /// carries its space so the separation is preserved even over one backing store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum Space {
     /// Disposable hypotheses, temporary bindings, query programs for the current task.
+    #[default]
     Working,
     /// Immutable task events, tool observations, decisions, outcomes.
     Episodic,
@@ -74,12 +76,6 @@ impl Space {
             Space::ProceduralActive,
             Space::Governance,
         ]
-    }
-}
-
-impl Default for Space {
-    fn default() -> Self {
-        Space::Working
     }
 }
 
@@ -545,7 +541,10 @@ mod tests {
     fn events_round_trip() {
         round_trip_event(Event::Ready {
             engine: "fallback".into(),
-            spaces: Space::all().iter().map(|s| s.as_str().to_string()).collect(),
+            spaces: Space::all()
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
         });
         round_trip_event(Event::Reply(OpResponse::ok(1, vec!["3".into()])));
         round_trip_event(Event::Error {
@@ -561,7 +560,10 @@ mod tests {
         for s in Space::all() {
             assert_eq!(Space::parse(s.as_str()), Some(s));
         }
-        assert_eq!(Space::parse("candidates"), Some(Space::ProceduralCandidates));
+        assert_eq!(
+            Space::parse("candidates"),
+            Some(Space::ProceduralCandidates)
+        );
         assert_eq!(Space::parse("nope"), None);
     }
 }

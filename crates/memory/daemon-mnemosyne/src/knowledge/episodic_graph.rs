@@ -309,13 +309,25 @@ fn extract_location(content: &str) -> Option<String> {
 
 /// Emotion class, or `None` (`_extract_emotion` L254-L267). Order: positive, negative, neutral.
 fn extract_emotion(content: &str) -> Option<String> {
-    const POSITIVE: &[&str] =
-        &["happy", "excited", "great", "awesome", "love", "enjoy", "glad", "pleased"];
-    const NEGATIVE: &[&str] =
-        &["sad", "angry", "frustrated", "upset", "hate", "disappointed", "worried"];
+    const POSITIVE: &[&str] = &[
+        "happy", "excited", "great", "awesome", "love", "enjoy", "glad", "pleased",
+    ];
+    const NEGATIVE: &[&str] = &[
+        "sad",
+        "angry",
+        "frustrated",
+        "upset",
+        "hate",
+        "disappointed",
+        "worried",
+    ];
     const NEUTRAL: &[&str] = &["fine", "okay", "alright", "normal", "standard"];
     let lower = content.to_lowercase();
-    for (class, words) in [("positive", POSITIVE), ("negative", NEGATIVE), ("neutral", NEUTRAL)] {
+    for (class, words) in [
+        ("positive", POSITIVE),
+        ("negative", NEGATIVE),
+        ("neutral", NEUTRAL),
+    ] {
         if words.iter().any(|w| lower.contains(w)) {
             return Some(class.to_string());
         }
@@ -329,12 +341,18 @@ fn create_summary(content: &str) -> String {
     if first.chars().count() > 10 {
         return first.trim().chars().take(100).collect();
     }
-    content.chars().take(100).collect::<String>().trim().to_string()
+    content
+        .chars()
+        .take(100)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Store a gist (`episodic_graph.py` `store_gist` L376-L393).
 pub fn store_gist(conn: &Connection, gist: &Gist, memory_id: &str) -> Result<()> {
-    let participants_json = serde_json::to_string(&gist.participants).unwrap_or_else(|_| "[]".into());
+    let participants_json =
+        serde_json::to_string(&gist.participants).unwrap_or_else(|_| "[]".into());
     conn.execute(
         "INSERT OR REPLACE INTO gists \
          (id, text, timestamp, participants_json, location, emotion, time_scope, memory_id) \
@@ -355,14 +373,20 @@ pub fn store_gist(conn: &Connection, gist: &Gist, memory_id: &str) -> Result<()>
 
 /// `(memory_id, gist_text)` for gists whose `participants_json` contains `participant`
 /// (`episodic_graph.py` `find_gists_by_participant` L508-L529). Used by the polyphonic graph voice.
-pub fn find_gists_by_participant(conn: &Connection, participant: &str) -> Result<Vec<(String, String)>> {
+pub fn find_gists_by_participant(
+    conn: &Connection,
+    participant: &str,
+) -> Result<Vec<(String, String)>> {
     let like = format!("%\"{participant}\"%");
     let mut stmt = conn.prepare(
         "SELECT memory_id, text FROM gists \
          WHERE participants_json LIKE ?1 ORDER BY timestamp DESC",
     )?;
     let rows = stmt.query_map(params![like], |r| {
-        Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, String>(1)?))
+        Ok((
+            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            r.get::<_, String>(1)?,
+        ))
     })?;
     Ok(rows.flatten().filter(|(mid, _)| !mid.is_empty()).collect())
 }
@@ -473,7 +497,10 @@ mod tests {
 
     #[test]
     fn extract_gist_pulls_participants_emotion_and_summary() {
-        let g = extract_gist("Alice was happy at the Office yesterday. We celebrated.", "m1");
+        let g = extract_gist(
+            "Alice was happy at the Office yesterday. We celebrated.",
+            "m1",
+        );
         assert_eq!(g.id, "gist_m1");
         assert!(g.participants.iter().any(|p| p == "Alice"));
         assert_eq!(g.emotion.as_deref(), Some("positive"));
@@ -489,5 +516,4 @@ mod tests {
         let facts = extract_facts(content, "m1");
         assert!(facts.len() <= MAX_FACTS_PER_MEMORY, "{}", facts.len());
     }
-
 }

@@ -16,6 +16,10 @@ mod config;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use daemon_api::{
+    BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileSpec,
+    ProviderSelector,
+};
 use daemon_common::{
     CredMode, CredScope, JournalStreamId, ModelEngine, ModelRef, ModelSource, ProfileRef,
     SessionId, UnitId,
@@ -23,44 +27,41 @@ use daemon_common::{
 use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
     CommandProviderHandle, ContextEngine, ContextEngineBuilder, CredentialBuilder,
-    CredentialProvider, EmbeddingProvider, EngineProfile, FileMemory, MemoryBuilder, MemoryProvider,
-    MockProvider, Provider, ProviderRegistry, SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome,
-    ToolProvider, ToolRegistry, TurnCx,
+    CredentialProvider, EmbeddingProvider, EngineProfile, FileMemory, MemoryBuilder,
+    MemoryProvider, MockProvider, Provider, ProviderRegistry, SystemPrompt, Tool, ToolCall,
+    ToolDef, ToolOutcome, ToolProvider, ToolRegistry, TurnCx,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
-    CloudCatalog, CommandRegistry, CoreEngineFactory, CredentialBroker, CredentialStore, EngineUnit,
-    FileCredentialStore, FileProfileStore, FileRevisionLog, HostConfig, JournalFeeder, JournalSink,
-    MemCredentialStore, MemProfileStore, OriginMatcher, OwnerBroker, PooledStoreCredentialSource,
-    ProfileStore, RoutingRegistry, ScopePattern, SessionBinding, TransportPattern,
-};
-use daemon_protocol::{IsolationPolicy, TransportId};
-use daemon_api::{
-    BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileSpec,
-    ProviderSelector,
+    CloudCatalog, CommandRegistry, CoreEngineFactory, CredentialBroker, CredentialStore,
+    EngineUnit, FileCredentialStore, FileProfileStore, FileRevisionLog, HostConfig, JournalFeeder,
+    JournalSink, MemCredentialStore, MemProfileStore, OriginMatcher, OwnerBroker,
+    PooledStoreCredentialSource, ProfileStore, RoutingRegistry, ScopePattern, SessionBinding,
+    TransportPattern,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_metta::protocol::Bounds as MettaBounds;
 use daemon_metta_client::{MettaConfig as MettaClientConfig, MettaCoprocessor};
-use daemon_pytool_client::{PyToolConfig, PyToolProvider};
 use daemon_mnemosyne::{MnemosyneConfig, MnemosyneProvider};
-use daemon_tool_metta::MettaTool;
-use daemon_tool_clarify::ClarifyTool;
-use daemon_tool_todo::TodoTool;
-use daemon_tool_web::{
-    FirecrawlFetch, LocalFetch, SecretSource, TavilySearch, WebExtractTool, WebFetchBackend,
-    WebSearchTool,
-};
 use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly, ProviderResolver};
+use daemon_protocol::{IsolationPolicy, TransportId};
 use daemon_providers::{
     genai_listed_models, GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider,
     WorkerConfig,
 };
 use daemon_provision::CutChannel;
+use daemon_pytool_client::{PyToolConfig, PyToolProvider};
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
+use daemon_tool_clarify::ClarifyTool;
+use daemon_tool_metta::MettaTool;
+use daemon_tool_todo::TodoTool;
+use daemon_tool_web::{
+    FirecrawlFetch, LocalFetch, SecretSource, TavilySearch, WebExtractTool, WebFetchBackend,
+    WebSearchTool,
+};
 use daemon_transport::RemoteHost;
 
 use config::{
@@ -124,11 +125,11 @@ async fn run_matrix_login(args: &[String]) -> anyhow::Result<()> {
 
     let cfg = NodeConfig::load()?;
     // Login implies persistence: write to the same on-disk credential store the host reads.
-    std::fs::create_dir_all(&cfg.data_dir).map_err(|e| {
-        anyhow::anyhow!("creating data dir {}: {e}", cfg.data_dir.display())
-    })?;
-    let credential_store: Arc<dyn CredentialStore> =
-        Arc::new(FileCredentialStore::open(cfg.data_dir.join("credentials.json"))?);
+    std::fs::create_dir_all(&cfg.data_dir)
+        .map_err(|e| anyhow::anyhow!("creating data dir {}: {e}", cfg.data_dir.display()))?;
+    let credential_store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::open(
+        cfg.data_dir.join("credentials.json"),
+    )?);
     daemon_matrix::login(
         credential_store,
         &homeserver,
@@ -149,9 +150,14 @@ fn pricing_for(model: &str) -> Option<daemon_common::Pricing> {
     ModelDescriptor::builtin_cloud_catalog()
         .into_iter()
         .find(|m| m.id == model)
-        .and_then(|m| match (m.input_price_micros_per_mtok, m.output_price_micros_per_mtok) {
-            (Some(input), Some(output)) => Some(daemon_common::Pricing::from_io(input, output)),
-            _ => None,
+        .and_then(|m| {
+            match (
+                m.input_price_micros_per_mtok,
+                m.output_price_micros_per_mtok,
+            ) {
+                (Some(input), Some(output)) => Some(daemon_common::Pricing::from_io(input, output)),
+                _ => None,
+            }
         })
 }
 
@@ -414,8 +420,9 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
                     }
                 })
             };
-            let command_provider =
-                Some(Arc::new(LcmCommandProvider { banks: banks.clone() }) as CommandProviderHandle);
+            let command_provider = Some(Arc::new(LcmCommandProvider {
+                banks: banks.clone(),
+            }) as CommandProviderHandle);
             ContextWiring {
                 builder: Some(builder),
                 tools,
@@ -502,7 +509,9 @@ impl LcmBanks {
         profile: Option<&ProfileRef>,
         session: &SessionId,
     ) -> Option<Arc<LcmContextEngine>> {
-        let profile = profile.cloned().unwrap_or_else(|| self.default_profile.clone());
+        let profile = profile
+            .cloned()
+            .unwrap_or_else(|| self.default_profile.clone());
         let key = (profile.clone(), session.clone());
         let mut sessions = self.sessions.lock().expect("lcm banks poisoned");
         if let Some(existing) = sessions.get(&key) {
@@ -549,8 +558,9 @@ impl Tool for LcmTool {
         let args = serde_json::from_str(&call.args).unwrap_or(serde_json::Value::Null);
         let result = match self.banks.get_or_open(cx.profile.as_ref(), &cx.session_id) {
             Some(lcm) => lcm.call_tool(&self.def.name, args).await,
-            None => serde_json::json!({"status": "error", "error": "lcm bank unavailable"})
-                .to_string(),
+            None => {
+                serde_json::json!({"status": "error", "error": "lcm bank unavailable"}).to_string()
+            }
         };
         ToolOutcome::text(call.call_id.clone(), true, result)
     }
@@ -606,10 +616,9 @@ impl daemon_core::CommandProvider for MemoryCommandProvider {
             .session
             .as_ref()
             .ok_or(daemon_core::CommandError::MissingSession)?;
-        let provider = self
-            .banks
-            .get_or_open(None, session)
-            .ok_or_else(|| daemon_core::CommandError::Failed("mnemosyne bank unavailable".into()))?;
+        let provider = self.banks.get_or_open(None, session).ok_or_else(|| {
+            daemon_core::CommandError::Failed("mnemosyne bank unavailable".into())
+        })?;
         provider.run_command(invocation, cx).await
     }
 }
@@ -677,18 +686,16 @@ fn build_memory(
                 .collect();
             let builder: MemoryBuilder = {
                 let banks = banks.clone();
-                Arc::new(
-                    move |profile: Option<&ProfileRef>, id: &SessionId| {
-                        match banks.get_or_open(profile, id) {
-                            Some(p) => vec![p as Arc<dyn MemoryProvider>],
-                            None => Vec::new(),
-                        }
-                    },
-                )
+                Arc::new(move |profile: Option<&ProfileRef>, id: &SessionId| {
+                    match banks.get_or_open(profile, id) {
+                        Some(p) => vec![p as Arc<dyn MemoryProvider>],
+                        None => Vec::new(),
+                    }
+                })
             };
-            let command_provider = Some(
-                Arc::new(MemoryCommandProvider { banks: banks.clone() }) as CommandProviderHandle,
-            );
+            let command_provider = Some(Arc::new(MemoryCommandProvider {
+                banks: banks.clone(),
+            }) as CommandProviderHandle);
             MemoryWiring {
                 builder: Some(builder),
                 shared: Vec::new(),
@@ -959,7 +966,9 @@ impl MnemosyneBanks {
         profile: Option<&ProfileRef>,
         session: &SessionId,
     ) -> Option<Arc<MnemosyneProvider>> {
-        let profile = profile.cloned().unwrap_or_else(|| self.default_profile.clone());
+        let profile = profile
+            .cloned()
+            .unwrap_or_else(|| self.default_profile.clone());
         let key = (profile.clone(), session.clone());
         let mut sessions = self.sessions.lock().expect("mnemosyne banks poisoned");
         if let Some(existing) = sessions.get(&key) {
@@ -1161,8 +1170,8 @@ async fn build_embedder(
                 );
                 return None;
             }
-            let mut embedder =
-                GenAiEmbedder::openai(cfg.embed.model.clone()).with_auth(cfg.credential_key.clone());
+            let mut embedder = GenAiEmbedder::openai(cfg.embed.model.clone())
+                .with_auth(cfg.credential_key.clone());
             if let Some(base) = &cfg.embed.base_url {
                 embedder = embedder.with_endpoint(base.clone());
             }
@@ -1251,7 +1260,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.
     // Durable nodes persist secrets under the data root; the ephemeral default keeps them in memory.
     let credential_store: Arc<dyn CredentialStore> = if cfg.persist_providers() {
-        Arc::new(FileCredentialStore::open(cfg.data_dir.join("credentials.json"))?)
+        Arc::new(FileCredentialStore::open(
+            cfg.data_dir.join("credentials.json"),
+        )?)
     } else {
         Arc::new(MemCredentialStore::new())
     };
@@ -1472,10 +1483,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // The §12 tool-checkpoint store: a workspace checkpoint is recorded before each mutating tool
     // runs (rewindable via the `Checkpoint{List,Rewind}` control ops). The ledger lives under the
     // data dir so rewind points survive a restart.
-    let checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>> =
-        Some(Arc::new(daemon_core::LocalCheckpointStore::new(
-            cfg.data_dir.join("checkpoints"),
-        )) as Arc<dyn daemon_core::CheckpointStore>);
+    let checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>> = Some(Arc::new(
+        daemon_core::LocalCheckpointStore::new(cfg.data_dir.join("checkpoints")),
+    )
+        as Arc<dyn daemon_core::CheckpointStore>);
 
     // Register the interactive-auth families this node exposes over the wire `AuthApi` (the
     // client-driven SSO/OAuth2 login seam). The Matrix SSO factory is registered whenever the matrix
@@ -1489,7 +1500,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         vec![]
     };
 
-    let AssembledNode { node, handle, signer, .. } = assemble(NodeAssembly {
+    let AssembledNode {
+        node,
+        handle,
+        signer,
+        ..
+    } = assemble(NodeAssembly {
         store: store.clone(),
         partition: cfg.partition,
         host_config,
@@ -1569,8 +1585,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.matrix.enabled {
         tracing::info!("registering matrix transport (daemon-matrix)");
         let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
-        adapter_registry = adapter_registry
-            .with_adapter(daemon_matrix::MatrixAdapter::new(provisioning, cfg.matrix.clone()));
+        adapter_registry = adapter_registry.with_adapter(daemon_matrix::MatrixAdapter::new(
+            provisioning,
+            cfg.matrix.clone(),
+        ));
     }
     node.set_adapters(adapter_registry);
     let adapter_tasks = node.spawn_adapters();
@@ -1667,7 +1685,11 @@ fn build_owner_broker(
     let signer = Arc::new(CapabilitySigner::generate());
     // The pooled source selects/rotates among the profile's key pool (multi-key) on a rotatable
     // failure, falling back to the launch-configured key when the pool is empty.
-    let source = Arc::new(PooledStoreCredentialSource::new(store, profile, fallback_key));
+    let source = Arc::new(PooledStoreCredentialSource::new(
+        store,
+        profile,
+        fallback_key,
+    ));
     let scope = CredScope::new([profile], ["chat", "embed"], Some(1_000));
     let authority = Arc::new(CredentialAuthority::new(
         scope,
@@ -1695,7 +1717,8 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
     cred_store
         .set(&cfg.profile, &cfg.credential_key)
         .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
-    let (owner, _cred_authority) = build_owner_broker(&cfg.profile, &cfg.credential_key, cred_store);
+    let (owner, _cred_authority) =
+        build_owner_broker(&cfg.profile, &cfg.credential_key, cred_store);
     let credentials: CredentialBuilder = {
         let owner = owner.clone();
         Arc::new(move || {
@@ -1808,8 +1831,12 @@ async fn run_as_placed_child() {
     // `run_placed_child*`), so a real provider resolves its API key from the parent's authority.
     let provider = build_placed_child_provider(&cfg).await;
     let registry = build_placed_child_tools(&cfg);
-    let profile = EngineProfile::new(provider, Arc::new(registry), SystemPrompt::new("placed child"))
-        .with_config(cfg.engine);
+    let profile = EngineProfile::new(
+        provider,
+        Arc::new(registry),
+        SystemPrompt::new("placed child"),
+    )
+    .with_config(cfg.engine);
     let factory = CoreEngineFactory::from_profile(profile);
     let channel = CutChannel::from_stdio();
     let cred_profile = ProfileRef::new(cfg.profile.clone());

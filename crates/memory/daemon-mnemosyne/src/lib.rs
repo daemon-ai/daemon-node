@@ -26,7 +26,6 @@ pub mod embeddings;
 pub mod engine;
 pub mod error;
 pub mod extract;
-pub mod tools;
 pub mod knowledge;
 pub mod memoria;
 pub mod provider;
@@ -34,6 +33,7 @@ pub mod recall;
 pub mod sanitize;
 pub mod store;
 pub mod tokens;
+pub mod tools;
 pub mod util;
 
 pub use config::{MnemosyneConfig, RecallMode};

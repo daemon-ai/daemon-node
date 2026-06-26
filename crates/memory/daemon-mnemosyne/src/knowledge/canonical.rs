@@ -55,7 +55,9 @@ pub fn remember(
         ));
     }
     if body.trim().is_empty() {
-        return Err(Error::Invalid("body is required and cannot be blank".into()));
+        return Err(Error::Invalid(
+            "body is required and cannot be blank".into(),
+        ));
     }
 
     let current: Option<(i64, String)> = conn
@@ -69,10 +71,7 @@ pub fn remember(
 
     if let Some((id, current_body)) = &current {
         if current_body == body {
-            return Ok((
-                fetch_by_id(conn, *id)?,
-                Status::Unchanged,
-            ));
+            return Ok((fetch_by_id(conn, *id)?, Status::Unchanged));
         }
     }
 

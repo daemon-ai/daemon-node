@@ -53,12 +53,12 @@ pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlReject> {
         return Err(UrlReject::Scheme(scheme));
     }
     // The authority ends at the first '/', '?', or '#'.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // Strip any userinfo ("user:pass@host") then the optional ":port".
-    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     let host = strip_port(host_port).to_ascii_lowercase();
     if host.is_empty() {
         return Err(UrlReject::EmptyHost);
@@ -204,6 +204,9 @@ mod tests {
             check_url("not a url"),
             Err(UrlReject::Malformed(_))
         ));
-        assert!(matches!(check_url("http:///path"), Err(UrlReject::EmptyHost)));
+        assert!(matches!(
+            check_url("http:///path"),
+            Err(UrlReject::EmptyHost)
+        ));
     }
 }

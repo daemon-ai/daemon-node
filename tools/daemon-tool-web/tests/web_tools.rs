@@ -64,7 +64,10 @@ async fn tavily_sends_bearer_and_parses_hits() {
         max_results: 5,
         topic: SearchTopic::General,
     };
-    let results = backend.search("rust async", &opts).await.expect("search ok");
+    let results = backend
+        .search("rust async", &opts)
+        .await
+        .expect("search ok");
     assert_eq!(results.provider, "tavily");
     assert_eq!(results.answer.as_deref(), Some("Async Rust uses futures."));
     assert_eq!(results.hits.len(), 2);

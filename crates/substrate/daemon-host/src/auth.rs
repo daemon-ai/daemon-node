@@ -204,7 +204,8 @@ impl PendingAuthFlows {
             let mut guard = self.parked.lock().unwrap();
             guard.remove(flow_id)
         };
-        let parked = parked.ok_or_else(|| ApiError::Other("unknown or expired auth flow".into()))?;
+        let parked =
+            parked.ok_or_else(|| ApiError::Other("unknown or expired auth flow".into()))?;
         if parked.expires_at <= now_secs() {
             return Err(ApiError::Other("unknown or expired auth flow".into()));
         }

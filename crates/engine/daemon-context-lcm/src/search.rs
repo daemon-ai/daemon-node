@@ -420,7 +420,10 @@ mod tests {
             "\"exact phrase\" \"extra\""
         );
         // FTS operators are neutralized by quoting.
-        assert_eq!(sanitize_fts5_query("foo* OR bar^"), "\"foo\" \"or\" \"bar\"");
+        assert_eq!(
+            sanitize_fts5_query("foo* OR bar^"),
+            "\"foo\" \"or\" \"bar\""
+        );
         assert!(sanitize_fts5_query("***").is_empty());
     }
 

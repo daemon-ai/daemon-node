@@ -15,7 +15,7 @@ use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint,
     JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval, Room,
     RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
-    StoredCronJob, StoredCronRun, StoredCronSuggestion, StoreError, StoreStats, TraceEntry,
+    StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion, TraceEntry,
     TraceSegment, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
@@ -281,7 +281,8 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         match conn.execute(stmt, []) {
             Ok(_) => {}
             // Already migrated (column present): the only benign failure here.
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column") => {}
             Err(e) => return Err(sql_err(e)),
         }
     }
@@ -708,8 +709,9 @@ impl SessionStore for SqliteStore {
         };
         let mut children =
             read("SELECT child FROM delegations WHERE parent_session = ?1 ORDER BY rowseq");
-        children
-            .extend(read("SELECT child FROM background_edges WHERE parent_session = ?1 ORDER BY rowseq"));
+        children.extend(read(
+            "SELECT child FROM background_edges WHERE parent_session = ?1 ORDER BY rowseq",
+        ));
         children
     }
 
@@ -1244,11 +1246,11 @@ impl SessionStore for SqliteStore {
 
     async fn room_list(&self) -> Vec<Room> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT id, name, policy, descriptor FROM rooms ORDER BY id")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let mut stmt =
+            match conn.prepare("SELECT id, name, policy, descriptor FROM rooms ORDER BY id") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
         let rows = stmt.query_map([], |row| {
             Ok(Room {
                 id: row.get::<_, String>(0)?,
@@ -1829,7 +1831,11 @@ mod tests {
         let a = SessionId::new("sess-a");
         let b = SessionId::new("sess-b");
         store
-            .index_session_text(&a, Some("Refactor".into()), "we refactored the parser pipeline")
+            .index_session_text(
+                &a,
+                Some("Refactor".into()),
+                "we refactored the parser pipeline",
+            )
             .await;
         store
             .index_session_text(&b, Some("Bugfix".into()), "fixed a crash in the renderer")
@@ -1839,10 +1845,16 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, a);
         assert_eq!(hits[0].title, "Refactor");
-        assert!(hits[0].snippet.contains("[parser]"), "snippet: {}", hits[0].snippet);
+        assert!(
+            hits[0].snippet.contains("[parser]"),
+            "snippet: {}",
+            hits[0].snippet
+        );
 
         // Re-indexing replaces the prior row (no duplicate hits).
-        store.index_session_text(&a, Some("Refactor".into()), "now about the lexer").await;
+        store
+            .index_session_text(&a, Some("Refactor".into()), "now about the lexer")
+            .await;
         assert!(store.search_sessions("parser", 10).await.is_empty());
         assert_eq!(store.search_sessions("lexer", 10).await.len(), 1);
     }

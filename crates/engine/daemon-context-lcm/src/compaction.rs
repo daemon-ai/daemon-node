@@ -249,8 +249,14 @@ async fn condense(
             },
         )
         .await;
-        let earliest = feeders.iter().filter_map(|n| n.earliest_at).fold(None, min_opt);
-        let latest = feeders.iter().filter_map(|n| n.latest_at).fold(None, max_opt);
+        let earliest = feeders
+            .iter()
+            .filter_map(|n| n.earliest_at)
+            .fold(None, min_opt);
+        let latest = feeders
+            .iter()
+            .filter_map(|n| n.latest_at)
+            .fold(None, max_opt);
         let node = NewNode {
             session_id: session_id.to_string(),
             depth: depth + 1,
@@ -275,7 +281,9 @@ async fn condense(
 /// Build the synthetic summary turn from the DAG frontier (highest depth first), or `None` if the
 /// frontier is empty. On the first compaction a one-line "recoverable via tools" note is prepended.
 fn assemble_summary_turn(store: &Store, session_id: &str, first_compaction: bool) -> Option<Turn> {
-    let frontier = store.get_uncondensed_frontier(session_id).unwrap_or_default();
+    let frontier = store
+        .get_uncondensed_frontier(session_id)
+        .unwrap_or_default();
     if frontier.is_empty() {
         return None;
     }

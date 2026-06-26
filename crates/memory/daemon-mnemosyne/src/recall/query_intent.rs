@@ -149,10 +149,22 @@ mod tests {
 
     #[test]
     fn classifies_representative_queries() {
-        assert_eq!(classify_intent("what happened last Monday"), Intent::Temporal);
-        assert_eq!(classify_intent("what is the database password"), Intent::Factual);
-        assert_eq!(classify_intent("how do I deploy the service"), Intent::Procedural);
-        assert_eq!(classify_intent("which option should I pick"), Intent::Preference);
+        assert_eq!(
+            classify_intent("what happened last Monday"),
+            Intent::Temporal
+        );
+        assert_eq!(
+            classify_intent("what is the database password"),
+            Intent::Factual
+        );
+        assert_eq!(
+            classify_intent("how do I deploy the service"),
+            Intent::Procedural
+        );
+        assert_eq!(
+            classify_intent("which option should I pick"),
+            Intent::Preference
+        );
         assert_eq!(classify_intent("banana"), Intent::General);
     }
 }

@@ -21,7 +21,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// The verbatim extraction prompt (`LCM:extraction.py:29-42`).
-const EXTRACTION_PROMPT_HEAD: &str = "Extract decisions, commitments, outcomes, and rules from this conversation segment.\n\n\
+const EXTRACTION_PROMPT_HEAD: &str =
+    "Extract decisions, commitments, outcomes, and rules from this conversation segment.\n\n\
 Format as a flat list of bullet points. Each bullet should be self-contained and understandable\n\
 without the surrounding conversation. Include:\n\
 - Decisions made (what was chosen, and why if stated)\n\
@@ -105,7 +106,10 @@ fn append_daily(dir: &Path, bullets: &str, now_secs: f64) -> std::io::Result<()>
     set_dir_mode(dir);
     let (y, m, d, hh, mm, ss) = civil_datetime(now_secs);
     let file = dir.join(format!("{y:04}-{m:02}-{d:02}.md"));
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(file)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?;
     writeln!(f, "## {hh:02}:{mm:02}:{ss:02} UTC")?;
     writeln!(f, "{bullets}")?;
     writeln!(f)?;
@@ -172,7 +176,10 @@ mod tests {
         }
         async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
             match &self.reply {
-                Some(t) => Ok(ModelOutput { text: t.clone(), ..Default::default() }),
+                Some(t) => Ok(ModelOutput {
+                    text: t.clone(),
+                    ..Default::default()
+                }),
                 None => Err(Failure::Provider("aux down".into())),
             }
         }
@@ -204,8 +211,17 @@ mod tests {
     #[tokio::test]
     async fn writes_bullets_to_daily_file() {
         let dir = tmp("write");
-        let aux = FixedAux { reply: Some("- decided X\n- committed to Y".into()) };
-        let outcome = run_extraction(&aux, "some segment", Some(dir.as_path()), Duration::from_secs(5), 1_609_459_200.0).await;
+        let aux = FixedAux {
+            reply: Some("- decided X\n- committed to Y".into()),
+        };
+        let outcome = run_extraction(
+            &aux,
+            "some segment",
+            Some(dir.as_path()),
+            Duration::from_secs(5),
+            1_609_459_200.0,
+        )
+        .await;
         assert_eq!(outcome, ExtractionOutcome::Wrote);
         let body = fs::read_to_string(dir.join("2021-01-01.md")).unwrap();
         assert!(body.contains("decided X"));
@@ -215,8 +231,17 @@ mod tests {
     #[tokio::test]
     async fn nothing_to_extract_writes_no_file() {
         let dir = tmp("nothing");
-        let aux = FixedAux { reply: Some(NOTHING_TO_EXTRACT.into()) };
-        let outcome = run_extraction(&aux, "small talk", Some(dir.as_path()), Duration::from_secs(5), 1_609_459_200.0).await;
+        let aux = FixedAux {
+            reply: Some(NOTHING_TO_EXTRACT.into()),
+        };
+        let outcome = run_extraction(
+            &aux,
+            "small talk",
+            Some(dir.as_path()),
+            Duration::from_secs(5),
+            1_609_459_200.0,
+        )
+        .await;
         assert_eq!(outcome, ExtractionOutcome::NothingToExtract);
         assert!(!dir.join("2021-01-01.md").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -226,15 +251,31 @@ mod tests {
     async fn aux_failure_is_skipped_not_fatal() {
         let dir = tmp("fail");
         let aux = FixedAux { reply: None };
-        let outcome = run_extraction(&aux, "segment", Some(dir.as_path()), Duration::from_secs(5), 1_609_459_200.0).await;
+        let outcome = run_extraction(
+            &aux,
+            "segment",
+            Some(dir.as_path()),
+            Duration::from_secs(5),
+            1_609_459_200.0,
+        )
+        .await;
         assert_eq!(outcome, ExtractionOutcome::Skipped);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn no_dir_is_skipped() {
-        let aux = FixedAux { reply: Some("- x".into()) };
-        let outcome = run_extraction(&aux, "segment", None, Duration::from_secs(5), 1_609_459_200.0).await;
+        let aux = FixedAux {
+            reply: Some("- x".into()),
+        };
+        let outcome = run_extraction(
+            &aux,
+            "segment",
+            None,
+            Duration::from_secs(5),
+            1_609_459_200.0,
+        )
+        .await;
         assert_eq!(outcome, ExtractionOutcome::Skipped);
     }
 }

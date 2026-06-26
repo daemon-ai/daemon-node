@@ -96,7 +96,10 @@ fn patch_edits_in_place_and_misses_are_errors() {
     store
         .patch("arxiv", "academic papers", "scholarly works", None, false)
         .unwrap();
-    assert!(store.view("arxiv", None).unwrap().contains("scholarly works"));
+    assert!(store
+        .view("arxiv", None)
+        .unwrap()
+        .contains("scholarly works"));
     assert!(matches!(
         store.patch("arxiv", "does-not-exist", "x", None, false),
         Err(SkillError::PatchMiss(_))
@@ -139,7 +142,9 @@ fn cache_invalidated_on_write() {
     store
         .create(
             "obsidian",
-            &ARXIV.replace("arxiv", "obsidian").replace("Search arXiv", "Manage Obsidian"),
+            &ARXIV
+                .replace("arxiv", "obsidian")
+                .replace("Search arXiv", "Manage Obsidian"),
             Some("productivity"),
         )
         .unwrap();
@@ -155,7 +160,9 @@ fn seed_from_bundled_skips_existing() {
     bundled
         .create(
             "maps",
-            &ARXIV.replace("arxiv", "maps").replace("Search arXiv", "Driving directions"),
+            &ARXIV
+                .replace("arxiv", "maps")
+                .replace("Search arXiv", "Driving directions"),
             Some("productivity"),
         )
         .unwrap();
@@ -171,7 +178,10 @@ fn seed_from_bundled_skips_existing() {
 
     let seeded = user.seed_from(bundled.root()).unwrap();
     assert_eq!(seeded, vec!["maps".to_string()]);
-    assert!(user.view("arxiv", None).unwrap().contains("MY custom arxiv"));
+    assert!(user
+        .view("arxiv", None)
+        .unwrap()
+        .contains("MY custom arxiv"));
     assert_eq!(user.discover().len(), 2);
 }
 
@@ -181,7 +191,12 @@ fn seed_bundled_materializes_curated_skills() {
     let seeded = store.seed_bundled().unwrap();
 
     // The curated set ships these portable, tool-agnostic skills.
-    for expected in ["plan", "systematic-debugging", "design-md", "research-paper-writing"] {
+    for expected in [
+        "plan",
+        "systematic-debugging",
+        "design-md",
+        "research-paper-writing",
+    ] {
         assert!(seeded.contains(&expected.to_string()), "missing {expected}");
     }
     // Categories are derived from the embedded path layout.
@@ -190,7 +205,10 @@ fn seed_bundled_materializes_curated_skills() {
     assert_eq!(plan.category.as_deref(), Some("software-development"));
     // Linked reference files come along (progressive disclosure level 3).
     let refs = store
-        .view("research-paper-writing", Some("references/writing-guide.md"))
+        .view(
+            "research-paper-writing",
+            Some("references/writing-guide.md"),
+        )
         .unwrap();
     assert!(!refs.is_empty());
 

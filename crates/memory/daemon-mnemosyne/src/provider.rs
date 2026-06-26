@@ -345,10 +345,10 @@ impl MnemosyneProvider {
 mod tests {
     use super::*;
     use crate::engine::Engine;
-    use serde_json::json;
     use daemon_core::conversation::{Conversation, SystemPrompt, Turn, UserMsg};
     use daemon_core::memory::RecallQuery;
     use daemon_core::MockEmbedder;
+    use serde_json::json;
 
     #[tokio::test]
     async fn vector_recall_surfaces_semantic_match_through_provider() {
@@ -466,7 +466,10 @@ mod tests {
                 json!({"content": "the cache uses an LRU eviction policy"}),
             )
             .await;
-        assert!(remembered.contains("\"status\":\"ok\""), "got: {remembered}");
+        assert!(
+            remembered.contains("\"status\":\"ok\""),
+            "got: {remembered}"
+        );
 
         let recalled = provider
             .call_tool("mnemosyne_recall", json!({"query": "eviction policy"}))

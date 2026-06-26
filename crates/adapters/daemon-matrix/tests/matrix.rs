@@ -228,7 +228,9 @@ async fn outbound_turn_finished_posts_reply() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room).add_timeline_event(
-                factory.text_msg("seed").sender(user_id!("@alice:localhost")),
+                factory
+                    .text_msg("seed")
+                    .sender(user_id!("@alice:localhost")),
             ),
         )
         .await;
@@ -294,15 +296,10 @@ async fn sso_begin_mints_url_then_complete_persists_session() {
     let redirect_uri = "http://127.0.0.1:65000/cb";
 
     // begin: build the on-disk client + mint the SSO authorization URL pointing at our redirect.
-    let session = daemon_matrix::sso_begin(
-        &store_root,
-        &server.uri(),
-        "matrix-bot",
-        redirect_uri,
-        None,
-    )
-    .await
-    .expect("sso_begin mints an authorization url");
+    let session =
+        daemon_matrix::sso_begin(&store_root, &server.uri(), "matrix-bot", redirect_uri, None)
+            .await
+            .expect("sso_begin mints an authorization url");
     assert!(
         session
             .authorization_url

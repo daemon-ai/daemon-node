@@ -47,7 +47,11 @@ impl ToolOutcome {
     /// A text-only outcome whose content is **untrusted** external data (web/MCP/browser): the §12
     /// pipeline fences it before budgeting. Use this for any tool result derived from a fetched page,
     /// search hit, or other source outside the agent's own trust boundary.
-    pub fn untrusted_text(call_id: impl Into<String>, ok: bool, content: impl Into<String>) -> Self {
+    pub fn untrusted_text(
+        call_id: impl Into<String>,
+        ok: bool,
+        content: impl Into<String>,
+    ) -> Self {
         let mut out = Self::text(call_id, ok, content);
         out.untrusted = true;
         out
@@ -207,7 +211,11 @@ impl ToolRegistry {
 
     /// The names of all registered tools (core + deferrable).
     pub fn names(&self) -> Vec<String> {
-        self.core.keys().chain(self.deferrable.keys()).cloned().collect()
+        self.core
+            .keys()
+            .chain(self.deferrable.keys())
+            .cloned()
+            .collect()
     }
 
     /// The static descriptions of all registered tools (core + deferrable).

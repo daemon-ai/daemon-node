@@ -121,10 +121,9 @@ pub async fn probe(launch: AcpLaunch) -> Option<AcpProbe> {
     let (agent, _cwd) = launch.into_agent();
     let captured = Arc::new(std::sync::Mutex::new(None));
     let sink = captured.clone();
-    let run = Client
-        .builder()
-        .name("daemon-acp-probe")
-        .connect_with(agent, move |cx: ConnectionTo<Agent>| {
+    let run = Client.builder().name("daemon-acp-probe").connect_with(
+        agent,
+        move |cx: ConnectionTo<Agent>| {
             let sink = sink.clone();
             async move {
                 let resp = cx
@@ -138,7 +137,8 @@ pub async fn probe(launch: AcpLaunch) -> Option<AcpProbe> {
                 }
                 Ok(())
             }
-        });
+        },
+    );
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
         Ok(Ok(())) => {}
         // A connection error (failed spawn / not ACP) or a timeout: not a confirmed ACP agent.

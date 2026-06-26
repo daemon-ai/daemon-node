@@ -110,7 +110,11 @@ async fn manage_patch_and_write_file_and_delete() {
     .await;
     assert!(linked.result.content.contains("endpoints"));
 
-    let deleted = run(&manage, &serde_json::json!({"action":"delete","name":"arxiv"}).to_string()).await;
+    let deleted = run(
+        &manage,
+        &serde_json::json!({"action":"delete","name":"arxiv"}).to_string(),
+    )
+    .await;
     assert!(deleted.result.ok);
     assert!(store.discover().is_empty());
 }
@@ -125,11 +129,18 @@ async fn errors_are_reported_not_panicked() {
     assert!(!missing.result.ok);
     assert!(missing.result.content.contains("not found"));
 
-    let bad_action = run(&manage, &serde_json::json!({"action":"nope","name":"x"}).to_string()).await;
+    let bad_action = run(
+        &manage,
+        &serde_json::json!({"action":"nope","name":"x"}).to_string(),
+    )
+    .await;
     assert!(!bad_action.result.ok);
 
-    let missing_content =
-        run(&manage, &serde_json::json!({"action":"create","name":"x"}).to_string()).await;
+    let missing_content = run(
+        &manage,
+        &serde_json::json!({"action":"create","name":"x"}).to_string(),
+    )
+    .await;
     assert!(!missing_content.result.ok);
     assert!(missing_content.result.content.contains("content"));
 }

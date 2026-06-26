@@ -51,7 +51,10 @@ pub enum ProviderSelector {
 impl ProviderSelector {
     /// Whether this selector is a local-inference engine (llama.cpp / mistral.rs).
     pub fn is_local(self) -> bool {
-        matches!(self, ProviderSelector::LlamaCpp | ProviderSelector::MistralRs)
+        matches!(
+            self,
+            ProviderSelector::LlamaCpp | ProviderSelector::MistralRs
+        )
     }
 }
 
@@ -188,7 +191,11 @@ pub struct ProfileSpec {
 
 impl ProfileSpec {
     /// A minimal profile over a provider + model, with empty persona and full toolset.
-    pub fn new(id: impl Into<String>, provider: ProviderSelector, model: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        provider: ProviderSelector,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             provider,
@@ -432,8 +439,7 @@ impl ModelDescriptor {
                 .with_pricing(1.25, 10.0),
             ModelDescriptor::cloud("gemini-2.5-flash", GenAi, Some(1_048_576))
                 .with_pricing(0.30, 2.5),
-            ModelDescriptor::cloud("deepseek-chat", GenAi, Some(128_000))
-                .with_pricing(0.27, 1.10),
+            ModelDescriptor::cloud("deepseek-chat", GenAi, Some(128_000)).with_pricing(0.27, 1.10),
             ModelDescriptor::cloud("deepseek-reasoner", GenAi, Some(128_000))
                 .with_pricing(0.55, 2.19),
             ModelDescriptor::cloud("grok-4", GenAi, Some(256_000)).with_pricing(3.0, 15.0),
@@ -475,7 +481,14 @@ impl CredentialInfo {
         let profile = profile.into();
         match secret {
             Some(s) if !s.is_empty() => {
-                let tail: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                let tail: String = s
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
                 Self {
                     profile,
                     present: true,
@@ -580,8 +593,7 @@ mod tests {
             "cohere",
             "genai",
         ] {
-            let sel: ProviderSelector =
-                serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            let sel: ProviderSelector = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
             assert_eq!(sel, ProviderSelector::GenAi, "{legacy} should map to GenAi");
         }
         // The local engines keep their own ids.
@@ -594,7 +606,9 @@ mod tests {
     #[test]
     fn catalog_is_genai_with_known_context() {
         let catalog = ModelDescriptor::builtin_cloud_catalog();
-        assert!(catalog.iter().all(|m| m.provider == ProviderSelector::GenAi));
+        assert!(catalog
+            .iter()
+            .all(|m| m.provider == ProviderSelector::GenAi));
         // opus is still discoverable with its published context window (the overlay).
         assert_eq!(
             ModelDescriptor::known_context_length("claude-opus-4-8"),

@@ -9,11 +9,11 @@ use crate::approval::{ApprovalPolicy, Decision};
 use crate::conversation::{ToolCall, Turn};
 use crate::events::EventSink;
 use crate::exec::ExecutionEnvironment;
+use daemon_common::ReqId;
 use daemon_common::{Budget, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponseBody, SpawnSpec,
 };
-use daemon_common::ReqId;
 use tokio_util::sync::CancellationToken;
 
 /// The ambient context handed to phases and tools during a turn (§4.2).

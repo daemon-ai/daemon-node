@@ -413,7 +413,11 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
         let mut pending_policy: Option<crate::approval::ApprovalPolicy> = None;
         // A rewind requested while a turn was running: the turn is cancelled (interrupt-first) and the
         // rewind is applied here at the boundary, once the abandoned turn has released `&mut engine`.
-        type PendingRewind = (RewindAnchor, ReqId, oneshot::Sender<Result<RewindOutcome, RewindError>>);
+        type PendingRewind = (
+            RewindAnchor,
+            ReqId,
+            oneshot::Sender<Result<RewindOutcome, RewindError>>,
+        );
         let mut pending_rewind: Option<PendingRewind> = None;
         let mut shutting_down = false;
 

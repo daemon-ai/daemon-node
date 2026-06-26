@@ -90,18 +90,12 @@ async fn mcp_discover_register_run_roundtrip() {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
 
     let server = tokio::spawn(async move {
-        let running = EchoServer
-            .serve(server_io)
-            .await
-            .expect("server handshake");
+        let running = EchoServer.serve(server_io).await.expect("server handshake");
         running.waiting().await.expect("server run");
     });
 
     // Client half: complete the rmcp handshake, then wrap in our McpClient over the live connection.
-    let connection = ()
-        .serve(client_io)
-        .await
-        .expect("client handshake");
+    let connection = ().serve(client_io).await.expect("client handshake");
     let client = Arc::new(McpClient::from_connection(
         McpServerConfig::stdio("echo-srv", "true", Vec::new()),
         connection,

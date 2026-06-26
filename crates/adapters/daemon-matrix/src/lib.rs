@@ -52,8 +52,7 @@ pub(crate) const FAMILY: &str = "matrix";
 /// `MessagingProtocol` feature-trait method bodies (which only hold `&self`, so they recover the
 /// account's [`Client`] from here). A `tokio::sync::RwLock` (not std) so the read in an `async`
 /// verb body never blocks the runtime, and writers (bring-up) don't hold a guard across an await.
-pub(crate) type LiveClients =
-    Arc<tokio::sync::RwLock<HashMap<TransportId, Client>>>;
+pub(crate) type LiveClients = Arc<tokio::sync::RwLock<HashMap<TransportId, Client>>>;
 
 /// Persist refreshed session tokens back to the credential subsystem (spec §6.2: the credential
 /// store is authoritative over the SDK's session copy). matrix-sdk refreshes tokens in-memory (the

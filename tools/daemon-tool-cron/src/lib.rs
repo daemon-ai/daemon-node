@@ -88,7 +88,10 @@ fn check_prompt(prompt: &str) -> Result<(), String> {
     if prompt.len() > MAX_PROMPT_BYTES {
         return Err(format!("prompt exceeds {MAX_PROMPT_BYTES} bytes"));
     }
-    if prompt.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') {
+    if prompt
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r')
+    {
         return Err("prompt contains control characters".into());
     }
     Ok(())
@@ -100,7 +103,9 @@ fn parse_overlap(s: &str) -> Result<OverlapPolicy, String> {
         "" | "skip" => Ok(OverlapPolicy::Skip),
         "allow" => Ok(OverlapPolicy::Allow),
         "queue" => Ok(OverlapPolicy::Queue),
-        other => Err(format!("unknown overlap policy {other:?} (skip|allow|queue)")),
+        other => Err(format!(
+            "unknown overlap policy {other:?} (skip|allow|queue)"
+        )),
     }
 }
 
@@ -110,7 +115,9 @@ fn parse_catch_up(s: &str) -> Result<CatchUpPolicy, String> {
         "" | "grace" => Ok(CatchUpPolicy::Grace),
         "skip" => Ok(CatchUpPolicy::Skip),
         "always" => Ok(CatchUpPolicy::Always),
-        other => Err(format!("unknown catch_up policy {other:?} (grace|skip|always)")),
+        other => Err(format!(
+            "unknown catch_up policy {other:?} (grace|skip|always)"
+        )),
     }
 }
 
@@ -151,7 +158,10 @@ fn spec_from(map: &serde_json::Map<String, serde_json::Value>) -> Result<CronSpe
     if let Some(s) = &script {
         check_script(s)?;
     }
-    let no_agent = map.get("no_agent").and_then(|v| v.as_bool()).unwrap_or(false);
+    let no_agent = map
+        .get("no_agent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let overlap = match map.get("overlap").and_then(|v| v.as_str()) {
         Some(s) => parse_overlap(s)?,
         None => OverlapPolicy::default(),
@@ -168,7 +178,10 @@ fn spec_from(map: &serde_json::Map<String, serde_json::Value>) -> Result<CronSpe
         enabled: map.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
         timezone: str_field("timezone"),
         repeat: map.get("repeat").and_then(|v| v.as_u64()).map(|n| n as u32),
-        jitter_secs: map.get("jitter_secs").and_then(|v| v.as_u64()).map(|n| n as u32),
+        jitter_secs: map
+            .get("jitter_secs")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
         overlap,
         catch_up,
         script,
@@ -333,8 +346,7 @@ mod tests {
     fn spec_requires_name_and_schedule() {
         assert!(spec_from(&obj(r#"{"name":"x"}"#)).is_err());
         assert!(spec_from(&obj(r#"{"schedule":"0 9 * * *"}"#)).is_err());
-        let spec =
-            spec_from(&obj(r#"{"name":"x","schedule":"0 9 * * *","prompt":"hi"}"#)).unwrap();
+        let spec = spec_from(&obj(r#"{"name":"x","schedule":"0 9 * * *","prompt":"hi"}"#)).unwrap();
         assert_eq!(spec.name, "x");
         assert_eq!(spec.payload, b"hi");
     }
@@ -362,7 +374,10 @@ mod tests {
         assert_eq!(spec.workdir.as_deref(), Some("/srv/p"));
         assert_eq!(spec.model.as_deref(), Some("gpt-5"));
         assert_eq!(spec.provider.as_deref(), Some("genai"));
-        assert_eq!(spec.skills, vec!["briefing".to_owned(), "calendar".to_owned()]);
+        assert_eq!(
+            spec.skills,
+            vec!["briefing".to_owned(), "calendar".to_owned()]
+        );
     }
 
     #[test]
@@ -375,9 +390,27 @@ mod tests {
         let props = schema["properties"].as_object().expect("properties object");
         // Every CronSpec-backed field the agent can set is discoverable in the schema.
         for field in [
-            "action", "id", "name", "schedule", "prompt", "timezone", "repeat", "jitter_secs",
-            "enabled", "overlap", "catch_up", "target", "deliver", "script", "no_agent",
-            "context_from", "enabled_toolsets", "skills", "workdir", "model", "provider",
+            "action",
+            "id",
+            "name",
+            "schedule",
+            "prompt",
+            "timezone",
+            "repeat",
+            "jitter_secs",
+            "enabled",
+            "overlap",
+            "catch_up",
+            "target",
+            "deliver",
+            "script",
+            "no_agent",
+            "context_from",
+            "enabled_toolsets",
+            "skills",
+            "workdir",
+            "model",
+            "provider",
         ] {
             assert!(props.contains_key(field), "schema must advertise `{field}`");
         }

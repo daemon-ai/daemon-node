@@ -64,7 +64,7 @@ pub fn chaos_tick(inner: TickFn, panic_every: usize, counter: Arc<AtomicUsize>) 
         let counter = counter.clone();
         Box::pin(async move {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if panic_every > 0 && n % panic_every == 0 {
+            if panic_every > 0 && n.is_multiple_of(panic_every) {
                 panic!("chaos panic on tick {n}");
             }
             inner().await

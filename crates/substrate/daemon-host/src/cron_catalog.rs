@@ -91,8 +91,8 @@ impl CronBlueprint {
                 .unwrap_or(slot.default);
             match slot.kind {
                 SlotKind::Time => {
-                    let (minute, hour) =
-                        parse_hhmm(raw).unwrap_or_else(|| parse_hhmm(slot.default).unwrap_or((0, 9)));
+                    let (minute, hour) = parse_hhmm(raw)
+                        .unwrap_or_else(|| parse_hhmm(slot.default).unwrap_or((0, 9)));
                     tokens.insert("minute".into(), minute.to_string());
                     tokens.insert("hour".into(), hour.to_string());
                 }
@@ -210,7 +210,8 @@ const INTERVAL_SLOT: BlueprintSlot = BlueprintSlot {
 pub fn blueprints() -> &'static [CronBlueprint] {
     const MORNING_BRIEF: &[BlueprintSlot] = &[time_slot("08:00"), SLOT_DELIVER];
     const IMPORTANT_MAIL: &[BlueprintSlot] = &[INTERVAL_SLOT, SLOT_DELIVER];
-    const WEEKLY_REVIEW: &[BlueprintSlot] = &[weekdays_slot("sun"), time_slot("18:00"), SLOT_DELIVER];
+    const WEEKLY_REVIEW: &[BlueprintSlot] =
+        &[weekdays_slot("sun"), time_slot("18:00"), SLOT_DELIVER];
     const WORKDAY_START: &[BlueprintSlot] = &[time_slot("09:00"), SLOT_DELIVER];
     const CUSTOM_REMINDER: &[BlueprintSlot] = &[
         time_slot("10:00"),
@@ -548,7 +549,10 @@ mod tests {
 
     #[test]
     fn fill_time_blueprint_expands_minute_hour() {
-        let bp = blueprints().iter().find(|b| b.id == "morning-brief").unwrap();
+        let bp = blueprints()
+            .iter()
+            .find(|b| b.id == "morning-brief")
+            .unwrap();
         let mut values = BTreeMap::new();
         values.insert("time".to_string(), "07:30".to_string());
         let spec = bp.fill(&values);
@@ -559,7 +563,10 @@ mod tests {
 
     #[test]
     fn fill_weekly_blueprint_expands_weekdays() {
-        let bp = blueprints().iter().find(|b| b.id == "weekly-review").unwrap();
+        let bp = blueprints()
+            .iter()
+            .find(|b| b.id == "weekly-review")
+            .unwrap();
         let mut values = BTreeMap::new();
         values.insert("weekdays".to_string(), "Mon, Wed , Fri".to_string());
         values.insert("time".to_string(), "18:00".to_string());
@@ -569,7 +576,10 @@ mod tests {
 
     #[test]
     fn fill_text_slot_substitutes_prompt() {
-        let bp = blueprints().iter().find(|b| b.id == "custom-reminder").unwrap();
+        let bp = blueprints()
+            .iter()
+            .find(|b| b.id == "custom-reminder")
+            .unwrap();
         let mut values = BTreeMap::new();
         values.insert("what".to_string(), "drink water".to_string());
         let spec = bp.fill(&values);
@@ -578,14 +588,20 @@ mod tests {
 
     #[test]
     fn fill_interval_blueprint_uses_every_grammar() {
-        let bp = blueprints().iter().find(|b| b.id == "important-mail").unwrap();
+        let bp = blueprints()
+            .iter()
+            .find(|b| b.id == "important-mail")
+            .unwrap();
         let spec = bp.fill(&BTreeMap::new());
         assert_eq!(spec.schedule, "@every 30m");
     }
 
     #[test]
     fn fill_deliver_slot_local_means_store_only() {
-        let bp = blueprints().iter().find(|b| b.id == "morning-brief").unwrap();
+        let bp = blueprints()
+            .iter()
+            .find(|b| b.id == "morning-brief")
+            .unwrap();
         let mut values = BTreeMap::new();
         values.insert("deliver".to_string(), "local".to_string());
         let spec = bp.fill(&values);
@@ -594,7 +610,10 @@ mod tests {
 
     #[test]
     fn fill_uses_defaults_when_missing() {
-        let bp = blueprints().iter().find(|b| b.id == "morning-brief").unwrap();
+        let bp = blueprints()
+            .iter()
+            .find(|b| b.id == "morning-brief")
+            .unwrap();
         let spec = bp.fill(&BTreeMap::new());
         assert_eq!(spec.schedule, "0 8 * * *");
     }
@@ -617,8 +636,12 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), 4, "dedup_keys must be unique");
-        assert!(starters.iter().all(|s| s.status == SuggestionStatus::Pending));
-        assert!(starters.iter().all(|s| s.spec.deliver.as_deref() == Some("origin")));
+        assert!(starters
+            .iter()
+            .all(|s| s.status == SuggestionStatus::Pending));
+        assert!(starters
+            .iter()
+            .all(|s| s.spec.deliver.as_deref() == Some("origin")));
     }
 
     #[test]

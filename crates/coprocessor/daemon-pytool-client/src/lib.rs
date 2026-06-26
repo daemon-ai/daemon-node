@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use daemon_common::SessionId;
 use daemon_core::{
     Tool, ToolCall, ToolConcurrency, ToolOutcome, ToolProvider, ToolProviderError, TurnCx,
 };
@@ -35,7 +36,6 @@ use daemon_provision::{
 use daemon_pytool::protocol::{
     self, Command, Concurrency, ErrorClass, Event, ResultDetail, ToolManifest, PROTOCOL_VERSION,
 };
-use daemon_common::SessionId;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
@@ -155,7 +155,12 @@ impl PyToolHost {
     /// Spawn the worker (if needed) and return the tools it most recently advertised.
     pub async fn discover(&self) -> Result<Vec<ToolManifest>, PyToolError> {
         self.ensure_worker().await?;
-        Ok(self.inner.tools.lock().expect("pytool tools poisoned").clone())
+        Ok(self
+            .inner
+            .tools
+            .lock()
+            .expect("pytool tools poisoned")
+            .clone())
     }
 
     /// Invoke a tool on the (lazily spawned) worker. Tears the worker down on a fault that warrants
@@ -349,9 +354,7 @@ impl Worker {
                     return Err(PyToolError::from_class(class, message))
                 }
                 Ok(other) => {
-                    return Err(PyToolError::Fatal(format!(
-                        "expected Ready, got {other:?}"
-                    )))
+                    return Err(PyToolError::Fatal(format!("expected Ready, got {other:?}")))
                 }
                 Err(e) => return Err(PyToolError::Fatal(format!("undecodable ready frame: {e}"))),
             },
@@ -419,7 +422,9 @@ impl Worker {
             match tokio::time::timeout(timeout, reader.recv()).await {
                 Err(_) => return Err(PyToolError::Transient("list_tools timed out".into())),
                 Ok(None) => {
-                    return Err(PyToolError::Transient("worker exited during discovery".into()))
+                    return Err(PyToolError::Transient(
+                        "worker exited during discovery".into(),
+                    ))
                 }
                 Ok(Some(bytes)) => match protocol::decode::<Event>(&bytes) {
                     Ok(Event::Tools { tools, .. }) => return Ok(tools),
@@ -429,7 +434,9 @@ impl Worker {
                     // Ignore any unrelated frame during the handshake.
                     Ok(_) => {}
                     Err(e) => {
-                        return Err(PyToolError::Fatal(format!("undecodable discovery frame: {e}")))
+                        return Err(PyToolError::Fatal(format!(
+                            "undecodable discovery frame: {e}"
+                        )))
                     }
                 },
             }
@@ -495,7 +502,10 @@ impl Worker {
         if let Some(reader) = self.reader.lock().expect("pytool reader poisoned").take() {
             reader.abort();
         }
-        self.pending.lock().expect("pytool pending poisoned").clear();
+        self.pending
+            .lock()
+            .expect("pytool pending poisoned")
+            .clear();
     }
 }
 
@@ -568,9 +578,9 @@ impl Tool for PyToolProxy {
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
         let call_id = call.call_id.clone();
         let session_id = cx.session_id.to_string();
-        let call_fut = self
-            .host
-            .call_tool(&call_id, &self.manifest.name, &call.args, &session_id, 0);
+        let call_fut =
+            self.host
+                .call_tool(&call_id, &self.manifest.name, &call.args, &session_id, 0);
         tokio::select! {
             biased;
             // Cooperative cancellation: tell the worker to stop, return a failed (cancelled) result.

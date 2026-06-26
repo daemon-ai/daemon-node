@@ -86,8 +86,14 @@ pub fn defs() -> Vec<ToolDef> {
             "mnemosyne_scratchpad_write",
             r#"{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}"#,
         ),
-        def("mnemosyne_scratchpad_read", r#"{"type":"object","properties":{}}"#),
-        def("mnemosyne_scratchpad_clear", r#"{"type":"object","properties":{}}"#),
+        def(
+            "mnemosyne_scratchpad_read",
+            r#"{"type":"object","properties":{}}"#,
+        ),
+        def(
+            "mnemosyne_scratchpad_clear",
+            r#"{"type":"object","properties":{}}"#,
+        ),
         def(
             "mnemosyne_graph_query",
             r#"{"type":"object","properties":{"id":{"type":"string"},"depth":{"type":"integer"}},"required":["id"]}"#,
@@ -113,7 +119,10 @@ pub fn defs() -> Vec<ToolDef> {
             "mnemosyne_shared_forget",
             r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
         ),
-        def("mnemosyne_shared_stats", r#"{"type":"object","properties":{}}"#),
+        def(
+            "mnemosyne_shared_stats",
+            r#"{"type":"object","properties":{}}"#,
+        ),
     ];
     #[cfg(feature = "sync")]
     defs.extend(sync_defs());
@@ -123,8 +132,14 @@ pub fn defs() -> Vec<ToolDef> {
 #[cfg(feature = "sync")]
 fn sync_defs() -> Vec<ToolDef> {
     vec![
-        def("mnemosyne_sync_status", r#"{"type":"object","properties":{}}"#),
-        def("mnemosyne_sync_export", r#"{"type":"object","properties":{}}"#),
+        def(
+            "mnemosyne_sync_status",
+            r#"{"type":"object","properties":{}}"#,
+        ),
+        def(
+            "mnemosyne_sync_export",
+            r#"{"type":"object","properties":{}}"#,
+        ),
         def(
             "mnemosyne_sync_import",
             r#"{"type":"object","properties":{"bundle":{"type":"object"}},"required":["bundle"]}"#,
@@ -142,7 +157,11 @@ fn err(e: impl std::fmt::Display) -> String {
 
 /// Run a sleep pass, summarizing via the LLM when present, else the engine's AAAK fallback.
 /// Shared by the `mnemosyne_sleep` tool and the provider's session-boundary/auto-sleep hooks.
-pub async fn run_sleep(engine: &Engine, extractor: &Extractor, force: bool) -> crate::Result<crate::engine::SleepReport> {
+pub async fn run_sleep(
+    engine: &Engine,
+    extractor: &Extractor,
+    force: bool,
+) -> crate::Result<crate::engine::SleepReport> {
     if !extractor.available() {
         return engine.sleep(force);
     }

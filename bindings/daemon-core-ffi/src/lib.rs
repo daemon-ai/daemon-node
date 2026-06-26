@@ -34,14 +34,14 @@ use daemon_core::{
     EmbeddedCredentialPool, Engine, EngineProfile, MockProvider, Provider, ProviderBuilder,
     SystemPrompt, ToolRegistry,
 };
-use daemon_providers::GenAiProvider;
-use serde::{Deserialize, Serialize};
 use daemon_protocol::{
     AgentCommand, Direction, Disposition, HostRequest, HostRequestHandler, HostResponse,
     HostResponseBody, Origin, OriginScope, SessionLogEntry, SessionPayload, TransportId,
 };
+use daemon_providers::GenAiProvider;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -182,9 +182,9 @@ fn provider_builder(cfg: &CoreFfiConfig) -> ProviderBuilder {
                 Arc::new(p) as Arc<dyn Provider>
             })
         }
-        _ => Arc::new(|| {
-            Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>
-        }),
+        _ => {
+            Arc::new(|| Arc::new(MockProvider::completing("ffi session done")) as Arc<dyn Provider>)
+        }
     }
 }
 
@@ -945,7 +945,8 @@ mod fixture_tests {
         0xA2, // map(2)
         0x64, b't', b'e', b'x', b't', // "text"
         0x62, b'h', b'i', // "hi"
-        0x6B, b'a', b't', b't', b'a', b'c', b'h', b'm', b'e', b'n', b't', b's', // "attachments"
+        0x6B, b'a', b't', b't', b'a', b'c', b'h', b'm', b'e', b'n', b't',
+        b's', // "attachments"
         0x80, // array(0)
         0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd', // "request_id"
         0x01, // 1
@@ -1059,7 +1060,8 @@ mod config_tests {
         0x64, b'm', b'o', b'c', b'k', // "mock"
         0x6D, b's', b'y', b's', b't', b'e', b'm', b'_', b'p', b'r', b'o', b'm', b'p',
         b't', // "system_prompt"
-        0x6B, b'h', b'a', b'r', b'n', b'e', b's', b's', b'-', b'c', b'f', b'g', // "harness-cfg"
+        0x6B, b'h', b'a', b'r', b'n', b'e', b's', b's', b'-', b'c', b'f',
+        b'g', // "harness-cfg"
     ];
 
     #[test]

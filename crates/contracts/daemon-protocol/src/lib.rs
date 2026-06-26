@@ -1105,10 +1105,12 @@ impl RoomMember {
 /// re-injected as the next inbound post. The stub set; the policy engine lives in `daemon-rooms`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
+#[derive(Default)]
 pub enum RoomPolicy {
     /// Members take the floor in a fixed rotation (the default group-chat shape).
     RoundRobin,
     /// Only an explicitly addressed (mentioned) member opens a turn; others stay observers.
+    #[default]
     AddressedOnly,
     /// One moderator member arbitrates who may speak next.
     Moderator {
@@ -1117,12 +1119,6 @@ pub enum RoomPolicy {
     },
     /// No arbitration — every member turns on every post (bounded only by the turn budget).
     FreeForAll,
-}
-
-impl Default for RoomPolicy {
-    fn default() -> Self {
-        RoomPolicy::AddressedOnly
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,21 +1245,16 @@ pub enum UnitState {
 /// (`Primary` only) separate from drill-down children, and to keep long-lived managed children
 /// stable while coalescing transient-subagent churn. The transport-stable mirror of the store's
 /// `SessionRole`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SessionRole {
     /// A top-level conversation (the only role in the `TopLevel` roster scope / fleet root).
+    #[default]
     Primary,
     /// A long-lived child an agent owns/manages: stable, low churn; always projected into the tree.
     ManagedChild,
     /// A transient/temporary subagent: in the tree but high churn (rapidly created/destroyed), so
     /// consumers may coalesce or filter it.
     EphemeralSubagent,
-}
-
-impl Default for SessionRole {
-    fn default() -> Self {
-        Self::Primary
-    }
 }
 
 impl SessionRole {

@@ -132,7 +132,9 @@ fn redaction_placeholder(name: &str, secret: &str, include_hash: bool) -> String
     let bytes = secret.len();
     if include_hash {
         let sha = sha256_hex_prefix(secret.as_bytes(), 16);
-        format!("[LCM sensitive redaction: name={name}; chars={chars}; bytes={bytes}; sha256={sha}]")
+        format!(
+            "[LCM sensitive redaction: name={name}; chars={chars}; bytes={bytes}; sha256={sha}]"
+        )
     } else {
         format!("[LCM sensitive redaction: name={name}; chars={chars}; bytes={bytes}]")
     }
@@ -166,7 +168,11 @@ fn redact_one(text: &str, pat: &SensitivePattern) -> String {
             None => continue,
         };
         out.push_str(&text[last..secret.start()]);
-        out.push_str(&redaction_placeholder(pat.name, secret.as_str(), pat.include_hash));
+        out.push_str(&redaction_placeholder(
+            pat.name,
+            secret.as_str(),
+            pat.include_hash,
+        ));
         out.push_str(&text[secret.end()..whole.end()]);
         last = whole.end();
     }
@@ -179,7 +185,9 @@ fn redact_one(text: &str, pat: &SensitivePattern) -> String {
 pub fn redact_sensitive_value(value: &mut Value, active: &[String]) {
     match value {
         Value::String(s) => *s = redact_sensitive_text(s, active),
-        Value::Array(items) => items.iter_mut().for_each(|v| redact_sensitive_value(v, active)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|v| redact_sensitive_value(v, active)),
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
                 if let (Some(name), Value::String(s)) = (sensitive_pattern_for_key(k), &*v) {
@@ -274,12 +282,20 @@ fn externalize_runs(
             Some(m) => m,
             None => continue,
         };
-        let candidate = caps.get(group).map(|m| m.as_str()).unwrap_or(whole.as_str());
+        let candidate = caps
+            .get(group)
+            .map(|m| m.as_str())
+            .unwrap_or(whole.as_str());
         if !looks_like_long_base64(candidate, min_len) {
             continue;
         }
         let body = whole.as_str();
-        let meta = PayloadMeta { kind, field, role, tool_call_id };
+        let meta = PayloadMeta {
+            kind,
+            field,
+            role,
+            tool_call_id,
+        };
         match externalize::store_payload(dir, body, &meta) {
             Ok(reference) => {
                 out.push_str(&text[last..whole.start()]);
@@ -366,7 +382,11 @@ pub fn assistant_output_quarantine_reason(content: &str) -> Option<String> {
     let unique_token_ratio = ratio(distinct_tokens, total);
     let top_token_ratio = ratio(token_freq.values().copied().max().unwrap_or(0), total);
 
-    let segments: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let segments: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
     let seg_total = segments.len();
     let mut seg_freq = std::collections::HashMap::new();
     for s in &segments {
@@ -376,12 +396,17 @@ pub fn assistant_output_quarantine_reason(content: &str) -> Option<String> {
     let duplicate_segment_ratio = ratio(seg_total.saturating_sub(distinct_segments), seg_total);
     let top_segment_ratio = ratio(seg_freq.values().copied().max().unwrap_or(0), seg_total);
 
-    let distinct_chars = content.chars().collect::<std::collections::HashSet<_>>().len();
+    let distinct_chars = content
+        .chars()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     let degenerate_tokens = total >= QUARANTINED_ASSISTANT_MIN_TOKENS || total == 0;
     let primary = unique_token_ratio <= 0.03
         && degenerate_tokens
-        && (top_segment_ratio >= 0.10 || duplicate_segment_ratio >= 0.50 || top_token_ratio >= 0.08);
+        && (top_segment_ratio >= 0.10
+            || duplicate_segment_ratio >= 0.50
+            || top_token_ratio >= 0.08);
     let secondary = unique_token_ratio <= 0.015 && distinct_chars <= 64;
 
     if primary {
@@ -479,7 +504,13 @@ pub fn protect_message_for_ingest(
 
     // 5. Always-on storage guard over the (possibly quarantined) content.
     if let Some(content) = msg.content.as_ref() {
-        msg.content = Some(apply_storage_guard(content, "content", &msg.role, msg.tool_call_id.as_deref(), dir));
+        msg.content = Some(apply_storage_guard(
+            content,
+            "content",
+            &msg.role,
+            msg.tool_call_id.as_deref(),
+            dir,
+        ));
     }
     // 6. Tool-call blob protection (base64 inside args).
     if let Some(tc) = msg.tool_calls.as_ref() {
@@ -493,7 +524,12 @@ pub fn protect_message_for_ingest(
 /// volatile active-replay placeholder.
 fn quarantine_replacement(content: &str, role: &str, dir: Option<&Path>) -> String {
     if let Some(dir) = dir {
-        let meta = PayloadMeta { kind: "quarantine", field: "content", role, tool_call_id: None };
+        let meta = PayloadMeta {
+            kind: "quarantine",
+            field: "content",
+            role,
+            tool_call_id: None,
+        };
         match externalize::store_payload(dir, content, &meta) {
             Ok(reference) => {
                 return format!(
@@ -544,7 +580,10 @@ mod tests {
     fn redaction_is_disabled_when_pattern_inactive() {
         let active: Vec<String> = vec!["bearer_token".to_string()];
         let red = redact_sensitive_text("api_key=ABCDEF0123456789", &active);
-        assert!(red.contains("ABCDEF0123456789"), "inactive pattern is not applied");
+        assert!(
+            red.contains("ABCDEF0123456789"),
+            "inactive pattern is not applied"
+        );
     }
 
     #[test]
@@ -562,8 +601,14 @@ mod tests {
         let active = all_patterns();
         let mut v: Value = serde_json::json!({"password": "short!", "nested": {"api_token": "ABCDEFGHIJKL"}, "ok": "keep"});
         redact_sensitive_value(&mut v, &active);
-        assert!(v["password"].as_str().unwrap().contains("name=password_assignment"));
-        assert!(v["nested"]["api_token"].as_str().unwrap().contains("name=api_key"));
+        assert!(v["password"]
+            .as_str()
+            .unwrap()
+            .contains("name=password_assignment"));
+        assert!(v["nested"]["api_token"]
+            .as_str()
+            .unwrap()
+            .contains("name=api_key"));
         assert_eq!(v["ok"], "keep");
     }
 
@@ -605,7 +650,9 @@ mod tests {
         assert!(content.chars().count() >= QUARANTINED_ASSISTANT_MIN_CHARS);
         assert!(assistant_output_quarantine_reason(&content).is_some());
         // Normal long-ish prose with variety is not quarantined.
-        let varied: String = (0..70_000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let varied: String = (0..70_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
         let _ = varied; // entropy high but single segment; ensure short normal text is safe
         assert!(assistant_output_quarantine_reason("a short normal reply").is_none());
     }

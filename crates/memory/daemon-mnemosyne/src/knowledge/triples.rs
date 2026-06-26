@@ -44,7 +44,9 @@ pub fn add(
     confidence: f64,
     supersede: bool,
 ) -> Result<i64> {
-    let valid_from = valid_from.map(str::to_string).unwrap_or_else(util::today_iso);
+    let valid_from = valid_from
+        .map(str::to_string)
+        .unwrap_or_else(util::today_iso);
     if supersede {
         conn.execute(
             "UPDATE triples SET valid_until = ?1 \
@@ -154,8 +156,30 @@ mod tests {
     fn supersede_closes_prior_and_as_of_history() {
         let store = conn();
         let c = store.conn.lock().unwrap();
-        add(&c, "user", "city", "Berlin", Some("2024-01-01"), None, "test", 1.0, true).unwrap();
-        add(&c, "user", "city", "Lisbon", Some("2024-06-01"), None, "test", 1.0, true).unwrap();
+        add(
+            &c,
+            "user",
+            "city",
+            "Berlin",
+            Some("2024-01-01"),
+            None,
+            "test",
+            1.0,
+            true,
+        )
+        .unwrap();
+        add(
+            &c,
+            "user",
+            "city",
+            "Lisbon",
+            Some("2024-06-01"),
+            None,
+            "test",
+            1.0,
+            true,
+        )
+        .unwrap();
 
         // Current truth: only Lisbon is open.
         let now = query(&c, Some("user"), Some("city"), None, Some("2024-07-01")).unwrap();
@@ -172,8 +196,30 @@ mod tests {
     fn multivalued_predicate_keeps_priors_open() {
         let store = conn();
         let c = store.conn.lock().unwrap();
-        add(&c, "user", "speaks", "English", Some("2024-01-01"), None, "t", 1.0, false).unwrap();
-        add(&c, "user", "speaks", "Spanish", Some("2024-01-01"), None, "t", 1.0, false).unwrap();
+        add(
+            &c,
+            "user",
+            "speaks",
+            "English",
+            Some("2024-01-01"),
+            None,
+            "t",
+            1.0,
+            false,
+        )
+        .unwrap();
+        add(
+            &c,
+            "user",
+            "speaks",
+            "Spanish",
+            Some("2024-01-01"),
+            None,
+            "t",
+            1.0,
+            false,
+        )
+        .unwrap();
         let langs = query(&c, Some("user"), Some("speaks"), None, Some("2024-02-01")).unwrap();
         assert_eq!(langs.len(), 2);
     }
@@ -182,7 +228,18 @@ mod tests {
     fn end_closes_open_rows() {
         let store = conn();
         let c = store.conn.lock().unwrap();
-        add(&c, "user", "role", "admin", Some("2024-01-01"), None, "t", 1.0, false).unwrap();
+        add(
+            &c,
+            "user",
+            "role",
+            "admin",
+            Some("2024-01-01"),
+            None,
+            "t",
+            1.0,
+            false,
+        )
+        .unwrap();
         let closed = end(&c, "user", "role", None, Some("2024-05-01")).unwrap();
         assert_eq!(closed, 1);
         let after = query(&c, Some("user"), Some("role"), None, Some("2024-06-01")).unwrap();

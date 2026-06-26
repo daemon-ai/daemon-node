@@ -27,7 +27,9 @@ fn tiktoken_count(text: &str) -> Option<usize> {
     use tiktoken_rs::CoreBPE;
     static ENCODER: OnceLock<Option<CoreBPE>> = OnceLock::new();
     let encoder = ENCODER.get_or_init(|| tiktoken_rs::cl100k_base().ok());
-    encoder.as_ref().map(|bpe| bpe.encode_with_special_tokens(text).len())
+    encoder
+        .as_ref()
+        .map(|bpe| bpe.encode_with_special_tokens(text).len())
 }
 
 #[cfg(test)]

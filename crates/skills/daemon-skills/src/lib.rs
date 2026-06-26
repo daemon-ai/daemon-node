@@ -451,7 +451,10 @@ impl SkillStore {
     pub fn delete(&self, name: &str) -> Result<(), SkillError> {
         let entry = self.find(name)?;
         // Defense in depth: never recurse-remove anything outside the store root.
-        let canon_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let canon_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
         let canon_dir = entry
             .dir
             .canonicalize()
@@ -609,10 +612,9 @@ impl SkillStore {
             )));
         }
         let entry = self.find(name)?;
-        let rel = entry
-            .dir
-            .strip_prefix(&self.root)
-            .map_err(|_| SkillError::Invalid(format!("skill `{name}` is outside the store root")))?;
+        let rel = entry.dir.strip_prefix(&self.root).map_err(|_| {
+            SkillError::Invalid(format!("skill `{name}` is outside the store root"))
+        })?;
         let dest = self.archive_root().join(rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -965,7 +967,9 @@ pub fn parse_frontmatter(content: &str) -> Result<SkillFrontmatter, SkillError> 
 fn validate_skill_md(content: &str) -> Result<(), SkillError> {
     let fm = parse_frontmatter(content)?;
     if fm.name.trim().is_empty() {
-        return Err(SkillError::Malformed("frontmatter `name` is required".into()));
+        return Err(SkillError::Malformed(
+            "frontmatter `name` is required".into(),
+        ));
     }
     if fm.description.trim().is_empty() {
         return Err(SkillError::Malformed(
@@ -1043,7 +1047,7 @@ fn walk_skill_files(root: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in read.flatten() {
         let path = entry.path();
-        let Ok( file_type) = entry.file_type() else {
+        let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_dir() {
@@ -1120,7 +1124,9 @@ fn collect_bundle_files(
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let allowed = rel == "SKILL.md"
-            || SUPPORT_DIRS.iter().any(|d| rel.starts_with(&format!("{d}/")));
+            || SUPPORT_DIRS
+                .iter()
+                .any(|d| rel.starts_with(&format!("{d}/")));
         if !allowed {
             continue;
         }

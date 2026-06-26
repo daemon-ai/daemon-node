@@ -116,10 +116,7 @@ impl McpClient {
     /// Build a client over an already-established connection (the seam for tests and for callers
     /// that own the rmcp handshake themselves). The `config` is retained only for reconnect-on-fault;
     /// the supplied connection is used until it faults.
-    pub fn from_connection(
-        config: McpServerConfig,
-        conn: RunningService<RoleClient, ()>,
-    ) -> Self {
+    pub fn from_connection(config: McpServerConfig, conn: RunningService<RoleClient, ()>) -> Self {
         Self {
             config,
             conn: AsyncMutex::new(Some(conn)),
@@ -140,8 +137,8 @@ impl McpClient {
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
-                let transport =
-                    TokioChildProcess::new(cmd).map_err(|e| McpClientError::Connect(e.to_string()))?;
+                let transport = TokioChildProcess::new(cmd)
+                    .map_err(|e| McpClientError::Connect(e.to_string()))?;
                 ().serve(transport)
                     .await
                     .map_err(|e| McpClientError::Connect(e.to_string()))
@@ -263,7 +260,8 @@ impl McpToolProxy {
     pub fn new(client: Arc<McpClient>, tool: &rmcp::model::Tool) -> Self {
         let remote_name = tool.name.to_string();
         let full_name = format!("mcp__{}__{}", client.name(), remote_name);
-        let schema = serde_json::to_string(&*tool.input_schema).unwrap_or_else(|_| "{}".to_string());
+        let schema =
+            serde_json::to_string(&*tool.input_schema).unwrap_or_else(|_| "{}".to_string());
         Self {
             client,
             full_name,
@@ -355,7 +353,10 @@ mod tests {
 
     fn schema_obj() -> StdArc<rmcp::model::JsonObject> {
         let mut m = serde_json::Map::new();
-        m.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+        m.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
         StdArc::new(m)
     }
 

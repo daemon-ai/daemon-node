@@ -98,12 +98,20 @@ pub(crate) async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String
 // ---- 10.1 lcm_grep ------------------------------------------------------------------------------
 
 fn grep(cx: &ToolCx<'_>, args: &Value) -> String {
-    let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if query.is_empty() {
         return err("query is required");
     }
     let limit = arg_u64(args, "limit", 10).clamp(1, 200) as usize;
-    let sort = SortMode::parse(args.get("sort").and_then(Value::as_str).unwrap_or("recency"));
+    let sort = SortMode::parse(
+        args.get("sort")
+            .and_then(Value::as_str)
+            .unwrap_or("recency"),
+    );
     let scope = args
         .get("session_scope")
         .and_then(Value::as_str)
@@ -246,7 +254,13 @@ fn describe(cx: &ToolCx<'_>, args: &Value) -> String {
         let count = cx.store.count_at_depth(cx.session_id, depth).unwrap_or(0);
         if count == 0 {
             // Allow a single gap (defensive), then stop.
-            if depth > 0 && cx.store.count_at_depth(cx.session_id, depth + 1).unwrap_or(0) == 0 {
+            if depth > 0
+                && cx
+                    .store
+                    .count_at_depth(cx.session_id, depth + 1)
+                    .unwrap_or(0)
+                    == 0
+            {
                 break;
             }
             if depth == 0 {
@@ -364,7 +378,8 @@ fn expand_externalized_ref(
         return err(&format!("externalized payload {reference} not found"));
     };
     let sliced = slice_chars_from(&full, content_offset);
-    let (content, next_content_offset) = truncate_to_token_budget(cx.tokenizer, &sliced, max_tokens);
+    let (content, next_content_offset) =
+        truncate_to_token_budget(cx.tokenizer, &sliced, max_tokens);
     let consumed = content.chars().count();
     json!({
         "type": "externalized_payload",
@@ -393,7 +408,8 @@ fn expand_store_id(
     };
     let full = row.content.clone().unwrap_or_default();
     let sliced = slice_chars_from(&full, content_offset);
-    let (content, next_content_offset) = truncate_to_token_budget(cx.tokenizer, &sliced, max_tokens);
+    let (content, next_content_offset) =
+        truncate_to_token_budget(cx.tokenizer, &sliced, max_tokens);
     let consumed = content.chars().count();
     json!({
         "type": "message",
@@ -451,12 +467,7 @@ fn expand_node(
             .get_messages(&page_ids)
             .unwrap_or_default()
             .into_iter()
-            .map(|r| {
-                (
-                    r.role.clone(),
-                    r.content.clone().unwrap_or_default(),
-                )
-            })
+            .map(|r| (r.role.clone(), r.content.clone().unwrap_or_default()))
             .collect()
     } else {
         page_ids
@@ -485,7 +496,11 @@ fn expand_node(
         remaining = remaining.saturating_sub(used);
         if let Some(more_at) = more {
             // This source overflowed the shared budget — record where to resume and stop.
-            next_content_offset = Some(if i == 0 { content_offset + more_at } else { more_at });
+            next_content_offset = Some(if i == 0 {
+                content_offset + more_at
+            } else {
+                more_at
+            });
             rendered.push(json!({"role": label, "content": content}));
             consumed_sources += 1;
             break;
@@ -520,7 +535,11 @@ fn expand_node(
 // ---- 10.5 lcm_expand_query ----------------------------------------------------------------------
 
 async fn expand_query(cx: &ToolCx<'_>, args: &Value) -> String {
-    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("").trim();
+    let prompt = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if prompt.is_empty() {
         return err("prompt is required");
     }
@@ -551,7 +570,10 @@ async fn expand_query(cx: &ToolCx<'_>, args: &Value) -> String {
     let mut used = 0usize;
     let mut included = 0usize;
     for node in &candidates {
-        let block = format!("[d{} node {}]\n{}\n\n", node.depth, node.node_id, node.summary);
+        let block = format!(
+            "[d{} node {}]\n{}\n\n",
+            node.depth, node.node_id, node.summary
+        );
         let cost = cx.tokenizer.count_text(&block);
         if used + cost > context_budget && included > 0 {
             break;
@@ -670,15 +692,36 @@ fn doctor(cx: &ToolCx<'_>) -> String {
     // database_integrity
     let integrity = cx.store.integrity_check().unwrap_or_else(|e| e.to_string());
     let integrity_ok = integrity == "ok";
-    push_check(&mut checks, &mut worst, "database_integrity", integrity_ok, Health::Unhealthy, integrity);
+    push_check(
+        &mut checks,
+        &mut worst,
+        "database_integrity",
+        integrity_ok,
+        Health::Unhealthy,
+        integrity,
+    );
 
     // schema_core_tables — every core table/index the schema declares is present (§10.6).
     match cx.store.schema_health() {
         Ok(schema) => {
             let ok = schema.missing.is_empty();
-            push_check(&mut checks, &mut worst, "schema_core_tables", ok, Health::Unhealthy, to_detail(&schema));
+            push_check(
+                &mut checks,
+                &mut worst,
+                "schema_core_tables",
+                ok,
+                Health::Unhealthy,
+                to_detail(&schema),
+            );
         }
-        Err(e) => push_check(&mut checks, &mut worst, "schema_core_tables", false, Health::Unhealthy, e.to_string()),
+        Err(e) => push_check(
+            &mut checks,
+            &mut worst,
+            "schema_core_tables",
+            false,
+            Health::Unhealthy,
+            e.to_string(),
+        ),
     }
 
     // fts_index_sync (both shadows must match their base table)
@@ -706,9 +749,23 @@ fn doctor(cx: &ToolCx<'_>) -> String {
     match cx.store.storage_posture() {
         Ok(posture) => {
             let ok = posture.quick_check == "ok";
-            push_check(&mut checks, &mut worst, "sqlite_storage", ok, Health::Unhealthy, to_detail(&posture));
+            push_check(
+                &mut checks,
+                &mut worst,
+                "sqlite_storage",
+                ok,
+                Health::Unhealthy,
+                to_detail(&posture),
+            );
         }
-        Err(e) => push_check(&mut checks, &mut worst, "sqlite_storage", false, Health::Unhealthy, e.to_string()),
+        Err(e) => push_check(
+            &mut checks,
+            &mut worst,
+            "sqlite_storage",
+            false,
+            Health::Unhealthy,
+            e.to_string(),
+        ),
     }
 
     // orphaned_dag_nodes
@@ -748,14 +805,35 @@ fn doctor(cx: &ToolCx<'_>) -> String {
     match cx.store.summary_quality_stats(cx.session_id) {
         Ok(sq) => {
             let ok = sq.extreme_ratio_nodes + sq.tiny_large_source_nodes == 0;
-            push_check(&mut checks, &mut worst, "summary_quality", ok, Health::Warnings, to_detail(&sq));
+            push_check(
+                &mut checks,
+                &mut worst,
+                "summary_quality",
+                ok,
+                Health::Warnings,
+                to_detail(&sq),
+            );
         }
-        Err(e) => push_check(&mut checks, &mut worst, "summary_quality", false, Health::Unhealthy, e.to_string()),
+        Err(e) => push_check(
+            &mut checks,
+            &mut worst,
+            "summary_quality",
+            false,
+            Health::Unhealthy,
+            e.to_string(),
+        ),
     }
 
     // config_validation — config values within sane operating ranges (§10.6).
     let (config_ok, config_detail) = config_validation_check(cx);
-    push_check(&mut checks, &mut worst, "config_validation", config_ok, Health::Warnings, config_detail);
+    push_check(
+        &mut checks,
+        &mut worst,
+        "config_validation",
+        config_ok,
+        Health::Warnings,
+        config_detail,
+    );
 
     // source_lineage_hygiene — source-attribution bucket counts, bank-wide (§10.6). Detail-only
     // (always `pass`), matching the Python reference.
@@ -763,20 +841,51 @@ fn doctor(cx: &ToolCx<'_>) -> String {
         Ok(src) => {
             let mut detail = to_detail(&src);
             if let Value::Object(ref mut map) = detail {
-                map.insert("normalization_mode".to_string(), json!("backcompat-normalization"));
+                map.insert(
+                    "normalization_mode".to_string(),
+                    json!("backcompat-normalization"),
+                );
             }
-            push_check(&mut checks, &mut worst, "source_lineage_hygiene", true, Health::Warnings, detail);
+            push_check(
+                &mut checks,
+                &mut worst,
+                "source_lineage_hygiene",
+                true,
+                Health::Warnings,
+                detail,
+            );
         }
-        Err(e) => push_check(&mut checks, &mut worst, "source_lineage_hygiene", false, Health::Unhealthy, e.to_string()),
+        Err(e) => push_check(
+            &mut checks,
+            &mut worst,
+            "source_lineage_hygiene",
+            false,
+            Health::Unhealthy,
+            e.to_string(),
+        ),
     }
 
     // lifecycle_fragmentation — session-id mismatches across messages/nodes/lifecycle state (§10.6).
     match cx.store.lifecycle_fragmentation_stats() {
         Ok(frag) => {
             let ok = !frag.is_fragmented();
-            push_check(&mut checks, &mut worst, "lifecycle_fragmentation", ok, Health::Warnings, to_detail(&frag));
+            push_check(
+                &mut checks,
+                &mut worst,
+                "lifecycle_fragmentation",
+                ok,
+                Health::Warnings,
+                to_detail(&frag),
+            );
         }
-        Err(e) => push_check(&mut checks, &mut worst, "lifecycle_fragmentation", false, Health::Unhealthy, e.to_string()),
+        Err(e) => push_check(
+            &mut checks,
+            &mut worst,
+            "lifecycle_fragmentation",
+            false,
+            Health::Unhealthy,
+            e.to_string(),
+        ),
     }
 
     // context_pressure — live prompt usage vs the compaction threshold (§10.6). Reported only when
@@ -844,15 +953,24 @@ fn to_detail<T: serde::Serialize>(value: &T) -> Value {
 /// `payload_storage` doctor check: the externalization directory is usable (metadata-only).
 fn payload_storage_check(cx: &ToolCx<'_>) -> (bool, String) {
     match cx.config.externalization_dir() {
-        None => (true, "ephemeral bank: payloads kept inline (no externalization dir)".to_string()),
+        None => (
+            true,
+            "ephemeral bank: payloads kept inline (no externalization dir)".to_string(),
+        ),
         Some(dir) => {
             if !dir.exists() {
                 (true, format!("not yet created: {}", dir.display()))
             } else if dir.is_dir() {
                 let count = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
-                (true, format!("{count} externalized payload(s) at {}", dir.display()))
+                (
+                    true,
+                    format!("{count} externalized payload(s) at {}", dir.display()),
+                )
             } else {
-                (false, format!("externalization path is not a directory: {}", dir.display()))
+                (
+                    false,
+                    format!("externalization path is not a directory: {}", dir.display()),
+                )
             }
         }
     }
@@ -872,10 +990,16 @@ fn sensitive_pattern_check(cx: &ToolCx<'_>) -> (bool, String) {
     if unknown.is_empty() {
         (
             true,
-            format!("enabled; {} catalog pattern(s)", cx.config.sensitive_patterns.len()),
+            format!(
+                "enabled; {} catalog pattern(s)",
+                cx.config.sensitive_patterns.len()
+            ),
         )
     } else {
-        (false, format!("enabled; unrecognized pattern names: {unknown:?}"))
+        (
+            false,
+            format!("enabled; unrecognized pattern names: {unknown:?}"),
+        )
     }
 }
 

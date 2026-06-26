@@ -96,7 +96,10 @@ async fn lists_are_per_session() {
     )
     .await;
     assert!(out.result.content.contains("s2 task"));
-    assert!(!out.result.content.contains("s1 task"), "sessions must not bleed");
+    assert!(
+        !out.result.content.contains("s1 task"),
+        "sessions must not bleed"
+    );
 }
 
 #[tokio::test]

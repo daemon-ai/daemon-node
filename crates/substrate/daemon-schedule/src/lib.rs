@@ -284,7 +284,11 @@ fn parse_duration_secs(expr: &str) -> Option<u64> {
     let mut saw_unit = false;
     for ch in expr.chars() {
         if ch.is_ascii_digit() {
-            num = Some(num.unwrap_or(0).checked_mul(10)?.checked_add((ch as u8 - b'0') as u64)?);
+            num = Some(
+                num.unwrap_or(0)
+                    .checked_mul(10)?
+                    .checked_add((ch as u8 - b'0') as u64)?,
+            );
         } else {
             let n = num.take()?;
             let unit = match ch.to_ascii_lowercase() {
@@ -330,7 +334,11 @@ fn parse_iso8601_duration(expr: &str) -> Option<u64> {
                 in_time = true;
             }
             c if c.is_ascii_digit() => {
-                num = Some(num.unwrap_or(0).checked_mul(10)?.checked_add((c as u8 - b'0') as u64)?);
+                num = Some(
+                    num.unwrap_or(0)
+                        .checked_mul(10)?
+                        .checked_add((c as u8 - b'0') as u64)?,
+                );
             }
             'D' | 'd' => {
                 total = total.checked_add(num.take()?.checked_mul(86_400)?)?;
@@ -375,10 +383,19 @@ mod tests {
             let next = s.next_after(1000).unwrap();
             assert!(next > 1000, "{expr} should advance past now");
         }
-        assert_eq!(Schedule::parse("@every 30m").unwrap().next_after(0), Some(1800));
-        assert_eq!(Schedule::parse("PT1H30M").unwrap().next_after(0), Some(5400));
+        assert_eq!(
+            Schedule::parse("@every 30m").unwrap().next_after(0),
+            Some(1800)
+        );
+        assert_eq!(
+            Schedule::parse("PT1H30M").unwrap().next_after(0),
+            Some(5400)
+        );
         assert_eq!(Schedule::parse("90s").unwrap().next_after(10), Some(100));
-        assert_eq!(Schedule::parse("2w").unwrap().next_after(0), Some(1_209_600));
+        assert_eq!(
+            Schedule::parse("2w").unwrap().next_after(0),
+            Some(1_209_600)
+        );
         assert_eq!(Schedule::parse("P1W").unwrap().next_after(0), Some(604_800));
     }
 
@@ -424,14 +441,25 @@ mod tests {
     #[test]
     fn invalid_inputs_error() {
         assert!(matches!(Schedule::parse("   "), Err(ScheduleError::Empty)));
-        assert!(matches!(Schedule::parse("not a schedule at all !!"), Err(ScheduleError::Cron(_))));
         assert!(matches!(
-            Schedule::parse("0 9 * * *").unwrap().with_timezone(Some("Mars/Phobos")),
+            Schedule::parse("not a schedule at all !!"),
+            Err(ScheduleError::Cron(_))
+        ));
+        assert!(matches!(
+            Schedule::parse("0 9 * * *")
+                .unwrap()
+                .with_timezone(Some("Mars/Phobos")),
             Err(ScheduleError::Timezone(_))
         ));
         // Month/year ISO durations are unsupported (no anchor date).
-        assert!(matches!(Schedule::parse("P1Y"), Err(ScheduleError::Duration(_))));
-        assert!(matches!(Schedule::parse("P1M"), Err(ScheduleError::Duration(_))));
+        assert!(matches!(
+            Schedule::parse("P1Y"),
+            Err(ScheduleError::Duration(_))
+        ));
+        assert!(matches!(
+            Schedule::parse("P1M"),
+            Err(ScheduleError::Duration(_))
+        ));
     }
 
     #[test]

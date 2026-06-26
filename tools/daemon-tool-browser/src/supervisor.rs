@@ -111,7 +111,10 @@ impl BrowserSupervisor {
     }
 
     /// Extract the active page's content in the requested format.
-    pub async fn extract(&self, format: ExtractFormat) -> Result<(Option<String>, String), BrowserError> {
+    pub async fn extract(
+        &self,
+        format: ExtractFormat,
+    ) -> Result<(Option<String>, String), BrowserError> {
         self.run(move |page| {
             Box::pin(async move {
                 match format {
@@ -123,7 +126,9 @@ impl BrowserSupervisor {
                         Ok((None, html))
                     }
                     ExtractFormat::Text => {
-                        let text = eval_string(page, "document.body ? document.body.innerText : ''").await?;
+                        let text =
+                            eval_string(page, "document.body ? document.body.innerText : ''")
+                                .await?;
                         Ok((None, text))
                     }
                     ExtractFormat::Markdown => {
@@ -149,7 +154,9 @@ impl BrowserSupervisor {
                     .find_element(selector)
                     .await
                     .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-                el.click().await.map_err(|e| BrowserError::Cdp(e.to_string()))?;
+                el.click()
+                    .await
+                    .map_err(|e| BrowserError::Cdp(e.to_string()))?;
                 Ok(())
             })
         })
@@ -166,7 +173,9 @@ impl BrowserSupervisor {
                     .find_element(selector)
                     .await
                     .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-                el.click().await.map_err(|e| BrowserError::Cdp(e.to_string()))?;
+                el.click()
+                    .await
+                    .map_err(|e| BrowserError::Cdp(e.to_string()))?;
                 el.type_str(text)
                     .await
                     .map_err(|e| BrowserError::Cdp(e.to_string()))?;
@@ -395,7 +404,10 @@ async fn spawn_dialog_dismisser(page: &Page) -> Option<JoinHandle<()>> {
     let page = page.clone();
     Some(tokio::spawn(async move {
         while events.next().await.is_some() {
-            if let Ok(params) = HandleJavaScriptDialogParams::builder().accept(false).build() {
+            if let Ok(params) = HandleJavaScriptDialogParams::builder()
+                .accept(false)
+                .build()
+            {
                 let _ = page.execute(params).await;
             }
         }

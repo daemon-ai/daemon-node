@@ -1226,10 +1226,7 @@ impl NodeConfig {
             .and_then(|s| s.parse().ok())
             .or(file.max_turns)
             .unwrap_or(defaults.max_turns);
-        daemon_rooms::RoomsConfig {
-            enabled,
-            max_turns,
-        }
+        daemon_rooms::RoomsConfig { enabled, max_turns }
     }
 
     /// Resolve the `[matrix]` table (env overriding TOML overriding defaults). `store_root` is made
@@ -1271,9 +1268,9 @@ impl NodeConfig {
             let transport = ip.transport.ok_or_else(|| {
                 anyhow::anyhow!("[[routing.instance_profile]] requires `transport`")
             })?;
-            let profile = ip
-                .profile
-                .ok_or_else(|| anyhow::anyhow!("[[routing.instance_profile]] requires `profile`"))?;
+            let profile = ip.profile.ok_or_else(|| {
+                anyhow::anyhow!("[[routing.instance_profile]] requires `profile`")
+            })?;
             instance_profiles.push(InstanceProfile { transport, profile });
         }
         let mut routes = Vec::new();
@@ -1386,13 +1383,17 @@ impl NodeConfig {
             metta.max_results = n;
         }
         if let Some(s) = env_string(METTA_MAX_RESULTS_ENV) {
-            metta.max_results = s.parse().context("DAEMON_METTA_MAX_RESULTS must be a u64")?;
+            metta.max_results = s
+                .parse()
+                .context("DAEMON_METTA_MAX_RESULTS must be a u64")?;
         }
         if let Some(n) = file.max_restarts {
             metta.max_restarts = n;
         }
         if let Some(s) = env_string(METTA_MAX_RESTARTS_ENV) {
-            metta.max_restarts = s.parse().context("DAEMON_METTA_MAX_RESTARTS must be a u32")?;
+            metta.max_restarts = s
+                .parse()
+                .context("DAEMON_METTA_MAX_RESTARTS must be a u32")?;
         }
         resolve_duration_ms(
             &mut metta.restart_window,
@@ -1491,7 +1492,9 @@ impl NodeConfig {
             python.max_restarts = n;
         }
         if let Some(s) = env_string(PYTHON_MAX_RESTARTS_ENV) {
-            python.max_restarts = s.parse().context("DAEMON_PYTHON_MAX_RESTARTS must be a u32")?;
+            python.max_restarts = s
+                .parse()
+                .context("DAEMON_PYTHON_MAX_RESTARTS must be a u32")?;
         }
         resolve_duration_ms(
             &mut python.restart_window,

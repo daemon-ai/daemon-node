@@ -89,7 +89,10 @@ impl Tool for WebSearchTool {
             _ => SearchTopic::General,
         };
         let opts = SearchOpts {
-            max_results: args.max_results.unwrap_or(self.default_max_results).clamp(1, 20),
+            max_results: args
+                .max_results
+                .unwrap_or(self.default_max_results)
+                .clamp(1, 20),
             topic,
         };
         match self.backend.search(&args.query, &opts).await {

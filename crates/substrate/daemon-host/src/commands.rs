@@ -260,7 +260,11 @@ fn builtin_catalog() -> Vec<(CommandSpec, Builtin)> {
             Builtin::Help,
         ),
         (
-            node(spec("whoami", "Show the node profile + partition identity", "Info")),
+            node(spec(
+                "whoami",
+                "Show the node profile + partition identity",
+                "Info",
+            )),
             Builtin::Whoami,
         ),
         (
@@ -359,7 +363,10 @@ pub fn render_help(specs: &[CommandSpec]) -> String {
             } else {
                 format!(" {}", c.args_hint)
             };
-            out.push_str(&format!("  /{}{}{} — {}\n", c.name, aliases, hint, c.summary));
+            out.push_str(&format!(
+                "  /{}{}{} — {}\n",
+                c.name, aliases, hint, c.summary
+            ));
         }
     }
     out
@@ -420,7 +427,10 @@ mod tests {
                 .alias("context")],
         }));
         let entry = reg.resolve("lcm").expect("lcm folded in");
-        assert_eq!(entry.spec.source, "lcm", "source stamped with provider name");
+        assert_eq!(
+            entry.spec.source, "lcm",
+            "source stamped with provider name"
+        );
         assert!(matches!(entry.owner, Owner::Provider(_)));
         assert!(reg.resolve("context").is_some(), "provider alias resolves");
     }

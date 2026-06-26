@@ -172,8 +172,7 @@ impl FileCredentialStore {
     }
 
     fn write_map(&self, map: &BTreeMap<String, String>) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(map)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(map).map_err(io::Error::other)?;
         std::fs::write(&self.path, bytes)?;
         #[cfg(unix)]
         {
@@ -410,7 +409,10 @@ mod tests {
         let s = MemCredentialStore::new();
         s.set("grok", "key-a").unwrap();
         s.add_key("grok", "key-b").unwrap();
-        assert_eq!(s.keys("grok"), vec!["key-a".to_string(), "key-b".to_string()]);
+        assert_eq!(
+            s.keys("grok"),
+            vec!["key-a".to_string(), "key-b".to_string()]
+        );
         // The redacted listing collapses to one entry per profile (the primary key's hint).
         assert_eq!(s.list_redacted().len(), 1);
         // `set` replaces the whole pool.
