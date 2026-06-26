@@ -20,3 +20,6 @@ bc-components = { workspace = true }
 
 [dev-dependencies]
 bc-rand = { workspace = true }
+
+[lints]
+workspace = true

@@ -81,6 +81,22 @@
           "rust-src"
           "rustc"
           "rustfmt"
+          # llvm-tools (llvm-profdata/llvm-cov) backs `cargo llvm-cov` coverage runs.
+          "llvm-tools"
+        ];
+
+        # Nightly toolchain for the lanes that require it: Miri (UB checking over the FFI/codec
+        # `unsafe` surface) and cargo-fuzz (libFuzzer needs `-Z` flags). Kept off the default shell
+        # so the everyday `cargo build/test` stays on the pinned stable toolchain; exposed via the
+        # separate `nightly` devShell below.
+        rustNightly = fenix.packages.${system}.complete.withComponents [
+          "cargo"
+          "clippy"
+          "rustc"
+          "rustfmt"
+          "rust-src"
+          "miri"
+          "llvm-tools"
         ];
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -267,14 +283,29 @@
                 fenix.packages.${system}.rust-analyzer
                 pkgs.rust-cbindgen
                 pkgs.python3Packages.zcbor
+                # --- code-quality tooling (see justfile `lint` / `audit-cleanup` / `coverage`) ---
+                pkgs.cargo-deny # advisories + license/ban/source policy (supersedes cargo-audit)
+                pkgs.cargo-nextest # faster, more reliable test runner
+                pkgs.cargo-machete # fast unused-dependency detection
+                pkgs.cargo-hack # feature-powerset checks across the many feature gates
+                pkgs.cargo-mutants # mutation testing (validates test strength)
+                pkgs.cargo-llvm-cov # source-based coverage
+                pkgs.gitleaks # secret scanning
+                pkgs.typos # source spell-checker
+                pkgs.nodejs # provides npx for jscpd (not packaged in nixpkgs)
               ]
-              ++ engineNativeInputs
-              ++ lib.optionals (lib.hasAttr "cargo-deny" pkgs) [
-                pkgs.cargo-deny
-              ]
-              ++ lib.optionals (lib.hasAttr "cargo-nextest" pkgs) [
-                pkgs.cargo-nextest
-              ];
+              ++ engineNativeInputs;
+          };
+        }
+        // {
+          # Nightly lane for Miri + cargo-fuzz (`just miri` / `just fuzz`). Separate from the default
+          # shell so the everyday build never pulls the nightly toolchain onto PATH.
+          nightly = pkgs.mkShell {
+            LIBCLANG_PATH = libclangPath;
+            packages = [
+              rustNightly
+              pkgs.cargo-fuzz
+            ] ++ engineNativeInputs;
           };
         }
         # Optional GPU lanes for building/exercising the worker with an accelerated backend

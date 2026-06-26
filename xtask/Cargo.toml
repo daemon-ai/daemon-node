@@ -16,3 +16,6 @@ daemon-api = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 serde = { workspace = true }
+
+[lints]
+workspace = true

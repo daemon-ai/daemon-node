@@ -21,3 +21,6 @@ futures = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
+
+[lints]
+workspace = true

@@ -36,3 +36,6 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 ciborium = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

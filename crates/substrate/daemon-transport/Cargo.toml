@@ -25,3 +25,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 daemon-core = { workspace = true }
 daemon-host = { workspace = true }
+
+[lints]
+workspace = true

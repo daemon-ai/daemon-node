@@ -39,3 +39,6 @@ matrix-sdk-test = "0.18"
 # pinned to the same 0.6 line matrix-sdk's `testing` feature already pulls in.
 wiremock = "0.6"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

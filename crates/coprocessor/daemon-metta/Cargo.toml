@@ -41,3 +41,6 @@ hyperon = { workspace = true, optional = true }
 tempfile = "3"
 # Integration test spawns the real worker bin through the process provisioner (needs SessionId).
 daemon-common = { workspace = true }
+
+[lints]
+workspace = true

@@ -11,6 +11,21 @@ rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/daemon"
 
+# Single source of truth for lint policy. Member crates opt in with `[lints]\nworkspace = true`.
+# Levels are inherited by every member; the `just lint` recipe escalates warnings to errors
+# (`cargo clippy ... -- -D warnings`), so these are the de-facto gate. Keep additions conservative
+# to avoid a large churn pass; tighten over time. Crate-local `#[allow(...)]` still override.
+[workspace.lints.rust]
+# Dead/unused code is the primary "leftover / unfinished" signal (often AI-agent residue).
+# `unused` is a lint group, so it takes a lower priority than any specific lint that overrides it.
+unused = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# High-signal, low-false-positive checks for common leftovers; default clippy groups also run.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
 [workspace.dependencies]
 # shared third-party deps (single source of truth)
 tokio = { version = "1", features = ["full"] }
@@ -98,9 +113,33 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 arc-swap = "1"
 # verifiable-trace stack (Blockchain Commons): dcbor for deterministic CBOR,
 # bc-envelope for the Gordian Envelope digest tree + signing, bc-components for keys.
+# We only ever use ed25519 signing (daemon-credentials capability leases + daemon-telemetry journal
+# segments), never SSH keys or post-quantum KEM/DSA. So we drop the default `ssh` and `pqcrypto`
+# features: `ssh` pulls `ssh-key` -> `rsa` (RUSTSEC-2023-0071 Marvin timing attack) and `bc-components/ssh`;
+# `pqcrypto` pulls the archived/unmaintained `pqcrypto-mlkem/mldsa/traits/internals`
+# (RUSTSEC-2026-0161/0162/0163/0166). Trimming them removes all five from the tree entirely. The
+# remaining features are bc-envelope's defaults minus those two. Keep this list in sync if a new
+# default feature is added upstream.
 dcbor = "0.25"
-bc-envelope = { version = "0.43", features = ["signature"] }
-bc-components = "0.31"
+bc-envelope = { version = "0.43", default-features = false, features = [
+    "attachment",
+    "compress",
+    "edge",
+    "ed25519",
+    "encrypt",
+    "expression",
+    "known_value",
+    "known-values-directory-loading",
+    "proof",
+    "recipient",
+    "salt",
+    "secp256k1",
+    "secret",
+    "signature",
+    "sskr",
+    "types",
+] }
+bc-components = { version = "0.31", default-features = false, features = ["secp256k1", "ed25519"] }
 bc-rand = "0.5"
 # Agent Client Protocol (ACP): JSON-RPC 2.0 over stdio for foreign agents. Pinned; isolated to the
 # `daemon-acp` adapter crate so its runtime model never leaks into `daemon-host`.
@@ -116,53 +155,53 @@ agent-client-protocol = "=0.15.0"
 hyperon = { git = "https://github.com/trueagi-io/hyperon-experimental.git", rev = "3f76dc460da6961f57f69f6c3e550c59c74ada83", default-features = false, features = ["pkg_mgmt"] }
 
 # internal crates (path deps; referenced by member crates via `workspace = true`)
-daemon-common = { path = "crates/contracts/daemon-common" }
-daemon-protocol = { path = "crates/contracts/daemon-protocol" }
-daemon-supervision = { path = "crates/contracts/daemon-supervision" }
-daemon-api = { path = "crates/contracts/daemon-api" }
-daemon-core = { path = "crates/engine/daemon-core" }
-daemon-context-lcm = { path = "crates/engine/daemon-context-lcm" }
-daemon-mnemosyne = { path = "crates/memory/daemon-mnemosyne" }
-daemon-providers = { path = "crates/providers/daemon-providers" }
+daemon-common = { version = "0.0.0", path = "crates/contracts/daemon-common" }
+daemon-protocol = { version = "0.0.0", path = "crates/contracts/daemon-protocol" }
+daemon-supervision = { version = "0.0.0", path = "crates/contracts/daemon-supervision" }
+daemon-api = { version = "0.0.0", path = "crates/contracts/daemon-api" }
+daemon-core = { version = "0.0.0", path = "crates/engine/daemon-core" }
+daemon-context-lcm = { version = "0.0.0", path = "crates/engine/daemon-context-lcm" }
+daemon-mnemosyne = { version = "0.0.0", path = "crates/memory/daemon-mnemosyne" }
+daemon-providers = { version = "0.0.0", path = "crates/providers/daemon-providers" }
 # default-features = false here so workspace consumers inherit the light (no-engine) build; a worker
 # build opts into an engine via `--features llama` / `--features mistralrs` on the crate directly.
-daemon-infer = { path = "crates/providers/daemon-infer", default-features = false }
-daemon-models = { path = "crates/providers/daemon-models" }
-daemon-store = { path = "crates/substrate/daemon-store" }
-daemon-schedule = { path = "crates/substrate/daemon-schedule" }
-daemon-activation = { path = "crates/substrate/daemon-activation" }
-daemon-provision = { path = "crates/substrate/daemon-provision" }
-daemon-credentials = { path = "crates/substrate/daemon-credentials" }
-daemon-telemetry = { path = "crates/substrate/daemon-telemetry" }
-daemon-host = { path = "crates/substrate/daemon-host" }
-daemon-acp = { path = "crates/adapters/daemon-acp" }
-daemon-http = { path = "crates/adapters/daemon-http" }
-daemon-mcp-client = { path = "crates/adapters/daemon-mcp-client" }
-daemon-delivery = { path = "crates/adapters/daemon-delivery" }
-daemon-ingest = { path = "crates/adapters/daemon-ingest" }
-daemon-matrix = { path = "crates/adapters/daemon-matrix" }
-daemon-rooms = { path = "crates/adapters/daemon-rooms" }
-daemon-transport = { path = "crates/substrate/daemon-transport" }
-daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
-daemon-node = { path = "crates/node/daemon-node" }
+daemon-infer = { version = "0.0.0", path = "crates/providers/daemon-infer", default-features = false }
+daemon-models = { version = "0.0.0", path = "crates/providers/daemon-models" }
+daemon-store = { version = "0.0.0", path = "crates/substrate/daemon-store" }
+daemon-schedule = { version = "0.0.0", path = "crates/substrate/daemon-schedule" }
+daemon-activation = { version = "0.0.0", path = "crates/substrate/daemon-activation" }
+daemon-provision = { version = "0.0.0", path = "crates/substrate/daemon-provision" }
+daemon-credentials = { version = "0.0.0", path = "crates/substrate/daemon-credentials" }
+daemon-telemetry = { version = "0.0.0", path = "crates/substrate/daemon-telemetry" }
+daemon-host = { version = "0.0.0", path = "crates/substrate/daemon-host" }
+daemon-acp = { version = "0.0.0", path = "crates/adapters/daemon-acp" }
+daemon-http = { version = "0.0.0", path = "crates/adapters/daemon-http" }
+daemon-mcp-client = { version = "0.0.0", path = "crates/adapters/daemon-mcp-client" }
+daemon-delivery = { version = "0.0.0", path = "crates/adapters/daemon-delivery" }
+daemon-ingest = { version = "0.0.0", path = "crates/adapters/daemon-ingest" }
+daemon-matrix = { version = "0.0.0", path = "crates/adapters/daemon-matrix" }
+daemon-rooms = { version = "0.0.0", path = "crates/adapters/daemon-rooms" }
+daemon-transport = { version = "0.0.0", path = "crates/substrate/daemon-transport" }
+daemon-orchestration = { version = "0.0.0", path = "crates/orchestration/daemon-orchestration" }
+daemon-node = { version = "0.0.0", path = "crates/node/daemon-node" }
 # default-features = false here so workspace consumers (the client + tool) inherit the light
 # (no-hyperon) build; the worker build opts into the engine via `--features hyperon` on the crate.
-daemon-metta = { path = "crates/coprocessor/daemon-metta", default-features = false }
-daemon-metta-client = { path = "crates/coprocessor/daemon-metta-client" }
-daemon-pytool = { path = "crates/coprocessor/daemon-pytool" }
-daemon-pytool-client = { path = "crates/coprocessor/daemon-pytool-client" }
-daemon-tool-metta = { path = "tools/daemon-tool-metta" }
-daemon-tool-shell = { path = "tools/daemon-tool-shell" }
-daemon-tool-fs = { path = "tools/daemon-tool-fs" }
-daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
-daemon-tool-orchestrate = { path = "tools/daemon-tool-orchestrate" }
-daemon-tool-cron = { path = "tools/daemon-tool-cron" }
-daemon-tool-web = { path = "tools/daemon-tool-web" }
-daemon-tool-browser = { path = "tools/daemon-tool-browser" }
-daemon-tool-todo = { path = "tools/daemon-tool-todo" }
-daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
-daemon-skills = { path = "crates/skills/daemon-skills" }
-daemon-tool-skill = { path = "tools/daemon-tool-skill" }
+daemon-metta = { version = "0.0.0", path = "crates/coprocessor/daemon-metta", default-features = false }
+daemon-metta-client = { version = "0.0.0", path = "crates/coprocessor/daemon-metta-client" }
+daemon-pytool = { version = "0.0.0", path = "crates/coprocessor/daemon-pytool" }
+daemon-pytool-client = { version = "0.0.0", path = "crates/coprocessor/daemon-pytool-client" }
+daemon-tool-metta = { version = "0.0.0", path = "tools/daemon-tool-metta" }
+daemon-tool-shell = { version = "0.0.0", path = "tools/daemon-tool-shell" }
+daemon-tool-fs = { version = "0.0.0", path = "tools/daemon-tool-fs" }
+daemon-tool-tkx = { version = "0.0.0", path = "tools/daemon-tool-tkx" }
+daemon-tool-orchestrate = { version = "0.0.0", path = "tools/daemon-tool-orchestrate" }
+daemon-tool-cron = { version = "0.0.0", path = "tools/daemon-tool-cron" }
+daemon-tool-web = { version = "0.0.0", path = "tools/daemon-tool-web" }
+daemon-tool-browser = { version = "0.0.0", path = "tools/daemon-tool-browser" }
+daemon-tool-todo = { version = "0.0.0", path = "tools/daemon-tool-todo" }
+daemon-tool-clarify = { version = "0.0.0", path = "tools/daemon-tool-clarify" }
+daemon-skills = { version = "0.0.0", path = "crates/skills/daemon-skills" }
+daemon-tool-skill = { version = "0.0.0", path = "tools/daemon-tool-skill" }
 
 [profile.release]
 panic = "unwind"   # catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)

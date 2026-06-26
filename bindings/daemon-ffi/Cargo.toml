@@ -20,3 +20,6 @@ daemon-node = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true }
 serde = { workspace = true }
+
+[lints]
+workspace = true

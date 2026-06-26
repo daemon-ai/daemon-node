@@ -43,3 +43,6 @@ sha2 = { workspace = true }
 regex = { workspace = true }
 # the file-backed skills store backing the node's skill versioning + distribution ops.
 daemon-skills = { workspace = true }
+
+[lints]
+workspace = true

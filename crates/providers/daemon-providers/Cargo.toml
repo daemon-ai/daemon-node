@@ -28,3 +28,6 @@ tokio = { workspace = true }
 daemon-infer = { workspace = true }
 daemon-core = { workspace = true }
 futures = { workspace = true }
+
+[lints]
+workspace = true

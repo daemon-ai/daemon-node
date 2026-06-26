@@ -42,3 +42,6 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 daemon-context-lcm = { workspace = true }
 daemon-mnemosyne = { workspace = true }
+
+[lints]
+workspace = true

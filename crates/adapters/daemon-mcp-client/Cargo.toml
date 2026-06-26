@@ -31,3 +31,6 @@ daemon-core = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 tokio-util = { workspace = true }
+
+[lints]
+workspace = true

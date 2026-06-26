@@ -49,3 +49,6 @@ daemon-provision = { workspace = true }
 llama-cpp-4 = { workspace = true, optional = true }
 encoding_rs = { workspace = true, optional = true }
 mistralrs = { workspace = true, optional = true }
+
+[lints]
+workspace = true
