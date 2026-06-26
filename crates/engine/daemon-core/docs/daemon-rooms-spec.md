@@ -1,8 +1,9 @@
 # Rooms — the internal loopback transport (N-participant agent conversations)
 
-Status: design / skeleton landed (the `crates/adapters/daemon-rooms` adapter: `RoomRouter` + `serve`
-entrypoint, the floor-control policy stub, and the loopback `Projector` shell; contract + store
-skeletons in `daemon-protocol` / `daemon-api` / `daemon-store`; see §9 for what is landed vs deferred).
+Status: landed (the `crates/adapters/daemon-rooms` adapter: `RoomRouter` + `serve` entrypoint, all four
+floor-control policies, the loopback `RoomProjector` re-injection, and the sealed per-room transcript;
+contract + store in `daemon-protocol` / `daemon-api` / `daemon-store`; see §9 for what is landed vs
+deferred).
 Companion to [`daemon-event-io-spec.md`](./daemon-event-io-spec.md) (the §5.4 merged session log and
 §5.9 bidirectional-routing capability this builds on) and
 [`daemon-matrix-transport-spec.md`](./daemon-matrix-transport-spec.md) (the chat-transport shape this
@@ -40,9 +41,10 @@ already express everything an N-party conversation needs.
 | Reusable inbound gate | `daemon_ingest::Ingestor` | `crates/adapters/daemon-ingest` |
 | Reusable outbound delivery | `daemon_delivery::serve_delivery` + `Projector` | `crates/adapters/daemon-delivery` |
 
-The single new piece is floor control (§5). Out of scope for the buildable skeleton: the live
-`room_post` fan-out behavior, transcript persistence wiring, and the moderator/round-robin arbitration
-(all `todo!()`/stub, §9). A2A code is out of scope entirely (§8 is design-only).
+The single new piece is floor control (§5). The live post fan-out behavior, transcript persistence,
+and the moderator/round-robin arbitration have all landed (§9); they ride the messaging-adapter
+`Conv*`/`Member*` ops rather than bespoke `room_*` ops. A2A code is out of scope entirely (§8 is
+design-only).
 
 ---
 
@@ -132,28 +134,30 @@ The wire DTOs (`daemon-api`) mirror the `ChatRoute`/`RoomInfo` derive set:
 and the protocol newtypes (`daemon-protocol`): `RoomId` (`room/<id>` transport), `RoomMember`
 (`member` + `profile` + resolved `session`), and `RoomPolicy` (§5). `Room` is distinct from the
 existing read-only `RoomInfo` (the per-transport room *enumeration* the `transport_rooms` op lists):
-`RoomInfo` answers "what chats does this transport see?", `Room` is the first-class entity the new
-`room_*` ops manage.
+`RoomInfo` answers "what chats does this transport see?", `Room` is the first-class entity managed via
+the messaging-adapter `Conv*`/`Member*` ops (`ConvCreate`/`ConvList`/`ConvGet`, `MemberInvite`/
+`MemberRemove`) — the bespoke `room_*` ops sketched earlier were retired.
 
 **Transcript.** The Room transcript is the merged log already produced by the member sessions plus the
 re-injected posts; durable history rides the existing verifiable-journal `TranscriptBlock` path
 (event-io). No new transcript store is introduced — a Room transcript is a *view* over the participant
-logs keyed by the room origin. (Skeleton: the transcript-append on re-injection is `todo!()`.)
+logs keyed by the room origin. (The transcript-append on each post + re-injection is implemented as a
+sealed verifiable-journal block in `RoomRouter`.)
 
 ---
 
 ## 5. Floor-control policies (the only novel logic)
 
 Floor control decides, for an inbound post, *which* members may open a turn, and a turn budget caps
-how far a single post may cascade so a room cannot echo-storm. The policy is a stub enum
-(`daemon-protocol::RoomPolicy`) with the logic in `daemon-rooms::policy`:
+how far a single post may cascade so a room cannot echo-storm. The policy is the enum
+(`daemon-protocol::RoomPolicy`) with the logic in `daemon-rooms::policy` (`FloorControl::admits`):
 
 | Policy | Who turns on a post | Status |
 | --- | --- | --- |
-| `AddressedOnly` (default) | only an explicitly mentioned member; others `Observe` | implemented (skeleton) |
-| `FreeForAll` | every member (bounded only by the budget) | implemented (skeleton) |
-| `RoundRobin` | members in a fixed rotation | `todo!()` (needs per-room cursor) |
-| `Moderator { profile }` | a moderator member arbitrates the next speaker | `todo!()` (needs arbiter state) |
+| `AddressedOnly` (default) | only an explicitly mentioned member; others `Observe` | implemented |
+| `FreeForAll` | every member (bounded only by the budget) | implemented |
+| `RoundRobin` | members in a fixed rotation (per-room cursor) | implemented |
+| `Moderator { profile }` | a moderator member arbitrates the next speaker | implemented |
 
 `TurnBudget { max_turns }` (config `[rooms].max_turns`, default 16; `0` = unbounded) is consumed per
 granted turn and reset at the start of each originating post (`FloorControl::begin_post`). It is the
@@ -181,7 +185,7 @@ The user observes and participates through the **existing** primitives, unchange
 - **Spectator.** A user surface (daemon-app) attaches to a participant session — or to the room origin
   — as a `SinkKind::Spectator` and reads the full merged log via `subscribe(session, after_seq)`. It
   sees every post and every `TurnFinished` without being the reply sink.
-- **Participate.** The user injects a post as an ordinary member (a `room_post` from the user handle),
+- **Participate.** The user injects a post as an ordinary member (a `ConvSend` from the user handle),
   which the router fans out like any other.
 - **Take the floor.** `handover` re-points a session's `Primary` to the user surface, so the user can
   seize a participant's reply sink (e.g. to answer on its behalf). Both `Spectator` attach and
@@ -208,22 +212,22 @@ The daemon-app routing manager already builds on these wire ops, reused unchange
 - `tree` / `tree_subscribe` — the orchestration tree the GUI renders.
 - `subscribe` — the live merged-log stream the GUI tails for a Spectator view.
 
-Rooms add the first-class **Room CRUD** ops on the same `ControlApi`, mirroring the `routing_*`
-defaults (empty / `ApiError::Unsupported` on a node built without the adapter):
+Room management rides the typed messaging-adapter `Conv*`/`Member*` ops on the same `ControlApi`
+(forwarded to the registered `daemon-rooms` adapter; `ApiError::Unsupported` on a node built without
+it). A Room is a conversation of `ConversationType::{GroupDm, Channel}`; its floor policy is carried in
+`CreateConversationDetails.extras`:
 
 | Op | Request | Response | Meaning |
 | --- | --- | --- | --- |
-| `room_list` | `RoomList` | `RoomList(Vec<Room>)` | every Room the node owns |
-| `room_get` | `RoomGet { room }` | `Room(Option<Room>)` | one Room by id |
-| `room_create` | `RoomCreate { room }` | `Ok` / `Error` | create/upsert a Room |
-| `room_delete` | `RoomDelete { room }` | `Ok` / `Error` | delete a Room |
-| `room_add_member` | `RoomAddMember { room, member }` | `Ok` / `Error` | add/upsert a member |
-| `room_remove_member` | `RoomRemoveMember { room, member }` | `Ok` / `Error` | remove a member |
-| `room_post` | `RoomPost { room, from, text }` | `Ok` / `Error` | inject a post (router fans out) |
+| `conv_list` | `ConvList { transport }` | `Conversations(Vec<ConversationInfo>)` | every Room on the `room` transport |
+| `conv_get` | `ConvGet { transport, conv }` | `Conversation(Option<ConversationInfo>)` | one Room by id |
+| `conv_create` | `ConvCreate { transport, details }` | `Conversation(Some)` / `Error` | create a Room (policy in `details.extras`) |
+| `conv_delete` | `ConvDelete { transport, conv }` | `Ok` / `Error` | delete a Room |
+| `member_invite` | `MemberInvite { transport, conv, who, message? }` | `Ok` / `Error` | add a member |
+| `member_remove` | `MemberRemove { transport, conv, who, reason? }` | `Ok` / `Error` | remove a member |
+| `conv_send` | `ConvSend { transport, conv, from?, message }` | `Ok` / `Error` | inject a post (router fans out) |
 
-> CDDL + WireVersion: the Room CRUD requests are **not** yet in `daemon-api.cddl` nor the generated
-> CBOR codec. A `TODO(rooms)` marks both the contract and the `.cddl`; bump `WireVersion` and
-> regenerate before exposing Rooms over the wire.
+These ops are in `daemon-api.cddl` and the generated CBOR codec; `WireVersion` is at 18–20.
 
 ---
 
@@ -261,28 +265,28 @@ adapter's job, later.
 
 ---
 
-## 9. What is landed vs deferred (skeleton boundary)
+## 9. What is landed vs deferred
 
-Landed (compiles; no behavior change to existing paths):
+Landed:
 
 - Protocol newtypes `RoomId` / `RoomMember` / `RoomPolicy`.
-- `daemon-api` `Room` / `RoomMemberView` DTOs + `room_*` `ControlApi` methods (default empty /
-  `Unsupported`) + `ApiRequest`/`ApiResponse` variants + `dispatch` arms (CDDL/WireVersion left as
-  `TODO`).
-- `daemon-store` `Room` / `RoomMember` rows + `room_*` trait methods (default no-op) + sqlite `rooms`
-  / `room_members` tables + their CRUD impls.
+- `daemon-api` `Room` / `RoomMemberView` DTOs and the management surface — realized via the typed
+  messaging-adapter `Conv*`/`Member*` ops (`ConvCreate`/`ConvList`/`ConvGet`/`ConvSend`/`ConvSetTopic`,
+  `MemberInvite`/`MemberRemove`), forwarded to the registered `daemon-rooms` adapter. (The bespoke
+  `room_*` `ControlApi` ops were retired; CDDL parity + `WireVersion` 18–20 done.)
+- `daemon-store` `Room` / `RoomMember` rows + sqlite `rooms` / `room_members` tables + their CRUD impls.
 - `daemon-rooms` crate: `RoomsConfig`, `RoomRouter` + `serve` (loads durable rooms, subscribes member
-  delivery), `Membership` + `RoomInbound` fan-out, `FloorControl` + `TurnBudget`, the loopback
-  `RoomProjector`.
-- Wiring: workspace member + dep, `[rooms].enabled` config + `cfg.rooms.enabled` spawn block in
-  `bins/daemon`, this spec, and the layout-doc adapters entry.
+  delivery), `Membership` + `RoomInbound` fan-out, `FloorControl` + `TurnBudget`, and the loopback
+  `RoomProjector` re-injection.
+- `RoomProjector::reinject` — the session -> Room resolution, floor gating, sealed-transcript append,
+  and fan-out of a finished turn.
+- `FloorControl::admits` for all four policies, including `RoundRobin` (turn-order cursor) and
+  `Moderator` (arbiter state).
+- The live post -> `RoomInbound::fan_out` wiring (via `ConvSend`) and loading membership into the
+  router on `MemberInvite`/`MemberRemove`.
+- Wiring: workspace member + dep, `[rooms].enabled` config; the adapter is registered in the
+  `AdapterRegistry` in `bins/daemon` and lifecycle-driven by `AdapterRegistry::spawn_all`.
 
-Deferred (`todo!()` / stub):
+Deferred:
 
-- `RoomProjector::reinject` — the session -> Room resolution, floor gating, transcript append, and
-  fan-out of a finished turn.
-- `FloorControl::admits` for `RoundRobin` (turn-order cursor) and `Moderator` (arbiter state).
-- The live `room_post` -> `RoomInbound::fan_out` wiring on the host `ControlApi` impl, and loading
-  membership into the router on `room_add_member`/`room_remove_member`.
-- CDDL + `WireVersion` bump and the generated CBOR codec for the Room ops.
 - The `daemon-a2a` server + client adapters (§8 — design only here).

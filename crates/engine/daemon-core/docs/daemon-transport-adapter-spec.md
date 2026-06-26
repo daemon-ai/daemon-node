@@ -1,19 +1,23 @@
 # Daemon Transport-Adapter Framework — first-class events-IO adapters
 
-Status: research / design proposal. The **declarative skeleton** (capability/presence DTOs, the
-`TransportAdapter` trait + optional capability traits, the host `AdapterRegistry`, and the
-`transport_adapters` / `transport_instances` wire ops) lands inert; the behavioural wiring (adapters
-implementing the trait, the registry driving lifecycle, live presence) is deferred. Companion to
-`daemon-event-io-spec.md` (§5 the IO edge, §5.9 routing), `daemon-rooms-spec.md` (the internal
-loopback transport), and `daemon-matrix-transport-spec.md` (the reference chat transport).
+Status: landed. The **declarative layer** (capability/presence DTOs, the `TransportAdapter` trait, the
+host `AdapterRegistry`, and the `transport_adapters` / `transport_instances` wire ops) is the live
+foundation; the behavioural wiring (adapters implementing the traits, the registry driving lifecycle,
+live instances) has since landed via the messaging-adapter spec (`daemon-rooms`/`daemon-matrix`
+registered in `bins/daemon`; `AdapterRegistry::spawn_all`). Companion to `daemon-event-io-spec.md`
+(§5 the IO edge, §5.9 routing), `daemon-rooms-spec.md` (the internal loopback transport), and
+`daemon-matrix-transport-spec.md` (the reference chat transport).
 
-> **Superseded (in part) by [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md).**
-> The capability *model* in this doc — §3.1's optional **marker** capability traits and §7's P1
-> "adapter retrofit" — is replaced by that spec's typed, libpurple-3-style feature-trait family
-> (`SupportsConversations`, `SupportsRoster`, `SupportsContacts`, `SupportsDirectory`,
-> `SupportsFileTransfer`, each with a per-verb `supported()` probe). The `AdapterRegistry`,
-> `AdapterInfo`/`AdapterCapabilities`, `TransportInstanceInfo`, and the presence/connection DTOs here
-> remain valid (the presence primitive is reconciled to libpurple's 8-value set there).
+> **Extended / specialized by [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md).**
+> That spec layers a typed, libpurple-3-style feature-trait family (`SupportsConversations`,
+> `SupportsMembership`, `SupportsRoster`, `SupportsContacts`, `SupportsDirectory`,
+> `SupportsFileTransfer`, each with a per-verb `supported()` probe) on top of the `TransportAdapter`
+> base here, reached via `TransportAdapter::messaging()`. The `AdapterRegistry`,
+> `AdapterInfo`/`AdapterCapabilities`, `TransportInstanceInfo`, and the presence/connection DTOs in this
+> doc remain the live foundation (the presence primitive is reconciled to libpurple's 8-value set
+> there). The only part of this doc not built as written is §3.1's optional **marker** capability traits
+> (`SupportsRooms`/`SupportsPresence`/…): coarse capability is carried by the `AdapterCapabilities`
+> bool struct, and the fine-grained per-verb capability by that spec's typed feature traits.
 
 This document studies how three mature multi-protocol messengers — Pidgin/**libpurple 3**,
 **Kopete** (KDE/Qt), and **Adium** (a native client over libpurple) — model first-class support for
@@ -44,10 +48,10 @@ and daemon: `crates/contracts/daemon-api/src/lib.rs`, `crates/contracts/daemon-p
    halves `daemon-ingest` (inbound gate) and `daemon-delivery` (outbound `Projector`) already factor
    the per-adapter *mechanics*.
 
-3. **What is missing is purely the *adapter-facing declarative layer*.** Today an adapter is an
+3. **The gap this spec closed was the *adapter-facing declarative layer*.** Previously an adapter was an
    anonymous `pub async fn serve(api, cfg)` wired by hand in `bins/daemon/src/main.rs`; nothing
-   declares *what an adapter is, what it can do, or how to configure an account of it* in a way the
-   GUI/TUI can read. The three gaps this spec closes:
+   declared *what an adapter is, what it can do, or how to configure an account of it* in a way the
+   GUI/TUI can read. The three gaps this spec closed (now landed):
    - **(a) A `TransportAdapter` descriptor + a registry** — the `PurpleProtocol` /
      `Kopete::Protocol` / `AIService` analogue, so adapters are enumerable and self-describing.
    - **(b) A capability model** — the `implements_*()` probes / `Capability` flags / service bool
@@ -76,13 +80,13 @@ and daemon: `crates/contracts/daemon-api/src/lib.rs`, `crates/contracts/daemon-p
 
 | Universal concept | libpurple 3 | Kopete | Adium | daemon today |
 | --- | --- | --- | --- | --- |
-| **Adapter** (protocol + capabilities + factory) | `PurpleProtocol` + feature ifaces | `Kopete::Protocol` | `AIService` | `serve(api,cfg)` fn, ad-hoc in `main.rs` |
+| **Adapter** (protocol + capabilities + factory) | `PurpleProtocol` + feature ifaces | `Kopete::Protocol` | `AIService` | `TransportAdapter` (+ `MessagingProtocol` + feature traits), registered in `AdapterRegistry` |
 | **Account** (configured instance + conn state) | `PurpleAccount` / `PurpleConnection` | `Kopete::Account` | `AIAccount` | `TransportId` + `bound_accounts` + `credential_ref` |
-| **Capability descriptor** | `implements_*()` + `PurpleTags` | `Capability` flags | service bool flags + optional protocols | — (missing) |
+| **Capability descriptor** | `implements_*()` + `PurpleTags` | `Capability` flags | service bool flags + optional protocols | `AdapterCapabilities` (coarse) + feature-trait `*Ops` probes (fine) |
 | **Conversation** (DM/Group/Channel) | `PurpleConversation` + `PurpleConversationType` | `ChatSession` | `AIChat` | session + `OriginScope{Dm,Group,Api,Internal}` |
 | **Person / MetaContact** | `PurplePerson` → `PurpleContact` | `MetaContact` → `Contact` | `AIMetaContact` → `AIListContact` | — (deferred, §6) |
-| **Presence** (normalized + per-proto map) | `PurplePresencePrimitive` | `OnlineStatus` + manager | `AIStatusSummary` | — (missing) |
-| **Adapter registry** | `PurpleProtocolManager` | `PluginManager` | `AdiumServices` | — (this spec) |
+| **Presence** (normalized + per-proto map) | `PurplePresencePrimitive` | `OnlineStatus` + manager | `AIStatusSummary` | `PresenceState` / `ConnectionState` on `TransportInstanceInfo` |
+| **Adapter registry** | `PurpleProtocolManager` | `PluginManager` | `AdiumServices` | `AdapterRegistry` (`daemon-host`) |
 
 The structural match is closest with **libpurple 3**, whose recent GObject refactor split the old
 monolithic `PurplePluginProtocolInfo` into a base `PurpleProtocol` plus *optional feature interfaces*
@@ -108,9 +112,11 @@ flowchart TB
 
 ## 2. What daemon has today (the seams)
 
-- **Adapters are anonymous functions.** `daemon_matrix::serve`, `daemon_rooms::serve`,
-  `daemon_http::serve_http` are spawned by `cfg.<x>.enabled` blocks in `bins/daemon/src/main.rs`.
-  There is no value that *describes* an adapter.
+- **Adapters are now self-describing values.** `daemon-matrix`/`daemon-rooms` implement
+  `TransportAdapter` (+ `MessagingProtocol`), are registered in the host `AdapterRegistry` in
+  `bins/daemon/src/main.rs`, and the registry drives their `serve` lifecycle via
+  `AdapterRegistry::spawn_all` (`node.spawn_adapters()`). (`daemon_http::serve_http` is the remaining
+  bespoke `cfg.<x>.enabled` spawn not yet retrofitted onto the trait.)
 - **Mechanics are already factored** (do not reimplement): `daemon-ingest` owns the inbound
   decision (addressing → which `AgentCommand` → `submit_routed`, with busy/queue/fold);
   `daemon-delivery` owns the outbound loop (`serve_delivery` = `delivery_sessions` + `subscribe` +
@@ -124,8 +130,8 @@ flowchart TB
 - **Read-only room enumeration exists:** `ControlApi::transport_rooms(transport) -> Vec<RoomInfo>`
   (pins-only today; EIO-8 tracks live enumeration).
 
-**Gaps:** no adapter descriptor/registry (a), no capability model (b), no presence/connection-state
-(c).
+**Gaps (now closed):** the adapter descriptor/registry (a), the capability model (b), and
+presence/connection-state (c) all landed (the latter two finalized by `daemon-messaging-adapter-spec.md`).
 
 ---
 
@@ -133,9 +139,10 @@ flowchart TB
 
 ### 3.1 `TransportAdapter` trait + optional capability traits
 
-> Superseded by [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md) §3: the
-> marker traits below become typed feature traits (real method sets ported from libpurple 3) with
-> per-verb `supported()` probes. Retained here for historical context.
+> Concretized by [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md) §3: the
+> marker traits below were never built as written — they are realized as that spec's typed feature
+> traits (real method sets ported from libpurple 3) with per-verb `supported()` probes, layered on the
+> `TransportAdapter` base. Retained here for historical context.
 
 A small declarative trait, co-located in `daemon-api` (so an adapter crate, which already depends on
 `daemon-api`, implements it without a new dependency — and **no new crate**):
@@ -168,8 +175,9 @@ pub trait SupportsFileTransfer {}     // attachments
 pub trait SupportsAuth {}             // interactive login (drives the AuthApi flow)
 ```
 
-These are intentionally marker traits in the skeleton; the behavioural method sets (send, join,
-set-topic, …) are deferred and remain owned by the existing `daemon-ingest`/`daemon-delivery` seams.
+These were sketched as marker traits; in the shipped design the behavioural method sets (send, join,
+set-topic, …) live on `daemon-messaging-adapter-spec.md`'s typed feature traits, while message
+send/receive *mechanics* remain owned by the existing `daemon-ingest`/`daemon-delivery` seams.
 
 ### 3.2 Capability descriptor + account-setup schema
 
@@ -227,8 +235,9 @@ pub struct TransportInstanceInfo {
 
 The registry is **host-owned**, mirroring `RoutingRegistry` (builder + immutable snapshot behind the
 existing `ArcSwap`): it holds the registered `Arc<dyn TransportAdapter>`s, answers descriptor/instance
-queries, and is the single place that — in a later phase — drives adapter lifecycle (replacing the
-`main.rs` spawn blocks).
+queries, and drives adapter lifecycle via `AdapterRegistry::spawn_all` (called by
+`NodeApiImpl::spawn_adapters`, used from `bins/daemon` — the bespoke `main.rs` per-adapter spawn blocks
+are retired for the retrofitted adapters).
 
 ```rust
 pub struct AdapterRegistry { adapters: Vec<Arc<dyn TransportAdapter>> }
@@ -239,8 +248,8 @@ impl AdapterRegistry {
 }
 ```
 
-Two read-only `ControlApi` ops (default empty, so a node without the registry inherits the surface,
-exactly like `transport_rooms` / `room_*`):
+Two read-only `ControlApi` ops (default empty, so a node without a registry inherits the surface,
+exactly like `transport_rooms`):
 
 - `transport_adapters() -> Vec<AdapterInfo>` — the available adapter families + their capabilities +
   account-setup schemas (the GUI "Add channel" picker).
@@ -248,8 +257,7 @@ exactly like `transport_rooms` / `room_*`):
   connection/presence state (the GUI status bar + roster grouping).
 
 `ApiRequest::{TransportAdapters, TransportInstances}` + `ApiResponse::{Adapters, TransportInstances}`
-+ `dispatch` arms mirror the `RoomList` pattern. A `TODO(adapters): CDDL + WireVersion bump` marks
-the generated-codec follow-up.
++ `dispatch` arms landed, with CDDL parity and the `WireVersion` bump (18–20) done.
 
 ### 3.5 Relationship to existing seams (no reimplementation)
 
@@ -263,8 +271,8 @@ flowchart LR
 ```
 
 The trait is a *thin declarative wrapper*: its `serve` body is the same `Ingestor` + `Projector`
-wiring `daemon-matrix`/`daemon-rooms` already do. The registry adds enumeration + (later) lifecycle.
-Routing, profile binding, and delivery storage stay host-owned and unchanged.
+wiring `daemon-matrix`/`daemon-rooms` already do. The registry adds enumeration + lifecycle
+(`spawn_all`). Routing, profile binding, and delivery storage stay host-owned and unchanged.
 
 ---
 
@@ -273,9 +281,8 @@ Routing, profile binding, and delivery storage stay host-owned and unchanged.
 - DTOs (in `daemon-api`): `AdapterInfo`, `AdapterCapabilities`, `AccountSettingsSchema`,
   `TransportInstanceInfo`, `ConnectionState`, `PresenceState`.
 - `ControlApi`: `transport_adapters()`, `transport_instances()` (default empty).
-- `ApiRequest`/`ApiResponse` variants + `dispatch` arms (mirroring `RoomList`).
-- `TODO(adapters): CDDL + WireVersion bump` — the generated CBOR codec regen is deferred, like the
-  Rooms ops.
+- `ApiRequest`/`ApiResponse` variants + `dispatch` arms.
+- CDDL + `WireVersion` bump (18–20) and the generated CBOR codec — landed.
 
 ---
 
@@ -324,17 +331,17 @@ layer rather than be reshaped later.
 
 ## 7. Phasing
 
-- **P0 — declarative skeleton (this change).** Capability/presence DTOs, the `TransportAdapter` trait
-  + capability marker traits (in `daemon-api`), the host `AdapterRegistry`, and the
-  `transport_adapters`/`transport_instances` wire ops — all inert (defaults empty), `cargo check`
-  clean. Plus the daemon-app client-surface spec + core seam stubs.
-- **P1 — adapter retrofit.** `daemon-matrix` / `daemon-rooms` / `daemon-http` implement
-  `TransportAdapter` (real `info()` + capabilities); the registry drives lifecycle (retire the
-  `main.rs` spawn blocks); live `transport_instances` reports real connection/presence.
-  *(Concretized and superseded by [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md),
-  which defines the typed feature-trait family these adapters implement.)*
-- **P2 — presence + live room enumeration.** Real per-account `ConnectionState`/`PresenceState`;
-  generalise `transport_rooms` to live enumeration (EIO-8) behind `SupportsRoomEnumeration`.
+- **P0 — declarative layer (landed).** Capability/presence DTOs, the `TransportAdapter` trait (in
+  `daemon-api`), the host `AdapterRegistry`, and the `transport_adapters`/`transport_instances` wire
+  ops — default-empty until a registry is installed. Plus the daemon-app client-surface spec + core
+  seam stubs.
+- **P1 — adapter retrofit (landed).** `daemon-matrix` / `daemon-rooms` implement `TransportAdapter`
+  (real `info()` + capabilities) and the typed feature traits; the registry drives lifecycle
+  (`spawn_all`, retiring those `main.rs` spawn blocks); `transport_instances` reports connection state.
+  *(Concretized by [`daemon-messaging-adapter-spec.md`](./daemon-messaging-adapter-spec.md), which
+  defines the typed feature-trait family these adapters implement. `daemon-http` is not yet retrofitted.)*
+- **P2 — presence + live room enumeration (partial).** Per-account `ConnectionState` reported (Matrix);
+  richer `PresenceState` and generalising `transport_rooms` to live enumeration (EIO-8) remain open.
 - **P3 — Person/MetaContact (§6).** Endpoint unification + preferred-endpoint routing.
 - **P4 — `daemon-a2a`.** Server + client roles; `AgentCard` ↔ `AdapterInfo` (§5).
 - **Deferred (optional) — server-side `daemonnet()` projection.** A read-only, additive, **stateless**
@@ -345,12 +352,14 @@ layer rather than be reshaped later.
   the **DaemonNet** — the unifying model the client uses
   (`daemon-app/docs/multi-protocol-client-surface.md` §1.1/§1.5): the daemon's network of actor/place
   nodes plus session nodes joined by those edges — from the subsystems that already own each fact
-  (supervision `tree`, `SessionsQuery`, `room_*`, `transport_instances`, `delivery_targets`). It is the **same inert pattern as `transport_adapters`**: a projection, **not** a
-  new source of truth, **not** an execution model, and **not** a refactor of ownership. It is *not built
+  (supervision `tree`, `SessionsQuery`, the messaging-adapter `Conv*` ops, `transport_instances`,
+  `delivery_targets`). It would be the **same read-only projection pattern as `transport_adapters`**: a
+  projection, **not** a new source of truth, **not** an execution model, and **not** a refactor of
+  ownership. It is *not built
   now* and is *not required*: the DaemonNet is firstly a conceptual model and secondly a **client-side
   view-model** the GUI/TUI assembles by joining the existing endpoints on `SessionId` (client-surface
   spec §1.5). Promote to this server-side projection only if the client join becomes too many
   round-trips, more than one client must replicate it, or a single coalesced delta stream is wanted.
 
-Each phase is additive over the prior; the skeleton in P0 cannot regress existing adapters because it
+Each phase is additive over the prior; the declarative layer in P0 cannot regress existing adapters because it
 is purely declarative and default-empty.

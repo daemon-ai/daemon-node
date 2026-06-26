@@ -1,18 +1,23 @@
 # Daemon Messaging-Adapter Interface — a faithful port of libpurple 3
 
-Status: design proposal. Defines the daemon analogue of libpurple 3's protocol interface: one typed,
+Status: landed. Defines the daemon analogue of libpurple 3's protocol interface: one typed,
 capability-probed **messaging-adapter** surface that every chat-like transport (the internal
 `daemon-rooms` loopback, `daemon-matrix`, and future Slack/XMPP/IRC/…) implements selectively. This
 is primarily a **port**, not a fresh design: libpurple has done the hard contract work over two
 decades, so we copy its decomposition, translate idioms (GObject → Rust), and delineate the few
 daemon-specific extensions. Where the in-progress libpurple-3 snapshot is incomplete (notably
 membership administration) we restore the stable contract from libpurple 2 / Adium / Kopete (§2.3.1).
-Implementation is a separate follow-up; this document is the contract that implementation realizes.
+The interface family, the `Conv*`/`Member*`/`Contact*`/`Directory*` wire ops, and the `daemon-rooms`
+and `daemon-matrix` implementors have landed (`WireVersion` 18–20); the remaining deferrals are
+itemized in §12.1.
 
 Companion to `daemon-event-io-spec.md` (§5 the IO edge, §5.9 routing), `daemon-rooms-spec.md` (the
 internal loopback transport, a reference implementor), and `daemon-matrix-transport-spec.md` (the
-reference external chat transport). **Supersedes** the capability model of
-`daemon-transport-adapter-spec.md` — see [§12 Supersession](#12-supersession-map).
+reference external chat transport). **Specializes** (does not supersede) the transport-adapter
+framework in `daemon-transport-adapter-spec.md`: that spec's `TransportAdapter` base + `AdapterInfo`/
+`AdapterCapabilities`/`TransportInstanceInfo` + host `AdapterRegistry` remain the live foundation, and
+this spec layers the libpurple-3-style typed feature traits on top of it via the
+`TransportAdapter::messaging()` accessor — see [§12.3](#123-relationship-to-the-transport-adapter-framework).
 
 > Source authority: the libpurple 3 tree at
 > `/home/j/experiments/multiprotocol-instant-messengers/pidgin-496de266ac6c/libpurple/`. Every ported
@@ -140,13 +145,13 @@ contract, documenting the deliberate divergence from the in-progress libpurple-3
 | `PurpleProtocolManager` | `AdapterRegistry` (`daemon-host`) |
 | connection/presence DTOs | `ConnectionState` / `PresenceState` / `TransportInstanceInfo` (`daemon-api`) — reconciled to the libpurple primitives, see §5 |
 | interactive login | `AuthApi` (`auth_begin`/`auth_complete`) + `AccountProvisioning` (`daemon-host`) |
-| the `TransportAdapter` seam + marker traits | the inert skeleton in `daemon-api` — replaced by this spec's typed feature traits |
+| the `TransportAdapter` seam + capability model | the live base `TransportAdapter` + `AdapterCapabilities` in `daemon-api` — this spec specializes it with the typed feature traits |
 
 ---
 
 ## 3. The interface family
 
-All types live in `daemon-api` (co-located with the existing `TransportAdapter` skeleton and the
+All types live in `daemon-api` (co-located with the existing `TransportAdapter` base and the
 capability DTOs an adapter crate already depends on — no new crate). The libpurple `PurpleProtocol`
 maps to a **`MessagingProtocol` specialization of the generic `TransportAdapter`** (§3.1.1), **not** to
 `TransportAdapter` itself — so the generic adapter seam (shared by non-chat transports like a webhook
@@ -676,19 +681,21 @@ reading the source at implementation time.
 
 ---
 
-## 12. Phasing, acceptance criteria, and supersession
+## 12. Phasing, acceptance criteria, and relationship to the transport-adapter framework
 
 ### 12.1 Phasing
 
-- **Now (the implementation follow-up):** the generic `TransportAdapter` base + the `MessagingProtocol`
-  specialization + `SupportsConversations` + `SupportsMembership` (invite/remove); Rooms full; Matrix
-  subset (incl. membership invite/remove/ban); the wire vocabulary + CDDL + `WireVersion` 18;
-  registry-driven lifecycle; dCBOR management audit; CLI; conformance test. `SupportsRoster`/
-  `Contacts`/`Directory`/`FileTransfer` defined but unimplemented; `SupportsMembership` `ban`/`set_role`
-  defined, implemented by Matrix (power levels) and off in Rooms.
-- **Deferred:** real Roster/Contacts/Directory/FileTransfer; Matrix admin beyond `send`/`set_topic`;
-  `RoomProjector::reinject` + RoundRobin/Moderator floor policies (own todos in
-  `daemon-rooms-spec.md`); `Person`/MetaContact unification; the daemon-app GUI client.
+- **Landed:** the generic `TransportAdapter` base + the `MessagingProtocol` specialization +
+  `SupportsConversations` + `SupportsMembership` (invite/remove); Rooms full (incl. all four floor
+  policies and `RoomProjector` re-injection + sealed transcript); Matrix subset (incl. membership
+  invite/remove/ban, and `SupportsContacts`/`SupportsDirectory` — `get_profile` + directory search);
+  the wire vocabulary + CDDL + `WireVersion` 18–20; registry-driven lifecycle (`AdapterRegistry::spawn_all`
+  via `node.spawn_adapters()`, with `daemon-rooms`/`daemon-matrix` registered in `bins/daemon`); dCBOR
+  management audit; CLI; conformance test. `SupportsMembership` `ban`/`set_role` implemented by Matrix
+  (power levels) and off in Rooms.
+- **Deferred:** real `SupportsRoster`/`SupportsFileTransfer` (defined but no implementor); Matrix admin
+  beyond the landed `send`/`set_topic`/membership; `Person`/MetaContact unification; the daemon-app GUI
+  client.
 
 ### 12.2 Acceptance criteria (for the implementation)
 
@@ -704,14 +711,18 @@ reading the source at implementation time.
   (assert via `store.load_trace_segment`, mirroring `drain_records_audit_into_the_journal`).
 - CBOR round-trip unit tests in `daemon-api` for the new DTOs and ops.
 
-### 12.3 Supersession map
+### 12.3 Relationship to the transport-adapter framework
 
-- `daemon-transport-adapter-spec.md`: its **§3.1** (the marker capability traits
-  `SupportsRooms`/`SupportsPresence`/`SupportsRoomEnumeration`/`SupportsFileTransfer`/`SupportsAuth`)
-  and its **§7 P1** (the abstract "adapter retrofit / capability model") are **superseded** by this
-  spec's typed feature-trait family. Its `AdapterRegistry`, `AdapterInfo`/`AdapterCapabilities`,
-  `TransportInstanceInfo`, and presence/connection DTOs remain valid (this spec reconciles the
-  presence primitive to libpurple's 8-value set).
+- `daemon-transport-adapter-spec.md`: this spec **specializes**, it does not supersede, that framework.
+  Its `TransportAdapter` base, host `AdapterRegistry`, `AdapterInfo`/`AdapterCapabilities`,
+  `TransportInstanceInfo`, and presence/connection DTOs remain the live foundation (this spec only
+  reconciles the presence primitive to libpurple's 8-value set). The one place it diverges: that spec's
+  **§3.1** *marker* capability traits (`SupportsRooms`/`SupportsPresence`/`SupportsRoomEnumeration`/
+  `SupportsFileTransfer`/`SupportsAuth`) were a sketch that was never built — coarse capability is
+  carried by the `AdapterCapabilities` bool struct, and the fine-grained per-verb capability by this
+  spec's typed feature traits (`SupportsConversations`/`SupportsMembership`/… each with a `supported()`
+  probe), reached via `TransportAdapter::messaging()`. So §3.1's marker traits and §7's P1 are
+  *realized by* this spec's feature-trait family, not discarded.
 - `daemon-rooms-spec.md`: Room management is realized via this messaging-adapter interface
-  (`SupportsConversations` + `SupportsMembership`), not bespoke `room_*` ops.
+  (`SupportsConversations` + `SupportsMembership`), not bespoke `room_*` ops (which were retired).
 - `daemon-matrix-transport-spec.md`: Matrix is a reference implementor of this interface.
