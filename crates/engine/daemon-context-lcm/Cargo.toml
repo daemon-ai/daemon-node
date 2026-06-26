@@ -31,3 +31,8 @@ daemon-protocol = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# False positives / deps wired up during active development (macro- or feature-only use that
+# cargo-machete cannot see, or in-progress crates). Intentional; do not auto-remove.
+ignored = ["base64"]
