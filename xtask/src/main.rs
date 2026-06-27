@@ -423,6 +423,179 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             }],
         }),
     )?;
+    // Local model track (Phase 2): exercise the model arrays + ModelRef/ModelSource through the
+    // regenerated (cap-bumped to 64) C codec. The quant is the chosen GGUF file carried as
+    // ModelRef::Hf{ file: Some(...) }; ModelId is content-derived (no quant in it).
+    {
+        use daemon_common::{
+            DownloadState, DownloadStatus, InstalledModel, ModelEngine, ModelFile, ModelId,
+            ModelRef, ModelSource, QuantCandidate, QuantRecommendation, SearchHit, SearchPage,
+            SearchQuery, SearchSort,
+        };
+        let repo = "bartowski/SmolLM2-135M-Instruct-GGUF";
+        let gguf = "SmolLM2-135M-Instruct-Q4_K_M.gguf";
+        let hf_ref = || {
+            ModelRef::new(
+                ModelEngine::Llama,
+                ModelSource::Hf {
+                    repo: repo.into(),
+                    file: Some(gguf.into()),
+                    revision: "main".into(),
+                },
+            )
+        };
+        write_cbor(
+            &out,
+            "request-model-search.cbor",
+            &ApiRequest::ModelSearch {
+                query: SearchQuery {
+                    text: "SmolLM2".into(),
+                    engine: ModelEngine::Llama,
+                    sort: SearchSort::Trending,
+                    page: 0,
+                    limit: 25,
+                },
+            },
+        )?;
+        write_cbor(
+            &out,
+            "request-model-files.cbor",
+            &ApiRequest::ModelFiles {
+                repo: repo.into(),
+                revision: None,
+                engine: ModelEngine::Llama,
+            },
+        )?;
+        write_cbor(
+            &out,
+            "request-model-download.cbor",
+            &ApiRequest::ModelDownload { model: hf_ref() },
+        )?;
+        write_cbor(
+            &out,
+            "request-model-downloads.cbor",
+            &ApiRequest::ModelDownloads,
+        )?;
+        write_cbor(
+            &out,
+            "request-model-catalog.cbor",
+            &ApiRequest::ModelCatalog,
+        )?;
+        write_cbor(
+            &out,
+            "request-model-recommend.cbor",
+            &ApiRequest::ModelRecommend {
+                repo: repo.into(),
+                revision: None,
+                engine: ModelEngine::Llama,
+                budget_bytes: Some(6 * 1024 * 1024 * 1024),
+            },
+        )?;
+        // Responses exercise the bumped array caps: search-page.results, [model-file],
+        // [download-status], [installed-model], plus the nested quant candidate list.
+        write_cbor(
+            &out,
+            "response-model-search.cbor",
+            &ApiResponse::ModelSearch(SearchPage {
+                page: 0,
+                results: vec![SearchHit {
+                    repo: repo.into(),
+                    author: Some("bartowski".into()),
+                    downloads: 12_345,
+                    likes: 42,
+                    num_parameters: Some(135_000_000),
+                    pipeline_tag: Some("text-generation".into()),
+                    last_modified: Some("2025-01-01T00:00:00Z".into()),
+                    gated: false,
+                    private: false,
+                }],
+                has_more: false,
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "response-model-files.cbor",
+            &ApiResponse::ModelFiles(vec![
+                ModelFile {
+                    path: gguf.into(),
+                    size_bytes: 92_000_000,
+                    quant: Some("Q4_K_M".into()),
+                    is_split: false,
+                    is_first_shard: false,
+                },
+                ModelFile {
+                    path: "SmolLM2-135M-Instruct-Q8_0.gguf".into(),
+                    size_bytes: 145_000_000,
+                    quant: Some("Q8_0".into()),
+                    is_split: false,
+                    is_first_shard: false,
+                },
+            ]),
+        )?;
+        write_cbor(
+            &out,
+            "response-model-downloads.cbor",
+            &ApiResponse::ModelDownloads(vec![DownloadStatus {
+                id: daemon_common::DownloadId(1),
+                model: hf_ref(),
+                state: DownloadState::Downloading,
+                downloaded_bytes: 46_000_000,
+                total_bytes: 92_000_000,
+                files_done: 0,
+                files_total: 1,
+                error: None,
+            }]),
+        )?;
+        write_cbor(
+            &out,
+            "response-model-catalog.cbor",
+            &ApiResponse::ModelCatalog(vec![InstalledModel {
+                id: ModelId::new("smollm2-135m-q4km"),
+                model: hf_ref(),
+                display_name: "SmolLM2-135M-Instruct".into(),
+                local_path: "/cache/models/SmolLM2-135M-Instruct-Q4_K_M.gguf".into(),
+                size_bytes: 92_000_000,
+                quant: Some("Q4_K_M".into()),
+                installed_at_ms: 1_700_000_000_000,
+                arch: Some("llama".into()),
+                context_length: Some(8192),
+                file_type: Some("Q4_K_M".into()),
+            }]),
+        )?;
+        write_cbor(
+            &out,
+            "response-model-recommend.cbor",
+            &ApiResponse::ModelRecommend(QuantRecommendation {
+                engine: ModelEngine::Llama,
+                repo: repo.into(),
+                file: Some(gguf.into()),
+                quant: "Q4_K_M".into(),
+                size_bytes: Some(92_000_000),
+                budget_bytes: 6 * 1024 * 1024 * 1024,
+                fits: true,
+                reason: "best quality that fits the detected ~6 GiB budget".into(),
+                candidates: vec![
+                    QuantCandidate {
+                        quant: "Q8_0".into(),
+                        file: Some("SmolLM2-135M-Instruct-Q8_0.gguf".into()),
+                        size_bytes: Some(145_000_000),
+                        fits: true,
+                    },
+                    QuantCandidate {
+                        quant: "Q4_K_M".into(),
+                        file: Some(gguf.into()),
+                        size_bytes: Some(92_000_000),
+                        fits: true,
+                    },
+                ],
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "response-model-download-started.cbor",
+            &ApiResponse::ModelDownloadStarted(daemon_common::DownloadId(1)),
+        )?;
+    }
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())
 }
