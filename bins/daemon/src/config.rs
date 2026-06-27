@@ -35,8 +35,11 @@ const CONTEXT_ENGINE_ENV: &str = "DAEMON_CONTEXT_ENGINE";
 const MEMORY_PROVIDER_ENV: &str = "DAEMON_MEMORY_PROVIDER";
 /// The snapshot file the `file` memory provider serves as its frozen memory (when selected).
 const MEMORY_FILE_ENV: &str = "DAEMON_MEMORY_FILE";
-/// Selects the model provider implementation: `mock` (default), `openai`, or `anthropic`.
+/// Selects the model provider implementation: `mock` (default), `scripted`, `openai`, or `anthropic`.
 const MODEL_PROVIDER_ENV: &str = "DAEMON_MODEL_PROVIDER";
+/// The scripted provider's replay script (a JSON array of `{call,args}`/`{final}` steps). Only read
+/// when `DAEMON_MODEL_PROVIDER=scripted`.
+const MOCK_SCRIPT_ENV: &str = "DAEMON_MOCK_SCRIPT";
 /// Overrides the provider API base URL (defaults per provider).
 const BASE_URL_ENV: &str = "DAEMON_BASE_URL";
 /// Overrides the model name sent to a real provider.
@@ -200,6 +203,11 @@ const MODELS_ENDPOINT_ENV: &str = "DAEMON_MODELS_ENDPOINT";
 pub enum ProviderKind {
     /// The deterministic in-tree provider (zero-config default; no network/keys).
     Mock,
+    /// The deterministic in-tree [`ScriptedProvider`](daemon_core::ScriptedProvider) replaying a
+    /// fixed tool-call/final script from `DAEMON_MOCK_SCRIPT` (env-only, binary-internal). Used to
+    /// drive a hermetic tool-using turn (so the host parks approvals/clarify) in the HITL e2e — the
+    /// wire `ProviderSelector` stays `Mock`, so no contract change.
+    Scripted,
     /// Any networked provider served by `genai`; the adapter is inferred from the (optionally
     /// namespaced) `DAEMON_MODEL` name. Replaces the former per-family launch kinds.
     GenAi,
@@ -652,8 +660,10 @@ pub struct NodeConfig {
     pub memory_provider: MemoryProviderKind,
     /// The snapshot file the `file` memory provider serves (when `memory_provider = file`).
     pub memory_file: Option<PathBuf>,
-    /// Which model provider implementation to use (mock|openai|anthropic).
+    /// Which model provider implementation to use (mock|scripted|genai|llama|mistralrs).
     pub provider_kind: ProviderKind,
+    /// The [`ProviderKind::Scripted`] replay script (raw `DAEMON_MOCK_SCRIPT` JSON); `None` otherwise.
+    pub mock_script: Option<String>,
     /// An optional provider API base-URL override. `None` uses the provider's default endpoint (the
     /// usual case); `Some` points the client elsewhere (a gateway/proxy, or a test mock server).
     pub base_url: Option<String>,
@@ -1133,6 +1143,8 @@ impl NodeConfig {
             .as_str()
         {
             "mock" => ProviderKind::Mock,
+            // Binary-internal scripted provider for the hermetic HITL e2e (DAEMON_MOCK_SCRIPT).
+            "scripted" | "script" => ProviderKind::Scripted,
             // All networked providers are genai-backed; the adapter is inferred from DAEMON_MODEL.
             // The legacy per-family names remain accepted for launch back-compat and all map here.
             "genai" | "openai" | "anthropic" | "gemini" | "google" | "groq" | "deepseek"
@@ -1141,9 +1153,11 @@ impl NodeConfig {
             "llama" | "llamacpp" | "llama-cpp" => ProviderKind::LlamaCpp,
             "mistralrs" | "mistral-rs" | "mistral.rs" => ProviderKind::MistralRs,
             other => anyhow::bail!(
-                "unknown model provider {other:?} (expected mock|genai|llama|mistralrs)"
+                "unknown model provider {other:?} (expected mock|scripted|genai|llama|mistralrs)"
             ),
         };
+        // The scripted provider's replay script (env-only; JSON array of {call,args}/{final} steps).
+        let mock_script = env_string(MOCK_SCRIPT_ENV);
         // No default: `None` lets the provider client use its own default endpoint. An override is
         // only meaningful for a gateway/proxy or the in-process wire tests.
         let base_url = env_string(BASE_URL_ENV).or(file.base_url);
@@ -1193,6 +1207,7 @@ impl NodeConfig {
             memory_provider,
             memory_file,
             provider_kind,
+            mock_script,
             base_url,
             model,
             local,

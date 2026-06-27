@@ -28,8 +28,8 @@ use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
     CommandProviderHandle, ContextEngine, ContextEngineBuilder, CredentialBuilder,
     CredentialProvider, EmbeddingProvider, EngineProfile, FileMemory, MemoryBuilder,
-    MemoryProvider, MockProvider, Provider, ProviderRegistry, SystemPrompt, Tool, ToolCall,
-    ToolDef, ToolOutcome, ToolProvider, ToolRegistry, TurnCx,
+    MemoryProvider, MockProvider, Provider, ProviderRegistry, ScriptStep, ScriptedProvider,
+    SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolProvider, ToolRegistry, TurnCx,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
@@ -196,6 +196,47 @@ impl CloudCatalog for GenAiCloudCatalog {
     }
 }
 
+/// Parse the [`ProviderKind::Scripted`] replay script from `DAEMON_MOCK_SCRIPT`: a JSON array whose
+/// entries are either `{"call": "<tool>", "args": "<payload>"}` (emit a tool call) or
+/// `{"final": "<text>"}` (the completing text). Returns the ordered call steps plus the final text
+/// (the last `final` wins; default "done"). A malformed/empty script yields an immediately-completing
+/// provider, so a misconfigured launch degrades to a trivial turn rather than panicking.
+fn parse_mock_script(raw: Option<&str>) -> (Vec<ScriptStep>, String) {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        call: Option<String>,
+        #[serde(default)]
+        args: String,
+        #[serde(rename = "final")]
+        final_text: Option<String>,
+    }
+    let mut steps = Vec::new();
+    let mut final_text = String::from("done");
+    if let Some(text) = raw {
+        match serde_json::from_str::<Vec<Entry>>(text) {
+            Ok(entries) => {
+                for e in entries {
+                    if let Some(name) = e.call {
+                        steps.push(ScriptStep::Call { name, args: e.args });
+                    } else if let Some(t) = e.final_text {
+                        final_text = t;
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(%err, "DAEMON_MOCK_SCRIPT is not a valid step array"),
+        }
+    }
+    (steps, final_text)
+}
+
+/// Build the scripted provider builder shared by the launch registry + per-profile resolver.
+fn scripted_builder(cfg: &NodeConfig) -> daemon_core::ProviderBuilder {
+    let (steps, final_text) = parse_mock_script(cfg.mock_script.as_deref());
+    Arc::new(move || {
+        Arc::new(ScriptedProvider::new(steps.clone(), final_text.clone())) as Arc<dyn Provider>
+    })
+}
+
 fn build_providers(
     cfg: &NodeConfig,
     manager: &Arc<ModelManager>,
@@ -203,6 +244,15 @@ fn build_providers(
 ) -> ProviderRegistry {
     let mut providers = ProviderRegistry::new();
     match cfg.provider_kind {
+        ProviderKind::Scripted => {
+            // Hermetic tool-using turn: the default provider replays the configured script, so a
+            // side-effecting tool call parks an approval under the node's Ask policy (the HITL e2e).
+            providers.set_default(scripted_builder(cfg));
+            providers.register(
+                "child",
+                Arc::new(|| Arc::new(MockProvider::completing("child done")) as Arc<dyn Provider>),
+            );
+        }
         ProviderKind::Mock => {
             providers.set_default(Arc::new(|| {
                 Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>
@@ -271,6 +321,12 @@ fn provider_builder_for(
     manager: &Arc<ModelManager>,
     active: &ActiveModels,
 ) -> daemon_core::ProviderBuilder {
+    // Scripted launch overrides the per-profile provider: the wire ProviderSelector stays Mock
+    // (no contract change), but every interactive session runs the scripted tool-calling provider
+    // so the HITL e2e drives real parked approvals/clarify.
+    if cfg.provider_kind == ProviderKind::Scripted {
+        return scripted_builder(cfg);
+    }
     match spec.provider {
         ProviderSelector::Mock => {
             Arc::new(|| Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>)
@@ -311,7 +367,9 @@ fn provider_builder_for(
 /// tunables, and a GUI can then clone/edit/select alternatives over the `ProfileApi`.
 fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
     let provider = match cfg.provider_kind {
-        ProviderKind::Mock => ProviderSelector::Mock,
+        // Scripted is binary-internal: the durable profile records Mock so the wire stays unchanged
+        // (provider_builder_for swaps in the scripted provider for the live session).
+        ProviderKind::Mock | ProviderKind::Scripted => ProviderSelector::Mock,
         ProviderKind::GenAi => ProviderSelector::GenAi,
         ProviderKind::LlamaCpp => ProviderSelector::LlamaCpp,
         ProviderKind::MistralRs => ProviderSelector::MistralRs,
