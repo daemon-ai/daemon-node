@@ -334,13 +334,31 @@ impl JournalFeeder {
     }
 }
 
-/// Drain the owner authority's pending credential-audit records into `sink` (host-spec §6), then
-/// seal the segment when anything was recorded — so grant/use/revoke/rotate land in the durable,
+/// A source of pending credential-audit records to fold into the journal. Implemented by the single
+/// owner [`CredentialAuthority`] and by the host's per-profile [`crate::MultiProfileStoreBroker`]
+/// (which aggregates across its lazily-created per-profile authorities), so the same drain loop
+/// serves both the single-profile and multi-profile owner shapes.
+pub trait CredentialAuditDrain: Send + Sync {
+    /// Take (and clear) the pending audit records.
+    fn take_audit(&self) -> Vec<CredentialAuditEvent>;
+}
+
+impl CredentialAuditDrain for CredentialAuthority {
+    fn take_audit(&self) -> Vec<CredentialAuditEvent> {
+        CredentialAuthority::take_audit(self)
+    }
+}
+
+/// Drain the owner's pending credential-audit records into `sink` (host-spec §6), then seal the
+/// segment when anything was recorded — so grant/use/revoke/rotate land in the durable,
 /// tamper-evident transcript on the **production** path (today only conformance drains the audit).
 /// Returns the number of records journaled. Best-effort: a store error on one record is swallowed so
 /// a journaling hiccup never blocks credential issuance.
-pub async fn drain_credential_audit(authority: &CredentialAuthority, sink: &JournalSink) -> usize {
-    let events = authority.take_audit();
+pub async fn drain_credential_audit(
+    source: &dyn CredentialAuditDrain,
+    sink: &JournalSink,
+) -> usize {
+    let events = source.take_audit();
     if events.is_empty() {
         return 0;
     }
@@ -361,7 +379,7 @@ pub async fn drain_credential_audit(authority: &CredentialAuthority, sink: &Jour
 /// node shutdown; on each tick the accumulated audit is folded into the verifiable chain. Returns
 /// the join handle so the caller can abort it.
 pub fn spawn_credential_audit_drain(
-    authority: Arc<CredentialAuthority>,
+    source: Arc<dyn CredentialAuditDrain>,
     store: Arc<dyn SessionStore>,
     signer: Arc<TraceSigner>,
     stream: JournalStreamId,
@@ -374,7 +392,7 @@ pub fn spawn_credential_audit_drain(
         tick.tick().await;
         loop {
             tick.tick().await;
-            drain_credential_audit(&authority, &sink).await;
+            drain_credential_audit(source.as_ref(), &sink).await;
         }
     })
 }

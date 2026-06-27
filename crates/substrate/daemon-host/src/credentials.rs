@@ -13,13 +13,17 @@
 //!   so the engine injected at [`CoreEngineFactory`](crate::engine_incarnation) acquires brokered
 //!   capabilities through the identical interface whether it runs in-process or across a cut.
 
+use crate::credstore::{CredentialStore, PooledStoreCredentialSource};
+use crate::journal::CredentialAuditDrain;
 use async_trait::async_trait;
 use daemon_common::{
-    CapabilityLease, CredError, CredId, CredScope, FenceToken, LeaseSecret, ProfileRef, UnitId,
+    CapabilityLease, CredError, CredId, CredMode, CredScope, FenceToken, LeaseSecret, ProfileRef,
+    UnitId,
 };
 use daemon_core::CredentialProvider;
-use daemon_credentials::{AcquireCtx, CredentialAuthority};
+use daemon_credentials::{AcquireCtx, CapabilitySigner, CredentialAuditEvent, CredentialAuthority};
 use daemon_telemetry::current_trace;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// A hop's incarnation guard: the fence this incarnation was granted, against the session's current
@@ -162,6 +166,120 @@ impl CredentialBroker for OwnerBroker {
         if self.fence_ok().is_ok() {
             self.authority.rotate(cap_id);
         }
+    }
+}
+
+/// The owner endpoint for a node whose provider secrets are keyed **per profile** in a
+/// [`CredentialStore`]. Instead of binding the node to one fixed profile (the single-authority
+/// `OwnerBroker` shape, which rejects every other profile at `acquire`), this broker lazily builds a
+/// per-profile [`CredentialAuthority`] on first use — each over a [`PooledStoreCredentialSource`]
+/// for that profile — so a `CredentialSet` on any profile reaches that profile's sessions with no
+/// dependence on a launch-configured profile name. All per-profile authorities **share the one node
+/// signer**, so every lease verifies under the node's single published verifying key, and
+/// `use_capability`/`rotate` route by the lease's / requested profile back to the owning authority.
+pub struct MultiProfileStoreBroker {
+    store: Arc<dyn CredentialStore>,
+    signer: Arc<CapabilitySigner>,
+    fallback: String,
+    actions: Vec<String>,
+    scope_tokens: Option<u64>,
+    mode: CredMode,
+    ttl_ms: u64,
+    authorities: Mutex<HashMap<ProfileRef, Arc<CredentialAuthority>>>,
+}
+
+impl MultiProfileStoreBroker {
+    /// A broker over `store`: each profile's lazily-built authority issues `mode` leases living
+    /// `ttl_ms`, granting that profile + `actions` (with an optional scope token ceiling), and hands
+    /// over `fallback` when the profile has no stored key. All authorities sign with `signer` so the
+    /// node presents one verifying key.
+    pub fn new(
+        store: Arc<dyn CredentialStore>,
+        signer: Arc<CapabilitySigner>,
+        fallback: impl Into<String>,
+        actions: impl IntoIterator<Item = impl Into<String>>,
+        scope_tokens: Option<u64>,
+        mode: CredMode,
+        ttl_ms: u64,
+    ) -> Self {
+        Self {
+            store,
+            signer,
+            fallback: fallback.into(),
+            actions: actions.into_iter().map(Into::into).collect(),
+            scope_tokens,
+            mode,
+            ttl_ms,
+            authorities: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get (or lazily create) the authority that serves `profile`.
+    fn authority_for(&self, profile: &ProfileRef) -> Arc<CredentialAuthority> {
+        let mut map = self.authorities.lock().unwrap();
+        if let Some(authority) = map.get(profile) {
+            return authority.clone();
+        }
+        let source = Arc::new(PooledStoreCredentialSource::new(
+            self.store.clone(),
+            profile.as_str(),
+            self.fallback.clone(),
+        ));
+        let scope = CredScope::new(
+            [profile.as_str()],
+            self.actions.iter().map(String::as_str),
+            self.scope_tokens,
+        );
+        let authority = Arc::new(CredentialAuthority::new(
+            scope,
+            self.mode,
+            self.ttl_ms,
+            self.signer.clone(),
+            source,
+        ));
+        map.insert(profile.clone(), authority.clone());
+        authority
+    }
+}
+
+#[async_trait]
+impl CredentialBroker for MultiProfileStoreBroker {
+    async fn acquire(
+        &self,
+        requester: Option<UnitId>,
+        profile: &ProfileRef,
+        scope: &CredScope,
+    ) -> Result<CapabilityLease, CredError> {
+        let ctx = AcquireCtx::new(requester, current_trace());
+        tracing::debug!(trace_id = %current_trace(), profile = %profile, requester = ?ctx.requester, "cred.acquire");
+        self.authority_for(profile).acquire(&ctx, profile, scope)
+    }
+
+    async fn use_capability(
+        &self,
+        requester: Option<UnitId>,
+        lease: &CapabilityLease,
+    ) -> Result<LeaseSecret, CredError> {
+        let ctx = AcquireCtx::new(requester, current_trace());
+        tracing::debug!(trace_id = %current_trace(), requester = ?ctx.requester, "cred.use");
+        // Route by the lease's own profile so the use reaches the authority that minted it.
+        self.authority_for(&lease.profile)
+            .use_capability(&ctx, lease)
+    }
+
+    async fn rotate(&self, _requester: Option<UnitId>, profile: &ProfileRef, cap_id: &CredId) {
+        self.authority_for(profile).rotate(cap_id);
+    }
+}
+
+impl CredentialAuditDrain for MultiProfileStoreBroker {
+    fn take_audit(&self) -> Vec<CredentialAuditEvent> {
+        let map = self.authorities.lock().unwrap();
+        let mut out = Vec::new();
+        for authority in map.values() {
+            out.extend(authority.take_audit());
+        }
+        out
     }
 }
 
@@ -356,5 +474,73 @@ mod tests {
             "key-b",
             "rotation cycles to a different pooled key"
         );
+    }
+
+    /// The multi-profile broker serves each profile from its own stored key (no single bound
+    /// profile), and `use_capability` routes a lease back to the authority that minted it.
+    #[tokio::test]
+    async fn multi_profile_broker_serves_each_profile_independently() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("alpha", "key-alpha").unwrap();
+        store.set("beta", "key-beta").unwrap();
+        let signer = Arc::new(CapabilitySigner::generate());
+        let broker = MultiProfileStoreBroker::new(
+            store,
+            signer,
+            "sk-fallback",
+            ["chat", "embed"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        );
+
+        let scope_a = CredScope::new(["alpha"], ["chat"], Some(1_000));
+        let lease_a = broker
+            .acquire(None, &ProfileRef::new("alpha"), &scope_a)
+            .await
+            .expect("alpha acquires");
+        assert_eq!(lease_a.secret.as_ref().unwrap().expose(), "key-alpha");
+
+        let scope_b = CredScope::new(["beta"], ["chat"], Some(1_000));
+        let lease_b = broker
+            .acquire(None, &ProfileRef::new("beta"), &scope_b)
+            .await
+            .expect("beta acquires (a different profile, no rebinding needed)");
+        assert_eq!(lease_b.secret.as_ref().unwrap().expose(), "key-beta");
+
+        // The lease resolves at the owner that minted it (routed by lease.profile).
+        let used = broker
+            .use_capability(None, &lease_a)
+            .await
+            .expect("alpha's lease resolves");
+        assert_eq!(used.expose(), "key-alpha");
+
+        // Audit aggregates across both per-profile authorities.
+        assert!(
+            !broker.take_audit().is_empty(),
+            "acquires recorded audit across profiles"
+        );
+    }
+
+    /// A profile with no stored key falls back to the configured fallback (zero-config bootstrap).
+    #[tokio::test]
+    async fn multi_profile_broker_falls_back_for_unset_profile() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        let signer = Arc::new(CapabilitySigner::generate());
+        let broker = MultiProfileStoreBroker::new(
+            store,
+            signer,
+            "sk-fallback",
+            ["chat"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        );
+        let scope = CredScope::new(["ghost"], ["chat"], Some(1_000));
+        let lease = broker
+            .acquire(None, &ProfileRef::new("ghost"), &scope)
+            .await
+            .expect("unset profile still acquires via fallback");
+        assert_eq!(lease.secret.as_ref().unwrap().expose(), "sk-fallback");
     }
 }

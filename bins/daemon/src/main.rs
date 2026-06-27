@@ -34,11 +34,11 @@ use daemon_core::{
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
     run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
-    CloudCatalog, CommandRegistry, CoreEngineFactory, CredentialBroker, CredentialStore,
-    EngineUnit, FileCredentialStore, FileProfileStore, FileRevisionLog, HostConfig, JournalFeeder,
-    JournalSink, MemCredentialStore, MemProfileStore, OriginMatcher, OwnerBroker,
-    PooledStoreCredentialSource, ProfileStore, RoutingRegistry, ScopePattern, SessionBinding,
-    TransportPattern,
+    CloudCatalog, CommandRegistry, CoreEngineFactory, CredentialAuditDrain, CredentialBroker,
+    CredentialStore, EngineUnit, FileCredentialStore, FileProfileStore, FileRevisionLog,
+    HostConfig, JournalFeeder, JournalSink, MemCredentialStore, MemProfileStore,
+    MultiProfileStoreBroker, OriginMatcher, OwnerBroker, PooledStoreCredentialSource, ProfileStore,
+    RoutingRegistry, ScopePattern, SessionBinding, TransportPattern,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_metta::protocol::Bounds as MettaBounds;
@@ -1271,10 +1271,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         .set(&cfg.profile, &cfg.credential_key)
         .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
 
-    // Credentials: an owner authority brokered into *every* engine, uniformly across the durable,
-    // interactive, and fleet-child construction paths (host-spec §6).
-    let (owner, cred_authority) =
-        build_owner_broker(&cfg.profile, &cfg.credential_key, credential_store.clone());
+    // Credentials: a PER-PROFILE owner broker over the credential store, brokered into *every*
+    // engine, uniformly across the durable, interactive, and fleet-child construction paths
+    // (host-spec §6). Per-profile provisioning means a GUI `CredentialSet` on any profile reaches
+    // that profile's sessions, so onboarding never depends on a launch-configured profile name.
+    let owner_broker = build_multi_profile_broker(&cfg.credential_key, credential_store.clone());
+    let owner: Arc<dyn CredentialBroker> = owner_broker.clone();
     let cred_profile = ProfileRef::new(cfg.profile.clone());
     let credentials: CredentialBuilder = {
         let owner = owner.clone();
@@ -1294,7 +1296,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             .unwrap_or_else(daemon_telemetry::TraceSigner::generate),
     );
     let cred_audit_drain = daemon_host::spawn_credential_audit_drain(
-        cred_authority,
+        owner_broker.clone() as Arc<dyn CredentialAuditDrain>,
         store.clone(),
         cred_audit_signer,
         JournalStreamId::unit(&UnitId::new("node-credentials")),
@@ -1700,6 +1702,27 @@ fn build_owner_broker(
     ));
     let broker = Arc::new(OwnerBroker::new(authority.clone())) as Arc<dyn CredentialBroker>;
     (broker, authority)
+}
+
+/// Build the per-profile owner broker for the host path: a `CredentialSet` on any profile reaches
+/// that profile's sessions (each profile gets a lazily-built authority over a pooled store source,
+/// all sharing one node signer). Returned as the concrete type so the caller can coerce it to both
+/// the engine-facing `CredentialBroker` and the audit-drain `CredentialAuditDrain`. Bearer mode +
+/// the launch-configured `fallback_key` for any profile with no stored key (zero-config bootstrap).
+fn build_multi_profile_broker(
+    fallback_key: &str,
+    store: Arc<dyn CredentialStore>,
+) -> Arc<MultiProfileStoreBroker> {
+    let signer = Arc::new(CapabilitySigner::generate());
+    Arc::new(MultiProfileStoreBroker::new(
+        store,
+        signer,
+        fallback_key,
+        ["chat", "embed"],
+        Some(1_000),
+        CredMode::Bearer,
+        60_000,
+    ))
 }
 
 /// Run as a transport server: host a completing engine unit + an authoritative store, reachable as
