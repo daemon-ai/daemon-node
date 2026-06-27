@@ -218,7 +218,7 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
         ApiRequest, ApiResponse, CommandInvocation, CommandOutput, CredentialInfo, HealthReport,
-        LogPageView, ModelDescriptor, ProviderSelector, ServiceHealth, SessionPage,
+        LogPageView, ModelDescriptor, ProfileSpec, ProviderSelector, ServiceHealth, SessionPage,
     };
     use daemon_common::{ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, UserMsg};
@@ -312,6 +312,44 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             provider: Some(ProviderSelector::GenAi),
         },
     )?;
+    // Profiles CRUD (PRO-2/3/4): exercise the now-concrete profile-spec (the optional arms -
+    // tool_allowlist Some, base_url/system_prompt set - and the nested budget/tunables maps).
+    let mut fixture_spec = ProfileSpec::new("work", ProviderSelector::GenAi, "claude-opus-4-8");
+    fixture_spec.system_prompt = "You are a helpful work assistant.".into();
+    fixture_spec.tool_allowlist = Some(vec!["read".into(), "search".into()]);
+    write_cbor(
+        &out,
+        "request-profile-create.cbor",
+        &ApiRequest::ProfileCreate {
+            spec: fixture_spec.clone(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-profile-update.cbor",
+        &ApiRequest::ProfileUpdate {
+            spec: fixture_spec.clone(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-profile-get.cbor",
+        &ApiRequest::ProfileGet { id: "work".into() },
+    )?;
+    write_cbor(
+        &out,
+        "request-profile-clone.cbor",
+        &ApiRequest::ProfileClone {
+            source: "default".into(),
+            new_id: "work".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-profile.cbor",
+        &ApiResponse::Profile(Some(fixture_spec)),
+    )?;
+
     let fixture_descriptor = ModelDescriptor {
         id: "claude-opus-4-8".into(),
         provider: ProviderSelector::GenAi,

@@ -714,8 +714,8 @@ revision = {
 }
 ; a portable skill bundle: bundle-relative path -> file contents (text; includes SKILL.md).
 skill-bundle = { "name": tstr, "category": (tstr / null), "files": { * tstr => tstr } }
-; a portable profile distribution: the spec (carried as `any` — the Rust ProfileSpec contract) plus
-; the profile's local skills; credential_ref is kept (a name, not a secret).
+; a portable profile distribution: the concrete profile-spec plus the profile's local skills;
+; credential_ref is kept (a name, not a secret).
 distribution = {
   "wire_version": wire_version,
   "profile": profile-spec,
@@ -723,7 +723,27 @@ distribution = {
   ? "head_seq": (uint / null),
   ? "source": (tstr / null),
 }
-profile-spec = any                       ; opaque: large ProfileSpec (budget/tunables/context/memory sub-specs); Rust-authoritative
+; the full ProfileSpec (daemon-api profile.rs). serde default + ciborium with no
+; skip_serializing_if, so every field is present on the wire (Option fields as null); reuse the
+; existing `budget` (BudgetSpec) and `provider-selector`/`bound-account` rules.
+engine-tunables = { "model_retry_attempts": (uint / null), "context_budget_tokens": (uint / null), "max_iterations": (uint / null), "tool_result_budget": (uint / null) }
+context-engine-sel = "lcm" / "budgeted"
+memory-provider-sel = "mnemosyne" / "file" / "none"
+profile-spec = {
+  "id": tstr,
+  "provider": provider-selector,
+  "model": tstr,
+  "base_url": (tstr / null),
+  "system_prompt": tstr,
+  "tool_allowlist": ([* tstr] / null),
+  "budget": budget,
+  "tunables": engine-tunables,
+  "context_engine": context-engine-sel,
+  "memory_provider": memory-provider-sel,
+  "credential_ref": (tstr / null),
+  "fallback_credential_ref": (tstr / null),
+  "bound_accounts": [* bound-account],
+}
 bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account] }
 credential-info = { "profile": tstr, "present": bool, "hint": tstr }
@@ -1198,7 +1218,7 @@ response-model-quantize-started = { "ModelQuantizeStarted": quantize-id }
 response-model-quantizes = { "ModelQuantizes": [* quantize-status] }
 response-model-inspect = { "ModelInspect": gguf-info }
 response-profiles = { "Profiles": [* profile-info] }
-response-profile = { "Profile": profile-spec }
+response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns null on a missing id
 response-credentials = { "Credentials": [* credential-info] }
 response-models = { "Models": [* model-descriptor] }
 response-model-current = { "ModelCurrent": (model-descriptor / null) }
