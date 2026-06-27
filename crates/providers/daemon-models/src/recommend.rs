@@ -24,13 +24,13 @@ const WEIGHT_BUDGET_FRACTION: f64 = 0.8;
 const LLAMA_QUALITY: &[&str] = &[
     "F32", "BF16", "F16", "FP16", //
     "Q8_K", "Q8_1", "Q8_0", //
-    "Q6_K", //
-    "Q5_K_M", "Q5_K", "Q5_K_S", "Q5_1", "Q5_0", //
-    "Q4_K_M", "Q4_K", "Q4_K_S", "Q4_1", "Q4_0", //
+    "Q6_K_L", "Q6_K", //
+    "Q5_K_L", "Q5_K_M", "Q5_K", "Q5_K_S", "Q5_1", "Q5_0", //
+    "Q4_K_L", "Q4_K_M", "Q4_K", "Q4_K_S", "Q4_1", "Q4_0", //
     "IQ4_NL", "IQ4_XS", //
-    "Q3_K_L", "Q3_K_M", "Q3_K", "Q3_K_S", //
+    "Q3_K_XL", "Q3_K_L", "Q3_K_M", "Q3_K", "Q3_K_S", //
     "IQ3_M", "IQ3_S", "IQ3_XS", "IQ3_XXS", //
-    "Q2_K_S", "Q2_K", //
+    "Q2_K_L", "Q2_K_S", "Q2_K", //
     "IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS", //
     "IQ1_M", "IQ1_S",
 ];
@@ -323,6 +323,24 @@ mod tests {
         assert!(quality_rank("F16") < quality_rank("Q8_0"));
         // Unknown labels rank worst.
         assert!(quality_rank("WAT") >= LLAMA_QUALITY.len());
+    }
+
+    #[test]
+    fn quality_rank_places_embed_output_variants() {
+        // The `_L`/`_XL` embed/output variants rank known (not worst) and at least as high as their
+        // base/`_M` sibling, while staying within their own family's band.
+        for label in ["Q2_K_L", "Q3_K_XL", "Q4_K_L", "Q5_K_L", "Q6_K_L"] {
+            assert!(
+                quality_rank(label) < LLAMA_QUALITY.len(),
+                "{label} should be a known quant"
+            );
+        }
+        assert!(quality_rank("Q4_K_L") <= quality_rank("Q4_K_M"));
+        assert!(quality_rank("Q5_K_L") <= quality_rank("Q5_K_M"));
+        assert!(quality_rank("Q6_K_L") <= quality_rank("Q6_K"));
+        assert!(quality_rank("Q3_K_XL") <= quality_rank("Q3_K_L"));
+        // Family bands stay ordered: a Q4 embed/output variant still beats a Q2 one.
+        assert!(quality_rank("Q4_K_L") < quality_rank("Q2_K_L"));
     }
 
     #[test]

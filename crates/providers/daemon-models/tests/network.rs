@@ -157,3 +157,122 @@ async fn live_quantize_small_gguf() {
 
     let _ = std::fs::remove_dir_all(&cache_dir);
 }
+
+/// A `ModelManager` that downloads into the *real* shared HF cache (so the artifact persists for the
+/// `daemon-infer` Vulkan inference/embedding tests), but keeps its catalog manifest in a throwaway
+/// temp file so we do not clutter the cache directory.
+async fn shared_cache_manager(tag: &str) -> ModelManager {
+    let registry =
+        std::env::temp_dir().join(format!("daemon-models-{tag}-{}.json", std::process::id()));
+    ModelManager::new(ManagerConfig {
+        cache_dir: None, // follow HF_*/XDG precedence so downloads land in the shared hub cache
+        registry_path: Some(registry),
+        endpoint: None,
+        ..Default::default()
+    })
+    .await
+    .expect("manager")
+}
+
+/// Full chat-model flow against the real Hub: search -> list files (the `_L` quant labels we added
+/// must now resolve `Q2_K_L`) -> recommend -> download the chosen `SmolLM2-135M-Instruct-Q2_K_L.gguf`
+/// into the shared cache -> verify the GGUF magic. Prints the on-disk path as
+/// `DAEMON_INFER_TEST_GGUF=<path>` so the Vulkan inference test can consume it.
+#[tokio::test]
+#[ignore = "downloads SmolLM2-135M Q2_K_L (~90 MB) from the live Hub"]
+async fn live_smollm2_search_files_recommend_download() {
+    const REPO: &str = "bartowski/SmolLM2-135M-Instruct-GGUF";
+    const FILE: &str = "SmolLM2-135M-Instruct-Q2_K_L.gguf";
+
+    let manager = shared_cache_manager("smollm2").await;
+
+    // Step 1: search surfaces the repo.
+    let page = manager
+        .search(SearchQuery::new(
+            "SmolLM2 Instruct GGUF",
+            ModelEngine::Llama,
+        ))
+        .await
+        .expect("search");
+    assert!(!page.results.is_empty(), "expected SmolLM2 search hits");
+    assert!(
+        page.results.iter().any(|h| h.repo.contains("SmolLM2")),
+        "expected a SmolLM2 repo among hits: {:?}",
+        page.results.iter().map(|h| &h.repo).collect::<Vec<_>>()
+    );
+
+    // Step 2: list files — the Q2_K_L embed/output variant must be present AND labeled.
+    let files = manager
+        .model_files(REPO, Some("main"), ModelEngine::Llama)
+        .await
+        .expect("files");
+    let q2kl = files.iter().find(|f| f.path == FILE).unwrap_or_else(|| {
+        panic!(
+            "repo should expose {FILE}; saw {:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        q2kl.quant.as_deref(),
+        Some("Q2_K_L"),
+        "Q2_K_L must be recognized after the quant-label fix"
+    );
+
+    // The recommender should pick a real, labeled GGUF for a generous budget.
+    let rec = manager
+        .recommend(REPO, Some("main"), ModelEngine::Llama, Some(64 << 30))
+        .await
+        .expect("recommend");
+    assert!(rec.file.is_some(), "a GGUF file should be recommended");
+    assert!(!rec.candidates.is_empty());
+
+    // Step 3: download the specific Q2_K_L file and verify it on disk.
+    let model = daemon_common::ModelRef::new(
+        ModelEngine::Llama,
+        daemon_common::ModelSource::hf_file(REPO, FILE),
+    );
+    let artifact = manager.resolve(&model).await.expect("resolve/download");
+    assert!(artifact.local_path.exists(), "artifact on disk");
+    assert!(
+        daemon_models::gguf::verify_gguf_magic(&artifact.local_path).unwrap(),
+        "downloaded file must start with the GGUF magic"
+    );
+    println!("DAEMON_INFER_TEST_GGUF={}", artifact.local_path.display());
+}
+
+/// Full embedding-model flow: list files for the all-MiniLM-L12-v2 GGUF repo, download the small
+/// `Q2_K` quant into the shared cache, and verify the GGUF magic. Prints the on-disk path as
+/// `DAEMON_INFER_TEST_EMBED_GGUF=<path>` for the embedding test.
+#[tokio::test]
+#[ignore = "downloads all-MiniLM-L12-v2 Q2_K (~25 MB) from the live Hub"]
+async fn live_minilm_embed_files_download() {
+    const REPO: &str = "leliuga/all-MiniLM-L12-v2-GGUF";
+    const FILE: &str = "all-MiniLM-L12-v2.Q2_K.gguf";
+
+    let manager = shared_cache_manager("minilm").await;
+
+    let files = manager
+        .model_files(REPO, Some("main"), ModelEngine::Llama)
+        .await
+        .expect("files");
+    assert!(
+        files.iter().any(|f| f.path == FILE),
+        "repo should expose {FILE}; saw {:?}",
+        files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+
+    let model = daemon_common::ModelRef::new(
+        ModelEngine::Llama,
+        daemon_common::ModelSource::hf_file(REPO, FILE),
+    );
+    let artifact = manager.resolve(&model).await.expect("resolve/download");
+    assert!(artifact.local_path.exists(), "artifact on disk");
+    assert!(
+        daemon_models::gguf::verify_gguf_magic(&artifact.local_path).unwrap(),
+        "downloaded file must start with the GGUF magic"
+    );
+    println!(
+        "DAEMON_INFER_TEST_EMBED_GGUF={}",
+        artifact.local_path.display()
+    );
+}

@@ -54,6 +54,25 @@ pub async fn load(
     }
 }
 
+/// Whether the linked llama.cpp build was compiled with a GPU backend (CUDA / Vulkan / Metal / …).
+///
+/// This reflects the *build*, not the presence of a runtime device: a Vulkan-enabled `libllama`
+/// returns `true` even before any device is probed. Used by the engine lane's integration tests to
+/// assert the worker is actually a GPU build (vs. a silent CPU-only fallback). Only meaningful with
+/// the `llama` feature; the stub build reports `false`.
+#[cfg(feature = "llama")]
+#[must_use]
+pub fn gpu_offload_supported() -> bool {
+    llama_cpp_4::supports_gpu_offload()
+}
+
+/// llama.cpp's system/build info string (CPU features + compiled backends). Diagnostic only.
+#[cfg(feature = "llama")]
+#[must_use]
+pub fn system_info() -> String {
+    llama_cpp_4::print_system_info()
+}
+
 /// The identifier of the engine compiled for `engine` (for [`crate::protocol::Event::Health`]).
 pub fn backend_name(engine: Engine) -> &'static str {
     match engine {

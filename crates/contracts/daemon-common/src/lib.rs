@@ -977,7 +977,9 @@ impl SearchSort {
     /// The Hugging Face `sort` query value.
     pub fn as_query(self) -> &'static str {
         match self {
-            SearchSort::Trending => "trending",
+            // The `/api/models` endpoint expects `trendingScore`; a bare `trending` is rejected
+            // with HTTP 400 ("Invalid sort parameter: trending").
+            SearchSort::Trending => "trendingScore",
             SearchSort::Downloads => "downloads",
             SearchSort::Likes => "likes",
             SearchSort::Modified => "lastModified",

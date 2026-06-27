@@ -47,22 +47,30 @@
         ];
         libclangPath = "${pkgs.llvmPackages.libclang.lib}/lib";
 
-        # A from-source, CPU, shared-lib build of the exact llama.cpp commit that `llama-cpp-sys-4`
-        # 0.3.2 vendors. cmake runs in the Nix build sandbox (which has `/bin/sh`), so this sidesteps
+        # A from-source, shared-lib build of the exact llama.cpp commit that `llama-cpp-sys-4` 0.3.2
+        # vendors, with BOTH the CPU and Vulkan ggml backends compiled in (`GGML_VULKAN=ON`; the CPU
+        # backend is always built). One artifact serves every dev lane: with `n_gpu_layers = 0` it
+        # runs on CPU, and with layers offloaded it uses Vulkan if a device is present (else it falls
+        # back to CPU). cmake runs in the Nix build sandbox (which has `/bin/sh`), so this sidesteps
         # the missing-`/bin/sh` trap. Pointing `LLAMA_PREBUILT_DIR` at it lets a plain `cargo build
         # --features llama,dynamic-link` skip cmake entirely in the dev shell (only the `cc`-built
-        # `mtp_shim` compiles locally). `GGML_NATIVE=OFF` keeps the store path portable/reproducible.
+        # `mtp_shim` compiles locally). `GGML_NATIVE=OFF` keeps the store path portable/reproducible;
+        # `shaderc` provides `glslc` for the SPIR-V shader compile, and `vulkan-headers` +
+        # `vulkan-loader` satisfy cmake's `FindVulkan` and the `libggml-vulkan.so` link. At runtime the
+        # NixOS loader resolves the system ICD (RADV) from `/run/opengl-driver/share/vulkan/icd.d`.
         llamaCpp = pkgs.stdenv.mkDerivation {
           pname = "llama-cpp-prebuilt";
           version = "b9496";
           src = llama-cpp-src;
-          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config pkgs.shaderc ];
+          buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
           # Build only the ggml + libllama shared libraries; everything else (tools, the unified
           # `app` binary, server, examples, tests, common, web UI) is dropped — we only consume the
           # `.so`s, and those extra targets pull in deps that fail to link in this trimmed build.
           cmakeFlags = [
             "-DBUILD_SHARED_LIBS=ON"
             "-DGGML_NATIVE=OFF"
+            "-DGGML_VULKAN=ON"
             "-DLLAMA_CURL=OFF"
             "-DLLAMA_BUILD_TESTS=OFF"
             "-DLLAMA_BUILD_EXAMPLES=OFF"
@@ -191,6 +199,28 @@
         daemon-infer-llama = buildEngineWorker "llama";
         daemon-infer-mistralrs = buildEngineWorker "mistralrs";
 
+        # The authoritative "llama-cpp-4 compiles with the Vulkan backend" gate: build the worker
+        # `--features vulkan`, which forwards to `llama-cpp-4/vulkan` -> `llama-cpp-sys-4/vulkan` ->
+        # `GGML_VULKAN=ON` in cmake. Unlike the CPU lanes this needs the Vulkan SDK pieces at build
+        # time: `shaderc` (`glslc`) to compile the SPIR-V shaders, and `vulkan-headers` +
+        # `vulkan-loader` for cmake's `FindVulkan` and the `libggml-vulkan` link. Compile-only
+        # (`doCheck = false`); runtime GPU exercise happens via the dev-shell tests.
+        daemon-infer-vulkan = craneLib.buildPackage (
+          commonArgs
+          // {
+            pname = "daemon-infer-vulkan";
+            inherit cargoArtifacts;
+            cargoExtraArgs = "-p daemon-infer --features vulkan";
+            nativeBuildInputs = engineNativeInputs ++ [ pkgs.shaderc ];
+            # `spirv-headers` satisfies the `find_package(SPIRV-Headers)` in the crate's vendored
+            # `ggml-vulkan` CMake (and its `license_add_file`); without it the from-source Vulkan
+            # build fails at configure time.
+            buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.spirv-headers ];
+            LIBCLANG_PATH = libclangPath;
+            doCheck = false;
+          }
+        );
+
         # The MeTTa symbolic-coprocessor worker, built WITH the real engine (`--features hyperon`).
         # This is a deliberately separate output, NOT part of the default workspace gate: the default
         # `daemon-metta` (fallback engine) and every other crate never link `hyperon`. The hyperon
@@ -217,10 +247,11 @@
             daemon-cli
             daemon-infer-llama
             daemon-infer-mistralrs
+            daemon-infer-vulkan
             daemon-metta
             ;
-          # Prebuilt llama.cpp (shared, CPU) matching the crate's vendored commit; consumed by the dev
-          # shell via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
+          # Prebuilt llama.cpp (shared, CPU + Vulkan) matching the crate's vendored commit; consumed
+          # by the dev shells via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
           llama-cpp = llamaCpp;
           default = daemon;
         };
@@ -266,17 +297,19 @@
             # so a dev can build an engine lane locally. The default `cargo test --workspace` still
             # builds only the stub worker — no engine, no cmake step.
             #
-            # llama lane in the dev shell: this host has no `/bin/sh`, so compiling llama.cpp from
-            # source (cmake -> make/ninja, both of which exec `/bin/sh`) fails here. Instead we point
+            # llama lane in the dev shell: rather than compile llama.cpp from source here, we point
             # `LLAMA_PREBUILT_DIR` at the pinned `packages.llama-cpp` (built from source in the Nix
             # sandbox), so `cargo build -p daemon-infer --features llama,dynamic-link` links that
             # prebuilt and skips cmake entirely (only the `cc`-built `mtp_shim` compiles locally).
-            # `LD_LIBRARY_PATH` makes the shared llama/ggml libs + libgomp resolvable when the worker
-            # runs in-shell (e.g. `cargo test`, `cargo run`).
+            # That prebuilt now bundles the Vulkan backend (one CPU+Vulkan artifact), so
+            # `LD_LIBRARY_PATH` also includes the Vulkan loader: `libggml-vulkan.so` has a `DT_NEEDED`
+            # on `libvulkan.so`, which must resolve even for a CPU-only (`n_gpu_layers = 0`) run. It
+            # also makes the shared llama/ggml libs + libgomp resolvable when the worker runs in-shell
+            # (e.g. `cargo test`, `cargo run`).
             LIBCLANG_PATH = libclangPath;
             LLAMA_PREBUILT_DIR = "${llamaCpp}";
             LLAMA_PREBUILT_SHARED = "1";
-            LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.gcc.cc.lib}/lib";
+            LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
             packages =
               [
                 rustToolchain
@@ -314,6 +347,15 @@
         // lib.optionalAttrs pkgs.stdenv.isLinux {
           vulkan = craneLib.devShell {
             LIBCLANG_PATH = libclangPath;
+            # Same CPU+Vulkan prebuilt as the default shell, so `cargo build -p daemon-infer
+            # --features llama,dynamic-link` links a Vulkan-capable llama.cpp and skips cmake.
+            # `LD_LIBRARY_PATH` resolves the shared llama/ggml libs (incl. `libggml-vulkan.so`), the
+            # Vulkan loader (`libvulkan.so` -> RADV ICD under `/run/opengl-driver`), and libgomp at
+            # runtime. The Vulkan SDK pieces on `packages` also let a from-source `--features vulkan`
+            # build work here (it just recompiles llama.cpp via the crate's cmake path).
+            LLAMA_PREBUILT_DIR = "${llamaCpp}";
+            LLAMA_PREBUILT_SHARED = "1";
+            LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
             packages =
               [ rustToolchain pkgs.rust-cbindgen ]
               ++ engineNativeInputs

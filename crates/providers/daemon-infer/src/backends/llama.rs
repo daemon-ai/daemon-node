@@ -434,7 +434,13 @@ fn run_generation<'a>(
         let bytes = model
             .token_to_bytes(token, Special::Plaintext)
             .map_err(|e| BackendError::transient(format!("detokenize: {e}")))?;
+        // `decode_to_string` writes only into the String's existing spare capacity (it never grows
+        // the buffer), so an empty `String` would silently swallow the output. Reserve the decoder's
+        // worst-case UTF-8 length for these bytes first.
         let mut piece = String::new();
+        if let Some(needed) = decoder.max_utf8_buffer_length(bytes.len()) {
+            piece.reserve(needed);
+        }
         let _ = decoder.decode_to_string(&bytes, &mut piece, false);
         if !piece.is_empty() {
             if has_tools {

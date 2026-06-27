@@ -184,14 +184,19 @@ async fn run_generation(
     let generate = backend.generate(req, chunk_tx, cancel);
     tokio::pin!(generate);
 
+    // Once the backend drops its chunk sender, `chunk_rx.recv()` is *immediately* ready with `None`
+    // on every poll. With a `biased` select that would starve the `generate` arm and spin forever
+    // (the worker would stream every token but never finalize), so disable the chunk arm once the
+    // stream closes and let `generate` resolve.
+    let mut chunks_open = true;
     let terminal = loop {
         tokio::select! {
             biased;
-            maybe = chunk_rx.recv() => {
-                if let Some(chunk) = maybe {
-                    forward_chunk(&writer, request_id, chunk).await;
+            maybe = chunk_rx.recv(), if chunks_open => {
+                match maybe {
+                    Some(chunk) => forward_chunk(&writer, request_id, chunk).await,
+                    None => chunks_open = false,
                 }
-                // `None` means the backend dropped its sender; the `generate` arm finalizes.
             }
             result = &mut generate => break result,
         }

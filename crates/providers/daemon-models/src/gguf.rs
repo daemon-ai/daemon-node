@@ -11,11 +11,18 @@ use std::path::Path;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 
 /// Known GGUF quantization labels, longest-first so a scan matches the most specific token (e.g.
-/// `Q4_K_M` before `Q4_K` before `Q4`).
+/// `Q4_K_M` before `Q4_K` before `Q4`). Within each family the embed/output `_L`/`_XL` variants
+/// (e.g. bartowski's `Q4_K_L`, which keeps Q8_0 embeddings) and the ARM `Q4_0_M_N` variants must
+/// precede the shorter token they contain so the scan does not truncate them to `Q4_K` / `Q4_0`.
 const QUANT_LABELS: &[&str] = &[
-    "Q2_K_S", "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K", "Q4_K_S", "Q4_K_M", "Q4_K", "Q4_0",
-    "Q4_1", "Q5_K_S", "Q5_K_M", "Q5_K", "Q5_0", "Q5_1", "Q6_K", "Q8_0", "Q8_1", "Q8_K", "IQ1_S",
-    "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M",
+    "Q2_K_L", "Q2_K_S", "Q2_K", //
+    "Q3_K_XL", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q3_K", //
+    "Q4_K_L", "Q4_K_M", "Q4_K_S", "Q4_K", //
+    "Q4_0_4_4", "Q4_0_4_8", "Q4_0_8_8", "Q4_0", "Q4_1", //
+    "Q5_K_L", "Q5_K_M", "Q5_K_S", "Q5_K", "Q5_0", "Q5_1", //
+    "Q6_K_L", "Q6_K", //
+    "Q8_0", "Q8_1", "Q8_K", //
+    "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M",
     "IQ4_XS", "IQ4_NL", "BF16", "F16", "F32", "FP16",
 ];
 
@@ -110,6 +117,31 @@ mod tests {
         assert_eq!(quant_label("foo.q8_0.gguf").as_deref(), Some("Q8_0"));
         assert_eq!(quant_label("model-f16.gguf").as_deref(), Some("F16"));
         assert_eq!(quant_label("tokenizer.json"), None);
+    }
+
+    #[test]
+    fn parses_embed_output_and_arm_variants() {
+        // The `_L`/`_XL` embed/output variants must not be truncated to their base token.
+        assert_eq!(
+            quant_label("SmolLM2-135M-Instruct-Q2_K_L.gguf").as_deref(),
+            Some("Q2_K_L")
+        );
+        assert_eq!(quant_label("model-Q4_K_L.gguf").as_deref(), Some("Q4_K_L"));
+        assert_eq!(quant_label("model-Q5_K_L.gguf").as_deref(), Some("Q5_K_L"));
+        assert_eq!(quant_label("model-Q6_K_L.gguf").as_deref(), Some("Q6_K_L"));
+        assert_eq!(
+            quant_label("model-Q3_K_XL.gguf").as_deref(),
+            Some("Q3_K_XL")
+        );
+        // Plain base quants still resolve to the base token (no false `_L`/`_XL` match).
+        assert_eq!(quant_label("model-Q2_K.gguf").as_deref(), Some("Q2_K"));
+        assert_eq!(quant_label("model-Q6_K.gguf").as_deref(), Some("Q6_K"));
+        // ARM Q4_0_M_N variants are recognized in full, not truncated to `Q4_0`.
+        assert_eq!(
+            quant_label("model-Q4_0_4_4.gguf").as_deref(),
+            Some("Q4_0_4_4")
+        );
+        assert_eq!(quant_label("model-Q4_0.gguf").as_deref(), Some("Q4_0"));
     }
 
     #[test]
