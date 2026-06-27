@@ -11,6 +11,11 @@ serde = { workspace = true }
 async-trait = { workspace = true }
 # CBOR codec for the opaque delegation/completion payloads (daemon-content-transfer-spec.md Phase 2).
 ciborium = { workspace = true }
+arbitrary = { workspace = true, optional = true }
+
+[features]
+# See daemon-common: feature-gated `Arbitrary` derives for the CDDL conformance proptest.
+arbitrary = ["dep:arbitrary", "daemon-common/arbitrary"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

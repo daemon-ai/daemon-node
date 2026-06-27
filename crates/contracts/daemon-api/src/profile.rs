@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Which model provider implementation a profile binds to. Mirrors the host's internal
 /// `ProviderKind`, kept as a contract enum so the wire surface does not depend on the binary's
 /// config crate.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSelector {
@@ -59,6 +60,7 @@ impl ProviderSelector {
 }
 
 /// Which default context engine (§10) a profile wires into its engine.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextEngineSel {
@@ -70,6 +72,7 @@ pub enum ContextEngineSel {
 }
 
 /// Which default memory provider (§11) a profile wires into its engine.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryProviderSel {
@@ -84,6 +87,7 @@ pub enum MemoryProviderSel {
 
 /// The subset of engine tunables (§20) a profile can override. `None` fields fall back to the
 /// node/engine default at resolution time.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineTunables {
@@ -98,6 +102,7 @@ pub struct EngineTunables {
 }
 
 /// An optional budget ceiling carried on a profile (token / wall-clock).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BudgetSpec {
@@ -119,6 +124,7 @@ pub struct BudgetSpec {
 /// `CredentialStore` (the system of record). Routing consumes only `transport_instance`;
 /// `credential_ref` is metadata a live transport (M2/M3) reads to restore the account's client. No
 /// secret ever lives here — `credential_ref` is a name, not the blob.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundAccount {
     /// The instance-qualified transport id this account speaks as (e.g. `matrix/@bot:hs.org`).
@@ -142,6 +148,7 @@ impl BoundAccount {
 /// One profile is the unit a GUI manages: it names a provider + model, the persona system prompt,
 /// the tool allowlist, the engine budget/tunables, the context/memory backends, and the credential
 /// it acquires from. The host resolves it into an `EngineProfile` per session.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileSpec {
     /// The profile's unique id/name (also its on-disk key and its credential profile by default).
@@ -234,6 +241,7 @@ impl ProfileSpec {
 /// another. It carries the [`ProfileSpec`] plus the profile's local skill bundles; `credential_ref`
 /// is **kept** (it is a name, not a secret — the importer registers the key via `CredentialSet`).
 /// Secrets never live in a profile, so nothing is stripped.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Distribution {
     /// The wire version this distribution was produced under (import validates compatibility).
@@ -255,6 +263,7 @@ pub struct Distribution {
 /// One row of a profile's curator listing ([`crate::ProfileApi::curator_list`]): a discovered or
 /// archived skill with its usage + lifecycle record. The `usage` defaults (all-zero, `Active`) for a
 /// skill that has no `.usage.json` entry yet (e.g. a freshly-seeded bundled skill).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CuratorEntry {
     /// The skill (bundle) name.
@@ -268,6 +277,7 @@ pub struct CuratorEntry {
 }
 
 /// One lifecycle change a curator run applied ([`crate::ProfileApi::curator_run`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CuratorChange {
     /// The skill (bundle) name.
@@ -280,6 +290,7 @@ pub struct CuratorChange {
 
 /// A redacted view of a profile for listing (no secrets live in a profile, but this is the shape a
 /// GUI list renders).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileInfo {
     /// The profile id/name.
@@ -311,6 +322,7 @@ impl ProfileInfo {
 /// How a [`SessionOverlay`] overrides the bound profile's `tool_allowlist`. A tri-state so the
 /// overlay can distinguish "leave the profile's allowlist alone" from "override to the full node
 /// toolset" from "override to this explicit list".
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolsOverride {
@@ -329,6 +341,7 @@ pub enum ToolsOverride {
 /// is the live tweak. It is persisted as host-level session metadata, so it is **restored on
 /// rehydration** rather than lost on restart. Every field is optional / inherit; unset fields fall
 /// through to the bound profile.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionOverlay {
@@ -375,6 +388,7 @@ impl SessionOverlay {
 
 /// A discoverable model entry: what a GUI's model picker renders. Merges cloud-provider catalog
 /// entries (well-known models incl. `claude-opus-4-8`) and locally-installed models.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDescriptor {
     /// The model id sent to the provider (or the local catalog id).
@@ -465,6 +479,7 @@ impl ModelDescriptor {
 
 /// A redacted view of a stored credential (the shape a GUI's "API keys" list renders). The secret
 /// itself is never returned on a read — only whether one is present and a short masked hint.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialInfo {
     /// The profile / credential-ref the secret is keyed by.

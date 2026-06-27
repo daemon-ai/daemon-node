@@ -16,6 +16,7 @@ use std::path::PathBuf;
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
+        #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
         #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         pub struct $name(pub String);
 
@@ -83,6 +84,7 @@ impl JournalStreamId {
 }
 
 /// Partition / ownership domain. The activation lease is scoped per partition.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PartitionId(pub u64);
 
@@ -101,6 +103,7 @@ impl Default for PartitionId {
 ///
 /// Ordering is load-bearing: only the holder of the highest token for a `SessionId` may commit
 /// durable state (lifecycle §4 invariant #5; acceptance tests #4/#6).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FenceToken(pub u64);
 
@@ -122,6 +125,7 @@ impl Default for FenceToken {
 
 /// Monotonic incarnation epoch, bumped on every suspension; part of the idempotency key
 /// `UNIQUE(session_id, epoch, job_id)` (lifecycle §4 invariant #2).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Epoch(pub u64);
 
@@ -142,6 +146,7 @@ impl Default for Epoch {
 }
 
 /// A resource budget carried alongside delegated work.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     /// Optional token ceiling (`None` = unbounded).
@@ -165,6 +170,7 @@ impl Budget {
 /// Shared by the §17 host protocol (`daemon-protocol`) and the generic management protocol
 /// (`daemon-supervision`) so a `request_id` means the same thing at every level of the tree
 /// (supervision spec §2.3; §17.1 item 2). Mandatory on every correlated command/request.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReqId(pub u64);
 
@@ -174,6 +180,7 @@ pub struct ReqId(pub u64);
 /// every outbound frame, and the receiver *restores* it into its task-local scope so logs,
 /// spans, and the verifiable journal on both sides of a cut correlate. This is a correlation
 /// handle only — **not** an integrity primitive (the signed Merkle journal provides that).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TraceId(pub u64);
 
@@ -222,6 +229,7 @@ impl fmt::Display for TraceId {
 /// `Usage` is first-class on both the §17 and management event streams precisely because it
 /// aggregates up the tree by construction: an orchestrator's usage is the fold of its children's
 /// (supervision spec §2.2 / §4, "identical at every level"). Deltas are additive.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageDelta {
     /// Prompt/input tokens consumed by this step.
@@ -285,6 +293,7 @@ impl UsageDelta {
 /// e.g. $3.00 / Mtok => `3_000_000`). Used by [`UsageDelta::estimate_cost_micros`] to fill in
 /// `cost_micros` at the provider boundary. Cache read/write rates default to the Anthropic public
 /// ratios relative to base input (reads at 0.1x, writes at 1.25x) when not set explicitly.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pricing {
     /// Base (un-cached) input rate, micro-USD per million tokens.
@@ -312,6 +321,7 @@ impl Pricing {
 
 /// A point-in-time view of a provider rate-limit window, identical at every level (supervision
 /// spec §2.2). Fields are `None` when the provider does not surface them.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitSnapshot {
     /// Requests/tokens remaining in the current window.
@@ -323,6 +333,7 @@ pub struct RateLimitSnapshot {
 }
 
 /// Version of the live host wire protocol (§17 envelopes / CDDL contract).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WireVersion(pub u16);
 
@@ -460,6 +471,7 @@ impl Default for WireVersion {
 /// The opaque, persisted form of an engine snapshot. The typed `Snapshot` lives in `daemon-core`
 /// (§5); the durable layer (`daemon-store` / `daemon-activation`) handles them only as CBOR bytes,
 /// keeping those crates free of an engine/protocol dependency (lifecycle §2; layout §3 DAG).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBlob(pub Vec<u8>);
 
@@ -490,6 +502,7 @@ impl From<Vec<u8>> for SnapshotBlob {
 macro_rules! hash32 {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
+        #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
         #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         pub struct $name(pub [u8; 32]);
 
@@ -554,6 +567,7 @@ hash32! {
 /// The `hash` is the identity (SHA-256 of the bytes); the rest is small metadata that lets a client
 /// render/route a transfer without fetching the bytes. A "file" in any envelope is a `BlobRef`
 /// (plus, optionally, a target workspace path) - the bytes are never inline.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobRef {
     /// Identity: SHA-256 of the blob's bytes.
@@ -593,6 +607,7 @@ impl BlobRef {
 }
 
 /// A half-open byte range `[offset, offset + len)` for a ranged blob read.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ByteRange {
     /// Start offset into the blob.
@@ -623,6 +638,7 @@ string_id! {
 }
 
 /// How a `CapabilityLease` resolves at the point of use — three modes trading isolation for cost.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredMode {
     /// The owner mints a genuinely short-lived provider token (OAuth/STS); the holder calls the
@@ -640,6 +656,7 @@ pub enum CredMode {
 
 /// A short-lived secret token embedded in a `CredMode::Native` lease. Its `Debug` is redacted so a
 /// token never leaks into logs or the verifiable trace.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseSecret(pub String);
 
@@ -663,6 +680,7 @@ impl fmt::Debug for LeaseSecret {
 /// An attenuable capability scope (macaroon-style): the set of profiles and actions a holder may
 /// use, plus an optional cost ceiling. Attenuation is set intersection + the tighter ceiling, so a
 /// child's scope can only ever *narrow* its parent's (least privilege enforced by the authority).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredScope {
     /// The profiles this scope may serve.
@@ -746,6 +764,7 @@ impl CredScope {
 /// real call is proxied to the owner. The `signature` is an opaque ed25519 detached signature over
 /// the capability's canonical form (produced/verified by `daemon-credentials`); this layer treats it
 /// as bytes so the DAG root stays crypto-free.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityLease {
     /// The capability's stable id (audit correlation).
@@ -773,6 +792,7 @@ impl CapabilityLease {
 
 /// Why a credential acquire / use / verify failed. Crosses a cut (the brokered `CredReply`), so it
 /// is serializable; the authority's verdict (notably `Fenced`/`Expired`) round-trips faithfully.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum CredError {
     /// No usable credential is available for the profile (pool exhausted/dead).
@@ -842,6 +862,7 @@ string_id! {
 
 /// Which local inference engine a model targets. Mirrors `daemon_infer::protocol::Engine`, kept
 /// independent so this DAG-root crate carries no engine dependency.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelEngine {
     /// llama.cpp (GGUF) via the `llama-cpp-4` bindings.
@@ -876,6 +897,7 @@ impl fmt::Display for ModelEngine {
 }
 
 /// Where a model's bytes come from.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelSource {
     /// A Hugging Face Hub repo. `file` selects a single artifact within the repo (the GGUF file for
@@ -918,6 +940,7 @@ impl ModelSource {
 
 /// A model named for a specific local engine — the unit a client downloads, activates, and the
 /// daemon resolves to a ready on-disk artifact before loading.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelRef {
     /// The engine that will load this model.
@@ -934,6 +957,7 @@ impl ModelRef {
 }
 
 /// How a model search result set is ordered (Hugging Face `sort` values).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchSort {
     /// Trending score (the Hub default).
@@ -963,6 +987,7 @@ impl SearchSort {
 }
 
 /// A model-search request a client issues (step 1 of the two-step search→select→download flow).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// The free-text query (matched against repo id / name).
@@ -991,6 +1016,7 @@ impl SearchQuery {
 }
 
 /// One repo in a search result page.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchHit {
     /// The `org/name` repo id.
@@ -1014,6 +1040,7 @@ pub struct SearchHit {
 }
 
 /// A page of search results (step 1 result).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchPage {
     /// The 0-based page index this set corresponds to.
@@ -1025,6 +1052,7 @@ pub struct SearchPage {
 }
 
 /// One downloadable file within a repo (step 2 result — what the client selects to download).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelFile {
     /// The file path within the repo (e.g. `Model-Q4_K_M.gguf`).
@@ -1040,6 +1068,7 @@ pub struct ModelFile {
 }
 
 /// A handle to one in-flight or completed download job.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DownloadId(pub u64);
 
@@ -1050,6 +1079,7 @@ impl fmt::Display for DownloadId {
 }
 
 /// The lifecycle state of a download job.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadState {
     /// Accepted, not yet started transferring.
@@ -1067,6 +1097,7 @@ pub enum DownloadState {
 }
 
 /// A point-in-time snapshot of a download job's progress.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadStatus {
     /// The job handle.
@@ -1088,6 +1119,7 @@ pub struct DownloadStatus {
 }
 
 /// An installed (downloaded + cataloged) model the daemon can activate and load.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledModel {
     /// The stable catalog id.
@@ -1122,6 +1154,7 @@ pub struct InstalledModel {
 /// A recommended quantization for a repo given detected hardware — the "tune"-like selection that
 /// helps a user get running quickly regardless of engine. For llama it names a GGUF file to pull;
 /// for mistral.rs it names an in-engine ISQ level to apply.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantRecommendation {
     /// The engine the recommendation targets.
@@ -1145,6 +1178,7 @@ pub struct QuantRecommendation {
 }
 
 /// One ranked quantization candidate the recommender considered.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantCandidate {
     /// The quant label (GGUF quant or ISQ level).
@@ -1158,6 +1192,7 @@ pub struct QuantCandidate {
 }
 
 /// A handle to a local quantization job.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct QuantizeId(pub u64);
 
@@ -1168,6 +1203,7 @@ impl fmt::Display for QuantizeId {
 }
 
 /// The lifecycle state of a quantization job.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantizeState {
     /// Accepted, not yet started.
@@ -1183,6 +1219,7 @@ pub enum QuantizeState {
 }
 
 /// A point-in-time snapshot of a quantization job.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizeStatus {
     /// The job handle.
@@ -1204,6 +1241,7 @@ pub struct QuantizeStatus {
 }
 
 /// Metadata read from a GGUF file header (via `gguf-rs`) without loading the model.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GgufInfo {
     /// The model architecture (`general.architecture`, e.g. `llama`, `qwen2`).
@@ -1228,6 +1266,7 @@ pub struct GgufInfo {
 /// (`SKILL.md` + support files), keyed by bundle-relative path. This is both the skill revision
 /// snapshot blob and the unit carried in a profile [distribution]. Text-only (skills are markdown +
 /// support docs); binary assets are out of scope.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillBundle {
     /// The bundle (directory) name — the canonical skill name.
@@ -1241,6 +1280,7 @@ pub struct SkillBundle {
 /// How a session's workspace root is chosen (host-spec §7). Carried on the session overlay and
 /// realized by the provisioner + `EngineProfile::with_exec`, so the agent engine and the
 /// filesystem surface resolve the *same* directory.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -1257,6 +1297,7 @@ pub enum WorkspaceBinding {
 
 /// Which versioned artifact a revision history tracks. One [`RevisionLog`] keys its history by
 /// `(kind, id)`, so profiles and skills share one append-only mechanism.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionKind {
@@ -1279,6 +1320,7 @@ impl RevisionKind {
 /// Who authored a revision — the provenance that matters when the agent edits its own
 /// profile/skills. Distinguishes a human operator (a NodeApi call) from the agent itself (a tool
 /// write, labeled by source, e.g. `skill_manage`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Author {
@@ -1290,6 +1332,7 @@ pub enum Author {
 
 /// One recorded revision of a versioned artifact. The full snapshot lives in a content-addressed
 /// blob (keyed by `content_hash`); this is the metadata row a `history` query returns.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision {
     /// The 1-based monotonic sequence within `(kind, id)`.
@@ -1365,6 +1408,7 @@ impl fmt::Display for RevisionKind {
 
 /// Who authored a skill — the provenance that gates curator eligibility. Only agent-created skills
 /// are auto-archived by the curator; user- and bundled-authored skills are protected.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillCreator {
@@ -1378,6 +1422,7 @@ pub enum SkillCreator {
 }
 
 /// A skill's curator lifecycle state, tracked alongside its usage counters.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillState {
@@ -1403,6 +1448,7 @@ impl SkillState {
 
 /// The per-skill usage + lifecycle record tracked in a profile's `.usage.json` sidecar (hermes'
 /// per-profile usage tracking). Co-located with the skill library so it travels with a profile.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillUsage {
     /// Authorship provenance (curation-eligibility gate).

@@ -13,10 +13,19 @@ async-trait = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+arbitrary = { workspace = true, optional = true }
+
+[features]
+# See daemon-common: feature-gated `Arbitrary` derives for the CDDL conformance proptest.
+arbitrary = ["dep:arbitrary", "daemon-common/arbitrary", "daemon-protocol/arbitrary"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# Conformance gate: validate real ciborium wire bytes against the authoritative daemon-api.cddl so
+# serde<->CDDL drift becomes a failing test. In-process (no external CDDL toolchain).
+cddl-cat = "0.7.1"
+proptest = { workspace = true }
 
 [lints]
 workspace = true

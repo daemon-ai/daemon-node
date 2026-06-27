@@ -6,6 +6,16 @@
 ; (serde/ciborium, externally-tagged enums). `wire_version` (daemon-common WireVersion::CURRENT)
 ; governs evolution; bump it on any breaking change to a shape below.
 
+; Note: rule names ending in `-t` are disambiguated from a same-named map member.
+; zcbor derives a coder identifier `<map>_<member>` for a map entry, which would collide
+; with a sibling rule named `<map>-<member>` (e.g. map `origin`.`scope` vs rule
+; `origin-scope`). The `-t` suffix only affects generated C identifiers; CDDL rule names are
+; local and never appear on the wire, so the encoding is unchanged.
+;
+kv-pair = [k: tstr, v: tstr]
+; Rust byte vectors (`Vec<u8>`, `[u8; N]`) are plain serde sequences: ciborium serializes them as a
+; CBOR array of integers, NOT a byte string (no `serde_bytes` is used). The contract mirrors that.
+byte-array = [* uint]
 wire_version = uint                 ; daemon-common WireVersion (current = 20)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
@@ -17,90 +27,161 @@ profile-ref = tstr
 
 ; ----- usage (daemon-common UsageDelta) -----
 usage-delta = {
-  input_tokens: uint,
-  output_tokens: uint,
-  api_calls: uint,
+  "input_tokens": uint,
+  "output_tokens": uint,
+  "api_calls": uint,
+  "cache_read_tokens": uint,
+  "cache_write_tokens": uint,
+  "reasoning_tokens": uint,
+  "cost_micros": uint,
 }
 
 ; ----- §17 protocol shapes (daemon-protocol; summarized) -----
-user-msg = { text: tstr, ? attachments: [* blob-ref] }   ; attachments wire v14 (content-transfer Phase 2b)
+user-msg = { "text": tstr, ? "attachments": [* blob-ref] }   ; attachments wire v14 (content-transfer Phase 2b)
 
-agent-command = { "StartTurn": { input: user-msg, request_id: req-id } }
-              / { "Steer": { text: tstr, request_id: req-id } }
-              / { "Observe": { input: user-msg, request_id: req-id } }   ; wire v8 (context-only append, no turn)
-              / { "Interrupt": { reason: (tstr / null) } }
-              / { "Snapshot": { request_id: req-id } }
-              / { "RewindTo": { anchor: rewind-anchor, request_id: req-id } }  ; wire v14 (conversation rewind)
+agent-command-start-turn = { "StartTurn": { "input": user-msg, "request_id": req-id } }
+agent-command-steer = { "Steer": { "text": tstr, "request_id": req-id } }
+agent-command-observe = { "Observe": { "input": user-msg, "request_id": req-id } }
+agent-command-interrupt = { "Interrupt": { "reason": (tstr / null) } }
+agent-command-snapshot = { "Snapshot": { "request_id": req-id } }
+agent-command-rewind-to = { "RewindTo": { "anchor": rewind-anchor, "request_id": req-id } }
+agent-command = agent-command-start-turn
+              / agent-command-steer
+              / agent-command-observe
+              / agent-command-interrupt
+              / agent-command-snapshot
+              / agent-command-rewind-to
               / "Shutdown"
 
 ; ----- conversation-rewind anchor (daemon-protocol RewindAnchor; wire v13) -----
-rewind-anchor = { "UserTurn": { ordinal: uint } }
-              / { "ReplyAfter": { ordinal: uint } }
-              / { "Cursor": { seq: uint } }
+rewind-anchor-user-turn = { "UserTurn": { "ordinal": uint } }
+rewind-anchor-reply-after = { "ReplyAfter": { "ordinal": uint } }
+rewind-anchor-cursor = { "Cursor": { "seq": uint } }
+rewind-anchor = rewind-anchor-user-turn
+              / rewind-anchor-reply-after
+              / rewind-anchor-cursor
 
 ; ----- read-only conversation projection (Snapshot event body) -----
 conv-turn-view = {
-  role: tstr,                       ; "user" / "assistant" / "tool"
-  text: tstr,
-  tools: [* tstr],
+  "role": tstr,                       ; "user" / "assistant" / "tool"
+  "text": tstr,
+  "tools": [* tstr],
 }
 
 conv-view = {
-  epoch: uint,
-  turns: [* conv-turn-view],
-  waiting_for: [* tstr],
+  "epoch": uint,
+  "turns": [* conv-turn-view],
+  "waiting_for": [* tstr],
 }
 
 ; An opaque structured payload a brain (or foreign-agent adapter) attaches for a rich consumer (a
 ; transcript GUI). Opaque to the daemon: `kind` is a renderer discriminator (a tool name, or a
 ; reserved kind such as "ansi-stream" / "pty"); `body` is the encoded payload (CBOR by convention).
-tool-detail = { kind: tstr, body: bstr }
+tool-detail = { "kind": tstr, "body": byte-array }
 
-tool-call-view   = { call_id: tstr, name: tstr, args_summary: tstr, ? detail: (tool-detail / null) }
-tool-result-view = { call_id: tstr, ok: bool, summary: tstr, ? detail: (tool-detail / null) }
+tool-call-view   = { "call_id": tstr, "name": tstr, "args_summary": tstr, ? "detail": (tool-detail / null) }
+tool-result-view = { "call_id": tstr, "ok": bool, "summary": tstr, ? "detail": (tool-detail / null) }
 
-agent-event = { "TurnStarted": { seq: uint, trigger: any } }
-            / { "TextDelta": { seq: uint, text: tstr } }
-            / { "ReasoningDelta": { seq: uint, text: tstr } }
-            / { "ContentDelta": { seq: uint, kind: tstr, body: bstr } }
-            / { "ToolStarted": { seq: uint, call: tool-call-view } }
-            / { "ToolFinished": { seq: uint, result: tool-result-view } }
-            / { "Usage": { seq: uint, delta: usage-delta } }
-            / { "RateLimit": { seq: uint, snapshot: any } }
-            / { "TurnFinished": { seq: uint, summary: any } }
-            / { "Error": { seq: uint, failure: tstr } }
-            / { "Steered": { seq: uint, request_id: req-id, accepted: bool } }
-            / { "Snapshot": { seq: uint, request_id: req-id, view: conv-view } }
-            / { "Rewound": { seq: uint, request_id: req-id, to_cursor: uint, epoch: uint } }  ; wire v14 (conversation rewind)
+agent-event-turn-started = { "TurnStarted": { "seq": uint, "trigger": turn-trigger } }
+agent-event-text-delta = { "TextDelta": { "seq": uint, "text": tstr } }
+agent-event-reasoning-delta = { "ReasoningDelta": { "seq": uint, "text": tstr } }
+agent-event-content-delta = { "ContentDelta": { "seq": uint, "kind": tstr, "body": byte-array } }
+agent-event-tool-started = { "ToolStarted": { "seq": uint, "call": tool-call-view } }
+agent-event-tool-finished = { "ToolFinished": { "seq": uint, "result": tool-result-view } }
+agent-event-usage = { "Usage": { "seq": uint, "delta": usage-delta } }
+context-status = { "used_tokens": uint, "max_tokens": (uint / null), "budget_tokens": (uint / null), "compacted": bool, "dropped_turns": uint }
+agent-event-context = { "Context": { "seq": uint, "status": context-status } }
+agent-event-rate-limit = { "RateLimit": { "seq": uint, "snapshot": rate-limit-snapshot } }
+agent-event-turn-finished = { "TurnFinished": { "seq": uint, "summary": turn-summary } }
+agent-event-error = { "Error": { "seq": uint, "failure": tstr } }
+agent-event-steered = { "Steered": { "seq": uint, "request_id": req-id, "accepted": bool } }
+agent-event-snapshot = { "Snapshot": { "seq": uint, "request_id": req-id, "view": conv-view } }
+agent-event-rewound = { "Rewound": { "seq": uint, "request_id": req-id, "to_cursor": uint, "epoch": uint } }
+agent-event = agent-event-turn-started
+            / agent-event-text-delta
+            / agent-event-reasoning-delta
+            / agent-event-content-delta
+            / agent-event-tool-started
+            / agent-event-tool-finished
+            / agent-event-usage
+            / agent-event-context
+            / agent-event-rate-limit
+            / agent-event-turn-finished
+            / agent-event-error
+            / agent-event-steered
+            / agent-event-snapshot
+            / agent-event-rewound
 
-host-request  = { request_id: req-id, kind: any }
-host-response = { request_id: req-id, body: any }
+; ----- concrete event payloads (tightened from `any`; Rust is authoritative) -----
+completion-source-process = { "Process": job-id }
+completion-source-delegation = { "Delegation": job-id }
+completion-source = completion-source-process / completion-source-delegation
+turn-trigger-background = { "BackgroundCompletion": { "source": completion-source } }
+turn-trigger-scheduled = { "Scheduled": { "job": job-id } }
+turn-trigger = "User" / "Steer" / turn-trigger-background / turn-trigger-scheduled
+end-reason = "Completed" / "Suspended" / "Interrupted" / "BudgetExhausted" / "NoProgress" / "Failed"
+turn-summary = { "end_reason": end-reason, "final_text": (tstr / null), "usage": usage-delta }
+rate-limit-snapshot = { "remaining": (uint / null), "limit": (uint / null), "reset_ms": (uint / null) }
 
-outbound = { "Event": agent-event }
-         / { "Request": host-request }
+; ----- concrete host-request / host-response payloads (tightened from `any`) -----
+budget = { "tokens": (uint / null), "wall_ms": (uint / null) }
+spawn-seed = "FromConversation"
+spawn-spec = { "kind": tstr, "seed": spawn-seed }
+host-request-kind-approval = { "Approval": { "prompt": tstr } }
+host-request-kind-input = { "Input": { "prompt": tstr } }
+host-request-kind-choice = { "Choice": { "prompt": tstr, "options": [* tstr] } }
+host-request-kind-delegate = { "Delegate": { "label": tstr, "budget": budget } }
+host-request-kind-spawn = { "Spawn": { "spec": spawn-spec } }
+host-request-kind-t = host-request-kind-approval
+                  / host-request-kind-input
+                  / host-request-kind-choice
+                  / host-request-kind-delegate
+                  / host-request-kind-spawn
+host-response-body-approved = { "Approved": bool }
+host-response-body-input = { "Input": tstr }
+host-response-body-chosen = { "Chosen": uint }
+host-response-body-delegated = { "Delegated": job-id }
+host-response-body-spawned = { "Spawned": session-id }
+host-response-body-deferred = { "Deferred": job-id }
+host-response-body-t = host-response-body-approved
+                   / host-response-body-input
+                   / host-response-body-chosen
+                   / host-response-body-delegated
+                   / host-response-body-spawned
+                   / host-response-body-deferred
+
+host-request  = { "request_id": req-id, "kind": host-request-kind-t }
+host-response = { "request_id": req-id, "body": host-response-body-t }
+
+outbound-event = { "Event": agent-event }
+outbound-request = { "Request": host-request }
+outbound = outbound-event
+         / outbound-request
 
 ; ----- report DTOs -----
 service-health = {
-  name: tstr,
-  ok: bool,
-  restarts: uint,
-  detail: (tstr / null),
+  "name": tstr,
+  "ok": bool,
+  "restarts": uint,
+  "detail": (tstr / null),
 }
 
 health-report = {
-  all_ok: bool,
-  services: [* service-health],
+  "all_ok": bool,
+  "services": [* service-health],
 }
 
 stats-report = {
-  pending_jobs: uint,
-  pending_wakes: uint,
-  sessions: uint,
-  active: uint,
+  "pending_jobs": uint,
+  "pending_wakes": uint,
+  "sessions": uint,
+  "active": uint,
+  "usage": usage-delta,
 }
 
+session-state-suspended = { "Suspended": { "job_id": job-id } }
 session-state = "Active"
-              / { "Suspended": { job_id: job-id } }
+              / session-state-suspended
               / "Ready"
               / "Completed"
               / "Unknown"
@@ -110,26 +191,30 @@ session-state = "Active"
 ; lifecycle; the unified roster surfaces both. `session-role` is the inbox/tree taxonomy: only
 ; `Primary` is listed in the `TopLevel` roster scope; children are reached by walking the tree.
 lifecycle    = "Durable" / "Live"
-session-role = "Primary" / "ManagedChild" / "EphemeralSubagent"
+session-role = "Primary"
+             / "ManagedChild"
+             / "EphemeralSubagent"
 
 session-info = {
-  session: session-id,
-  state: session-state,
-  ? rewindable: bool,                 ; default true (daemon-core sessions truncate; foreign do not)
-  ? bound_profile: (profile-ref / null),
-  ? title: (tstr / null),
-  ? last_activity_ms: (uint / null),
-  ? lifecycle: lifecycle,             ; default "Durable"
-  ? role: session-role,               ; default "Primary"
-  ? parent: (session-id / null),
-  ? pinned: bool,                     ; default false (operator-pinned, sorts first)
-  ? archived: bool,                   ; default false (excluded from default scopes)
+  "session": session-id,
+  "state": session-state,
+  ? "rewindable": bool,                 ; default true (daemon-core sessions truncate; foreign do not)
+  ? "bound_profile": (profile-ref / null),
+  ? "title": (tstr / null),
+  ? "last_activity_ms": (uint / null),
+  ? "lifecycle": lifecycle,             ; default "Durable"
+  ? "role": session-role,               ; default "Primary"
+  ? "parent": (session-id / null),
+  ? "pinned": bool,                     ; default false (operator-pinned, sorts first)
+  ? "archived": bool,                   ; default false (excluded from default scopes)
 }
 
 ; The scoped roster query (ControlApi::sessions_query). `TopLevel` is the inbox (Primary only).
+session-scope-by-profile = { "ByProfile": profile-ref }
+session-scope-by-transport = { "ByTransport": transport-id }
 session-scope = "TopLevel"
-              / { "ByProfile": profile-ref }
-              / { "ByTransport": transport-id }
+              / session-scope-by-profile
+              / session-scope-by-transport
               / "Archived"
               / "All"
 
@@ -137,166 +222,180 @@ session-scope = "TopLevel"
 ; a leave-unchanged; a non-null `title` sets it. (`title` is `Option<Option<String>>` in Rust; the
 ; outer/inner `None` both encode as CBOR null, so the wire shape is `tstr / null`.)
 session-meta-patch = {
-  ? title: (tstr / null),
-  ? pinned: (bool / null),
-  ? archived: (bool / null),
+  ? "title": (tstr / null),
+  ? "pinned": (bool / null),
+  ? "archived": (bool / null),
 }
 
 session-query = {
-  ? scope: session-scope,             ; default "TopLevel"
-  ? after: (session-id / null),       ; exclusive cursor (last id of previous page)
-  ? limit: uint,                      ; 0 = server default
+  ? "scope": session-scope,             ; default "TopLevel"
+  ? "after": (session-id / null),       ; exclusive cursor (last id of previous page)
+  ? "limit": uint,                      ; 0 = server default
 }
 
 session-page = {
-  sessions: [* session-info],
-  ? next_cursor: (session-id / null), ; null => last page
+  "sessions": [* session-info],
+  ? "next_cursor": (session-id / null), ; null => last page
 }
 
 ; One session's full detail (the detail-pane round-trip).
 session-detail = {
-  info: session-info,
-  ? overlay: (session-overlay / null),
-  ? model: (tstr / null),
-  ? delivery_targets: [* delivery-target],
-  ? children: [* session-id],
-  ? checkpoints: uint,
+  "info": session-info,
+  ? "overlay": (session-overlay / null),
+  ? "model": (tstr / null),
+  ? "delivery_targets": [* delivery-target],
+  ? "children": [* session-id],
+  ? "checkpoints": uint,
 }
 
-session-search-hit = { session: session-id, title: tstr, snippet: tstr }
+session-search-hit = { "session": session-id, "title": tstr, "snippet": tstr }
 
 ; A recorded §12 tool checkpoint (rewind point). `turn_ordinal`/`cursor` correlate a workspace
 ; checkpoint with the conversation rewind anchor / merged-log position when the ledger carries them.
 checkpoint-info = {
-  id: tstr,
-  session: session-id,
-  tool: tstr,
-  created_unix: uint,
-  ? turn_ordinal: (uint / null),
-  ? cursor: (uint / null),
+  "id": tstr,
+  "session": session-id,
+  "tool": tstr,
+  "created_unix": uint,
+  ? "turn_ordinal": (uint / null),
+  ? "cursor": (uint / null),
 }
 
 fleet-report = {
-  children: [* unit-id],
-  usage: usage-delta,
+  "children": [* unit-id],
+  "usage": usage-delta,
 }
 
 ; ----- §12 edit-approval (runtime control, wire v5) -----
 ; The per-session edit-approval session mode a caller selects (SetSessionMode); maps onto daemon-core
 ; ApprovalPolicy. A parked approval (durable HITL) is listed via ApprovalsPending and answered via
 ; ApprovalDecide; `request_id` is the opaque parked-request handle.
-approval-mode = "ask" / "accept_edits" / "auto_allow" / "deny"
+approval-mode = "ask"
+              / "accept_edits"
+              / "auto_allow"
+              / "deny"
 
 ; ----- per-session overlay (profiles + session overlay, wire v9) -----
 ; The unified per-session override layered on the bound profile at engine construction. Persisted as
 ; host-level session metadata, so a switch is restored on rehydration. Unset fields inherit the
 ; profile. `tool_allowlist` is a tri-state: inherit the profile's allowlist, override to the full
 ; node toolset, or override to an explicit list. `provider` is the opaque provider-selector.
-tools-override = "inherit" / "full_toolset" / { "allowlist": [* tstr] }
+tools-override-allowlist = { "allowlist": [* tstr] }
+tools-override = "inherit"
+               / "full_toolset"
+               / tools-override-allowlist
 
 ; `workspace` selects the session's workspace root binding (wire v14): inherit the node default
 ; (isolated per-session sandbox) when absent, or bind in-place to an operator-specified directory.
-workspace-binding = "isolated" / { "bound": tstr }
+workspace-binding-bound = { "bound": tstr }
+workspace-binding = "isolated"
+                  / workspace-binding-bound
 
 session-overlay = {
-  ? model: (tstr / null),
-  ? provider: (any / null),
-  ? tool_allowlist: tools-override,
-  ? approval_mode: (approval-mode / null),
-  ? workspace: (workspace-binding / null),
+  ? "model": (tstr / null),
+  ? "provider": (provider-selector / null),
+  ? "tool_allowlist": tools-override,
+  ? "approval_mode": (approval-mode / null),
+  ? "workspace": (workspace-binding / null),
 }
 
 approval-info = {
-  session: session-id,
-  request_id: tstr,
-  prompt: tstr,
-  ? path: (tstr / null),
+  "session": session-id,
+  "request_id": tstr,
+  "prompt": tstr,
+  ? "path": (tstr / null),
 }
 
 ; ----- tree projection DTOs (the GUI/TUI surface over the management tree) -----
-unit-kind = "Engine" / "Host" / "Orchestrator"
+unit-kind = "Engine"
+          / "Host"
+          / "Orchestrator"
 
+unit-state-finished = { "Finished": { "end_reason": tstr } }
 unit-state = "Running"
-           / { "Finished": { end_reason: tstr } }
+           / unit-state-finished
            / "Unknown"
 
 unit-node = {
-  id: unit-id,
-  kind: unit-kind,
-  state: unit-state,
-  work: (tstr / null),
-  usage: usage-delta,
-  children: [* unit-id],
+  "id": unit-id,
+  "kind": unit-kind,
+  "state": unit-state,
+  "work": (tstr / null),
+  "usage": usage-delta,
+  "children": [* unit-id],
   ; GUI identity/hierarchy enrichment (wire v14, additive).
-  ? profile: (profile-ref / null),
-  ? session: (session-id / null),
-  ? title: (tstr / null),
-  ? role: (session-role / null),      ; null => Primary
+  ? "profile": (profile-ref / null),
+  ? "session": (session-id / null),
+  ? "title": (tstr / null),
+  ? "role": (session-role / null),      ; null => Primary
 }
 
 tree-report = {
-  root: (unit-id / null),
-  nodes: [* unit-node],
+  "root": (unit-id / null),
+  "nodes": [* unit-node],
 }
 
 ; A delegation/subagent lifecycle phase (the Subagent manage-event discriminator).
-subagent-phase = "Spawned" / "Finished"
+subagent-phase = "Spawned"
+               / "Finished"
 
-manage-event-view = { "Started": { seq: uint } }
-                  / { "Progress": { seq: uint, text: (tstr / null) } }
-                  / { "Usage": { seq: uint, delta: usage-delta } }
-                  / { "Finished": { seq: uint, end_reason: tstr, summary: (tstr / null) } }
-                  / { "Error": { seq: uint, message: tstr } }
-                  ; subagent spawn/finish churn signal (wire v14)
-                  / { "Subagent": { seq: uint, child: unit-id, role: session-role, phase: subagent-phase, active_children: uint } }
-
-; ----- tree-subscribe push stream (wire v14) -----
-; A churn-control filter: opt out of ephemeral nodes or coalesce rapid changes into one update per
-; window. A `tree-event` is a coalesced whole-tree snapshot or a subagent churn signal.
-tree-sub-filter = {
-  ? include_ephemeral: bool,          ; default true
-  ? coalesce_ms: (uint / null),       ; null => deliver every change
-}
-
-tree-event = { "Snapshot": tree-report }
-           / { "Subagent": manage-event-view }
+manage-event-view-started = { "Started": { "seq": uint } }
+manage-event-view-progress = { "Progress": { "seq": uint, "text": (tstr / null) } }
+manage-event-view-usage = { "Usage": { "seq": uint, "delta": usage-delta } }
+manage-event-view-finished = { "Finished": { "seq": uint, "end_reason": tstr, "summary": (tstr / null) } }
+manage-event-view-error = { "Error": { "seq": uint, "message": tstr } }
+manage-event-view-subagent = { "Subagent": { "seq": uint, "child": unit-id, "role": session-role, "phase": subagent-phase, "active_children": uint } }
+manage-event-view = manage-event-view-started
+                  / manage-event-view-progress
+                  / manage-event-view-usage
+                  / manage-event-view-finished
+                  / manage-event-view-error
+                  / manage-event-view-subagent
 
 ; ----- unified rewind (wire v14) -----
 ; Where to rewind a session: a conversation anchor to truncate at, plus optional workspace rollback.
 rewind-point = {
-  anchor: rewind-anchor,
-  ? restore_workspace: bool,          ; default false
+  "anchor": rewind-anchor,
+  ? "restore_workspace": bool,          ; default false
 }
 
 ; ----- verifiable journal read DTOs (non-destructive reconnect / scroll-back history) -----
 ; A finished, coalesced chat block (daemon-protocol TranscriptBlock), already decoded for the
 ; consumer. Opaque tool `detail` / content `body` ride through as in the live shapes above.
 transcript-role  = "Assistant" / "User" / "System"
-transcript-block = { "Message": { role: transcript-role, text: tstr } }
-                 / { "ToolCall": { call_id: tstr, name: tstr, args_summary: tstr, ? detail: (tool-detail / null) } }
-                 / { "ToolResult": { call_id: tstr, ok: bool, summary: tstr, ? detail: (tool-detail / null) } }
-                 / { "Request": { request_id: req-id, kind: any } }
-                 / { "Content": { kind: tstr, body: bstr } }
+transcript-block-message = { "Message": { "role": transcript-role, "text": tstr } }
+transcript-block-tool-call = { "ToolCall": { "call_id": tstr, "name": tstr, "args_summary": tstr, ? "detail": (tool-detail / null) } }
+transcript-block-tool-result = { "ToolResult": { "call_id": tstr, "ok": bool, "summary": tstr, ? "detail": (tool-detail / null) } }
+transcript-block-request = { "Request": { "request_id": req-id, "kind": host-request-kind-t } }
+transcript-block-content = { "Content": { "kind": tstr, "body": byte-array } }
+transcript-block = transcript-block-message
+                 / transcript-block-tool-call
+                 / transcript-block-tool-result
+                 / transcript-block-request
+                 / transcript-block-content
 
-journal-record-payload = { "Management": { detail: tstr } }
-                       / { "Block": { block: transcript-block } }
+journal-record-payload-management = { "Management": { "detail": tstr } }
+journal-record-payload-block = { "Block": { "block": transcript-block } }
+journal-record-payload-t = journal-record-payload-management
+                         / journal-record-payload-block
 
 journal-record = {
-  cursor: uint,
-  segment: uint,
-  seq: uint,
-  epoch: uint,
-  trace: uint,
-  kind: tstr,
-  timestamp_ms: uint,
-  verified: bool,
-  payload: journal-record-payload,
+  "cursor": uint,
+  "segment": uint,
+  "seq": uint,
+  "epoch": uint,
+  "trace": uint,
+  "kind": tstr,
+  "timestamp_ms": uint,
+  "verified": bool,
+  "payload": journal-record-payload-t,
 }
 
 journal-page-view = {
-  entries: [* journal-record],
-  next_cursor: uint,
-  head_cursor: uint,
+  "entries": [* journal-record],
+  "next_cursor": uint,
+  "head_cursor": uint,
+  "sealed_after": (uint / null),
 }
 
 ; ----- merged live session event log (wire v2: the bidirectional, seq-stamped edge) -----
@@ -306,37 +405,46 @@ journal-page-view = {
 ; enters the conversation/prompt; `Transport` is observability-only (never prompt, never journaled).
 transport-id = tstr                 ; adapter name: "telegram" / "http" / "mcp" / "engine" / ...
 
-origin-scope = { "Dm": { user: tstr } }
-             / { "Group": { chat: tstr, thread: (tstr / null) } }
-             / { "Api": { key: tstr } }
-             / "Internal"
+origin-scope-dm = { "Dm": { "user": tstr } }
+origin-scope-group = { "Group": { "chat": tstr, "thread": (tstr / null) } }
+origin-scope-api = { "Api": { "key": tstr } }
+origin-scope-t = origin-scope-dm
+               / origin-scope-group
+               / origin-scope-api
+               / "Internal"
 
 origin = {
-  transport: transport-id,
-  scope: origin-scope,
+  "transport": transport-id,
+  "scope": origin-scope-t,
 }
 
 direction   = "Inbound" / "Outbound"
-disposition = "Context" / "Transport"
+disposition = "Context"
+            / "Transport"
 
-session-payload = { "Event": agent-event }
-                / { "Request": host-request }
-                / { "Command": agent-command }
-                / { "Response": host-response }
-                / { "Meta": { kind: tstr, body: bstr } }
+session-payload-event = { "Event": agent-event }
+session-payload-request = { "Request": host-request }
+session-payload-command = { "Command": agent-command }
+session-payload-response = { "Response": host-response }
+session-payload-meta = { "Meta": { "kind": tstr, "body": byte-array } }
+session-payload = session-payload-event
+                / session-payload-request
+                / session-payload-command
+                / session-payload-response
+                / session-payload-meta
 
 session-log-entry = {
-  seq: uint,
-  direction: direction,
-  origin: origin,
-  disposition: disposition,
-  payload: session-payload,
+  "seq": uint,
+  "direction": direction,
+  "origin": origin,
+  "disposition": disposition,
+  "payload": session-payload,
 }
 
 log-page-view = {
-  entries: [* session-log-entry],
-  next_seq: uint,
-  head_seq: uint,
+  "entries": [* session-log-entry],
+  "next_seq": uint,
+  "head_seq": uint,
 }
 
 ; ----- outbound delivery targets (§5.4: where a session's replies post) + handover -----
@@ -344,155 +452,173 @@ log-page-view = {
 ; force at a time; `Handover` re-points it (demoting the prior Primary to Spectator).
 route-addr      = tstr                ; adapter-opaque route handle within a transport
 sink-kind       = "Primary" / "Spectator"
-delivery-target = { transport: transport-id, route: route-addr, kind: sink-kind }
+delivery-target = { "transport": transport-id, "route": route-addr, "kind": sink-kind }
 
-api-error = { "UnknownSession": tstr }
-          / { "Unsupported": tstr }
-          / { "Conflict": tstr }
-          / { "Other": tstr }
+api-error-unknown-session = { "UnknownSession": tstr }
+api-error-unsupported = { "Unsupported": tstr }
+api-error-conflict = { "Conflict": tstr }
+api-error-other = { "Other": tstr }
+api-error = api-error-unknown-session
+          / api-error-unsupported
+          / api-error-conflict
+          / api-error-other
 
 ; ----- model-management DTOs (daemon-common; the ModelApi sub-surface) -----
 model-id = tstr                       ; content-derived catalog handle
 download-id = uint                    ; numeric job handle (rendered "dl-N")
-model-engine = "Llama" / "MistralRs"
+model-engine = "Llama"
+             / "MistralRs"
 
-model-source = { "Hf": { repo: tstr, file: (tstr / null), revision: tstr } }
-             / { "Local": { path: tstr } }
+model-source-hf = { "Hf": { "repo": tstr, "file": (tstr / null), "revision": tstr } }
+model-source-local = { "Local": { "path": tstr } }
+model-source = model-source-hf
+             / model-source-local
 
-model-ref = { engine: model-engine, source: model-source }
+model-ref = { "engine": model-engine, "source": model-source }
 
-search-sort = "Trending" / "Downloads" / "Likes" / "Modified" / "Created"
+search-sort = "Trending"
+            / "Downloads"
+            / "Likes"
+            / "Modified"
+            / "Created"
 
 search-query = {
-  text: tstr,
-  engine: model-engine,
-  sort: search-sort,
-  page: uint,
-  limit: uint,
+  "text": tstr,
+  "engine": model-engine,
+  "sort": search-sort,
+  "page": uint,
+  "limit": uint,
 }
 
 search-hit = {
-  repo: tstr,
-  author: (tstr / null),
-  downloads: uint,
-  likes: uint,
-  num_parameters: (uint / null),
-  pipeline_tag: (tstr / null),
-  last_modified: (tstr / null),
-  gated: bool,
-  private: bool,
+  "repo": tstr,
+  "author": (tstr / null),
+  "downloads": uint,
+  "likes": uint,
+  "num_parameters": (uint / null),
+  "pipeline_tag": (tstr / null),
+  "last_modified": (tstr / null),
+  "gated": bool,
+  "private": bool,
 }
 
-search-page = { page: uint, results: [* search-hit], has_more: bool }
+search-page = { "page": uint, "results": [* search-hit], "has_more": bool }
 
 model-file = {
-  path: tstr,
-  size_bytes: uint,
-  quant: (tstr / null),
-  is_split: bool,
-  is_first_shard: bool,
+  "path": tstr,
+  "size_bytes": uint,
+  "quant": (tstr / null),
+  "is_split": bool,
+  "is_first_shard": bool,
 }
 
-download-state = "Queued" / "Downloading" / "Completed" / "Paused" / "Cancelled" / "Failed"
+download-state = "Queued"
+               / "Downloading"
+               / "Completed"
+               / "Paused"
+               / "Cancelled"
+               / "Failed"
 
 download-status = {
-  id: download-id,
-  model: model-ref,
-  state: download-state,
-  downloaded_bytes: uint,
-  total_bytes: uint,
-  files_done: uint,
-  files_total: uint,
-  error: (tstr / null),
+  "id": download-id,
+  "model": model-ref,
+  "state": download-state,
+  "downloaded_bytes": uint,
+  "total_bytes": uint,
+  "files_done": uint,
+  "files_total": uint,
+  "error": (tstr / null),
 }
 
 installed-model = {
-  id: model-id,
-  model: model-ref,
-  display_name: tstr,
-  local_path: tstr,
-  size_bytes: uint,
-  quant: (tstr / null),
-  installed_at_ms: uint,
-  ? arch: (tstr / null),
-  ? context_length: (uint / null),
-  ? file_type: (tstr / null),
+  "id": model-id,
+  "model": model-ref,
+  "display_name": tstr,
+  "local_path": tstr,
+  "size_bytes": uint,
+  "quant": (tstr / null),
+  "installed_at_ms": uint,
+  ? "arch": (tstr / null),
+  ? "context_length": (uint / null),
+  ? "file_type": (tstr / null),
 }
 
 ; ----- recommend / quantize / inspect DTOs -----
 quantize-id = uint                    ; numeric job handle (rendered "qz-N")
-quantize-state = "Queued" / "Preparing" / "Quantizing" / "Completed" / "Failed"
+quantize-state = "Queued"
+               / "Preparing"
+               / "Quantizing"
+               / "Completed"
+               / "Failed"
 
 quant-candidate = {
-  quant: tstr,
-  file: (tstr / null),
-  size_bytes: (uint / null),
-  fits: bool,
+  "quant": tstr,
+  "file": (tstr / null),
+  "size_bytes": (uint / null),
+  "fits": bool,
 }
 
 quant-recommendation = {
-  engine: model-engine,
-  repo: tstr,
-  file: (tstr / null),
-  quant: tstr,
-  size_bytes: (uint / null),
-  budget_bytes: uint,
-  fits: bool,
-  reason: tstr,
-  candidates: [* quant-candidate],
+  "engine": model-engine,
+  "repo": tstr,
+  "file": (tstr / null),
+  "quant": tstr,
+  "size_bytes": (uint / null),
+  "budget_bytes": uint,
+  "fits": bool,
+  "reason": tstr,
+  "candidates": [* quant-candidate],
 }
 
 quantize-status = {
-  id: quantize-id,
-  repo: tstr,
-  source_file: tstr,
-  target_quant: tstr,
-  state: quantize-state,
-  output_path: (tstr / null),
-  model_id: (model-id / null),
-  error: (tstr / null),
+  "id": quantize-id,
+  "repo": tstr,
+  "source_file": tstr,
+  "target_quant": tstr,
+  "state": quantize-state,
+  "output_path": (tstr / null),
+  "model_id": (model-id / null),
+  "error": (tstr / null),
 }
 
 gguf-info = {
-  architecture: (tstr / null),
-  name: (tstr / null),
-  file_type: (tstr / null),
-  context_length: (uint / null),
-  block_count: (uint / null),
-  quantization_version: (uint / null),
-  parameter_count: (uint / null),
-  size_bytes: uint,
+  "architecture": (tstr / null),
+  "name": (tstr / null),
+  "file_type": (tstr / null),
+  "context_length": (uint / null),
+  "block_count": (uint / null),
+  "quantization_version": (uint / null),
+  "parameter_count": (uint / null),
+  "size_bytes": uint,
 }
 
 ; ----- ACP agent discovery/catalog DTOs (wire v14; ControlApi::acp_*) -----
 ; Where a cataloged ACP agent's launch recipe came from. A recipe is either a stdio subprocess
 ; (`program` + `args` + `env`) or a network `endpoint`; capabilities/version are `initialize`-verified.
-acp-source = "Builtin" / "Manual" / "Endpoint"
+acp-source = "Builtin"
+           / "Manual"
+           / "Endpoint"
 
 acp-recipe = {
-  ? program: (tstr / null),
-  ? args: [* tstr],
-  ? env: [* [tstr, tstr]],
-  ? endpoint: (tstr / null),
+  ? "program": (tstr / null),
+  ? "args": [* tstr],
+  ? "env": [* kv-pair],
+  ? "endpoint": (tstr / null),
 }
 
 acp-agent-entry = {
-  name: tstr,
-  recipe: acp-recipe,
-  source: acp-source,
-  ? installed: bool,
-  ? version: (tstr / null),
-  ? capabilities: [* [tstr, tstr]],
+  "name": tstr,
+  "recipe": acp-recipe,
+  "source": acp-source,
+  ? "installed": bool,
+  ? "version": (tstr / null),
+  ? "capabilities": [* kv-pair],
 }
 
-; ----- node log-tail stream DTOs (wire v14; ControlApi::logs) -----
-log-filter = { ? min_level: (tstr / null), ? target: (tstr / null) }
-log-line   = { ts_ms: uint, level: tstr, target: tstr, message: tstr }
-
 ; ----- long-tail surface stub DTOs (wire v14) -----
-provider-info    = { name: tstr, ? base_url: (tstr / null), ? available: bool }
-tool-info        = { name: tstr, ? description: (tstr / null) }
-node-config-view = { format: tstr, body: tstr }
+provider-info    = { "name": tstr, ? "base_url": (tstr / null), ? "available": bool }
+tool-info        = { "name": tstr, ? "description": (tstr / null) }
+node-config-view = { "format": tstr, "body": tstr }
 
 ; ----- cron / scheduling (wire v15; I15; ControlApi::cron_*) -----
 overlap-policy   = "Skip" / "Allow" / "Queue"          ; default "Skip"
@@ -500,70 +626,73 @@ catch-up-policy  = "Grace" / "Skip" / "Always"         ; default "Grace"
 run-trigger      = "Scheduled" / "Manual"              ; default "Scheduled"
 suggestion-status = "Pending" / "Accepted" / "Dismissed" ; default "Pending"
 cron-spec = {
-  name: tstr,
-  schedule: tstr,
-  ? target: (tstr / null),
-  ? payload: bstr,
-  ? enabled: bool,                    ; default true (paused job stays but never fires)
-  ? timezone: (tstr / null),          ; IANA tz for cron exprs; null = node default
-  ? repeat: (uint / null),            ; max fires before auto-delete; null = forever
-  ? jitter_secs: (uint / null),       ; random fire delay 0..=jitter_secs
-  ? overlap: overlap-policy,
-  ? catch_up: catch-up-policy,
-  ? script: (tstr / null),            ; node-scripts-relative path
-  ? no_agent: bool,                   ; run script only, no LLM (requires script)
-  ? context_from: [* tstr],           ; job ids whose last output is injected
-  ? deliver: (tstr / null),           ; delivery routing string; null = store-only
-  ? enabled_toolsets: ([* tstr] / null),
-  ? workdir: (tstr / null),
-  ? model: (tstr / null),
-  ? provider: (tstr / null),
-  ? skills: [* tstr],                 ; (wire v16) skills preloaded before an agent run
-  ? origin: (origin / null),          ; (wire v17) creating chat/session, for deliver="origin"
+  "name": tstr,
+  "schedule": tstr,
+  ? "target": (tstr / null),
+  ? "payload": byte-array,
+  ? "enabled": bool,                    ; default true (paused job stays but never fires)
+  ? "timezone": (tstr / null),          ; IANA tz for cron exprs; null = node default
+  ? "repeat": (uint / null),            ; max fires before auto-delete; null = forever
+  ? "jitter_secs": (uint / null),       ; random fire delay 0..=jitter_secs
+  ? "overlap": overlap-policy,
+  ? "catch_up": catch-up-policy,
+  ? "script": (tstr / null),            ; node-scripts-relative path
+  ? "no_agent": bool,                   ; run script only, no LLM (requires script)
+  ? "context_from": [* tstr],           ; job ids whose last output is injected
+  ? "deliver": (tstr / null),           ; delivery routing string; null = store-only
+  ? "enabled_toolsets": ([* tstr] / null),
+  ? "workdir": (tstr / null),
+  ? "model": (tstr / null),
+  ? "provider": (tstr / null),
+  ? "skills": [* tstr],                 ; (wire v16) skills preloaded before an agent run
+  ? "origin": (origin / null),          ; (wire v17) creating chat/session, for deliver="origin"
 }
 cron-job  = {
-  id: tstr,
-  spec: cron-spec,
-  ? next_fire_unix: (uint / null),
-  ? paused: bool,
-  ? last_run_unix: (uint / null),
-  ? last_ok: (bool / null),
-  ? last_detail: (tstr / null),
-  ? fire_count: uint,
+  "id": tstr,
+  "spec": cron-spec,
+  ? "next_fire_unix": (uint / null),
+  ? "paused": bool,
+  ? "last_run_unix": (uint / null),
+  ? "last_ok": (bool / null),
+  ? "last_detail": (tstr / null),
+  ? "fire_count": uint,
 }
 cron-run  = {
-  started_unix: uint,
-  ok: bool,
-  ? detail: (tstr / null),
-  ? finished_unix: (uint / null),
-  ? session: (session-id / null),
-  ? trigger: run-trigger,
+  "started_unix": uint,
+  "ok": bool,
+  ? "detail": (tstr / null),
+  ? "finished_unix": (uint / null),
+  ? "session": (session-id / null),
+  ? "trigger": run-trigger,
 }
 cron-suggestion = {
-  id: tstr,
-  title: tstr,
-  ? description: tstr,
-  ? source: tstr,
-  spec: cron-spec,
-  dedup_key: tstr,
-  ? status: suggestion-status,
+  "id": tstr,
+  "title": tstr,
+  ? "description": tstr,
+  ? "source": tstr,
+  "spec": cron-spec,
+  "dedup_key": tstr,
+  ? "status": suggestion-status,
 }
 
 ; ----- chat->session routing pins (wire v14; I5, §5.9; ControlApi::routing_*) -----
 ; A resolve-first override of the deterministic origin->session derivation: pin an inbound origin to
 ; an explicit session (+ optional profile). `isolation` mirrors daemon-protocol IsolationPolicy.
-isolation-policy = "PerUser" / "PerChat" / "PerThread" / "Shared"
+isolation-policy = "PerUser"
+                 / "PerChat"
+                 / "PerThread"
+                 / "Shared"
 chat-route = {
-  origin: origin,
-  session: session-id,
-  ? profile: (profile-ref / null),
-  ? isolation: isolation-policy,      ; default "PerThread"
+  "origin": origin,
+  "session": session-id,
+  ? "profile": (profile-ref / null),
+  ? "isolation": isolation-policy,      ; default "PerThread"
 }
 room-info = {
-  transport: transport-id,
-  room: tstr,
-  ? name: (tstr / null),
-  ? session: (session-id / null),     ; the pinned session, when one exists
+  "transport": transport-id,
+  "room": tstr,
+  ? "name": (tstr / null),
+  ? "session": (session-id / null),     ; the pinned session, when one exists
 }
 
 ; ----- the request/response mirror (1:1 with the interface methods) -----
@@ -571,408 +700,661 @@ room-info = {
 ; a value routes through `submit_from` so per-event attribution is recorded on the merged log.
 ; ----- profile/skill versioning + distribution (wire v6) -----
 ; `author` provenance: an operator (NodeApi call) or the agent itself (a tool write, labeled).
-author = "operator" / { "agent": tstr }
+author-agent = { "agent": tstr }
+author = "operator"
+       / author-agent
 ; one revision in an artifact's append-only history (profiles + skills share the mechanism).
 revision = {
-  seq: uint,
-  parent: (uint / null),
-  content_hash: bstr,            ; 32-byte SHA-256 of the snapshot blob
-  author: author,
-  reason: tstr,
-  ts_ms: uint,
+  "seq": uint,
+  "parent": (uint / null),
+  "content_hash": byte-array,            ; 32-byte SHA-256 of the snapshot blob
+  "author": author,
+  "reason": tstr,
+  "ts_ms": uint,
 }
 ; a portable skill bundle: bundle-relative path -> file contents (text; includes SKILL.md).
-skill-bundle = { name: tstr, category: (tstr / null), files: { * tstr => tstr } }
+skill-bundle = { "name": tstr, "category": (tstr / null), "files": { * tstr => tstr } }
 ; a portable profile distribution: the spec (carried as `any` — the Rust ProfileSpec contract) plus
 ; the profile's local skills; credential_ref is kept (a name, not a secret).
 distribution = {
-  wire_version: wire_version,
-  profile: any,
-  skills: [* skill-bundle],
-  ? head_seq: (uint / null),
-  ? source: (tstr / null),
+  "wire_version": wire_version,
+  "profile": profile-spec,
+  "skills": [* skill-bundle],
+  ? "head_seq": (uint / null),
+  ? "source": (tstr / null),
 }
-profile-spec = any                       ; full ProfileSpec schema lives in Rust/profile.rs today
-profile-info = any
-credential-info = any
-model-descriptor = any
-curator-entry = any
-curator-change = any
+profile-spec = any                       ; opaque: large ProfileSpec (budget/tunables/context/memory sub-specs); Rust-authoritative
+bound-account = { "transport_instance": tstr, "credential_ref": tstr }
+profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account] }
+credential-info = { "profile": tstr, "present": bool, "hint": tstr }
+provider-selector = "mock"
+                  / "genai"
+                  / "llama_cpp"
+                  / "mistral_rs"
+model-descriptor = { "id": tstr, "provider": provider-selector, "context_length": (uint / null), "input_price_micros_per_mtok": (uint / null), "output_price_micros_per_mtok": (uint / null), "local": bool }
+skill-creator = "agent" / "user" / "bundled"
+skill-state = "active" / "stale" / "archived"
+skill-usage = { "created_by": skill-creator, "state": skill-state, "pinned": bool, "use_count": uint, "view_count": uint, "patch_count": uint, "created_at_ms": uint, "last_used_ms": (uint / null), "last_viewed_ms": (uint / null), "last_patched_ms": (uint / null) }
+curator-entry = { "name": tstr, "category": (tstr / null), "is_bundled": bool, "usage": skill-usage }
+curator-change = { "name": tstr, "from": skill-state, "to": skill-state }
 ; ----- command catalog (thin-client slash-command surface) -----
 ; Concrete mirror of daemon-api's CommandSpec/CommandInvocation/CommandOutput. The daemon owns the
 ; catalog + handlers; clients render menus/autocomplete from command-spec and dispatch
 ; command-invocation, never modeling commands locally. Unit enums serialize as their variant name;
 ; #[serde(default)] fields carry no skip_serializing_if, so every field is present on the wire
 ; (Option fields as null).
-command-scope = "Session" / "Node"
-command-surface = "Cli" / "Gui" / "Chat"
-command-access = "User" / "Admin"
+command-scope = "Session"
+              / "Node"
+command-surface = "Cli"
+                / "Gui"
+                / "Chat"
+command-access = "User"
+               / "Admin"
 command-spec = {
-  name: tstr,
-  aliases: [* tstr],
-  summary: tstr,
-  category: tstr,
-  args_hint: tstr,
-  subcommands: [* tstr],
-  scope: command-scope,
-  surfaces: [* command-surface],
-  side_effecting: bool,
-  confirm: bool,
-  min_access: command-access,
-  source: tstr,
+  "name": tstr,
+  "aliases": [* tstr],
+  "summary": tstr,
+  "category": tstr,
+  "args_hint": tstr,
+  "subcommands": [* tstr],
+  "scope": command-scope,
+  "surfaces": [* command-surface],
+  "side_effecting": bool,
+  "confirm": bool,
+  "min_access": command-access,
+  "source": tstr,
 }
 command-invocation = {
-  name: tstr,
-  args: tstr,
-  session: (session-id / null),
-  origin: (origin / null),
+  "name": tstr,
+  "args": tstr,
+  "session": (session-id / null),
+  "origin": (origin / null),
 }
-command-output = { text: tstr, ephemeral: bool }
+command-output = { "text": tstr, "ephemeral": bool }
 
 ; ----- interactive auth (SSO / OAuth2), wire v13 (daemon-interactive-auth-spec) -----
 ; the client-driven, browser-redirect login seam. The client owns the browser + the redirect_uri; the
 ; daemon parks a pending flow between begin and complete and writes the credential via CredentialStore.
-auth-flow-kind = "MatrixSso" / "OAuth2Pkce"
-auth-param-field = { key: tstr, label: tstr, required: bool }
-auth-provider-info = { family: tstr, flow_kind: auth-flow-kind, display_name: tstr, params_schema: [* auth-param-field] }
+auth-flow-kind = "MatrixSso"
+               / "OAuth2Pkce"
+auth-param-field = { "key": tstr, "label": tstr, "required": bool }
+auth-provider-info = { "family": tstr, "flow_kind": auth-flow-kind, "display_name": tstr, "params_schema": [* auth-param-field] }
 ; optionally bind the freshly-authenticated account to a profile on success.
-auth-bind-request = { profile: tstr, transport_instance: (transport-id / null), credential_ref: (tstr / null) }
+auth-bind-request = { "profile": tstr, "transport_instance": (transport-id / null), "credential_ref": (tstr / null) }
 auth-begin-request = {
-  family: tstr,
-  params: { * tstr => tstr },        ; family-specific (matrix: homeserver, ? idp_id)
-  redirect_uri: tstr,                ; the client-owned capture URI (loopback or custom-scheme)
-  ? bind: (auth-bind-request / null),
+  "family": tstr,
+  "params": { * tstr => tstr },        ; family-specific (matrix: homeserver, ? idp_id)
+  "redirect_uri": tstr,                ; the client-owned capture URI (loopback or custom-scheme)
+  ? "bind": (auth-bind-request / null),
 }
 auth-begin-response = {
-  flow_id: tstr,
-  authorization_url: tstr,
-  redirect_uri: tstr,
-  expires_at: uint,                  ; flow TTL (unix seconds)
-  flow_kind: auth-flow-kind,
+  "flow_id": tstr,
+  "authorization_url": tstr,
+  "redirect_uri": tstr,
+  "expires_at": uint,                  ; flow TTL (unix seconds)
+  "flow_kind": auth-flow-kind,
 }
-auth-complete-request = { flow_id: tstr, callback: tstr }   ; callback: full redirect URL or its query
+auth-complete-request = { "flow_id": tstr, "callback": tstr }   ; callback: full redirect URL or its query
 auth-complete-response = {
-  credential_ref: tstr,
-  account_label: tstr,
-  transport_instance: transport-id,
-  bound_profile: (tstr / null),
+  "credential_ref": tstr,
+  "account_label": tstr,
+  "transport_instance": transport-id,
+  "bound_profile": (tstr / null),
 }
 
 ; ----- transport-adapter framework + messaging data model (wire v18) -----
-account-settings-schema = { ? fields: [* auth-param-field] }
-account-settings-values = { ? values: { * tstr => tstr } }
+account-settings-schema = { ? "fields": [* auth-param-field] }
+account-settings-values = { ? "values": { * tstr => tstr } }
 adapter-capabilities = {
-  rooms: bool, direct_messages: bool, presence: bool,
-  room_enumeration: bool, file_transfer: bool, interactive_auth: bool,
+  "rooms": bool, "direct_messages": bool, "presence": bool,
+  "room_enumeration": bool, "file_transfer": bool, "interactive_auth": bool,
 }
-adapter-info = { family: tstr, display_name: tstr, capabilities: adapter-capabilities, ? account_schema: account-settings-schema }
-connection-state = "Offline" / "Connecting" / "Connected" / "Error"
-presence-state = "Unknown" / "Offline" / "Available" / "Idle" / "Away" / "Busy"
+adapter-info = { "family": tstr, "display_name": tstr, "capabilities": adapter-capabilities, ? "account_schema": account-settings-schema }
+connection-state = "Offline"
+                 / "Connecting"
+                 / "Connected"
+                 / "Error"
+presence-state = "Unknown"
+               / "Offline"
+               / "Available"
+               / "Idle"
+               / "Away"
+               / "Busy"
 transport-instance-info = {
-  transport: transport-id, family: tstr, display_name: tstr,
-  ? connection: connection-state, ? presence: presence-state, ? bound_profile: (profile-ref / null),
+  "transport": transport-id, "family": tstr, "display_name": tstr,
+  ? "connection": connection-state, ? "presence": presence-state, ? "bound_profile": (profile-ref / null),
 }
-conversation-type = "Unset" / "Dm" / "GroupDm" / "Channel" / "Thread"
-member-role = "None" / "Voice" / "HalfOp" / "Op" / "Founder"
-typing-state = "None" / "Typing" / "Paused"
-presence-primitive = "Offline" / "Available" / "Idle" / "Invisible" / "Away" / "DoNotDisturb" / "Streaming" / "OutOfOffice"
-presence = { primitive: presence-primitive, ? message: (tstr / null), ? emoji: (tstr / null), ? mobile: bool, ? idle_since: (uint / null) }
-contact-permission = "Unset" / "Allow" / "Deny"
-contact-info = { id: tstr, ? display_name: (tstr / null), ? presence: presence, ? permission: contact-permission }
-action-menu = { ? items: [* tstr] }
-participant = { "Contact": contact-info } / { "Agent": { profile: profile-ref, member: tstr } }
+conversation-type = "Unset"
+                  / "Dm"
+                  / "GroupDm"
+                  / "Channel"
+                  / "Thread"
+member-role = "None"
+            / "Voice"
+            / "HalfOp"
+            / "Op"
+            / "Founder"
+typing-state = "None"
+             / "Typing"
+             / "Paused"
+presence-primitive-t = "Offline"
+                     / "Available"
+                     / "Idle"
+                     / "Invisible"
+                     / "Away"
+                     / "DoNotDisturb"
+                     / "Streaming"
+                     / "OutOfOffice"
+presence = { "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "mobile": bool, ? "idle_since": (uint / null) }
+contact-permission = "Unset"
+                   / "Allow"
+                   / "Deny"
+contact-info = { "id": tstr, ? "display_name": (tstr / null), ? "presence": presence, ? "permission": contact-permission }
+action-menu = { ? "items": [* tstr] }
+participant-contact = { "Contact": contact-info }
+participant-agent = { "Agent": { "profile": profile-ref, "member": tstr } }
+participant = participant-contact
+            / participant-agent
 conversation-member = {
-  contact: contact-info, ? alias: (tstr / null), ? nickname: (tstr / null),
-  ? typing: typing-state, ? role: member-role, ? session: (session-id / null),
+  "contact": contact-info, ? "alias": (tstr / null), ? "nickname": (tstr / null),
+  ? "typing": typing-state, ? "role": member-role, ? "session": (session-id / null),
 }
 conversation-info = {
-  transport: transport-id, id: tstr, kind: conversation-type,
-  ? title: (tstr / null), ? topic: (tstr / null), ? description: (tstr / null),
-  ? members: [* conversation-member],
+  "transport": transport-id, "id": tstr, "kind": conversation-type,
+  ? "title": (tstr / null), ? "topic": (tstr / null), ? "description": (tstr / null),
+  ? "members": [* conversation-member],
 }
 create-conversation-details = {
-  ? max_participants: uint, ? participants: [* contact-info],
-  ? extras_schema: account-settings-schema, ? extras: account-settings-values,
+  ? "max_participants": uint, ? "participants": [* contact-info],
+  ? "extras_schema": account-settings-schema, ? "extras": account-settings-values,
 }
 channel-join-details = {
-  ? name: (tstr / null), ? name_max_length: uint,
-  ? nickname: (tstr / null), ? nickname_supported: bool, ? nickname_max_length: uint,
-  ? password: (tstr / null), ? password_supported: bool, ? password_max_length: uint,
-  ? extras_schema: account-settings-schema, ? extras: account-settings-values,
+  ? "name": (tstr / null), ? "name_max_length": uint,
+  ? "nickname": (tstr / null), ? "nickname_supported": bool, ? "nickname_max_length": uint,
+  ? "password": (tstr / null), ? "password_supported": bool, ? "password_max_length": uint,
+  ? "extras_schema": account-settings-schema, ? "extras": account-settings-values,
 }
 
-api-request = { "Submit": { session: session-id, command: agent-command, ? origin: (origin / null), ? profile: (profile-ref / null) } }  ; profile wire v14 ("open chat as agent X")
-            ; routing (wire v7): submit by origin; the host resolves session + profile + delivery -> Routed
-            / { "SubmitRouted": { origin: origin, command: agent-command } }
-            / { "Poll": { session: session-id, max: uint } }
-            / { "Respond": { session: session-id, response: host-response } }
-            / "Health"
-            / "Stats"
-            / "Telemetry"
-            / "Sessions"
-            / { "Assign": { session: session-id } }
-            / { "Cancel": { session: session-id } }
-            / "Fleet"
-            / "Tree"
-            / { "Unit": { unit: unit-id } }
-            / { "UnitEvents": { unit: unit-id, max: uint } }
-            / { "UnitOutbound": { unit: unit-id, max: uint } }   ; rich §17 drain -> Drained
-            / { "SessionHistory": { session: session-id, after_cursor: uint, max: uint } }
-            / { "Subscribe": { session: session-id, after_seq: uint, max: uint } }  ; merged-log cursor read -> LogPage
-            / { "DeliveryTargets": { session: session-id } }                        ; reply sinks -> DeliveryTargets
-            / { "DeliverySessions": { transport: transport-id } }                    ; owned-session discovery -> DeliverySessions (wire v10)
-            / { "Handover": { session: session-id, target: delivery-target } }      ; re-point Primary -> Ok
-            / { "RecordMeta": { session: session-id, origin: origin, kind: tstr, body: bstr } }  ; transport/meta -> Ok
-            / { "UnitHistory": { unit: unit-id, after_cursor: uint, max: uint } }
-            / { "Pause": { unit: unit-id } }
-            / { "Resume": { unit: unit-id } }
-            / { "Scale": { unit: unit-id, n: uint } }
-            / "VerifyingKey"
-            ; ----- runtime control (wire v5): live model switch + §12 edit-approval -----
-            / { "SetSessionModel": { session: session-id, model: tstr, ? provider: (any / null) } }   ; model override (overlay) -> Ok
-            / { "SetSessionMode": { session: session-id, mode: approval-mode } }                       ; approval override (overlay) -> Ok
-            / { "SetSessionOverlay": { session: session-id, overlay: session-overlay } }               ; full per-session overlay -> Ok
-            / { "ApprovalsPending": { ? session: (session-id / null) } }                               ; HITL inbox -> Approvals
-            / { "ApprovalDecide": { session: session-id, request_id: tstr, allow: bool } }             ; answer + wake -> Ok
-            ; ----- profile distributions + versioning (wire v6) -----
-            / "ProfileList"                                                                            ; -> Profiles
-            / { "ProfileGet": { id: tstr } }                                                           ; -> Profile
-            / { "ProfileCreate": { spec: profile-spec } }                                              ; -> ProfileId
-            / { "ProfileUpdate": { spec: profile-spec } }                                              ; -> Ok
-            / { "ProfileDelete": { id: tstr } }                                                        ; -> Ok
-            / { "ProfileSelect": { id: tstr } }                                                        ; -> Ok
-            / { "ProfileClone": { source: tstr, new_id: tstr } }                                       ; local copy -> Ok
-            / { "ProfileExport": { id: tstr } }                                                        ; -> Distribution
-            / { "ProfileImport": { dist: distribution, ? new_id: (tstr / null) } }                     ; -> ProfileId
-            / { "ProfileHistory": { id: tstr } }                                                       ; -> Revisions
-            / { "ProfileAt": { id: tstr, seq: uint } }                                                 ; -> Profile
-            / { "ProfileRevert": { id: tstr, seq: uint } }                                             ; non-destructive -> Ok
-            / { "SkillHistory": { name: tstr } }                                                       ; -> Revisions
-            / { "SkillAt": { name: tstr, seq: uint } }                                                 ; -> SkillBundle
-            / { "SkillRevert": { name: tstr, seq: uint } }                                             ; bundled rejected -> Ok
-            / { "CuratorList": { ? profile: (tstr / null) } }                                          ; -> CuratorSkills
-            / { "CuratorPin": { ? profile: (tstr / null), name: tstr } }                                ; -> Ok
-            / { "CuratorUnpin": { ? profile: (tstr / null), name: tstr } }                              ; -> Ok
-            / { "CuratorArchive": { ? profile: (tstr / null), name: tstr } }                            ; -> Ok
-            / { "CuratorRestore": { ? profile: (tstr / null), name: tstr } }                            ; -> Ok
-            / { "CuratorRun": { ? profile: (tstr / null) } }                                           ; -> CuratorRun
-            ; ----- credentials (CredentialApi) -----
-            / { "CredentialSet": { profile: tstr, secret: tstr } }                                      ; -> Ok
-            / "CredentialList"                                                                         ; -> Credentials
-            / { "CredentialRemove": { profile: tstr } }                                                ; -> Ok
-            ; ----- model management (ModelApi) -----
-            / { "ModelSearch": { query: search-query } }
-            / { "ModelFiles": { repo: tstr, revision: (tstr / null), engine: model-engine } }
-            / { "ModelDownload": { model: model-ref } }
-            / "ModelDownloads"
-            / { "ModelCancel": { id: download-id } }
-            / { "ModelPause": { id: download-id } }
-            / { "ModelResume": { id: download-id } }
-            / "ModelCatalog"
-            / { "ModelDelete": { id: model-id } }
-            / { "ModelActivate": { id: model-id, profile: (tstr / null) } }
-            / { "ModelRecommend": { repo: tstr, revision: (tstr / null), engine: model-engine, budget_bytes: (uint / null) } }
-            / { "ModelQuantize": { repo: tstr, revision: (tstr / null), target_quant: tstr, source_file: (tstr / null) } }
-            / "ModelQuantizes"
-            / { "ModelInspect": { id: model-id } }
-            / "Models"                                                                                 ; -> Models
-            / { "ModelCurrent": { profile: (tstr / null) } }                                           ; -> ModelCurrent
-            ; ----- interactive auth (AuthApi), wire v13 -----
-            / { "AuthBegin": auth-begin-request }      ; mint authorization URL + park flow -> AuthBegun
-            / { "AuthComplete": auth-complete-request } ; finish from captured redirect -> AuthCompleted
-            / { "AuthCancel": { flow_id: tstr } }       ; drop a pending flow (idempotent) -> Ok
-            / "AuthProviders"                           ; capability discovery -> AuthProviders
-            ; ----- §12 checkpoints (rewind points) -----
-            / { "CheckpointList": { ? session: (session-id / null) } }                  ; -> Checkpoints
-            / { "CheckpointRewind": { session: session-id, checkpoint_id: tstr } }      ; workspace-only rewind -> Ok
-            ; ----- GUI roster + unified rewind (wire v14) -----
-            / { "SessionsQuery": { query: session-query } }                             ; scoped/paginated roster -> SessionPage
-            / { "SessionGet": { session: session-id } }                                 ; one session detail -> SessionDetail
-            / "SessionsByProfile"                                                       ; roster grouped by profile -> SessionsByProfile
-            / { "SessionSearch": { query: tstr, limit: uint } }                         ; full-text search -> SessionSearch
-            / { "SessionUpdateMeta": { session: session-id, patch: session-meta-patch } } ; rename/pin/archive -> Ok
-            / { "Rewind": { session: session-id, point: rewind-point } }                ; conversation + workspace rewind -> Ok
-            ; ----- ACP discovery/catalog (wire v14) -----
-            / "AcpDiscover"                                                             ; trigger a discovery scan -> AcpCatalog
-            / "AcpCatalog"                                                              ; persisted catalog -> AcpCatalog
-            / { "AcpRegister": { entry: acp-agent-entry } }                             ; register a recipe -> Ok
-            / { "AcpRemove": { name: tstr } }                                           ; remove an entry -> Ok
-            ; ----- skills (bundle get/put, wire v14) -----
-            / { "SkillGet": { name: tstr } }                                            ; -> SkillBundle
-            / { "SkillPut": { bundle: skill-bundle } }                                  ; -> Ok
-            ; ----- long-tail surfaces (wire v14) -----
-            / "ProviderList"                                                            ; -> Providers
-            / { "ProviderRegister": { provider: provider-info } }                       ; -> Ok
-            / "ToolList"                                                                ; -> Tools
-            / { "ToolRegister": { tool: tool-info } }                                   ; -> Ok
-            / "CommandList"                                                            ; -> Commands
-            / { "CommandInvoke": { invocation: command-invocation } }                   ; -> CommandOutput
-            / "ConfigGet"                                                               ; -> Config
-            / { "ConfigSet": { config: node-config-view } }                             ; -> Ok
-            / "CronList"                                                                ; -> CronJobs
-            / { "CronCreate": { spec: cron-spec } }                                     ; -> CronId
-            / { "CronUpdate": { id: tstr, spec: cron-spec } }                           ; -> Ok
-            / { "CronDelete": { id: tstr } }                                            ; -> Ok
-            / { "CronTrigger": { id: tstr } }                                           ; -> Ok
-            / { "CronRuns": { id: tstr } }                                              ; -> CronRuns
-            ; ----- cron pause/resume + suggestions (wire v15; I15) -----
-            / { "CronPause": { id: tstr, paused: bool } }                               ; -> Ok
-            / "CronSuggestions"                                                         ; -> CronSuggestions
-            / { "CronAcceptSuggestion": { id: tstr } }                                  ; -> CronId
-            / { "CronDismissSuggestion": { id: tstr } }                                 ; -> Ok
-            ; ----- chat->session routing pins (wire v14; I5, §5.9) -----
-            / "RoutingListChats"                                                        ; -> ChatRoutes
-            / { "RoutingGet": { origin: origin } }                                      ; -> ChatRoute
-            / { "RoutingSet": { route: chat-route } }                                   ; -> Ok
-            / { "RoutingBindChat": { origin: origin, session: session-id, ? profile: (profile-ref / null) } }  ; -> Ok
-            / { "RoutingUnbindChat": { origin: origin } }                               ; -> Ok
-            / { "TransportRooms": { transport: transport-id } }                         ; -> Rooms
-            ; ----- transport-adapter framework (wire v18; daemon-transport-adapter-spec.md) -----
-            / "TransportAdapters"                                                        ; -> Adapters
-            / "TransportInstances"                                                       ; -> TransportInstances
-            ; ----- messaging-adapter management (wire v18; daemon-messaging-adapter-spec.md) -----
-            / { "ConvList": { transport: transport-id } }                                ; -> Conversations
-            / { "ConvGet": { transport: transport-id, conv: tstr } }                     ; -> Conversation
-            / { "ConvCreateDetails": { transport: transport-id } }                       ; -> ConvCreateDetails
-            / { "ConvCreate": { transport: transport-id, details: create-conversation-details } }  ; -> Conversation
-            / { "ConvJoinDetails": { transport: transport-id } }                         ; -> ConvJoinDetails
-            / { "ConvJoin": { transport: transport-id, details: channel-join-details } } ; -> Conversation
-            / { "ConvLeave": { transport: transport-id, conv: tstr } }                   ; -> Ok
-            / { "ConvSend": { transport: transport-id, conv: tstr, ? from: (participant / null), message: user-msg } }  ; -> Ok
-            / { "ConvSetTopic": { transport: transport-id, conv: tstr, ? topic: (tstr / null) } }        ; -> Ok
-            / { "ConvSetTitle": { transport: transport-id, conv: tstr, ? title: (tstr / null) } }        ; -> Ok
-            / { "ConvSetDescription": { transport: transport-id, conv: tstr, ? description: (tstr / null) } }  ; -> Ok
-            / { "ConvDelete": { transport: transport-id, conv: tstr } }                  ; -> Ok
-            / { "ConvHistory": { transport: transport-id, conv: tstr, ? after_cursor: uint, ? max: uint } }  ; -> Journal
-            / { "MemberInvite": { transport: transport-id, conv: tstr, who: participant, ? message: (tstr / null) } }  ; -> Ok
-            / { "MemberRemove": { transport: transport-id, conv: tstr, who: participant, ? reason: (tstr / null) } }  ; -> Ok
-            / { "MemberBan": { transport: transport-id, conv: tstr, who: participant, ? reason: (tstr / null) } }  ; -> Ok
-            / { "MemberSetRole": { transport: transport-id, conv: tstr, who: participant, role: member-role } }  ; -> Ok
-            ; ----- contacts + directory (wire v20; daemon-messaging-adapter-spec.md §3.4/§3.5) -----
-            / { "ContactGetProfile": { transport: transport-id, contact: contact-info } }  ; -> ContactProfile
-            / { "ContactSetAlias": { transport: transport-id, contact: contact-info, ? alias: (tstr / null) } }  ; -> Ok
-            / { "ContactActionMenu": { transport: transport-id, contact: contact-info } }  ; -> ActionMenu
-            / { "DirectorySearch": { transport: transport-id, ? query: (tstr / null) } }   ; -> Contacts
-            ; ----- filesystem / workspace surface (wire v14; daemon-fs-surface-spec.md) -----
-            / "FsRoots"                                                                  ; -> FsRoots
-            / { "FsList": { root: fs-root-id, dir: tstr, ? show_ignored: bool } }        ; -> FsList
-            / { "FsStat": { root: fs-root-id, path: tstr } }                             ; -> FsStat
-            / { "FsRead": { root: fs-root-id, path: tstr, ? max_bytes: uint } }          ; -> FsRead
-            / { "FsWrite": { root: fs-root-id, path: tstr, bytes: bstr, ? base_revision: (fs-revision / null), ? force: bool } }  ; -> FsWrite
-            / { "FsSearch": { root: fs-root-id, query: fs-search-query } }               ; -> FsSearch
-            / { "FsWatchPoll": { root: fs-root-id, dir: tstr, after_seq: uint, max: uint } }  ; cursor read -> FsWatch
-            ; ----- content store (wire v14; daemon-content-transfer-spec.md) -----
-            / { "BlobPut": { bytes: bstr } }                                             ; -> BlobPut
-            / { "BlobGet": { hash: content-hash, ? range: (byte-range / null) } }        ; -> BlobGet
-            / { "BlobStat": { hash: content-hash } }                                     ; -> BlobStat
-            / { "FsWriteFromBlob": { root: fs-root-id, path: tstr, hash: content-hash, ? base_revision: (fs-revision / null), ? force: bool } }  ; -> FsWrite
+request-submit = { "Submit": { "session": session-id, "command": agent-command, ? "origin": (origin / null), ? "profile": (profile-ref / null) } }
+request-submit-routed = { "SubmitRouted": { "origin": origin, "command": agent-command } }
+request-poll = { "Poll": { "session": session-id, "max": uint } }
+request-respond = { "Respond": { "session": session-id, "response": host-response } }
+request-health = "Health"
+request-stats = "Stats"
+request-telemetry = "Telemetry"
+request-sessions = "Sessions"
+request-assign = { "Assign": { "session": session-id } }
+request-cancel = { "Cancel": { "session": session-id } }
+request-fleet = "Fleet"
+request-tree = "Tree"
+request-unit = { "Unit": { "unit": unit-id } }
+request-unit-events = { "UnitEvents": { "unit": unit-id, "max": uint } }
+request-unit-outbound = { "UnitOutbound": { "unit": unit-id, "max": uint } }
+request-session-history = { "SessionHistory": { "session": session-id, "after_cursor": uint, "max": uint } }
+request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint, "max": uint } }
+request-delivery-targets = { "DeliveryTargets": { "session": session-id } }
+request-delivery-sessions = { "DeliverySessions": { "transport": transport-id } }
+request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
+request-record-meta = { "RecordMeta": { "session": session-id, "origin": origin, "kind": tstr, "body": byte-array } }
+request-unit-history = { "UnitHistory": { "unit": unit-id, "after_cursor": uint, "max": uint } }
+request-pause = { "Pause": { "unit": unit-id } }
+request-resume = { "Resume": { "unit": unit-id } }
+request-scale = { "Scale": { "unit": unit-id, "n": uint } }
+request-verifying-key = "VerifyingKey"
+request-set-session-model = { "SetSessionModel": { "session": session-id, "model": tstr, ? "provider": (provider-selector / null) } }
+request-set-session-mode = { "SetSessionMode": { "session": session-id, "mode": approval-mode } }
+request-set-session-overlay = { "SetSessionOverlay": { "session": session-id, "overlay": session-overlay } }
+request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null) } }
+request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool } }
+request-profile-list = "ProfileList"
+request-profile-get = { "ProfileGet": { "id": tstr } }
+request-profile-create = { "ProfileCreate": { "spec": profile-spec } }
+request-profile-update = { "ProfileUpdate": { "spec": profile-spec } }
+request-profile-delete = { "ProfileDelete": { "id": tstr } }
+request-profile-select = { "ProfileSelect": { "id": tstr } }
+request-profile-clone = { "ProfileClone": { "source": tstr, "new_id": tstr } }
+request-profile-export = { "ProfileExport": { "id": tstr } }
+request-profile-import = { "ProfileImport": { "dist": distribution, ? "new_id": (tstr / null) } }
+request-profile-history = { "ProfileHistory": { "id": tstr } }
+request-profile-at = { "ProfileAt": { "id": tstr, "seq": uint } }
+request-profile-revert = { "ProfileRevert": { "id": tstr, "seq": uint } }
+request-skill-history = { "SkillHistory": { "name": tstr } }
+request-skill-at = { "SkillAt": { "name": tstr, "seq": uint } }
+request-skill-revert = { "SkillRevert": { "name": tstr, "seq": uint } }
+request-curator-list = { "CuratorList": { ? "profile": (tstr / null) } }
+request-curator-pin = { "CuratorPin": { ? "profile": (tstr / null), "name": tstr } }
+request-curator-unpin = { "CuratorUnpin": { ? "profile": (tstr / null), "name": tstr } }
+request-curator-archive = { "CuratorArchive": { ? "profile": (tstr / null), "name": tstr } }
+request-curator-restore = { "CuratorRestore": { ? "profile": (tstr / null), "name": tstr } }
+request-curator-run = { "CuratorRun": { ? "profile": (tstr / null) } }
+request-credential-set = { "CredentialSet": { "profile": tstr, "secret": tstr } }
+request-credential-list = "CredentialList"
+request-credential-remove = { "CredentialRemove": { "profile": tstr } }
+request-model-search = { "ModelSearch": { "query": search-query } }
+request-model-files = { "ModelFiles": { "repo": tstr, "revision": (tstr / null), "engine": model-engine } }
+request-model-download = { "ModelDownload": { "model": model-ref } }
+request-model-downloads = "ModelDownloads"
+request-model-cancel = { "ModelCancel": { "id": download-id } }
+request-model-pause = { "ModelPause": { "id": download-id } }
+request-model-resume = { "ModelResume": { "id": download-id } }
+request-model-catalog = "ModelCatalog"
+request-model-delete = { "ModelDelete": { "id": model-id } }
+request-model-activate = { "ModelActivate": { "id": model-id, "profile": (tstr / null) } }
+request-model-recommend = { "ModelRecommend": { "repo": tstr, "revision": (tstr / null), "engine": model-engine, "budget_bytes": (uint / null) } }
+request-model-quantize = { "ModelQuantize": { "repo": tstr, "revision": (tstr / null), "target_quant": tstr, "source_file": (tstr / null) } }
+request-model-quantizes = "ModelQuantizes"
+request-model-inspect = { "ModelInspect": { "id": model-id } }
+request-models = "Models"
+request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
+request-auth-begin = { "AuthBegin": auth-begin-request }
+request-auth-complete = { "AuthComplete": auth-complete-request }
+request-auth-cancel = { "AuthCancel": { "flow_id": tstr } }
+request-auth-providers = "AuthProviders"
+request-checkpoint-list = { "CheckpointList": { ? "session": (session-id / null) } }
+request-checkpoint-rewind = { "CheckpointRewind": { "session": session-id, "checkpoint_id": tstr } }
+request-sessions-query = { "SessionsQuery": { "query": session-query } }
+request-session-get = { "SessionGet": { "session": session-id } }
+request-sessions-by-profile = "SessionsByProfile"
+request-session-search = { "SessionSearch": { "query": tstr, "limit": uint } }
+request-session-update-meta = { "SessionUpdateMeta": { "session": session-id, "patch": session-meta-patch } }
+request-rewind = { "Rewind": { "session": session-id, "point": rewind-point } }
+request-acp-discover = "AcpDiscover"
+request-acp-catalog = "AcpCatalog"
+request-acp-register = { "AcpRegister": { "entry": acp-agent-entry } }
+request-acp-remove = { "AcpRemove": { "name": tstr } }
+request-skill-get = { "SkillGet": { "name": tstr } }
+request-skill-put = { "SkillPut": { "bundle": skill-bundle } }
+request-provider-list = "ProviderList"
+request-provider-register = { "ProviderRegister": { "provider": provider-info } }
+request-tool-list = "ToolList"
+request-tool-register = { "ToolRegister": { "tool": tool-info } }
+request-command-list = "CommandList"
+request-command-invoke = { "CommandInvoke": { "invocation": command-invocation } }
+request-config-get = "ConfigGet"
+request-config-set = { "ConfigSet": { "config": node-config-view } }
+request-cron-list = "CronList"
+request-cron-create = { "CronCreate": { "spec": cron-spec } }
+request-cron-update = { "CronUpdate": { "id": tstr, "spec": cron-spec } }
+request-cron-delete = { "CronDelete": { "id": tstr } }
+request-cron-trigger = { "CronTrigger": { "id": tstr } }
+request-cron-runs = { "CronRuns": { "id": tstr } }
+request-cron-pause = { "CronPause": { "id": tstr, "paused": bool } }
+request-cron-suggestions = "CronSuggestions"
+request-cron-accept-suggestion = { "CronAcceptSuggestion": { "id": tstr } }
+request-cron-dismiss-suggestion = { "CronDismissSuggestion": { "id": tstr } }
+request-routing-list-chats = "RoutingListChats"
+request-routing-get = { "RoutingGet": { "origin": origin } }
+request-routing-set = { "RoutingSet": { "route": chat-route } }
+request-routing-bind-chat = { "RoutingBindChat": { "origin": origin, "session": session-id, ? "profile": (profile-ref / null) } }
+request-routing-unbind-chat = { "RoutingUnbindChat": { "origin": origin } }
+request-transport-rooms = { "TransportRooms": { "transport": transport-id } }
+request-transport-adapters = "TransportAdapters"
+request-transport-instances = "TransportInstances"
+request-conv-list = { "ConvList": { "transport": transport-id } }
+request-conv-get = { "ConvGet": { "transport": transport-id, "conv": tstr } }
+request-conv-create-details = { "ConvCreateDetails": { "transport": transport-id } }
+request-conv-create = { "ConvCreate": { "transport": transport-id, "details": create-conversation-details } }
+request-conv-join-details = { "ConvJoinDetails": { "transport": transport-id } }
+request-conv-join = { "ConvJoin": { "transport": transport-id, "details": channel-join-details } }
+request-conv-leave = { "ConvLeave": { "transport": transport-id, "conv": tstr } }
+request-conv-send = { "ConvSend": { "transport": transport-id, "conv": tstr, ? "from": (participant / null), "message": user-msg } }
+request-conv-set-topic = { "ConvSetTopic": { "transport": transport-id, "conv": tstr, ? "topic": (tstr / null) } }
+request-conv-set-title = { "ConvSetTitle": { "transport": transport-id, "conv": tstr, ? "title": (tstr / null) } }
+request-conv-set-description = { "ConvSetDescription": { "transport": transport-id, "conv": tstr, ? "description": (tstr / null) } }
+request-conv-delete = { "ConvDelete": { "transport": transport-id, "conv": tstr } }
+request-conv-history = { "ConvHistory": { "transport": transport-id, "conv": tstr, ? "after_cursor": uint, ? "max": uint } }
+request-member-invite = { "MemberInvite": { "transport": transport-id, "conv": tstr, "who": participant, ? "message": (tstr / null) } }
+request-member-remove = { "MemberRemove": { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null) } }
+request-member-ban = { "MemberBan": { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null) } }
+request-member-set-role = { "MemberSetRole": { "transport": transport-id, "conv": tstr, "who": participant, "role": member-role } }
+request-contact-get-profile = { "ContactGetProfile": { "transport": transport-id, "contact": contact-info } }
+request-contact-set-alias = { "ContactSetAlias": { "transport": transport-id, "contact": contact-info, ? "alias": (tstr / null) } }
+request-contact-action-menu = { "ContactActionMenu": { "transport": transport-id, "contact": contact-info } }
+request-directory-search = { "DirectorySearch": { "transport": transport-id, ? "query": (tstr / null) } }
+request-fs-roots = "FsRoots"
+request-fs-list = { "FsList": { "root": fs-root-id-t, "dir": tstr, ? "show_ignored": bool } }
+request-fs-stat = { "FsStat": { "root": fs-root-id-t, "path": tstr } }
+request-fs-read = { "FsRead": { "root": fs-root-id-t, "path": tstr, ? "max_bytes": uint } }
+request-fs-write = { "FsWrite": { "root": fs-root-id-t, "path": tstr, "bytes": byte-array, ? "base_revision": (fs-revision / null), ? "force": bool } }
+request-fs-search = { "FsSearch": { "root": fs-root-id-t, "query": fs-search-query } }
+request-fs-watch-poll = { "FsWatchPoll": { "root": fs-root-id-t, "dir": tstr, "after_seq": uint, "max": uint } }
+request-blob-put = { "BlobPut": { "bytes": byte-array } }
+request-blob-get = { "BlobGet": { "hash": content-hash, ? "range": (byte-range / null) } }
+request-blob-stat = { "BlobStat": { "hash": content-hash } }
+request-fs-write-from-blob = { "FsWriteFromBlob": { "root": fs-root-id-t, "path": tstr, "hash": content-hash, ? "base_revision": (fs-revision / null), ? "force": bool } }
+api-request = request-submit
+            / request-submit-routed
+            / request-poll
+            / request-respond
+            / request-health
+            / request-stats
+            / request-telemetry
+            / request-sessions
+            / request-assign
+            / request-cancel
+            / request-fleet
+            / request-tree
+            / request-unit
+            / request-unit-events
+            / request-unit-outbound
+            / request-session-history
+            / request-subscribe
+            / request-delivery-targets
+            / request-delivery-sessions
+            / request-handover
+            / request-record-meta
+            / request-unit-history
+            / request-pause
+            / request-resume
+            / request-scale
+            / request-verifying-key
+            / request-set-session-model
+            / request-set-session-mode
+            / request-set-session-overlay
+            / request-approvals-pending
+            / request-approval-decide
+            / request-profile-list
+            / request-profile-get
+            / request-profile-create
+            / request-profile-update
+            / request-profile-delete
+            / request-profile-select
+            / request-profile-clone
+            / request-profile-export
+            / request-profile-import
+            / request-profile-history
+            / request-profile-at
+            / request-profile-revert
+            / request-skill-history
+            / request-skill-at
+            / request-skill-revert
+            / request-curator-list
+            / request-curator-pin
+            / request-curator-unpin
+            / request-curator-archive
+            / request-curator-restore
+            / request-curator-run
+            / request-credential-set
+            / request-credential-list
+            / request-credential-remove
+            / request-model-search
+            / request-model-files
+            / request-model-download
+            / request-model-downloads
+            / request-model-cancel
+            / request-model-pause
+            / request-model-resume
+            / request-model-catalog
+            / request-model-delete
+            / request-model-activate
+            / request-model-recommend
+            / request-model-quantize
+            / request-model-quantizes
+            / request-model-inspect
+            / request-models
+            / request-model-current
+            / request-auth-begin
+            / request-auth-complete
+            / request-auth-cancel
+            / request-auth-providers
+            / request-checkpoint-list
+            / request-checkpoint-rewind
+            / request-sessions-query
+            / request-session-get
+            / request-sessions-by-profile
+            / request-session-search
+            / request-session-update-meta
+            / request-rewind
+            / request-acp-discover
+            / request-acp-catalog
+            / request-acp-register
+            / request-acp-remove
+            / request-skill-get
+            / request-skill-put
+            / request-provider-list
+            / request-provider-register
+            / request-tool-list
+            / request-tool-register
+            / request-command-list
+            / request-command-invoke
+            / request-config-get
+            / request-config-set
+            / request-cron-list
+            / request-cron-create
+            / request-cron-update
+            / request-cron-delete
+            / request-cron-trigger
+            / request-cron-runs
+            / request-cron-pause
+            / request-cron-suggestions
+            / request-cron-accept-suggestion
+            / request-cron-dismiss-suggestion
+            / request-routing-list-chats
+            / request-routing-get
+            / request-routing-set
+            / request-routing-bind-chat
+            / request-routing-unbind-chat
+            / request-transport-rooms
+            / request-transport-adapters
+            / request-transport-instances
+            / request-conv-list
+            / request-conv-get
+            / request-conv-create-details
+            / request-conv-create
+            / request-conv-join-details
+            / request-conv-join
+            / request-conv-leave
+            / request-conv-send
+            / request-conv-set-topic
+            / request-conv-set-title
+            / request-conv-set-description
+            / request-conv-delete
+            / request-conv-history
+            / request-member-invite
+            / request-member-remove
+            / request-member-ban
+            / request-member-set-role
+            / request-contact-get-profile
+            / request-contact-set-alias
+            / request-contact-action-menu
+            / request-directory-search
+            / request-fs-roots
+            / request-fs-list
+            / request-fs-stat
+            / request-fs-read
+            / request-fs-write
+            / request-fs-search
+            / request-fs-watch-poll
+            / request-blob-put
+            / request-blob-get
+            / request-blob-stat
+            / request-fs-write-from-blob
 
-api-response = "Ok"
-             / { "Routed": { session: session-id } }   ; the session a SubmitRouted resolved to (wire v7)
-             / { "Drained": [* outbound] }
-             / { "Health": health-report }
-             / { "Stats": stats-report }
-             / { "Telemetry": any }
-             / { "Sessions": [* session-info] }
-             / { "Approvals": [* approval-info] }
-             / { "Fleet": fleet-report }
-             / { "Tree": tree-report }
-             / { "Unit": (unit-node / null) }
-             / { "UnitEvents": [* manage-event-view] }
-             / { "Journal": journal-page-view }
-             / { "LogPage": log-page-view }
-             / { "DeliveryTargets": [* delivery-target] }
-             / { "DeliverySessions": [* session-id] }   ; owned sessions of a transport instance (wire v10)
-             / { "VerifyingKey": (tstr / null) }
-             / { "ModelSearch": search-page }
-             / { "ModelFiles": [* model-file] }
-             / { "ModelDownloadStarted": download-id }
-             / { "ModelDownloads": [* download-status] }
-             / { "ModelCatalog": [* installed-model] }
-             / { "ModelRecommend": quant-recommendation }
-             / { "ModelQuantizeStarted": quantize-id }
-             / { "ModelQuantizes": [* quantize-status] }
-             / { "ModelInspect": gguf-info }
-             / { "Profiles": [* profile-info] }
-             / { "Profile": (profile-spec / null) }
-             / { "Credentials": [* credential-info] }
-             / { "Models": [* model-descriptor] }
-             / { "ModelCurrent": (model-descriptor / null) }
-             ; ----- profile distributions + versioning (wire v6) -----
-             / { "Distribution": distribution }
-             / { "ProfileId": tstr }
-             / { "Revisions": [* revision] }
-             / { "SkillBundle": skill-bundle }
-             / { "CuratorSkills": [* curator-entry] }
-             / { "CuratorRun": [* curator-change] }
-             ; ----- interactive auth (AuthApi), wire v13 -----
-             / { "AuthBegun": auth-begin-response }
-             / { "AuthCompleted": auth-complete-response }
-             / { "AuthProviders": [* auth-provider-info] }
-             ; ----- §12 checkpoints + GUI roster + unified rewind (wire v14) -----
-             / { "Checkpoints": [* checkpoint-info] }
-             / { "SessionPage": session-page }
-             / { "SessionDetail": (session-detail / null) }
-             / { "SessionsByProfile": [* [profile-ref, [* session-info]]] }
-             / { "SessionSearch": [* session-search-hit] }
-             ; ----- ACP discovery/catalog (wire v14) -----
-             / { "AcpCatalog": [* acp-agent-entry] }
-             ; ----- long-tail surfaces (wire v14) -----
-             / { "Providers": [* provider-info] }
-             / { "Tools": [* tool-info] }
-             / { "Commands": [* command-spec] }
-             / { "CommandOutput": command-output }
-             / { "Config": node-config-view }
-             / { "CronJobs": [* cron-job] }
-             / { "CronId": tstr }
-             / { "CronRuns": [* cron-run] }
-             / { "CronSuggestions": [* cron-suggestion] }   ; wire v15 (I15)
-             ; ----- chat->session routing pins (wire v14; I5, §5.9) -----
-             / { "ChatRoutes": [* chat-route] }
-             / { "ChatRoute": (chat-route / null) }
-             / { "Rooms": [* room-info] }
-             ; ----- transport-adapter framework + messaging management (wire v18) -----
-             / { "Adapters": [* adapter-info] }
-             / { "TransportInstances": [* transport-instance-info] }
-            / { "Conversations": [* conversation-info] }
-            / { "Conversation": (conversation-info / null) }
-            / { "ConvCreateDetails": create-conversation-details }
-            / { "ConvJoinDetails": channel-join-details }
-            ; ----- contacts + directory (wire v20) -----
-            / { "ContactProfile": tstr }
-            / { "Contacts": [* contact-info] }
-            / { "ActionMenu": (action-menu / null) }
-            / { "Error": api-error }
-             ; ----- filesystem / workspace surface (wire v14) -----
-             / { "FsRoots": [* fs-root] }
-             / { "FsList": [* fs-entry] }
-             / { "FsStat": fs-entry }
-             / { "FsRead": fs-content }
-             / { "FsWrite": fs-revision }
-             / { "FsSearch": fs-search-page }
-             / { "FsWatch": fs-watch-page-view }
-             ; ----- content store (wire v14) -----
-             / { "BlobPut": blob-ref }
-             / { "BlobGet": bstr }
-             / { "BlobStat": blob-stat }
+response-ok = "Ok"
+response-routed = { "Routed": { "session": session-id } }
+response-drained = { "Drained": [* outbound] }
+response-health = { "Health": health-report }
+response-stats = { "Stats": stats-report }
+telemetry-dump = { "usage": usage-delta, "events": uint, "healthy": bool, "pending_jobs": uint, "pending_wakes": uint, "sessions": uint, "active": uint }
+response-telemetry = { "Telemetry": telemetry-dump }
+response-sessions = { "Sessions": [* session-info] }
+response-approvals = { "Approvals": [* approval-info] }
+response-fleet = { "Fleet": fleet-report }
+response-tree = { "Tree": tree-report }
+response-unit = { "Unit": (unit-node / null) }
+response-unit-events = { "UnitEvents": [* manage-event-view] }
+response-journal = { "Journal": journal-page-view }
+response-log-page = { "LogPage": log-page-view }
+response-delivery-targets = { "DeliveryTargets": [* delivery-target] }
+response-delivery-sessions = { "DeliverySessions": [* session-id] }
+response-verifying-key = { "VerifyingKey": (tstr / null) }
+response-model-search = { "ModelSearch": search-page }
+response-model-files = { "ModelFiles": [* model-file] }
+response-model-download-started = { "ModelDownloadStarted": download-id }
+response-model-downloads = { "ModelDownloads": [* download-status] }
+response-model-catalog = { "ModelCatalog": [* installed-model] }
+response-model-recommend = { "ModelRecommend": quant-recommendation }
+response-model-quantize-started = { "ModelQuantizeStarted": quantize-id }
+response-model-quantizes = { "ModelQuantizes": [* quantize-status] }
+response-model-inspect = { "ModelInspect": gguf-info }
+response-profiles = { "Profiles": [* profile-info] }
+response-profile = { "Profile": profile-spec }
+response-credentials = { "Credentials": [* credential-info] }
+response-models = { "Models": [* model-descriptor] }
+response-model-current = { "ModelCurrent": (model-descriptor / null) }
+response-distribution = { "Distribution": distribution }
+response-profile-id = { "ProfileId": tstr }
+response-revisions = { "Revisions": [* revision] }
+response-skill-bundle = { "SkillBundle": skill-bundle }
+response-curator-skills = { "CuratorSkills": [* curator-entry] }
+response-curator-run = { "CuratorRun": [* curator-change] }
+response-auth-begun = { "AuthBegun": auth-begin-response }
+response-auth-completed = { "AuthCompleted": auth-complete-response }
+response-auth-providers = { "AuthProviders": [* auth-provider-info] }
+response-checkpoints = { "Checkpoints": [* checkpoint-info] }
+response-session-page = { "SessionPage": session-page }
+response-session-detail = { "SessionDetail": (session-detail / null) }
+response-sessions-by-profile = { "SessionsByProfile": [* [profile: profile-ref, sessions: [* session-info]]] }
+response-session-search = { "SessionSearch": [* session-search-hit] }
+response-acp-catalog = { "AcpCatalog": [* acp-agent-entry] }
+response-providers = { "Providers": [* provider-info] }
+response-tools = { "Tools": [* tool-info] }
+response-commands = { "Commands": [* command-spec] }
+response-command-output = { "CommandOutput": command-output }
+response-config = { "Config": node-config-view }
+response-cron-jobs = { "CronJobs": [* cron-job] }
+response-cron-id = { "CronId": tstr }
+response-cron-runs = { "CronRuns": [* cron-run] }
+response-cron-suggestions = { "CronSuggestions": [* cron-suggestion] }
+response-chat-routes = { "ChatRoutes": [* chat-route] }
+response-chat-route = { "ChatRoute": (chat-route / null) }
+response-rooms = { "Rooms": [* room-info] }
+response-adapters = { "Adapters": [* adapter-info] }
+response-transport-instances = { "TransportInstances": [* transport-instance-info] }
+response-conversations = { "Conversations": [* conversation-info] }
+response-conversation = { "Conversation": (conversation-info / null) }
+response-conv-create-details = { "ConvCreateDetails": create-conversation-details }
+response-conv-join-details = { "ConvJoinDetails": channel-join-details }
+response-contact-profile = { "ContactProfile": tstr }
+response-contacts = { "Contacts": [* contact-info] }
+response-action-menu = { "ActionMenu": (action-menu / null) }
+response-error = { "Error": api-error }
+response-fs-roots = { "FsRoots": [* fs-root] }
+response-fs-list = { "FsList": [* fs-entry] }
+response-fs-stat = { "FsStat": fs-entry }
+response-fs-read = { "FsRead": fs-content }
+response-fs-write = { "FsWrite": fs-revision }
+response-fs-search = { "FsSearch": fs-search-page }
+response-fs-watch = { "FsWatch": fs-watch-page-view }
+response-blob-put = { "BlobPut": blob-ref }
+response-blob-get = { "BlobGet": byte-array }
+response-blob-stat = { "BlobStat": blob-stat }
+api-response = response-ok
+             / response-routed
+             / response-drained
+             / response-health
+             / response-stats
+             / response-telemetry
+             / response-sessions
+             / response-approvals
+             / response-fleet
+             / response-tree
+             / response-unit
+             / response-unit-events
+             / response-journal
+             / response-log-page
+             / response-delivery-targets
+             / response-delivery-sessions
+             / response-verifying-key
+             / response-model-search
+             / response-model-files
+             / response-model-download-started
+             / response-model-downloads
+             / response-model-catalog
+             / response-model-recommend
+             / response-model-quantize-started
+             / response-model-quantizes
+             / response-model-inspect
+             / response-profiles
+             / response-profile
+             / response-credentials
+             / response-models
+             / response-model-current
+             / response-distribution
+             / response-profile-id
+             / response-revisions
+             / response-skill-bundle
+             / response-curator-skills
+             / response-curator-run
+             / response-auth-begun
+             / response-auth-completed
+             / response-auth-providers
+             / response-checkpoints
+             / response-session-page
+             / response-session-detail
+             / response-sessions-by-profile
+             / response-session-search
+             / response-acp-catalog
+             / response-providers
+             / response-tools
+             / response-commands
+             / response-command-output
+             / response-config
+             / response-cron-jobs
+             / response-cron-id
+             / response-cron-runs
+             / response-cron-suggestions
+             / response-chat-routes
+             / response-chat-route
+             / response-rooms
+             / response-adapters
+             / response-transport-instances
+             / response-conversations
+             / response-conversation
+             / response-conv-create-details
+             / response-conv-join-details
+             / response-contact-profile
+             / response-contacts
+             / response-action-menu
+             / response-error
+             / response-fs-roots
+             / response-fs-list
+             / response-fs-stat
+             / response-fs-read
+             / response-fs-write
+             / response-fs-search
+             / response-fs-watch
+             / response-blob-put
+             / response-blob-get
+             / response-blob-stat
 
 ; ----- filesystem / workspace surface DTOs (wire v14; daemon-fs-surface-spec.md) -----
-fs-root-id = { "host": tstr } / "workspace" / { "session": session-id }
-fs-root-kind = "host" / "workspace" / "session"
-fs-root = { id: fs-root-id, label: tstr, kind: fs-root-kind, ? session: (session-id / null) }
-fs-entry-kind = "file" / "dir" / "symlink"
-fs-entry = { name: tstr, path: tstr, kind: fs-entry-kind, size: uint, mtime_ms: uint, ? ignored: bool }
-fs-revision = { mtime_ms: uint, size: uint }
-fs-content = { bytes: bstr, revision: fs-revision, ? truncated: bool, ? blob_ref: (blob-ref / null) }
-fs-search-query = { query: tstr, ? regex: bool, ? case_sensitive: bool, ? max_results: uint, ? page: uint }
-fs-search-hit = { path: tstr, line: uint, col: uint, preview: tstr }
-fs-search-page = { hits: [* fs-search-hit], ? has_more: bool }
-fs-change-kind = "created" / "modified" / "removed"
-fs-change = { path: tstr, kind: fs-change-kind }
-fs-watch-page-view = { events: [* fs-change], next_seq: uint }
+fs-root-id-host = { "host": tstr }
+fs-root-id-session = { "session": session-id }
+fs-root-id-t = fs-root-id-host
+             / "workspace"
+             / fs-root-id-session
+fs-root-kind-t = "host"
+               / "workspace"
+               / "session"
+fs-root = { "id": fs-root-id-t, "label": tstr, "kind": fs-root-kind-t, ? "session": (session-id / null) }
+fs-entry-kind-t = "file"
+                / "dir"
+                / "symlink"
+fs-entry = { "name": tstr, "path": tstr, "kind": fs-entry-kind-t, "size": uint, "mtime_ms": uint, ? "ignored": bool }
+fs-revision = { "mtime_ms": uint, "size": uint }
+fs-content = { "bytes": byte-array, "revision": fs-revision, ? "truncated": bool, ? "blob_ref": (blob-ref / null) }
+fs-search-query = { "query": tstr, ? "regex": bool, ? "case_sensitive": bool, ? "max_results": uint, ? "page": uint }
+fs-search-hit = { "path": tstr, "line": uint, "col": uint, "preview": tstr }
+fs-search-page = { "hits": [* fs-search-hit], ? "has_more": bool }
+fs-change-kind-t = "created"
+                 / "modified"
+                 / "removed"
+fs-change = { "path": tstr, "kind": fs-change-kind-t }
+fs-watch-page-view = { "events": [* fs-change], "next_seq": uint }
 
 ; ----- content store DTOs (wire v14; daemon-content-transfer-spec.md) -----
-content-hash = bstr                 ; 32-byte SHA-256 (mirrors revision.content_hash)
-byte-range = { offset: uint, len: uint }
-blob-ref = { hash: content-hash, size: uint, ? name: (tstr / null), ? mime: (tstr / null) }
-blob-stat = { size: uint, present: bool }
+content-hash = byte-array                 ; 32-byte SHA-256 (mirrors revision.content_hash)
+byte-range = { "offset": uint, "len": uint }
+blob-ref = { "hash": content-hash, "size": uint, ? "name": (tstr / null), ? "mime": (tstr / null) }
+blob-stat = { "size": uint, "present": bool }

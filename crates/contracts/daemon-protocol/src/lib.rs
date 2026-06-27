@@ -18,6 +18,7 @@ use daemon_common::{
 use serde::{Deserialize, Serialize};
 
 /// A user-authored turn input (the `StartTurn` payload; the §5 message type proper lives in core).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMsg {
     /// The textual body of the message.
@@ -49,6 +50,7 @@ impl UserMsg {
 /// the task text plus parent-workspace-relative paths to hand down. Carried as the opaque
 /// `JobCommand.payload`. The node (which holds the workspace roots + blob store) resolves the paths
 /// to the child's `inbox/`; the engine only ever produces/consumes the opaque bytes.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationInput {
     /// The task instruction seeded as the child's first message.
@@ -87,6 +89,7 @@ impl DelegationInput {
 /// The structured result a child returns to its parent (daemon-content-transfer-spec.md Phase 2a):
 /// a summary plus content-addressed artifacts (captured by the node from the child's `outbox/`).
 /// Carried as the opaque completion payload.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationResult {
     /// A short human-readable summary of the child's outcome.
@@ -128,6 +131,7 @@ impl DelegationResult {
 // ---------------------------------------------------------------------------
 
 /// Commands the host sends down to an engine (§17, host -> core).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AgentCommand {
@@ -188,6 +192,7 @@ pub enum AgentCommand {
 /// `ordinal` variants index into the live conversation turns — the same 0-based index a client sees
 /// in [`ConvView::turns`] — so a client addresses what it can see. `Cursor` addresses by the durable
 /// journal cursor (the §17 `session_history` cursor) for reconnect-stable addressing.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewindAnchor {
     /// Seal off the user turn at `ordinal` and everything after it (the restore/edit case): the
@@ -215,6 +220,7 @@ pub enum RewindAnchor {
 // ---------------------------------------------------------------------------
 
 /// Why a turn started (§17). A background completion is the durable rehydration trigger.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TurnTrigger {
@@ -236,6 +242,7 @@ pub enum TurnTrigger {
 }
 
 /// The origin of a background completion (§17).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompletionSource {
     /// A host-owned OS process.
@@ -245,6 +252,7 @@ pub enum CompletionSource {
 }
 
 /// How a turn ended (carried in [`TurnSummary`]; the §17.3 leaf form of the management `EndReason`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EndReason {
@@ -265,6 +273,7 @@ pub enum EndReason {
 }
 
 /// Terminal turn outcome (§17).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnSummary {
     /// Why the turn ended.
@@ -289,6 +298,7 @@ impl TurnSummary {
 /// A point-in-time context-window status (the §10 context engine's view), carried on
 /// [`AgentEvent::Context`]. `max_tokens` is the model window (the HUD denominator) when the provider
 /// declares one; `budget_tokens` is the configured soft compaction budget.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextStatus {
     /// The estimated tokens the assembled context currently uses.
@@ -304,6 +314,7 @@ pub struct ContextStatus {
 }
 
 /// A read-only projection of one conversation turn, carried in a [`ConvView`] (§17 snapshot reply).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvTurnView {
     /// The turn's role: `user`, `assistant`, or `tool`.
@@ -317,6 +328,7 @@ pub struct ConvTurnView {
 /// A read-only projection of the engine's conversation at a consistent phase boundary — the body of
 /// an [`AgentEvent::Snapshot`] reply. Built by the engine from its durable `Snapshot`; never live
 /// state.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvView {
     /// The incarnation epoch the view was taken at.
@@ -339,6 +351,7 @@ pub struct ConvView {
 /// `"ansi-stream"` / `"pty"` for terminal output); `body` is the encoded payload (CBOR by
 /// convention) the GUI decodes per `kind`. Kept as raw bytes so the §17 wire types stay `Eq` and the
 /// contract crate gains no codec dependency.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDetail {
     /// The stable renderer discriminator (e.g. a tool name, or `"ansi-stream"`/`"pty"`).
@@ -359,6 +372,7 @@ impl ToolDetail {
 
 /// A compact view of a tool invocation, streamed on the event surface (the durable record lives in
 /// the engine's `Conversation`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallView {
     /// Correlates the start with its result.
@@ -374,6 +388,7 @@ pub struct ToolCallView {
 }
 
 /// A compact view of a tool result, streamed on the event surface.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultView {
     /// Correlates back to the originating [`ToolCallView`].
@@ -390,6 +405,7 @@ pub struct ToolResultView {
 
 /// Events the engine streams up to the host (§17, core -> host). Each carries a monotonic `seq`;
 /// the stream is lossless-primary, so a lossy live consumer resyncs from the last acked `seq`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AgentEvent {
@@ -543,6 +559,7 @@ impl AgentEvent {
 // ---------------------------------------------------------------------------
 
 /// A blocking, correlated request the engine raises to the host (§17).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostRequest {
     /// Correlation id.
@@ -554,6 +571,7 @@ pub struct HostRequest {
 /// The kinds of blocking host request the engine can raise (§17 = `{Approval, Input, Choice,
 /// Delegate}`; the management protocol's `ManageRequestKind` is the superset that adds
 /// `Escalate`/`Resource`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HostRequestKind {
@@ -594,6 +612,7 @@ pub enum HostRequestKind {
 }
 
 /// A request to spawn an attached, non-joining background child ([`HostRequestKind::Spawn`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnSpec {
     /// The background-profile kind the host materializes the child from (e.g. `"skill_review"`,
@@ -605,6 +624,7 @@ pub struct SpawnSpec {
 }
 
 /// How a spawned background child's conversation is seeded ([`SpawnSpec::seed`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SpawnSeed {
@@ -615,6 +635,7 @@ pub enum SpawnSeed {
 }
 
 /// The host's correlated reply to a [`HostRequest`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostResponse {
     /// Correlation id matching the originating request.
@@ -624,6 +645,7 @@ pub struct HostResponse {
 }
 
 /// The body of a [`HostResponse`], typed per request kind.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HostResponseBody {
@@ -663,6 +685,7 @@ pub trait HostRequestHandler: Send + Sync {
 /// arrive on the agent's stdin; a foreign brain that speaks §17 is driven by them, and the host
 /// wraps the cut as an `Engine`-leaf managed unit. The reference in-process brain (`daemon-core`)
 /// uses typed channels instead, but the dialect is the same §17.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Inbound {
@@ -675,6 +698,7 @@ pub enum Inbound {
 /// A §17 frame emitted **from** an engine (engine -> host). This is the canonical "item coming up
 /// from an engine" union: it doubles as the node drain item (`daemon-api` re-exports it as
 /// `Outbound`) and as the up-frame over a foreign-agent process cut, written to the agent's stdout.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Outbound {
@@ -700,6 +724,7 @@ pub enum Outbound {
 /// The stable name of a surface/adapter that an item entered or left through ("telegram", "http",
 /// "mcp", "slack", "socket", "ffi", "schedule", …). A plain interned string keeps the contract open:
 /// adding an adapter needs no protocol change and the daemon never matches structurally on it.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TransportId(pub String);
 
@@ -731,6 +756,7 @@ impl From<String> for TransportId {
 /// deterministic session-id derivation, and the per-event attribution carried on the log. This is
 /// the daemon analogue of hermes's `build_session_key` input, but carried explicitly (never via
 /// env/`ContextVars`). Principal/route handles are opaque strings the originating adapter owns.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum OriginScope {
@@ -760,6 +786,7 @@ pub enum OriginScope {
 /// session-id derivation, carried **per event, not just per session creation**, so the log and
 /// journal can record "steered via the GUI by the owner" vs "message from the Telegram user" within
 /// one shared conversation.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Origin {
     /// The surface/adapter the item entered or left through.
@@ -787,6 +814,7 @@ impl Origin {
 }
 
 /// Which way an entry flows on the merged session log.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Direction {
     /// World → session: a surface message, steering, a tool result, a trigger, or a meta event.
@@ -802,6 +830,7 @@ pub enum Direction {
 /// surface-attach / receipts — entries the engine's prompt never sees, making them **cache-safe by
 /// construction** (the first-class form of hermes's "events describe transport, never context").
 /// `Transport` entries are also never journaled.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Disposition {
     /// Enters the conversation: a turn, a tool message, a rehydration/scheduled trigger.
@@ -814,6 +843,7 @@ pub enum Disposition {
 /// The body of a [`SessionLogEntry`]. Unifies the outbound §17 union ([`Outbound`] = event / request)
 /// with the inbound intake ([`Inbound`] = command / response) and adds an inbound transport/meta
 /// channel for observability-only events. Opaque `Meta` bodies ride through the daemon untouched.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SessionPayload {
@@ -852,6 +882,7 @@ impl SessionPayload {
 /// payload: a single monotonic `seq` across **both** directions (global per-session ordering and the
 /// subscribe cursor), the `direction`, the per-event `origin` (attribution), and the `disposition`
 /// (context vs transport-only).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLogEntry {
     /// One monotonic sequence across both directions — global ordering and the subscribe cursor.
@@ -900,6 +931,7 @@ impl SessionLogEntry {
 /// How finely an [`Origin`] is split into distinct sessions — the isolation policy a transport
 /// applies when deriving a [`SessionId`]. Coarser policies collapse principals/threads onto one
 /// shared conversation; finer ones fork a session per principal or per thread.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IsolationPolicy {
@@ -956,6 +988,7 @@ pub fn session_id_for(origin: &Origin, policy: IsolationPolicy) -> SessionId {
 
 /// An adapter-opaque outbound route handle within a transport (e.g. a Telegram chat id, an HTTP
 /// connection id). The originating adapter owns its meaning; the daemon never matches on it.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RouteAddr(pub String);
 
@@ -973,6 +1006,7 @@ impl RouteAddr {
 
 /// Whether an outbound delivery target is the session's authoritative reply sink (`Primary`) or a
 /// passive observer (`Spectator`). Exactly one `Primary` is in force at a time; handover re-points it.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SinkKind {
     /// The authoritative reply sink — where outbound replies post.
@@ -984,6 +1018,7 @@ pub enum SinkKind {
 /// Where a session's outbound replies are delivered. A property of the session (populated from the
 /// opening [`Origin`]), not caller state — the daemon analogue of hermes's `DeliveryRouter`, but
 /// owned by the session rather than threaded through the caller.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DeliveryTarget {
@@ -1042,6 +1077,7 @@ impl Origin {
 /// Stable identity of a [`Room`-backed](crate) N-participant conversation. The loopback transport
 /// instance a Room presents as is `TransportId("room/<RoomId>")`; its routing scope is
 /// `OriginScope::Group { chat: <RoomId> }` (mirrors `TransportId`'s hand-rolled newtype shape).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RoomId(pub String);
 
@@ -1078,6 +1114,7 @@ impl From<String> for RoomId {
 /// One participant of a [`RoomId`]-keyed Room: an agent (or the user) bound to a profile and a
 /// resolved per-member session. The membership table maps `(room, member) -> (ProfileRef,
 /// SessionId)`; the RoomRouter fans an inbound post out to each member's session via `submit_from`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomMember {
     /// The adapter-opaque member handle within the room (the speaker label / `@name`).
@@ -1103,6 +1140,7 @@ impl RoomMember {
 /// RoomRouter applies before fanning a post out (echo-storm prevention is a `max_turns` budget the
 /// router enforces orthogonally to this choice). Each variant decides *whose* `TurnFinished` is
 /// re-injected as the next inbound post. The stub set; the policy engine lives in `daemon-rooms`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[derive(Default)]
@@ -1126,6 +1164,7 @@ pub enum RoomPolicy {
 // ---------------------------------------------------------------------------
 
 /// Who authored a transcript message block.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TranscriptRole {
@@ -1142,6 +1181,7 @@ pub enum TranscriptRole {
 /// deltas, which are *not* individually journaled) into these at turn/tool boundaries; the verifiable
 /// journal stores each as one entry, and a consuming GUI replays them for scroll-back. Opaque tool
 /// `detail` / content `body` ride through untouched (the daemon never matches on them).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TranscriptBlock {
@@ -1217,6 +1257,7 @@ impl TranscriptBlock {
 /// What kind of unit a tree node is (a transport-stable mirror of the supervision `UnitKind`). A
 /// foreign agent and a `daemon-core` engine are both `Engine` — the GUI cannot, and need not, tell
 /// them apart.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnitKind {
     /// A leaf brain (a `daemon-core` engine or a foreign agent over a §17 cut).
@@ -1228,6 +1269,7 @@ pub enum UnitKind {
 }
 
 /// A tree node's lifecycle state (decoupled from the orchestration runtime's `ChildStatus`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnitState {
     /// Attached, no terminal outcome yet (working or idle).
@@ -1245,6 +1287,7 @@ pub enum UnitState {
 /// (`Primary` only) separate from drill-down children, and to keep long-lived managed children
 /// stable while coalescing transient-subagent churn. The transport-stable mirror of the store's
 /// `SessionRole`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SessionRole {
     /// A top-level conversation (the only role in the `TopLevel` roster scope / fleet root).
@@ -1267,6 +1310,7 @@ impl SessionRole {
 /// One node in the orchestration tree projection (the GUI's per-unit view). The tree is a flat node
 /// list plus per-node `children` ids, so deeper / cross-node nesting can fill in later without a DTO
 /// change.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitNode {
     /// The unit id.
@@ -1298,6 +1342,7 @@ pub struct UnitNode {
 }
 
 /// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeReport {
     /// The root unit id (the node itself), when there is one.
@@ -1309,6 +1354,7 @@ pub struct TreeReport {
 /// A transport-stable projection of a unit's management event, for GUI drill-down (decoupled from
 /// the supervision `ManageEvent`). Mirrors the per-session poll model: a bounded drain of recent
 /// events for one unit.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManageEventView {
     /// The unit started a unit of work.
@@ -1366,6 +1412,7 @@ pub enum ManageEventView {
 }
 
 /// A delegation/subagent lifecycle phase (the [`ManageEventView::Subagent`] discriminator).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubagentPhase {
     /// The child was spawned/attached.

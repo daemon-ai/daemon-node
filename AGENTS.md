@@ -9,8 +9,35 @@ Nix-managed workspace. There are NO host tools — run cargo inside the devShell
 - `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`
 - `nix develop --command cargo deny check`
 - `nix develop --command cargo test --workspace`                       # or `cargo nextest run`
+- `nix develop --command cargo test -p daemon-api --features arbitrary` # CDDL conformance (see below)
 
 Never bypass the pre-commit hook (no `git commit --no-verify`).
+
+## Wire contract (CDDL) — keep it in lockstep with the Rust types
+
+[`crates/contracts/daemon-api/daemon-api.cddl`](crates/contracts/daemon-api/daemon-api.cddl) is the
+**single, authoritative** wire contract: one hand-authored, zcbor-generatable file that both documents
+every CBOR shape and generates the client C codec. The Rust serde types are the source of truth; the
+CDDL must mirror them exactly and stay clean.
+
+- **Any change to a Rust type exposed over the wire MUST be reflected in the CDDL.** "Exposed over the
+  wire" = `ApiRequest` / `ApiResponse` and every type reachable from them across `daemon-api`,
+  `daemon-common`, and `daemon-protocol` (adding/removing/renaming/retyping a field or enum variant,
+  or adding a new variant). Update `daemon-api.cddl` in the same change, then `just update-codec` to
+  regenerate the vendored codec.
+- **No stale or loose rules.** Remove rules that are no longer reachable from `api-request` /
+  `api-response` (unreachable rules are unvalidated and silently drift). Prefer concrete shapes over
+  `any`; only use `any` for genuinely large/opaque payloads and say why in a comment.
+- **Authoring rules (so zcbor generates cleanly):** quote every map key (`"key":`), give each union
+  arm its own named rule, label same-type tuple elements (`[k: tstr, v: tstr]`), and suffix a rule
+  with `-t` when its name would otherwise collide with a map member's coder (e.g. map `origin`.`scope`
+  vs rule `origin-scope` → `origin-scope-t`). Rust `Vec<u8>`/`[u8; N]` serialize as a CBOR array of
+  ints (`byte-array`), not `bstr` (no `serde_bytes` is used).
+- **The gates prove it (drift = failing test):** `cargo test -p daemon-api --test conformance`
+  (cddl-cat, real fixtures + negatives), `cargo test -p daemon-api --features arbitrary`
+  (proptest: arbitrary values across every variant validate against the CDDL), `cargo run -p xtask --
+  verify-codec` (zcbor C decoder vs ciborium), and `cargo run -p xtask -- cddl` (variant parity). If
+  you change a wire type without updating the CDDL, these fail. `just conformance` runs them.
 
 ## Lint policy
 

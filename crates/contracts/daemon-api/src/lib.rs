@@ -66,6 +66,7 @@ pub const API_WIRE_VERSION: WireVersion = WireVersion::CURRENT;
 ///   *sensitive* paths and dangerous commands;
 /// - [`AutoAllow`](ApprovalMode::AutoAllow): auto-allow every gated action except sensitive paths;
 /// - [`Deny`](ApprovalMode::Deny): reject every gated action outright.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
@@ -1320,6 +1321,7 @@ pub trait CredentialApi: Send + Sync {
 // two calls and writes the resulting credential into the same `CredentialStore` as `CredentialApi`.
 
 /// The kind of interactive auth flow (informs the client how to capture the redirect).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthFlowKind {
     /// Matrix SSO: the redirect carries a single-use `loginToken`.
@@ -1329,6 +1331,7 @@ pub enum AuthFlowKind {
 }
 
 /// Optionally bind the freshly-authenticated account to a profile on success.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthBindRequest {
     /// The profile to attach the account to (edits its `bound_accounts`).
@@ -1341,6 +1344,7 @@ pub struct AuthBindRequest {
 }
 
 /// Begin an interactive auth flow.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthBeginRequest {
     /// Transport/provider family, e.g. `"matrix"`.
@@ -1354,6 +1358,7 @@ pub struct AuthBeginRequest {
 }
 
 /// The parked-flow handle returned by `auth_begin`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthBeginResponse {
     /// The single-use flow id to pass to `auth_complete` / `auth_cancel`.
@@ -1369,6 +1374,7 @@ pub struct AuthBeginResponse {
 }
 
 /// Finish a flow from the captured redirect.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCompleteRequest {
     /// The flow id from `auth_begin`.
@@ -1379,6 +1385,7 @@ pub struct AuthCompleteRequest {
 }
 
 /// The outcome of a completed flow.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCompleteResponse {
     /// The `CredentialStore` key the session blob was stored under.
@@ -1392,6 +1399,7 @@ pub struct AuthCompleteResponse {
 }
 
 /// One field of a family's `params` form (capability discovery).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthParamField {
     /// The `params` key.
@@ -1403,6 +1411,7 @@ pub struct AuthParamField {
 }
 
 /// A registered interactive-auth provider (capability discovery for the client).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProviderInfo {
     /// The transport/provider family (`auth_begin.family`).
@@ -1464,6 +1473,7 @@ impl<T: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthAp
 // ---------------------------------------------------------------------------
 
 /// The resident-service tree health (a projection of the host supervisor handle).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthReport {
     /// Whether every resident service is currently `Ok`.
@@ -1473,6 +1483,7 @@ pub struct HealthReport {
 }
 
 /// One resident service's health line.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceHealth {
     /// The service name (e.g. `JobOutboxDispatcher`).
@@ -1486,6 +1497,7 @@ pub struct ServiceHealth {
 }
 
 /// Durable queue depths and live counts (a projection of `StoreStats` + active sessions).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsReport {
     /// Pending background jobs on the durable job outbox.
@@ -1505,6 +1517,7 @@ pub struct StatsReport {
 /// A point-in-time observability snapshot exposed over the control surface (the API-level mirror of
 /// the resident `daemon-telemetry` metrics dump): folded usage + an event counter + aggregate health
 /// + the durable queue depths. This is the `Dump` op a GUI/operator polls for a live HUD.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryDump {
     /// Cumulative usage folded across every unit reporting to the node aggregator (incl. cost).
@@ -1527,6 +1540,7 @@ pub struct TelemetryDump {
 /// (session surface, `submit`) lifecycle. The two are mutually exclusive for a given id; the unified
 /// roster surfaces both so a GUI sees in-progress interactive chats *and* durable sessions in one
 /// list.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Lifecycle {
     /// Durable-managed (a `session_record` row; driven via [`ControlApi::assign`]).
@@ -1540,6 +1554,7 @@ pub enum Lifecycle {
 /// the bound profile (agent identity), an optional title, last-activity (for sort), the
 /// durable-vs-live [`Lifecycle`], and the hierarchy [`SessionRole`] + `parent` so a client can keep
 /// the `Primary` inbox separate from drill-down children.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// The session id.
@@ -1589,6 +1604,7 @@ fn default_rewindable() -> bool {
 /// The scope filter for [`ControlApi::sessions_query`] — the GUI roster query. The tree is the lazy
 /// drill-down for children, so the default `TopLevel` returns only `Primary` conversations (the
 /// inbox); the by-profile / by-transport scopes back the per-agent / per-transport views.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SessionScope {
     /// Only top-level (`Primary`) conversations — the inbox. Children are reached via `tree()`.
@@ -1607,6 +1623,7 @@ pub enum SessionScope {
 
 /// A scoped, paginated roster query. The cursor is the last session id from the previous page
 /// (`None` for the first page); `limit == 0` means a sensible server default.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionQuery {
     /// The roster scope filter.
@@ -1622,6 +1639,7 @@ pub struct SessionQuery {
 
 /// A page of the scoped roster: the matching sessions plus the cursor to fetch the next page
 /// (`None` when the page is the last).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPage {
     /// The sessions in this page (already scope-filtered + ordered).
@@ -1636,6 +1654,7 @@ pub struct SessionPage {
 /// double-option so a `Some(None)` clears the title (rename-to-empty) while `None` leaves it intact.
 /// Applied as a read-modify-write of [`SessionMeta`](../daemon_store/struct.SessionMeta.html) that
 /// preserves the untouched fields (overlay/role/parent/bound profile).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetaPatch {
     /// Set/clear the conversation title (`None` = leave; `Some(None)` = clear; `Some(Some(t))` = set).
@@ -1652,6 +1671,7 @@ pub struct SessionMetaPatch {
 /// The full detail of one session — the single round-trip a GUI detail pane reads: roster `info`
 /// plus the resolved overlay/model/provider, delivery targets, parent/children ids, and a
 /// checkpoint count.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetail {
     /// The roster line for this session.
@@ -1675,6 +1695,7 @@ pub struct SessionDetail {
 
 /// One full-text session-search hit — the transport-stable mirror of the store's `SessionSearchHit`
 /// ([`ControlApi::session_search`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchHit {
     /// The session that matched.
@@ -1688,6 +1709,7 @@ pub struct SessionSearchHit {
 /// A parked §12 edit-approval request awaiting an operator decision — the transport-stable mirror of
 /// a durable `pending_approvals` row, surfaced by [`ControlApi::approvals_pending`] so a GUI/operator
 /// can render the pending asks and answer them with [`ControlApi::approval_decide`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalInfo {
     /// The session that parked the request (and resumes when it is answered).
@@ -1704,6 +1726,7 @@ pub struct ApprovalInfo {
 /// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`
 /// `CheckpointRecord`, surfaced by [`ControlApi::checkpoints`] so a GUI/operator can render the
 /// rewind points and restore one with [`ControlApi::checkpoint_rewind`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointInfo {
     /// The opaque checkpoint id to pass back to [`ControlApi::checkpoint_rewind`].
@@ -1725,6 +1748,7 @@ pub struct CheckpointInfo {
 }
 
 /// A transport-stable mirror of the durable session lifecycle (decoupled from `daemon-store`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     /// A live incarnation is (or was) running.
@@ -1743,6 +1767,7 @@ pub enum SessionState {
 }
 
 /// The orchestration fleet roster + folded usage.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetReport {
     /// The ids of all registered children.
@@ -1769,6 +1794,7 @@ pub type TreeStream = BoxStream<'static, TreeEvent>;
 /// `ManagedChild` topology punctuated by transient `EphemeralSubagent` churn, so a client can opt
 /// out of ephemeral nodes entirely or have rapid ephemeral changes coalesced into one update per
 /// window.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeSubFilter {
     /// Whether to deliver `EphemeralSubagent` node changes at all (`false` = stable topology only).
@@ -1796,6 +1822,7 @@ fn default_true() -> bool {
 /// One push update on the [`ControlApi::tree_subscribe`] stream. The foundation is a coalesced
 /// whole-tree snapshot (simple, churn-bounded); finer node-delta events can fill in later behind the
 /// same wire shape.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TreeEvent {
     /// The current tree snapshot (already scope/coalesce-filtered for the subscriber).
@@ -1809,6 +1836,7 @@ pub enum TreeEvent {
 /// the transcript at `anchor`) and the optional workspace rollback. A single
 /// [`ControlApi::rewind`] op replaces the separate conversation-`RewindTo` and workspace-only
 /// [`ControlApi::checkpoint_rewind`] paths.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewindPoint {
     /// The conversation anchor to truncate the transcript at.
@@ -1819,6 +1847,7 @@ pub struct RewindPoint {
 }
 
 /// Where a cataloged ACP agent's launch recipe came from.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AcpSource {
     /// From the curated builtin known-agent recipe table.
@@ -1832,6 +1861,7 @@ pub enum AcpSource {
 /// A launch recipe for a foreign ACP agent — the catalog's mirror of the host's spawn spec. Either a
 /// stdio subprocess (`program` + `args` + `env`) or a network `endpoint`; exactly one is meaningful
 /// per `source`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpRecipe {
     /// The program to exec for a stdio agent (the candidate binary, possibly an adapter shim).
@@ -1850,6 +1880,7 @@ pub struct AcpRecipe {
 
 /// One entry in the ACP agent catalog ([`ControlApi::acp_catalog`] / [`ControlApi::acp_discover`]):
 /// a known/registered agent, whether it is installed, and the ACP `initialize`-verified metadata.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpAgentEntry {
     /// The agent display name (catalog key, e.g. `"gemini"`, `"goose"`, `"claude-via-zed"`).
@@ -1874,6 +1905,7 @@ pub struct AcpAgentEntry {
 pub type LogLineStream = BoxStream<'static, LogLine>;
 
 /// A filter for the node log-tail stream ([`ControlApi::logs`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogFilter {
     /// Minimum level to deliver (e.g. `"info"`, `"warn"`, `"error"`); `None` = all.
@@ -1885,6 +1917,7 @@ pub struct LogFilter {
 }
 
 /// One node log line.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLine {
     /// Unix-millis timestamp.
@@ -1899,6 +1932,7 @@ pub struct LogLine {
 
 /// A runtime provider-registry entry (I11 stub DTO): a provider *type* the node can resolve engines
 /// against (the cloud/network builder selection frozen at assembly today).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderInfo {
     /// The provider id/name (e.g. `"anthropic"`, `"openai"`, `"genai"`).
@@ -1912,6 +1946,7 @@ pub struct ProviderInfo {
 }
 
 /// A node tool entry (I12 stub DTO).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInfo {
     /// The tool name (as used in `ProfileSpec.tool_allowlist`).
@@ -1933,6 +1968,7 @@ pub struct ToolInfo {
 // ops, so no operation logic is duplicated.
 
 /// The minimum access tier required to run a command — the `slash_access.py` analog.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandAccess {
     /// Any authenticated user may run it (the read-only floor: e.g. `help`/`whoami`/`status`).
@@ -1943,6 +1979,7 @@ pub enum CommandAccess {
 }
 
 /// Whether a command applies to a specific session or the node as a whole.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandScope {
     /// Operates on a specific session (an invocation should carry a [`SessionId`]).
@@ -1954,6 +1991,7 @@ pub enum CommandScope {
 
 /// A client surface a command is exposed on. An empty `surfaces` list means "all surfaces" (the
 /// common case); a non-empty list restricts the command (the hermes `cli_only`/`gateway_only` analog).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandSurface {
     /// A terminal/CLI shell.
@@ -1967,6 +2005,7 @@ pub enum CommandSurface {
 /// A declarative command-catalog entry (the `CommandDef` analog). **Metadata only** — the handler
 /// lives in the node-side command registry. Clients render menus + autocomplete from this and never
 /// model commands themselves.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     /// Canonical name without the leading slash (e.g. `"lcm"`, `"new"`).
@@ -2008,6 +2047,7 @@ pub struct CommandSpec {
 
 /// A request to run a command. `args` is the raw trailing argument string (handlers parse it, like
 /// hermes' `fn(raw_args: str)`); `session` is required for [`CommandScope::Session`] commands.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandInvocation {
     /// The command name or alias (with or without a leading slash).
@@ -2024,6 +2064,7 @@ pub struct CommandInvocation {
 }
 
 /// The rendered result of a command invocation.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandOutput {
     /// The rendered output text (the client displays it).
@@ -2036,6 +2077,7 @@ pub struct CommandOutput {
 /// An opaque view of the node's runtime config (I13 stub DTO). Carried as a serialized blob so the
 /// concrete `NodeConfig` (a binary-layer type) need not leak into the contract; the shape is the
 /// stable wire envelope, the encoding fills in with the runtime.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfigView {
     /// The config encoding discriminator (e.g. `"toml"` / `"json"`).
@@ -2047,6 +2089,7 @@ pub struct NodeConfigView {
 /// How the scheduler treats a due job whose previous run is still in flight (I15). The default
 /// [`OverlapPolicy::Skip`] also closes the manual-trigger-vs-tick double-fire race: a job already
 /// running is not fired again.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverlapPolicy {
     /// Skip this fire if the job's previous run has not finished (default).
@@ -2061,6 +2104,7 @@ pub enum OverlapPolicy {
 /// How the scheduler treats a job that is overdue when a tick observes it (I15) — e.g. after the
 /// node was down across the fire time. Within a grace window a missed fire still runs once; beyond
 /// it the schedule fast-forwards to the next future occurrence (no thundering herd).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatchUpPolicy {
     /// Fire once if overdue within the grace window; otherwise fast-forward (default).
@@ -2074,6 +2118,7 @@ pub enum CatchUpPolicy {
 
 /// What initiated a recorded cron run (I15): the scheduler's own clock, or an explicit operator/GUI
 /// "run now".
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunTrigger {
     /// Fired by the scheduler at its scheduled time (default).
@@ -2088,6 +2133,7 @@ pub enum RunTrigger {
 /// (`jitter_secs`), locale (`timezone`), a script-only (`no_agent`) path, output-chaining
 /// (`context_from`), delivery routing (`deliver`), and per-job run shaping (`enabled_toolsets`,
 /// `workdir`, `model`/`provider`). All fields past `payload` are additive and default-friendly.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronSpec {
     /// A human name for the job.
@@ -2190,6 +2236,7 @@ impl Default for CronSpec {
 
 /// A scheduled job (I15): a [`CronSpec`] plus its id, next-fire time, and run bookkeeping so a GUI
 /// list can show status without a `cron_runs` round-trip.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronJob {
     /// The opaque job id.
@@ -2217,6 +2264,7 @@ pub struct CronJob {
 }
 
 /// One recorded run of a scheduled job (I15).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronRun {
     /// Unix seconds the run started.
@@ -2239,6 +2287,7 @@ pub struct CronRun {
 
 /// The lifecycle of a [`CronSuggestion`] (I15): a consent-first proposal the operator accepts (which
 /// creates the job) or dismisses (latched by `dedup_key` so it is never re-offered).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SuggestionStatus {
     /// Offered, awaiting an operator decision (default).
@@ -2253,6 +2302,7 @@ pub enum SuggestionStatus {
 /// A ready-to-create cron job the node surfaces for operator consent (I15): catalog starters and
 /// filled blueprints compile to one of these. Accepting it calls `cron_create(spec)`; there is no
 /// second job engine.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronSuggestion {
     /// The opaque suggestion id.
@@ -2278,6 +2328,7 @@ pub struct CronSuggestion {
 /// [`Origin`] to a specific session (+ optional profile + session-naming isolation), surfaced by the
 /// `routing_*` ops so a GUI/operator can pin a chat to a named conversation. The host consults pins
 /// **resolve-first**, overriding the deterministic `session_id_for` derivation.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatRoute {
     /// The inbound origin (transport instance + scope) this pin matches.
@@ -2301,6 +2352,7 @@ fn default_isolation() -> IsolationPolicy {
 /// A room/chat a transport instance knows about ([`ControlApi::transport_rooms`], I5): the read-only
 /// enumeration a GUI lists when binding a chat to a session. Carries the pinned session, when one
 /// exists, so the GUI can show which rooms are already routed.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomInfo {
     /// The transport instance the room belongs to.
@@ -2327,6 +2379,7 @@ pub struct RoomInfo {
 
 /// The live connection state of a transport instance (the Pidgin `PurpleConnectionState` analogue),
 /// surfaced per account so the GUI status bar can show a status dot.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionState {
     /// Not connected (disabled, signed out, or never started).
@@ -2343,6 +2396,7 @@ pub enum ConnectionState {
 /// A normalized presence primitive (libpurple `PurplePresencePrimitive` / Kopete `OnlineStatus`
 /// category / Adium `AIStatusSummary`). Each adapter maps its wire-format presence into this so the
 /// unified roster sorts/filters uniformly across transports.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PresenceState {
     /// Presence is unknown / not reported by this transport.
@@ -2364,6 +2418,7 @@ pub enum PresenceState {
 /// capability-gate affordances (join channel, invite, set topic, send file) instead of switching on
 /// a transport-family string. The daemon analogue of libpurple's `implements_*()` probes / Kopete's
 /// `Capability` flags / Adium's per-service bool flags (daemon-transport-adapter-spec.md §3.2).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterCapabilities {
     /// Supports group/channel conversations (`OriginScope::Group`).
@@ -2384,6 +2439,7 @@ pub struct AdapterCapabilities {
 /// [`AuthProviderInfo::params_schema`] beyond interactive-auth flows. An adapter with no login (the
 /// HTTP surface, the internal Rooms loopback) still describes its instance config (a listen address,
 /// a room-id prefix) with the same [`AuthParamField`] shape.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSettingsSchema {
     /// The fields the client collects to configure one account/instance of this adapter.
@@ -2394,6 +2450,7 @@ pub struct AccountSettingsSchema {
 /// `PurpleProtocol` / Kopete's `Kopete::Protocol` / Adium's `AIService`). Enumerated by
 /// [`ControlApi::transport_adapters`] so the GUI renders the "Add channel" picker and
 /// capability-gates UI (daemon-transport-adapter-spec.md §3).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterInfo {
     /// The transport family / adapter id (`"matrix"`, `"room"`, `"http"`, `"a2a"`).
@@ -2410,6 +2467,7 @@ pub struct AdapterInfo {
 /// One configured transport instance (account) plus its live status — what the GUI status bar and
 /// the unified conversation roster render (the Pidgin/Kopete per-account status-icon analogue).
 /// Closes the per-account connection-state gap (`EIO-9`) the channels user stories track.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportInstanceInfo {
     /// The instance-qualified transport id (e.g. `matrix/@bot:hs.org`, `room`).
@@ -2502,6 +2560,7 @@ pub trait MessagingProtocol: TransportAdapter {
 }
 
 /// Per-verb capability probe for [`SupportsConversations`] (← libpurple's `implements_*`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationOps {
     pub create: bool,
@@ -2592,6 +2651,7 @@ pub trait SupportsConversations: Send + Sync {
 }
 
 /// Per-verb probe for [`SupportsMembership`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipOps {
     pub invite: bool,
@@ -2645,6 +2705,7 @@ pub trait SupportsMembership: Send + Sync {
 }
 
 /// Per-verb probe for [`SupportsRoster`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterOps {
     pub add: bool,
@@ -2668,6 +2729,7 @@ pub trait SupportsRoster: Send + Sync {
 }
 
 /// Per-verb probe for [`SupportsContacts`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactsOps {
     pub get_profile: bool,
@@ -2714,6 +2776,7 @@ pub trait SupportsDirectory: Send + Sync {
 }
 
 /// Per-verb probe for [`SupportsFileTransfer`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTransferOps {
     pub send: bool,
@@ -2737,6 +2800,7 @@ pub trait SupportsFileTransfer: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// ← PurpleConversationType.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationType {
     /// Unset / unknown (faithful round-trip; libpurple keeps `*_UNSET`).
@@ -2753,6 +2817,7 @@ pub enum ConversationType {
 }
 
 /// ← PurpleTypingState.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypingState {
     /// Not typing.
@@ -2765,6 +2830,7 @@ pub enum TypingState {
 }
 
 /// Normalized presence primitive (← `PurplePresencePrimitive`, the faithful 8-value set).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PresencePrimitive {
     /// Offline / unknown.
@@ -2787,6 +2853,7 @@ pub enum PresencePrimitive {
 }
 
 /// ← PurplePresence: a primitive plus optional status decorations.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
     /// The presence primitive.
@@ -2806,6 +2873,7 @@ pub struct Presence {
 }
 
 /// ← PurpleContactInfoPermission.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContactPermission {
     /// Unset.
@@ -2818,6 +2886,7 @@ pub enum ContactPermission {
 }
 
 /// ← PurpleContactInfo: the information used wherever a remote party is referenced.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactInfo {
     /// The adapter-opaque contact id.
@@ -2834,6 +2903,7 @@ pub struct ContactInfo {
 }
 
 /// A per-participant role/affiliation (← Adium `AIGroupChatFlags` / libpurple badges / XMPP affiliations).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberRole {
     /// No special role.
@@ -2853,6 +2923,7 @@ pub enum MemberRole {
 /// is the faithful libpurple identity (a human/remote contact); `Agent` is the delineated daemon
 /// extension — an agent bound as a participant (`member` is its in-conversation handle, `profile`
 /// resolves to a session).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Participant {
     /// A human/remote contact.
@@ -2868,6 +2939,7 @@ pub enum Participant {
 
 /// One occupant of a conversation (← PurpleConversationMember). Observed state the protocol populates
 /// from sync; `session` is the daemon extension binding the member to an engine incarnation.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationMember {
     /// The participant's contact info.
@@ -2890,6 +2962,7 @@ pub struct ConversationMember {
 }
 
 /// A conversation as the host/GUI sees it — the `list`/`get` projection.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationInfo {
     /// The transport that owns the conversation.
@@ -2913,6 +2986,7 @@ pub struct ConversationInfo {
 }
 
 /// Filled values for an adapter-described settings form (the companion to [`AccountSettingsSchema`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSettingsValues {
     /// The filled `key -> value` pairs (keyed by [`AuthParamField::key`]).
@@ -2922,6 +2996,7 @@ pub struct AccountSettingsValues {
 
 /// ← PurpleCreateConversationDetails: the typed common core plus adapter-described extras the UI fills
 /// before `create` (e.g. the Rooms floor policy rides in `extras`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateConversationDetails {
     /// Max participants (`0` = unlimited).
@@ -2939,6 +3014,7 @@ pub struct CreateConversationDetails {
 }
 
 /// ← PurpleChannelJoinDetails.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelJoinDetails {
     /// The channel name.
@@ -2974,6 +3050,7 @@ pub struct ChannelJoinDetails {
 }
 
 /// Minimal avatar carrier for the (deferred) avatar/file interfaces.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
     /// The content-addressed image blob.
@@ -2981,6 +3058,7 @@ pub struct Image {
 }
 
 /// Minimal contact action-menu carrier (← `BirbActionMenu`; deferred).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionMenu {
     /// The action labels.
@@ -2988,6 +3066,7 @@ pub struct ActionMenu {
 }
 
 /// Minimal file-transfer carrier (← `PurpleFileTransfer`; deferred).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTransfer {
     /// The file name.
@@ -3004,6 +3083,7 @@ pub struct FileTransfer {
 /// finished chat block (a `daemon-protocol` [`TranscriptBlock`], already decoded for the consumer —
 /// the GUI renders it directly, an auditor reads one timeline). Streaming deltas never appear here;
 /// they stay on the ephemeral live drains.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalRecordPayload {
     /// A management lifecycle / credential-audit record (its human/structured detail).
@@ -3019,6 +3099,7 @@ pub enum JournalRecordPayload {
 }
 
 /// One decoded + verified journal entry, as returned by a history read.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
     /// The stream-monotonic pagination cursor (pass as the next `after_cursor`).
@@ -3045,6 +3126,7 @@ pub struct JournalRecord {
 
 /// A page of a unit/session's verifiable journal: decoded entries past a cursor plus the pagination
 /// cursors. Non-destructive — repeated reads from the same `after_cursor` return the same page.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalPageView {
     /// The decoded entries in cursor order.
@@ -3066,6 +3148,7 @@ pub struct JournalPageView {
 /// A page of a session's **merged live event log**: the [`SessionLogEntry`] items past a cursor plus
 /// the pagination cursors. Non-destructive — repeated reads from the same `after_seq` return the same
 /// page. This is the live-log analogue of [`JournalPageView`] (which pages the *durable* journal).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogPageView {
     /// The merged-log entries (inbound + outbound) in `seq` order.
@@ -3083,6 +3166,7 @@ pub struct LogPageView {
 
 /// The serializable reflection of a call into the interface — what every non-in-process transport
 /// marshals onto the wire.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiRequest {
     /// [`SessionApi::submit`] / [`SessionApi::submit_from`] / [`SessionApi::submit_as`].
@@ -3981,6 +4065,7 @@ pub enum ApiRequest {
 }
 
 /// The serializable reflection of an interface result.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiResponse {
     /// A successful unit reply (submit/respond/assign/cancel).
@@ -4149,6 +4234,7 @@ pub enum ApiResponse {
 // ---------------------------------------------------------------------------
 
 /// Which root a filesystem op addresses.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsRootId {
@@ -4162,6 +4248,7 @@ pub enum FsRootId {
 }
 
 /// The kind of an advertised root.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsRootKind {
@@ -4174,6 +4261,7 @@ pub enum FsRootKind {
 }
 
 /// A browsable root the node advertises (`fs_roots`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsRoot {
     /// The root id to pass to the other fs ops.
@@ -4188,6 +4276,7 @@ pub struct FsRoot {
 }
 
 /// What kind of directory entry a listing row is.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsEntryKind {
@@ -4200,6 +4289,7 @@ pub enum FsEntryKind {
 }
 
 /// One directory child (fs_list / fs_stat). `path` is root-relative with POSIX separators.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsEntry {
     /// The entry's base name.
@@ -4221,6 +4311,7 @@ pub struct FsEntry {
 
 /// A cheap opaque content etag for optimistic-concurrency writes. NOT [`Revision`] (which is
 /// profile/skill versioning); this avoids re-reading a file to validate a write base.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsRevision {
     /// Last-modified wall-clock milliseconds at read time.
@@ -4230,6 +4321,7 @@ pub struct FsRevision {
 }
 
 /// A file's bytes + etag (fs_read).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsContent {
     /// The (possibly truncated) file bytes.
@@ -4247,6 +4339,7 @@ pub struct FsContent {
 }
 
 /// Metadata for a blob in the node content store (`blob_stat`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobStat {
     /// The blob's byte length (0 when absent).
@@ -4256,6 +4349,7 @@ pub struct BlobStat {
 }
 
 /// A server-side project-search query (fs_search).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsSearchQuery {
     /// The search text (or regex when `regex`).
@@ -4275,6 +4369,7 @@ pub struct FsSearchQuery {
 }
 
 /// One project-search hit.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsSearchHit {
     /// Root-relative path of the matching file.
@@ -4288,6 +4383,7 @@ pub struct FsSearchHit {
 }
 
 /// A page of project-search hits (fs_search).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FsSearchPage {
     /// The hits in this page.
@@ -4298,6 +4394,7 @@ pub struct FsSearchPage {
 }
 
 /// What changed under a watched directory.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsChangeKind {
@@ -4310,6 +4407,7 @@ pub enum FsChangeKind {
 }
 
 /// One change event under a watched directory (fs_watch).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsChange {
     /// Root-relative path that changed.
@@ -4320,6 +4418,7 @@ pub struct FsChange {
 
 /// A page of change events drained by the watch cursor (fs_watch_after), modeled on the session
 /// log's cursor read: `next_seq` is the cursor to pass on the next poll.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FsWatchPageView {
     /// The change events since the requested cursor.
@@ -4333,6 +4432,7 @@ pub struct FsWatchPageView {
 pub type FsWatchStream = BoxStream<'static, FsChange>;
 
 /// Why an api call failed (serializable so it round-trips over any transport).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ApiError {
     /// No such live/durable session.
