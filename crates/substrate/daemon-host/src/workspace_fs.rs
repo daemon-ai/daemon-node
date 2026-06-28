@@ -12,8 +12,9 @@
 //!   [`daemon_core::exec::contain`] + `tokio::fs` (the engine is never involved), reusing the
 //!   agents' containment so a path can never escape its root.
 
+use daemon_common::cursored::CursoredRing;
 use dashmap::DashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -161,18 +162,23 @@ impl WorkspaceRoots {
     }
 }
 
-/// Per-watched-directory change state: a monotonic `seq`, the last directory snapshot
-/// (name -> (mtime_ms, size)), and a bounded ring of `(seq, change)` for cursor reads.
-#[derive(Default)]
+/// Per-watched-directory change state: the last directory snapshot (name -> (mtime_ms, size)) and a
+/// shared [`CursoredRing`] of `(seq, change)` for cursor reads. The ring's floor flags a reader that
+/// aged out (the fs analogue of the merged log's lossy-lag `Reset`); re-list to reconcile.
 struct WatchState {
-    seq: u64,
     snapshot: HashMap<String, (u64, u64)>,
-    ring: VecDeque<(u64, FsChange)>,
+    ring: CursoredRing<FsChange>,
     primed: bool,
-    /// The highest `seq` evicted from the ring on overflow: a reader whose `after_seq` is below this
-    /// lost events that can no longer be served, so its next page is flagged `reset` (re-list to
-    /// reconcile) — the fs analogue of the merged log's lossy-lag `Reset`.
-    floor: u64,
+}
+
+impl WatchState {
+    fn new(cap: usize) -> Self {
+        Self {
+            snapshot: HashMap::new(),
+            ring: CursoredRing::new(cap),
+            primed: false,
+        }
+    }
 }
 
 /// The filesystem operations behind the node's `fs_*` surface. Resolves an [`FsRootId`] to a
@@ -546,14 +552,18 @@ impl WorkspaceFs {
             }
         }
         let key = (Self::root_key(root), dir.to_string());
-        let mut state = self.watches.entry(key).or_default();
+        let cap = self.watch_ring_cap;
+        let mut state = self
+            .watches
+            .entry(key)
+            .or_insert_with(|| WatchState::new(cap));
         if !state.primed {
             state.snapshot = current;
             state.primed = true;
             return Ok(FsWatchPageView {
                 events: Vec::new(),
-                next_seq: state.seq,
-                head_seq: state.seq,
+                next_seq: state.ring.head(),
+                head_seq: state.ring.head(),
                 reset: false,
             });
         }
@@ -582,31 +592,23 @@ impl WorkspaceFs {
         }
         state.snapshot = current;
         for change in changes {
-            state.seq += 1;
-            let seq = state.seq;
-            state.ring.push_back((seq, change));
-            while state.ring.len() > self.watch_ring_cap {
-                if let Some((evicted, _)) = state.ring.pop_front() {
-                    // An overflow eviction loses events; raise the resync floor past them.
-                    state.floor = state.floor.max(evicted);
-                }
-            }
+            // push handles the cap eviction + raising the resync floor past evicted events.
+            state.ring.push(change);
         }
         // The reader's cursor aged out of the ring (events evicted past it): this page can't be a
         // complete delta, so flag `reset` and let the client re-list to reconcile.
-        let reset = after_seq < state.floor;
-        let max = if max == 0 { WATCH_RING_CAP as u32 } else { max };
+        let reset = state.ring.lagged(after_seq);
         let events: Vec<FsChange> = state
             .ring
-            .iter()
-            .filter(|(seq, _)| *seq > after_seq)
-            .take(max as usize)
-            .map(|(_, c)| c.clone())
+            .page(after_seq, max as usize)
+            .into_iter()
+            .map(|(_, c)| c)
             .collect();
+        let head_seq = state.ring.head();
         Ok(FsWatchPageView {
             events,
-            next_seq: state.seq,
-            head_seq: state.seq,
+            next_seq: head_seq,
+            head_seq,
             reset,
         })
     }

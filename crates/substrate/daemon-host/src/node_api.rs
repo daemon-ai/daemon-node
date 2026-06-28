@@ -41,6 +41,7 @@ use daemon_api::{
     SupportsDirectory, SupportsMembership, TelemetryDump, TransportInstanceInfo, TreeReport,
     UnitNode,
 };
+use daemon_common::cursored::CursoredRing;
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
     ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, ProfileRef, QuantRecommendation,
@@ -3893,14 +3894,13 @@ type Delivery = Arc<Mutex<Vec<DeliveryTarget>>>;
 /// multi-surface observability surface — N consumers each page from their own cursor (`log_after`)
 /// or hold a live push subscription (`subscribe`), and never steal each other's events.
 struct MergedLog {
-    /// The next `seq` to assign (one counter across both directions).
-    next_seq: u64,
     /// The session-activation generation (L2 resync): a fresh log after a restart/reactivation
     /// carries a strictly greater epoch, sourced from the durable `SessionMeta.activation_epoch` in
     /// `ensure()`. Stamped onto every `LogPageView` so a client detects a generation change.
     epoch: u64,
-    /// The full ordered history (retained so a late joiner can backfill from any cursor).
-    entries: Vec<SessionLogEntry>,
+    /// The full ordered history as a shared cursored ring (unbounded: a late joiner can backfill
+    /// from any cursor). The entry's own `seq` equals its ring id.
+    ring: CursoredRing<SessionLogEntry>,
     /// The live fan-out to push subscribers.
     tx: broadcast::Sender<SessionLogEntry>,
     /// This log's session id (stamped onto the `SessionAdvanced` node-event).
@@ -3913,12 +3913,11 @@ struct MergedLog {
 impl MergedLog {
     fn new(session: SessionId, epoch: u64, feed: Option<Arc<NodeEventFeed>>) -> Self {
         let (tx, _rx) = broadcast::channel(256);
-        // Seq starts at 1 so the `after_seq` cursor convention (exclusive lower bound; 0 = "from the
-        // start") can address the very first entry.
+        // Unbounded ring: seq starts at 1 so the `after_seq` cursor convention (exclusive lower
+        // bound; 0 = "from the start") can address the very first entry.
         Self {
-            next_seq: 1,
             epoch,
-            entries: Vec::new(),
+            ring: CursoredRing::new(0),
             tx,
             session,
             feed,
@@ -3934,8 +3933,8 @@ impl MergedLog {
         disposition: Disposition,
         payload: SessionPayload,
     ) -> SessionLogEntry {
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        // The id the ring will assign equals the entry's seq (the ring is monotonic from 1).
+        let seq = self.ring.head() + 1;
         let entry = SessionLogEntry {
             seq,
             direction,
@@ -3943,7 +3942,7 @@ impl MergedLog {
             disposition,
             payload,
         };
-        self.entries.push(entry.clone());
+        self.ring.push(entry.clone());
         // A send error only means there are no live subscribers; the history retains the entry.
         let _ = self.tx.send(entry.clone());
         // L3: tell the node-wide feed this session advanced (coalesced per session in the feed's
@@ -3961,14 +3960,13 @@ impl MergedLog {
 
     /// A non-destructive page of entries with `seq > after_seq` (up to `max`, 0 = all).
     fn page(&self, after_seq: u64, max: u32) -> LogPageView {
-        let head_seq = self.next_seq.saturating_sub(1);
-        let mut entries = Vec::new();
-        for e in self.entries.iter().filter(|e| e.seq > after_seq) {
-            if max != 0 && entries.len() >= max as usize {
-                break;
-            }
-            entries.push(e.clone());
-        }
+        let head_seq = self.ring.head();
+        let entries: Vec<SessionLogEntry> = self
+            .ring
+            .page(after_seq, max as usize)
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
         let next_seq = entries.last().map(|e| e.seq).unwrap_or(after_seq);
         LogPageView {
             entries,
@@ -3982,12 +3980,13 @@ impl MergedLog {
     /// holds the log mutex while calling this, so the backlog snapshot and the live subscription are
     /// taken atomically (no entry can slip between them).
     fn subscribe(&self, after_seq: u64) -> LogStream {
+        // The ring is unbounded, so the backlog is always the full tail (never a Lagged marker); a
+        // lossy lag only arises on the live broadcast below.
         let backlog: Vec<LogStreamItem> = self
-            .entries
-            .iter()
-            .filter(|e| e.seq > after_seq)
-            .cloned()
-            .map(LogStreamItem::Entry)
+            .ring
+            .page(after_seq, 0)
+            .into_iter()
+            .map(|(_, e)| LogStreamItem::Entry(e))
             .collect();
         let rx = self.tx.subscribe();
         // Surface a lossy lag as `LogStreamItem::Lagged` (instead of silently dropping it) so a
@@ -4009,7 +4008,6 @@ impl MergedLog {
 pub struct NodeEventFeed {
     inner: Mutex<NodeFeedInner>,
     tx: broadcast::Sender<NodeFeedEntry>,
-    capacity: usize,
 }
 
 #[derive(Clone)]
@@ -4019,10 +4017,9 @@ struct NodeFeedEntry {
 }
 
 struct NodeFeedInner {
-    /// The cursor the next emitted event will take (monotonic, starts at 1; `0` is "before any").
-    next_cursor: u64,
-    /// The bounded retained ring (oldest first).
-    ring: VecDeque<NodeFeedEntry>,
+    /// The bounded retained ring of payload-free events (the shared cursored-ring primitive). Its
+    /// cursor is monotonic from 1; an overflow eviction raises the ring's floor (-> `ResyncNeeded`).
+    ring: CursoredRing<NodeEvent>,
     /// The monotonic roster revision (L4): stamped onto `RosterChanged`/`SessionMetaChanged` AND
     /// returned by `SessionsQuery`, so the two agree on which generation a refetch reflects. In-memory
     /// — resets to 0 on restart, which makes a stale client `since_rev` unservable (-> full page).
@@ -4034,11 +4031,6 @@ struct NodeFeedInner {
     /// empty today (archive is a *change* with `archived=true`, not a removal; the store has no
     /// hard-delete) — reserved so the wire `removed` field is populated when a delete path lands.
     removed: VecDeque<(u64, SessionId)>,
-    /// The highest cursor dropped *because the ring overflowed its capacity* (not coalescing): a
-    /// reader at or below this lost an event that can never be re-read, so it gets `ResyncNeeded`.
-    /// Coalescing drops do not bump this (a superseded `SessionAdvanced` loses no information — the
-    /// later one carries the latest `head_seq`).
-    floor: u64,
     /// The monotonic fleet revision: bumped on every fleet/tree change and stamped onto
     /// `FleetChanged` (its coalescing key; the client re-fetches `Tree` regardless of the value).
     fleet_rev: u64,
@@ -4049,16 +4041,13 @@ impl NodeEventFeed {
         let (tx, _rx) = broadcast::channel(256);
         Arc::new(Self {
             inner: Mutex::new(NodeFeedInner {
-                next_cursor: 1,
-                ring: VecDeque::new(),
+                ring: CursoredRing::new(capacity),
                 rev: 0,
                 changed: HashMap::new(),
                 removed: VecDeque::new(),
-                floor: 0,
                 fleet_rev: 0,
             }),
             tx,
-            capacity,
         })
     }
 
@@ -4119,38 +4108,33 @@ impl NodeEventFeed {
     /// dedups/throttles per-session activity).
     pub fn emit(&self, event: NodeEvent) {
         let mut g = self.inner.lock().unwrap();
-        let cursor = g.next_cursor;
-        g.next_cursor += 1;
         if let NodeEvent::SessionAdvanced { session, .. } = &event {
             let session = session.clone();
-            g.ring.retain(|e| {
-                !matches!(&e.event, NodeEvent::SessionAdvanced { session: s, .. } if *s == session)
-            });
+            // Coalesce a superseded per-session advance (floor-exempt: the later one carries the
+            // latest head_seq, so no information is lost).
+            g.ring.coalesce(
+                |e| matches!(e, NodeEvent::SessionAdvanced { session: s, .. } if *s == session),
+            );
         }
         // FleetChanged coalesces globally (the client always refetches the whole Tree), so a backlog
         // never holds more than the latest one — a spawn burst is one refetch for a reconnecting reader.
+        // Floor-exempt: collapsing superseded fleet pings loses no information.
         if matches!(&event, NodeEvent::FleetChanged { .. }) {
             g.ring
-                .retain(|e| !matches!(&e.event, NodeEvent::FleetChanged { .. }));
+                .coalesce(|e| matches!(e, NodeEvent::FleetChanged { .. }));
         }
-        let entry = NodeFeedEntry { cursor, event };
-        g.ring.push_back(entry.clone());
-        while g.ring.len() > self.capacity {
-            if let Some(dropped) = g.ring.pop_front() {
-                // A capacity eviction loses information; raise the resync floor past it.
-                g.floor = g.floor.max(dropped.cursor);
-            }
-        }
+        // push assigns the cursor + raises the floor on a capacity eviction.
+        let cursor = g.ring.push(event.clone());
         drop(g);
-        let _ = self.tx.send(entry);
+        let _ = self.tx.send(NodeFeedEntry { cursor, event });
     }
 
     /// The one-shot cursor read: the retained events past `after_cursor` (capped at `max`, `0` = all),
     /// or a single `ResyncNeeded` when `after_cursor` aged out of the ring.
     fn page(&self, after_cursor: u64, max: u32) -> EventsPage {
         let g = self.inner.lock().unwrap();
-        let head_cursor = g.next_cursor.saturating_sub(1);
-        if after_cursor < g.floor {
+        let head_cursor = g.ring.head();
+        if g.ring.lagged(after_cursor) {
             return EventsPage {
                 events: vec![NodeEvent::ResyncNeeded {
                     scope: "all".into(),
@@ -4161,12 +4145,9 @@ impl NodeEventFeed {
         }
         let mut events = Vec::new();
         let mut next = after_cursor;
-        for e in g.ring.iter().filter(|e| e.cursor > after_cursor) {
-            if max != 0 && events.len() >= max as usize {
-                break;
-            }
-            events.push(e.event.clone());
-            next = e.cursor;
+        for (cursor, event) in g.ring.page(after_cursor, max as usize) {
+            events.push(event);
+            next = cursor;
         }
         EventsPage {
             events,
@@ -4179,9 +4160,9 @@ impl NodeEventFeed {
     /// when aged out) chained to the live broadcast (a lag surfaces as `ResyncNeeded`).
     fn subscribe(&self, after_cursor: u64) -> NodeEventStream {
         let g = self.inner.lock().unwrap();
-        let head_cursor = g.next_cursor.saturating_sub(1);
+        let head_cursor = g.ring.head();
         let mut backlog: Vec<EventsPage> = Vec::new();
-        if after_cursor < g.floor {
+        if g.ring.lagged(after_cursor) {
             backlog.push(EventsPage {
                 events: vec![NodeEvent::ResyncNeeded {
                     scope: "all".into(),
@@ -4190,10 +4171,10 @@ impl NodeEventFeed {
                 head_cursor,
             });
         } else {
-            for e in g.ring.iter().filter(|e| e.cursor > after_cursor) {
+            for (cursor, event) in g.ring.page(after_cursor, 0) {
                 backlog.push(EventsPage {
-                    events: vec![e.event.clone()],
-                    next_cursor: e.cursor,
+                    events: vec![event],
+                    next_cursor: cursor,
                     head_cursor,
                 });
             }

@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+/// The shared cursored-ring primitive (`CursoredRing`/`CursoredItem`) backing the daemon's live
+/// streams (merged log, node-event feed, fs-watch). Pure + sync.
+pub mod cursored;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;

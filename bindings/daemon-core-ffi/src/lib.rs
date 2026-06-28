@@ -28,6 +28,7 @@ use daemon_api::{
     dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, LogPageView,
     LogStream, LogStreamItem, Outbound, ProviderSelector, SessionApi,
 };
+use daemon_common::cursored::CursoredRing;
 use daemon_common::{Budget, CredScope, ProfileRef, ReqId, SessionId};
 use daemon_core::{
     spawn_agent_session, AgentHandle, Config, CredentialBuilder, CredentialProvider,
@@ -45,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 /// The session's own attribution for engine-emitted (outbound) merged-log entries.
 fn engine_origin() -> Origin {
@@ -524,19 +525,19 @@ type Merged = Arc<Mutex<MergedLog>>;
 /// A focused mirror of the durable host's log, kept self-contained so the brain FFI stays free of
 /// `daemon-host`.
 struct MergedLog {
-    next_seq: u64,
-    entries: Vec<SessionLogEntry>,
+    /// The full ordered history as a shared cursored ring (unbounded, mirroring the host log). The
+    /// entry's own `seq` equals its ring id.
+    ring: CursoredRing<SessionLogEntry>,
     tx: broadcast::Sender<SessionLogEntry>,
 }
 
 impl MergedLog {
     fn new() -> Self {
         let (tx, _rx) = broadcast::channel(256);
-        // Seq starts at 1 so the `after_seq` cursor convention (exclusive lower bound; 0 = "from the
-        // start") can address the very first entry.
+        // Unbounded ring: seq starts at 1 so the `after_seq` cursor convention (exclusive lower
+        // bound; 0 = "from the start") can address the very first entry.
         Self {
-            next_seq: 1,
-            entries: Vec::new(),
+            ring: CursoredRing::new(0),
             tx,
         }
     }
@@ -548,8 +549,8 @@ impl MergedLog {
         disposition: Disposition,
         payload: SessionPayload,
     ) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        // The id the ring will assign equals the entry's seq (the ring is monotonic from 1).
+        let seq = self.ring.head() + 1;
         let entry = SessionLogEntry {
             seq,
             direction,
@@ -557,19 +558,18 @@ impl MergedLog {
             disposition,
             payload,
         };
-        self.entries.push(entry.clone());
+        self.ring.push(entry.clone());
         let _ = self.tx.send(entry);
     }
 
     fn page(&self, after_seq: u64, max: u32) -> LogPageView {
-        let head_seq = self.next_seq.saturating_sub(1);
-        let mut entries = Vec::new();
-        for e in self.entries.iter().filter(|e| e.seq > after_seq) {
-            if max != 0 && entries.len() >= max as usize {
-                break;
-            }
-            entries.push(e.clone());
-        }
+        let head_seq = self.ring.head();
+        let entries: Vec<SessionLogEntry> = self
+            .ring
+            .page(after_seq, max as usize)
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
         let next_seq = entries.last().map(|e| e.seq).unwrap_or(after_seq);
         LogPageView {
             entries,
@@ -581,17 +581,20 @@ impl MergedLog {
     }
 
     fn subscribe(&self, after_seq: u64) -> LogStream {
+        // Unbounded ring: the backlog is always the full tail (never a Lagged marker).
         let backlog: Vec<LogStreamItem> = self
-            .entries
-            .iter()
-            .filter(|e| e.seq > after_seq)
-            .cloned()
-            .map(LogStreamItem::Entry)
+            .ring
+            .page(after_seq, 0)
+            .into_iter()
+            .map(|(_, e)| LogStreamItem::Entry(e))
             .collect();
         let rx = self.tx.subscribe();
-        // The §17 brain seam is single-incarnation; a lossy lag is silently skipped (no Reset).
-        let live = BroadcastStream::new(rx)
-            .filter_map(|r| async move { r.ok().map(LogStreamItem::Entry) });
+        // Surface a lossy broadcast lag as `LogStreamItem::Lagged` (parity with the host log) so a
+        // consumer can re-baseline rather than silently miss entries.
+        let live = BroadcastStream::new(rx).map(|r| match r {
+            Ok(entry) => LogStreamItem::Entry(entry),
+            Err(BroadcastStreamRecvError::Lagged(_)) => LogStreamItem::Lagged,
+        });
         stream::iter(backlog).chain(live).boxed()
     }
 }
