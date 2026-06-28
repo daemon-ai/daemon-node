@@ -1421,8 +1421,13 @@ fs-root = { "id": fs-root-id-t, "label": tstr, "kind": fs-root-kind-t, ? "sessio
 fs-entry-kind-t = "file"
                 / "dir"
                 / "symlink"
-fs-entry = { "name": tstr, "path": tstr, "kind": fs-entry-kind-t, "size": uint, "mtime_ms": uint, ? "ignored": bool }
-fs-revision = { "mtime_ms": uint, "size": uint }
+; 64-bit file metadata: mtime_ms is a millisecond epoch (~1.78e12, always > u32) and size is a file
+; length (can exceed 4 GiB), so these must be u64 - the explicit range makes the generated zcbor
+; codec pick uint64_t (an unconstrained `uint` defaults to uint32_t, which silently overflows on a
+; real mtime). Wire-compatible: ciborium already encodes the Rust u64 as a CBOR uint.
+uint64 = 0..18446744073709551615
+fs-entry = { "name": tstr, "path": tstr, "kind": fs-entry-kind-t, "size": uint64, "mtime_ms": uint64, ? "ignored": bool }
+fs-revision = { "mtime_ms": uint64, "size": uint64 }
 fs-content = { "bytes": byte-array, "revision": fs-revision, ? "truncated": bool, ? "blob_ref": (blob-ref / null) }
 fs-search-query = { "query": tstr, ? "regex": bool, ? "case_sensitive": bool, ? "max_results": uint, ? "page": uint }
 fs-search-hit = { "path": tstr, "line": uint, "col": uint, "preview": tstr }
