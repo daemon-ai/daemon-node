@@ -950,6 +950,28 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // The node-wide event feed (L3): `events_since` serves from this ring and the §5 emit hooks
     // push onto it.
     .with_node_events(node_events.clone());
+    // L3 fleet liveness: bridge the fleet topology bus (`fleet_events`, consumed by `tree_subscribe`)
+    // onto the node-wide feed as a coalesced `FleetChanged`, so `events_since` clients learn the
+    // subagent tree changed (spawn / state / finish) and re-fetch `Tree` live - without threading the
+    // feed through the orchestration crate (only `NodeApiImpl`/`LiveSessions` can reach it directly).
+    // `FleetChanged` coalesces in the feed ring, so a spawn burst is one client refetch; a `Lagged`
+    // (the bridge fell behind the bus) is itself just "the tree changed".
+    {
+        let feed = node_events.clone();
+        let mut rx = fleet_events.subscribe();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match rx.recv().await {
+                    Ok(_) | Err(RecvError::Lagged(_)) => {
+                        let rev = feed.note_fleet_change();
+                        feed.emit(daemon_api::NodeEvent::FleetChanged { rev });
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     // Bind the filesystem / workspace surface (`fs_*`) over the SAME `WorkspaceRoots` the engine
     // exec builders root at, so operator and agent see one filesystem.
     if let Some(roots) = &workspace_roots {

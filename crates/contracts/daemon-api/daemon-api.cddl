@@ -458,12 +458,14 @@ log-page-view = {
 node-event = node-event-session-advanced
            / node-event-session-meta-changed
            / node-event-roster-changed
+           / node-event-fleet-changed
            / node-event-approval-pending
            / node-event-download-progress
            / node-event-resync-needed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint, "head_seq": uint } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint } }
+node-event-fleet-changed        = { "FleetChanged":       { "rev": uint } }
 node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }

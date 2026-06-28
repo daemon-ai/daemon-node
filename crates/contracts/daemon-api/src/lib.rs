@@ -3283,6 +3283,12 @@ pub enum NodeEvent {
         /// The new roster revision.
         rev: u64,
     },
+    /// The fleet/subagent tree changed (a unit spawned / changed state / finished); the client
+    /// refetches `Tree`. Like `RosterChanged`, a payload-free pointer carrying a coalescing `rev`.
+    FleetChanged {
+        /// The new fleet revision.
+        rev: u64,
+    },
     /// An approval is pending operator action.
     ApprovalPending {
         /// The session it belongs to.

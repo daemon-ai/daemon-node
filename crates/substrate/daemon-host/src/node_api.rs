@@ -4039,6 +4039,9 @@ struct NodeFeedInner {
     /// Coalescing drops do not bump this (a superseded `SessionAdvanced` loses no information — the
     /// later one carries the latest `head_seq`).
     floor: u64,
+    /// The monotonic fleet revision: bumped on every fleet/tree change and stamped onto
+    /// `FleetChanged` (its coalescing key; the client re-fetches `Tree` regardless of the value).
+    fleet_rev: u64,
 }
 
 impl NodeEventFeed {
@@ -4052,6 +4055,7 @@ impl NodeEventFeed {
                 changed: HashMap::new(),
                 removed: VecDeque::new(),
                 floor: 0,
+                fleet_rev: 0,
             }),
             tx,
             capacity,
@@ -4101,6 +4105,14 @@ impl NodeEventFeed {
         self.inner.lock().unwrap().rev
     }
 
+    /// Bump the fleet revision and return it. The fleet bridge (in the node crate) calls this then
+    /// stamps the returned `rev` onto a `FleetChanged` so a spawn burst collapses to one `Tree` refetch.
+    pub fn note_fleet_change(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.fleet_rev += 1;
+        g.fleet_rev
+    }
+
     /// Assign a cursor, retain in the bounded ring, and broadcast live. Consecutive
     /// `SessionAdvanced` for the same session are coalesced in the *backlog* (latest wins) so a
     /// reconnecting reader isn't flooded; the live broadcast still fires per emit (the client
@@ -4114,6 +4126,12 @@ impl NodeEventFeed {
             g.ring.retain(|e| {
                 !matches!(&e.event, NodeEvent::SessionAdvanced { session: s, .. } if *s == session)
             });
+        }
+        // FleetChanged coalesces globally (the client always refetches the whole Tree), so a backlog
+        // never holds more than the latest one — a spawn burst is one refetch for a reconnecting reader.
+        if matches!(&event, NodeEvent::FleetChanged { .. }) {
+            g.ring
+                .retain(|e| !matches!(&e.event, NodeEvent::FleetChanged { .. }));
         }
         let entry = NodeFeedEntry { cursor, event };
         g.ring.push_back(entry.clone());
@@ -5123,6 +5141,33 @@ mod node_feed_tests {
             advanced,
             vec![(a, 4), (b, 9)],
             "coalesced to the latest per session"
+        );
+    }
+
+    #[test]
+    fn fleet_changed_is_coalesced_in_the_backlog() {
+        let feed = NodeEventFeed::new(64);
+        for rev in 1..=4 {
+            feed.emit(NodeEvent::FleetChanged { rev });
+        }
+        feed.emit(NodeEvent::RosterChanged { rev: 1 }); // a different event is untouched
+        feed.emit(NodeEvent::FleetChanged { rev: 5 });
+        let page = feed.page(0, 0);
+        let fleet = page
+            .events
+            .iter()
+            .filter(|e| matches!(e, NodeEvent::FleetChanged { .. }))
+            .count();
+        assert_eq!(fleet, 1, "the backlog keeps a single (latest) FleetChanged");
+        assert!(
+            matches!(page.events.last(), Some(NodeEvent::FleetChanged { rev: 5 })),
+            "the latest FleetChanged wins"
+        );
+        assert!(
+            page.events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::RosterChanged { .. })),
+            "FleetChanged coalescing must not drop other events"
         );
     }
 

@@ -500,11 +500,12 @@ then fetches detail lazily on focus.
 request-events-since = { "EventsSince": {
   "cursor": uint, ? "wait_ms": (uint / null), ? "filter": (event-filter / null) } }
 
-node-event = session-advanced / session-meta-changed / roster-changed
+node-event = session-advanced / session-meta-changed / roster-changed / fleet-changed
            / approval-pending / download-progress / resync-needed
 session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint, "head_seq": uint } }
 session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint } }
 roster-changed       = { "RosterChanged":      { "rev": uint } }
+fleet-changed        = { "FleetChanged":       { "rev": uint } }   ; the subagent tree changed -> refetch Tree
 approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
 download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr } }
 resync-needed        = { "ResyncNeeded":       { "scope": tstr } }   ; the feed itself lagged

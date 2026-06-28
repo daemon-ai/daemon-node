@@ -2739,6 +2739,78 @@ mod node_interface {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Live fleet push: a durable delegation (the default node delegates once on `Assign`) changes the
+    /// subagent tree, and the `assemble()` bridge forwards the fleet bus onto the node-wide feed as a
+    /// `FleetChanged` so an `EventsSince` client re-fetches `Tree` live (not just on focus/reconnect).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_since_feed_delivers_fleet_changed_on_delegation() {
+        use daemon_api::{NodeEvent, WireS2C};
+        use daemon_host::MuxApiClient;
+
+        let (node, handle) = assemble();
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+
+        let mut mux = MuxApiClient::connect(path.clone())
+            .await
+            .expect("mux connect + hello");
+        let feed_id = mux
+            .open(ApiRequest::EventsSince {
+                cursor: 0,
+                wait_ms: None,
+            })
+            .await
+            .expect("open events-since");
+
+        match mux
+            .call(ApiRequest::Assign {
+                session: SessionId::new("fleet-feed-op"),
+            })
+            .await
+            .expect("assign drives a delegation")
+        {
+            ApiResponse::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let mut saw_fleet = false;
+        while !saw_fleet {
+            let frame = match tokio::time::timeout(Duration::from_secs(30), mux.next()).await {
+                Ok(f) => f.expect("feed frame"),
+                Err(_) => break, // deadline: no FleetChanged arrived
+            };
+            match frame {
+                WireS2C::Item { id: rid, res } => {
+                    assert_eq!(rid, feed_id, "Item must carry the feed stream id");
+                    let ApiResponse::EventsPage(page) = res else {
+                        panic!("EventsSince Item must wrap an EventsPage, got {res:?}");
+                    };
+                    if page
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, NodeEvent::FleetChanged { .. }))
+                    {
+                        saw_fleet = true;
+                    }
+                }
+                WireS2C::End { id: rid, error } => {
+                    panic!("feed ended early: id={rid} error={error:?}")
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_fleet,
+            "the feed delivered no FleetChanged after a delegation"
+        );
+
+        handle.shutdown().await;
+        server.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_surface_is_transport_agnostic_and_drives_a_session_to_completion() {
         let (node, handle) = assemble();
