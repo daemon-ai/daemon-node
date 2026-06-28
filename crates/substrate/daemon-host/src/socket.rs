@@ -13,7 +13,7 @@
 use daemon_api::{
     dispatch, from_cbor, is_streaming, to_cbor, ApiError, ApiRequest, ApiResponse, EventsPage,
     LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM,
-    WIRE_VERSION,
+    WIRE_FEATURE_VERSIONING, WIRE_VERSION,
 };
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::StreamExt;
@@ -145,13 +145,20 @@ async fn serve_mux(
         };
         match frame {
             WireC2S::Hello { .. } => {
+                // Advertise the always-on envelope capabilities plus any optional surface the node
+                // actually hosts (versioning needs a bound revision log), so the client can hide
+                // unavailable affordances up front.
+                let mut features = vec![
+                    WIRE_FEATURE_MUX.to_string(),
+                    WIRE_FEATURE_STREAM.to_string(),
+                ];
+                if api.supports_versioning() {
+                    features.push(WIRE_FEATURE_VERSIONING.to_string());
+                }
                 let _ = tx
                     .send(WireS2C::Hello {
                         wire_version: WIRE_VERSION,
-                        features: vec![
-                            WIRE_FEATURE_MUX.to_string(),
-                            WIRE_FEATURE_STREAM.to_string(),
-                        ],
+                        features,
                     })
                     .await;
             }

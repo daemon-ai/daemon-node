@@ -4515,6 +4515,13 @@ mod node_interface {
         let _ = std::fs::remove_dir_all(&dir);
         let (node, handle, skills) = assemble_versioning(&dir);
 
+        // A node assembled with a bound revision log advertises the `versioning` capability (the
+        // Hello feature the client gates its History/Revert UI on).
+        assert!(
+            node.supports_versioning(),
+            "a versioned node reports supports_versioning"
+        );
+
         // --- profile history + non-destructive revert + roll-forward ---
         let mut spec = ProfileSpec::new("p1", ProviderSelector::GenAi, "claude-opus-4-8");
         spec.credential_ref = Some("team-key".into());

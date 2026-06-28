@@ -1211,6 +1211,14 @@ pub trait ModelApi: Send + Sync {
 /// (backed by a `ProfileStore`).
 #[async_trait]
 pub trait ProfileApi: Send + Sync {
+    /// Whether this node hosts profile/skill versioning (a bound revision log). When false, the
+    /// `profile_history`/`profile_revert` (and skill equivalents) ops resolve to
+    /// [`ApiError::Unsupported`]. Advertised as the `versioning` Hello feature so a client can hide
+    /// its history/revert affordances up front rather than discovering the gap per request.
+    fn supports_versioning(&self) -> bool {
+        false
+    }
+
     /// All known profiles (listing view, with the active default marked).
     async fn profile_list(&self) -> Vec<ProfileInfo> {
         Vec::new()
@@ -4407,6 +4415,9 @@ pub const WIRE_VERSION: u32 = 1;
 pub const WIRE_FEATURE_MUX: &str = "mux";
 /// Feature flag: the server can push `Item`/`End` frames for streaming requests.
 pub const WIRE_FEATURE_STREAM: &str = "stream";
+/// Feature flag: the node hosts profile/skill versioning (a bound revision log), so the
+/// `Profile{History,At,Revert}` (+ skill) ops are available rather than `Unsupported`.
+pub const WIRE_FEATURE_VERSIONING: &str = "versioning";
 
 /// A client -> server multiplexed frame. Wraps an [`ApiRequest`] so one connection can carry many
 /// correlated exchanges. Absent on the legacy path: a connection whose first frame decodes as a

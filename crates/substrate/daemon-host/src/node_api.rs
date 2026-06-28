@@ -3439,6 +3439,10 @@ fn skill_err(e: daemon_skills::SkillError) -> ApiError {
 
 #[async_trait]
 impl ProfileApi for NodeApiImpl {
+    fn supports_versioning(&self) -> bool {
+        self.revisions.is_some()
+    }
+
     async fn profile_list(&self) -> Vec<ProfileInfo> {
         let Ok(store) = self.profile_store() else {
             return Vec::new();
