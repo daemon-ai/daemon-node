@@ -961,14 +961,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         let mut rx = fleet_events.subscribe();
         tokio::spawn(async move {
             use tokio::sync::broadcast::error::RecvError;
-            loop {
-                match rx.recv().await {
-                    Ok(_) | Err(RecvError::Lagged(_)) => {
-                        let rev = feed.note_fleet_change();
-                        feed.emit(daemon_api::NodeEvent::FleetChanged { rev });
-                    }
-                    Err(RecvError::Closed) => break,
-                }
+            // Loop until the bus closes; both a value and a `Lagged` mean "the tree changed".
+            while let Ok(_) | Err(RecvError::Lagged(_)) = rx.recv().await {
+                let rev = feed.note_fleet_change();
+                feed.emit(daemon_api::NodeEvent::FleetChanged { rev });
             }
         });
     }
@@ -1975,7 +1971,7 @@ impl CronScheduler for CronWorker {
             let schedule = match Self::schedule_of(&spec) {
                 Ok(s) => s,
                 Err(_) => {
-                    // Unparseable schedule: clear next_fire so it stops being due (operator must fix).
+                    // Unparsable schedule: clear next_fire so it stops being due (operator must fix).
                     let mut job = job.clone();
                     job.next_fire_unix = None;
                     let _ = self.store.cron_set(job).await;
