@@ -177,7 +177,13 @@ impl DeliveryManager {
                     return;
                 }
             };
-            while let Some(entry) = stream.next().await {
+            while let Some(item) = stream.next().await {
+                // Best-effort-skip a lossy lag (the prior silent-drop behavior); durable delivery
+                // re-baseline is future work.
+                let entry = match item {
+                    daemon_api::LogStreamItem::Entry(e) => e,
+                    daemon_api::LogStreamItem::Lagged => continue,
+                };
                 if !still_owns(&me.api, &session, &transport).await {
                     break;
                 }

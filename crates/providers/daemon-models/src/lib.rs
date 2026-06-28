@@ -33,7 +33,7 @@ pub mod recommend;
 pub mod registry;
 pub mod resolve;
 
-pub use acquire::{DownloadPlan, Downloader, PlanFile, ResolvedArtifact};
+pub use acquire::{DownloadPlan, DownloadProgressCb, Downloader, PlanFile, ResolvedArtifact};
 pub use cache::CacheConfig;
 pub use error::{ModelError, Result};
 pub use hardware::HardwareProbe;

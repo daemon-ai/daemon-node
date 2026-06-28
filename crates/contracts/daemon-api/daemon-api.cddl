@@ -13,9 +13,12 @@
 ; local and never appear on the wire, so the encoding is unchanged.
 ;
 kv-pair = [k: tstr, v: tstr]
-; Rust byte vectors (`Vec<u8>`, `[u8; N]`) are plain serde sequences: ciborium serializes them as a
-; CBOR array of integers, NOT a byte string (no `serde_bytes` is used). The contract mirrors that.
-byte-array = [* uint]
+; Variable-length opaque byte payloads (file/blob content, opaque event/meta `body` blobs) are
+; CBOR byte strings: the Rust fields carry `#[serde(with = "serde_bytes")]` so ciborium emits a
+; `bstr`, which the generated zcbor codec decodes as an unbounded `zcbor_string` (no array element
+; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
+; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
+byte-array = bstr
 wire_version = uint                 ; daemon-common WireVersion (current = 20)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
@@ -231,11 +234,14 @@ session-query = {
   ? "scope": session-scope,             ; default "TopLevel"
   ? "after": (session-id / null),       ; exclusive cursor (last id of previous page)
   ? "limit": uint,                      ; 0 = server default
+  ? "since_rev": (uint / null),         ; L4: delta read past this roster revision (null = full page)
 }
 
 session-page = {
   "sessions": [* session-info],
   ? "next_cursor": (session-id / null), ; null => last page
+  "rev": uint,                          ; L4: the roster revision this page reflects
+  ? "removed": [* session-id],          ; L4: ids removed since since_rev (delta reads only)
 }
 
 ; One session's full detail (the detail-pane round-trip).
@@ -445,6 +451,26 @@ log-page-view = {
   "entries": [* session-log-entry],
   "next_seq": uint,
   "head_seq": uint,
+  "epoch": uint,                      ; session-activation generation (L2 resync; 0 = first activation)
+}
+
+; ----- node-wide event feed (L3 EventsSince): payload-free "what changed out of focus" pointers -----
+node-event = node-event-session-advanced
+           / node-event-session-meta-changed
+           / node-event-roster-changed
+           / node-event-approval-pending
+           / node-event-download-progress
+           / node-event-resync-needed
+node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint, "head_seq": uint } }
+node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint } }
+node-event-roster-changed       = { "RosterChanged":      { "rev": uint } }
+node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
+node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr } }
+node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
+events-page = {
+  "events": [* node-event],
+  "next_cursor": uint,                ; pass as the next EventsSince cursor
+  "head_cursor": uint,                ; highest cursor the feed has assigned
 }
 
 ; ----- outbound delivery targets (§5.4: where a session's replies post) + handover -----
@@ -707,7 +733,7 @@ author = "operator"
 revision = {
   "seq": uint,
   "parent": (uint / null),
-  "content_hash": byte-array,            ; 32-byte SHA-256 of the snapshot blob
+  "content_hash": content-hash,          ; 32-byte SHA-256 of the snapshot blob (array, see below)
   "author": author,
   "reason": tstr,
   "ts_ms": uint,
@@ -897,6 +923,8 @@ channel-join-details = {
 
 request-submit = { "Submit": { "session": session-id, "command": agent-command, ? "origin": (origin / null), ? "profile": (profile-ref / null) } }
 request-submit-routed = { "SubmitRouted": { "origin": origin, "command": agent-command } }
+; Poll: a DESTRUCTIVE single-consumer drain (FFI/MCP-LCD only; multi-surface uses SessionHistory /
+; the cursored log subscribe). See daemon-event-io-spec §5.4.1 (unified cursored-stream contract).
 request-poll = { "Poll": { "session": session-id, "max": uint } }
 request-respond = { "Respond": { "session": session-id, "response": host-response } }
 request-health = "Health"
@@ -908,10 +936,14 @@ request-cancel = { "Cancel": { "session": session-id } }
 request-fleet = "Fleet"
 request-tree = "Tree"
 request-unit = { "Unit": { "unit": unit-id } }
+; UnitEvents: a NON-destructive bounded snapshot of a unit's recent management-event views (a read
+; over a retained ring), despite the legacy "drain"-style naming. UnitOutbound: a DESTRUCTIVE
+; single-consumer drain (FFI/MCP-LCD; multi-surface uses UnitHistory). See daemon-event-io-spec §5.4.1.
 request-unit-events = { "UnitEvents": { "unit": unit-id, "max": uint } }
 request-unit-outbound = { "UnitOutbound": { "unit": unit-id, "max": uint } }
 request-session-history = { "SessionHistory": { "session": session-id, "after_cursor": uint, "max": uint } }
 request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint, "max": uint } }
+request-events-since = { "EventsSince": { "cursor": uint, ? "wait_ms": (uint / null) } }
 request-delivery-targets = { "DeliveryTargets": { "session": session-id } }
 request-delivery-sessions = { "DeliverySessions": { "transport": transport-id } }
 request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
@@ -1059,6 +1091,7 @@ api-request = request-submit
             / request-unit-outbound
             / request-session-history
             / request-subscribe
+            / request-events-since
             / request-delivery-targets
             / request-delivery-sessions
             / request-handover
@@ -1205,6 +1238,7 @@ response-unit = { "Unit": (unit-node / null) }
 response-unit-events = { "UnitEvents": [* manage-event-view] }
 response-journal = { "Journal": journal-page-view }
 response-log-page = { "LogPage": log-page-view }
+response-events-page = { "EventsPage": events-page }
 response-delivery-targets = { "DeliveryTargets": [* delivery-target] }
 response-delivery-sessions = { "DeliverySessions": [* session-id] }
 response-verifying-key = { "VerifyingKey": (tstr / null) }
@@ -1283,6 +1317,7 @@ api-response = response-ok
              / response-unit-events
              / response-journal
              / response-log-page
+             / response-events-page
              / response-delivery-targets
              / response-delivery-sessions
              / response-verifying-key
@@ -1348,6 +1383,31 @@ api-response = response-ok
              / response-blob-get
              / response-blob-stat
 
+; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
+; Wraps api-request/api-response so one connection carries many correlated exchanges, with
+; server-push (Item/End) for streaming requests. These are NOT zcbor entry types (the vendored client
+; codec hand-codes this tiny envelope and the generated codec stays scoped to api-request/-response);
+; they are here as the authoritative schema + cddl-cat conformance target. The legacy bare
+; api-request / api-response path (a connection that sends no Hello) stays valid.
+wire-hello  = { "Hello":  { "wire_version": uint, "features": [* tstr] } }
+wire-call   = { "Call":   { "id": uint, "req": api-request } }
+wire-open   = { "Open":   { "id": uint, "req": api-request } }
+wire-cancel = { "Cancel": { "id": uint } }
+wire-c2s = wire-hello
+         / wire-call
+         / wire-open
+         / wire-cancel
+
+wire-reply = { "Reply": { "id": uint, "res": api-response } }
+wire-item  = { "Item":  { "id": uint, "res": api-response } }
+wire-end   = { "End":   { "id": uint, "error": (api-error / null) } }
+wire-reset = { "Reset": { "id": uint, "epoch": uint, "head_seq": uint } }
+wire-s2c = wire-hello
+         / wire-reply
+         / wire-item
+         / wire-end
+         / wire-reset
+
 ; ----- filesystem / workspace surface DTOs (wire v14; daemon-fs-surface-spec.md) -----
 fs-root-id-host = { "host": tstr }
 fs-root-id-session = { "session": session-id }
@@ -1371,10 +1431,15 @@ fs-change-kind-t = "created"
                  / "modified"
                  / "removed"
 fs-change = { "path": tstr, "kind": fs-change-kind-t }
-fs-watch-page-view = { "events": [* fs-change], "next_seq": uint }
+; Cursored, resync-capable (daemon-event-io-spec §5.4.1): head_seq is the live edge; reset=true means
+; the reader's after_seq aged out of the ring (events evicted) so the page is not a complete delta and
+; the client must re-list to reconcile (the fs analogue of the merged log's Lagged -> Reset).
+fs-watch-page-view = { "events": [* fs-change], "next_seq": uint, "head_seq": uint, "reset": bool }
 
 ; ----- content store DTOs (wire v14; daemon-content-transfer-spec.md) -----
-content-hash = byte-array                 ; 32-byte SHA-256 (mirrors revision.content_hash)
+; 32-byte SHA-256, kept as a CBOR array of ints (ContentHash([u8; 32]) serializes as a sequence; the
+; fixed 32-byte size is well under the codec's array cap, so it does not need the bstr treatment).
+content-hash = [* uint]
 byte-range = { "offset": uint, "len": uint }
 blob-ref = { "hash": content-hash, "size": uint, ? "name": (tstr / null), ? "mime": (tstr / null) }
 blob-stat = { "size": uint, "present": bool }

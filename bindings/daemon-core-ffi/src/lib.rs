@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use daemon_api::{
     dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, LogPageView,
-    LogStream, Outbound, ProviderSelector, SessionApi,
+    LogStream, LogStreamItem, Outbound, ProviderSelector, SessionApi,
 };
 use daemon_common::{Budget, CredScope, ProfileRef, ReqId, SessionId};
 use daemon_core::{
@@ -575,18 +575,23 @@ impl MergedLog {
             entries,
             next_seq,
             head_seq,
+            // The in-process §17 brain seam is single-incarnation; epoch resync is a socket concern.
+            epoch: 0,
         }
     }
 
     fn subscribe(&self, after_seq: u64) -> LogStream {
-        let backlog: Vec<SessionLogEntry> = self
+        let backlog: Vec<LogStreamItem> = self
             .entries
             .iter()
             .filter(|e| e.seq > after_seq)
             .cloned()
+            .map(LogStreamItem::Entry)
             .collect();
         let rx = self.tx.subscribe();
-        let live = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+        // The §17 brain seam is single-incarnation; a lossy lag is silently skipped (no Reset).
+        let live = BroadcastStream::new(rx)
+            .filter_map(|r| async move { r.ok().map(LogStreamItem::Entry) });
         stream::iter(backlog).chain(live).boxed()
     }
 }

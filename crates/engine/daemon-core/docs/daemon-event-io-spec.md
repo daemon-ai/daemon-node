@@ -513,6 +513,79 @@ Primary target to the GUI — no longer a tangle of competing primaries. There i
 no `mirror.py`, no DB-as-IPC. (Auth for *who may observe/inject/handover*: single-tenant local-trust
 for v1 — any authenticated local client may attach to any session; per-principal ACLs deferred.)
 
+### 5.4.1 Unified cursored-stream contract + conformance (the gold standard, and what still deviates)
+
+The merged session log (above) and the durable verifiable journal are the **gold standard** every
+read/stream/drain surface should converge on. The L0-L4 sync-protocol refactor
+(`daemon/docs/specs/daemon-sync-protocol-spec.md`) made the client side of this contract real
+(epoch-stamped push, `EventsSince` feed, revisioned lists); this section states the contract
+authoritatively for the daemon-node internals + adapters and inventories where they conform or
+deviate. It is a convergence onto an existing intent, not a rewrite — the journal substrate
+(`JournalStreamId`/`load_journal`/`JournalSink`, shared by sessions/units/conversations) already
+unifies the durable side.
+
+**The one contract.** A conforming data source is:
+
+1. **Monotonic** — a `seq` (volatile live tail) or `cursor` (durable journal) totally orders items.
+2. **Non-destructive** — re-readable from any cursor; a read never consumes. (`after_seq`/`after_cursor`
+   is an exclusive lower bound; repeated reads from the same cursor return the same items.)
+3. **Durable + epoch-stamped where it must survive a restart** — the journal carries `cursor` + `epoch`
+   (+ `sealed_after`); the volatile live tail carries `epoch` too (L2), so a generation change
+   (restart/reactivation) is detectable rather than silently mis-applied.
+4. **Lossy-safe** — a gap (broadcast lag, ring-cap eviction, aged-out cursor) surfaces as an explicit
+   `Reset` / `ResyncNeeded` signal, never a silent skip; the consumer re-baselines from the durable
+   source.
+
+Destructive drains (`poll`-style, each read consumes) are a **single-consumer convenience** for the
+FFI / MCP lowest-common-denominator, never the multi-surface basis (a drain is inherently one-reader).
+
+**Conformance inventory** (refreshed after L0-L4 landed):
+
+| Surface | Status | Notes |
+|---|---|---|
+| `Subscribe` / `log_after` (`LogPageView`) | Conforms | Carries `epoch` (L2); push via `Open` (L0); `Lagged` -> `Reset` |
+| `SessionHistory` / `UnitHistory` / `ConvHistory` (`Journal`) | Conforms | Durable `cursor` + `epoch` + `sealed_after`; the re-baseline source |
+| `daemon-delivery` resume loop | Conforms | `delivery_sessions` + `subscribe(0)`, cursor-driven |
+| mux envelope `Reset` frame (L0) | Conforms | The lossy-lag re-baseline signal on the wire |
+| `EventsSince` node feed (`EventsPage`, L3) | Conforms | Monotonic node cursor + retained ring; `ResyncNeeded` on aged-out |
+| roster `SessionsQuery` (L4) | Conforms (delta) | Monotonic `rev` + `since_rev` delta + scope-relative `removed`; full page when unservable |
+| `Poll` / `unit_outbound` | Deviates (by design) | Destructive single-consumer drains; FFI/MCP-LCD only — documented, multi-consumer callers use `SessionHistory`/`UnitHistory` |
+| `unit_events` | Conforms (mis-named) | Already a non-destructive bounded snapshot; the trait/CDDL comment still says "drain" -> fixed to "bounded snapshot" |
+| `FsWatchPoll` (`fs-watch-page-view`) | Conforms | `head_seq` + `reset` (set when `after_seq` aged out of the bounded ring) -> client re-lists to reconcile; the fs analogue of `Lagged -> Reset` |
+| profiles / models / approvals lists | Deviates (deferred) | No delta yet (§6.2 of the sync-protocol spec); small lists, full refetch is fine until one grows |
+
+Resolved by L0-L4 (previously deviations): the live `LogPageView` now carries `epoch` (was the L2
+fix), and snapshot lists gained a delta for the roster (the L3 `EventsSince` "what changed" signal +
+the L4 `rev`/`since_rev`/`removed` query). What remains is non-session live-surface cleanup, mostly
+documentation + comments (no wire breaks), tracked as the migration punch list below.
+
+**Migration punch list (Phase 5 of the sync-protocol plan).** (a) Demote + document the destructive
+drains (`Poll`/`unit_outbound`) as single-consumer LCD; rename `unit_events`' "drain" wording to
+"bounded snapshot". (b) FsWatch aligned to the contract (Phase 4): `fs-watch-page-view` carries
+`head_seq` + `reset` (set when `after_seq` aged out of the bounded ring), so the client re-lists to
+reconcile instead of silently missing changes. (c) Normalize cursor
+vocabulary (§5.4.2). (d) Optional: a shared Rust `CursoredStream`/`LogStreamItem` seam so the
+hand-rolled live `MergedLog`, the fs-watch ring, and the fleet bus stop being three patterns (gated
+on appetite; the journal already unifies the durable side). Per-resource list deltas
+(profiles/models/approvals) stay deferred (§6.2).
+
+### 5.4.2 Cursor vocabulary
+
+Two cursor families, named for what they index, so a reader can tell volatile position from durable
+key at a glance:
+
+- `after_seq` / `head_seq` / `next_seq` — a **volatile live** position into a `seq`-stamped tail
+  (the merged session log, `EventsSince` node cursor, a fs-watch ring). Resets across a generation
+  change; pair with `epoch` where restart-detection matters.
+- `after_cursor` / `head_cursor` / `next_cursor` — a **durable journal** key (`SessionHistory` /
+  `UnitHistory` / `ConvHistory`), stable across restart, epoch-stamped.
+
+Deliberate exceptions (named, not drift): `SessionsQuery.after` is an **id-cursor** (the last
+`SessionId` of the previous page — pagination, not a sequence); `ModelSearch.page` is an HTTP-style
+**page index** (the Hub's own paging); `Revision.seq` on the FS / model-file write surface is an
+**optimistic-concurrency precondition** (a write `base_revision`), not a read cursor — see §6.3 of
+the sync-protocol spec.
+
 ### 5.5 Scheduled triggers (cron) over the store outbox
 
 Cron is a **trigger source**, not a gateway feature and not an engine feature. Proposed crate

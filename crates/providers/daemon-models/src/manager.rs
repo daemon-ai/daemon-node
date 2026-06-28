@@ -80,6 +80,12 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
+    /// Wire the node-wide download-progress callback (L3 `DownloadProgress`): the host sets this
+    /// after assembly so a job's progress fans onto the event feed instead of the client polling.
+    pub fn set_download_progress(&self, cb: crate::acquire::DownloadProgressCb) {
+        self.downloader.set_progress(cb);
+    }
+
     /// Build a manager over the shared cache + catalog.
     pub async fn new(config: ManagerConfig) -> Result<Self> {
         let cache = CacheConfig::resolve(config.cache_dir);

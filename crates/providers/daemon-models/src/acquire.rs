@@ -22,6 +22,11 @@ use crate::cache::CacheConfig;
 use crate::error::{from_hf, ModelError, Result};
 use crate::gguf;
 
+/// A progress callback the host wires to fan a job's [`DownloadStatus`] onto the node-wide event
+/// feed (L3 `DownloadProgress`), so the client renders live progress without polling. Invoked on
+/// every state transition and per-file completion.
+pub type DownloadProgressCb = Arc<dyn Fn(DownloadStatus) + Send + Sync>;
+
 /// One file to fetch for a job, with its expected size (for the progress total).
 #[derive(Clone, Debug)]
 pub struct PlanFile {
@@ -86,6 +91,9 @@ struct Job {
     stop: Arc<Mutex<Option<StopKind>>>,
     /// The resolved artifact once the job completes.
     artifact: Arc<Mutex<Option<ResolvedArtifact>>>,
+    /// The shared progress callback (L3): cloned from the [`Downloader`] at job creation, so a
+    /// callback wired after a job started still fires (the `Arc<Mutex<Option>>` is shared).
+    progress: Arc<std::sync::Mutex<Option<DownloadProgressCb>>>,
 }
 
 /// The acquisition engine: an `hf-hub` API over the shared cache plus a job table.
@@ -95,6 +103,9 @@ pub struct Downloader {
     jobs: Arc<Mutex<HashMap<DownloadId, Arc<Job>>>>,
     by_model: Arc<Mutex<HashMap<ModelRef, DownloadId>>>,
     next_id: Arc<AtomicU64>,
+    /// The optional node-wide progress callback (L3). Interior-mutable + shared across clones/jobs so
+    /// the host can wire it after the manager is built (the feed is assembled later).
+    progress: Arc<std::sync::Mutex<Option<DownloadProgressCb>>>,
 }
 
 impl Downloader {
@@ -112,7 +123,14 @@ impl Downloader {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             by_model: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            progress: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Wire the node-wide progress callback (L3 `DownloadProgress`). Shared across clones + in-flight
+    /// jobs, so it can be set after the manager is constructed (once the event feed exists).
+    pub fn set_progress(&self, cb: DownloadProgressCb) {
+        *self.progress.lock().unwrap() = Some(cb);
     }
 
     /// Start (or rejoin) a download for `model` following `plan`. Dedupes on the model reference:
@@ -153,6 +171,7 @@ impl Downloader {
             cancel: CancellationToken::new(),
             stop: Arc::new(Mutex::new(None)),
             artifact: Arc::new(Mutex::new(None)),
+            progress: self.progress.clone(),
         });
         self.jobs.lock().await.insert(id, job.clone());
         self.by_model.lock().await.insert(model, id);
@@ -233,6 +252,7 @@ impl Downloader {
             cancel: CancellationToken::new(),
             stop: Arc::new(Mutex::new(None)),
             artifact: old.artifact.clone(),
+            progress: self.progress.clone(),
         });
         {
             let mut s = job.status.lock().await;
@@ -345,6 +365,7 @@ async fn run_job(api: Api, _id: DownloadId, job: Arc<Job>) {
             s.files_done = (i + 1) as u32;
             s.downloaded_bytes = job.counters.base.load(Ordering::Relaxed);
         }
+        notify_progress(&job).await; // L3: per-file completion progress
         last_path = Some(path);
     }
 
@@ -386,12 +407,36 @@ fn snapshot_dir(file_path: &std::path::Path, files: &[PlanFile]) -> PathBuf {
 
 async fn set_state(job: &Arc<Job>, state: DownloadState) {
     job.status.lock().await.state = state;
+    notify_progress(job).await;
 }
 
 async fn fail(job: &Arc<Job>, message: String) {
-    let mut s = job.status.lock().await;
-    s.state = DownloadState::Failed;
-    s.error = Some(message);
+    {
+        let mut s = job.status.lock().await;
+        s.state = DownloadState::Failed;
+        s.error = Some(message);
+    }
+    notify_progress(job).await;
+}
+
+/// Fan the job's current status onto the wired node-wide progress callback (L3), folding the live
+/// byte counters into the snapshot (mirrors [`Downloader::read_status`]). No-op when no callback is
+/// wired (the lock is held only to clone the `Arc`, never across the callback).
+async fn notify_progress(job: &Arc<Job>) {
+    let cb = job.progress.lock().unwrap().clone();
+    let Some(cb) = cb else {
+        return;
+    };
+    let mut status = job.status.lock().await.clone();
+    if matches!(
+        status.state,
+        DownloadState::Downloading | DownloadState::Queued
+    ) {
+        let base = job.counters.base.load(Ordering::Relaxed);
+        let current = job.counters.current.load(Ordering::Relaxed);
+        status.downloaded_bytes = base + current;
+    }
+    cb(status);
 }
 
 /// Build a [`DownloadPlan`] for a Hugging Face model reference. `files` is the resolved file list

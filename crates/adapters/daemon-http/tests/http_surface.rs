@@ -53,10 +53,13 @@ impl SessionApi for MockApi {
                 .collect(),
             next_seq: 2,
             head_seq: 2,
+            epoch: 0,
         })
     }
     async fn subscribe(&self, _: SessionId, _: u64) -> Result<LogStream, ApiError> {
-        Ok(futures::stream::iter(vec![entry(1), entry(2)]).boxed())
+        Ok(futures::stream::iter(vec![entry(1), entry(2)])
+            .map(daemon_api::LogStreamItem::Entry)
+            .boxed())
     }
     async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
         // The `http/t1` tenant owns exactly one session (the discovery the delivery endpoint runs).

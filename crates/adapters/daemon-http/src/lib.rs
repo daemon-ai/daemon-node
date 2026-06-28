@@ -235,10 +235,14 @@ async fn subscribe_sse(
     Query(q): Query<CursorQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let log = open_log(&state, session, q.after_seq).await;
-    let events = log.map(|entry| {
-        let event = Event::default()
-            .json_data(&entry)
-            .unwrap_or_else(|_| Event::default().data("serialize error"));
+    let events = log.map(|item| {
+        let event = match item {
+            daemon_api::LogStreamItem::Entry(entry) => Event::default()
+                .json_data(&entry)
+                .unwrap_or_else(|_| Event::default().data("serialize error")),
+            // A lossy lag becomes a `reset` event so the SSE client re-baselines from the journal.
+            daemon_api::LogStreamItem::Lagged => Event::default().event("reset").data("lagged"),
+        };
         Ok::<_, Infallible>(event)
     });
     Sse::new(events).keep_alive(KeepAlive::default())
@@ -257,9 +261,14 @@ async fn subscribe_ws(
 
 async fn pump_ws(mut socket: WebSocket, state: AppState, session: String, after_seq: u64) {
     let mut log = open_log(&state, session, after_seq).await;
-    while let Some(entry) = log.next().await {
-        let Ok(text) = serde_json::to_string(&entry) else {
-            continue;
+    while let Some(item) = log.next().await {
+        let text = match item {
+            daemon_api::LogStreamItem::Entry(entry) => match serde_json::to_string(&entry) {
+                Ok(t) => t,
+                Err(_) => continue,
+            },
+            // A lossy lag becomes a reset marker so the WS client re-baselines.
+            daemon_api::LogStreamItem::Lagged => "{\"reset\":true}".to_string(),
         };
         if socket.send(Message::Text(text.into())).await.is_err() {
             break;

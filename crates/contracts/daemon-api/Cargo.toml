@@ -9,6 +9,7 @@ license.workspace = true
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 async-trait = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }

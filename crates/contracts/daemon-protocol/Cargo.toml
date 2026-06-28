@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 daemon-common = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 async-trait = { workspace = true }
 # CBOR codec for the opaque delegation/completion payloads (daemon-content-transfer-spec.md Phase 2).
 ciborium = { workspace = true }

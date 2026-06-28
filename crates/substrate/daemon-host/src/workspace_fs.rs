@@ -169,6 +169,10 @@ struct WatchState {
     snapshot: HashMap<String, (u64, u64)>,
     ring: VecDeque<(u64, FsChange)>,
     primed: bool,
+    /// The highest `seq` evicted from the ring on overflow: a reader whose `after_seq` is below this
+    /// lost events that can no longer be served, so its next page is flagged `reset` (re-list to
+    /// reconcile) — the fs analogue of the merged log's lossy-lag `Reset`.
+    floor: u64,
 }
 
 /// The filesystem operations behind the node's `fs_*` surface. Resolves an [`FsRootId`] to a
@@ -179,6 +183,9 @@ pub struct WorkspaceFs {
     roots: std::sync::Arc<WorkspaceRoots>,
     /// (root-key, dir) -> change state, for the `fs_watch_after` cursor (on-demand diff).
     watches: DashMap<(String, String), WatchState>,
+    /// The per-dir watch-ring capacity (default [`WATCH_RING_CAP`]); overridable in tests to exercise
+    /// the overflow -> `reset` path without synthesizing thousands of changes.
+    watch_ring_cap: usize,
 }
 
 impl WorkspaceFs {
@@ -187,7 +194,15 @@ impl WorkspaceFs {
         Self {
             roots,
             watches: DashMap::new(),
+            watch_ring_cap: WATCH_RING_CAP,
         }
+    }
+
+    /// Test-only: shrink the watch ring so an overflow -> `reset` is cheap to drive.
+    #[cfg(test)]
+    fn with_watch_ring_cap(mut self, cap: usize) -> Self {
+        self.watch_ring_cap = cap;
+        self
     }
 
     /// The shared root resolver (so callers can advertise roots / record bindings).
@@ -538,6 +553,8 @@ impl WorkspaceFs {
             return Ok(FsWatchPageView {
                 events: Vec::new(),
                 next_seq: state.seq,
+                head_seq: state.seq,
+                reset: false,
             });
         }
         // Diff previous snapshot vs current to synthesize change events.
@@ -568,10 +585,16 @@ impl WorkspaceFs {
             state.seq += 1;
             let seq = state.seq;
             state.ring.push_back((seq, change));
-            while state.ring.len() > WATCH_RING_CAP {
-                state.ring.pop_front();
+            while state.ring.len() > self.watch_ring_cap {
+                if let Some((evicted, _)) = state.ring.pop_front() {
+                    // An overflow eviction loses events; raise the resync floor past them.
+                    state.floor = state.floor.max(evicted);
+                }
             }
         }
+        // The reader's cursor aged out of the ring (events evicted past it): this page can't be a
+        // complete delta, so flag `reset` and let the client re-list to reconcile.
+        let reset = after_seq < state.floor;
         let max = if max == 0 { WATCH_RING_CAP as u32 } else { max };
         let events: Vec<FsChange> = state
             .ring
@@ -583,6 +606,8 @@ impl WorkspaceFs {
         Ok(FsWatchPageView {
             events,
             next_seq: state.seq,
+            head_seq: state.seq,
+            reset,
         })
     }
 }
@@ -711,6 +736,40 @@ mod tests {
             .events
             .iter()
             .any(|c| c.path == "new.txt" && matches!(c.kind, FsChangeKind::Created)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A bounded ring that overflows past a stale cursor flags `reset` (the fs Lagged->Reset), so the
+    // client knows to re-list rather than trust an incomplete delta. head_seq tracks the live edge.
+    #[tokio::test]
+    async fn watch_after_overflow_sets_reset() {
+        let base = temp_base("watch-reset");
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())))
+            .with_watch_ring_cap(2);
+        let root = FsRootId::Workspace;
+        // Prime, then capture the cursor at seq 0 (a reader that will fall behind).
+        let primed = fs.watch_after(&root, "", 0, 0).await.unwrap();
+        assert!(!primed.reset);
+        let stale_cursor = primed.next_seq; // 0
+
+        // Generate > cap (2) changes across polls so the ring evicts the earliest seqs.
+        for n in 0..5 {
+            std::fs::write(base.join(format!("f{n}.txt")), b"x").unwrap();
+            fs.watch_after(&root, "", 999, 0).await.unwrap(); // advance the ring (no reset; ahead)
+        }
+
+        // Polling from the stale cursor (0) now sees the floor risen past it -> reset.
+        let page = fs.watch_after(&root, "", stale_cursor, 0).await.unwrap();
+        assert!(page.reset, "an aged-out cursor must flag reset");
+        assert!(
+            page.head_seq >= 5,
+            "head_seq tracks the live edge, got {}",
+            page.head_seq
+        );
+
+        // A reader at the live edge is NOT reset.
+        let fresh = fs.watch_after(&root, "", page.head_seq, 0).await.unwrap();
+        assert!(!fresh.reset);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

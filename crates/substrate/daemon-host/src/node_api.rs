@@ -30,15 +30,16 @@ use daemon_api::{
     AuthCompleteResponse, AuthProviderInfo, BlobRef, BlobStat, BoundAccount, ByteRange,
     ChannelJoinDetails, ChatRoute, CommandInvocation, CommandOutput, CommandScope, CommandSpec,
     ContactInfo, ControlApi, ConversationInfo, CreateConversationDetails, CredentialApi,
-    CredentialInfo, DeliverySink, Distribution, FleetReport, FsContent, FsEntry, FsRevision,
-    FsRoot, FsRootId, FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView, HealthReport,
-    JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle, LogPageView,
-    LogStream, ManageEventView, MemberRole, ModelApi, ModelDescriptor, Outbound, Participant,
-    ProfileApi, ProfileInfo, ProfileSpec, ProviderSelector, RoomInfo, ServiceHealth, SessionApi,
-    SessionDetail, SessionInfo, SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery,
-    SessionRole, SessionScope, SessionSearchHit, SessionState, StatsReport, SupportsContacts,
-    SupportsConversations, SupportsDirectory, SupportsMembership, TelemetryDump,
-    TransportInstanceInfo, TreeReport, UnitNode,
+    CredentialInfo, DeliverySink, Distribution, EventsPage, FleetReport, FsContent, FsEntry,
+    FsRevision, FsRoot, FsRootId, FsRootKind, FsSearchPage, FsSearchQuery, FsWatchPageView,
+    HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, Lifecycle as ApiLifecycle,
+    LogPageView, LogStream, LogStreamItem, ManageEventView, MemberRole, ModelApi, ModelDescriptor,
+    NodeEvent, NodeEventStream, Outbound, Participant, ProfileApi, ProfileInfo, ProfileSpec,
+    ProviderSelector, RoomInfo, ServiceHealth, SessionApi, SessionDetail, SessionInfo,
+    SessionMetaPatch, SessionOverlay, SessionPage, SessionQuery, SessionRole, SessionScope,
+    SessionSearchHit, SessionState, StatsReport, SupportsContacts, SupportsConversations,
+    SupportsDirectory, SupportsMembership, TelemetryDump, TransportInstanceInfo, TreeReport,
+    UnitNode,
 };
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, JobId, JournalStreamId,
@@ -66,6 +67,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
 /// The session's own attribution for engine-emitted (outbound) merged-log entries.
@@ -279,6 +281,11 @@ pub struct NodeApiImpl {
     /// deltas instead of re-projecting `tree()` on a fixed poll interval. `None` => `tree_subscribe`
     /// falls back to the snapshot-only foundation with no live push source.
     fleet_events: Option<broadcast::Sender<daemon_api::TreeEvent>>,
+    /// The node-wide event feed (L3 `EventsSince`): a retained, cursored ring of payload-free
+    /// notifications (roster/meta/approval/session-advanced/download/resync) that lets a client learn
+    /// what changed out of focus without polling and re-baseline after a gap. `None` => `events_*`
+    /// serve empty (a node assembled without the feed).
+    node_events: Option<Arc<NodeEventFeed>>,
     /// The filesystem / workspace surface (daemon-fs-surface-spec.md): resolves `FsRootId`s to
     /// directories (shared with the engine exec builder) and serves list/stat/read/write/search/
     /// watch. `None` => the `fs_*` ops resolve to [`ApiError::Unsupported`] (a node with no
@@ -355,6 +362,7 @@ impl NodeApiImpl {
             checkpoints: None,
             auth_flows: None,
             fleet_events: None,
+            node_events: None,
             workspace: None,
             blobs: None,
             cron: None,
@@ -687,6 +695,20 @@ impl NodeApiImpl {
         self
     }
 
+    /// Wire the node-wide event feed (L3 `EventsSince`) so `events_*` serve live notifications and
+    /// the §5 emit hooks (here + on the live-session actor) reach a real ring.
+    pub fn with_node_events(mut self, feed: Arc<NodeEventFeed>) -> Self {
+        self.live.set_node_events(feed.clone());
+        self.node_events = Some(feed);
+        self
+    }
+
+    /// The node-wide event feed, when wired (cloned out for an emit / `bump_rev` in the §5 hooks that
+    /// hang off `NodeApiImpl` directly — roster/meta changes).
+    fn node_feed(&self) -> Option<Arc<NodeEventFeed>> {
+        self.node_events.clone()
+    }
+
     /// Ping the fleet bus that the roster/tree changed (a rename/pin/archive that no producer models
     /// as a subagent transition). Projects a fresh `tree()` snapshot onto the bus off-thread so live
     /// `tree_subscribe` subscribers refresh promptly; a no-op when no bus is wired or there are no
@@ -838,6 +860,15 @@ impl NodeApiImpl {
         }
         let title = meta.title.clone();
         let _ = self.store.set_session_meta(session, meta).await;
+        // L3: a turn touched this session (recency + maybe a seeded title changed), so its roster row
+        // is stale. Turn-level granularity (not per-delta — `SessionAdvanced` covers token growth).
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(session);
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session: session.clone(),
+                rev,
+            });
+        }
         if let Some(text) = turn_text {
             if !text.trim().is_empty() {
                 self.store.index_session_text(session, title, &text).await;
@@ -1341,6 +1372,20 @@ fn forward_event(
 
 #[async_trait]
 impl ControlApi for NodeApiImpl {
+    async fn events_page(&self, cursor: u64, max: u32) -> EventsPage {
+        match &self.node_events {
+            Some(feed) => feed.page(cursor, max),
+            None => EventsPage::default(),
+        }
+    }
+
+    async fn events_subscribe(&self, cursor: u64) -> Result<NodeEventStream, ApiError> {
+        Ok(match &self.node_events {
+            Some(feed) => feed.subscribe(cursor),
+            None => stream::empty().boxed(),
+        })
+    }
+
     async fn health(&self) -> HealthReport {
         let services = self
             .supervisor
@@ -1403,25 +1448,57 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn sessions_query(&self, query: SessionQuery) -> SessionPage {
+        // L4: the current roster revision this page reflects (0 when no feed is wired — the client
+        // then always takes full pages). Read once up front so the page is consistent with the rev.
+        let rev = self.node_feed().map(|f| f.roster_rev()).unwrap_or(0);
+        // L4 delta read: when `since_rev` is set and the feed can serve it, restrict the page to the
+        // sessions changed after that revision (+ the removed list) instead of the full roster. An
+        // unservable `since_rev` (daemon restarted -> in-memory index reset) falls through to a full
+        // page, which the client applies as a replace.
+        let delta = match (query.since_rev, self.node_feed()) {
+            (Some(since), Some(feed)) => feed.roster_delta(since),
+            _ => None,
+        };
         let mut roster = self.roster().await;
-        // Scope filter. `TopLevel` (the inbox) shows only `Primary`; children are reached by walking
-        // the tree. The by-profile/by-transport scopes back the per-agent/per-transport views.
-        match &query.scope {
-            SessionScope::TopLevel => {
-                roster.retain(|i| i.role == SessionRole::Primary && !i.archived)
+        // The scope predicate, evaluated per session (so a delta can tell "still in scope" from "left
+        // the scope"). `ByTransport` needs the live owned-session set, resolved once.
+        let owned: std::collections::HashSet<SessionId> = match &query.scope {
+            SessionScope::ByTransport(t) => self.live.delivery_sessions(t).into_iter().collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        let in_scope = |i: &SessionInfo| -> bool {
+            match &query.scope {
+                SessionScope::TopLevel => i.role == SessionRole::Primary && !i.archived,
+                SessionScope::ByProfile(p) => i.bound_profile.as_ref() == Some(p) && !i.archived,
+                SessionScope::ByTransport(_) => owned.contains(&i.session) && !i.archived,
+                SessionScope::Archived => i.role == SessionRole::Primary && i.archived,
+                SessionScope::All => true,
             }
-            SessionScope::ByProfile(p) => {
-                roster.retain(|i| i.bound_profile.as_ref() == Some(p) && !i.archived)
+        };
+        // L4 removals are scope-relative: a session that changed but no longer matches the queried
+        // scope (e.g. an archive leaving `TopLevel`, or a hard-removed id) must be pruned client-side,
+        // so it rides the `removed` list rather than silently vanishing from the delta.
+        let mut removed: Vec<SessionId> = Vec::new();
+        if let Some((changed, removed_hard, _)) = &delta {
+            let changed_set: std::collections::HashSet<&SessionId> = changed.iter().collect();
+            removed.extend(removed_hard.iter().cloned());
+            // Changed-but-now-out-of-scope sessions left the client's view.
+            for i in roster
+                .iter()
+                .filter(|i| changed_set.contains(&i.session) && !in_scope(i))
+            {
+                removed.push(i.session.clone());
             }
-            SessionScope::ByTransport(t) => {
-                let owned: std::collections::HashSet<SessionId> =
-                    self.live.delivery_sessions(t).into_iter().collect();
-                roster.retain(|i| owned.contains(&i.session) && !i.archived);
+            // Changed ids absent from the roster entirely (a true hard removal) also prune.
+            let present: std::collections::HashSet<&SessionId> =
+                roster.iter().map(|i| &i.session).collect();
+            for id in changed.iter().filter(|id| !present.contains(id)) {
+                removed.push((*id).clone());
             }
-            SessionScope::Archived => {
-                roster.retain(|i| i.role == SessionRole::Primary && i.archived)
-            }
-            SessionScope::All => {}
+            // The page body is the changed + still-in-scope sessions.
+            roster.retain(|i| changed_set.contains(&i.session) && in_scope(i));
+        } else {
+            roster.retain(|i| in_scope(i));
         }
         // Stable order: pinned conversations first, then most-recently-active, then id as the final
         // tie-break (so the cursor stays total across pages).
@@ -1451,6 +1528,10 @@ impl ControlApi for NodeApiImpl {
         SessionPage {
             sessions: roster,
             next_cursor,
+            rev,
+            // Populated only on a delta read (scope-relative + hard removals); a full page replaces
+            // the client's roster wholesale, so it carries no removal list.
+            removed,
         }
     }
 
@@ -1538,6 +1619,11 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(e.to_string()))?;
         // Nudge live roster/tree subscribers so the rename/pin/archive shows up without a poll.
         self.emit_tree_changed();
+        // L3: a rename/pin/archive changed this session's roster metadata.
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(&session);
+            feed.emit(NodeEvent::SessionMetaChanged { session, rev });
+        }
         Ok(())
     }
 
@@ -2897,6 +2983,10 @@ impl SessionApi for NodeApiImpl {
         Ok(self.live.subscribe(&session, after_seq))
     }
 
+    async fn log_epoch(&self, session: SessionId) -> u64 {
+        self.live.log_epoch(&session)
+    }
+
     async fn delivery_targets(&self, session: SessionId) -> Vec<DeliveryTarget> {
         self.live.delivery_targets(&session)
     }
@@ -3801,21 +3891,33 @@ type Delivery = Arc<Mutex<Vec<DeliveryTarget>>>;
 struct MergedLog {
     /// The next `seq` to assign (one counter across both directions).
     next_seq: u64,
+    /// The session-activation generation (L2 resync): a fresh log after a restart/reactivation
+    /// carries a strictly greater epoch, sourced from the durable `SessionMeta.activation_epoch` in
+    /// `ensure()`. Stamped onto every `LogPageView` so a client detects a generation change.
+    epoch: u64,
     /// The full ordered history (retained so a late joiner can backfill from any cursor).
     entries: Vec<SessionLogEntry>,
     /// The live fan-out to push subscribers.
     tx: broadcast::Sender<SessionLogEntry>,
+    /// This log's session id (stamped onto the `SessionAdvanced` node-event).
+    session: SessionId,
+    /// The node-wide event feed (L3): every `append` emits a coalesced `SessionAdvanced` so the
+    /// client learns an *out-of-focus* session grew without polling it. `None` => no feed wired.
+    feed: Option<Arc<NodeEventFeed>>,
 }
 
 impl MergedLog {
-    fn new() -> Self {
+    fn new(session: SessionId, epoch: u64, feed: Option<Arc<NodeEventFeed>>) -> Self {
         let (tx, _rx) = broadcast::channel(256);
         // Seq starts at 1 so the `after_seq` cursor convention (exclusive lower bound; 0 = "from the
         // start") can address the very first entry.
         Self {
             next_seq: 1,
+            epoch,
             entries: Vec::new(),
             tx,
+            session,
+            feed,
         }
     }
 
@@ -3840,6 +3942,16 @@ impl MergedLog {
         self.entries.push(entry.clone());
         // A send error only means there are no live subscribers; the history retains the entry.
         let _ = self.tx.send(entry.clone());
+        // L3: tell the node-wide feed this session advanced (coalesced per session in the feed's
+        // backlog ring). Payload-free — a focused tab streams the entry directly; an out-of-focus
+        // observer just learns "this session has new activity at head_seq" and lazily refetches.
+        if let Some(feed) = &self.feed {
+            feed.emit(NodeEvent::SessionAdvanced {
+                session: self.session.clone(),
+                epoch: self.epoch,
+                head_seq: seq,
+            });
+        }
         entry
     }
 
@@ -3858,6 +3970,7 @@ impl MergedLog {
             entries,
             next_seq,
             head_seq,
+            epoch: self.epoch,
         }
     }
 
@@ -3865,14 +3978,220 @@ impl MergedLog {
     /// holds the log mutex while calling this, so the backlog snapshot and the live subscription are
     /// taken atomically (no entry can slip between them).
     fn subscribe(&self, after_seq: u64) -> LogStream {
-        let backlog: Vec<SessionLogEntry> = self
+        let backlog: Vec<LogStreamItem> = self
             .entries
             .iter()
             .filter(|e| e.seq > after_seq)
             .cloned()
+            .map(LogStreamItem::Entry)
             .collect();
         let rx = self.tx.subscribe();
-        let live = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+        // Surface a lossy lag as `LogStreamItem::Lagged` (instead of silently dropping it) so a
+        // re-baseline-capable transport can emit a `Reset`; the channel closing ends the stream.
+        let live = BroadcastStream::new(rx).map(|r| match r {
+            Ok(entry) => LogStreamItem::Entry(entry),
+            Err(BroadcastStreamRecvError::Lagged(_)) => LogStreamItem::Lagged,
+        });
+        stream::iter(backlog).chain(live).boxed()
+    }
+}
+
+/// The node-wide event feed (L3 `EventsSince`): a retained, cursored ring of payload-free
+/// [`NodeEvent`]s plus a live broadcast. Producers `emit`; a client reads via [`Self::page`]
+/// (one-shot/long-poll) or [`Self::subscribe`] (push). A reader whose cursor aged out of the ring
+/// (or a lagging push subscriber) gets a `ResyncNeeded` event so it re-baselines rather than
+/// silently missing notifications. Unlike `fleet_events` (a lossy, cursor-less bus) this is
+/// re-readable from a cursor — the property `EventsSince` requires.
+pub struct NodeEventFeed {
+    inner: Mutex<NodeFeedInner>,
+    tx: broadcast::Sender<NodeFeedEntry>,
+    capacity: usize,
+}
+
+#[derive(Clone)]
+struct NodeFeedEntry {
+    cursor: u64,
+    event: NodeEvent,
+}
+
+struct NodeFeedInner {
+    /// The cursor the next emitted event will take (monotonic, starts at 1; `0` is "before any").
+    next_cursor: u64,
+    /// The bounded retained ring (oldest first).
+    ring: VecDeque<NodeFeedEntry>,
+    /// The monotonic roster revision (L4): stamped onto `RosterChanged`/`SessionMetaChanged` AND
+    /// returned by `SessionsQuery`, so the two agree on which generation a refetch reflects. In-memory
+    /// — resets to 0 on restart, which makes a stale client `since_rev` unservable (-> full page).
+    rev: u64,
+    /// L4 delta index: the `rev` at each session's last roster change (rename/pin/archive/activity/
+    /// activation). `roster_delta(R)` returns the sessions whose value is `> R`.
+    changed: HashMap<SessionId, u64>,
+    /// L4 removal tombstones `(rev, session)` for sessions hard-removed from the roster. Effectively
+    /// empty today (archive is a *change* with `archived=true`, not a removal; the store has no
+    /// hard-delete) — reserved so the wire `removed` field is populated when a delete path lands.
+    removed: VecDeque<(u64, SessionId)>,
+    /// The highest cursor dropped *because the ring overflowed its capacity* (not coalescing): a
+    /// reader at or below this lost an event that can never be re-read, so it gets `ResyncNeeded`.
+    /// Coalescing drops do not bump this (a superseded `SessionAdvanced` loses no information — the
+    /// later one carries the latest `head_seq`).
+    floor: u64,
+}
+
+impl NodeEventFeed {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        let (tx, _rx) = broadcast::channel(256);
+        Arc::new(Self {
+            inner: Mutex::new(NodeFeedInner {
+                next_cursor: 1,
+                ring: VecDeque::new(),
+                rev: 0,
+                changed: HashMap::new(),
+                removed: VecDeque::new(),
+                floor: 0,
+            }),
+            tx,
+            capacity,
+        })
+    }
+
+    /// Bump the roster revision, record it as `session`'s last-change rev (L4 delta index), and
+    /// return it. The §5 emit hooks call this then stamp the returned `rev` onto the
+    /// `RosterChanged`/`SessionMetaChanged` event, so the feed's `rev` and `SessionsQuery.rev` agree.
+    pub(crate) fn note_roster_change(&self, session: &SessionId) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.rev += 1;
+        let rev = g.rev;
+        g.changed.insert(session.clone(), rev);
+        rev
+    }
+
+    /// The L4 roster delta past `since_rev`: the sessions whose roster metadata changed after
+    /// `since_rev`, the sessions removed since then, and the current `rev`. Returns `None` when the
+    /// delta is unservable — `since_rev` is ahead of our `rev` (the daemon restarted and reset the
+    /// in-memory index, so the client must take a full page) — which the caller maps to a full query.
+    pub(crate) fn roster_delta(
+        &self,
+        since_rev: u64,
+    ) -> Option<(Vec<SessionId>, Vec<SessionId>, u64)> {
+        let g = self.inner.lock().unwrap();
+        if since_rev > g.rev {
+            return None;
+        }
+        let changed: Vec<SessionId> = g
+            .changed
+            .iter()
+            .filter(|(_, rev)| **rev > since_rev)
+            .map(|(s, _)| s.clone())
+            .collect();
+        let removed: Vec<SessionId> = g
+            .removed
+            .iter()
+            .filter(|(rev, _)| *rev > since_rev)
+            .map(|(_, s)| s.clone())
+            .collect();
+        Some((changed, removed, g.rev))
+    }
+
+    /// The current roster revision (stamped on every `SessionsQuery` page, delta or full).
+    pub(crate) fn roster_rev(&self) -> u64 {
+        self.inner.lock().unwrap().rev
+    }
+
+    /// Assign a cursor, retain in the bounded ring, and broadcast live. Consecutive
+    /// `SessionAdvanced` for the same session are coalesced in the *backlog* (latest wins) so a
+    /// reconnecting reader isn't flooded; the live broadcast still fires per emit (the client
+    /// dedups/throttles per-session activity).
+    pub fn emit(&self, event: NodeEvent) {
+        let mut g = self.inner.lock().unwrap();
+        let cursor = g.next_cursor;
+        g.next_cursor += 1;
+        if let NodeEvent::SessionAdvanced { session, .. } = &event {
+            let session = session.clone();
+            g.ring.retain(|e| {
+                !matches!(&e.event, NodeEvent::SessionAdvanced { session: s, .. } if *s == session)
+            });
+        }
+        let entry = NodeFeedEntry { cursor, event };
+        g.ring.push_back(entry.clone());
+        while g.ring.len() > self.capacity {
+            if let Some(dropped) = g.ring.pop_front() {
+                // A capacity eviction loses information; raise the resync floor past it.
+                g.floor = g.floor.max(dropped.cursor);
+            }
+        }
+        drop(g);
+        let _ = self.tx.send(entry);
+    }
+
+    /// The one-shot cursor read: the retained events past `after_cursor` (capped at `max`, `0` = all),
+    /// or a single `ResyncNeeded` when `after_cursor` aged out of the ring.
+    fn page(&self, after_cursor: u64, max: u32) -> EventsPage {
+        let g = self.inner.lock().unwrap();
+        let head_cursor = g.next_cursor.saturating_sub(1);
+        if after_cursor < g.floor {
+            return EventsPage {
+                events: vec![NodeEvent::ResyncNeeded {
+                    scope: "all".into(),
+                }],
+                next_cursor: head_cursor,
+                head_cursor,
+            };
+        }
+        let mut events = Vec::new();
+        let mut next = after_cursor;
+        for e in g.ring.iter().filter(|e| e.cursor > after_cursor) {
+            if max != 0 && events.len() >= max as usize {
+                break;
+            }
+            events.push(e.event.clone());
+            next = e.cursor;
+        }
+        EventsPage {
+            events,
+            next_cursor: next,
+            head_cursor,
+        }
+    }
+
+    /// The push read: backlog (one page per retained event past `after_cursor`, or a `ResyncNeeded`
+    /// when aged out) chained to the live broadcast (a lag surfaces as `ResyncNeeded`).
+    fn subscribe(&self, after_cursor: u64) -> NodeEventStream {
+        let g = self.inner.lock().unwrap();
+        let head_cursor = g.next_cursor.saturating_sub(1);
+        let mut backlog: Vec<EventsPage> = Vec::new();
+        if after_cursor < g.floor {
+            backlog.push(EventsPage {
+                events: vec![NodeEvent::ResyncNeeded {
+                    scope: "all".into(),
+                }],
+                next_cursor: head_cursor,
+                head_cursor,
+            });
+        } else {
+            for e in g.ring.iter().filter(|e| e.cursor > after_cursor) {
+                backlog.push(EventsPage {
+                    events: vec![e.event.clone()],
+                    next_cursor: e.cursor,
+                    head_cursor,
+                });
+            }
+        }
+        let rx = self.tx.subscribe();
+        drop(g);
+        let live = BroadcastStream::new(rx).map(|r| match r {
+            Ok(entry) => EventsPage {
+                events: vec![entry.event],
+                next_cursor: entry.cursor,
+                head_cursor: entry.cursor,
+            },
+            Err(BroadcastStreamRecvError::Lagged(_)) => EventsPage {
+                events: vec![NodeEvent::ResyncNeeded {
+                    scope: "all".into(),
+                }],
+                next_cursor: 0,
+                head_cursor: 0,
+            },
+        });
         stream::iter(backlog).chain(live).boxed()
     }
 }
@@ -3917,6 +4236,11 @@ struct LiveSessions {
     /// resolved live by the per-session pump (so handover demotion stops/starts delivery for free).
     /// Shared with each pump task; a missing instance simply means no in-process push (pull-only).
     sinks: Arc<DashMap<TransportId, Arc<dyn DeliverySink>>>,
+    /// The node-wide event feed (L3), shared from `NodeApiImpl`: the §5 emit hooks here
+    /// (`SessionAdvanced` at `MergedLog::append`, `SessionMetaChanged`/`RosterChanged` at
+    /// `note_activity`/`ensure`, `ApprovalPending` in the live `ParkingHandler`) push onto it. `None`
+    /// until `set_node_events` wires it (a node assembled without a feed leaves it unset).
+    node_events: Mutex<Option<Arc<NodeEventFeed>>>,
 }
 
 impl LiveSessions {
@@ -3934,7 +4258,18 @@ impl LiveSessions {
             background: Mutex::new(None),
             modes,
             sinks: Arc::new(DashMap::new()),
+            node_events: Mutex::new(None),
         }
+    }
+
+    /// Wire the node-wide event feed so the emit hooks reach a real ring.
+    fn set_node_events(&self, feed: Arc<NodeEventFeed>) {
+        *self.node_events.lock().unwrap() = Some(feed);
+    }
+
+    /// The node-wide event feed, when wired (cloned out of the mutex for an emit/`bump_rev`).
+    fn node_feed(&self) -> Option<Arc<NodeEventFeed>> {
+        self.node_events.lock().unwrap().clone()
     }
 
     fn set_journal(&self, cfg: JournalConfig) {
@@ -3972,13 +4307,30 @@ impl LiveSessions {
         let mut meta = self.store.session_meta(session).await.unwrap_or_default();
         if meta.bound_profile.is_none() && profile.is_some() {
             meta.bound_profile = profile.clone();
-            let _ = self.store.set_session_meta(session, meta.clone()).await;
+        }
+        // L2 resync: stamp this activation's epoch and bump the stored generation, so the next
+        // activation (including after a daemon restart - SessionMeta is durable, the live MergedLog
+        // is not) yields a strictly greater epoch. The first activation is epoch 0 (matching
+        // `Snapshot::fresh`). The live `submit` path has no `SessionRecord`, so this sidecar is the
+        // durable epoch source. Always persist (the generation changed even when the profile did not).
+        let epoch = meta.activation_epoch;
+        meta.activation_epoch = epoch + 1;
+        let _ = self.store.set_session_meta(session, meta.clone()).await;
+        // L3: a session (re)entered the live roster — the roster *set* changed, so a client refetches
+        // it (a delta query is L4). Fires on first activation and on re-activation after a restart.
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(session);
+            feed.emit(NodeEvent::RosterChanged { rev });
         }
         let overlay = decode_overlay(&meta.overlay);
         let engine = (self.builder)(session.clone(), profile, &overlay);
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let log: Merged = Arc::new(Mutex::new(MergedLog::new()));
+        let log: Merged = Arc::new(Mutex::new(MergedLog::new(
+            session.clone(),
+            epoch,
+            self.node_feed(),
+        )));
         let delivery: Delivery = Arc::new(Mutex::new(Vec::new()));
         // A per-session journal feeder (keyed by SessionId), shared by the event pump and the
         // request handler so the live transcript is sealed per turn into the unified journal.
@@ -3998,6 +4350,7 @@ impl LiveSessions {
             session: session.clone(),
             background: self.background.lock().unwrap().clone(),
             modes: self.modes.clone(),
+            feed: self.node_feed(),
         });
         let handle = spawn_agent_session(engine, host);
 
@@ -4418,6 +4771,14 @@ impl LiveSessions {
         }
     }
 
+    /// The activation epoch of a live session's merged log (0 if the session is not resident).
+    fn log_epoch(&self, session: &SessionId) -> u64 {
+        match self.sessions.get(session) {
+            Some(s) => s.log.lock().unwrap().epoch,
+            None => 0,
+        }
+    }
+
     fn existing(&self, session: &SessionId) -> Result<AgentHandle, ApiError> {
         self.sessions
             .get(session)
@@ -4607,6 +4968,9 @@ struct ParkingHandler {
     /// The shared per-session live edit-approval policy, consulted on an `Approval` request to
     /// auto-allow / deny without parking a human (in lockstep with the engine's snapshot policy).
     modes: Arc<DashMap<SessionId, daemon_core::ApprovalPolicy>>,
+    /// The node-wide event feed (L3): emit `ApprovalPending` when an approval parks for a human, so a
+    /// client badges it without polling `approvals_pending`. `None` => no feed wired.
+    feed: Option<Arc<NodeEventFeed>>,
 }
 
 #[async_trait]
@@ -4648,9 +5012,20 @@ impl HostRequestHandler for ParkingHandler {
                 _ => {}
             }
         }
+        let is_approval = matches!(req.kind, HostRequestKind::Approval { .. });
         let (tx, rx) = oneshot::channel();
         let request_id = req.request_id;
         self.pending.lock().unwrap().insert(request_id, tx);
+        // L3: an approval just parked for operator action — badge it on the feed (the client then
+        // fetches the detail via `approvals_pending`). Payload-free notification only.
+        if is_approval {
+            if let Some(feed) = &self.feed {
+                feed.emit(NodeEvent::ApprovalPending {
+                    session: self.session.clone(),
+                    request_id: request_id.0.to_string(),
+                });
+            }
+        }
         // Record the raised request on the merged log (outbound / Context) under the unified seq, so
         // it shares one ordered timeline with events and the eventual inbound response.
         self.log.lock().unwrap().append(
@@ -4672,5 +5047,98 @@ impl HostRequestHandler for ParkingHandler {
                 body: HostResponseBody::Approved(false),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod node_feed_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[test]
+    fn page_resyncs_when_cursor_aged_out_of_the_ring() {
+        // A tiny ring (capacity 2) so a few emits push the early cursors out.
+        let feed = NodeEventFeed::new(2);
+        for rev in 1..=5 {
+            feed.emit(NodeEvent::RosterChanged { rev });
+        }
+        // The ring retains only the last two (cursors 4,5). A reader still at cursor 0 lost 1..=3, so
+        // it must be told to re-baseline rather than silently miss them.
+        let page = feed.page(0, 0);
+        assert_eq!(
+            page.events,
+            vec![NodeEvent::ResyncNeeded {
+                scope: "all".into()
+            }],
+            "an aged-out cursor must surface ResyncNeeded"
+        );
+        assert_eq!(page.head_cursor, 5);
+
+        // A reader still within the ring (cursor 3 -> 4,5) reads forward, no resync.
+        let page = feed.page(3, 0);
+        assert_eq!(
+            page.events,
+            vec![
+                NodeEvent::RosterChanged { rev: 4 },
+                NodeEvent::RosterChanged { rev: 5 }
+            ]
+        );
+        assert_eq!(page.next_cursor, 5);
+    }
+
+    #[test]
+    fn session_advanced_is_coalesced_per_session_in_the_backlog() {
+        let feed = NodeEventFeed::new(64);
+        let a = SessionId::new("sa");
+        let b = SessionId::new("sb");
+        for head in 1..=4 {
+            feed.emit(NodeEvent::SessionAdvanced {
+                session: a.clone(),
+                epoch: 0,
+                head_seq: head,
+            });
+        }
+        feed.emit(NodeEvent::SessionAdvanced {
+            session: b.clone(),
+            epoch: 0,
+            head_seq: 9,
+        });
+        // The backlog keeps one SessionAdvanced per session (latest head_seq), not one per append.
+        let page = feed.page(0, 0);
+        let advanced: Vec<_> = page
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                NodeEvent::SessionAdvanced {
+                    session, head_seq, ..
+                } => Some((session.clone(), *head_seq)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            advanced,
+            vec![(a, 4), (b, 9)],
+            "coalesced to the latest per session"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_backfills_then_delivers_live() {
+        let feed = NodeEventFeed::new(64);
+        feed.emit(NodeEvent::RosterChanged { rev: 1 });
+        let mut stream = feed.subscribe(0);
+        // Backlog first.
+        let first = stream.next().await.expect("backlog page");
+        assert_eq!(first.events, vec![NodeEvent::RosterChanged { rev: 1 }]);
+        // Then a live emit arrives on the same stream.
+        feed.emit(NodeEvent::ApprovalPending {
+            session: SessionId::new("s"),
+            request_id: "r".into(),
+        });
+        let live = stream.next().await.expect("live page");
+        assert!(matches!(
+            live.events.as_slice(),
+            [NodeEvent::ApprovalPending { .. }]
+        ));
     }
 }

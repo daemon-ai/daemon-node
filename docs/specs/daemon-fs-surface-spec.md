@@ -100,7 +100,7 @@ Methods on `ControlApi` (all `#[async_trait]`, `Unsupported` defaults):
   is profile/skill versioning). Avoids re-reading the file to validate a write base.
 - `FsSearchQuery { query, regex, case_sensitive, max_results, page }`,
   `FsSearchPage { hits: Vec<FsSearchHit { path, line, col, preview }>, has_more }`.
-- `FsChange { path, kind: FsChangeKind }`, `FsWatchPageView { events: Vec<FsChange>, next_seq }`.
+- `FsChange { path, kind: FsChangeKind }`, `FsWatchPageView { events: Vec<FsChange>, next_seq, head_seq, reset }` (cursored + resync-capable: `reset` => re-list to reconcile).
 
 ## Write gating (operator writes reuse agent policy, minus the host-ask)
 

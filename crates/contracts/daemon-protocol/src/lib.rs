@@ -357,6 +357,7 @@ pub struct ToolDetail {
     /// The stable renderer discriminator (e.g. a tool name, or `"ansi-stream"`/`"pty"`).
     pub kind: String,
     /// The opaque encoded payload (CBOR by convention), decoded by the consumer per `kind`.
+    #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
 }
 
@@ -443,6 +444,7 @@ pub enum AgentEvent {
         /// The stable renderer discriminator (e.g. `"ansi-stream"` / `"pty"`).
         kind: String,
         /// The opaque encoded payload (CBOR by convention), decoded by the consumer per `kind`.
+        #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
     /// A tool invocation began.
@@ -861,6 +863,7 @@ pub enum SessionPayload {
         /// The stable renderer/router discriminator (e.g. `"presence"` / `"attach"` / `"receipt"`).
         kind: String,
         /// The opaque encoded payload (CBOR by convention), decoded by the consumer per `kind`.
+        #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
 }
@@ -1227,6 +1230,7 @@ pub enum TranscriptBlock {
         /// The stable renderer discriminator (e.g. `"ansi-stream"` / `"pty"`).
         kind: String,
         /// The opaque encoded payload (CBOR by convention).
+        #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
 }

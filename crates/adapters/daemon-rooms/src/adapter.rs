@@ -165,7 +165,13 @@ impl RoomRuntime {
                     return;
                 }
             };
-            while let Some(entry) = stream.next().await {
+            while let Some(item) = stream.next().await {
+                // Best-effort-skip a lossy lag (turn-lifecycle notes may be missed; the durable
+                // conv journal remains the record). Re-baseline is future work.
+                let entry = match item {
+                    daemon_api::LogStreamItem::Entry(e) => e,
+                    daemon_api::LogStreamItem::Lagged => continue,
+                };
                 match &entry.payload {
                     SessionPayload::Event(AgentEvent::TurnStarted { .. }) => {
                         this.ingestor.note_turn_started(&session);

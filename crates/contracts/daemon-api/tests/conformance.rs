@@ -16,7 +16,11 @@ use std::path::Path;
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-api.cddl"));
 
 fn root_for(fixture_stem: &str) -> &'static str {
-    if fixture_stem.starts_with("request-") {
+    if fixture_stem.starts_with("wire-c2s-") {
+        "wire-c2s"
+    } else if fixture_stem.starts_with("wire-s2c-") {
+        "wire-s2c"
+    } else if fixture_stem.starts_with("request-") {
         "api-request"
     } else {
         "api-response"

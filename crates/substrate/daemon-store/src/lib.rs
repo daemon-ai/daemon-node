@@ -105,6 +105,13 @@ pub struct SessionMeta {
     /// non-cron session (and legacy rows).
     #[serde(default)]
     pub scheduled_job: Option<JobId>,
+    /// The session-activation generation (L2 resync). The host reads this in `ensure()` to stamp the
+    /// fresh in-memory `MergedLog` and persists `+1`, so each (re)activation - including after a
+    /// daemon restart, since this sidecar is durable while the live log is not - yields a strictly
+    /// greater epoch. Clients track `(epoch, seq)` to detect a generation change and re-baseline from
+    /// the durable journal. `0` for the first activation / legacy rows.
+    #[serde(default)]
+    pub activation_epoch: u64,
 }
 
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
@@ -2058,6 +2065,7 @@ mod session_meta_tests {
             pinned: true,
             archived: false,
             scheduled_job: Some(JobId::from("cron-7")),
+            activation_epoch: 3,
         }
     }
 

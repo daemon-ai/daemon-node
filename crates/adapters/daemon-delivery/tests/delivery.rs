@@ -68,7 +68,9 @@ impl SessionApi for MockApi {
         Ok(())
     }
     async fn subscribe(&self, _: SessionId, _: u64) -> Result<LogStream, ApiError> {
-        Ok(futures::stream::iter(self.entries.clone()).boxed())
+        Ok(futures::stream::iter(self.entries.clone())
+            .map(daemon_api::LogStreamItem::Entry)
+            .boxed())
     }
     async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
         if transport == self.transport {

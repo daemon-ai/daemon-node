@@ -274,6 +274,8 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         "ALTER TABLE session_meta ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
         // I15: the cron job that fired this (isolated) session, set by the cron worker.
         "ALTER TABLE session_meta ADD COLUMN scheduled_job TEXT",
+        // L2 resync: per-session activation generation (stamped on each fresh MergedLog in ensure()).
+        "ALTER TABLE session_meta ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 0",
         // Delegation child-lifetime marker on the durable outbox (managed vs ephemeral subagent).
         "ALTER TABLE job_outbox ADD COLUMN lifetime TEXT",
     ];
@@ -1123,10 +1125,11 @@ impl SessionStore for SqliteStore {
         let last_activity = meta.last_activity_ms.map(|v| v as i64);
         let scheduled_job = meta.scheduled_job.as_ref().map(|j| j.as_str());
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
-             last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10",
+             last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10, \
+             activation_epoch = ?11",
             params![
                 id.as_str(),
                 bound,
@@ -1137,7 +1140,8 @@ impl SessionStore for SqliteStore {
                 parent,
                 meta.pinned as i64,
                 meta.archived as i64,
-                scheduled_job
+                scheduled_job,
+                meta.activation_epoch as i64
             ],
         )
         .map_err(sql_err)?;
@@ -1147,7 +1151,7 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job \
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch \
              FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
@@ -1160,6 +1164,7 @@ impl SessionStore for SqliteStore {
                 let pinned: i64 = row.get(6)?;
                 let archived: i64 = row.get(7)?;
                 let scheduled_job: Option<String> = row.get(8)?;
+                let activation_epoch: i64 = row.get(9)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
@@ -1170,6 +1175,7 @@ impl SessionStore for SqliteStore {
                     pinned: pinned != 0,
                     archived: archived != 0,
                     scheduled_job: scheduled_job.map(JobId::from),
+                    activation_epoch: activation_epoch as u64,
                 })
             },
         )

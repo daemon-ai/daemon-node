@@ -47,12 +47,34 @@ pub use profile::{
     ProviderSelector, SessionOverlay, ToolsOverride,
 };
 
-/// A live, push-based stream of merged [`SessionLogEntry`] items (inbound + outbound), the delivery
-/// shape a streaming transport (in-process, socket, HTTP/WS) returns from [`SessionApi::subscribe`].
+/// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live
+/// broadcast dropped entries for a slow consumer (L2 resync). A transport that can re-baseline
+/// (the socket mux) maps `Lagged` to a `Reset` frame so the client re-reads from the durable
+/// journal; a transport that cannot simply skips it (the prior silent-drop behavior).
+// `Entry` is intentionally inline (not boxed): it is the hot path - one item per streamed log
+// entry - and the broadcast already owns/clones a `SessionLogEntry`, so boxing would add an
+// allocation per event for no benefit. `Lagged` is rare.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum LogStreamItem {
+    /// A merged-log entry in `seq` order.
+    Entry(SessionLogEntry),
+    /// The broadcast lagged; entries were missed and the consumer must re-baseline.
+    Lagged,
+}
+
+/// A live, push-based stream of merged-log items (inbound + outbound), the delivery shape a
+/// streaming transport (in-process, socket, HTTP/WS) returns from [`SessionApi::subscribe`].
 /// Streaming is a *transport capability*, not a wire-mirror variant: the cursor read
 /// ([`SessionApi::log_after`] / [`ApiRequest::Subscribe`]) is the one-shot/long-poll form every
 /// transport marshals.
-pub type LogStream = BoxStream<'static, SessionLogEntry>;
+pub type LogStream = BoxStream<'static, LogStreamItem>;
+
+/// A live, push-based stream of node-wide [`EventsPage`]s (L3 `EventsSince` feed), the delivery
+/// shape a streaming transport returns from [`ControlApi::events_subscribe`]. Each page carries a
+/// batch of payload-free [`NodeEvent`] pointers plus the feed cursors; one-shot transports poll
+/// [`ControlApi::events_page`] over the same cursor instead.
+pub type NodeEventStream = BoxStream<'static, EventsPage>;
 
 /// The wire version of the api mirror (rides every framed request/response; governs evolution).
 pub const API_WIRE_VERSION: WireVersion = WireVersion::CURRENT;
@@ -179,7 +201,12 @@ pub trait SessionApi: Send + Sync {
         Ok(session)
     }
 
-    /// Drain up to `max` outbound items (events + raised host requests) for `session`.
+    /// Drain up to `max` outbound items (events + raised host requests) for `session`. A
+    /// **destructive, single-consumer** convenience (each call consumes what it returns), for the
+    /// FFI / MCP lowest-common-denominator only — NOT the multi-surface basis (a drain is inherently
+    /// one-reader; cf. the unified cursored-stream contract in
+    /// `daemon-core/docs/daemon-event-io-spec.md` §5.4.1). Multi-surface observers use the
+    /// non-destructive cursored [`Self::log_after`] (live) / [`Self::session_history`] (durable).
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError>;
 
     /// Answer a host request the session raised (matched by `response.request_id`).
@@ -221,6 +248,14 @@ pub trait SessionApi: Send + Sync {
     /// stream (a transport that exposes no live log — callers fall back to `log_after`).
     async fn subscribe(&self, _session: SessionId, _after_seq: u64) -> Result<LogStream, ApiError> {
         Ok(stream::empty().boxed())
+    }
+
+    /// The session-activation generation of the live merged log (L2 resync), so a streaming
+    /// transport can stamp the `epoch` on its pushed pages and on a `Reset`. Matches
+    /// [`LogPageView::epoch`] for the same session. Default `0` (a transport with no live log /
+    /// single-incarnation seam).
+    async fn log_epoch(&self, _session: SessionId) -> u64 {
+        0
     }
 
     /// The session's current outbound [`DeliveryTarget`]s — where its replies post (the `Primary`)
@@ -401,7 +436,10 @@ pub trait ControlApi: Send + Sync {
         None
     }
 
-    /// Drain up to `max` recent management events for one unit (GUI drill-down). Default: empty.
+    /// A bounded, **non-destructive** snapshot of up to `max` recent management-event views for one
+    /// unit (GUI drill-down) — a read over a retained ring, not a drain (the impl in
+    /// `daemon-orchestration` `runtime.rs` keeps the buffer; repeated reads return the same items).
+    /// Default: empty.
     async fn unit_events(&self, _id: UnitId, _max: u32) -> Vec<ManageEventView> {
         Vec::new()
     }
@@ -411,8 +449,10 @@ pub trait ControlApi: Send + Sync {
     /// for *any* unit in the tree (not just a top-level interactive session). The coarse
     /// [`Self::unit_events`] is the fleet-dashboard view; this is the drill-down-to-transcript view,
     /// carrying the full §17 vocabulary (text, reasoning, tool I/O with opaque structured `detail`,
-    /// opaque `ContentDelta`, usage, errors) plus blocking host requests, untouched. A destructive
-    /// drain like [`Self::poll`] (each call consumes what it returns; `max == 0` drains all).
+    /// opaque `ContentDelta`, usage, errors) plus blocking host requests, untouched. A **destructive,
+    /// single-consumer** drain like [`Self::poll`] (each call consumes what it returns; `max == 0`
+    /// drains all) — FFI/MCP-LCD only; a multi-surface consumer uses the non-destructive cursored
+    /// [`Self::unit_history`] instead (the unified contract, daemon-event-io-spec §5.4.1).
     /// Default: empty (a transport with no fleet projection).
     async fn unit_outbound(&self, _id: UnitId, _max: u32) -> Vec<Outbound> {
         Vec::new()
@@ -498,6 +538,20 @@ pub trait ControlApi: Send + Sync {
     /// `filter` (drop or coalesce transient subagents). The push delivery a streaming transport
     /// holds open; one-shot transports poll [`Self::tree`] instead. Default: an empty stream.
     async fn tree_subscribe(&self, _filter: TreeSubFilter) -> Result<TreeStream, ApiError> {
+        Ok(stream::empty().boxed())
+    }
+
+    /// One-shot/long-poll read of the node-wide event feed past `cursor` (L3 `EventsSince`): the
+    /// payload-free [`NodeEvent`] pointers a client uses to learn out-of-focus changes without
+    /// polling, plus the feed cursors. Non-destructive. Default: an empty page (a node with no feed).
+    async fn events_page(&self, _cursor: u64, _max: u32) -> EventsPage {
+        EventsPage::default()
+    }
+
+    /// Subscribe to the node-wide event feed as a push stream of [`EventsPage`]s from `cursor`
+    /// (backfill then live). The push delivery a streaming transport holds open; one-shot transports
+    /// poll [`Self::events_page`]. Default: an empty stream (a node with no feed).
+    async fn events_subscribe(&self, _cursor: u64) -> Result<NodeEventStream, ApiError> {
         Ok(stream::empty().boxed())
     }
 
@@ -969,7 +1023,11 @@ pub trait ControlApi: Send + Sync {
     }
 
     /// The cursor / long-poll form of the change stream (the wire-marshaled form of `fs_watch`):
-    /// drain change events under `dir` since `after_seq`. Default: unsupported.
+    /// read change events under `dir` since `after_seq`. Cursored + resync-capable per the unified
+    /// cursored-stream contract (`daemon-core/docs/daemon-event-io-spec.md` §5.4.1): the page carries
+    /// `head_seq` (the live edge) and `reset = true` when `after_seq` aged out of the bounded watch
+    /// ring (events evicted past the reader), signaling the client to re-list the dir to reconcile —
+    /// the fs analogue of the merged log's `Lagged -> Reset`. Default: unsupported.
     async fn fs_watch_after(
         &self,
         _root: FsRootId,
@@ -1630,11 +1688,20 @@ pub struct SessionQuery {
     #[serde(default)]
     pub scope: SessionScope,
     /// The exclusive cursor: the last [`SessionId`] returned by the previous page (`None` = start).
+    /// An **id-cursor** for pagination — a deliberate exception to the seq/journal cursor vocabulary
+    /// (it is not an `after_seq` live position nor an `after_cursor` journal key); see
+    /// daemon-event-io-spec §5.4.2. L4 roster *delta* reads use [`Self::since_rev`] instead.
     #[serde(default)]
     pub after: Option<SessionId>,
     /// Maximum sessions to return (`0` = a server default).
     #[serde(default)]
     pub limit: u32,
+    /// L4 delta read: when `Some(R)`, ask for only the sessions whose roster metadata changed after
+    /// revision `R` (plus the `removed` list and current `rev`), instead of the full page. `None`
+    /// (the default) = a full page — today's behavior, and the back-compat path for an old daemon
+    /// (which ignores the field) or a cold client (no persisted `rev`).
+    #[serde(default)]
+    pub since_rev: Option<u64>,
 }
 
 /// A page of the scoped roster: the matching sessions plus the cursor to fetch the next page
@@ -1647,6 +1714,16 @@ pub struct SessionPage {
     /// The cursor to pass as [`SessionQuery::after`] on the next read; `None` => no more pages.
     #[serde(default)]
     pub next_cursor: Option<SessionId>,
+    /// L4: the roster revision this page reflects. The client persists it and passes it back as
+    /// [`SessionQuery::since_rev`] on the next read to fetch only the delta. `0` for a node with no
+    /// event feed (no revision tracking) — the client then always takes full pages.
+    #[serde(default)]
+    pub rev: u64,
+    /// L4 delta read: session ids removed from the roster since the requested `since_rev` (so the
+    /// client prunes them). Empty on a full page and effectively empty today (archive is a *change*
+    /// with `archived=true`, not a removal); reserved for a future hard-delete path.
+    #[serde(default)]
+    pub removed: Vec<SessionId>,
 }
 
 /// A partial update to a session's roster metadata — the backend of daemon-app's "session actions"
@@ -2146,7 +2223,7 @@ pub struct CronSpec {
     pub target: Option<String>,
     /// The opaque payload/command the job submits when it fires (the agent prompt, unless
     /// `no_agent`).
-    #[serde(default)]
+    #[serde(default, with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Whether the scheduler considers this job. A paused job stays in the store but never fires.
     #[serde(default = "default_true")]
@@ -3158,6 +3235,82 @@ pub struct LogPageView {
     pub next_seq: u64,
     /// The highest `seq` currently retained for the session (how far a reader can advance now).
     pub head_seq: u64,
+    /// The session-activation generation this page belongs to (L2 resync). A fresh in-memory log
+    /// after a restart/reactivation carries a strictly greater `epoch`, so a client that tracks
+    /// `(epoch, seq)` detects the generation change and re-baselines from the durable journal rather
+    /// than mis-applying a new log's entries onto the old one. `0` for the first activation
+    /// (matching `Snapshot::fresh`). `#[serde(default)]` keeps old (epoch-less) encodings decodable.
+    #[serde(default)]
+    pub epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Node-wide event feed DTOs (L3; daemon-sync-protocol-spec.md §5)
+// ---------------------------------------------------------------------------
+
+/// One payload-free node-wide notification (L3 `EventsSince`). A pointer, not a payload: it tells a
+/// client that *something* changed out of focus so it can update a badge / mark a roster row stale /
+/// nudge a focused turn and then lazily fetch the detail; it never carries transcript/model bytes.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeEvent {
+    /// A session's live merged log advanced (coalesced to the latest per session).
+    SessionAdvanced {
+        /// The session whose log grew.
+        session: SessionId,
+        /// Its activation epoch (L2).
+        epoch: u64,
+        /// The highest `seq` now retained.
+        head_seq: u64,
+    },
+    /// A session's roster metadata changed (rename / pin / archive / activity).
+    SessionMetaChanged {
+        /// The affected session.
+        session: SessionId,
+        /// The roster revision at the change.
+        rev: u64,
+    },
+    /// The roster set changed (a session opened/closed/moved); the client refetches (delta in L4).
+    RosterChanged {
+        /// The new roster revision.
+        rev: u64,
+    },
+    /// An approval is pending operator action.
+    ApprovalPending {
+        /// The session it belongs to.
+        session: SessionId,
+        /// The approval's request id.
+        request_id: String,
+    },
+    /// A model download advanced (replaces the client's poll).
+    DownloadProgress {
+        /// The download job id.
+        id: DownloadId,
+        /// Percent complete (0..=100).
+        pct: u32,
+        /// The job state string.
+        state: String,
+    },
+    /// The feed could not serve from the client's cursor (aged out / lagged); the client must
+    /// re-baseline the named scope ("roster" / "all" / ...).
+    ResyncNeeded {
+        /// The scope to refetch.
+        scope: String,
+    },
+}
+
+/// A page of the node-wide event feed (`EventsSince` -> `EventsPage`): a batch of [`NodeEvent`]s past
+/// the requested cursor plus the feed cursors. Non-destructive; repeated reads from the same cursor
+/// return the same page (until it ages out of the retained ring, which surfaces as `ResyncNeeded`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsPage {
+    /// The events in cursor order.
+    pub events: Vec<NodeEvent>,
+    /// The cursor to pass as the next `cursor` (the last event's cursor, or the input when empty).
+    pub next_cursor: u64,
+    /// The highest cursor the feed has assigned (how far a reader can advance now).
+    pub head_cursor: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -3266,6 +3419,16 @@ pub enum ApiRequest {
         /// Maximum entries to return (0 = all available).
         max: u32,
     },
+    /// [`ControlApi::events_page`] / [`ControlApi::events_subscribe`] — the node-wide event feed
+    /// (L3). Served as a push stream over `Open` (streaming, [`is_streaming`]) or a one-shot/long-poll
+    /// page over `Call`.
+    EventsSince {
+        /// The exclusive lower-bound feed cursor (0 from the start of the retained ring).
+        cursor: u64,
+        /// One-shot long-poll hold (ms); `None`/`0` returns immediately. Ignored by the push path.
+        #[serde(default)]
+        wait_ms: Option<u32>,
+    },
     /// [`SessionApi::delivery_targets`].
     DeliveryTargets {
         /// The session whose delivery targets to read.
@@ -3292,6 +3455,7 @@ pub enum ApiRequest {
         /// The renderer/router discriminator (e.g. `"presence"` / `"attach"`).
         kind: String,
         /// The opaque encoded body, decoded by the consumer per `kind`.
+        #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
     /// [`ControlApi::unit_history`].
@@ -4003,6 +4167,7 @@ pub enum ApiRequest {
         /// Root-relative path.
         path: String,
         /// The bytes to write.
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
         /// The base etag for optimistic concurrency (`None` = create-or-overwrite).
         #[serde(default)]
@@ -4032,6 +4197,7 @@ pub enum ApiRequest {
     /// [`ControlApi::blob_put`].
     BlobPut {
         /// The bytes to store.
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     /// [`ControlApi::blob_get`].
@@ -4101,6 +4267,8 @@ pub enum ApiResponse {
     Journal(JournalPageView),
     /// A page of the merged live session event log (the cursor read of `subscribe`).
     LogPage(LogPageView),
+    /// A page of the node-wide event feed (the cursor read of `events_since`; L3).
+    EventsPage(EventsPage),
     /// A session's outbound delivery targets (the reply sinks of `delivery_targets`).
     DeliveryTargets(Vec<DeliveryTarget>),
     /// The live sessions a transport instance owns for delivery (`delivery_sessions`).
@@ -4224,9 +4392,112 @@ pub enum ApiResponse {
     /// A stored blob's ref (blob_put).
     BlobPut(BlobRef),
     /// A blob's bytes (blob_get).
-    BlobGet(Vec<u8>),
+    BlobGet(#[serde(with = "serde_bytes")] Vec<u8>),
     /// A blob's metadata (blob_stat).
     BlobStat(BlobStat),
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2)
+// ---------------------------------------------------------------------------
+
+/// The wire protocol version a `Hello` negotiates. Bumped when the envelope shape changes.
+pub const WIRE_VERSION: u32 = 1;
+/// Feature flag: the connection speaks the multiplexed `Call`/`Reply` envelope.
+pub const WIRE_FEATURE_MUX: &str = "mux";
+/// Feature flag: the server can push `Item`/`End` frames for streaming requests.
+pub const WIRE_FEATURE_STREAM: &str = "stream";
+
+/// A client -> server multiplexed frame. Wraps an [`ApiRequest`] so one connection can carry many
+/// correlated exchanges. Absent on the legacy path: a connection whose first frame decodes as a
+/// bare [`ApiRequest`] (no `Hello`) is served one-shot exactly as before, preserving the FFI/CLI.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireC2S {
+    /// Opt into the multiplexed/streaming envelope; the server answers with [`WireS2C::Hello`].
+    Hello {
+        /// The highest [`WIRE_VERSION`] the client speaks.
+        wire_version: u32,
+        /// Requested capabilities (e.g. [`WIRE_FEATURE_MUX`], [`WIRE_FEATURE_STREAM`]).
+        features: Vec<String>,
+    },
+    /// A one-shot request, answered by exactly one [`WireS2C::Reply`]. `Subscribe` over `Call` is the
+    /// non-destructive cursor read (`log_after`), so a polling client keeps working under mux.
+    Call {
+        /// Client-chosen, per-connection, monotonically increasing correlation id.
+        id: u64,
+        /// The wrapped request.
+        req: ApiRequest,
+    },
+    /// Open a server-stream for a streaming-capable request ([`is_streaming`]), answered by zero or
+    /// more [`WireS2C::Item`]s then [`WireS2C::End`]. The client (not the request variant alone)
+    /// chooses streaming, so the same `Subscribe` can be polled (`Call`) or streamed (`Open`).
+    Open {
+        /// Client-chosen correlation id for the stream.
+        id: u64,
+        /// The wrapped streaming request.
+        req: ApiRequest,
+    },
+    /// Tear an `Open` stream down early (distinct from [`ApiRequest::Cancel`], which cancels a
+    /// turn). No-op for an already-closed `id`.
+    Cancel {
+        /// The exchange to abort.
+        id: u64,
+    },
+}
+
+/// A server -> client multiplexed frame.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireS2C {
+    /// Handshake ack: the capabilities the server actually supports (the usable set is the
+    /// intersection with the client's requested `features`).
+    Hello {
+        /// The server's [`WIRE_VERSION`].
+        wire_version: u32,
+        /// Supported capabilities.
+        features: Vec<String>,
+    },
+    /// The single result of a one-shot `Call` (closes `id`).
+    Reply {
+        /// The `Call` id this answers.
+        id: u64,
+        /// The wrapped response.
+        res: ApiResponse,
+    },
+    /// One chunk of a streaming `Call`; `id` stays open until `End`.
+    Item {
+        /// The `Call` id this belongs to.
+        id: u64,
+        /// The wrapped response chunk.
+        res: ApiResponse,
+    },
+    /// A stream closed (clean iff `error` is `None`).
+    End {
+        /// The `Call` id that closed.
+        id: u64,
+        /// `Some` if the stream ended in error (e.g. the live broadcast lagged).
+        error: Option<ApiError>,
+    },
+    /// The stream's cursor is no longer trustworthy (lag / re-activation); the client must
+    /// re-baseline. Carried here from L0 on; the epoch/head_seq semantics are finalized in L2.
+    Reset {
+        /// The affected `Call` id.
+        id: u64,
+        /// The current session-activation epoch.
+        epoch: u64,
+        /// The current high-water `seq`.
+        head_seq: u64,
+    },
+}
+
+/// Whether a request is served as a server-stream (`Item`* then `End`) rather than a single `Reply`.
+/// L0 streams only the live log subscription; later layers add the node-wide events feed.
+pub fn is_streaming(req: &ApiRequest) -> bool {
+    matches!(
+        req,
+        ApiRequest::Subscribe { .. } | ApiRequest::EventsSince { .. }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4325,6 +4596,7 @@ pub struct FsRevision {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsContent {
     /// The (possibly truncated) file bytes.
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     /// The content etag (pass as `base_revision` to fs_write).
     pub revision: FsRevision,
@@ -4425,6 +4697,16 @@ pub struct FsWatchPageView {
     pub events: Vec<FsChange>,
     /// The cursor to pass as `after_seq` on the next poll.
     pub next_seq: u64,
+    /// The highest change `seq` the watch ring currently holds (how far a reader can advance now).
+    /// Lets the client detect it is behind the live edge. `#[serde(default)]` keeps old (head-less)
+    /// encodings decodable. (Cursored-stream contract; daemon-event-io-spec §5.4.1.)
+    #[serde(default)]
+    pub head_seq: u64,
+    /// `true` when the reader's `after_seq` aged out of the ring (events were evicted past it), so
+    /// this page is NOT a complete delta — the client must re-list the watched dir to reconcile
+    /// (the fs analogue of the merged log's `Lagged -> Reset`). `#[serde(default)]` = `false`.
+    #[serde(default)]
+    pub reset: bool,
 }
 
 /// A live push stream of filesystem changes (a transport capability, like [`LogStream`]; the
@@ -4556,6 +4838,11 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         } => unit_or_err(api.approval_decide(session, request_id, allow).await),
         ApiRequest::CheckpointList { session } => {
             ApiResponse::Checkpoints(api.checkpoints(session).await)
+        }
+        // L3 node-wide event feed: the one-shot/long-poll page (the push form rides `Open` ->
+        // `events_subscribe` in the socket pump, not `dispatch`).
+        ApiRequest::EventsSince { cursor, .. } => {
+            ApiResponse::EventsPage(api.events_page(cursor, 0).await)
         }
         ApiRequest::CheckpointRewind {
             session,
@@ -5455,6 +5742,8 @@ mod tests {
                     kind: FsChangeKind::Modified,
                 }],
                 next_seq: 5,
+                head_seq: 5,
+                reset: false,
             }),
         ];
         for resp in resps {
@@ -5580,6 +5869,7 @@ mod tests {
                     scope: SessionScope::ByProfile(ProfileRef::new("agent-x")),
                     after: Some(SessionId::new("s0")),
                     limit: 25,
+                    since_rev: Some(12),
                 },
             },
             ApiRequest::SessionGet {
@@ -5622,6 +5912,8 @@ mod tests {
             ApiResponse::SessionPage(SessionPage {
                 sessions: vec![sample_info()],
                 next_cursor: Some(SessionId::new("s1")),
+                rev: 7,
+                removed: vec![SessionId::new("gone")],
             }),
             ApiResponse::SessionDetail(Some(SessionDetail {
                 info: sample_info(),
@@ -5708,6 +6000,7 @@ mod tests {
             }],
             next_seq: 13,
             head_seq: 13,
+            epoch: 0,
         });
         assert_eq!(page, from_cbor::<ApiResponse>(&to_cbor(&page)).unwrap());
     }

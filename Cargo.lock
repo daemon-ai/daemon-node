@@ -2121,6 +2121,7 @@ dependencies = [
  "futures",
  "proptest",
  "serde",
+ "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -2531,6 +2532,7 @@ dependencies = [
  "ciborium",
  "daemon-common",
  "serde",
+ "serde_bytes",
  "serde_json",
 ]
 

@@ -109,7 +109,13 @@ pub async fn serve_delivery(
                 Ok(s) => s,
                 Err(_) => return,
             };
-            while let Some(entry) = stream.next().await {
+            while let Some(item) = stream.next().await {
+                // A lossy lag is best-effort-skipped here (the prior silent-drop behavior); durable
+                // delivery re-baseline is future work (it would re-subscribe from 0 and dedup).
+                let entry = match item {
+                    daemon_api::LogStreamItem::Entry(e) => e,
+                    daemon_api::LogStreamItem::Lagged => continue,
+                };
                 // Re-check ownership before projecting: subscribe streams the full merged log to every
                 // reader (Primary or Spectator), so a demoted transport keeps receiving entries — it
                 // must drop out itself once it is no longer the Primary (handover stop).

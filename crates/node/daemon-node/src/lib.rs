@@ -33,9 +33,9 @@ use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
     BlobStore, CodecSession, CoreEngineFactory, CredentialStore, CronFiring, CronScheduler,
     DurableProfileResolver, EngineUnit, FileBlobStore, FleetControl, Host, HostConfig, JobWorker,
-    JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl, ProcessAgentUnit,
-    ProfileStore, RoutingRegistry, ServiceError, SessionEngineBuilder, StreamJsonCodec,
-    SupervisorHandle, WorkspaceFs, WorkspaceRoots,
+    JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl, NodeEventFeed,
+    ProcessAgentUnit, ProfileStore, RoutingRegistry, ServiceError, SessionEngineBuilder,
+    StreamJsonCodec, SupervisorHandle, WorkspaceFs, WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -704,6 +704,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // topology change, and `NodeApiImpl::tree_subscribe` subscribes to for live push. Capacity is a
     // burst cushion; a slow subscriber that lags re-syncs with a fresh snapshot.
     let (fleet_events, _) = tokio::sync::broadcast::channel::<TreeEvent>(256);
+    // The node-wide event feed (L3 `EventsSince`): a retained, cursored ring of payload-free
+    // notifications the client subscribes to so it learns out-of-focus changes without polling. The
+    // ring depth bounds how far behind a reconnecting client can be before it gets `ResyncNeeded`.
+    let node_events = NodeEventFeed::new(1024);
     let fleet = FleetRuntime::new(
         a.store.clone(),
         a.partition,
@@ -942,7 +946,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     .with_metrics(host.metrics().clone())
     // Subscribe the tree-push surface to the host fleet bus (I4/I8): `tree_subscribe` now forwards
     // live spawn/terminal/progress deltas instead of re-projecting on a fixed poll interval.
-    .with_fleet_events(fleet_events.clone());
+    .with_fleet_events(fleet_events.clone())
+    // The node-wide event feed (L3): `events_since` serves from this ring and the §5 emit hooks
+    // push onto it.
+    .with_node_events(node_events.clone());
     // Bind the filesystem / workspace surface (`fs_*`) over the SAME `WorkspaceRoots` the engine
     // exec builders root at, so operator and agent see one filesystem.
     if let Some(roots) = &workspace_roots {
@@ -958,6 +965,30 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     node_api = node_api.with_cron(cron_ops.clone());
     // Bind the model-management sub-surface when this node hosts local-inference model management.
     if let Some(models) = a.models.clone() {
+        // L3: fan download progress onto the node-wide feed so the client renders it without the
+        // 600ms poll. pct is derived from the byte counters; state mirrors the wire string.
+        let feed = node_events.clone();
+        models.set_download_progress(Arc::new(move |status: daemon_common::DownloadStatus| {
+            let pct = status
+                .downloaded_bytes
+                .saturating_mul(100)
+                .checked_div(status.total_bytes)
+                .unwrap_or(0)
+                .min(100) as u32;
+            let state = match status.state {
+                daemon_common::DownloadState::Queued => "Queued",
+                daemon_common::DownloadState::Downloading => "Downloading",
+                daemon_common::DownloadState::Completed => "Completed",
+                daemon_common::DownloadState::Paused => "Paused",
+                daemon_common::DownloadState::Cancelled => "Cancelled",
+                daemon_common::DownloadState::Failed => "Failed",
+            };
+            feed.emit(daemon_api::NodeEvent::DownloadProgress {
+                id: status.id,
+                pct,
+                state: state.to_string(),
+            });
+        }));
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
     }
     // Bind the profile/config sub-surface when this node hosts profile management.

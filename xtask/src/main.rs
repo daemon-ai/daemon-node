@@ -217,8 +217,9 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 
 fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
-        ApiRequest, ApiResponse, CommandInvocation, CommandOutput, CredentialInfo, HealthReport,
-        LogPageView, ModelDescriptor, ProfileSpec, ProviderSelector, ServiceHealth, SessionPage,
+        ApiRequest, ApiResponse, CommandInvocation, CommandOutput, CredentialInfo, EventsPage,
+        HealthReport, LogPageView, ModelDescriptor, NodeEvent, ProfileSpec, ProviderSelector,
+        ServiceHealth, SessionPage,
     };
     use daemon_common::{ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, UserMsg};
@@ -236,6 +237,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 scope: daemon_api::SessionScope::TopLevel,
                 after: None,
                 limit: 25,
+                since_rev: None,
             },
         },
     )?;
@@ -246,6 +248,14 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             session: SessionId::new("fixture-session"),
             after_seq: 0,
             max: 64,
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-events-since.cbor",
+        &ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: Some(1000),
         },
     )?;
     write_cbor(
@@ -384,6 +394,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiResponse::SessionPage(SessionPage {
             sessions: Vec::new(),
             next_cursor: None,
+            rev: 0,
+            removed: Vec::new(),
         }),
     )?;
     write_cbor(
@@ -393,6 +405,22 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             entries: Vec::new(),
             next_seq: 0,
             head_seq: 0,
+            epoch: 0,
+        }),
+    )?;
+    write_cbor(
+        &out,
+        "response-events-page.cbor",
+        &ApiResponse::EventsPage(EventsPage {
+            events: vec![
+                NodeEvent::RosterChanged { rev: 7 },
+                NodeEvent::ApprovalPending {
+                    session: SessionId::new("fixture-session"),
+                    request_id: "req-1".into(),
+                },
+            ],
+            next_cursor: 12,
+            head_cursor: 12,
         }),
     )?;
     write_cbor(
@@ -596,6 +624,92 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             &ApiResponse::ModelDownloadStarted(daemon_common::DownloadId(1)),
         )?;
     }
+    // Multiplexed/server-streaming envelope (wire L0): prove the Rust serde shapes match the
+    // wire-c2s / wire-s2c CDDL rules. The client hand-codes this envelope, so these fixtures are the
+    // schema gate that keeps both sides in agreement.
+    {
+        use daemon_api::{WireC2S, WireS2C, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM, WIRE_VERSION};
+        let features = vec![
+            WIRE_FEATURE_MUX.to_string(),
+            WIRE_FEATURE_STREAM.to_string(),
+        ];
+        write_cbor(
+            &out,
+            "wire-c2s-hello.cbor",
+            &WireC2S::Hello {
+                wire_version: WIRE_VERSION,
+                features: features.clone(),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "wire-c2s-call.cbor",
+            &WireC2S::Call {
+                id: 1,
+                req: ApiRequest::Subscribe {
+                    session: SessionId::new("fixture-session"),
+                    after_seq: 0,
+                    max: 64,
+                },
+            },
+        )?;
+        write_cbor(
+            &out,
+            "wire-c2s-open.cbor",
+            &WireC2S::Open {
+                id: 2,
+                req: ApiRequest::Subscribe {
+                    session: SessionId::new("fixture-session"),
+                    after_seq: 0,
+                    max: 64,
+                },
+            },
+        )?;
+        write_cbor(&out, "wire-c2s-cancel.cbor", &WireC2S::Cancel { id: 1 })?;
+        write_cbor(
+            &out,
+            "wire-s2c-hello.cbor",
+            &WireS2C::Hello {
+                wire_version: WIRE_VERSION,
+                features,
+            },
+        )?;
+        write_cbor(
+            &out,
+            "wire-s2c-reply.cbor",
+            &WireS2C::Reply {
+                id: 1,
+                res: ApiResponse::Ok,
+            },
+        )?;
+        write_cbor(
+            &out,
+            "wire-s2c-item.cbor",
+            &WireS2C::Item {
+                id: 1,
+                res: ApiResponse::LogPage(LogPageView {
+                    entries: Vec::new(),
+                    next_seq: 0,
+                    head_seq: 0,
+                    epoch: 0,
+                }),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "wire-s2c-end.cbor",
+            &WireS2C::End { id: 1, error: None },
+        )?;
+        write_cbor(
+            &out,
+            "wire-s2c-reset.cbor",
+            &WireS2C::Reset {
+                id: 1,
+                epoch: 0,
+                head_seq: 0,
+            },
+        )?;
+    }
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())
 }
@@ -754,6 +868,17 @@ fn verify_codec() -> anyhow::Result<()> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().map(|ext| ext == "cbor").unwrap_or(false))
+        // The multiplexed-envelope fixtures (`wire-c2s-*` / `wire-s2c-*`) are NOT `api-request` /
+        // `api-response`, and the vendored C codec is deliberately scoped to those two entry types
+        // (the client hand-codes the tiny envelope). Their schema is covered by the cddl-cat
+        // conformance test against `wire-c2s` / `wire-s2c`, not this generated-decoder harness.
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("wire-"))
+                .unwrap_or(false)
+        })
         .collect();
     fixtures.sort();
     anyhow::ensure!(
