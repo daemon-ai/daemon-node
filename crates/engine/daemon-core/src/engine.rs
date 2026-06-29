@@ -1145,36 +1145,6 @@ impl Engine {
                     checkpoints: checkpoints.as_deref(),
                 };
 
-                // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
-                // slots, effects, and structured detail for the rich §17 transcript views.
-                //
-                // A batch runs **concurrently** only when it has more than one call and *every* call
-                // resolves to a tool that declares itself [`ToolConcurrency::Parallel`] (all-or-nothing;
-                // any exclusive/mutating call serializes the batch — see [`crate::tools::Tool::concurrency`]).
-                let view_of = |call: &crate::conversation::ToolCall| ToolCallView {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    args_summary: call.args.clone(),
-                    // A generic structured echo of the call arguments, opaque to the daemon; a tool
-                    // with a richer call schema can refine this once providers carry structured args.
-                    detail: Some(ToolDetail {
-                        kind: call.name.clone(),
-                        body: call.args.clone().into_bytes(),
-                    }),
-                };
-                let result_view_of = |outcome: &crate::tools::ToolOutcome| ToolResultView {
-                    call_id: outcome.result.call_id.clone(),
-                    ok: outcome.result.ok,
-                    summary: outcome.result.content.clone(),
-                    // The tool's typed output (fs listing, command exit/stdout, ...) for a rich
-                    // consumer; `None` for plain-text tools.
-                    detail: outcome.detail.clone(),
-                };
-
-                let mut calls = Vec::new();
-                let mut effects: Vec<Effect> = Vec::new();
-                let mut interrupted = false;
-
                 // Count this tool-executing round and note skill/memory tool use for the review nudges.
                 tool_rounds = tool_rounds.saturating_add(1);
                 for c in &out.tool_calls {
@@ -1185,58 +1155,11 @@ impl Engine {
                     }
                 }
 
-                let parallel = out.tool_calls.len() > 1
-                    && out.tool_calls.iter().all(|c| {
-                        registry
-                            .get(&c.name)
-                            .map(|t| t.concurrency() == crate::tools::ToolConcurrency::Parallel)
-                            .unwrap_or(false)
-                    });
-
-                if parallel {
-                    // Emit all starts in call order, run the batch concurrently, then drain results in
-                    // call order. Read-only parallel tools have no ordered side effects, so the boundary
-                    // is evaluated once after the whole batch settles.
-                    for call in &out.tool_calls {
-                        let view = view_of(call);
-                        events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-                    }
-                    let outcomes =
-                        futures::future::join_all(out.tool_calls.iter().map(|call| async {
-                            (call.clone(), run_tool(call, &registry, &cx).await)
-                        }))
-                        .await;
-                    for (call, outcome) in outcomes {
-                        let result_view = result_view_of(&outcome);
-                        events.emit(|seq| AgentEvent::ToolFinished {
-                            seq,
-                            result: result_view,
-                        });
-                        calls.push((call, outcome.result));
-                        effects.extend(outcome.effects);
-                    }
-                    if self.boundary_readonly(control, events) {
-                        interrupted = true;
-                    }
-                } else {
-                    for call in &out.tool_calls {
-                        let view = view_of(call);
-                        events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-                        let outcome = run_tool(call, &registry, &cx).await;
-                        let result_view = result_view_of(&outcome);
-                        events.emit(|seq| AgentEvent::ToolFinished {
-                            seq,
-                            result: result_view,
-                        });
-                        calls.push((call.clone(), outcome.result));
-                        effects.extend(outcome.effects);
-                        // Boundary after each tool: an interrupt stops further tool execution.
-                        if self.boundary_readonly(control, events) {
-                            interrupted = true;
-                            break;
-                        }
-                    }
-                }
+                // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
+                // slots, effects, and structured detail for the rich §17 transcript views.
+                let (calls, effects, interrupted) = self
+                    .execute_tool_batch(&out.tool_calls, &cx, &registry, control, events)
+                    .await;
 
                 // §4.2 no-progress signature of this round (the tool calls + their results), computed
                 // before `calls` is moved into the recorded turn. Repeated identical rounds => looping.
@@ -1250,26 +1173,17 @@ impl Engine {
                     },
                     calls,
                 }));
-                let mut delegated: Option<(JobId, Vec<u8>)> = None;
-                let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
-                let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
-                for effect in effects {
-                    match effect {
-                        Effect::Persist(turn) => self.snapshot.conversation.turns.push(turn),
-                        Effect::Delegate { job, payload } => delegated = Some((job, payload)),
-                        Effect::Spawn(spec) => spawns.push(spec),
-                        Effect::AwaitDecision {
-                            job_id,
-                            call,
-                            prompt,
-                            path,
-                        } => awaiting.push(crate::snapshot::PendingApproval {
-                            job_id,
-                            call,
-                            prompt,
-                            path,
-                        }),
-                    }
+                // Route the batch's effects: persisted turns land on the conversation (after the
+                // recorded tool turn, before any spawn is issued — the original ordering), the rest
+                // drive suspension / fire-and-forget below.
+                let PartitionedEffects {
+                    persists,
+                    delegated,
+                    spawns,
+                    awaiting,
+                } = partition_tool_effects(effects);
+                for turn in persists {
+                    self.snapshot.conversation.turns.push(turn);
                 }
                 // Fire-and-forget: issue each spawn as a non-joining host request and keep running. The
                 // parent never enters `waiting_for` and never suspends for these (cf. `Delegate` below).
@@ -1467,6 +1381,93 @@ impl Engine {
         })
     }
 
+    /// Run the model's tool batch through the §12 pipeline, collecting result slots, effects, and
+    /// structured detail for the rich §17 transcript views; returns `(calls, effects, interrupted)`.
+    ///
+    /// A batch runs **concurrently** only when it has more than one call and *every* call resolves to
+    /// a tool that declares itself [`ToolConcurrency::Parallel`](crate::tools::ToolConcurrency)
+    /// (all-or-nothing; any exclusive/mutating call serializes the batch). Strict §17 event ordering
+    /// is preserved: per-call `ToolStarted`→`ToolFinished` in call order (the parallel branch emits
+    /// every start in order, runs the batch, then drains every finish in order). The read-only steer
+    /// boundary is evaluated once after a parallel batch settles, but after *each* serial tool (an
+    /// interrupt stops further serial execution). Takes `&self` and the pre-cloned `cx`/`registry`
+    /// handles (so no `&mut self` is held across a tool await — the `resolve_approvals` pattern).
+    async fn execute_tool_batch(
+        &self,
+        tool_calls: &[crate::conversation::ToolCall],
+        cx: &TurnCx<'_>,
+        registry: &Arc<ToolRegistry>,
+        control: &TurnControl,
+        events: &EventSink,
+    ) -> (
+        Vec<(
+            crate::conversation::ToolCall,
+            crate::conversation::ToolResult,
+        )>,
+        Vec<Effect>,
+        bool,
+    ) {
+        let mut calls = Vec::new();
+        let mut effects: Vec<Effect> = Vec::new();
+        let mut interrupted = false;
+
+        let parallel = tool_calls.len() > 1
+            && tool_calls.iter().all(|c| {
+                registry
+                    .get(&c.name)
+                    .map(|t| t.concurrency() == crate::tools::ToolConcurrency::Parallel)
+                    .unwrap_or(false)
+            });
+
+        if parallel {
+            // Emit all starts in call order, run the batch concurrently, then drain results in
+            // call order. Read-only parallel tools have no ordered side effects, so the boundary
+            // is evaluated once after the whole batch settles.
+            for call in tool_calls {
+                let view = tool_call_view(call);
+                events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+            }
+            let outcomes = futures::future::join_all(
+                tool_calls
+                    .iter()
+                    .map(|call| async { (call.clone(), run_tool(call, registry, cx).await) }),
+            )
+            .await;
+            for (call, outcome) in outcomes {
+                let result_view = tool_result_view(&outcome);
+                events.emit(|seq| AgentEvent::ToolFinished {
+                    seq,
+                    result: result_view,
+                });
+                calls.push((call, outcome.result));
+                effects.extend(outcome.effects);
+            }
+            if self.boundary_readonly(control, events) {
+                interrupted = true;
+            }
+        } else {
+            for call in tool_calls {
+                let view = tool_call_view(call);
+                events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                let outcome = run_tool(call, registry, cx).await;
+                let result_view = tool_result_view(&outcome);
+                events.emit(|seq| AgentEvent::ToolFinished {
+                    seq,
+                    result: result_view,
+                });
+                calls.push((call.clone(), outcome.result));
+                effects.extend(outcome.effects);
+                // Boundary after each tool: an interrupt stops further tool execution.
+                if self.boundary_readonly(control, events) {
+                    interrupted = true;
+                    break;
+                }
+            }
+        }
+
+        (calls, effects, interrupted)
+    }
+
     /// Resolve parked §12 approval decisions on resume: for each unapplied completion whose `job_id`
     /// matches a [`PendingApproval`](crate::snapshot::PendingApproval), re-run the approved tool call
     /// (allow — performs the side effect, with `pre_approved` set so the tool skips its gate) or
@@ -1610,6 +1611,82 @@ impl Engine {
     }
 }
 
+/// The single-owner applier's view of a tool batch's [`Effect`]s, partitioned by kind (§4.3): the
+/// `Persist` turns to append to the conversation, the at-most-one `Delegate` (job + payload) that
+/// drives suspension, the fire-and-forget `Spawn`s, and the `AwaitDecision` parks (§12 HITL). Pure:
+/// the caller replays `persists` and acts on the rest, so no conversation mutation hides in here.
+struct PartitionedEffects {
+    /// Turns to append to the conversation (durable record), in effect order.
+    persists: Vec<Turn>,
+    /// The delegated job + opaque payload to suspend on, if the batch delegated (last one wins,
+    /// matching the original inline router).
+    delegated: Option<(JobId, Vec<u8>)>,
+    /// Attached, non-joining background children to spawn fire-and-forget.
+    spawns: Vec<daemon_protocol::SpawnSpec>,
+    /// Gated tool calls awaiting a durable operator decision.
+    awaiting: Vec<crate::snapshot::PendingApproval>,
+}
+
+/// Partition a tool batch's [`Effect`]s into [`PartitionedEffects`] (§4.3 effect router). Verbatim
+/// of the original inline `match`, but pure: `Persist` turns are collected (not pushed) so the
+/// single-owner applier remains the sole mutator of the conversation.
+fn partition_tool_effects(effects: Vec<Effect>) -> PartitionedEffects {
+    let mut persists: Vec<Turn> = Vec::new();
+    let mut delegated: Option<(JobId, Vec<u8>)> = None;
+    let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
+    let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
+    for effect in effects {
+        match effect {
+            Effect::Persist(turn) => persists.push(turn),
+            Effect::Delegate { job, payload } => delegated = Some((job, payload)),
+            Effect::Spawn(spec) => spawns.push(spec),
+            Effect::AwaitDecision {
+                job_id,
+                call,
+                prompt,
+                path,
+            } => awaiting.push(crate::snapshot::PendingApproval {
+                job_id,
+                call,
+                prompt,
+                path,
+            }),
+        }
+    }
+    PartitionedEffects {
+        persists,
+        delegated,
+        spawns,
+        awaiting,
+    }
+}
+
+/// The §17 transcript view of a tool *call* (`ToolStarted`): name + a generic structured echo of
+/// the call arguments, opaque to the daemon. A tool with a richer call schema can refine `detail`
+/// once providers carry structured args.
+fn tool_call_view(call: &crate::conversation::ToolCall) -> ToolCallView {
+    ToolCallView {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        args_summary: call.args.clone(),
+        detail: Some(ToolDetail {
+            kind: call.name.clone(),
+            body: call.args.clone().into_bytes(),
+        }),
+    }
+}
+
+/// The §17 transcript view of a tool *result* (`ToolFinished`): the summary text plus the tool's
+/// typed output (`detail`) for a rich consumer; `detail` is `None` for plain-text tools.
+fn tool_result_view(outcome: &crate::tools::ToolOutcome) -> ToolResultView {
+    ToolResultView {
+        call_id: outcome.result.call_id.clone(),
+        ok: outcome.result.ok,
+        summary: outcome.result.content.clone(),
+        detail: outcome.detail.clone(),
+    }
+}
+
 /// A stable hash of one tool round's calls and results (§4.2 no-progress guard). Hashes each call's
 /// `name` + `args` and its result's `ok` + `content`, but **not** the per-call `call_id` (freshly
 /// minted each round), so two rounds that issue the same calls and get the same results hash equal —
@@ -1663,11 +1740,14 @@ fn recovery_step_kind(step: &RecoveryStep) -> &'static str {
 }
 
 #[cfg(test)]
+mod support;
+
+#[cfg(test)]
 mod tests {
+    use super::support::*;
     use super::*;
-    use crate::provider::{Capabilities, ModelOutput, Request, ToolCallFormat};
+    use crate::provider::{Capabilities, ModelOutput, Request};
     use daemon_common::{CredScope, ReqId, UsageDelta};
-    use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A provider that fails the first call with a rotatable error, then completes.
@@ -1678,12 +1758,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Provider for FlakyProvider {
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_native_tools: true,
-                supports_streaming: false,
-                tool_call_format: ToolCallFormat::Native,
-                max_context: Some(8192),
-            }
+            test_caps()
         }
 
         async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
@@ -1691,24 +1766,7 @@ mod tests {
             if n == 0 {
                 Err(Failure::Rotatable("quota exceeded (429)".into()))
             } else {
-                Ok(ModelOutput {
-                    text: "done after rotation".into(),
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    usage: UsageDelta::default(),
-                })
-            }
-        }
-    }
-
-    struct NoopHost;
-
-    #[async_trait::async_trait]
-    impl HostRequestHandler for NoopHost {
-        async fn request(&self, req: HostRequest) -> HostResponse {
-            HostResponse {
-                request_id: req.request_id,
-                body: HostResponseBody::Approved(true),
+                Ok(ok_output("done after rotation"))
             }
         }
     }
@@ -1748,29 +1806,6 @@ mod tests {
         assert_eq!(pool.live_count(), 1, "the rotated key is cooling down");
     }
 
-    /// A provider that always completes with plain final text (no tool calls).
-    struct TextProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for TextProvider {
-        fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_native_tools: true,
-                supports_streaming: false,
-                tool_call_format: ToolCallFormat::Native,
-                max_context: Some(8192),
-            }
-        }
-        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
-            Ok(ModelOutput {
-                text: "ok".into(),
-                reasoning: None,
-                tool_calls: Vec::new(),
-                usage: UsageDelta::default(),
-            })
-        }
-    }
-
     /// A provider that records the system prompt of the request it receives, then completes.
     struct SystemRecordingProvider {
         seen: std::sync::Mutex<String>,
@@ -1779,21 +1814,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Provider for SystemRecordingProvider {
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_native_tools: true,
-                supports_streaming: false,
-                tool_call_format: ToolCallFormat::Native,
-                max_context: Some(8192),
-            }
+            test_caps()
         }
         async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
             *self.seen.lock().unwrap() = req.system.clone();
-            Ok(ModelOutput {
-                text: "ok".into(),
-                reasoning: None,
-                tool_calls: Vec::new(),
-                usage: UsageDelta::default(),
-            })
+            Ok(ok_output("ok"))
         }
     }
 
@@ -1831,29 +1856,6 @@ mod tests {
             seen.contains("<available_skills>"),
             "folds the stable block in"
         );
-    }
-
-    /// A host that records every spawn `kind` it is asked to materialize.
-    #[derive(Default)]
-    struct SpawnRecordingHost {
-        spawns: std::sync::Mutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl HostRequestHandler for SpawnRecordingHost {
-        async fn request(&self, req: HostRequest) -> HostResponse {
-            if let HostRequestKind::Spawn { spec } = &req.kind {
-                self.spawns.lock().unwrap().push(spec.kind.clone());
-                return HostResponse {
-                    request_id: req.request_id,
-                    body: HostResponseBody::Spawned(SessionId::new("child")),
-                };
-            }
-            HostResponse {
-                request_id: req.request_id,
-                body: HostResponseBody::Approved(true),
-            }
-        }
     }
 
     /// With `memory_review_interval = 1`, a completed turn (no memory write) fires exactly one
@@ -1947,12 +1949,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Provider for PolicyGatedProvider {
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_native_tools: true,
-                supports_streaming: false,
-                tool_call_format: ToolCallFormat::Native,
-                max_context: Some(8192),
-            }
+            test_caps()
         }
 
         async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
@@ -2020,33 +2017,12 @@ mod tests {
     #[async_trait::async_trait]
     impl Provider for FailingProvider {
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_native_tools: true,
-                supports_streaming: false,
-                tool_call_format: ToolCallFormat::Native,
-                max_context: Some(8192),
-            }
+            test_caps()
         }
 
         async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
             Err(Failure::Provider("model exploded".into()))
         }
-    }
-
-    /// An event sink that records every emitted event for assertions.
-    fn collecting() -> (EventSink, Arc<std::sync::Mutex<Vec<AgentEvent>>>) {
-        let log = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
-        let l = log.clone();
-        (EventSink::new(move |ev| l.lock().unwrap().push(ev)), log)
-    }
-
-    fn completing_engine(id: &str) -> Engine {
-        Engine::fresh(
-            SessionId::new(id),
-            SystemPrompt::new("test"),
-            Arc::new(crate::provider::MockProvider::completing("hi")),
-            Arc::new(ToolRegistry::new()),
-        )
     }
 
     /// An interrupt observed at the opening phase boundary finalizes the turn as `Interrupted`.
@@ -2155,48 +2131,6 @@ mod tests {
 
     use crate::conversation::ToolCall;
     use crate::provider::{ScriptStep, ScriptedProvider};
-    use crate::tools::Tool;
-    use crate::turn::TurnCx;
-
-    /// A trivial in-turn tool that records how many times it ran (shared counter) and returns a
-    /// fixed result — enough to exercise the model->tools->model loop without a real tool crate.
-    struct CounterTool {
-        runs: Arc<AtomicU64>,
-    }
-
-    #[async_trait::async_trait]
-    impl Tool for CounterTool {
-        fn name(&self) -> &str {
-            "counter"
-        }
-        fn schema(&self) -> &str {
-            "{}"
-        }
-        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> crate::tools::ToolOutcome {
-            let n = self.runs.fetch_add(1, Ordering::Relaxed);
-            crate::tools::ToolOutcome::text(call.call_id.clone(), true, format!("counter:{n}"))
-        }
-    }
-
-    fn looping_engine(
-        provider: Arc<dyn Provider>,
-        runs: Arc<AtomicU64>,
-        max_iterations: u32,
-    ) -> Engine {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(CounterTool { runs }));
-        let config = Config {
-            max_iterations,
-            ..Config::default()
-        };
-        Engine::fresh(
-            SessionId::new("react"),
-            SystemPrompt::new("test"),
-            provider,
-            Arc::new(registry),
-        )
-        .with_config(config)
-    }
 
     /// The model calls a tool twice across two rounds, then returns final text — one activation runs
     /// the whole multi-round loop and completes (no suspension).
@@ -2246,53 +2180,6 @@ mod tests {
             .filter(|t| matches!(t, Turn::Tool(_)))
             .count();
         assert_eq!(tool_turns, 2);
-    }
-
-    /// A tool that records the *peak* number of concurrent in-flight executions across a batch. By
-    /// holding a short overlap window in `run`, two genuinely concurrent calls observe `max_seen == 2`
-    /// while serialized calls only ever observe `1` — a deterministic probe for §12 batch concurrency.
-    struct ProbeTool {
-        name: &'static str,
-        concurrency: crate::tools::ToolConcurrency,
-        active: Arc<AtomicU64>,
-        max_seen: Arc<AtomicU64>,
-    }
-
-    #[async_trait::async_trait]
-    impl Tool for ProbeTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn schema(&self) -> &str {
-            "{}"
-        }
-        fn concurrency(&self) -> crate::tools::ToolConcurrency {
-            self.concurrency
-        }
-        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> crate::tools::ToolOutcome {
-            let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_seen.fetch_max(cur, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            crate::tools::ToolOutcome::text(call.call_id.clone(), true, "ok")
-        }
-    }
-
-    fn probe_engine(provider: Arc<dyn Provider>, tools: Vec<Arc<dyn Tool>>) -> Engine {
-        let mut registry = ToolRegistry::new();
-        for t in tools {
-            registry.register(t);
-        }
-        Engine::fresh(
-            SessionId::new("probe"),
-            SystemPrompt::new("test"),
-            provider,
-            Arc::new(registry),
-        )
-        .with_config(Config {
-            max_iterations: 8,
-            ..Config::default()
-        })
     }
 
     /// A batch of two `Parallel` tool calls runs concurrently: the peak observed in-flight count is 2.
@@ -2393,49 +2280,6 @@ mod tests {
         assert_eq!(provider.call_count(), 5);
     }
 
-    /// A tool that returns a *fixed* result every run (the inverse of `CounterTool`, whose result
-    /// changes each round) — so repeated identical calls yield byte-identical rounds, exercising the
-    /// §4.2 no-progress guard.
-    struct ConstantTool {
-        runs: Arc<AtomicU64>,
-    }
-
-    #[async_trait::async_trait]
-    impl Tool for ConstantTool {
-        fn name(&self) -> &str {
-            "constant"
-        }
-        fn schema(&self) -> &str {
-            "{}"
-        }
-        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> crate::tools::ToolOutcome {
-            self.runs.fetch_add(1, Ordering::Relaxed);
-            crate::tools::ToolOutcome::text(call.call_id.clone(), true, "same".to_string())
-        }
-    }
-
-    fn constant_engine(
-        provider: Arc<dyn Provider>,
-        runs: Arc<AtomicU64>,
-        max_iterations: u32,
-        max_repeated_rounds: u32,
-    ) -> Engine {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(ConstantTool { runs }));
-        let config = Config {
-            max_iterations,
-            max_repeated_rounds,
-            ..Config::default()
-        };
-        Engine::fresh(
-            SessionId::new("react"),
-            SystemPrompt::new("test"),
-            provider,
-            Arc::new(registry),
-        )
-        .with_config(config)
-    }
-
     /// A model that re-issues the identical tool call every round, where the tool returns the
     /// identical result, is looping: the §4.2 no-progress guard ends the turn `NoProgress` after
     /// `max_repeated_rounds` identical rounds — well before the (much larger) iteration budget.
@@ -2531,24 +2375,10 @@ mod tests {
         }
     }
 
-    fn ok_text(text: &str) -> ModelOutput {
-        ModelOutput {
-            text: text.into(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            usage: UsageDelta::default(),
-        }
-    }
-
     #[async_trait::async_trait]
     impl Provider for FaultProvider {
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                supports_native_tools: true,
-                supports_streaming: false,
-                tool_call_format: ToolCallFormat::Native,
-                max_context: Some(8192),
-            }
+            test_caps()
         }
         async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -2556,7 +2386,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Ok(ok_text("default")))
+                .unwrap_or_else(|| Ok(ok_output("default")))
         }
     }
 
@@ -2572,7 +2402,7 @@ mod tests {
                 retry_after: None,
                 message: "slow down".into(),
             }),
-            Ok(ok_text("recovered")),
+            Ok(ok_output("recovered")),
         ]));
         // Tiny backoff so the test is fast.
         let config = Config {
@@ -2622,7 +2452,7 @@ mod tests {
     async fn context_overflow_compacts_then_retries() {
         let provider = Arc::new(FaultProvider::new(vec![
             Err(Failure::ContextOverflow("too long".into())),
-            Ok(ok_text("after compact")),
+            Ok(ok_output("after compact")),
         ]));
         let mut engine = Engine::fresh(
             SessionId::new("overflow"),
