@@ -767,23 +767,23 @@ async fn run_model(client: &ApiClient, cmd: ModelCmd) -> anyhow::Result<()> {
             engine,
             revision,
             vram,
-        } => ApiRequest::ModelRecommend {
+        } => ApiRequest::ModelRecommend(daemon_api::ModelRecommendArgs {
             repo,
             revision,
             engine: parse_engine(&engine)?,
             budget_bytes: vram.map(gib_to_bytes),
-        },
+        }),
         ModelCmd::Quantize {
             repo,
             ftype,
             source,
             revision,
-        } => ApiRequest::ModelQuantize {
+        } => ApiRequest::ModelQuantize(daemon_api::ModelQuantizeArgs {
             repo,
             revision,
             target_quant: ftype,
             source_file: source,
-        },
+        }),
         ModelCmd::Quantizes => ApiRequest::ModelQuantizes,
         ModelCmd::Inspect { id } => ApiRequest::ModelInspect {
             id: ModelId::new(id),
@@ -804,12 +804,12 @@ async fn quickstart_up(
 ) -> anyhow::Result<()> {
     // 1. Recommend a quant for the detected (or overridden) budget.
     let rec = match client
-        .call(ApiRequest::ModelRecommend {
+        .call(ApiRequest::ModelRecommend(daemon_api::ModelRecommendArgs {
             repo: repo.clone(),
             revision: None,
             engine,
             budget_bytes: vram.map(gib_to_bytes),
-        })
+        }))
         .await?
     {
         ApiResponse::ModelRecommend(rec) => rec,
@@ -1157,12 +1157,12 @@ async fn run_conv(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> {
             text,
             from,
             from_profile,
-        } => ApiRequest::ConvSend {
+        } => ApiRequest::ConvSend(daemon_api::ConvSendArgs {
             transport: TransportId::new(transport),
             conv,
             from: from.map(|m| participant(m, from_profile)),
             message: UserMsg::new(text),
-        },
+        }),
         ConvCmd::Topic {
             transport,
             conv,
@@ -1199,12 +1199,12 @@ async fn run_conv(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> {
             conv,
             after,
             max,
-        } => ApiRequest::ConvHistory {
+        } => ApiRequest::ConvHistory(daemon_api::ConvHistoryArgs {
             transport: TransportId::new(transport),
             conv,
             after_cursor: after,
             max,
-        },
+        }),
     };
     render(client.call(req).await?);
     Ok(())
@@ -1219,48 +1219,48 @@ async fn run_member(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()> {
             member,
             profile,
             message,
-        } => ApiRequest::MemberInvite {
+        } => ApiRequest::MemberInvite(daemon_api::MemberInviteArgs {
             transport: TransportId::new(transport),
             conv,
             who: participant(member, profile),
             message,
-        },
+        }),
         MemberCmd::Remove {
             transport,
             conv,
             member,
             profile,
             reason,
-        } => ApiRequest::MemberRemove {
+        } => ApiRequest::MemberRemove(daemon_api::MemberRemoveArgs {
             transport: TransportId::new(transport),
             conv,
             who: participant(member, profile),
             reason,
-        },
+        }),
         MemberCmd::Ban {
             transport,
             conv,
             member,
             profile,
             reason,
-        } => ApiRequest::MemberBan {
+        } => ApiRequest::MemberBan(daemon_api::MemberBanArgs {
             transport: TransportId::new(transport),
             conv,
             who: participant(member, profile),
             reason,
-        },
+        }),
         MemberCmd::SetRole {
             transport,
             conv,
             member,
             role,
             profile,
-        } => ApiRequest::MemberSetRole {
+        } => ApiRequest::MemberSetRole(daemon_api::MemberSetRoleArgs {
             transport: TransportId::new(transport),
             conv,
             who: participant(member, profile),
             role: parse_role(&role)?,
-        },
+        }),
     };
     render(client.call(req).await?);
     Ok(())

@@ -29,18 +29,18 @@ use tokio::sync::mpsc;
 
 use daemon_api::{
     from_cbor, to_cbor, AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiError,
-    ChannelJoinDetails, ConnectionState, ContactInfo, ContactPermission, ConversationInfo,
-    ConversationMember, ConversationOps, ConversationType, CreateConversationDetails, MemberRole,
-    MembershipOps, MessagingProtocol, NodeApi, Participant, Presence, PresenceState,
-    SupportsConversations, SupportsMembership, TransportAdapter, TransportInstanceInfo,
-    TypingState,
+    ChannelJoinDetails, ConnectionState, ContactInfo, ContactPermission, ConvSendArgs,
+    ConversationInfo, ConversationMember, ConversationOps, ConversationType,
+    CreateConversationDetails, MemberInviteArgs, MemberRemoveArgs, MemberRole, MembershipOps,
+    MessagingProtocol, NodeApi, Participant, Presence, PresenceState, SupportsConversations,
+    SupportsMembership, TransportAdapter, TransportInstanceInfo, TypingState,
 };
 use daemon_common::{JournalStreamId, SessionId, UnitId};
 use daemon_host::journal::JournalSink;
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
     AgentEvent, RoomId, RoomMember, RoomPolicy, SessionPayload, TranscriptBlock, TranscriptRole,
-    TransportId, UserMsg,
+    TransportId,
 };
 use daemon_store::{Room, RoomMember as StoreRoomMember, SessionStore};
 use daemon_telemetry::TraceSigner;
@@ -104,15 +104,37 @@ pub(crate) struct RoomRuntime {
     max_turns: u32,
 }
 
+/// Constructor inputs for [`RoomRuntime::new`], grouped so `serve` passes one value instead of six
+/// positional arguments.
+struct RoomRuntimeParts {
+    api: Arc<dyn NodeApi>,
+    store: Arc<dyn SessionStore>,
+    signer: Arc<TraceSigner>,
+    membership: Arc<Mutex<Membership>>,
+    ingest_policy: daemon_ingest::IngestPolicy,
+    max_turns: u32,
+}
+
+/// Inputs for [`RoomRuntime::post`]: the post to record + fan out, and whether it starts a fresh
+/// cascade (`reset_budget`).
+struct RoomPost {
+    room: RoomId,
+    sender: String,
+    text: String,
+    role: TranscriptRole,
+    reset_budget: bool,
+}
+
 impl RoomRuntime {
-    fn new(
-        api: Arc<dyn NodeApi>,
-        store: Arc<dyn SessionStore>,
-        signer: Arc<TraceSigner>,
-        membership: Arc<Mutex<Membership>>,
-        ingest_policy: daemon_ingest::IngestPolicy,
-        max_turns: u32,
-    ) -> Arc<Self> {
+    fn new(parts: RoomRuntimeParts) -> Arc<Self> {
+        let RoomRuntimeParts {
+            api,
+            store,
+            signer,
+            membership,
+            ingest_policy,
+            max_turns,
+        } = parts;
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             inbound: Arc::new(RoomInbound::new(api.clone())),
@@ -223,14 +245,14 @@ impl RoomRuntime {
     /// Append `sender: text` to the room transcript (one sealed block), then floor-gate it and fan it
     /// out (StartTurn to admitted members, Observe to the rest; the sender is skipped). `reset_budget`
     /// starts a fresh cascade (an external/operator post); a re-injected reply continues the cascade.
-    async fn post(
-        &self,
-        room: RoomId,
-        sender: String,
-        text: String,
-        role: TranscriptRole,
-        reset_budget: bool,
-    ) {
+    async fn post(&self, args: RoomPost) {
+        let RoomPost {
+            room,
+            sender,
+            text,
+            role,
+            reset_budget,
+        } = args;
         // 1. Durable, verifiable transcript: one sealed block per post (the merged room history the
         //    host's `conv_history` replays).
         let sink = self.transcript_sink(&room);
@@ -280,16 +302,28 @@ impl RoomRuntime {
 
     /// An external/operator `ConvSend` post (starts a fresh cascade).
     async fn external_post(&self, room: RoomId, sender: String, text: String) {
-        self.post(room, sender, text, TranscriptRole::User, true)
-            .await;
+        self.post(RoomPost {
+            room,
+            sender,
+            text,
+            role: TranscriptRole::User,
+            reset_budget: true,
+        })
+        .await;
     }
 
     /// Re-inject a member session's finished-turn reply back into its Room (continues the cascade).
     async fn reinject_reply(&self, session: &SessionId, text: String) {
         let resolved = self.membership.lock().unwrap().find_by_session(session);
         if let Some((room, member)) = resolved {
-            self.post(room, member, text, TranscriptRole::Assistant, false)
-                .await;
+            self.post(RoomPost {
+                room,
+                sender: member,
+                text,
+                role: TranscriptRole::Assistant,
+                reset_budget: false,
+            })
+            .await;
         }
     }
 }
@@ -454,14 +488,14 @@ impl TransportAdapter for RoomsAdapter {
             return;
         }
 
-        let runtime = RoomRuntime::new(
-            api.clone(),
-            self.store.clone(),
-            self.signer.clone(),
-            self.membership.clone(),
-            self.cfg.ingest_policy(),
-            self.cfg.max_turns,
-        );
+        let runtime = RoomRuntime::new(RoomRuntimeParts {
+            api: api.clone(),
+            store: self.store.clone(),
+            signer: self.signer.clone(),
+            membership: self.membership.clone(),
+            ingest_policy: self.cfg.ingest_policy(),
+            max_turns: self.cfg.max_turns,
+        });
         runtime.load().await;
         // Subscribe any members that already existed at boot (durable rooms), so their replies
         // re-inject even before the first new post. New members get subscribed on the first post.
@@ -615,13 +649,13 @@ impl SupportsConversations for RoomsAdapter {
         Ok(())
     }
 
-    async fn send(
-        &self,
-        _transport: TransportId,
-        conv: String,
-        from: Option<Participant>,
-        message: UserMsg,
-    ) -> Result<(), ApiError> {
+    async fn send(&self, args: ConvSendArgs) -> Result<(), ApiError> {
+        let ConvSendArgs {
+            transport: _transport,
+            conv,
+            from,
+            message,
+        } = args;
         if self.store.room_get(&conv).await.is_none() {
             return Err(ApiError::Other(format!("room {conv} not found")));
         }
@@ -686,13 +720,13 @@ impl SupportsMembership for RoomsAdapter {
         }
     }
 
-    async fn invite(
-        &self,
-        _transport: TransportId,
-        conv: String,
-        who: Participant,
-        _message: Option<String>,
-    ) -> Result<(), ApiError> {
+    async fn invite(&self, args: MemberInviteArgs) -> Result<(), ApiError> {
+        let MemberInviteArgs {
+            transport: _transport,
+            conv,
+            who,
+            message: _message,
+        } = args;
         let (profile, member) = match who {
             Participant::Agent { profile, member } => (profile, member),
             Participant::Contact(_) => {
@@ -722,13 +756,13 @@ impl SupportsMembership for RoomsAdapter {
         Ok(())
     }
 
-    async fn remove(
-        &self,
-        _transport: TransportId,
-        conv: String,
-        who: Participant,
-        _reason: Option<String>,
-    ) -> Result<(), ApiError> {
+    async fn remove(&self, args: MemberRemoveArgs) -> Result<(), ApiError> {
+        let MemberRemoveArgs {
+            transport: _transport,
+            conv,
+            who,
+            reason: _reason,
+        } = args;
         let member = match who {
             Participant::Agent { member, .. } => member,
             Participant::Contact(c) => c.id,

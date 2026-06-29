@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use daemon_api::{
     dispatch_session, from_cbor, to_cbor, ApiError, ApiRequest, ApiResponse, LogPageView,
-    LogStream, LogStreamItem, Outbound, ProviderSelector, SessionApi,
+    LogStream, LogStreamItem, Outbound, ProviderSelector, RecordMetaArgs, SessionApi,
 };
 use daemon_common::cursored::CursoredRing;
 use daemon_common::{Budget, CredScope, ProfileRef, ReqId, SessionId};
@@ -887,13 +887,13 @@ impl SessionApi for CoreSessionApi {
         }
     }
 
-    async fn record_meta(
-        &self,
-        session: SessionId,
-        origin: Origin,
-        kind: String,
-        body: Vec<u8>,
-    ) -> Result<(), ApiError> {
+    async fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {
+        let RecordMetaArgs {
+            session,
+            origin,
+            kind,
+            body,
+        } = args;
         // Observability-only: lands on the merged log + broadcast as `Transport`, never the engine
         // or journal. No-op if the session is gone.
         self.record_inbound(
@@ -1229,9 +1229,14 @@ mod merged_log_tests {
                 key: "owner".into(),
             },
         );
-        api.record_meta(session.clone(), origin, "attach".into(), vec![1, 2, 3])
-            .await
-            .expect("record_meta");
+        api.record_meta(RecordMetaArgs {
+            session: session.clone(),
+            origin,
+            kind: "attach".into(),
+            body: vec![1, 2, 3],
+        })
+        .await
+        .expect("record_meta");
 
         let page = api.log_after(session.clone(), 0, 0).await.unwrap();
         let meta = page

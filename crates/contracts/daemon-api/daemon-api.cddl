@@ -24,19 +24,19 @@ wire_version = uint                 ; daemon-common WireVersion (current = 20)
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id  = tstr
 unit-id     = tstr
-req-id      = uint
+req-id      = uint64
 job-id      = tstr
 profile-ref = tstr
 
 ; ----- usage (daemon-common UsageDelta) -----
 usage-delta = {
-  "input_tokens": uint,
-  "output_tokens": uint,
+  "input_tokens": uint64,
+  "output_tokens": uint64,
   "api_calls": uint,
-  "cache_read_tokens": uint,
-  "cache_write_tokens": uint,
-  "reasoning_tokens": uint,
-  "cost_micros": uint,
+  "cache_read_tokens": uint64,
+  "cache_write_tokens": uint64,
+  "reasoning_tokens": uint64,
+  "cost_micros": uint64,
 }
 
 ; ----- §17 protocol shapes (daemon-protocol; summarized) -----
@@ -57,9 +57,9 @@ agent-command = agent-command-start-turn
               / "Shutdown"
 
 ; ----- conversation-rewind anchor (daemon-protocol RewindAnchor; wire v13) -----
-rewind-anchor-user-turn = { "UserTurn": { "ordinal": uint } }
-rewind-anchor-reply-after = { "ReplyAfter": { "ordinal": uint } }
-rewind-anchor-cursor = { "Cursor": { "seq": uint } }
+rewind-anchor-user-turn = { "UserTurn": { "ordinal": uint64 } }
+rewind-anchor-reply-after = { "ReplyAfter": { "ordinal": uint64 } }
+rewind-anchor-cursor = { "Cursor": { "seq": uint64 } }
 rewind-anchor = rewind-anchor-user-turn
               / rewind-anchor-reply-after
               / rewind-anchor-cursor
@@ -72,7 +72,7 @@ conv-turn-view = {
 }
 
 conv-view = {
-  "epoch": uint,
+  "epoch": uint64,
   "turns": [* conv-turn-view],
   "waiting_for": [* tstr],
 }
@@ -85,21 +85,21 @@ tool-detail = { "kind": tstr, "body": byte-array }
 tool-call-view   = { "call_id": tstr, "name": tstr, "args_summary": tstr, ? "detail": (tool-detail / null) }
 tool-result-view = { "call_id": tstr, "ok": bool, "summary": tstr, ? "detail": (tool-detail / null) }
 
-agent-event-turn-started = { "TurnStarted": { "seq": uint, "trigger": turn-trigger } }
-agent-event-text-delta = { "TextDelta": { "seq": uint, "text": tstr } }
-agent-event-reasoning-delta = { "ReasoningDelta": { "seq": uint, "text": tstr } }
-agent-event-content-delta = { "ContentDelta": { "seq": uint, "kind": tstr, "body": byte-array } }
-agent-event-tool-started = { "ToolStarted": { "seq": uint, "call": tool-call-view } }
-agent-event-tool-finished = { "ToolFinished": { "seq": uint, "result": tool-result-view } }
-agent-event-usage = { "Usage": { "seq": uint, "delta": usage-delta } }
-context-status = { "used_tokens": uint, "max_tokens": (uint / null), "budget_tokens": (uint / null), "compacted": bool, "dropped_turns": uint }
-agent-event-context = { "Context": { "seq": uint, "status": context-status } }
-agent-event-rate-limit = { "RateLimit": { "seq": uint, "snapshot": rate-limit-snapshot } }
-agent-event-turn-finished = { "TurnFinished": { "seq": uint, "summary": turn-summary } }
-agent-event-error = { "Error": { "seq": uint, "failure": tstr } }
-agent-event-steered = { "Steered": { "seq": uint, "request_id": req-id, "accepted": bool } }
-agent-event-snapshot = { "Snapshot": { "seq": uint, "request_id": req-id, "view": conv-view } }
-agent-event-rewound = { "Rewound": { "seq": uint, "request_id": req-id, "to_cursor": uint, "epoch": uint } }
+agent-event-turn-started = { "TurnStarted": { "seq": uint64, "trigger": turn-trigger } }
+agent-event-text-delta = { "TextDelta": { "seq": uint64, "text": tstr } }
+agent-event-reasoning-delta = { "ReasoningDelta": { "seq": uint64, "text": tstr } }
+agent-event-content-delta = { "ContentDelta": { "seq": uint64, "kind": tstr, "body": byte-array } }
+agent-event-tool-started = { "ToolStarted": { "seq": uint64, "call": tool-call-view } }
+agent-event-tool-finished = { "ToolFinished": { "seq": uint64, "result": tool-result-view } }
+agent-event-usage = { "Usage": { "seq": uint64, "delta": usage-delta } }
+context-status = { "used_tokens": uint64, "max_tokens": (uint64 / null), "budget_tokens": (uint64 / null), "compacted": bool, "dropped_turns": uint }
+agent-event-context = { "Context": { "seq": uint64, "status": context-status } }
+agent-event-rate-limit = { "RateLimit": { "seq": uint64, "snapshot": rate-limit-snapshot } }
+agent-event-turn-finished = { "TurnFinished": { "seq": uint64, "summary": turn-summary } }
+agent-event-error = { "Error": { "seq": uint64, "failure": tstr } }
+agent-event-steered = { "Steered": { "seq": uint64, "request_id": req-id, "accepted": bool } }
+agent-event-snapshot = { "Snapshot": { "seq": uint64, "request_id": req-id, "view": conv-view } }
+agent-event-rewound = { "Rewound": { "seq": uint64, "request_id": req-id, "to_cursor": uint64, "epoch": uint64 } }
 agent-event = agent-event-turn-started
             / agent-event-text-delta
             / agent-event-reasoning-delta
@@ -124,10 +124,10 @@ turn-trigger-scheduled = { "Scheduled": { "job": job-id } }
 turn-trigger = "User" / "Steer" / turn-trigger-background / turn-trigger-scheduled
 end-reason = "Completed" / "Suspended" / "Interrupted" / "BudgetExhausted" / "NoProgress" / "Failed"
 turn-summary = { "end_reason": end-reason, "final_text": (tstr / null), "usage": usage-delta }
-rate-limit-snapshot = { "remaining": (uint / null), "limit": (uint / null), "reset_ms": (uint / null) }
+rate-limit-snapshot = { "remaining": (uint64 / null), "limit": (uint64 / null), "reset_ms": (uint64 / null) }
 
 ; ----- concrete host-request / host-response payloads (tightened from `any`) -----
-budget = { "tokens": (uint / null), "wall_ms": (uint / null) }
+budget = { "tokens": (uint64 / null), "wall_ms": (uint64 / null) }
 spawn-seed = "FromConversation"
 spawn-spec = { "kind": tstr, "seed": spawn-seed }
 host-request-kind-approval = { "Approval": { "prompt": tstr } }
@@ -175,10 +175,10 @@ health-report = {
 }
 
 stats-report = {
-  "pending_jobs": uint,
-  "pending_wakes": uint,
-  "sessions": uint,
-  "active": uint,
+  "pending_jobs": uint64,
+  "pending_wakes": uint64,
+  "sessions": uint64,
+  "active": uint64,
   "usage": usage-delta,
 }
 
@@ -204,7 +204,7 @@ session-info = {
   ? "rewindable": bool,                 ; default true (daemon-core sessions truncate; foreign do not)
   ? "bound_profile": (profile-ref / null),
   ? "title": (tstr / null),
-  ? "last_activity_ms": (uint / null),
+  ? "last_activity_ms": (uint64 / null),
   ? "lifecycle": lifecycle,             ; default "Durable"
   ? "role": session-role,               ; default "Primary"
   ? "parent": (session-id / null),
@@ -234,13 +234,13 @@ session-query = {
   ? "scope": session-scope,             ; default "TopLevel"
   ? "after": (session-id / null),       ; exclusive cursor (last id of previous page)
   ? "limit": uint,                      ; 0 = server default
-  ? "since_rev": (uint / null),         ; L4: delta read past this roster revision (null = full page)
+  ? "since_rev": (uint64 / null),         ; L4: delta read past this roster revision (null = full page)
 }
 
 session-page = {
   "sessions": [* session-info],
   ? "next_cursor": (session-id / null), ; null => last page
-  "rev": uint,                          ; L4: the roster revision this page reflects
+  "rev": uint64,                          ; L4: the roster revision this page reflects
   ? "removed": [* session-id],          ; L4: ids removed since since_rev (delta reads only)
 }
 
@@ -262,9 +262,9 @@ checkpoint-info = {
   "id": tstr,
   "session": session-id,
   "tool": tstr,
-  "created_unix": uint,
-  ? "turn_ordinal": (uint / null),
-  ? "cursor": (uint / null),
+  "created_unix": uint64,
+  ? "turn_ordinal": (uint64 / null),
+  ? "cursor": (uint64 / null),
 }
 
 fleet-report = {
@@ -345,12 +345,12 @@ tree-report = {
 subagent-phase = "Spawned"
                / "Finished"
 
-manage-event-view-started = { "Started": { "seq": uint } }
-manage-event-view-progress = { "Progress": { "seq": uint, "text": (tstr / null) } }
-manage-event-view-usage = { "Usage": { "seq": uint, "delta": usage-delta } }
-manage-event-view-finished = { "Finished": { "seq": uint, "end_reason": tstr, "summary": (tstr / null) } }
-manage-event-view-error = { "Error": { "seq": uint, "message": tstr } }
-manage-event-view-subagent = { "Subagent": { "seq": uint, "child": unit-id, "role": session-role, "phase": subagent-phase, "active_children": uint } }
+manage-event-view-started = { "Started": { "seq": uint64 } }
+manage-event-view-progress = { "Progress": { "seq": uint64, "text": (tstr / null) } }
+manage-event-view-usage = { "Usage": { "seq": uint64, "delta": usage-delta } }
+manage-event-view-finished = { "Finished": { "seq": uint64, "end_reason": tstr, "summary": (tstr / null) } }
+manage-event-view-error = { "Error": { "seq": uint64, "message": tstr } }
+manage-event-view-subagent = { "Subagent": { "seq": uint64, "child": unit-id, "role": session-role, "phase": subagent-phase, "active_children": uint } }
 manage-event-view = manage-event-view-started
                   / manage-event-view-progress
                   / manage-event-view-usage
@@ -386,22 +386,22 @@ journal-record-payload-t = journal-record-payload-management
                          / journal-record-payload-block
 
 journal-record = {
-  "cursor": uint,
-  "segment": uint,
-  "seq": uint,
-  "epoch": uint,
-  "trace": uint,
+  "cursor": uint64,
+  "segment": uint64,
+  "seq": uint64,
+  "epoch": uint64,
+  "trace": uint64,
   "kind": tstr,
-  "timestamp_ms": uint,
+  "timestamp_ms": uint64,
   "verified": bool,
   "payload": journal-record-payload-t,
 }
 
 journal-page-view = {
   "entries": [* journal-record],
-  "next_cursor": uint,
-  "head_cursor": uint,
-  "sealed_after": (uint / null),
+  "next_cursor": uint64,
+  "head_cursor": uint64,
+  "sealed_after": (uint64 / null),
 }
 
 ; ----- merged live session event log (wire v2: the bidirectional, seq-stamped edge) -----
@@ -440,7 +440,7 @@ session-payload = session-payload-event
                 / session-payload-meta
 
 session-log-entry = {
-  "seq": uint,
+  "seq": uint64,
   "direction": direction,
   "origin": origin,
   "disposition": disposition,
@@ -449,9 +449,9 @@ session-log-entry = {
 
 log-page-view = {
   "entries": [* session-log-entry],
-  "next_seq": uint,
-  "head_seq": uint,
-  "epoch": uint,                      ; session-activation generation (L2 resync; 0 = first activation)
+  "next_seq": uint64,
+  "head_seq": uint64,
+  "epoch": uint64,                      ; session-activation generation (L2 resync; 0 = first activation)
 }
 
 ; ----- node-wide event feed (L3 EventsSince): payload-free "what changed out of focus" pointers -----
@@ -462,17 +462,17 @@ node-event = node-event-session-advanced
            / node-event-approval-pending
            / node-event-download-progress
            / node-event-resync-needed
-node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint, "head_seq": uint } }
-node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint } }
-node-event-roster-changed       = { "RosterChanged":      { "rev": uint } }
-node-event-fleet-changed        = { "FleetChanged":       { "rev": uint } }
+node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
+node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
+node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
+node-event-fleet-changed        = { "FleetChanged":       { "rev": uint64 } }
 node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 events-page = {
   "events": [* node-event],
-  "next_cursor": uint,                ; pass as the next EventsSince cursor
-  "head_cursor": uint,                ; highest cursor the feed has assigned
+  "next_cursor": uint64,                ; pass as the next EventsSince cursor
+  "head_cursor": uint64,                ; highest cursor the feed has assigned
 }
 
 ; ----- outbound delivery targets (§5.4: where a session's replies post) + handover -----
@@ -493,7 +493,7 @@ api-error = api-error-unknown-session
 
 ; ----- model-management DTOs (daemon-common; the ModelApi sub-surface) -----
 model-id = tstr                       ; content-derived catalog handle
-download-id = uint                    ; numeric job handle (rendered "dl-N")
+download-id = uint64                  ; numeric job handle (rendered "dl-N")
 model-engine = "Llama"
              / "MistralRs"
 
@@ -521,9 +521,9 @@ search-query = {
 search-hit = {
   "repo": tstr,
   "author": (tstr / null),
-  "downloads": uint,
-  "likes": uint,
-  "num_parameters": (uint / null),
+  "downloads": uint64,
+  "likes": uint64,
+  "num_parameters": (uint64 / null),
   "pipeline_tag": (tstr / null),
   "last_modified": (tstr / null),
   "gated": bool,
@@ -534,7 +534,7 @@ search-page = { "page": uint, "results": [* search-hit], "has_more": bool }
 
 model-file = {
   "path": tstr,
-  "size_bytes": uint,
+  "size_bytes": uint64,
   "quant": (tstr / null),
   "is_split": bool,
   "is_first_shard": bool,
@@ -551,8 +551,8 @@ download-status = {
   "id": download-id,
   "model": model-ref,
   "state": download-state,
-  "downloaded_bytes": uint,
-  "total_bytes": uint,
+  "downloaded_bytes": uint64,
+  "total_bytes": uint64,
   "files_done": uint,
   "files_total": uint,
   "error": (tstr / null),
@@ -563,16 +563,16 @@ installed-model = {
   "model": model-ref,
   "display_name": tstr,
   "local_path": tstr,
-  "size_bytes": uint,
+  "size_bytes": uint64,
   "quant": (tstr / null),
-  "installed_at_ms": uint,
+  "installed_at_ms": uint64,
   ? "arch": (tstr / null),
   ? "context_length": (uint / null),
   ? "file_type": (tstr / null),
 }
 
 ; ----- recommend / quantize / inspect DTOs -----
-quantize-id = uint                    ; numeric job handle (rendered "qz-N")
+quantize-id = uint64                  ; numeric job handle (rendered "qz-N")
 quantize-state = "Queued"
                / "Preparing"
                / "Quantizing"
@@ -582,7 +582,7 @@ quantize-state = "Queued"
 quant-candidate = {
   "quant": tstr,
   "file": (tstr / null),
-  "size_bytes": (uint / null),
+  "size_bytes": (uint64 / null),
   "fits": bool,
 }
 
@@ -591,8 +591,8 @@ quant-recommendation = {
   "repo": tstr,
   "file": (tstr / null),
   "quant": tstr,
-  "size_bytes": (uint / null),
-  "budget_bytes": uint,
+  "size_bytes": (uint64 / null),
+  "budget_bytes": uint64,
   "fits": bool,
   "reason": tstr,
   "candidates": [* quant-candidate],
@@ -616,8 +616,8 @@ gguf-info = {
   "context_length": (uint / null),
   "block_count": (uint / null),
   "quantization_version": (uint / null),
-  "parameter_count": (uint / null),
-  "size_bytes": uint,
+  "parameter_count": (uint64 / null),
+  "size_bytes": uint64,
 }
 
 ; ----- ACP agent discovery/catalog DTOs (wire v14; ControlApi::acp_*) -----
@@ -678,18 +678,18 @@ cron-spec = {
 cron-job  = {
   "id": tstr,
   "spec": cron-spec,
-  ? "next_fire_unix": (uint / null),
+  ? "next_fire_unix": (uint64 / null),
   ? "paused": bool,
-  ? "last_run_unix": (uint / null),
+  ? "last_run_unix": (uint64 / null),
   ? "last_ok": (bool / null),
   ? "last_detail": (tstr / null),
   ? "fire_count": uint,
 }
 cron-run  = {
-  "started_unix": uint,
+  "started_unix": uint64,
   "ok": bool,
   ? "detail": (tstr / null),
-  ? "finished_unix": (uint / null),
+  ? "finished_unix": (uint64 / null),
   ? "session": (session-id / null),
   ? "trigger": run-trigger,
 }
@@ -733,12 +733,12 @@ author = "operator"
        / author-agent
 ; one revision in an artifact's append-only history (profiles + skills share the mechanism).
 revision = {
-  "seq": uint,
-  "parent": (uint / null),
+  "seq": uint64,
+  "parent": (uint64 / null),
   "content_hash": content-hash,          ; 32-byte SHA-256 of the snapshot blob (array, see below)
   "author": author,
   "reason": tstr,
-  "ts_ms": uint,
+  "ts_ms": uint64,
 }
 ; a portable skill bundle: bundle-relative path -> file contents (text; includes SKILL.md).
 skill-bundle = { "name": tstr, "category": (tstr / null), "files": { * tstr => tstr } }
@@ -748,7 +748,7 @@ distribution = {
   "wire_version": wire_version,
   "profile": profile-spec,
   "skills": [* skill-bundle],
-  ? "head_seq": (uint / null),
+  ? "head_seq": (uint64 / null),
   ? "source": (tstr / null),
 }
 ; the full ProfileSpec (daemon-api profile.rs). serde default + ciborium with no
@@ -779,10 +779,10 @@ provider-selector = "mock"
                   / "genai"
                   / "llama_cpp"
                   / "mistral_rs"
-model-descriptor = { "id": tstr, "provider": provider-selector, "context_length": (uint / null), "input_price_micros_per_mtok": (uint / null), "output_price_micros_per_mtok": (uint / null), "local": bool }
+model-descriptor = { "id": tstr, "provider": provider-selector, "context_length": (uint / null), "input_price_micros_per_mtok": (uint64 / null), "output_price_micros_per_mtok": (uint64 / null), "local": bool }
 skill-creator = "agent" / "user" / "bundled"
 skill-state = "active" / "stale" / "archived"
-skill-usage = { "created_by": skill-creator, "state": skill-state, "pinned": bool, "use_count": uint, "view_count": uint, "patch_count": uint, "created_at_ms": uint, "last_used_ms": (uint / null), "last_viewed_ms": (uint / null), "last_patched_ms": (uint / null) }
+skill-usage = { "created_by": skill-creator, "state": skill-state, "pinned": bool, "use_count": uint64, "view_count": uint64, "patch_count": uint64, "created_at_ms": uint64, "last_used_ms": (uint64 / null), "last_viewed_ms": (uint64 / null), "last_patched_ms": (uint64 / null) }
 curator-entry = { "name": tstr, "category": (tstr / null), "is_bundled": bool, "usage": skill-usage }
 curator-change = { "name": tstr, "from": skill-state, "to": skill-state }
 ; ----- command catalog (thin-client slash-command surface) -----
@@ -839,7 +839,7 @@ auth-begin-response = {
   "flow_id": tstr,
   "authorization_url": tstr,
   "redirect_uri": tstr,
-  "expires_at": uint,                  ; flow TTL (unix seconds)
+  "expires_at": uint64,                  ; flow TTL (unix seconds)
   "flow_kind": auth-flow-kind,
 }
 auth-complete-request = { "flow_id": tstr, "callback": tstr }   ; callback: full redirect URL or its query
@@ -893,7 +893,7 @@ presence-primitive-t = "Offline"
                      / "DoNotDisturb"
                      / "Streaming"
                      / "OutOfOffice"
-presence = { "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "mobile": bool, ? "idle_since": (uint / null) }
+presence = { "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "mobile": bool, ? "idle_since": (uint64 / null) }
 contact-permission = "Unset"
                    / "Allow"
                    / "Deny"
@@ -943,14 +943,15 @@ request-unit = { "Unit": { "unit": unit-id } }
 ; single-consumer drain (FFI/MCP-LCD; multi-surface uses UnitHistory). See daemon-event-io-spec §5.4.1.
 request-unit-events = { "UnitEvents": { "unit": unit-id, "max": uint } }
 request-unit-outbound = { "UnitOutbound": { "unit": unit-id, "max": uint } }
-request-session-history = { "SessionHistory": { "session": session-id, "after_cursor": uint, "max": uint } }
-request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint, "max": uint } }
-request-events-since = { "EventsSince": { "cursor": uint, ? "wait_ms": (uint / null) } }
+request-session-history = { "SessionHistory": { "session": session-id, "after_cursor": uint64, "max": uint } }
+request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint64, "max": uint } }
+request-events-since = { "EventsSince": { "cursor": uint64, ? "wait_ms": (uint / null) } }
 request-delivery-targets = { "DeliveryTargets": { "session": session-id } }
 request-delivery-sessions = { "DeliverySessions": { "transport": transport-id } }
 request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
-request-record-meta = { "RecordMeta": { "session": session-id, "origin": origin, "kind": tstr, "body": byte-array } }
-request-unit-history = { "UnitHistory": { "unit": unit-id, "after_cursor": uint, "max": uint } }
+record-meta-args = { "session": session-id, "origin": origin, "kind": tstr, "body": byte-array }
+request-record-meta = { "RecordMeta": record-meta-args }
+request-unit-history = { "UnitHistory": { "unit": unit-id, "after_cursor": uint64, "max": uint } }
 request-pause = { "Pause": { "unit": unit-id } }
 request-resume = { "Resume": { "unit": unit-id } }
 request-scale = { "Scale": { "unit": unit-id, "n": uint } }
@@ -970,11 +971,11 @@ request-profile-clone = { "ProfileClone": { "source": tstr, "new_id": tstr } }
 request-profile-export = { "ProfileExport": { "id": tstr } }
 request-profile-import = { "ProfileImport": { "dist": distribution, ? "new_id": (tstr / null) } }
 request-profile-history = { "ProfileHistory": { "id": tstr } }
-request-profile-at = { "ProfileAt": { "id": tstr, "seq": uint } }
-request-profile-revert = { "ProfileRevert": { "id": tstr, "seq": uint } }
+request-profile-at = { "ProfileAt": { "id": tstr, "seq": uint64 } }
+request-profile-revert = { "ProfileRevert": { "id": tstr, "seq": uint64 } }
 request-skill-history = { "SkillHistory": { "name": tstr } }
-request-skill-at = { "SkillAt": { "name": tstr, "seq": uint } }
-request-skill-revert = { "SkillRevert": { "name": tstr, "seq": uint } }
+request-skill-at = { "SkillAt": { "name": tstr, "seq": uint64 } }
+request-skill-revert = { "SkillRevert": { "name": tstr, "seq": uint64 } }
 request-curator-list = { "CuratorList": { ? "profile": (tstr / null) } }
 request-curator-pin = { "CuratorPin": { ? "profile": (tstr / null), "name": tstr } }
 request-curator-unpin = { "CuratorUnpin": { ? "profile": (tstr / null), "name": tstr } }
@@ -994,8 +995,10 @@ request-model-resume = { "ModelResume": { "id": download-id } }
 request-model-catalog = "ModelCatalog"
 request-model-delete = { "ModelDelete": { "id": model-id } }
 request-model-activate = { "ModelActivate": { "id": model-id, "profile": (tstr / null) } }
-request-model-recommend = { "ModelRecommend": { "repo": tstr, "revision": (tstr / null), "engine": model-engine, "budget_bytes": (uint / null) } }
-request-model-quantize = { "ModelQuantize": { "repo": tstr, "revision": (tstr / null), "target_quant": tstr, "source_file": (tstr / null) } }
+model-recommend-args = { "repo": tstr, "revision": (tstr / null), "engine": model-engine, "budget_bytes": (uint64 / null) }
+request-model-recommend = { "ModelRecommend": model-recommend-args }
+model-quantize-args = { "repo": tstr, "revision": (tstr / null), "target_quant": tstr, "source_file": (tstr / null) }
+request-model-quantize = { "ModelQuantize": model-quantize-args }
 request-model-quantizes = "ModelQuantizes"
 request-model-inspect = { "ModelInspect": { "id": model-id } }
 request-models = "Models"
@@ -1051,16 +1054,22 @@ request-conv-create = { "ConvCreate": { "transport": transport-id, "details": cr
 request-conv-join-details = { "ConvJoinDetails": { "transport": transport-id } }
 request-conv-join = { "ConvJoin": { "transport": transport-id, "details": channel-join-details } }
 request-conv-leave = { "ConvLeave": { "transport": transport-id, "conv": tstr } }
-request-conv-send = { "ConvSend": { "transport": transport-id, "conv": tstr, ? "from": (participant / null), "message": user-msg } }
+conv-send-args = { "transport": transport-id, "conv": tstr, ? "from": (participant / null), "message": user-msg }
+request-conv-send = { "ConvSend": conv-send-args }
 request-conv-set-topic = { "ConvSetTopic": { "transport": transport-id, "conv": tstr, ? "topic": (tstr / null) } }
 request-conv-set-title = { "ConvSetTitle": { "transport": transport-id, "conv": tstr, ? "title": (tstr / null) } }
 request-conv-set-description = { "ConvSetDescription": { "transport": transport-id, "conv": tstr, ? "description": (tstr / null) } }
 request-conv-delete = { "ConvDelete": { "transport": transport-id, "conv": tstr } }
-request-conv-history = { "ConvHistory": { "transport": transport-id, "conv": tstr, ? "after_cursor": uint, ? "max": uint } }
-request-member-invite = { "MemberInvite": { "transport": transport-id, "conv": tstr, "who": participant, ? "message": (tstr / null) } }
-request-member-remove = { "MemberRemove": { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null) } }
-request-member-ban = { "MemberBan": { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null) } }
-request-member-set-role = { "MemberSetRole": { "transport": transport-id, "conv": tstr, "who": participant, "role": member-role } }
+conv-history-args = { "transport": transport-id, "conv": tstr, ? "after_cursor": uint64, ? "max": uint }
+request-conv-history = { "ConvHistory": conv-history-args }
+member-invite-args = { "transport": transport-id, "conv": tstr, "who": participant, ? "message": (tstr / null) }
+request-member-invite = { "MemberInvite": member-invite-args }
+member-remove-args = { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null) }
+request-member-remove = { "MemberRemove": member-remove-args }
+member-ban-args = { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null) }
+request-member-ban = { "MemberBan": member-ban-args }
+member-set-role-args = { "transport": transport-id, "conv": tstr, "who": participant, "role": member-role }
+request-member-set-role = { "MemberSetRole": member-set-role-args }
 request-contact-get-profile = { "ContactGetProfile": { "transport": transport-id, "contact": contact-info } }
 request-contact-set-alias = { "ContactSetAlias": { "transport": transport-id, "contact": contact-info, ? "alias": (tstr / null) } }
 request-contact-action-menu = { "ContactActionMenu": { "transport": transport-id, "contact": contact-info } }
@@ -1068,14 +1077,17 @@ request-directory-search = { "DirectorySearch": { "transport": transport-id, ? "
 request-fs-roots = "FsRoots"
 request-fs-list = { "FsList": { "root": fs-root-id-t, "dir": tstr, ? "show_ignored": bool } }
 request-fs-stat = { "FsStat": { "root": fs-root-id-t, "path": tstr } }
-request-fs-read = { "FsRead": { "root": fs-root-id-t, "path": tstr, ? "max_bytes": uint } }
-request-fs-write = { "FsWrite": { "root": fs-root-id-t, "path": tstr, "bytes": byte-array, ? "base_revision": (fs-revision / null), ? "force": bool } }
+request-fs-read = { "FsRead": { "root": fs-root-id-t, "path": tstr, ? "max_bytes": uint64 } }
+fs-write-args = { "root": fs-root-id-t, "path": tstr, "bytes": byte-array, ? "base_revision": (fs-revision / null), ? "force": bool }
+request-fs-write = { "FsWrite": fs-write-args }
 request-fs-search = { "FsSearch": { "root": fs-root-id-t, "query": fs-search-query } }
-request-fs-watch-poll = { "FsWatchPoll": { "root": fs-root-id-t, "dir": tstr, "after_seq": uint, "max": uint } }
+fs-watch-after-args = { "root": fs-root-id-t, "dir": tstr, "after_seq": uint64, "max": uint }
+request-fs-watch-poll = { "FsWatchPoll": fs-watch-after-args }
 request-blob-put = { "BlobPut": { "bytes": byte-array } }
 request-blob-get = { "BlobGet": { "hash": content-hash, ? "range": (byte-range / null) } }
 request-blob-stat = { "BlobStat": { "hash": content-hash } }
-request-fs-write-from-blob = { "FsWriteFromBlob": { "root": fs-root-id-t, "path": tstr, "hash": content-hash, ? "base_revision": (fs-revision / null), ? "force": bool } }
+fs-write-from-blob-args = { "root": fs-root-id-t, "path": tstr, "hash": content-hash, ? "base_revision": (fs-revision / null), ? "force": bool }
+request-fs-write-from-blob = { "FsWriteFromBlob": fs-write-from-blob-args }
 api-request = request-submit
             / request-submit-routed
             / request-poll
@@ -1230,7 +1242,7 @@ response-routed = { "Routed": { "session": session-id } }
 response-drained = { "Drained": [* outbound] }
 response-health = { "Health": health-report }
 response-stats = { "Stats": stats-report }
-telemetry-dump = { "usage": usage-delta, "events": uint, "healthy": bool, "pending_jobs": uint, "pending_wakes": uint, "sessions": uint, "active": uint }
+telemetry-dump = { "usage": usage-delta, "events": uint64, "healthy": bool, "pending_jobs": uint64, "pending_wakes": uint64, "sessions": uint64, "active": uint64 }
 response-telemetry = { "Telemetry": telemetry-dump }
 response-sessions = { "Sessions": [* session-info] }
 response-approvals = { "Approvals": [* approval-info] }
@@ -1392,18 +1404,18 @@ api-response = response-ok
 ; they are here as the authoritative schema + cddl-cat conformance target. The legacy bare
 ; api-request / api-response path (a connection that sends no Hello) stays valid.
 wire-hello  = { "Hello":  { "wire_version": uint, "features": [* tstr] } }
-wire-call   = { "Call":   { "id": uint, "req": api-request } }
-wire-open   = { "Open":   { "id": uint, "req": api-request } }
-wire-cancel = { "Cancel": { "id": uint } }
+wire-call   = { "Call":   { "id": uint64, "req": api-request } }
+wire-open   = { "Open":   { "id": uint64, "req": api-request } }
+wire-cancel = { "Cancel": { "id": uint64 } }
 wire-c2s = wire-hello
          / wire-call
          / wire-open
          / wire-cancel
 
-wire-reply = { "Reply": { "id": uint, "res": api-response } }
-wire-item  = { "Item":  { "id": uint, "res": api-response } }
-wire-end   = { "End":   { "id": uint, "error": (api-error / null) } }
-wire-reset = { "Reset": { "id": uint, "epoch": uint, "head_seq": uint } }
+wire-reply = { "Reply": { "id": uint64, "res": api-response } }
+wire-item  = { "Item":  { "id": uint64, "res": api-response } }
+wire-end   = { "End":   { "id": uint64, "error": (api-error / null) } }
+wire-reset = { "Reset": { "id": uint64, "epoch": uint64, "head_seq": uint64 } }
 wire-s2c = wire-hello
          / wire-reply
          / wire-item
@@ -1441,12 +1453,12 @@ fs-change = { "path": tstr, "kind": fs-change-kind-t }
 ; Cursored, resync-capable (daemon-event-io-spec §5.4.1): head_seq is the live edge; reset=true means
 ; the reader's after_seq aged out of the ring (events evicted) so the page is not a complete delta and
 ; the client must re-list to reconcile (the fs analogue of the merged log's Lagged -> Reset).
-fs-watch-page-view = { "events": [* fs-change], "next_seq": uint, "head_seq": uint, "reset": bool }
+fs-watch-page-view = { "events": [* fs-change], "next_seq": uint64, "head_seq": uint64, "reset": bool }
 
 ; ----- content store DTOs (wire v14; daemon-content-transfer-spec.md) -----
 ; 32-byte SHA-256, kept as a CBOR array of ints (ContentHash([u8; 32]) serializes as a sequence; the
 ; fixed 32-byte size is well under the codec's array cap, so it does not need the bstr treatment).
 content-hash = [* uint]
-byte-range = { "offset": uint, "len": uint }
-blob-ref = { "hash": content-hash, "size": uint, ? "name": (tstr / null), ? "mime": (tstr / null) }
-blob-stat = { "size": uint, "present": bool }
+byte-range = { "offset": uint64, "len": uint64 }
+blob-ref = { "hash": content-hash, "size": uint64, ? "name": (tstr / null), ? "mime": (tstr / null) }
+blob-stat = { "size": uint64, "present": bool }

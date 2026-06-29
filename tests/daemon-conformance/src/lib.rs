@@ -1898,12 +1898,12 @@ mod node_interface {
         };
         assert!(matches!(
             client
-                .call(ApiRequest::MemberInvite {
+                .call(ApiRequest::MemberInvite(daemon_api::MemberInviteArgs {
                     transport: room.clone(),
                     conv: "r1".into(),
                     who: who.clone(),
                     message: None,
-                })
+                }))
                 .await
                 .unwrap(),
             ApiResponse::Ok
@@ -1919,12 +1919,12 @@ mod node_interface {
         // ConvSend addressed to that member opens a turn on its session (the floor-gated fan-out).
         assert!(matches!(
             client
-                .call(ApiRequest::ConvSend {
+                .call(ApiRequest::ConvSend(daemon_api::ConvSendArgs {
                     transport: room.clone(),
                     conv: "r1".into(),
                     from: None,
                     message: UserMsg::new("hey @bot please help"),
-                })
+                }))
                 .await
                 .unwrap(),
             ApiResponse::Ok
@@ -1958,12 +1958,12 @@ mod node_interface {
         // MemberRemove drops them from ConvGet.members.
         assert!(matches!(
             client
-                .call(ApiRequest::MemberRemove {
+                .call(ApiRequest::MemberRemove(daemon_api::MemberRemoveArgs {
                     transport: room.clone(),
                     conv: "r1".into(),
                     who,
                     reason: None,
-                })
+                }))
                 .await
                 .unwrap(),
             ApiResponse::Ok
@@ -2017,12 +2017,12 @@ mod node_interface {
             };
             assert!(matches!(
                 client
-                    .call(ApiRequest::MemberInvite {
+                    .call(ApiRequest::MemberInvite(daemon_api::MemberInviteArgs {
                         transport: room.clone(),
                         conv: "r2".into(),
                         who,
                         message: None,
-                    })
+                    }))
                     .await
                     .unwrap(),
                 ApiResponse::Ok
@@ -2040,12 +2040,12 @@ mod node_interface {
         // re-injects to member B; and so on, bounded by `max_turns`. Both member sessions must turn.
         assert!(matches!(
             client
-                .call(ApiRequest::ConvSend {
+                .call(ApiRequest::ConvSend(daemon_api::ConvSendArgs {
                     transport: room.clone(),
                     conv: "r2".into(),
                     from: None,
                     message: UserMsg::new("kick off the discussion"),
-                })
+                }))
                 .await
                 .unwrap(),
             ApiResponse::Ok
@@ -2079,12 +2079,12 @@ mod node_interface {
 
         // The merged room transcript records every post (operator + agent replies), verified.
         let history = match client
-            .call(ApiRequest::ConvHistory {
+            .call(ApiRequest::ConvHistory(daemon_api::ConvHistoryArgs {
                 transport: room.clone(),
                 conv: "r2".into(),
                 after_cursor: 0,
                 max: 0,
-            })
+            }))
             .await
             .unwrap()
         {
@@ -2210,13 +2210,13 @@ mod node_interface {
 
         // Write + read round-trips in the workspace root.
         let rev = node
-            .fs_write(
-                FsRootId::Workspace,
-                "notes/hello.txt".into(),
-                b"hi".to_vec(),
-                None,
-                false,
-            )
+            .fs_write(daemon_api::FsWriteArgs {
+                root: FsRootId::Workspace,
+                path: "notes/hello.txt".into(),
+                bytes: b"hi".to_vec(),
+                base_revision: None,
+                force: false,
+            })
             .await
             .expect("write");
         assert_eq!(rev.size, 2);
@@ -2237,23 +2237,23 @@ mod node_interface {
 
         // The sensitive-path gate blocks a dotenv write unless forced.
         let blocked = node
-            .fs_write(
-                FsRootId::Workspace,
-                ".env".into(),
-                b"SECRET=1".to_vec(),
-                None,
-                false,
-            )
+            .fs_write(daemon_api::FsWriteArgs {
+                root: FsRootId::Workspace,
+                path: ".env".into(),
+                bytes: b"SECRET=1".to_vec(),
+                base_revision: None,
+                force: false,
+            })
             .await;
         assert!(blocked.is_err(), "a .env write should be gated");
         let forced = node
-            .fs_write(
-                FsRootId::Workspace,
-                ".env".into(),
-                b"SECRET=1".to_vec(),
-                None,
-                true,
-            )
+            .fs_write(daemon_api::FsWriteArgs {
+                root: FsRootId::Workspace,
+                path: ".env".into(),
+                bytes: b"SECRET=1".to_vec(),
+                base_revision: None,
+                force: true,
+            })
             .await;
         assert!(forced.is_ok(), "force overrides the sensitive-path gate");
 
@@ -2329,13 +2329,13 @@ mod node_interface {
         assert_eq!(r.hash, r2.hash);
 
         // fs_read attaches a matching blob_ref for an untruncated read.
-        node.fs_write(
-            FsRootId::Workspace,
-            "doc.txt".into(),
-            b"hi there".to_vec(),
-            None,
-            false,
-        )
+        node.fs_write(daemon_api::FsWriteArgs {
+            root: FsRootId::Workspace,
+            path: "doc.txt".into(),
+            bytes: b"hi there".to_vec(),
+            base_revision: None,
+            force: false,
+        })
         .await
         .unwrap();
         let read = node
@@ -2351,13 +2351,13 @@ mod node_interface {
         );
 
         // fs_write_from_blob materializes a blob into the workspace in place.
-        node.fs_write_from_blob(
-            FsRootId::Workspace,
-            "from_blob.txt".into(),
-            r.hash,
-            None,
-            false,
-        )
+        node.fs_write_from_blob(daemon_api::FsWriteFromBlobArgs {
+            root: FsRootId::Workspace,
+            path: "from_blob.txt".into(),
+            hash: r.hash,
+            base_revision: None,
+            force: false,
+        })
         .await
         .expect("materialize");
         assert_eq!(
@@ -3580,15 +3580,15 @@ mod node_interface {
             .map(|n| SessionId::new(format!("byprof-{n}")))
             .collect();
         for id in &ids {
-            node.submit_as(
-                id.clone(),
-                None,
-                AgentCommand::StartTurn {
+            node.submit_as(daemon_api::SubmitAsArgs {
+                session: id.clone(),
+                origin: None,
+                command: AgentCommand::StartTurn {
                     input: UserMsg::new("hi"),
                     request_id: daemon_common::ReqId(1),
                 },
-                Some(profile.clone()),
-            )
+                profile: Some(profile.clone()),
+            })
             .await
             .expect("submit_as binds the profile and opens the session");
         }
@@ -7930,17 +7930,17 @@ mod node_interface {
             // record_meta lands on the live merged log as a Transport entry (observable), without
             // entering the prompt/journal.
             let before = node.log_after(inproc_session.clone(), 0, 0).await.unwrap();
-            node.record_meta(
-                inproc_session.clone(),
-                Origin::new(
+            node.record_meta(daemon_api::RecordMetaArgs {
+                session: inproc_session.clone(),
+                origin: Origin::new(
                     "gui",
                     OriginScope::Api {
                         key: "owner".into(),
                     },
                 ),
-                "attach".into(),
-                vec![1, 2, 3],
-            )
+                kind: "attach".into(),
+                body: vec![1, 2, 3],
+            })
             .await
             .unwrap();
             let delta = node

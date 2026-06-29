@@ -22,13 +22,14 @@ use async_trait::async_trait;
 
 use daemon_api::{
     AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiError, ChannelJoinDetails,
-    ConnectionState, ContactInfo, ContactsOps, ConversationInfo, ConversationOps,
-    CreateConversationDetails, MemberRole, MembershipOps, MessagingProtocol, NodeApi, Participant,
-    PresenceState, SupportsContacts, SupportsConversations, SupportsDirectory, SupportsMembership,
+    ConnectionState, ContactInfo, ContactsOps, ConvSendArgs, ConversationInfo, ConversationOps,
+    CreateConversationDetails, MemberBanArgs, MemberInviteArgs, MemberRemoveArgs,
+    MemberSetRoleArgs, MembershipOps, MessagingProtocol, NodeApi, Participant, PresenceState,
+    SupportsContacts, SupportsConversations, SupportsDirectory, SupportsMembership,
     TransportAdapter, TransportInstanceInfo,
 };
 use daemon_host::AccountProvisioning;
-use daemon_protocol::{TransportId, UserMsg};
+use daemon_protocol::TransportId;
 
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
@@ -296,13 +297,13 @@ impl SupportsConversations for MatrixAdapter {
             .map_err(|e| ApiError::Other(format!("matrix leave: {e}")))
     }
 
-    async fn send(
-        &self,
-        transport: TransportId,
-        conv: String,
-        _from: Option<Participant>,
-        message: UserMsg,
-    ) -> Result<(), ApiError> {
+    async fn send(&self, args: ConvSendArgs) -> Result<(), ApiError> {
+        let ConvSendArgs {
+            transport,
+            conv,
+            from: _from,
+            message,
+        } = args;
         // The Matrix account user is always the sender; `from` attribution is not forwarded onto the
         // wire (matrix-sdk posts as the bound account). The outbound projector posts the same way.
         let room = self.room_for(&transport, &conv).await?;
@@ -352,13 +353,13 @@ impl SupportsMembership for MatrixAdapter {
         }
     }
 
-    async fn invite(
-        &self,
-        transport: TransportId,
-        conv: String,
-        who: Participant,
-        _message: Option<String>,
-    ) -> Result<(), ApiError> {
+    async fn invite(&self, args: MemberInviteArgs) -> Result<(), ApiError> {
+        let MemberInviteArgs {
+            transport,
+            conv,
+            who,
+            message: _message,
+        } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
         room.invite_user_by_id(&user)
@@ -366,13 +367,13 @@ impl SupportsMembership for MatrixAdapter {
             .map_err(|e| ApiError::Other(format!("matrix invite: {e}")))
     }
 
-    async fn remove(
-        &self,
-        transport: TransportId,
-        conv: String,
-        who: Participant,
-        reason: Option<String>,
-    ) -> Result<(), ApiError> {
+    async fn remove(&self, args: MemberRemoveArgs) -> Result<(), ApiError> {
+        let MemberRemoveArgs {
+            transport,
+            conv,
+            who,
+            reason,
+        } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
         room.kick_user(&user, reason.as_deref())
@@ -380,13 +381,13 @@ impl SupportsMembership for MatrixAdapter {
             .map_err(|e| ApiError::Other(format!("matrix remove: {e}")))
     }
 
-    async fn ban(
-        &self,
-        transport: TransportId,
-        conv: String,
-        who: Participant,
-        reason: Option<String>,
-    ) -> Result<(), ApiError> {
+    async fn ban(&self, args: MemberBanArgs) -> Result<(), ApiError> {
+        let MemberBanArgs {
+            transport,
+            conv,
+            who,
+            reason,
+        } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
         room.ban_user(&user, reason.as_deref())
@@ -394,13 +395,13 @@ impl SupportsMembership for MatrixAdapter {
             .map_err(|e| ApiError::Other(format!("matrix ban: {e}")))
     }
 
-    async fn set_role(
-        &self,
-        transport: TransportId,
-        conv: String,
-        who: Participant,
-        role: MemberRole,
-    ) -> Result<(), ApiError> {
+    async fn set_role(&self, args: MemberSetRoleArgs) -> Result<(), ApiError> {
+        let MemberSetRoleArgs {
+            transport,
+            conv,
+            who,
+            role,
+        } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
         let level = Int::from(role_to_power(role));
@@ -479,6 +480,7 @@ mod tests {
     use daemon_api::ContactInfo;
     use daemon_common::ProfileRef;
     use daemon_host::ProvisionedAccount;
+    use daemon_protocol::UserMsg;
 
     use matrix_sdk::ruma::{event_id, room_id};
     use matrix_sdk::test_utils::mocks::MatrixMockServer;
@@ -630,10 +632,12 @@ mod tests {
 
         SupportsConversations::send(
             &*adapter,
-            transport,
-            room.as_str().to_string(),
-            None,
-            UserMsg::new("hello".to_string()),
+            ConvSendArgs {
+                transport,
+                conv: room.as_str().to_string(),
+                from: None,
+                message: UserMsg::new("hello".to_string()),
+            },
         )
         .await
         .expect("send succeeds against the mock");
@@ -702,10 +706,12 @@ mod tests {
         };
         let err = SupportsMembership::invite(
             &*adapter,
-            transport,
-            room.as_str().to_string(),
-            agent,
-            None,
+            MemberInviteArgs {
+                transport,
+                conv: room.as_str().to_string(),
+                who: agent,
+                message: None,
+            },
         )
         .await
         .expect_err("an agent is not a Matrix membership target");

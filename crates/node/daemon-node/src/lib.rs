@@ -36,9 +36,9 @@ use daemon_host::{
     AgentSession, AgentUnit, BackgroundProfile, BackgroundProfileRegistry, BackgroundSpawner,
     BlobStore, CodecSession, CoreEngineFactory, CredentialStore, CronFiring, CronScheduler,
     DurableProfileResolver, EngineUnit, FileBlobStore, FleetControl, Host, HostConfig, JobWorker,
-    JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl, NodeEventFeed,
-    ProcessAgentUnit, ProfileStore, RoutingRegistry, ServiceError, SessionEngineBuilder,
-    StreamJsonCodec, SupervisorHandle, WorkspaceFs, WorkspaceRoots,
+    JournalConfig, JournalFeeder, JournalSink, ModelProviderFactory, NodeApiImpl, NodeApiParts,
+    NodeEventFeed, ProcessAgentUnit, ProfileStore, RoutingRegistry, ServiceError,
+    SessionEngineBuilder, StreamJsonCodec, SupervisorHandle, WorkspaceFs, WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::HostRequestHandler;
@@ -935,14 +935,16 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         }
     };
 
-    let mut node_api = NodeApiImpl::new(
-        handle.observer(),
-        a.store.clone(),
-        host.manager().clone(),
-        a.partition,
-        session_builder,
-        Some(Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>),
-    )
+    let mut node_api = NodeApiImpl::new(NodeApiParts {
+        supervisor: handle.observer(),
+        store: a.store.clone(),
+        manager: host.manager().clone(),
+        partition: a.partition,
+        engine_builder: session_builder,
+        fleet: Some(
+            Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>
+        ),
+    })
     // Live interactive sessions journal per turn; also records the signer so history reads verify.
     .with_journal(a.store.clone(), signer.clone())
     // Surface the resident telemetry aggregator through the `telemetry` control op.

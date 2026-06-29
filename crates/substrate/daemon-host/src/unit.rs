@@ -68,12 +68,14 @@ impl AgentSession for LiveAgentSession {
                 if let Ok(outcome) = self.handle.rewind_to(request_id, anchor).await {
                     if let Some(hooks) = &self.rewind {
                         crate::node_api::apply_rewind_side_effects(
-                            &hooks.store,
-                            hooks.checkpoints.as_ref(),
-                            hooks.journaled,
-                            &hooks.session,
-                            &outcome,
-                            true,
+                            crate::node_api::RewindSideEffects {
+                                store: &hooks.store,
+                                checkpoints: hooks.checkpoints.as_ref(),
+                                journaled: hooks.journaled,
+                                session: &hooks.session,
+                                outcome: &outcome,
+                                restore_workspace: true,
+                            },
                         )
                         .await;
                     }

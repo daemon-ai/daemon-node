@@ -119,7 +119,8 @@ fn check_cddl() -> anyhow::Result<()> {
             path.display()
         );
     }
-    let rust = read_to_string(&root.join("crates/contracts/daemon-api/src/lib.rs"))?;
+    // ApiRequest / ApiResponse live in the `wire` submodule of daemon-api.
+    let rust = read_to_string(&root.join("crates/contracts/daemon-api/src/wire.rs"))?;
     assert_cddl_covers_enum(&text, &rust, "ApiRequest", "api-request")?;
     assert_cddl_covers_enum(&text, &rust, "ApiResponse", "api-response")?;
     println!("ok: {} defines the api mirror", path.display());
@@ -515,12 +516,12 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         write_cbor(
             &out,
             "request-model-recommend.cbor",
-            &ApiRequest::ModelRecommend {
+            &ApiRequest::ModelRecommend(daemon_api::ModelRecommendArgs {
                 repo: repo.into(),
                 revision: None,
                 engine: ModelEngine::Llama,
                 budget_bytes: Some(6 * 1024 * 1024 * 1024),
-            },
+            }),
         )?;
         // Responses exercise the bumped array caps: search-page.results, [model-file],
         // [download-status], [installed-model], plus the nested quant candidate list.

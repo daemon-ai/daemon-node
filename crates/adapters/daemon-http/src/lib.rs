@@ -33,8 +33,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daemon_api::{
-    dispatch, ApiRequest, ApiResponse, FsRootId, LogFilter, LogLineStream, LogStream, NodeApi,
-    SessionLogEntry, TreeStream, TreeSubFilter,
+    dispatch, ApiRequest, ApiResponse, FsRootId, FsWatchAfterArgs, LogFilter, LogLineStream,
+    LogStream, NodeApi, SessionLogEntry, TreeStream, TreeSubFilter,
 };
 use daemon_common::SessionId;
 use daemon_delivery::{serve_delivery, Projector};
@@ -377,7 +377,12 @@ async fn fs_watch_sse(
             loop {
                 tokio::time::sleep(poll).await;
                 match api
-                    .fs_watch_after(root.clone(), dir.clone(), after_seq, 0)
+                    .fs_watch_after(FsWatchAfterArgs {
+                        root: root.clone(),
+                        dir: dir.clone(),
+                        after_seq,
+                        max: 0,
+                    })
                     .await
                 {
                     Ok(page) if !page.events.is_empty() => {
