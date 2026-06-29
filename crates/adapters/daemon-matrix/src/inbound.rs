@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Inbound: Matrix room messages -> `Origin` + `Reception` -> the `daemon-ingest` gate.
 //!
 //! The adapter keeps only the *transport-specific* piece — classifying whether a message is

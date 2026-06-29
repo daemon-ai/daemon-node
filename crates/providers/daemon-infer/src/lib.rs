@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-infer` — the supervised local-inference worker (library + binary).
 //!
 //! Local engines can wedge a process on a GPU OOM/segfault/hang, so local inference runs in this

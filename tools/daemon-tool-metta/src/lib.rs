@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-metta` — the single `metta` symbolic-coprocessor tool (a `daemon_core::Tool`).
 //!
 //! One tool, an `op` field, the full `metta-symbolic-coprocessor` SKILL contract. `run()` parses the

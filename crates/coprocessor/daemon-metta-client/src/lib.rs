@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-metta-client` — the supervised client for the `daemon-metta` symbolic coprocessor.
 //!
 //! [`MettaCoprocessor`] is to the MeTTa worker what `LocalProvider` is to the inference worker: it

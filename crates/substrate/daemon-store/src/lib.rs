@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-store` — durable persistence primitives for the activation core.
 //!
 //! The [`SessionStore`] trait is the *sole authority* for durable session state (lifecycle §4

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The tool execution pipeline (§12 `run_tool`).
 //!
 //! Resolves a call against the registry, runs it against the turn context (where the tool itself

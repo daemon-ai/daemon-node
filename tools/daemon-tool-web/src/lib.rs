@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-web` — the `web_search` and `web_extract` chat tools (`daemon_core::Tool`s).
 //!
 //! Both are backed by pluggable traits ([`WebSearchBackend`], [`WebFetchBackend`]) so the concrete

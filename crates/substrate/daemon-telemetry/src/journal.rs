@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The verifiable journal: one hash-linked, per-segment-signed chain per stream carrying typed
 //! entries — coarse management records and coalesced finished chat blocks.
 //!

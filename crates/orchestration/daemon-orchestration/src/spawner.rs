@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The child-placement seam (layout §4: the per-child mechanism).
 //!
 //! The runtime never builds engines itself — that would couple it to `daemon-core` and weld it to

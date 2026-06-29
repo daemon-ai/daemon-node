@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-cli` — the operator surface over the node's [`daemon_api`] interface.
 //!
 //! A thin client: every subcommand marshals one [`daemon_api::ApiRequest`] over the Unix-socket

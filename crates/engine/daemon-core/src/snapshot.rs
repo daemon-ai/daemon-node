@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The typed engine snapshot (lifecycle §2) — the *only* durable engine state.
 //!
 //! Everything an incarnation needs to be reconstructed: its identity, epoch, the typed

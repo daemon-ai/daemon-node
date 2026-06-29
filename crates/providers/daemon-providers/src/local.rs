@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`LocalProvider`] — a [`Provider`] over a supervised `daemon-infer` worker process.
 //!
 //! Local inference engines (`llama.cpp`, `mistral.rs`) run in a separate `daemon-infer` child so a

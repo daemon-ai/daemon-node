@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Acquisition: download a [`ModelRef`]'s files into the shared HF cache via `hf-hub`, tracking
 //! per-job progress and supporting pause / resume / cancel.
 //!

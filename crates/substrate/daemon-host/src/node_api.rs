@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`NodeApiImpl`] — the node's [`daemon_api`] surface implemented over the running host.
 //!
 //! This is the one place the abstract interface ([`daemon_api::NodeApi`]) is bound to concrete

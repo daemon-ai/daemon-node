@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! URL safety (§9 `url_safety`) — an SSRF/egress guard for the network-facing tools.
 //!
 //! Web/browser tools fetch arbitrary model-supplied URLs. Without a guard the model could be

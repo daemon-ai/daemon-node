@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The LCM store schema (v4 subset — `daemon-context-lcm-port-spec.md` §4).
 //!
 //! A faithful subset of the hermes-lcm SQLite schema covering milestones M1-M4: the lossless

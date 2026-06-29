@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Live-network integration tests (ignored by default: run with `--ignored` and network access).
 //!
 //! These hit the real Hugging Face Hub. They are excluded from the normal suite (which uses the

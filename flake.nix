@@ -2,7 +2,7 @@
   description = "daemon Rust workspace";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
 
@@ -326,6 +326,7 @@
                 pkgs.gitleaks # secret scanning
                 pkgs.typos # source spell-checker
                 pkgs.nodejs # provides npx for jscpd (not packaged in nixpkgs)
+                pkgs.just # task runner: the justfile recipes (lint / deny / test / coverage)
               ]
               ++ engineNativeInputs;
           };

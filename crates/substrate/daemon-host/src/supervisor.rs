@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A small one-for-one supervisor for the host's fixed resident-service tree.
 //!
 //! Restart/backoff/meltdown policy is intentionally host-internal: it is **not** part of the

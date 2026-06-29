@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-fs` — the filesystem tool (§12/§13), a `daemon_core::Tool`.
 //!
 //! Read, write, list, and edit files through the engine's [`ExecutionEnvironment`](daemon_core::ExecutionEnvironment)

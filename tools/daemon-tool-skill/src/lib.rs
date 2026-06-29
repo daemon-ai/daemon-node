@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-skill` — the model-facing skills tools (`daemon_core::Tool`) over a
 //! [`daemon_skills::SkillStore`]: the progressive-disclosure level-2/3 reads and the CRUD surface.
 //!

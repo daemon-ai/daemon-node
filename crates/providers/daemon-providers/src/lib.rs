@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Real networked model providers (§7) — a thin [`Provider`] over the [`genai`] multi-provider
 //! client.
 //!

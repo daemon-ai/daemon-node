@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The [`SessionLog`] — the single per-session sequencer that stamps the monotonic `seq` on every
 //! item crossing the session boundary, in **both** directions.
 //!

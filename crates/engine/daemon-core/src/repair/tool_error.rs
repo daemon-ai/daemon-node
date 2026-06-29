@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Tool-error sanitization + untrusted-output wrapping (§9).
 //!
 //! Tool results are the second-most adversarial input after model output: a shell command's stderr

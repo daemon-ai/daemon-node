@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The [`Provider`] adapter over the [`genai`] multi-provider client.
 
 use crate::{classify_genai_error, finalize_output, RawToolCall};

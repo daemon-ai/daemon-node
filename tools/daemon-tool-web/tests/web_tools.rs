@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Web-tool coverage: hosted-backend auth+parse against an in-process `wiremock` server, the local
 //! readability fallback against a served HTML page, and tool-level dispatch (`web_search` /
 //! `web_extract`) through a hand-built `TurnCx` with fake backends — including the egress reject and

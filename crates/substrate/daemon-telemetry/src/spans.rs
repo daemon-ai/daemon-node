@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `TraceId` helpers for structured `tracing` spans/events.
 //!
 //! The task-local [`TraceId`](daemon_common::TraceId) remains the source of truth for wire

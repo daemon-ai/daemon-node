@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Recall diagnostics — port of `recall_diagnostics.py`.
 //!
 //! Per-tier hit counters and fallback-rate alarms (`recall_diagnostics.py` L47-L270) are not wired

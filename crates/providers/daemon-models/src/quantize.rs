@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Offline local quantization orchestration.
 //!
 //! The daemon never links `llama-cpp-4` itself; the only binary that does is the `daemon-infer`

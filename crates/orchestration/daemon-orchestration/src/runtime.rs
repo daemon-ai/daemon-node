@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The fleet runtime: the delegation-job worker, child fan-in, and the answer/escalation handler.
 //!
 //! [`FleetRuntime`] is a cloneable handle over shared fleet state. Its phase-4 job is

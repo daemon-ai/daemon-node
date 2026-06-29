@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Content sanitizer — port of `content_sanitizer.py`.
 //!
 //! Detects binary-shaped content (base64 data URIs, oversized payloads, high-entropy encoded blobs)

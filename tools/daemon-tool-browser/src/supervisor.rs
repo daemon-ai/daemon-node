@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The supervised browser session — a single lazily-launched Chromium driven over CDP, modeled on
 //! the `daemon-metta` `MettaCoprocessor`: the process is spawned on first use, guarded behind an
 //! async mutex (CDP commands are serialized per session), torn down + respawned after a transport

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The Unix-domain-socket transport adapter for the [`daemon_api`] surface.
 //!
 //! Two modes share one length-framed (4-byte big-endian length + CBOR payload) byte stream:

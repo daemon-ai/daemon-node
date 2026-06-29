@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `daemon-infer` worker binary: a length-framed stdio loop over [`daemon_infer::protocol`].
 //!
 //! Spawned by the daemon's `LocalProvider` with `--engine {llama|mistralrs}`. It loads a model

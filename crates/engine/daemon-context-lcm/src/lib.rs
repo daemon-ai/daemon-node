@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-context-lcm` — a native Rust port of **hermes-lcm**, exposed to `daemon-core` as the
 //! default [`ContextEngine`](daemon_core::context::ContextEngine) (§10 in-session context manager).
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! THE PHASE-5 GATE: placement / the first cut (`daemon-workspace-layout.md` §7 phase-5 gate).
 //!
 //! A child runs in a real isolated OS process — the `daemon` binary in its placed-child role,

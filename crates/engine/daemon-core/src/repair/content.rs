@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Content scrubbing (§9) — the [`StreamingThinkScrubber`].
 //!
 //! Some models leak chain-of-thought into the *content* channel wrapped in `<think>`/`<thinking>`

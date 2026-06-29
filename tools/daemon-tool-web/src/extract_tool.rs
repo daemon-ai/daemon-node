@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `web_extract` tool: fetch + clean a page through an ordered chain of [`WebFetchBackend`]s
 //! (a keyed hosted scraper first, the local readability fallback last) and return the content as
 //! untrusted external data. The target URL is checked against the egress policy first.

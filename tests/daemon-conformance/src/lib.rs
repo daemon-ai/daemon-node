@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-conformance` — the substrate + translation conformance harness.
 //!
 //! The executable acceptance gate for the build-first milestones: the seven substrate acceptance

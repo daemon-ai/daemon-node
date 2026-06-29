@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Contract tests for the seven `lcm_*` tools — exercised through [`dispatch`] over a seeded store.
 
 use super::*;

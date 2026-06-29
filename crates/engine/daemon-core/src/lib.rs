@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-core` — the agent engine (the "brain").
 //!
 //! The single-owner agent actor (§4.1) that drives turns over a typed [`Conversation`] (§5),

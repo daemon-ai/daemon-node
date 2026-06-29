@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A file-backed, content-addressed **blob store** - the node content store of
 //! `daemon-content-transfer-spec.md` (Phase 1). Immutable bytes are stored by their SHA-256
 //! `ContentHash` as `<root>/<sha256-hex>.bin`, written **write-if-absent** so identical content

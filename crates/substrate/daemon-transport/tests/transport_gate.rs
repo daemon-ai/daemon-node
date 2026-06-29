@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! THE PHASE-6c GATE: a managed unit driven over a real socket, trace-in-envelope across the node
 //! boundary, and a stale remote fence rejected by the authority (`daemon-workspace-layout.md` §7
 //! phase-6: "cross-node lease/fence when fleets-of-fleets is real" — the single process-pair proof).

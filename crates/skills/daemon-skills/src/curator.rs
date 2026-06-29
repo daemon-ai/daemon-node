@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The deterministic skill curator (hermes `curator.py`, minus the LLM consolidation fork).
 //!
 //! Library hygiene as a pure transition table over the per-profile usage sidecar: an agent-created

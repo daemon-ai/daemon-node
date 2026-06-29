@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Phase-10 foreign-agent proof: a non-`daemon-core` process is a first-class fleet member.
 //!
 //! A `daemon-host` `ProcessAgentUnit` drives the `mock_stdio_agent` binary (which has no

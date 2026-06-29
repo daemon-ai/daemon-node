@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Escalation & auxiliary-provider summarization (`daemon-context-lcm-port-spec.md` §7).
 //!
 //! A summary must shrink its source or it escalates: **L1** a detailed LLM summary, **L2** aggressive

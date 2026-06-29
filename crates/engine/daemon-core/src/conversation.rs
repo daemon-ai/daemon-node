@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The typed conversation (§5) — the engine's source of truth.
 //!
 //! A [`Conversation`] is a system prompt plus an ordered list of [`Turn`]s. The key invariant is

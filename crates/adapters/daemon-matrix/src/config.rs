@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Resolved Matrix adapter configuration.
 //!
 //! The *route table* is the config surface of the §5.9.1 routing registry: it carries no account

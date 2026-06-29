@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Task-local trace scope (elfo's `scope` / `post_recv` pattern).
 //!
 //! A [`TraceId`] is a correlation handle that must survive every message boundary. The pattern:

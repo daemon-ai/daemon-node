@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `workspace_fs` — the node's filesystem / workspace surface (daemon-fs-surface-spec.md).
 //!
 //! Two pieces:

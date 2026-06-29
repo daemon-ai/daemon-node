@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Wiring an agent's stream into the unified verifiable journal (host-spec §5).
 //!
 //! A [`JournalSink`] binds a `(stream, segment)` chain to the authoritative [`SessionStore`] and a

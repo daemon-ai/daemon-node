@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Veracity consolidation — port of `veracity_consolidation.py`.
 //!
 //! `compute_fact_id` (length-prefixed NFC SHA-256, L111-L115) and the incremental confidence math

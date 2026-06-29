@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The BEAM SQLite schema — port of `beam.py` `init_beam` (L485-L1026) and the knowledge-layer
 //! `init_*` functions.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-models` — unified local-inference model search, acquisition, caching, and catalog.
 //!
 //! This crate is the one owner of the model lifecycle the daemon exposes to clients (the

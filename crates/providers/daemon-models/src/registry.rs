@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The installed-model catalog: a single atomic JSON manifest of [`InstalledModel`] records.
 //!
 //! Chosen over SQLite (the old app's store) because the catalog is small, read-mostly, and benefits

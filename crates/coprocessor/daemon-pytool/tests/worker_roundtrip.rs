@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Integration test: drive the hermetic `fake-pytool-worker` over the supervised client.
 //!
 //! Spawns the compiled fake worker (via `CARGO_BIN_EXE_fake-pytool-worker`) through the same

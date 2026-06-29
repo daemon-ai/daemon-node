@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`StreamJsonCodec`] — the Claude-Code `stream-json` foreign codec (the second [`Codec`]).
 //!
 //! Claude Code (and compatible agents — Amp, Cursor's CLI) emit newline-delimited JSON on stdout

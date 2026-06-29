@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The host's resident services as supervised interval loops.
 //!
 //! Every inter-service handoff travels through the durable store queues (`wake_outbox`,

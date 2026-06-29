@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The embedding provider port — the backend-agnostic seam memory/recall use for vector similarity.
 //!
 //! This is a sibling of the [`Provider`](crate::Provider) port, kept separate because an embedding

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon` — the host binary that assembles an engine, its host, tools, and orchestration.
 //!
 //! It is the role-by-config node (workspace-layout §6):

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! AnnotationStore — port of `annotations.py` (the E6 triplestore split).
 //!
 //! Append-only, multi-valued per-memory tags with a `(memory_id, kind, value)` unique index and

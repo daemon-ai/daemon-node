@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Execution environments (§13) — the seam a tool uses to touch the world.
 //!
 //! Tools never spawn subprocesses or open files directly; they go through an [`ExecutionEnvironment`]

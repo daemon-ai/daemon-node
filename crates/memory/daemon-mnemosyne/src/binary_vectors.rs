@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! MIB (Maximally Informative Binarization) — port of `binary_vectors.py`.
 //!
 //! Sign-binarize each embedding dimension (`bit = 1 if x > 0`), pack MSB-first into bytes

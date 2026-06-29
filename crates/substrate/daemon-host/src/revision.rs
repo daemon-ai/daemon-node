@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A file-backed [`RevisionLog`]: the append-only, content-addressed version history backing the
 //! node's profile + skill versioning surface.
 //!

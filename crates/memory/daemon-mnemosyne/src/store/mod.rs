@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The SQLite storage layer — port of `beam.py`'s connection + schema setup (L404-L1026).
 //!
 //! A single `Mutex<Connection>` serializes all access (the workspace convention, see

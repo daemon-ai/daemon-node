@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Inbound: a Room post -> a per-member `submit_from` fan-out.
 //!
 //! A Room is the loopback analogue of a Matrix room. Where `daemon-matrix` receives one event and

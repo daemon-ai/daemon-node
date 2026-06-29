@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! SHMR (Self-Harmonizing Memory Reasoning) — port of `shmr.py` (P3, opt-in background pass).
 //!
 //! Greedy cosine clustering (>= 0.70) + belief convergence (<= 3 iters to harmony >= 0.60) writing

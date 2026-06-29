@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Temporal TripleStore — port of `triples.py`.
 //!
 //! Single-current-truth SPO chains: `add(supersede=true)` stamps prior open rows' `valid_until` to

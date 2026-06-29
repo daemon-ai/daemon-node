@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! CanonicalStore — port of `canonical.py`.
 //!
 //! Owner-scoped identity cards with monotonic version chains and a partial unique index on live rows

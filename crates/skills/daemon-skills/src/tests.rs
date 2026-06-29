@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 use super::*;
 
 const ARXIV: &str = "---\nname: arxiv\ndescription: \"Search arXiv papers by keyword, author, category, or ID.\"\nversion: 1.0.0\nplatforms: [linux, macos, windows]\nmetadata:\n  daemon:\n    tags: [Research, Arxiv, Papers]\n    related_skills: [ocr-and-documents]\n---\n\n# arXiv\n\n## When to Use\nWhen searching academic papers.\n";

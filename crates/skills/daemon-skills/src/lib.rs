@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-skills` — the filesystem skills subsystem (a Rust port of hermes' skills).
 //!
 //! A *skill* is a directory bundle under `<profile_home>/skills/<category>/<name>/` whose `SKILL.md`

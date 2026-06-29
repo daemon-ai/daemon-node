@@ -1,0 +1,55 @@
+version = 1
+
+# First-party Rust sources carry their own SPDX headers (SPDX-License-Identifier
+# + SPDX-FileCopyrightText). This file declares licensing for the build,
+# configuration, contract, FFI-binding, tooling, and fixture files that cannot
+# (or should not) carry a comment header. Optional/third-party components are
+# documented in NOTICE.
+#
+# NOTE: bundled skill markdown under crates/skills/daemon-skills/bundled/** (and a
+# few SKILL.md/DESCRIPTION.md/README.md skill docs) is intentionally NOT claimed
+# here. Some of it (e.g. research-paper-writing/references/) is likely third-party
+# reference material; each needs per-file provenance review before it can be
+# attributed and marked REUSE-compliant. Claiming copyright we may not hold would
+# be worse than an incomplete lint.
+
+[[annotations]]
+path = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "deny.toml",
+    "rustfmt.toml",
+    "rust-toolchain.toml",
+    "flake.nix",
+    "flake.lock",
+    ".gitignore",
+    "README.md",
+    "AGENTS.md",
+    "NOTICE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
+SPDX-FileCopyrightText = "2026 Jarrad Hope"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# --- First-party build/config/tooling/contract/fixture/FFI files ---
+[[annotations]]
+path = [
+    "**/Cargo.toml",
+    "**/AGENTS.md",
+    "**/.gitignore",
+    "**/*.cddl",
+    "**/fixtures/**",
+    "**/*.gbnf",
+    "**/*.lark",
+    "**/*.sh",
+    "**/*.py",
+    "**/*.toml",
+    "**/*.proptest-regressions",
+    "docs/**",
+    "**/docs/**",
+    "bindings/**/include/*.h",
+    "bindings/**/harness/*.c",
+]
+SPDX-FileCopyrightText = "2026 Jarrad Hope"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

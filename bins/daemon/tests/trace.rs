@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! THE GATE 6a: trace-in-envelope rides the placement cut end-to-end (elfo "context rides every
 //! message"), and a placed unit's `Usage` folds into the host's resident metrics dump.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! GGUF metadata introspection via `gguf-rs`.
 //!
 //! Reads the header key-values of a GGUF file (architecture, name, file-type, context length, block

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Firecrawl fetch backend (`POST https://api.firecrawl.dev/v1/scrape`, Bearer auth) — a hosted
 //! scraper that renders JS and returns clean Markdown.
 

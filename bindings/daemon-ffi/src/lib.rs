@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-ffi` — the C ABI adapter over the **durable host** (the node management + §17 surface).
 //!
 //! Where [`daemon-core-ffi`](../daemon_core_ffi/index.html) embeds the L1 *brain* (one completing

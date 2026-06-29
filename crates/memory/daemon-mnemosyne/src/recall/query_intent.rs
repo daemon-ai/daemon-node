@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Query-intent classification + weight bias — port of `query_intent.py`.
 //!
 //! The regex `INTENT_PATTERNS` (L41-L82) classify a query, the per-category `INTENT_WEIGHTS`

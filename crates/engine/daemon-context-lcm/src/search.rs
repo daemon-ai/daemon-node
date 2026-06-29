@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The transcript/DAG search stack (`daemon-context-lcm-port-spec.md` §11).
 //!
 //! Port of hermes-lcm's search layer over the SQLite FTS5 indexes:

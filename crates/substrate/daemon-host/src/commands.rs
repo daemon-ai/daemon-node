@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The node-side command registry — the single live catalog behind the daemon-authoritative
 //! command surface ([`ControlApi::command_list`](daemon_api::ControlApi::command_list) /
 //! [`command_invoke`](daemon_api::ControlApi::command_invoke)).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Persisted provider credentials: the durable store backing the node's `CredentialApi` surface,
 //! and the [`CredentialSource`] that feeds stored secrets into the credential authority.
 //!

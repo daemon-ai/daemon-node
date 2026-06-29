@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Per-account bring-up: the credential-store session blob, the on-disk E2EE client, and the
 //! refresh write-back.
 //!

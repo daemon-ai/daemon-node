@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A minimal **Claude-Code `stream-json`** foreign agent (newline-delimited JSON over stdio).
 //!
 //! It has no `daemon-core` (or `daemon-host`) dependency, yet a `daemon-host` `CodecSession`

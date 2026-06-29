@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The child-request answer/escalation policy (layout §4; synthesis §3.1 #3).
 //!
 //! A parent is the **answer-authority** for its children: a child's blocking `ManageRequest`

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The worker wire protocol — engine-agnostic [`Command`]/[`Event`] frames + a CBOR codec.
 //!
 //! The daemon (`daemon-providers`' `LocalProvider`) and the `daemon-infer` worker exchange these

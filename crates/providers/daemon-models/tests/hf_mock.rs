@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! HF read-surface tests against an in-process `wiremock` server (no live network).
 
 use daemon_common::{ModelEngine, SearchQuery};

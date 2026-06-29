@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Backend selection: map a [`protocol::Engine`] + load params to a live [`InferenceBackend`].
 //!
 //! Each engine impl lives behind its feature (`llama`, `mistralrs`) and is `cfg`-gated, so the

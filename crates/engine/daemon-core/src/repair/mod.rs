@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Output/tool repair (§9) — run **once at the decode boundary**.
 //!
 //! A typed [`Conversation`](crate::conversation) means the engine never re-parses its own history,

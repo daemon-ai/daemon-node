@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! matrix-sdk `Room`/`RoomMember` -> daemon-api conversation/contact DTO projection.
 //!
 //! The `list`/`get` projection (daemon-messaging-adapter-spec.md §10.2: "Matrix reads its synced

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `todo` tool coverage: replace vs merge, per-session isolation, and the rendered checklist.
 
 use async_trait::async_trait;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `mnemosyne_*` tool surface — port of the `__init__.py` JSON tool dispatch (L1750+).
 //!
 //! These tools are *not* part of the §11 [`MemoryProvider`](daemon_core::memory::MemoryProvider)

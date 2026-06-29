@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Per-repo file listing over the Hub `/api/models/{repo}/tree/{revision}` endpoint (step 2).
 //!
 //! Recursively pages the repo tree (following the `Link: rel="next"` cursor), then filters + labels

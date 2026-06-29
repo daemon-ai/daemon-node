@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The engine ⇄ activation-seam adapter (host-spec §3.1).
 //!
 //! `daemon-core` is deliberately free of the durable substrate (it depends only on

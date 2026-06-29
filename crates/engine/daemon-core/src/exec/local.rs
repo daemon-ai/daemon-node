@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`LocalEnvironment`] — the in-core v1 execution backend (§13).
 //!
 //! Runs commands and file I/O on the local machine, rooted at a per-session workspace directory. All

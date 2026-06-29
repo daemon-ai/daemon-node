@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Chat text normalization for Mnemosyne ingestion (NAI-1) — port of `chat_normalize.py`.
 //!
 //! Aggressive, all-algorithmic (zero-LLM) regex normalization that makes casual chat messages

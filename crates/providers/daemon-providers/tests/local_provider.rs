@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Integration tests for [`LocalProvider`] against the scripted `fake-infer-worker` binary.
 //!
 //! These exercise the full supervised-worker path (spawn -> load -> generate over the real

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Repo search over the Hub `/api/models` endpoint (step 1 of search→select→download).
 //!
 //! An idiomatic port of the old `HuggingFaceService` search: free-text query, engine-aware format

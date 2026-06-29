@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Message + session filter patterns (`daemon-context-lcm-port-spec.md` §12.3).
 //!
 //! Two filter families:

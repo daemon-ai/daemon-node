@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-shell` — the command-execution tool (§12/§13), a `daemon_core::Tool`.
 //!
 //! Runs a transient command through the engine's [`ExecutionEnvironment`](daemon_core::ExecutionEnvironment)

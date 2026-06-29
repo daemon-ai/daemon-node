@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The seven `lcm_*` drill-down tools (§10).
 //!
 //! Ported from `LCM:tools.py`. Each handler takes parsed JSON args and returns a JSON string. They

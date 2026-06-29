@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Offline GGUF quantization via llama.cpp's native quantizer.
 //!
 //! This is the only place that links `llama-cpp-4`'s `model_quantize` (PR-grade `llama-quantize`

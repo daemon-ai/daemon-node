@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-credentials` — the credential authority.
 //!
 //! The host-owned authority backing the engine's §7 `CredentialProvider` port (host-spec §6). It

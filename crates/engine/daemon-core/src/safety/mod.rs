@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Tool safety primitives (§9) shared across the network-facing tool crates.
 //!
 //! Currently the [`url`] egress guard ([`check_url`](url::check_url)); future siblings (path

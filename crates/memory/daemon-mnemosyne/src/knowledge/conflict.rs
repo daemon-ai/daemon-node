@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! LLM conflict detection — port of `llm_conflict_detector.py`.
 //!
 //! Opt-in tier-2 validator (`MNEMOSYNE_LLM_CONFLICT_DETECTION`) layered atop the deterministic

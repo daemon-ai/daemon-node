@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-clarify` — the `clarify` chat tool (`daemon_core::Tool`): a first-class
 //! human-in-the-loop ask. When the agent needs a decision only the user can make, it asks a
 //! question (optionally with fixed options) and **blocks** on the §17 host request channel until the

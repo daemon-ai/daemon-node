@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Integration tests for the genai-backed provider against an in-process mock HTTP server
 //! (wiremock): non-streaming decode, SSE streaming decode, and §8 error classification — driving the
 //! real `genai` request/response path with the endpoint pointed at the mock.

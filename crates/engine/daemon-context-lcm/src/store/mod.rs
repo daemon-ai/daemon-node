@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The LCM store (`daemon-context-lcm-port-spec.md` §4): one SQLite file per bank holding the
 //! lossless `messages` transcript, the summary DAG, and the lifecycle frontier.
 //!

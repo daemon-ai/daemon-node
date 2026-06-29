@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-cron` — the agent veneer over the cron backing (I15; layout §4: tool surface).
 //!
 //! Exposes scheduling to the engine as a single `daemon_core::Tool` so the agent can create, list,

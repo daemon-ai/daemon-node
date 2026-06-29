@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `CredentialSource` seam: where secret material comes from, and the stub used in this phase.
 //!
 //! The authority owns *governance* (scoping, attenuation, minting capabilities, rotation, cost);

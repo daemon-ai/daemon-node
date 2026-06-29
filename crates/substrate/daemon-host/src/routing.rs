@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Host-level bidirectional routing (daemon-event-io-spec §5.9).
 //!
 //! The routing registry maps an inbound [`Origin`] to the `(SessionId, profile, DeliveryTarget)` the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The evaluation/matching engine seam.
 //!
 //! A [`MettaEngine`] evaluates a MeTTa expression and structurally matches a pattern against a set

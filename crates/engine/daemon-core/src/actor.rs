@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The agent session as an actor (§17 runtime handle).
 //!
 //! [`spawn_agent_session`] owns an [`Engine`] on a dedicated task and serves §17 commands over an

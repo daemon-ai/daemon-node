@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-ingest` — the reusable **inbound** gate, the symmetric counterpart to `daemon-delivery`
 //! (daemon-event-io-spec §5.9.1).
 //!

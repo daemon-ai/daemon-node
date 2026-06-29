@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Small shared helpers (ids, timestamps).
 
 use sha2::{Digest, Sha256};

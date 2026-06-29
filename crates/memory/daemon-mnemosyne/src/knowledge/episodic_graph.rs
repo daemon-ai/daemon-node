@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! EpisodicGraph — port of `episodic_graph.py`.
 //!
 //! Regex SPO fact extraction (`is`/`has`/`uses`/`works_at`, cap 5, pronoun-led subjects rejected,

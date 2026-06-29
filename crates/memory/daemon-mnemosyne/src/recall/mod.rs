@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Retrieval & ranking: the shared scoring math plus the selectable pipelines (linear hybrid is the
 //! default; enhanced/polyphonic/SHMR are opt-in).
 

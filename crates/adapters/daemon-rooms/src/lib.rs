@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-rooms` — the internal Rooms transport (see `daemon-rooms-spec.md`).
 //!
 //! A **Room/Chat** is a first-class N-participant conversation backed by an **internal loopback

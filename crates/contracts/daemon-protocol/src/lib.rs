@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-protocol` — the §17 host wire protocol (the engine's upward face).
 //!
 //! The typed control/event/request surface the engine (`daemon-core`) speaks to its host: commands

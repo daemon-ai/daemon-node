@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-api` — the node's one canonical interface/surface.
 //!
 //! A node exposes a single operable surface; *how* a caller reaches it (in-process call, a Unix

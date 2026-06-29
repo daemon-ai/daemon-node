@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Resolved Rooms adapter configuration.
 //!
 //! Like the Matrix adapter's [`MatrixConfig`](daemon_matrix), the *shape* lives here and the binary

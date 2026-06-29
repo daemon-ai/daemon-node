@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A minimal **ACP** agent (JSON-RPC 2.0 over stdio), built on the published
 //! `agent-client-protocol` crate's agent side.
 //!

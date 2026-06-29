@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-orchestrate` — the agent veneer over the fleet runtime (layout §4: tool surface).
 //!
 //! Exposes orchestration to the engine as a single `daemon_core::Tool` so the brain can grow/steer a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The foreign-agent codec seam: one generic session driver over any line/length transport.
 //!
 //! A foreign brain (a CLI agent we did not write) speaks some protocol over its stdio that is *not*

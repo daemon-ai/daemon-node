@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The credential authority — the owner endpoint of the brokering chain.
 //!
 //! Holds the signing key and the [`CredentialSource`], mints scoped, signed [`CapabilityLease`]s in

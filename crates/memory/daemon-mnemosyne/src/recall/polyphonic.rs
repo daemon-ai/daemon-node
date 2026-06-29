@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Polyphonic recall — port of `polyphonic_recall.py` (P2, `MNEMOSYNE_POLYPHONIC_RECALL=1`).
 //!
 //! Four voices (vector/graph/fact/temporal) fused by Reciprocal Rank Fusion. The voices are

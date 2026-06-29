@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Interactive-auth machinery: the host side of the client-driven SSO / OAuth2 login seam
 //! (`daemon-interactive-auth-spec`).
 //!

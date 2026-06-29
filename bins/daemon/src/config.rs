@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The node's layered configuration: an optional TOML file, overlaid by environment variables
 //! (env wins). This is the *composition-layer* config (partition, socket, store backend, resident
 //! cadence, provider/credential selection) — distinct from the engine tunables

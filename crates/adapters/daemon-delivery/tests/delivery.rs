@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Unit tests for the reusable pull subscriber over a mock [`NodeApi`]: it discovers a transport
 //! instance's owned sessions, projects their merged-log entries, and halts a session once the
 //! transport is handed over (demoted from `Primary` to `Spectator`).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The model provider port (§7) and the deterministic [`MockProvider`]/[`ScriptedProvider`].
 //!
 //! The engine talks to a model through this trait, not a concrete client, so providers are

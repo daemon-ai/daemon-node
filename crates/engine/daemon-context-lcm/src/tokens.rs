@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Token counting (`daemon-context-lcm-port-spec.md` §6.1, §12.2).
 //!
 //! LCM sizes its compaction threshold and leaf/condense budgets in tokens, so it counts with the

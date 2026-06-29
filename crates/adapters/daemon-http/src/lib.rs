@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-http` — the optional in-process HTTP/WS transport adapter for the [`daemon_api`] surface.
 //!
 //! Like the Unix socket and the C FFI, this is a thin shell over the shared

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Query normalization + synonym expansion — port of `synonyms.py` (plus beam's recall-time map).
 //!
 //! Two synonym tables are ported here, mirroring the Python split:

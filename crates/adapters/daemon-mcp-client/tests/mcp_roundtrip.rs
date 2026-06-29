@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Hermetic MCP client<->server roundtrip conformance.
 //!
 //! Stands up a minimal in-process MCP **server** (rmcp `server` feature, dev-only) over a duplex

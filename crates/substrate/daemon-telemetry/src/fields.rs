@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Stable field and span names for operational tracing.
 //!
 //! These constants keep log pipelines and tests from depending on ad-hoc spelling at each call

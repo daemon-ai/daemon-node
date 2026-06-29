@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Unit tests for the inbound gate's decision table over a mock [`NodeApi`] that records every
 //! submitted command. No engine, no host — the gate's busy state is driven directly via
 //! `note_turn_started` / `note_turn_finished`, exactly as an adapter drives it from the outbound

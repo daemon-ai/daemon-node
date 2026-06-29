@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Wire message-sequence repair (§9, the flatten boundary).
 //!
 //! The typed [`Conversation`](crate::conversation) keeps a tool call and its result slot together in

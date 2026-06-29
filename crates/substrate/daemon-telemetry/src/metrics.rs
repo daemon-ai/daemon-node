@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A lightweight, in-tree metrics aggregator + serializable dump.
 //!
 //! `UsageDelta` aggregates up the supervision tree by construction (supervision spec §4): an

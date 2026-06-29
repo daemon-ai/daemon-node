@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Pluggable backend traits + shared types for the web tools.
 //!
 //! `web_search` resolves a query against a [`WebSearchBackend`] (hosted Tavily today; Exa et al.

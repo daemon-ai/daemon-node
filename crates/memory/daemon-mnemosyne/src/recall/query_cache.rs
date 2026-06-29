@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! 5-tier semantic query cache — port of `query_cache.py`.
 //!
 //! Tier 1 exact normalized key; Tier 2 cosine >= 0.88; Tier 3 cosine >= 0.78 + word Jaccard >= 0.15;

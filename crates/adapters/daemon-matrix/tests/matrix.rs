@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Vertical tests for the Matrix adapter over a wiremock-backed homeserver (`MatrixMockServer`) and
 //! a recording mock [`NodeApi`] (no real engine/host). They cover the three seams:
 //!   - **login/restore round-trip**: a `MatrixSession` survives the credential blob serialization.

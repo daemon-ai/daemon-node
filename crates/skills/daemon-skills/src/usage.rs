@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `FileSkillUsageLog` — the file-backed [`SkillUsageLog`] (a profile's `.usage.json` sidecar).
 //!
 //! Co-located with the profile's skills dir (`<profile_home>/skills/.usage.json`) so the usage +

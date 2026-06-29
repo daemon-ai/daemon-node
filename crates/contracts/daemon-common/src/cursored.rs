@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A bounded, monotonically-cursored ring: the shared core of the daemon's cursored live streams
 //! (the gold-standard cursored contract, `daemon-event-io-spec` §5.4.1). Each pushed item is
 //! assigned a monotonic id (seq/cursor) starting at 1; an overflow eviction raises a `floor`, so a

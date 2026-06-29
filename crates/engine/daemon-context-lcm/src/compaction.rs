@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The compaction engine (`daemon-context-lcm-port-spec.md` §6).
 //!
 //! Per `compact()`: select the region between the leading anchor and the fresh tail, summarize the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Integration test: drive the real `daemon-metta` worker process over the length-framed cut.
 //!
 //! Spawns the compiled worker binary (via `CARGO_BIN_EXE_daemon-metta`) through the same

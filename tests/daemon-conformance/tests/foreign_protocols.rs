@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Foreign native-protocol adapters: a Claude-Code `stream-json` agent and an ACP agent each attach
 //! as a first-class fleet member through the `ProfileChildSpawner` protocol selector.
 //!

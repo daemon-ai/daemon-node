@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Turn context and effects (§4.2 / §4.3).
 //!
 //! A turn is modelled as a near-pure function over the conversation that produces a stream of

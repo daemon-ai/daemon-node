@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Embeddings — port of `embeddings.py`, over the `daemon-core` [`EmbeddingProvider`] seam.
 //!
 //! Mnemosyne no longer owns an embedding runtime. Instead the host injects an

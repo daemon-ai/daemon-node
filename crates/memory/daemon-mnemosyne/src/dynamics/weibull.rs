@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Per-type Weibull survival decay — port of `weibull.py`.
 //!
 //! `boost(t) = exp(-(age_hours / eta)^k)` (`weibull.py` L150-L154), with per-type `{k, eta}` params

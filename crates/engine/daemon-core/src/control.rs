@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`TurnControl`] — the shared, interior-mutable control surface a running turn observes.
 //!
 //! The live actor ([`crate::actor`]) drives a turn as a future and concurrently services §17

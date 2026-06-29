@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! §4.3 attached, non-joining background spawn — host-side materialization of `Effect::Spawn`.
 //!
 //! The engine raises a fire-and-forget [`HostRequestKind::Spawn`](daemon_protocol::HostRequestKind)

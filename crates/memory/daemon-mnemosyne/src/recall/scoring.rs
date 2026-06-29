@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The shared recall scoring math — port of the constants/formulas in `beam.py`.
 //!
 //! These pure functions are the heart of the port and are unit-tested for parity. See

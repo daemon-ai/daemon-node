@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Pre-compaction extraction (`daemon-context-lcm-port-spec.md` §9.2).
 //!
 //! A best-effort side channel invoked in the compaction loop *before* summarization: it asks the aux

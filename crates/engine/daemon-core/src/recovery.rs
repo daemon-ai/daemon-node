@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Model-call recovery middleware (§8).
 //!
 //! A model call is the most failure-prone step in a turn: providers rate-limit, time out, overload,

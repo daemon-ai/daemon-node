@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The host credential broker: serve-or-forward, and the bridge to the engine's §7 port.
 //!
 //! The authority ([`daemon_credentials`]) is the *owner endpoint* — it holds secrets and mints

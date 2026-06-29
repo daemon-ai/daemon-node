@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Cron suggestion catalog + parameterized blueprints (I15 / Workstream H; v16 skill bridge).
 //!
 //! Consent-first scheduling UX, data-only so it is trivially extendable. Three layers, all compiling

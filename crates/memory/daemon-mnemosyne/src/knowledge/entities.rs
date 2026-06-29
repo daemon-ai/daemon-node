@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Entity extraction + fuzzy matching — port of `entities.py`.
 //!
 //! `levenshtein_distance` (L69-L97) and `similarity` (L100-L134) are pure and ported with tests.

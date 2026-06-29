@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-node` — the single host-composition root.
 //!
 //! Phases 1-11 grew the node's wiring (durable store + resident services, the orchestration fleet as

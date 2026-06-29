@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The single-owner agent actor body (§4.1) — the turn loop, phase sequence, and effect applier.
 //!
 //! An [`Engine`] owns one [`Snapshot`] (its only durable state) and drives turns by composing the

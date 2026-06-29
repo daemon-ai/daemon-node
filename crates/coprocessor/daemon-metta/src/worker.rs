@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The coprocessor worker core: maps one [`Command`] to one [`Event`] against the [`MettaState`]
 //! and the [`MettaEngine`].
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! MMR diversity rerank — port of `mmr.py`.
 //!
 //! `mmr = λ*relevance - (1-λ)*max_jaccard` over already-relevance-sorted candidates, λ default 0.7

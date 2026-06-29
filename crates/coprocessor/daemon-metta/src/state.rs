@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The durable coprocessor state: spaces of data records, versioned procedures, an append-only
 //! journal with monotonic snapshot ids, and the candidate -> active -> rollback lifecycle.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The crate error type, classified so the node surface can map it onto [`daemon_common`] /
 //! `daemon_api::ApiError` without leaking HTTP/IO specifics.
 

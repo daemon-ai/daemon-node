@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Typed-memory classification — port of `typed_memory.py`.
 //!
 //! 13 regex-classified types (`typed_memory.py` L37-L52) feeding the Weibull decay map. The full

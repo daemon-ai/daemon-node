@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! End-to-end tests for the HTTP/WS adapter over a mock [`NodeApi`]: JSON dispatch (`POST /api`),
 //! the non-destructive merged-log cursor read (`GET …/log`), and the live SSE subscription
 //! (`GET …/subscribe`). The adapter is a thin transport over the shared interface, so a mock surface

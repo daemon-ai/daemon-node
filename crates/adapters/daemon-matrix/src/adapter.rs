@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `MatrixAdapter` — the Matrix transport presented as a [`MessagingProtocol`](daemon_api::MessagingProtocol).
 //!
 //! The second reference implementor of the messaging-adapter interface (daemon-messaging-adapter-spec.md

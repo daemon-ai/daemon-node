@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Browser-tool coverage (only meaningful with the `cdp` feature).
 //!
 //! The default test runs without a real Chromium: it builds the tool, exercises the schema/egress

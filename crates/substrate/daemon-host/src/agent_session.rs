@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The transport-agnostic §17 session seam and the §17 ⇄ management translation adapter.
 //!
 //! §17 (`AgentCommand` in, `AgentEvent`/`HostRequest` out) is the *leaf dialect every brain speaks*,

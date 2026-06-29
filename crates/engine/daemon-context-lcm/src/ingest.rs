@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Turn -> message flattening (`daemon-context-lcm-port-spec.md` §6.2, §14.1).
 //!
 //! The store's granularity is the *message* (for lossless `store_id` lineage), while the engine's

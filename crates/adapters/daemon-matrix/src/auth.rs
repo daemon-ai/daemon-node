@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Matrix SSO as a client-driven interactive-auth family (`daemon-interactive-auth-spec`).
 //!
 //! Matrix SSO is a browser-redirect flow: the homeserver issues an authorization URL, the user logs

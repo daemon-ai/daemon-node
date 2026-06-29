@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The credential provider port (§7) and the default embedded multi-key pool.
 //!
 //! The engine never holds raw secret material as an owned pool — it holds a [`CredentialProvider`]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Floor control — the only genuinely novel logic in the Rooms adapter.
 //!
 //! Every other piece of a Room reuses the existing routing/ingest/delivery substrate unchanged; the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `browser` tool: a tagged-`op` surface over the supervised [`BrowserSupervisor`]
 //! (metta-tool style). Navigation is egress-checked and optionally approval-gated; extracted page
 //! content is returned as untrusted external data.

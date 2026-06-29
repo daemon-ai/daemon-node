@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The engine-agnostic [`InferenceBackend`] seam every local engine implements.
 //!
 //! llama.cpp (`llama-cpp-4`) is synchronous and `!Send`, so its impl owns the model/context on a

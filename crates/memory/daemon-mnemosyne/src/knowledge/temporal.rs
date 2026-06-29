@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Natural-language temporal parsing — port of `temporal_parser.py`.
 //!
 //! [`parse_nl_date`] runs a first-match priority chain (ISO -> slash EU/US -> named month -> relative

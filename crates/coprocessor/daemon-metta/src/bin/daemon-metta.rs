@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `daemon-metta` worker binary.
 //!
 //! Speaks the length-framed [`daemon_metta::protocol`] over stdio (a [`CutChannel`]), exactly like

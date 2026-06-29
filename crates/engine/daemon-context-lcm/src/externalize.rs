@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Large-payload externalization (`daemon-context-lcm-port-spec.md` §9.1).
 //!
 //! LCM keeps payload bytes (oversized base64/media, huge tool outputs) **out** of `lcm.db`, FTS, the

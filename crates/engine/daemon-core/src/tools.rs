@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The tool trait, registry, and the one bundled tool (§12).
 //!
 //! A [`Tool`] is a capability the engine invokes during a turn. It runs against the [`TurnCx`] and

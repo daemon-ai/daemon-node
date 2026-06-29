@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! MeTTa grammar artifacts for grammar-constrained generation.
 //!
 //! The supplied MeTTa EBNF, transcribed into the two formats the local engines accept:

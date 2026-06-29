@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-browser` — the `browser` chat tool: a headless Chromium driven over the Chrome
 //! DevTools Protocol (chromiumoxide), exposed as a single tagged-`op` `daemon_core::Tool`.
 //!

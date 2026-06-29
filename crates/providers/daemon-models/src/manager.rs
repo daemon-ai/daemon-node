@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`ModelManager`] — the one facade the node surface (`ModelApi`) and the local provider wiring
 //! call. It owns the HF client, the acquisition engine, the installed-model catalog, the shared
 //! cache config, and the per-profile *active model* selection used for runtime model switching.

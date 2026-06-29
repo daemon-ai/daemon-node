@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-acp` — the Agent Client Protocol (ACP) foreign-agent adapter.
 //!
 //! ACP is JSON-RPC 2.0 over newline-delimited stdio, and unlike Claude-Code `stream-json` it is

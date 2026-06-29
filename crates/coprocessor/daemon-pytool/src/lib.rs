@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-pytool` — the wire protocol for the out-of-process **Python tool worker**.
 //!
 //! Python tools run in a separate process, exactly like the MeTTa symbolic coprocessor

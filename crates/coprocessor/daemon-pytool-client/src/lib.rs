@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-pytool-client` — the supervised client for the out-of-process **Python tool worker**.
 //!
 //! [`PyToolHost`] is to the Python tool worker what `MettaCoprocessor` is to the MeTTa worker and

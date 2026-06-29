@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-mcp-client` — an MCP client exposed through the engine's [`ToolProvider`] seam.
 //!
 //! This adapter is to an external **MCP server** what [`PyToolProvider`](daemon_pytool_client) is to

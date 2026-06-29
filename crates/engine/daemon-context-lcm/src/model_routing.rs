@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Model-routing shim (`daemon-context-lcm-port-spec.md` §12.4).
 //!
 //! Python's `model_routing.py` parses `summary_model` / `expansion_model` override strings into a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-host` — the durable substrate that runs a unit, and the protocol translator.
 //!
 //! Composes the phase-1 durable substrate (`daemon-store` + `daemon-activation`) into a

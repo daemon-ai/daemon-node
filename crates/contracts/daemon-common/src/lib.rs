@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-common` — shared primitives across the workspace.
 //!
 //! Stable identifiers (`SessionId`, `UnitId`, `JobId`), `Budget`, `FenceToken`, `Epoch`,

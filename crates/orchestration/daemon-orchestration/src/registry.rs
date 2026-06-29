@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The child registry + fleet-state fold (layout §4: `UnitId -> status/work/lease`, Usage fan-in).
 //!
 //! The runtime materializes the live fleet view from the children it has spawned: each

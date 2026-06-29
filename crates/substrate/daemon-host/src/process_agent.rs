@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`ProcessAgentUnit`] — a **foreign** agent process presented as an `Engine`-leaf managed unit.
 //!
 //! Where [`crate::unit::EngineUnit`] backs a unit with an in-process `daemon-core` engine, this backs

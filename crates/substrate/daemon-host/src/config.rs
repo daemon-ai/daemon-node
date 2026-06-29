@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Host configuration: partition ownership and the resident-service cadence/policy.
 
 use crate::supervisor::{Backoff, MeltdownPolicy};

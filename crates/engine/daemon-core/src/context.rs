@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The context engine seam (§10) — prompt assembly, budget pressure, and compaction.
 //!
 //! Every turn's prompt is assembled, measured against a token budget, and (when over) compacted

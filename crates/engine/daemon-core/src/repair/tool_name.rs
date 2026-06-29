@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Tool-name repair (§9).
 //!
 //! Models occasionally emit a tool name that is *close* to a registered one — wrong case, an extra

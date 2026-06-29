@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Turning a [`ModelRef`] into a concrete download plan: which repo files to fetch for each engine.
 //!
 //! - **llama**: a single named GGUF file (expanding to the full shard set when the named file is the

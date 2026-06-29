@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Profile contract types: the serializable bundle a GUI creates/edits to configure an agent.
 //!
 //! A [`ProfileSpec`] is the full configuration bundle for an agent (the analogue of a hermes

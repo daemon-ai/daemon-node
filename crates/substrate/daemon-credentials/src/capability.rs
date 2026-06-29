@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Capability signing + verification (the same ed25519 / Gordian Envelope stack as the phase-6
 //! trace journal).
 //!

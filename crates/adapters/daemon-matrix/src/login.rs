@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The one-shot operator `matrix login` flow (spec §6.1).
 //!
 //! SSO is inherently interactive (it opens a browser), so it lives at bring-up, not in the headless

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-delivery` — the reusable **pull** half of the §5.9.3 outbound routing capability.
 //!
 //! The host owns inbound routing (origin -> session -> profile) and outbound *storage* (each live

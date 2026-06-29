@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Real-GGUF llama.cpp generation tests for the engine lane (ignored by default).
 //!
 //! These are gated on the `llama` feature and `#[ignore]` so the default `cargo test --workspace`

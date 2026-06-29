@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Hardware-aware quant recommender — the "tune"-like helper that picks a quantization a user can
 //! actually run, regardless of engine.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Configuration for the LCM context engine (`daemon-context-lcm-port-spec.md` §12.1).
 //!
 //! The M1-M4 compaction fields plus the M5 (protection §8/§9) and M7 (filters/routing/presets

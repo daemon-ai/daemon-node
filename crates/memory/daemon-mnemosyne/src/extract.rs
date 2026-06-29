@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! LLM extraction — port of `extraction.py`, over the `daemon-core` [`Provider`] seam.
 //!
 //! Mnemosyne does not own an LLM runtime. The host injects a [`Provider`] (the same chat backend the

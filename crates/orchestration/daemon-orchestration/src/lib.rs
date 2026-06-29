@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-orchestration` — the fleet runtime (not an engine).
 //!
 //! The machinery *between* the brain and the wire for an orchestrator node (layout §4): the engine

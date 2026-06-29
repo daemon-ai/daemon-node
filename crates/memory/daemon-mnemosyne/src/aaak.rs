@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! AAAK lossless shorthand — port of `aaak.py` (the dependency-free sleep-summary fallback).
 //!
 //! A deterministic compression scheme that shortens natural-language memory into a pipe-delimited

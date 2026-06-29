@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `RoomsAdapter` — the internal Rooms transport presented as a libpurple-style
 //! [`MessagingProtocol`](daemon_api::MessagingProtocol).
 //!

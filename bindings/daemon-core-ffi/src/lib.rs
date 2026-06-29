@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-core-ffi` — the C ABI adapter over the §17 **session sub-surface**.
 //!
 //! This is one more transport over the one node interface ([`daemon_api`]): where the Unix socket

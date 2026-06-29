@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Conformance: the three recall modes (`Base`, `Enhanced`, `Polyphonic`) over one seeded bank.
 //!
 //! Mirrors the port-spec §16 intent: enhanced + polyphonic must produce ranked results, and base

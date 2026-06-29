@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`EngineProfile`] — the one place that says *how to construct an engine*.
 //!
 //! Phases 1-8 grew three separate engine-construction sites (the durable activation factory, the

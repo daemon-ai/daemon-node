@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Property-based CDDL conformance (the comprehensive drift gate).
 //!
 //! `tests/conformance.rs` validates representative, real fixtures. This test goes further: it uses

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-metta` — the supervised out-of-process **symbolic coprocessor** (library + binary).
 //!
 //! MeTTa ([hyperon](https://github.com/trueagi-io/hyperon-experimental)) is `Rc`-based and therefore

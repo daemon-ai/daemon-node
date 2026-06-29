@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! SQLite-backed [`SessionStore`] (host-spec §4), behind the `sqlite` feature.
 //!
 //! A durable, single-file backend that mirrors [`InMemoryStore`](crate::InMemoryStore)'s semantics

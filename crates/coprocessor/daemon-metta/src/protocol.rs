@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The MeTTa coprocessor wire protocol — [`Command`]/[`Event`] frames + a CBOR codec.
 //!
 //! The daemon (`daemon-metta-client`'s `MettaCoprocessor`) and the `daemon-metta` worker exchange

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A minimal **foreign** agent: a non-`daemon-core` brain that speaks §17 over a process cut.
 //!
 //! It exists to prove the §17 leaf is a *universal agent-runner contract*: this binary has no

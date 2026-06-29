@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Memory compression + pattern detection — port of `patterns.py` (P3).
 //!
 //! This module is intentionally not on the default path yet. It marks the future home for

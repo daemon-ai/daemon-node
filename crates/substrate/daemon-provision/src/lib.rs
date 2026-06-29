@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-provision` — workspace + placement provisioning (the first cut).
 //!
 //! Creates the execution environment a unit runs in (working dirs, process or container sandboxes).

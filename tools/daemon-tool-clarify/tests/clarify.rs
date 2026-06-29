@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `clarify` tool coverage: free-form `Input` ask, fixed-`options` `Choice` ask, and the
 //! no-answer/declined path. A per-test host answers the §17 request.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `MemoryProvider` implementation — port of `hermes_memory_provider/__init__.py`.
 //!
 //! Maps Mnemosyne onto the daemon-core seam: `prompt_block` = memory-override instructions

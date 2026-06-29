@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A scripted fake `daemon-infer` worker for [`LocalProvider`] integration tests.
 //!
 //! It speaks the real [`daemon_infer::protocol`] over the same length-framed stdio cut as the

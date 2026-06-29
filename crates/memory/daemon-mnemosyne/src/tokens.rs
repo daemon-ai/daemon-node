@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Token counting — port of `token_counter.py`.
 //!
 //! With the `tiktoken` feature, [`estimate_tokens`] returns exact `cl100k_base` token counts (via a

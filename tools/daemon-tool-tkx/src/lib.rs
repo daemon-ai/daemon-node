@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-tool-tkx` — agent-managed task/knowledge tooling implementing `daemon_core::Tool`.
 
 #![forbid(unsafe_code)]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Outbound: the session's merged log -> `m.room.message`s, via a `daemon-delivery` [`Projector`].
 //!
 //! [`MatrixProjector`] implements the reusable `daemon_delivery::Projector` (spec §3.2, the inbound

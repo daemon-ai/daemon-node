@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-matrix` — the Matrix chat transport (see `daemon-matrix-transport-spec.md`).
 //!
 //! An in-process `NodeApi`-client adapter, structurally the **inverse of `daemon-acp`**: it isolates

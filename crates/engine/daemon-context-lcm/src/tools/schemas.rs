@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! JSON-schema strings for the seven `lcm_*` drill-down tools (§10.7).
 //!
 //! Ported from `LCM:schemas.py`. Each is the `ToolDef::schema` advertised to the model. Kept as

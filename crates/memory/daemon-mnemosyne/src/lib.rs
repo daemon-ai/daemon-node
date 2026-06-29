@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-mnemosyne` — a native Rust port of the Mnemosyne BEAM memory engine, exposed to
 //! `daemon-core` as the default [`MemoryProvider`](daemon_core::memory::MemoryProvider).
 //!

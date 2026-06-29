@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Tool checkpoints + rewind (§12 safety) — the reserved checkpoint stage of the tool pipeline.
 //!
 //! Before a **mutating** tool runs (an fs write/edit or a shell command — see [`Tool::mutates`]),

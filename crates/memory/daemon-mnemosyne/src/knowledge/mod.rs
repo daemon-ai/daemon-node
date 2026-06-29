@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The temporal knowledge layer: triples, annotations, canonical facts, episodic graph, entity
 //! extraction, temporal parsing, and veracity consolidation.
 

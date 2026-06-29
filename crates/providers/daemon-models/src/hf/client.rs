@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! A thin async Hugging Face Hub HTTP client (read-only: search + tree).
 //!
 //! Wraps `reqwest` with the Hub endpoint, an optional bearer token, and status→[`ModelError`]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Configuration presets (`daemon-context-lcm-port-spec.md` §12.6).
 //!
 //! Read-only **suggestion** metadata — the port never mutates live config (`presets.py:14-16`). Two

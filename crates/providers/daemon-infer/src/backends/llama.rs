@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The llama.cpp backend (`llama-cpp-4`).
 //!
 //! `llama-cpp-4` is synchronous and `!Send` (`LlamaModel`/`LlamaContext` wrap raw pointers), so the

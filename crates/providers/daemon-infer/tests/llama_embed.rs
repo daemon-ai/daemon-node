@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Real-GGUF llama.cpp embedding tests for the engine lane (ignored by default).
 //!
 //! Gated on the `llama` feature and `#[ignore]`, like `llama_inference.rs`. Loads an embedding GGUF

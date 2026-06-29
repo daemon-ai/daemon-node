@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Ingest protection (`daemon-context-lcm-port-spec.md` §8).
 //!
 //! Guards the SQLite write boundary — **storage / size / secret / repetition**, not prompt

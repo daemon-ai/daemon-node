@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Capstone: drive the REAL Vulkan-enabled `daemon-infer` worker through the daemon's own
 //! [`LocalProvider`] / [`LocalEmbedder`] wiring — the exact supervised-worker path the node composes
 //! (spawn -> `Command::Load` -> `Generate`/`Embed` over the length-framed protocol cut). This proves

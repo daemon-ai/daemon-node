@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The memory provider seam (§11) — recall + persistent prompt blocks across turns/sessions.
 //!
 //! Memory is modeled as a *set* of providers the engine consults at fixed hook points in the turn

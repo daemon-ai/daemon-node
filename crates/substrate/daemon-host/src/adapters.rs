@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Host-level transport-adapter registry (daemon-transport-adapter-spec.md §3.4).
 //!
 //! The declarative counterpart of [`crate::routing::RoutingRegistry`]: where the routing registry

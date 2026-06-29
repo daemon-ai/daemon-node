@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The dependency-light local fetch backend: `reqwest` GET + `dom_smoothie` (Mozilla-readability)
 //! extraction to Markdown/text. No API key, so it is always [`available`](WebFetchBackend::available)
 //! and serves as the `web_extract` fallback when no hosted scraper key is configured. It does not

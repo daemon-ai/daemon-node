@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! [`Config`] ? engine tunables (?20), loaded by the host and injected at construction.
 //!
 //! These are *engine* knobs, distinct from the host/node configuration (partition, socket, store

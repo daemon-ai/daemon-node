@@ -9,7 +9,7 @@ edition = "2021"
 # fenix `stable` toolchain (1.96 at lock time) satisfies it. All matrix types stay inside that crate.
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/daemon"
+repository = "https://github.com/daemon-ai/daemon-node"
 
 # Single source of truth for lint policy. Member crates opt in with `[lints]\nworkspace = true`.
 # Levels are inherited by every member; the `just lint` recipe escalates warnings to errors

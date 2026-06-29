@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The in-process §17 session backend and the `EngineUnit` constructor.
 //!
 //! [`LiveAgentSession`] is the [`AgentSession`] backed by a `daemon-core` engine running on the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! End-to-end engine gate: a Python tool, discovered over the supervised client and registered as
 //! an ordinary [`Tool`], is invoked by the engine's ReAct loop and its result lands in the durable
 //! conversation — exactly as a native Rust tool would. Uses the hermetic `fake-pytool-worker` (no

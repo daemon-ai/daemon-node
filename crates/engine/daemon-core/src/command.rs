@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The command-provider seam — daemon-authoritative operator/user commands.
 //!
 //! Commands are the human-invoked counterpart to the model-facing §12 [`ToolRegistry`](crate::tools):

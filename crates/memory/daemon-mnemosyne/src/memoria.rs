@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! MEMORIA — structured-fact extraction + retrieval (`beam.py` Phase 1/2).
 //!
 //! Always-on, zero-LLM regex extraction at write time populates the `memoria_*` specialist tables

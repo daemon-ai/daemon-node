@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Tool-argument JSON repair (§9).
 //!
 //! Models emit tool-call arguments as JSON text that is frequently *almost* valid: wrapped in a

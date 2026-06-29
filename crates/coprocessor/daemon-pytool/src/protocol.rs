@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The Python-tool worker wire protocol — [`Command`]/[`Event`] frames + a JSON codec.
 //!
 //! The daemon (`daemon-pytool-client`'s `PyToolHost`) and the Python worker exchange these frames

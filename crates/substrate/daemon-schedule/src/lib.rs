@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-schedule` — schedule parsing and next-fire computation for the I15 cron backing.
 //!
 //! A small, dependency-light crate that turns a human schedule expression into a [`Schedule`] and

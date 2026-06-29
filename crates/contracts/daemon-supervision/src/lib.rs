@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-supervision` — the generic management protocol.
 //!
 //! The shared, upward-facing contract spoken by **every managed unit** in the daemon tree (engine,

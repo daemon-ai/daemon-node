@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `fake-pytool-worker` — a hermetic, Python-free worker that speaks the [`daemon_pytool::protocol`].
 //!
 //! It exists so the supervised client (`daemon-pytool-client`) and `tests/daemon-conformance` can

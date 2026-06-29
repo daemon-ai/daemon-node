@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! The `web_search` tool: resolve a query through a [`WebSearchBackend`] and return ranked hits as
 //! untrusted external data.
 

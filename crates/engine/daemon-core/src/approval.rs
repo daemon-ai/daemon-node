@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Edit-approval policy (§12 safety) — the per-session "session mode" governing whether a
 //! mutating/dangerous tool action runs outright, is denied, or must be approved by a human.
 //!

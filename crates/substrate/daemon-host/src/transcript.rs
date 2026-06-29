@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! Coalescing the fine-grained §17 stream into finished transcript blocks for the verifiable
 //! journal.
 //!

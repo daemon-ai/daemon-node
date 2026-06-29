@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
 //! `daemon-transport` — wire transport for cross-node management traffic (phase 6c).
 //!
 //! When a placement cut puts a child host on another node, the management protocol runs over a real
