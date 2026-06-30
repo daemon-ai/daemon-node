@@ -39,6 +39,15 @@ server advertises offered mechanisms in its `Hello.auth_mechanisms`.
 Password storage is Argon2id (OWASP baseline). Session tokens are random, stored only as a SHA-256
 hash, server-side and revocable (never JWTs in the DB). See `daemon-auth`.
 
+SCRAM-SHA-256 stores RFC 5802 derived material (`salt`/`iterations`/`StoredKey`/`ServerKey`),
+derived from the password whenever it is set (`create_user` / `set_password`). This material cannot
+be back-derived from the existing Argon2id hash, so **a user provisioned before SCRAM derivation was
+introduced has no SCRAM material until their password is next set**: that user cannot use
+`SCRAM-SHA-256` until an admin (or the user) re-sets the password, but `PLAIN`-over-TLS keeps working
+in the meantime (it verifies the Argon2id hash directly). To avoid an account-probing oracle, the
+authenticator serves a deterministic *decoy* SCRAM credential for an unknown, disabled, or
+SCRAM-material-less user, so the exchange fails at proof verification exactly like a wrong password.
+
 ## 3. Authorization: roles and capabilities
 
 Authorization is two-step: a coarse per-request **capability** gate, plus a per-resource

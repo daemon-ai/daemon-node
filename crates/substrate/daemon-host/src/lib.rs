@@ -35,6 +35,7 @@
 pub mod adapters;
 pub mod agent_session;
 pub mod auth;
+pub mod authn;
 pub mod background;
 pub mod blob_store;
 pub mod commands;
@@ -65,6 +66,10 @@ pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
 pub use auth::{
     AuthFlowFactory, AuthOutcome, PendingAuthFlow, PendingAuthFlows, DEFAULT_FLOW_TTL_SECS,
+};
+pub use authn::{
+    principal_view, AuthExchange, AuthReject, AuthSuccess, Authenticator, BeginOutcome,
+    StepOutcome, TlsState, MECH_EXTERNAL, MECH_PLAIN, MECH_SCRAM_SHA_256,
 };
 pub use background::{
     background_child_id, background_kind_of, BackgroundProfile, BackgroundProfileRegistry,

@@ -13,6 +13,7 @@
 
 use crate::capability::{Principal, Role};
 use crate::error::{Error, Result};
+use crate::scram::{self, ScramMaterial, SCRAM_SHA_256};
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 use sha2::{Digest, Sha256};
@@ -139,6 +140,30 @@ fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
+/// Derive + upsert the `SCRAM-SHA-256` row for `user_id` from `password`, on the caller's open
+/// connection (so it shares the same write as the Argon2id PHC). Keeps PLAIN (Argon2) and SCRAM
+/// coherent for a user: both are derived from the same password whenever it is set.
+fn upsert_scram(conn: &Connection, user_id: &str, password: &str) -> Result<()> {
+    let m = scram::derive_scram_material(password)?;
+    conn.execute(
+        "INSERT INTO scram_credentials \
+            (user_id, mechanism, salt, iterations, stored_key, server_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(user_id, mechanism) DO UPDATE SET \
+            salt = excluded.salt, iterations = excluded.iterations, \
+            stored_key = excluded.stored_key, server_key = excluded.server_key",
+        params![
+            user_id,
+            SCRAM_SHA_256,
+            m.salt,
+            m.iterations,
+            m.stored_key,
+            m.server_key
+        ],
+    )?;
+    Ok(())
+}
+
 impl AuthStore {
     /// Open (creating if absent) the identity store at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -199,6 +224,8 @@ impl AuthStore {
             "INSERT INTO password_credentials (user_id, phc_hash, updated_at) VALUES (?1, ?2, ?3)",
             params![id, phc, created_at],
         )?;
+        // Derive the parallel SCRAM-SHA-256 material from the same password (same write).
+        upsert_scram(&conn, &id, password)?;
         for role in roles {
             conn.execute(
                 "INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?1, ?2)",
@@ -262,6 +289,8 @@ impl AuthStore {
         if n == 0 {
             return Err(Error::NotFound);
         }
+        // Re-derive the SCRAM-SHA-256 material so PLAIN (Argon2) and SCRAM stay coherent.
+        upsert_scram(&conn, user_id, password)?;
         Ok(())
     }
 
@@ -347,6 +376,53 @@ impl AuthStore {
         Ok(Principal::from_roles(user_id, username, roles))
     }
 
+    // --- SCRAM credentials ------------------------------------------------------------------
+
+    /// Derive + persist the `SCRAM-SHA-256` material for `user_id` from `password` (the explicit
+    /// entry point; `create_user`/`set_password` call the same derivation inline). Errors with
+    /// [`Error::NotFound`] if the user row does not exist.
+    pub fn set_scram_credentials(&self, user_id: &str, password: &str) -> Result<()> {
+        let conn = self.lock();
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE id = ?1",
+                params![user_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(Error::NotFound);
+        }
+        upsert_scram(&conn, user_id, password)
+    }
+
+    /// Fetch the persisted SCRAM material for `user_id` + `mechanism` (e.g. `"SCRAM-SHA-256"`), or
+    /// `None` if absent. The authenticator feeds this into rsasl's `ScramStoredPassword` property.
+    /// Legacy users created before SCRAM material was derived have no row until a password re-set.
+    pub fn scram_credentials_for(
+        &self,
+        user_id: &str,
+        mechanism: &str,
+    ) -> Result<Option<ScramMaterial>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT salt, iterations, stored_key, server_key FROM scram_credentials \
+             WHERE user_id = ?1 AND mechanism = ?2",
+            params![user_id, mechanism],
+            |r| {
+                Ok(ScramMaterial {
+                    salt: r.get(0)?,
+                    iterations: r.get::<_, i64>(1)? as u32,
+                    stored_key: r.get(2)?,
+                    server_key: r.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
     // --- session tokens ---------------------------------------------------------------------
 
     /// Mint an opaque session token for `user_id` valid for `ttl_secs`, returning the *plaintext*
@@ -409,6 +485,15 @@ impl AuthStore {
             params![token_hash(token)],
         )?;
         Ok(())
+    }
+
+    /// Count of currently-stored session tokens (live plus any not-yet-pruned expired rows). A
+    /// lightweight audit/observability aid — also lets tests assert a token is minted only on a
+    /// successful authentication.
+    pub fn session_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM auth_sessions", [], |r| r.get(0))
+            .map_err(Error::from)
     }
 
     /// Revoke every session for a user (e.g. on password change / lockout).
@@ -504,6 +589,49 @@ mod tests {
         let token = s.mint_session(&u.id, -1, "password").unwrap();
         assert!(matches!(
             s.principal_for_token(&token),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn create_user_populates_scram_material_and_set_password_rederives() {
+        let s = store();
+        let u = s.create_user("frank", "pw-one", &[Role::User]).unwrap();
+        let first = s
+            .scram_credentials_for(&u.id, crate::scram::SCRAM_SHA_256)
+            .unwrap()
+            .expect("create_user derives SCRAM material");
+        assert_eq!(first.iterations, crate::scram::SCRAM_DEFAULT_ITERATIONS);
+        assert_eq!(first.stored_key.len(), 32);
+        assert_eq!(first.server_key.len(), 32);
+
+        // A password change re-derives (new salt => new keys).
+        s.set_password(&u.id, "pw-two").unwrap();
+        let second = s
+            .scram_credentials_for(&u.id, crate::scram::SCRAM_SHA_256)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            first.salt, second.salt,
+            "set_password mints fresh SCRAM material"
+        );
+        assert_ne!(first.stored_key, second.stored_key);
+    }
+
+    #[test]
+    fn scram_credentials_for_unknown_user_is_none() {
+        let s = store();
+        assert!(s
+            .scram_credentials_for("nobody", crate::scram::SCRAM_SHA_256)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn set_scram_credentials_requires_existing_user() {
+        let s = store();
+        assert!(matches!(
+            s.set_scram_credentials("ghost", "pw"),
             Err(Error::NotFound)
         ));
     }

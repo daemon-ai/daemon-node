@@ -21,9 +21,19 @@ password-auth = "1"
 # CSPRNG for opaque session tokens, and SHA-256 to store only a hash of each token (never raw).
 getrandom = "0.2"
 sha2 = "0.10"
+# SCRAM-SHA-256 wire-KDF material (RFC 5802/7677): PBKDF2-HMAC-SHA256 -> SaltedPassword, then
+# HMAC-SHA256 for ClientKey/ServerKey and SHA-256 for StoredKey. RustCrypto, permissive licenses.
+# default-features off keeps `pbkdf2` to the generic `pbkdf2::<Hmac<Sha256>>` fn (no simple/std deps).
+pbkdf2 = { version = "0.12", default-features = false }
+hmac = "0.12"
+# SASLprep (RFC 4013) normalization of the password before SCRAM derivation, so the persisted
+# StoredKey/ServerKey match what an rsasl client computes from the same prepped input.
+stringprep = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# RFC 7677 §3 SCRAM-SHA-256 test vector decoding (salt + client-proof + server-signature are base64).
+base64 = "0.22"
 
 [lints]
 workspace = true

@@ -46,6 +46,16 @@ thiserror = "2"
 anyhow = "1"
 futures = "0.3"
 strsim = "0.11"
+# SASL state machine for the node authentication handshake (SCRAM-SHA-256 / PLAIN / EXTERNAL). v2+
+# is dual Apache-2.0/MIT. default-features off drops gssapi (native libgssapi) + the SSO mechanisms;
+# we enable only what the node serves. Isolated to `daemon-host` (the transport crate).
+rsasl = { version = "2.3.1", default-features = false, features = [
+    "provider",       # raw-bytes Session::step (the L0 mux envelope already carries opaque bytes)
+    "config_builder", # SASLConfig::builder()
+    "scram-sha-2",    # SCRAM-SHA-256
+    "plain",          # PLAIN (verified against Argon2id; TLS-only by policy)
+    "external",       # EXTERNAL (mTLS client-cert -> user)
+] }
 # Schema migrations for the rusqlite-backed stores, gated by `PRAGMA user_version` (no bookkeeping
 # table). Pinned to the release that targets rusqlite 0.37 — 2.4+ require newer rusqlite (2.4->0.38,
 # 2.5->0.39, 2.6->0.40), so bump this in lockstep only when the workspace rusqlite pin moves.
@@ -177,6 +187,7 @@ daemon-providers = { path = "crates/providers/daemon-providers" }
 # build opts into an engine via `--features llama` / `--features mistralrs` on the crate directly.
 daemon-infer = { path = "crates/providers/daemon-infer", default-features = false }
 daemon-models = { path = "crates/providers/daemon-models" }
+daemon-auth = { path = "crates/substrate/daemon-auth" }
 daemon-store = { path = "crates/substrate/daemon-store" }
 daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
