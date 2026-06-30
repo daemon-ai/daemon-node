@@ -8,11 +8,10 @@
 //! fresh store). sqlite-vec `vec0` virtual tables are created separately under the `vec-ext` feature
 //! because they require the registered extension. FTS5 comes from the bundled SQLite build.
 
-/// The core + knowledge schema, executed once at [`super::Store::open`].
+/// The core + knowledge schema, run by the `PRAGMA user_version` ladder ([`super::MIGRATIONS`]).
+/// Connection pragmas (WAL etc.) live in [`super::Store::init`], not here: the ladder runs in a
+/// transaction and `journal_mode` cannot change inside one.
 pub const SCHEMA: &str = r#"
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-
 -- ── BEAM tiers ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS working_memory (
     id                       TEXT PRIMARY KEY,

@@ -77,6 +77,12 @@ pub struct Snapshot {
     /// decodable.
     #[serde(default)]
     pub pending_approvals: Vec<PendingApproval>,
+    /// Provenance: the node build that last wrote this snapshot (`daemon_common::VERSION`, e.g.
+    /// `0.0.1+g1a2b3c4`). Stamped on [`Snapshot::encode`], not a migration key — the snapshot format
+    /// itself evolves via `#[serde(default)]`. Empty on snapshots written before this field existed.
+    /// [`Snapshot::decode`] warns (but still decodes) when a snapshot was written by a newer build.
+    #[serde(default)]
+    pub writer_version: String,
 }
 
 /// A gated tool call parked for a durable human-in-the-loop decision (§12). Persisted on the
@@ -108,18 +114,101 @@ impl Snapshot {
             turns_since_memory: 0,
             approval_policy: None,
             pending_approvals: Vec::new(),
+            writer_version: String::new(),
         }
     }
 
-    /// Encode to the opaque persisted CBOR form.
+    /// Encode to the opaque persisted CBOR form, stamping this build's version as provenance.
     pub fn encode(&self) -> Result<SnapshotBlob, DaemonError> {
+        let mut to_write = self.clone();
+        to_write.writer_version = daemon_common::VERSION.to_string();
         let mut bytes = Vec::new();
-        ciborium::into_writer(self, &mut bytes).map_err(|e| DaemonError::Codec(e.to_string()))?;
+        ciborium::into_writer(&to_write, &mut bytes)
+            .map_err(|e| DaemonError::Codec(e.to_string()))?;
         Ok(SnapshotBlob::new(bytes))
     }
 
-    /// Decode from the opaque persisted CBOR form.
+    /// Decode from the opaque persisted CBOR form. Decoding stays tolerant (the format evolves via
+    /// `#[serde(default)]`); a snapshot stamped by a *newer* build is decoded but logged, since this
+    /// (older) build may not understand fields the newer one wrote.
     pub fn decode(blob: &SnapshotBlob) -> Result<Self, DaemonError> {
-        ciborium::from_reader(blob.as_bytes()).map_err(|e| DaemonError::Codec(e.to_string()))
+        let snapshot: Self = ciborium::from_reader(blob.as_bytes())
+            .map_err(|e| DaemonError::Codec(e.to_string()))?;
+        if base_semver(&snapshot.writer_version)
+            .zip(base_semver(daemon_common::VERSION))
+            .is_some_and(|(writer, current)| writer > current)
+        {
+            tracing::warn!(
+                writer = %snapshot.writer_version,
+                current = %daemon_common::VERSION,
+                session = %snapshot.session_id,
+                "decoding a snapshot written by a newer node build; fields it added may be lost",
+            );
+        }
+        Ok(snapshot)
+    }
+}
+
+/// Parse the `MAJOR.MINOR.PATCH` core out of a version string, ignoring any `+build`/`-pre` suffix.
+/// Returns `None` for an empty or unparseable value (e.g. a pre-provenance snapshot), so the
+/// newer-than comparison is simply skipped.
+fn base_semver(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['+', '-']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+
+    /// Forward-compat: a blob written by an older build (no `writer_version` and none of the later
+    /// `#[serde(default)]` fields) must still decode, with the new fields defaulted. This is the
+    /// snapshot-format analogue of the wire layer's additive-field tolerance.
+    #[test]
+    fn decodes_blob_written_before_new_fields_existed() {
+        #[derive(Serialize)]
+        struct OldSnapshot {
+            session_id: SessionId,
+            epoch: Epoch,
+            conversation: Conversation,
+            references: References,
+            waiting_for: Vec<JobId>,
+        }
+        let old = OldSnapshot {
+            session_id: SessionId::new("s1"),
+            epoch: Epoch::ZERO,
+            conversation: Conversation::default(),
+            references: References::default(),
+            waiting_for: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+
+        let decoded = Snapshot::decode(&SnapshotBlob::new(bytes)).expect("old snapshot decodes");
+        assert_eq!(decoded.session_id, SessionId::new("s1"));
+        assert!(decoded.writer_version.is_empty());
+        assert!(decoded.pending_approvals.is_empty());
+        assert_eq!(decoded.iters_since_skill, 0);
+    }
+
+    /// `encode` stamps the running build's version, and a round-trip preserves it.
+    #[test]
+    fn encode_stamps_writer_version() {
+        let blob = Snapshot::fresh(SessionId::new("s2")).encode().unwrap();
+        let decoded = Snapshot::decode(&blob).unwrap();
+        assert_eq!(decoded.writer_version, daemon_common::VERSION);
+    }
+
+    #[test]
+    fn base_semver_parses_and_orders() {
+        assert_eq!(base_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(base_semver("0.0.1+g1a2b3c4.dirty"), Some((0, 0, 1)));
+        assert_eq!(base_semver(""), None);
+        assert!(base_semver("0.10.0") > base_semver("0.9.9"));
     }
 }

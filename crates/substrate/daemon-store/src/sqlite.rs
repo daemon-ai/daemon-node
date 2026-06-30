@@ -27,16 +27,14 @@ use daemon_common::{
     ProfileRef, SessionId, SnapshotBlob, UsageDelta,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite_migration::{Migrations, M};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 /// The durable schema = the host-spec §4 tables (session record, completion inbox, job/wake
 /// outboxes, the enqueued-job dedupe set) plus the verifiable trace journal (entries + sealed
 /// roots). The activation lease is the monotonic `fence` column on `session_record`.
 const SCHEMA: &str = r#"
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-
 CREATE TABLE IF NOT EXISTS session_record (
     session_id  TEXT PRIMARY KEY,
     partition   INTEGER NOT NULL,
@@ -192,7 +190,9 @@ CREATE TABLE IF NOT EXISTS session_meta (
     role             TEXT,
     parent           TEXT,
     pinned           INTEGER NOT NULL DEFAULT 0,
-    archived         INTEGER NOT NULL DEFAULT 0
+    archived         INTEGER NOT NULL DEFAULT 0,
+    scheduled_job    TEXT,
+    activation_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS session_usage (
@@ -257,42 +257,18 @@ fn sql_err(e: rusqlite::Error) -> StoreError {
     StoreError::Common(DaemonError::Other(format!("sqlite: {e}")))
 }
 
-/// Forward-only column migrations for tables that predate the enriched-usage columns. `CREATE TABLE
-/// IF NOT EXISTS` never alters an existing table, so a database created before the cache/reasoning/
-/// cost columns existed needs these `ALTER TABLE ... ADD COLUMN`s. Each is idempotent: a
-/// "duplicate column name" error (the column already exists, e.g. on a fresh schema) is ignored.
-fn migrate(conn: &Connection) -> Result<(), StoreError> {
-    const USAGE_COLUMNS: &[&str] = &[
-        "ALTER TABLE session_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE session_usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE session_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE session_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
-        // Roster/identity columns added for the GUI session surface (title/last_activity/role/parent).
-        "ALTER TABLE session_meta ADD COLUMN title TEXT",
-        "ALTER TABLE session_meta ADD COLUMN last_activity_ms INTEGER",
-        "ALTER TABLE session_meta ADD COLUMN role TEXT",
-        "ALTER TABLE session_meta ADD COLUMN parent TEXT",
-        // Roster session-action flags (pin/archive) for the GUI session-actions surface.
-        "ALTER TABLE session_meta ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE session_meta ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
-        // I15: the cron job that fired this (isolated) session, set by the cron worker.
-        "ALTER TABLE session_meta ADD COLUMN scheduled_job TEXT",
-        // L2 resync: per-session activation generation (stamped on each fresh MergedLog in ensure()).
-        "ALTER TABLE session_meta ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 0",
-        // Delegation child-lifetime marker on the durable outbox (managed vs ephemeral subagent).
-        "ALTER TABLE job_outbox ADD COLUMN lifetime TEXT",
-    ];
-    for stmt in USAGE_COLUMNS {
-        match conn.execute(stmt, []) {
-            Ok(_) => {}
-            // Already migrated (column present): the only benign failure here.
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column") => {}
-            Err(e) => return Err(sql_err(e)),
-        }
-    }
-    Ok(())
+fn migrate_err(e: rusqlite_migration::Error) -> StoreError {
+    StoreError::Common(DaemonError::Other(format!("sqlite migrate: {e}")))
 }
+
+/// The ordered schema-migration ladder, gated by SQLite's `PRAGMA user_version` (rusqlite_migration).
+/// `M1` is the entire current schema (`CREATE TABLE IF NOT EXISTS …`, every column inline), so a
+/// fresh database is built in one step and stamped to `user_version = 1`. Append an
+/// `M::up("ALTER TABLE …")` for each future schema change — never edit a released migration. Pragmas
+/// (WAL etc.) are applied in `open()` *outside* this ladder: `to_latest` runs in a transaction and
+/// `journal_mode` cannot change inside one.
+static MIGRATIONS: LazyLock<Migrations<'static>> =
+    LazyLock::new(|| Migrations::new(vec![M::up(SCHEMA)]));
 
 fn role_to_str(role: SessionRole) -> &'static str {
     match role {
@@ -383,9 +359,8 @@ fn status_from_row(kind: &str, job: Option<String>) -> SessionStatus {
 impl SqliteStore {
     /// Open (creating if absent) a SQLite-backed store at `path`, applying the durable schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let conn = Connection::open(path).map_err(sql_err)?;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&conn)?;
+        let mut conn = Connection::open(path).map_err(sql_err)?;
+        Self::prepare(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             fault: Mutex::new(None),
@@ -394,13 +369,21 @@ impl SqliteStore {
 
     /// Open an ephemeral in-memory SQLite store (tests; the single connection keeps it alive).
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory().map_err(sql_err)?;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&conn)?;
+        let mut conn = Connection::open_in_memory().map_err(sql_err)?;
+        Self::prepare(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             fault: Mutex::new(None),
         })
+    }
+
+    /// Apply connection pragmas (outside the migration transaction) then run the schema ladder to
+    /// the latest `user_version`. The connection is exclusive here (pre-`Mutex`).
+    fn prepare(conn: &mut Connection) -> Result<(), StoreError> {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .map_err(sql_err)?;
+        MIGRATIONS.to_latest(conn).map_err(migrate_err)?;
+        Ok(())
     }
 
     /// Arm the store to fail at a given durable boundary (acceptance test #2). `None` disarms.
@@ -1831,6 +1814,55 @@ impl SessionStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
+    /// `user_version` (1, the single `M1 = SCHEMA` step).
+    #[test]
+    fn migration_ladder_valid_and_applied() {
+        assert!(MIGRATIONS.validate().is_ok());
+        let store = SqliteStore::open_in_memory().expect("open");
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "fresh DB is stamped to the latest migration");
+    }
+
+    fn dump_schema(conn: &Connection) -> String {
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name")
+            .unwrap();
+        let mut out = String::new();
+        for sql in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            out.push_str(sql.unwrap().trim());
+            out.push_str(";\n");
+        }
+        out
+    }
+
+    /// On-disk schema-drift gate (the analogue of the wire `codec-drift` check): the live schema
+    /// must match the committed golden. Any DDL change must be made through a new migration AND
+    /// refresh the golden — run `DAEMON_UPDATE_SCHEMA=1 cargo test -p daemon-store --features sqlite
+    /// schema_matches_golden`.
+    #[test]
+    fn schema_matches_golden() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let dump = dump_schema(&store.conn.lock().unwrap());
+        let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/schema.golden.sql");
+        if std::env::var_os("DAEMON_UPDATE_SCHEMA").is_some() {
+            std::fs::write(golden_path, &dump).expect("write golden");
+            return;
+        }
+        let golden = std::fs::read_to_string(golden_path).unwrap_or_default();
+        assert_eq!(
+            dump.trim(),
+            golden.trim(),
+            "schema drift: add a migration (M::up) and refresh src/schema.golden.sql via \
+             DAEMON_UPDATE_SCHEMA=1",
+        );
+    }
 
     /// FTS5 is compiled into the bundled SQLite: indexing + a `MATCH` query returns a highlighted
     /// snippet, proving the `session_fts` virtual table is usable on this build.

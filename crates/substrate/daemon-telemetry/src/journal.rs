@@ -65,6 +65,12 @@ pub struct JournalEntryView {
     pub kind: String,
     /// Milliseconds since the Unix epoch when the entry was recorded.
     pub timestamp_ms: u64,
+    /// Provenance: the node build that wrote this entry (the host stamps `daemon_common::VERSION`).
+    /// Append-only — entries are never rewritten. Omitted from the wire when empty so entries
+    /// written before this field existed reproduce their original Gordian digest and still verify
+    /// (see [`entry_envelope`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub writer_version: String,
     /// The typed payload.
     pub payload: JournalPayload,
 }
@@ -85,13 +91,18 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Build the deterministic Gordian Envelope for one entry (the tamper-evidence over every field).
 fn entry_envelope(v: &JournalEntryView) -> Envelope {
-    let env = Envelope::new(v.kind.clone())
+    let mut env = Envelope::new(v.kind.clone())
         .add_assertion("stream", v.stream.as_str())
         .add_assertion("segment", v.segment)
         .add_assertion("seq", v.seq)
         .add_assertion("epoch", v.epoch)
         .add_assertion("trace", v.trace)
         .add_assertion("timestamp", v.timestamp_ms);
+    // Provenance assertion, added only when present so a pre-provenance entry (empty value)
+    // reproduces its original digest and still verifies. Never backfilled onto old rows.
+    if !v.writer_version.is_empty() {
+        env = env.add_assertion("writer", v.writer_version.clone());
+    }
     match &v.payload {
         JournalPayload::Management { detail } => env.add_assertion("detail", detail.clone()),
         // The block body is hashed (as hex) so any mutation invalidates the digest; the raw bytes
@@ -290,6 +301,7 @@ mod tests {
             trace: 0xC0FFEE,
             kind: kind.into(),
             timestamp_ms: 1_000 + seq,
+            writer_version: String::new(),
             payload: JournalPayload::Management {
                 detail: format!("detail-{seq}"),
             },
@@ -305,6 +317,7 @@ mod tests {
             trace: 1,
             kind: "block.message".into(),
             timestamp_ms: 2_000 + seq,
+            writer_version: String::new(),
             payload: JournalPayload::Block {
                 body: body.to_vec(),
             },

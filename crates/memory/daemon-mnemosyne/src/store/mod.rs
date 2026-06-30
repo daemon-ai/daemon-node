@@ -11,8 +11,16 @@ pub mod schema;
 
 use crate::error::Result;
 use rusqlite::Connection;
+use rusqlite_migration::{Migrations, M};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+
+/// The schema-migration ladder, gated by `PRAGMA user_version` (rusqlite_migration). `M1` is the
+/// full bank schema; future schema changes append an `M::up("…")`. `busy_timeout` is applied in
+/// [`Store::init`] before `to_latest`; the `vec-ext` `vec0` virtual tables in the schema resolve
+/// because [`register_vec_extension`] runs before the connection is opened.
+static MIGRATIONS: LazyLock<Migrations<'static>> =
+    LazyLock::new(|| Migrations::new(vec![M::up(schema::SCHEMA)]));
 
 /// The SQLite-backed BEAM store (one file per bank).
 pub struct Store {
@@ -39,9 +47,13 @@ impl Store {
         Self::init(conn)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
+        // Connection pragmas applied OUTSIDE the (transactional) migration ladder: `journal_mode`
+        // cannot change inside a transaction.
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        conn.execute_batch(schema::SCHEMA)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // Schema is owned by the `PRAGMA user_version` ladder.
+        MIGRATIONS.to_latest(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -71,6 +83,53 @@ fn register_vec_extension() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The migration ladder is internally consistent and a fresh store opens at the latest version.
+    #[test]
+    fn migration_ladder_valid() {
+        assert!(MIGRATIONS.validate().is_ok());
+        let store = Store::open_in_memory().expect("open");
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "fresh DB is stamped to the latest migration");
+    }
+
+    fn dump_schema(conn: &Connection) -> String {
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name")
+            .unwrap();
+        let mut out = String::new();
+        for sql in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            out.push_str(sql.unwrap().trim());
+            out.push_str(";\n");
+        }
+        out
+    }
+
+    /// On-disk schema-drift gate: the live schema must match the committed golden. Any DDL change
+    /// must go through a new migration AND refresh the golden — run `DAEMON_UPDATE_SCHEMA=1 cargo
+    /// test -p daemon-mnemosyne schema_matches_golden`.
+    #[test]
+    fn schema_matches_golden() {
+        let store = Store::open_in_memory().expect("open");
+        let dump = dump_schema(&store.conn.lock().unwrap());
+        let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/store/schema.golden.sql");
+        if std::env::var_os("DAEMON_UPDATE_SCHEMA").is_some() {
+            std::fs::write(golden_path, &dump).expect("write golden");
+            return;
+        }
+        let golden = std::fs::read_to_string(golden_path).unwrap_or_default();
+        assert_eq!(
+            dump.trim(),
+            golden.trim(),
+            "schema drift: add a migration (M::up) and refresh src/store/schema.golden.sql via \
+             DAEMON_UPDATE_SCHEMA=1",
+        );
+    }
 
     #[test]
     fn schema_applies_cleanly() {

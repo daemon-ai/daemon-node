@@ -13,9 +13,17 @@ pub mod schema;
 use crate::error::Result;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite_migration::{Migrations, M};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+
+/// The schema-migration ladder, gated by `PRAGMA user_version` (rusqlite_migration). `M1` is the
+/// full §4 schema; future schema changes append an `M::up("…")`. Pragmas (WAL + `synchronous=FULL`)
+/// are applied in [`Store::init`] *before* `to_latest`, since `journal_mode` cannot change inside the
+/// migration transaction.
+static MIGRATIONS: LazyLock<Migrations<'static>> =
+    LazyLock::new(|| Migrations::new(vec![M::up(schema::SCHEMA)]));
 
 /// Whether a node's `source_ids` point at raw `messages.store_id`s (a D0 leaf) or child
 /// `summary_nodes.node_id`s (a D>=1 condensation) — §5.2.
@@ -354,8 +362,10 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         // §4.1 pragmas — WAL + FULL durability (LCM is lossless), generous lock wait, bounded WAL.
+        // Applied OUTSIDE the migration ladder: `to_latest` runs in a transaction and `journal_mode`
+        // cannot change inside one.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -364,16 +374,13 @@ impl Store {
              PRAGMA journal_size_limit=67108864;
              PRAGMA mmap_size=268435456;",
         )?;
-        conn.execute_batch(schema::SCHEMA)?;
-        // Record the schema version + a migration marker so a future migration has the same hook.
+        // `PRAGMA user_version` is the schema authority. Mirror it into `metadata.schema_version` so
+        // the value stays readable from SQL (e.g. ad-hoc inspection); `lcm_migration_state` is no
+        // longer hand-stamped now that the ladder owns versioning.
+        MIGRATIONS.to_latest(&mut conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?1)",
             params![schema::SCHEMA_VERSION.to_string()],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO lcm_migration_state(step_name, completed_at) \
-             VALUES ('v4_greenfield', strftime('%s','now'))",
-            [],
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1275,6 +1282,53 @@ fn fts_sanitize(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The migration ladder is internally consistent and a fresh store opens at the latest version.
+    #[test]
+    fn migration_ladder_valid() {
+        assert!(MIGRATIONS.validate().is_ok());
+        let store = Store::open_in_memory().expect("open");
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "fresh DB is stamped to the latest migration");
+    }
+
+    fn dump_schema(conn: &Connection) -> String {
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name")
+            .unwrap();
+        let mut out = String::new();
+        for sql in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            out.push_str(sql.unwrap().trim());
+            out.push_str(";\n");
+        }
+        out
+    }
+
+    /// On-disk schema-drift gate: the live schema must match the committed golden. Any DDL change
+    /// must go through a new migration AND refresh the golden — run `DAEMON_UPDATE_SCHEMA=1 cargo
+    /// test -p daemon-context-lcm schema_matches_golden`.
+    #[test]
+    fn schema_matches_golden() {
+        let store = Store::open_in_memory().expect("open");
+        let dump = dump_schema(&store.conn.lock().unwrap());
+        let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/store/schema.golden.sql");
+        if std::env::var_os("DAEMON_UPDATE_SCHEMA").is_some() {
+            std::fs::write(golden_path, &dump).expect("write golden");
+            return;
+        }
+        let golden = std::fs::read_to_string(golden_path).unwrap_or_default();
+        assert_eq!(
+            dump.trim(),
+            golden.trim(),
+            "schema drift: add a migration (M::up) and refresh src/store/schema.golden.sql via \
+             DAEMON_UPDATE_SCHEMA=1",
+        );
+    }
 
     #[test]
     fn records_and_counts_summaries() {

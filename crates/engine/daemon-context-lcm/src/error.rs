@@ -12,6 +12,9 @@ pub enum Error {
     /// A SQLite error from the summary store.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A schema-migration error (the `user_version` ladder).
+    #[error("sqlite migrate: {0}")]
+    Migrate(#[from] rusqlite_migration::Error),
     /// A filesystem error (e.g. creating the data dir).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

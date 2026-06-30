@@ -46,6 +46,10 @@ thiserror = "2"
 anyhow = "1"
 futures = "0.3"
 strsim = "0.11"
+# Schema migrations for the rusqlite-backed stores, gated by `PRAGMA user_version` (no bookkeeping
+# table). Pinned to the release that targets rusqlite 0.37 — 2.4+ require newer rusqlite (2.4->0.38,
+# 2.5->0.39, 2.6->0.40), so bump this in lockstep only when the workspace rusqlite pin moves.
+rusqlite_migration = "=2.3.0"
 # real networked providers (isolated to the `daemon-providers` crate): genai gives one native-protocol
 # client over OpenAI/Anthropic/Gemini/… so we don't hand-roll wire/SSE/JSON. Default TLS is rustls.
 genai = "0.6"

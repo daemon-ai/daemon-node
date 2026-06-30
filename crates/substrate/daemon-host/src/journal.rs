@@ -155,6 +155,7 @@ impl JournalSink {
             trace: trace_or(current_trace(), TraceId::NONE).0,
             kind,
             timestamp_ms: now_ms(),
+            writer_version: daemon_common::VERSION.to_string(),
             payload,
         };
         tracing::debug!(
@@ -212,6 +213,7 @@ impl JournalSink {
             trace: trace_or(event.trace, current_trace()).0,
             kind: format!("cred.{}", event.kind.label()),
             timestamp_ms: event.timestamp_ms,
+            writer_version: daemon_common::VERSION.to_string(),
             payload: JournalPayload::Management {
                 detail: event.summary(),
             },

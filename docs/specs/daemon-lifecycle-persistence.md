@@ -285,3 +285,36 @@ flowchart LR
   partition/owner router, leases/fencing, active-only directory, `TaskTracker` tasks, completion
   consumer, wake/job outbox dispatchers, and recovery scanner — and must pass the seven acceptance
   tests.
+
+---
+
+## 8. Persistence versioning (on-disk migrations)
+
+On-disk/format compatibility is a distinct axis from the release version (the `VERSION` files) and
+the wire version (`WireVersion`). It is governed per artifact, with **schema-version integers
+driving migrations** and the **app/release SemVer stamped only as provenance** on append-only
+artifacts (never used as a migration key):
+
+| Artifact | Owner | Version mechanism | Bump policy |
+|---|---|---|---|
+| `daemon-store` SQLite (sessions, journal tables, cron, routes) | `daemon-store` | `PRAGMA user_version` via `rusqlite_migration` (`MIGRATIONS` ladder, `M1 = SCHEMA`) | Append an `M::up("ALTER …")` for any DDL change; never edit a released migration |
+| LCM SQLite (`daemon-context-lcm`) | `daemon-context-lcm` | `PRAGMA user_version` ladder (`metadata.schema_version` is an app-readable mirror only) | Append a migration |
+| Mnemosyne bank SQLite (`daemon-mnemosyne`) | `daemon-mnemosyne` | `PRAGMA user_version` ladder | Append a migration |
+| Engine `Snapshot` (CBOR `SnapshotBlob`) | `daemon-core` | additive `#[serde(default)]` fields; `writer_version` = `daemon_common::VERSION` (provenance) | Add fields with `#[serde(default)]`; bump nothing — decode stays tolerant; `decode` warns if written by a newer build |
+| Verifiable journal entries (CBOR, Gordian-envelope signed) | `daemon-telemetry` / host | append-only + `writer_version` provenance (asserted into the envelope only when present) | Never rewrite a row; add tolerant fields only |
+| daemon-app `daemon_cache.db` | `daemon-app` | internal `cache::kSchemaVersion` integer → **drop-and-rebuild** | Bump on cache DDL change (non-authoritative; re-baselined from the daemon) — decoupled from app/wire version |
+| daemon-app QSettings | `daemon-app` | `_meta/settingsSchemaVersion` integer ladder in `QtSettingsStore::migrate()` | Bump when a key is renamed/retyped/removed; add an ordered `if (v < N)` step |
+
+**Pragmas vs. migrations.** Connection pragmas (`journal_mode=WAL`, `synchronous`, `busy_timeout`)
+are applied in each store's `open()`/`init()` *before* the migration ladder — `to_latest` runs in a
+transaction and `journal_mode` cannot change inside one.
+
+**Gates.** Each SQLite store has a `MIGRATIONS.validate()` test and a schema-drift golden
+(`src/**/schema.golden.sql`, refreshed with `DAEMON_UPDATE_SCHEMA=1`, run via `just check-schema`) —
+the on-disk analogue of the wire `codec-drift` gate, forcing a migration on any DDL change.
+`Snapshot` decode tolerance is proptest/unit-tested (older shapes still decode).
+
+**Supported skew.** Stores carry a monotonic `user_version`; an older binary meeting a newer
+on-disk schema is refused by `rusqlite_migration` (`to_latest` errors rather than mis-reading). A
+snapshot/journal record written by a newer node still decodes but is logged. There are no legacy
+production databases, so no pre-`user_version` baseline shim is required.
