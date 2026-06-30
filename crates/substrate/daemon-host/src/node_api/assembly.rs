@@ -79,7 +79,27 @@ impl NodeApiImpl {
             blobs: None,
             cron: None,
             commands: Arc::new(ArcSwapOption::empty()),
+            auth_store: None,
+            auth_audit: None,
         }
+    }
+
+    /// Bind the identity store backing the admin access-control sub-surface
+    /// ([`daemon_api::AccessControlApi`]): `user_create`/`user_list`/`user_disable`/`user_set_roles`/
+    /// `user_set_password`/`session_revoke`. Absent, those ops resolve to [`ApiError::Unsupported`]
+    /// (`who_am_i` + `role_list` need no store and stay available).
+    pub fn with_auth_store(mut self, auth_store: Arc<daemon_auth::AuthStore>) -> Self {
+        self.auth_store = Some(auth_store);
+        self
+    }
+
+    /// Bind the shared auth-audit sink so admin access-control mutations are recorded onto the
+    /// verifiable `node-auth` journal stream. Pass the **same** [`AuthAudit`](crate::auth_audit::AuthAudit)
+    /// to the transport's [`Authenticator`](crate::authn::Authenticator) so login/denial events chain
+    /// together with the admin events. Absent, admin-op audit is a no-op.
+    pub fn with_auth_audit(mut self, auth_audit: Arc<crate::auth_audit::AuthAudit>) -> Self {
+        self.auth_audit = Some(auth_audit);
+        self
     }
 
     /// Bind the filesystem / workspace surface (`fs_*`), backed by the shared

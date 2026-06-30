@@ -173,6 +173,10 @@ pub struct AuthExchange {
 pub struct Authenticator {
     store: Arc<AuthStore>,
     decoy_secret: [u8; 32],
+    /// The shared auth-audit sink (login success/failure + permission denials ride this same
+    /// `node-auth` chain as the admin events). `None` => login/denial audit is a no-op (e.g. tests
+    /// or a node assembled without journaling).
+    audit: Option<Arc<crate::auth_audit::AuthAudit>>,
 }
 
 impl Authenticator {
@@ -185,6 +189,38 @@ impl Authenticator {
         Self {
             store,
             decoy_secret,
+            audit: None,
+        }
+    }
+
+    /// Attach the shared auth-audit sink so login success/failure (and, via [`Self::audit`], the
+    /// transport's permission denials) are recorded onto the verifiable `node-auth` journal stream.
+    pub fn with_audit(mut self, audit: Arc<crate::auth_audit::AuthAudit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The attached auth-audit sink, if any (the transport reaches it to record permission denials,
+    /// which are decided in the capability gate, not the authenticator).
+    pub fn audit(&self) -> Option<&Arc<crate::auth_audit::AuthAudit>> {
+        self.audit.as_ref()
+    }
+
+    /// Record a successful login onto the audit chain (no-op without an attached sink). The SASL
+    /// state machine ([`Self::begin`]/[`AuthExchange::step`]/[`Self::resume`]) is synchronous, so the
+    /// transport invokes this async hook once it has the resolved principal + method.
+    pub async fn audit_login_ok(&self, user_id: &str, method: &str) {
+        if let Some(a) = &self.audit {
+            a.login_ok(user_id, method).await;
+        }
+    }
+
+    /// Record a failed login onto the audit chain (no-op without an attached sink). Never receives
+    /// or records the supplied password; `username` is the attempted identity only when the mechanism
+    /// exposes it.
+    pub async fn audit_login_fail(&self, mechanism: &str, username: Option<&str>) {
+        if let Some(a) = &self.audit {
+            a.login_fail(mechanism, username).await;
         }
     }
 

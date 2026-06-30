@@ -30,4 +30,7 @@ pub enum Error {
     /// The account exists but has been disabled by an administrator.
     #[error("account disabled")]
     Disabled,
+    /// The mutation would remove the last enabled administrator (last-admin lockout guard).
+    #[error("refusing to remove the last administrator")]
+    LastAdmin,
 }

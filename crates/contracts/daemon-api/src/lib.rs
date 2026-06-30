@@ -1450,13 +1450,101 @@ pub trait AuthApi: Send + Sync {
     }
 }
 
-/// The whole node surface: the session, control, model-management, profile/config, credential, and
-/// interactive-auth sub-surfaces.
+/// The admin access-control surface (Auth 5): user/role/session administration over the node's
+/// identity store. Every op except [`who_am_i`](AccessControlApi::who_am_i) requires the
+/// `access_admin` capability (enforced by the request-context gate and re-checked in the host
+/// implementation); `who_am_i` is allowed for any authenticated principal. The reserved
+/// `resource_grant_*` ops return [`ApiError::Unsupported`] until per-resource grants are enforced.
+///
+/// Default methods resolve to [`ApiError::Unsupported`] / empty so a node assembled without an
+/// identity store (the FFI / conformance harness) still satisfies [`NodeApi`].
+#[async_trait]
+pub trait AccessControlApi: Send + Sync {
+    /// Create a user with an initial password + role set; returns the created record (no secrets).
+    async fn user_create(
+        &self,
+        _username: String,
+        _password: String,
+        _roles: Vec<String>,
+    ) -> Result<AccessUser, ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// List all users (with resolved roles).
+    async fn user_list(&self) -> Result<Vec<AccessUser>, ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// Enable/disable an account (disable also revokes the user's sessions).
+    async fn user_disable(&self, _user_id: String, _disabled: bool) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// Replace a user's role set.
+    async fn user_set_roles(&self, _user_id: String, _roles: Vec<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// Replace a user's password (re-derives SCRAM material and revokes the user's sessions).
+    async fn user_set_password(&self, _user_id: String, _password: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// The built-in roles and their effective capabilities (for an admin UI's role→cap matrix).
+    async fn role_list(&self) -> Result<Vec<RoleInfo>, ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// The caller's own [`PrincipalView`] (any authenticated principal; no `access_admin` needed).
+    async fn who_am_i(&self) -> Result<PrincipalView, ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// Revoke **all** session tokens for a user.
+    async fn session_revoke(&self, _user_id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("access control not available".into()))
+    }
+
+    /// Reserved (option B): grant one capability over one resource to one user. Returns
+    /// [`ApiError::Unsupported`] until per-resource grants are enforced.
+    async fn resource_grant_create(
+        &self,
+        _user_id: String,
+        _resource_kind: String,
+        _resource_id: String,
+        _capability: String,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("resource grants are reserved".into()))
+    }
+
+    /// Reserved: list per-resource grants. Returns [`ApiError::Unsupported`].
+    async fn resource_grant_list(&self, _user_id: Option<String>) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("resource grants are reserved".into()))
+    }
+
+    /// Reserved: revoke a per-resource grant. Returns [`ApiError::Unsupported`].
+    async fn resource_grant_revoke(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("resource grants are reserved".into()))
+    }
+}
+
+/// The whole node surface: the session, control, model-management, profile/config, credential,
+/// interactive-auth, and access-control sub-surfaces.
 pub trait NodeApi:
-    SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthApi
+    SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthApi + AccessControlApi
 {
 }
-impl<T: SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthApi> NodeApi for T {}
+impl<
+        T: SessionApi
+            + ControlApi
+            + ModelApi
+            + ProfileApi
+            + CredentialApi
+            + AuthApi
+            + AccessControlApi,
+    > NodeApi for T
+{
+}
 
 // ---------------------------------------------------------------------------
 // Outbound drain item (§17 events + raised host requests share one queue)
@@ -3148,7 +3236,7 @@ pub struct LogPageView {
     /// The session-activation generation this page belongs to (L2 resync). A fresh in-memory log
     /// after a restart/reactivation carries a strictly greater `epoch`, so a client that tracks
     /// `(epoch, seq)` detects the generation change and re-baselines from the durable journal rather
-    /// than mis-applying a new log's entries onto the old one. `0` for the first activation
+    /// than misapplying a new log's entries onto the old one. `0` for the first activation
     /// (matching `Snapshot::fresh`). `#[serde(default)]` keeps old (epoch-less) encodings decodable.
     #[serde(default)]
     pub epoch: u64,

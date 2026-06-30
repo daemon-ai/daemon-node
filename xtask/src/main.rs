@@ -715,6 +715,71 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             },
         )?;
     }
+
+    // ----- access control (Auth 5) -----
+    write_cbor(
+        &out,
+        "request-user-create.cbor",
+        &ApiRequest::UserCreate {
+            username: "alice".into(),
+            password: "correct horse".into(),
+            roles: vec!["user".into()],
+        },
+    )?;
+    write_cbor(&out, "request-user-list.cbor", &ApiRequest::UserList)?;
+    write_cbor(&out, "request-who-am-i.cbor", &ApiRequest::WhoAmI)?;
+    write_cbor(
+        &out,
+        "request-session-revoke.cbor",
+        &ApiRequest::SessionRevoke {
+            user_id: "u1".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-resource-grant-create.cbor",
+        &ApiRequest::ResourceGrantCreate {
+            user_id: "u1".into(),
+            resource_kind: "session".into(),
+            resource_id: "s1".into(),
+            capability: "session_read".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-access-user.cbor",
+        &ApiResponse::AccessUser(daemon_api::AccessUser {
+            user_id: "u1".into(),
+            username: "alice".into(),
+            disabled: false,
+            created_at: 0,
+            roles: vec!["user".into()],
+        }),
+    )?;
+    write_cbor(
+        &out,
+        "response-access-users.cbor",
+        &ApiResponse::AccessUsers(Vec::new()),
+    )?;
+    write_cbor(
+        &out,
+        "response-access-roles.cbor",
+        &ApiResponse::AccessRoles(vec![daemon_api::RoleInfo {
+            role: "admin".into(),
+            capabilities: vec!["access_admin".into()],
+        }]),
+    )?;
+    write_cbor(
+        &out,
+        "response-who-am-i.cbor",
+        &ApiResponse::WhoAmI(daemon_api::PrincipalView {
+            user_id: "u1".into(),
+            username: "alice".into(),
+            roles: vec!["admin".into()],
+            capabilities: vec!["access_admin".into()],
+        }),
+    )?;
+
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())
 }

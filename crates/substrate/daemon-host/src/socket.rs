@@ -13,6 +13,7 @@
 //!   streaming requests (`Subscribe`) push `Item`s until `End`/`Cancel`. The disjoint tag sets make
 //!   the first-frame mode select unambiguous.
 
+use crate::auth_audit::AuthAudit;
 use crate::authn::{AuthExchange, AuthSuccess, Authenticator, BeginOutcome, StepOutcome, TlsState};
 use crate::authz::authorize;
 use crate::request_context::{with_request_context, AuthMethod, RequestContext};
@@ -169,7 +170,9 @@ where
                         );
                         if mode.is_local_system() {
                             let ctx = RequestContext::system().with_conn_id(conn_id);
-                            authorize_and_dispatch(api.as_ref(), request, ctx).await
+                            // Local-trust system principal holds every capability, so no denial can
+                            // occur here; the bare one-shot path carries no audit sink.
+                            authorize_and_dispatch(api.as_ref(), request, ctx, None).await
                         } else {
                             // No SASL handshake on the bare protocol: fail closed.
                             ApiResponse::Error(ApiError::Unauthenticated(
@@ -214,6 +217,17 @@ fn auth_method_for(mechanism: &str) -> AuthMethod {
     }
 }
 
+/// The stable audit label for an [`AuthMethod`] (how the principal proved its identity).
+fn method_label(method: AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::LocalTrust => "local_trust",
+        AuthMethod::Scram => "scram",
+        AuthMethod::Plain => "plain",
+        AuthMethod::External => "external",
+        AuthMethod::Token => "token",
+    }
+}
+
 /// Run `req` through the capability gate then `dispatch`, all inside `ctx`'s task-local scope.
 /// `tokio::spawn`ed tasks do NOT inherit the caller's task-local, so EVERY spawned per-`Call` task
 /// re-establishes the scope here (the Auth 2 caveat); `current_principal` is otherwise `None`
@@ -222,14 +236,33 @@ async fn authorize_and_dispatch(
     api: &dyn NodeApi,
     req: ApiRequest,
     ctx: RequestContext,
+    audit: Option<Arc<AuthAudit>>,
 ) -> ApiResponse {
+    let conn_id = ctx.conn_id;
     with_request_context(ctx, async {
         match authorize(&req) {
             Ok(()) => dispatch(api, req).await,
-            Err(e) => ApiResponse::Error(e),
+            Err(e) => {
+                if let Some(a) = &audit {
+                    // Payload-free op tag (NEVER the request body — it may carry a password).
+                    a.permission_denied(&op_tag(&req), conn_id, &e.to_string())
+                        .await;
+                }
+                ApiResponse::Error(e)
+            }
         }
     })
     .await
+}
+
+/// The externally-tagged variant name of a request (the CBOR/JSON tag), with **no** payload — safe
+/// to put in an audit record even when the request body carries a credential (e.g. `UserCreate`).
+fn op_tag(req: &ApiRequest) -> String {
+    match serde_json::to_value(req) {
+        Ok(serde_json::Value::String(s)) => s,
+        Ok(serde_json::Value::Object(map)) => map.keys().next().cloned().unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 /// Deliver a completed authentication to the client: any trailing mechanism bytes (the SCRAM
@@ -294,6 +327,13 @@ where
         ConnAuth::Unauthenticated
     };
 
+    // The shared auth-audit sink (login success/failure + permission denials), if the authenticator
+    // carries one. `None` under local trust / a node without journaling -> audit is a no-op.
+    let audit: Option<Arc<AuthAudit>> = match mode.as_ref() {
+        AuthMode::Required { auth, .. } => auth.audit().cloned(),
+        AuthMode::LocalSystem => None,
+    };
+
     // Streaming `Open`s register an abort handle so a later `Cancel { id }` can tear them down.
     let mut streams: HashMap<u64, AbortHandle> = HashMap::new();
     let mut pending = first;
@@ -352,11 +392,14 @@ where
                             BeginOutcome::Success {
                                 final_data,
                                 success,
-                            } => ConnAuth::Authenticated {
-                                principal: complete_auth(&tx, final_data, success).await,
-                                method,
-                            },
+                            } => {
+                                let principal = complete_auth(&tx, final_data, success).await;
+                                auth.audit_login_ok(&principal.user_id, method_label(method))
+                                    .await;
+                                ConnAuth::Authenticated { principal, method }
+                            }
                             BeginOutcome::Failed(reject) => {
+                                auth.audit_login_fail(&mechanism, None).await;
                                 let _ = tx
                                     .send(WireS2C::AuthError {
                                         reason: reject.reason,
@@ -388,11 +431,17 @@ where
                             StepOutcome::Success {
                                 final_data,
                                 success,
-                            } => ConnAuth::Authenticated {
-                                principal: complete_auth(&tx, final_data, success).await,
-                                method,
-                            },
+                            } => {
+                                let principal = complete_auth(&tx, final_data, success).await;
+                                if let Some(a) = &audit {
+                                    a.login_ok(&principal.user_id, method_label(method)).await;
+                                }
+                                ConnAuth::Authenticated { principal, method }
+                            }
                             StepOutcome::Failed(reject) => {
+                                if let Some(a) = &audit {
+                                    a.login_fail(method_label(method), None).await;
+                                }
                                 let _ = tx
                                     .send(WireS2C::AuthError {
                                         reason: reject.reason,
@@ -426,11 +475,20 @@ where
                             BeginOutcome::Success {
                                 final_data,
                                 success,
-                            } => ConnAuth::Authenticated {
-                                principal: complete_auth(&tx, final_data, success).await,
-                                method: AuthMethod::Token,
-                            },
+                            } => {
+                                let principal = complete_auth(&tx, final_data, success).await;
+                                auth.audit_login_ok(
+                                    &principal.user_id,
+                                    method_label(AuthMethod::Token),
+                                )
+                                .await;
+                                ConnAuth::Authenticated {
+                                    principal,
+                                    method: AuthMethod::Token,
+                                }
+                            }
                             BeginOutcome::Failed(reject) => {
+                                auth.audit_login_fail("token", None).await;
                                 let _ = tx
                                     .send(WireS2C::AuthError {
                                         reason: reject.reason,
@@ -454,6 +512,7 @@ where
                 if let ConnAuth::Authenticated { principal, method } = &conn {
                     let api = api.clone();
                     let tx = tx.clone();
+                    let audit = audit.clone();
                     let ctx = RequestContext::authenticated(principal.clone(), None)
                         .with_conn_id(conn_id)
                         .with_auth_method(*method);
@@ -465,7 +524,7 @@ where
                             trace,
                             fields::span::API_UNIX_REQUEST,
                             SpanKind::Boundary,
-                            authorize_and_dispatch(api.as_ref(), req, ctx),
+                            authorize_and_dispatch(api.as_ref(), req, ctx, audit),
                         )
                         .await;
                         let _ = tx.send(WireS2C::Reply { id, res }).await;
@@ -495,6 +554,14 @@ where
                                 streams.insert(id, spawn_stream(api.clone(), tx.clone(), id, req));
                             }
                             Err(e) => {
+                                if let Some(a) = &audit {
+                                    a.permission_denied(
+                                        &op_tag(&req),
+                                        Some(conn_id),
+                                        &e.to_string(),
+                                    )
+                                    .await;
+                                }
                                 let _ = tx.send(WireS2C::End { id, error: Some(e) }).await;
                             }
                         }

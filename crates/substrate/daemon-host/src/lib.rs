@@ -35,6 +35,7 @@
 pub mod adapters;
 pub mod agent_session;
 pub mod auth;
+pub mod auth_audit;
 pub mod authn;
 pub mod authz;
 pub mod background;
@@ -70,11 +71,12 @@ pub use agent_session::AgentUnit;
 pub use auth::{
     AuthFlowFactory, AuthOutcome, PendingAuthFlow, PendingAuthFlows, DEFAULT_FLOW_TTL_SECS,
 };
+pub use auth_audit::{AuthAudit, AUTH_JOURNAL_UNIT};
 pub use authn::{
     principal_view, AuthExchange, AuthReject, AuthSuccess, Authenticator, BeginOutcome,
     StepOutcome, TlsState, MECH_EXTERNAL, MECH_PLAIN, MECH_SCRAM_SHA_256,
 };
-pub use authz::{authorize, required_capability};
+pub use authz::{authorize, required_capability, RequiredAccess};
 pub use background::{
     background_child_id, background_kind_of, BackgroundProfile, BackgroundProfileRegistry,
     BackgroundSpawner,

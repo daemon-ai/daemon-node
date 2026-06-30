@@ -500,6 +500,47 @@ async fn serve_fs(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     })
 }
 
+/// Admin access control (Auth 5): user/role/session administration + reserved per-resource grants.
+async fn serve_access(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
+    Some(match req {
+        ApiRequest::UserCreate {
+            username,
+            password,
+            roles,
+        } => ok_or_err(
+            api.user_create(username, password, roles).await,
+            ApiResponse::AccessUser,
+        ),
+        ApiRequest::UserList => ok_or_err(api.user_list().await, ApiResponse::AccessUsers),
+        ApiRequest::UserDisable { user_id, disabled } => {
+            unit_or_err(api.user_disable(user_id, disabled).await)
+        }
+        ApiRequest::UserSetRoles { user_id, roles } => {
+            unit_or_err(api.user_set_roles(user_id, roles).await)
+        }
+        ApiRequest::UserSetPassword { user_id, password } => {
+            unit_or_err(api.user_set_password(user_id, password).await)
+        }
+        ApiRequest::RoleList => ok_or_err(api.role_list().await, ApiResponse::AccessRoles),
+        ApiRequest::WhoAmI => ok_or_err(api.who_am_i().await, ApiResponse::WhoAmI),
+        ApiRequest::SessionRevoke { user_id } => unit_or_err(api.session_revoke(user_id).await),
+        ApiRequest::ResourceGrantCreate {
+            user_id,
+            resource_kind,
+            resource_id,
+            capability,
+        } => unit_or_err(
+            api.resource_grant_create(user_id, resource_kind, resource_id, capability)
+                .await,
+        ),
+        ApiRequest::ResourceGrantList { user_id } => {
+            unit_or_err(api.resource_grant_list(user_id).await)
+        }
+        ApiRequest::ResourceGrantRevoke { id } => unit_or_err(api.resource_grant_revoke(id).await),
+        _ => return None,
+    })
+}
+
 /// Dispatch a request against a full [`NodeApi`] — the entry point the socket/TCP/JSON-RPC node
 /// transports call. Fans out to the per-surface `serve_*` helpers; every `ApiRequest` variant is
 /// routed by exactly one of them (verified by the `daemon-conformance` suite, which exercises the
@@ -538,7 +579,10 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
     if let Some(resp) = serve_registry(api, req.clone()).await {
         return resp;
     }
-    if let Some(resp) = serve_fs(api, req).await {
+    if let Some(resp) = serve_fs(api, req.clone()).await {
+        return resp;
+    }
+    if let Some(resp) = serve_access(api, req).await {
         return resp;
     }
     unreachable!("every ApiRequest variant is routed by exactly one serve_* helper")
