@@ -202,16 +202,26 @@ fn to_wire_spec(core: &CoreSpec, source: &str) -> CommandSpec {
     }
 }
 
-/// The caller's access tier for command gating — the `slash_access.py` operator-vs-user axis. A
-/// command with **no origin** is a *local operator* (the in-process CLI/TUI/FFI or the trusted Unix
-/// socket) and resolves to [`CommandAccess::Admin`]; an origin-attributed call (a chat principal
-/// relayed by a transport adapter) resolves to [`CommandAccess::User`]. The read-only `User` floor
-/// is always allowed (see [`access_allows`]), so a chat user can still run `help`/`status` but not
-/// the admin-tier mutating/node-wide ops.
-pub fn caller_access(origin: Option<&Origin>) -> CommandAccess {
-    match origin {
-        None => CommandAccess::Admin,
-        Some(_) => CommandAccess::User,
+/// The caller's access tier for command gating — the `slash_access.py` operator-vs-user axis, now
+/// derived from the **authenticated principal** (the authz-core request context), not from
+/// origin-presence. A principal holding an operator/admin capability (`ControlWrite` or
+/// `AccessAdmin`) gets [`CommandAccess::Admin`]; everyone else — including an unauthenticated /
+/// empty context — gets the read-only [`CommandAccess::User`] floor. The read-only floor is always
+/// allowed (see [`access_allows`]), so a chat user can still run `help`/`status` but not the
+/// admin-tier mutating/node-wide ops.
+///
+/// Fail-closed inversion (authz core): the absence of identity no longer implies admin (was
+/// `None => Admin`). The trusted in-process / FFI / local-Unix paths keep the admin tier because
+/// they run inside a [`RequestContext::system()`](crate::request_context::RequestContext::system)
+/// scope, whose full-capability principal satisfies the check. `origin` is retained for signature
+/// stability and future per-origin policy, but no longer grants a tier.
+pub fn caller_access(_origin: Option<&Origin>) -> CommandAccess {
+    use daemon_auth::Capability;
+    match crate::request_context::current_principal() {
+        Some(p) if p.has(Capability::AccessAdmin) || p.has(Capability::ControlWrite) => {
+            CommandAccess::Admin
+        }
+        _ => CommandAccess::User,
     }
 }
 
@@ -461,7 +471,39 @@ mod tests {
         // Admin-tier: only an admin caller.
         assert!(!access_allows(CommandAccess::Admin, CommandAccess::User));
         assert!(access_allows(CommandAccess::Admin, CommandAccess::Admin));
-        // No origin == local operator == admin; an attributed origin == user.
-        assert_eq!(caller_access(None), CommandAccess::Admin);
+    }
+
+    #[tokio::test]
+    async fn caller_access_is_principal_driven_not_origin() {
+        use crate::request_context::{with_request_context, RequestContext};
+        use daemon_auth::{Principal, Role};
+
+        // Fail-closed inversion: with no authenticated principal, the tier is the read-only `User`
+        // floor (was `Admin` for `origin == None`).
+        assert_eq!(caller_access(None), CommandAccess::User);
+
+        // The local-trust system principal keeps the admin tier (the in-process / FFI / Unix path).
+        let admin =
+            with_request_context(RequestContext::system(), async { caller_access(None) }).await;
+        assert_eq!(admin, CommandAccess::Admin);
+
+        // A plain user principal stays on the floor...
+        let viewer_user = with_request_context(
+            RequestContext::authenticated(Principal::from_roles("u", "u", vec![Role::User]), None),
+            async { caller_access(None) },
+        )
+        .await;
+        assert_eq!(viewer_user, CommandAccess::User);
+
+        // ...while an operator (holds `ControlWrite`) is elevated to the admin tier.
+        let operator = with_request_context(
+            RequestContext::authenticated(
+                Principal::from_roles("o", "o", vec![Role::Operator]),
+                None,
+            ),
+            async { caller_access(None) },
+        )
+        .await;
+        assert_eq!(operator, CommandAccess::Admin);
     }
 }

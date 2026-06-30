@@ -15,6 +15,9 @@ daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }
+# RBAC foundation: the per-request capability gate + task-local request context consume the
+# transport-agnostic Capability/Role/Principal vocabulary (authz core, Auth 2).
+daemon-auth = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true }
 daemon-activation = { workspace = true }

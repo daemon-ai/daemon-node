@@ -2303,6 +2303,7 @@ dependencies = [
  "ciborium",
  "daemon-activation",
  "daemon-api",
+ "daemon-auth",
  "daemon-common",
  "daemon-core",
  "daemon-credentials",

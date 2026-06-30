@@ -1,0 +1,457 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! The per-request capability gate (authz core, Auth 2).
+//!
+//! [`required_capability`] maps every [`ApiRequest`] variant to the single coarse [`Capability`]
+//! that gates it, as ONE exhaustive `match` with **no `_` arm** — adding a request variant without
+//! a mapping is a compile error (the build-time exhaustiveness guard). The arms are organized to
+//! mirror the `serve_*` fan-out in `daemon-api`'s `dispatch`.
+//!
+//! [`authorize`] reads the task-local [`Principal`](daemon_auth::Principal) bound by
+//! [`with_request_context`](crate::request_context::with_request_context) and enforces the gate:
+//! no principal → [`ApiError::Unauthenticated`] (fail-closed), authenticated-but-missing-the-cap →
+//! [`ApiError::Forbidden`].
+//!
+//! This is the *coarse* half of the two-step model: it answers "may this caller perform this *kind*
+//! of operation at all?". The *per-resource* half — "may they touch *this* session?" — is the
+//! ownership check enforced later by the session layer (Track C), with
+//! [`Capability::SessionSeeAll`](daemon_auth::Capability::SessionSeeAll) /
+//! [`SessionControlAny`](daemon_auth::Capability::SessionControlAny) as the operator overrides. No
+//! variant maps to those override caps here; they gate cross-owner access downstream, not entry.
+
+use crate::request_context::current_principal;
+use daemon_api::{ApiError, ApiRequest};
+use daemon_auth::Capability;
+
+/// The single [`Capability`] gating `req`. ONE exhaustive match, NO `_` arm: a new [`ApiRequest`]
+/// variant that lands without a mapping breaks the build (and thus the test suite). Arms are grouped
+/// to parallel the `serve_*` dispatch surfaces.
+pub fn required_capability(req: &ApiRequest) -> Capability {
+    // `Capability` is aliased (`C`) because two of its variant names collide with `ApiRequest`'s
+    // (`FsRead`/`FsWrite`): bare names in patterns resolve to `ApiRequest`; capabilities are `C::*`.
+    use ApiRequest::*;
+    use Capability as C;
+    match req {
+        // -- serve_session: own-session interaction --------------------------------------------
+        Submit { .. }
+        | SubmitRouted { .. }
+        | Respond { .. }
+        | Handover { .. }
+        | RecordMeta(_)
+        | SetSessionModel { .. }
+        | SetSessionMode { .. }
+        | SetSessionOverlay { .. } => C::SessionWrite,
+        Poll { .. }
+        | SessionHistory { .. }
+        | Subscribe { .. }
+        | DeliveryTargets { .. }
+        | DeliverySessions { .. } => C::SessionRead,
+
+        // -- serve_control: node diagnostics + durable lifecycle + roster -----------------------
+        Health
+        | Stats
+        | Telemetry
+        | VerifyingKey
+        | ApprovalsPending { .. }
+        | CheckpointList { .. }
+        | EventsSince { .. } => C::ControlRead,
+        // Durable control-plane lifecycle is operator-level (Assign wakes a durable session).
+        Assign { .. } => C::ControlWrite,
+        // The roster reads are "one's own sessions"; SeeAll (Track C) widens them cross-owner.
+        Sessions
+        | SessionsQuery { .. }
+        | SessionGet { .. }
+        | SessionsByProfile
+        | SessionSearch { .. } => C::SessionRead,
+        // A user may drive their OWN session's lifecycle (cancel/rewind/checkpoint-rewind/approve +
+        // roster metadata); Track C scopes it to ownership, operators cross via SessionControlAny.
+        Cancel { .. }
+        | Rewind { .. }
+        | CheckpointRewind { .. }
+        | ApprovalDecide { .. }
+        | SessionUpdateMeta { .. } => C::SessionWrite,
+
+        // -- serve_fleet: orchestration tree ----------------------------------------------------
+        Fleet
+        | Tree
+        | Unit { .. }
+        | UnitEvents { .. }
+        | UnitOutbound { .. }
+        | UnitHistory { .. } => C::FleetRead,
+        Pause { .. } | Resume { .. } | Scale { .. } => C::FleetWrite,
+
+        // -- serve_models: model management -----------------------------------------------------
+        ModelSearch { .. }
+        | ModelFiles { .. }
+        | ModelDownloads
+        | ModelCatalog
+        | ModelRecommend(_)
+        | ModelQuantizes
+        | ModelInspect { .. }
+        | Models
+        | ModelCurrent { .. } => C::ModelsRead,
+        ModelDownload { .. }
+        | ModelCancel { .. }
+        | ModelPause { .. }
+        | ModelResume { .. }
+        | ModelDelete { .. }
+        | ModelActivate { .. }
+        | ModelQuantize(_) => C::ModelsWrite,
+
+        // -- serve_profile: profiles + skills (versioned) ---------------------------------------
+        ProfileList
+        | ProfileGet { .. }
+        | ProfileExport { .. }
+        | ProfileHistory { .. }
+        | ProfileAt { .. }
+        | SkillHistory { .. }
+        | SkillAt { .. }
+        | SkillGet { .. } => C::ProfileRead,
+        ProfileCreate { .. }
+        | ProfileUpdate { .. }
+        | ProfileDelete { .. }
+        | ProfileSelect { .. }
+        | ProfileClone { .. }
+        | ProfileImport { .. }
+        | ProfileRevert { .. }
+        | SkillRevert { .. }
+        | SkillPut { .. } => C::ProfileWrite,
+
+        // -- serve_curator: per-profile skill library -------------------------------------------
+        CuratorList { .. } => C::ProfileRead,
+        CuratorPin { .. }
+        | CuratorUnpin { .. }
+        | CuratorArchive { .. }
+        | CuratorRestore { .. }
+        | CuratorRun { .. } => C::ProfileWrite,
+
+        // -- serve_auth: interactive (OAuth) flows + credential store ---------------------------
+        AuthProviders | CredentialList => C::CredentialRead,
+        AuthBegin(_)
+        | AuthComplete(_)
+        | AuthCancel { .. }
+        | CredentialSet { .. }
+        | CredentialRemove { .. } => C::CredentialWrite,
+
+        // -- serve_cron: scheduled jobs ---------------------------------------------------------
+        CronList | CronRuns { .. } | CronSuggestions => C::CronRead,
+        CronCreate { .. }
+        | CronUpdate { .. }
+        | CronDelete { .. }
+        | CronTrigger { .. }
+        | CronPause { .. }
+        | CronAcceptSuggestion { .. }
+        | CronDismissSuggestion { .. } => C::CronWrite,
+
+        // -- serve_routing: chat routing + transport registry -----------------------------------
+        RoutingListChats
+        | RoutingGet { .. }
+        | TransportRooms { .. }
+        | TransportAdapters
+        | TransportInstances => C::RoutingRead,
+        RoutingSet { .. } | RoutingBindChat { .. } | RoutingUnbindChat { .. } => C::RoutingWrite,
+
+        // -- serve_messaging: conversations, membership, contacts -------------------------------
+        ConvList { .. }
+        | ConvGet { .. }
+        | ConvCreateDetails { .. }
+        | ConvJoinDetails { .. }
+        | ConvHistory(_)
+        | ContactGetProfile { .. }
+        | ContactActionMenu { .. }
+        | DirectorySearch { .. } => C::MessagingRead,
+        ConvCreate { .. }
+        | ConvJoin { .. }
+        | ConvLeave { .. }
+        | ConvSend(_)
+        | ConvSetTopic { .. }
+        | ConvSetTitle { .. }
+        | ConvSetDescription { .. }
+        | ConvDelete { .. }
+        | MemberInvite(_)
+        | MemberRemove(_)
+        | MemberBan(_)
+        | MemberSetRole(_)
+        | ContactSetAlias { .. } => C::MessagingWrite,
+
+        // -- serve_registry: extension/agent/provider registry + node config --------------------
+        // AcpDiscover only probes recipes and caches in memory (no persistence) -> a read.
+        AcpDiscover | AcpCatalog | ProviderList | ToolList | CommandList | ConfigGet => {
+            C::RegistryRead
+        }
+        // CommandInvoke is a coarse-floor read; the command catalog's own `min_access` (now
+        // principal-driven, see `commands::caller_access`) does the per-command Admin-tier gating.
+        CommandInvoke { .. } => C::RegistryRead,
+        AcpRegister { .. }
+        | AcpRemove { .. }
+        | ProviderRegister { .. }
+        | ToolRegister { .. }
+        | ConfigSet { .. } => C::RegistryWrite,
+
+        // -- serve_fs: filesystem surface + blob store ------------------------------------------
+        FsRoots
+        | FsList { .. }
+        | FsStat { .. }
+        | FsRead { .. }
+        | FsSearch { .. }
+        | FsWatchPoll(_)
+        | BlobGet { .. }
+        | BlobStat { .. } => C::FsRead,
+        FsWrite(_) | BlobPut { .. } | FsWriteFromBlob(_) => C::FsWrite,
+    }
+}
+
+/// Authorize `req` against the task-local request principal.
+///
+/// Fail-closed: with no active [`RequestContext`](crate::request_context::RequestContext) the
+/// principal is absent and the request is [`ApiError::Unauthenticated`]. An authenticated caller
+/// missing the [`required_capability`] gets [`ApiError::Forbidden`]. Per-resource ownership is a
+/// separate, downstream check (Track C).
+pub fn authorize(req: &ApiRequest) -> Result<(), ApiError> {
+    let needed = required_capability(req);
+    match current_principal() {
+        None => Err(ApiError::Unauthenticated(
+            "no authenticated principal bound to this request".into(),
+        )),
+        Some(principal) if principal.has(needed) => Ok(()),
+        Some(_) => Err(ApiError::Forbidden(format!(
+            "operation requires capability {needed:?}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request_context::{with_request_context, RequestContext};
+    use daemon_auth::{Principal, Role};
+    use daemon_protocol::TransportId;
+
+    fn principal(role: Role) -> Principal {
+        Principal::from_roles("u", "u", vec![role])
+    }
+
+    /// Run the gate for `req` under a principal holding exactly `role`.
+    async fn gate(role: Role, req: ApiRequest) -> Result<(), ApiError> {
+        let p = principal(role);
+        with_request_context(RequestContext::authenticated(p, None), async move {
+            authorize(&req)
+        })
+        .await
+    }
+
+    // ---- a representative request per `serve_*` surface, with its expected capability ----------
+    fn read_samples() -> Vec<(ApiRequest, Capability)> {
+        vec![
+            (ApiRequest::Health, Capability::ControlRead),
+            (ApiRequest::Sessions, Capability::SessionRead),
+            (ApiRequest::Fleet, Capability::FleetRead),
+            (ApiRequest::Models, Capability::ModelsRead),
+            (ApiRequest::ProfileList, Capability::ProfileRead),
+            (
+                ApiRequest::CuratorList { profile: None },
+                Capability::ProfileRead,
+            ),
+            (ApiRequest::CredentialList, Capability::CredentialRead),
+            (ApiRequest::CronList, Capability::CronRead),
+            (ApiRequest::RoutingListChats, Capability::RoutingRead),
+            (
+                ApiRequest::ConvList {
+                    transport: TransportId::new("t"),
+                },
+                Capability::MessagingRead,
+            ),
+            (ApiRequest::AcpCatalog, Capability::RegistryRead),
+            (ApiRequest::FsRoots, Capability::FsRead),
+        ]
+    }
+
+    /// User-tier writes: `User` (and up) may; `Viewer` may not.
+    fn user_writes() -> Vec<(ApiRequest, Capability)> {
+        vec![
+            (
+                ApiRequest::Cancel {
+                    session: "s".into(),
+                },
+                Capability::SessionWrite,
+            ),
+            (
+                ApiRequest::CheckpointRewind {
+                    session: "s".into(),
+                    checkpoint_id: "c".into(),
+                },
+                Capability::SessionWrite,
+            ),
+            (
+                ApiRequest::ProfileDelete { id: "p".into() },
+                Capability::ProfileWrite,
+            ),
+            (
+                ApiRequest::CredentialRemove {
+                    profile: "p".into(),
+                },
+                Capability::CredentialWrite,
+            ),
+            (
+                ApiRequest::CronDelete { id: "c".into() },
+                Capability::CronWrite,
+            ),
+            (
+                ApiRequest::ConvLeave {
+                    transport: TransportId::new("t"),
+                    conv: "c".into(),
+                },
+                Capability::MessagingWrite,
+            ),
+            (
+                ApiRequest::BlobPut { bytes: Vec::new() },
+                Capability::FsWrite,
+            ),
+        ]
+    }
+
+    /// Operator-tier writes: `Operator` (and `Admin`) may; `User` may not.
+    fn operator_writes() -> Vec<(ApiRequest, Capability)> {
+        vec![
+            (
+                ApiRequest::Assign {
+                    session: "s".into(),
+                },
+                Capability::ControlWrite,
+            ),
+            (
+                ApiRequest::Pause { unit: "u".into() },
+                Capability::FleetWrite,
+            ),
+            (
+                ApiRequest::AcpRemove { name: "a".into() },
+                Capability::RegistryWrite,
+            ),
+            (
+                ApiRequest::ModelDelete { id: "m".into() },
+                Capability::ModelsWrite,
+            ),
+        ]
+    }
+
+    #[test]
+    fn representative_mapping_per_group_is_stable() {
+        for (req, cap) in read_samples()
+            .into_iter()
+            .chain(user_writes())
+            .chain(operator_writes())
+        {
+            assert_eq!(
+                required_capability(&req),
+                cap,
+                "mapping drifted for {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_request_is_rejected() {
+        // No active scope: every surface fails closed with `Unauthenticated`.
+        for (req, _) in read_samples() {
+            assert!(
+                matches!(authorize(&req), Err(ApiError::Unauthenticated(_))),
+                "expected Unauthenticated for {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_missing_capability_is_forbidden() {
+        let err = gate(
+            Role::Viewer,
+            ApiRequest::Cancel {
+                session: "s".into(),
+            },
+        )
+        .await;
+        assert!(matches!(err, Err(ApiError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn role_matrix_viewer_reads_only() {
+        for (req, _) in read_samples() {
+            assert!(
+                gate(Role::Viewer, req.clone()).await.is_ok(),
+                "viewer read {req:?}"
+            );
+        }
+        for (req, _) in user_writes().into_iter().chain(operator_writes()) {
+            assert!(
+                matches!(
+                    gate(Role::Viewer, req.clone()).await,
+                    Err(ApiError::Forbidden(_))
+                ),
+                "viewer must be denied write {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn role_matrix_user_owns_writes_but_no_operator_caps() {
+        for (req, _) in read_samples().into_iter().chain(user_writes()) {
+            assert!(
+                gate(Role::User, req.clone()).await.is_ok(),
+                "user allowed {req:?}"
+            );
+        }
+        for (req, _) in operator_writes() {
+            assert!(
+                matches!(
+                    gate(Role::User, req.clone()).await,
+                    Err(ApiError::Forbidden(_))
+                ),
+                "user must be denied operator op {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn role_matrix_operator_drives_node_but_lacks_access_admin() {
+        for (req, _) in read_samples()
+            .into_iter()
+            .chain(user_writes())
+            .chain(operator_writes())
+        {
+            assert!(
+                gate(Role::Operator, req.clone()).await.is_ok(),
+                "operator allowed {req:?}"
+            );
+        }
+        // No v2 ApiRequest maps to AccessAdmin (admin DTOs are Track D), so the "Operator lacks
+        // AccessAdmin" guard is asserted at the Principal level.
+        assert!(!principal(Role::Operator).has(Capability::AccessAdmin));
+    }
+
+    #[tokio::test]
+    async fn role_matrix_admin_allows_everything_tested() {
+        for (req, _) in read_samples()
+            .into_iter()
+            .chain(user_writes())
+            .chain(operator_writes())
+        {
+            assert!(
+                gate(Role::Admin, req.clone()).await.is_ok(),
+                "admin allowed {req:?}"
+            );
+        }
+        assert!(principal(Role::Admin).has(Capability::AccessAdmin));
+    }
+
+    #[tokio::test]
+    async fn system_principal_passes_every_surface() {
+        for (req, _) in read_samples()
+            .into_iter()
+            .chain(user_writes())
+            .chain(operator_writes())
+        {
+            let r = with_request_context(RequestContext::system(), async { authorize(&req) }).await;
+            assert!(r.is_ok(), "system principal allowed {req:?}");
+        }
+    }
+}

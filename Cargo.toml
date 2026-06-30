@@ -177,6 +177,7 @@ daemon-providers = { path = "crates/providers/daemon-providers" }
 # build opts into an engine via `--features llama` / `--features mistralrs` on the crate directly.
 daemon-infer = { path = "crates/providers/daemon-infer", default-features = false }
 daemon-models = { path = "crates/providers/daemon-models" }
+daemon-auth = { path = "crates/substrate/daemon-auth" }
 daemon-store = { path = "crates/substrate/daemon-store" }
 daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
