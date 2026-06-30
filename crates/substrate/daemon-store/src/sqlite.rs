@@ -267,8 +267,20 @@ fn migrate_err(e: rusqlite_migration::Error) -> StoreError {
 /// `M::up("ALTER TABLE …")` for each future schema change — never edit a released migration. Pragmas
 /// (WAL etc.) are applied in `open()` *outside* this ladder: `to_latest` runs in a transaction and
 /// `journal_mode` cannot change inside one.
-static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(SCHEMA)]));
+static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(SCHEMA),
+        // M2 (Auth 4 ownership): a server-side owner key on both per-session metadata and scheduled
+        // jobs. `session_meta.owner` is the per-resource ownership column (stamped on every creation
+        // path); `cron_jobs.owner` records the job creator so the worker can stamp the spawned cron
+        // session's owner. Both default NULL on legacy rows (visible only to a `SessionSeeAll`
+        // holder). Never edit a released migration — this only appends columns.
+        M::up(
+            "ALTER TABLE session_meta ADD COLUMN owner TEXT;\n\
+             ALTER TABLE cron_jobs ADD COLUMN owner TEXT;",
+        ),
+    ])
+});
 
 fn role_to_str(role: SessionRole) -> &'static str {
     match role {
@@ -300,6 +312,7 @@ fn cron_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCronJob>
         last_detail: row.get::<_, Option<String>>(7)?,
         fire_count: row.get::<_, i64>(8)? as u32,
         created_unix: row.get::<_, i64>(9)? as u64,
+        owner: row.get::<_, Option<String>>(10)?,
     })
 }
 
@@ -316,7 +329,7 @@ fn cron_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCronRun>
     })
 }
 
-/// Map a `cron_suggestions` row to a [`StoredCronSuggestion`] (column order matches the SELECTs).
+/// Map a `cron_suggestions` row to a [`StoredCronSuggestion`] (column order matches each SELECT).
 fn cron_suggestion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCronSuggestion> {
     Ok(StoredCronSuggestion {
         id: row.get::<_, String>(0)?,
@@ -1111,11 +1124,11 @@ impl SessionStore for SqliteStore {
         let last_activity = meta.last_activity_ms.map(|v| v as i64);
         let scheduled_job = meta.scheduled_job.as_ref().map(|j| j.as_str());
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
              last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10, \
-             activation_epoch = ?11",
+             activation_epoch = ?11, owner = ?12",
             params![
                 id.as_str(),
                 bound,
@@ -1127,7 +1140,8 @@ impl SessionStore for SqliteStore {
                 meta.pinned as i64,
                 meta.archived as i64,
                 scheduled_job,
-                meta.activation_epoch as i64
+                meta.activation_epoch as i64,
+                meta.owner,
             ],
         )
         .map_err(sql_err)?;
@@ -1137,7 +1151,7 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch \
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner \
              FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
@@ -1151,6 +1165,7 @@ impl SessionStore for SqliteStore {
                 let archived: i64 = row.get(7)?;
                 let scheduled_job: Option<String> = row.get(8)?;
                 let activation_epoch: i64 = row.get(9)?;
+                let owner: Option<String> = row.get(10)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
@@ -1162,6 +1177,7 @@ impl SessionStore for SqliteStore {
                     archived: archived != 0,
                     scheduled_job: scheduled_job.map(JobId::from),
                     activation_epoch: activation_epoch as u64,
+                    owner,
                 })
             },
         )
@@ -1387,7 +1403,7 @@ impl SessionStore for SqliteStore {
     async fn cron_list(&self) -> Vec<StoredCronJob> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix \
+            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix, owner \
              FROM cron_jobs ORDER BY id",
         ) {
             Ok(s) => s,
@@ -1403,7 +1419,7 @@ impl SessionStore for SqliteStore {
     async fn cron_get(&self, id: &str) -> Option<StoredCronJob> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix \
+            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix, owner \
              FROM cron_jobs WHERE id = ?1",
             params![id],
             cron_job_from_row,
@@ -1416,10 +1432,10 @@ impl SessionStore for SqliteStore {
     async fn cron_set(&self, job: StoredCronJob) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO cron_jobs (id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            "INSERT INTO cron_jobs (id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix, owner) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(id) DO UPDATE SET schedule = ?2, spec = ?3, next_fire_unix = ?4, paused = ?5, \
-             last_run_unix = ?6, last_ok = ?7, last_detail = ?8, fire_count = ?9, created_unix = ?10",
+             last_run_unix = ?6, last_ok = ?7, last_detail = ?8, fire_count = ?9, created_unix = ?10, owner = ?11",
             params![
                 job.id,
                 job.schedule,
@@ -1431,6 +1447,7 @@ impl SessionStore for SqliteStore {
                 job.last_detail,
                 job.fire_count as i64,
                 job.created_unix as i64,
+                job.owner,
             ],
         )
         .map_err(sql_err)?;
@@ -1449,7 +1466,7 @@ impl SessionStore for SqliteStore {
     async fn cron_due(&self, now_unix: u64) -> Vec<StoredCronJob> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix \
+            "SELECT id, schedule, spec, next_fire_unix, paused, last_run_unix, last_ok, last_detail, fire_count, created_unix, owner \
              FROM cron_jobs WHERE paused = 0 AND next_fire_unix IS NOT NULL AND next_fire_unix <= ?1 \
              ORDER BY next_fire_unix",
         ) {
@@ -1816,7 +1833,7 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (1, the single `M1 = SCHEMA` step).
+    /// `user_version` (2: `M1 = SCHEMA` plus the Auth 4 ownership ALTERs).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -1827,7 +1844,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 2, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

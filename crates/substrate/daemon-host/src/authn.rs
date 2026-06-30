@@ -447,15 +447,17 @@ impl AuthCallback {
         }
     }
 
-    /// Map a verified client-cert fingerprint to a user identity.
-    ///
-    /// TODO(auth3-external): wire this to the persistent `external_identities (user_id, fingerprint)`
-    /// table. That schema change is intentionally deferred so the coordinator can sequence it with
-    /// the other `daemon-auth`/`daemon-store` migrations (so `MIGRATIONS.validate()` + the
-    /// schema-golden refresh happen once). Until then there is no mapping and EXTERNAL always denies
-    /// — the fail-closed default (an unmapped certificate is never trusted).
-    fn external_identity(&self, _fingerprint: &str) -> Option<ValidatedIdentity> {
-        None
+    /// Map a verified client-cert fingerprint to a user identity via the `external_identities` table
+    /// (Auth 4). An unmapped fingerprint (or a disabled mapped user) resolves to `None` — the
+    /// fail-closed default, so an untrusted certificate never authenticates. Fingerprints are
+    /// enrolled out of band (the store-level [`AuthStore::set_external_identity`] writer; the admin
+    /// enrollment op is a later track).
+    fn external_identity(&self, fingerprint: &str) -> Option<ValidatedIdentity> {
+        self.store
+            .external_identity(fingerprint)
+            .ok()
+            .flatten()
+            .map(|(user_id, username)| ValidatedIdentity { user_id, username })
     }
 }
 
@@ -742,6 +744,41 @@ mod tests {
         };
         assert!(matches!(
             auth.begin(MECH_EXTERNAL, b"", tls_no_cert),
+            BeginOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn external_mapped_fingerprint_authenticates() {
+        let store = store_with_user("svc", "pw", &[Role::Operator]);
+        // Enroll the verified client-cert fingerprint -> user (the store-level writer).
+        let user = store.find_user("svc").unwrap().unwrap();
+        store
+            .set_external_identity(&user.id, "ab12cd34")
+            .expect("enroll fingerprint");
+        let auth = Authenticator::new(store);
+        let tls = TlsState {
+            is_tls: true,
+            peer_cert_fingerprint: Some("ab12cd34".into()),
+        };
+        match auth.begin(MECH_EXTERNAL, b"", tls) {
+            BeginOutcome::Success { success, .. } => {
+                assert_eq!(success.principal.username, "svc");
+                assert!(success.principal.has(Capability::SessionControlAny));
+            }
+            _ => panic!("a mapped EXTERNAL certificate must authenticate"),
+        }
+        // A different, unmapped fingerprint still denies (fail-closed).
+        let auth2 = {
+            let store = store_with_user("svc2", "pw", &[Role::Operator]);
+            Authenticator::new(store)
+        };
+        let tls_unknown = TlsState {
+            is_tls: true,
+            peer_cert_fingerprint: Some("ab12cd34".into()),
+        };
+        assert!(matches!(
+            auth2.begin(MECH_EXTERNAL, b"", tls_unknown),
             BeginOutcome::Failed(_)
         ));
     }

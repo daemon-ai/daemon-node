@@ -8,6 +8,10 @@ impl SessionApi for NodeApiImpl {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
         // Guard-rail: claim the session for the live lifecycle (rejects an id already durable-managed).
         self.claim(&session, Lifecycle::Live)?;
+        // Auth 4: own-or-`SessionControlAny`. An `Absent` (brand-new) session passes here, then
+        // `note_activity` stamps the caller as owner — checked BEFORE `note_activity` so a foreign
+        // caller never mutates last-activity / the FTS index.
+        self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
         self.live.submit(session, command).await
     }
@@ -19,6 +23,7 @@ impl SessionApi for NodeApiImpl {
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         self.claim(&session, Lifecycle::Live)?;
+        self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
         self.live.submit_from(session, origin, command).await
     }
@@ -31,6 +36,7 @@ impl SessionApi for NodeApiImpl {
             profile,
         } = args;
         self.claim(&session, Lifecycle::Live)?;
+        self.require_session_access(&session, true).await?;
         // Bind the explicit profile sticky-on-first-open (the same `ensure` seam `submit_routed`
         // uses), so a GUI can "open this chat as agent X" before the first turn submits.
         if profile.is_some() {
@@ -53,6 +59,9 @@ impl SessionApi for NodeApiImpl {
         let routing = self.routing.load();
         let resolved = routing.resolve(&origin);
         self.claim(&resolved.session, Lifecycle::Live)?;
+        // Auth 4: own-or-`SessionControlAny` on the resolved session (new sessions pass and are
+        // stamped by `note_activity`).
+        self.require_session_access(&resolved.session, true).await?;
         // For session-opening commands, bind the resolved profile (sticky on first `ensure`) and seed
         // the resolved `Primary` before submitting, so routing owns agent-selection + delivery. Other
         // commands act on an already-open session whose profile/Primary were bound when it opened.
@@ -76,10 +85,13 @@ impl SessionApi for NodeApiImpl {
     }
 
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
+        // Auth 4: own-or-`SessionControlAny` (the task's named control ops include `poll`).
+        self.require_session_access(&session, true).await?;
         self.live.poll(&session, max)
     }
 
     async fn respond(&self, session: SessionId, response: HostResponse) -> Result<(), ApiError> {
+        self.require_session_access(&session, true).await?;
         self.live.respond(&session, response)
     }
 
@@ -89,6 +101,11 @@ impl SessionApi for NodeApiImpl {
         after_cursor: u64,
         max: u32,
     ) -> JournalPageView {
+        // Auth 4 (read-of-one): own-or-`SessionSeeAll`. The wire return is non-fallible, so an
+        // unauthorized read yields an empty page (no transcript leak) rather than an error.
+        if self.require_session_access(&session, false).await.is_err() {
+            return JournalPageView::default();
+        }
         self.read_history(JournalStreamId::session(&session), after_cursor, max)
             .await
     }
@@ -103,6 +120,8 @@ impl SessionApi for NodeApiImpl {
     }
 
     async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
+        // Auth 4: own-or-`SessionControlAny` (a live subscription is a session-interaction op).
+        self.require_session_access(&session, true).await?;
         Ok(self.live.subscribe(&session, after_seq))
     }
 
@@ -119,10 +138,14 @@ impl SessionApi for NodeApiImpl {
     }
 
     async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
+        // Auth 4: own-or-`SessionControlAny`.
+        self.require_session_access(&session, true).await?;
         self.live.handover(&session, target)
     }
 
     async fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {
+        // Auth 4: own-or-`SessionControlAny` (writes into the session's live log).
+        self.require_session_access(&args.session, true).await?;
         self.live.record_meta(args)
     }
 
@@ -132,6 +155,8 @@ impl SessionApi for NodeApiImpl {
         model: String,
         provider: Option<ProviderSelector>,
     ) -> Result<(), ApiError> {
+        // Auth 4: own-or-`SessionControlAny` (a per-session override write).
+        self.require_session_access(&session, true).await?;
         // Persist the model/provider override on the session overlay (durable host-level metadata),
         // then apply it to the live actor in place when resident. A non-resident session picks it up
         // at its next (re)hydration via the overlay — so a switch is no longer lost on restart.
@@ -153,6 +178,8 @@ impl SessionApi for NodeApiImpl {
         session: SessionId,
         mode: ApprovalMode,
     ) -> Result<(), ApiError> {
+        // Auth 4: own-or-`SessionControlAny`.
+        self.require_session_access(&session, true).await?;
         // Persist the edit-approval override on the overlay, then switch the live actor's policy in
         // place when resident (the live ParkingHandler reads `session_modes` to auto-allow vs park).
         let overlay = self
@@ -171,6 +198,8 @@ impl SessionApi for NodeApiImpl {
         session: SessionId,
         overlay: SessionOverlay,
     ) -> Result<(), ApiError> {
+        // Auth 4: own-or-`SessionControlAny`.
+        self.require_session_access(&session, true).await?;
         // The unified per-session override write: persist the whole overlay, then apply what can be
         // hot-applied to a resident actor (model/provider/approval). A tool-allowlist change takes
         // effect on the next (re)hydration (the live registry is fixed for an actor's lifetime).

@@ -20,6 +20,7 @@ mod harness;
 mod history;
 mod ingest;
 mod messaging;
+mod ownership;
 mod profiles_skills;
 mod routing_auth;
 mod sessions;

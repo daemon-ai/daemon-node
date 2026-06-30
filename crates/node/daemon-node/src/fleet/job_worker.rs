@@ -186,6 +186,14 @@ impl JobWorker for FleetJobWorker {
                 meta.parent = Some(job.session_id.clone());
                 let child_role = job.lifetime.role();
                 meta.role = Some(child_role);
+                // Auth 4: a delegated child INHERITS the delegating (parent) session's owner — the
+                // worker runs in a background service task with no request principal, so ownership
+                // can only flow down the tree. Legacy/unowned parents leave the child unowned too.
+                meta.owner = self
+                    .store
+                    .session_meta(&job.session_id)
+                    .await
+                    .and_then(|m| m.owner);
                 self.store
                     .set_session_meta(&child, meta)
                     .await

@@ -38,7 +38,7 @@ CREATE TABLE cron_jobs (
     last_detail    TEXT,
     fire_count     INTEGER NOT NULL DEFAULT 0,
     created_unix   INTEGER NOT NULL
-);
+, owner TEXT);
 CREATE TABLE cron_runs (
     rowseq        INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id        TEXT NOT NULL,
@@ -148,7 +148,7 @@ CREATE TABLE session_meta (
     archived         INTEGER NOT NULL DEFAULT 0,
     scheduled_job    TEXT,
     activation_epoch INTEGER NOT NULL DEFAULT 0
-);
+, owner TEXT);
 CREATE TABLE session_record (
     session_id  TEXT PRIMARY KEY,
     partition   INTEGER NOT NULL,

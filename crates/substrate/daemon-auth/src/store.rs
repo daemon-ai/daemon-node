@@ -93,8 +93,24 @@ CREATE TABLE IF NOT EXISTS resource_grants (
 );
 "#;
 
-static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(SCHEMA)]));
+static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(SCHEMA),
+        // M2 (Auth 4 EXTERNAL): map a verified mTLS client-certificate fingerprint to a user. The
+        // SASL EXTERNAL read path (`external_identity`) resolves a presented cert to its owner;
+        // `set_external_identity` is the store-level writer (the admin enrollment op is deferred).
+        // `fingerprint` is the primary key — one certificate maps to at most one user. Never edit a
+        // released migration; this only appends a table.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS external_identities (\
+                fingerprint TEXT PRIMARY KEY, \
+                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, \
+                created_at  INTEGER NOT NULL\
+             );\n\
+             CREATE INDEX IF NOT EXISTS external_identities_user ON external_identities (user_id);",
+        ),
+    ])
+});
 
 /// A persisted user row (without credential material).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -505,6 +521,51 @@ impl AuthStore {
         )?;
         Ok(())
     }
+
+    // --- EXTERNAL (mTLS) identities (Auth 4) ------------------------------------------------
+
+    /// Map a verified client-certificate `fingerprint` to a user (SASL EXTERNAL enrollment). Upsert:
+    /// re-binding a fingerprint moves it to the new user. Errors with [`Error::NotFound`] if the
+    /// target user row does not exist. The admin op that exposes this is deferred (Auth 5); this is
+    /// the store-level writer so the read path is testable end-to-end.
+    pub fn set_external_identity(&self, user_id: &str, fingerprint: &str) -> Result<()> {
+        let conn = self.lock();
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE id = ?1",
+                params![user_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(Error::NotFound);
+        }
+        conn.execute(
+            "INSERT INTO external_identities (fingerprint, user_id, created_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(fingerprint) DO UPDATE SET user_id = excluded.user_id, \
+             created_at = excluded.created_at",
+            params![fingerprint, user_id, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a verified client-certificate `fingerprint` to its `(user_id, username)`, or `None`
+    /// when unmapped or the mapped user is disabled (fail-closed: an unmapped/disabled cert is never
+    /// trusted). The SASL EXTERNAL mechanism feeds the result into the authenticated principal.
+    pub fn external_identity(&self, fingerprint: &str) -> Result<Option<(String, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT u.id, u.username FROM external_identities e \
+             JOIN users u ON u.id = e.user_id \
+             WHERE e.fingerprint = ?1 AND u.disabled = 0",
+            params![fingerprint],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(Error::from)
+    }
 }
 
 #[cfg(test)]
@@ -524,7 +585,57 @@ mod tests {
             .lock()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
+    }
+
+    #[test]
+    fn external_identity_resolves_written_fingerprint_and_denies_unknown() {
+        let s = store();
+        let u = s.create_user("svc", "pw", &[Role::Operator]).unwrap();
+        // Unmapped fingerprint: deny (fail-closed).
+        assert!(s.external_identity("ab12cd34").unwrap().is_none());
+        // Writing then reading resolves to the right user.
+        s.set_external_identity(&u.id, "ab12cd34").unwrap();
+        let (uid, name) = s.external_identity("ab12cd34").unwrap().expect("mapped");
+        assert_eq!(uid, u.id);
+        assert_eq!(name, "svc");
+        // A still-unknown fingerprint stays denied.
+        assert!(s.external_identity("ffffffff").unwrap().is_none());
+    }
+
+    #[test]
+    fn external_identity_requires_existing_user_and_hides_disabled() {
+        let s = store();
+        // Binding to a nonexistent user is rejected.
+        assert!(matches!(
+            s.set_external_identity("ghost", "aa"),
+            Err(Error::NotFound)
+        ));
+        // A disabled user's mapping is not resolvable (disable hides the EXTERNAL identity too).
+        let u = s.create_user("dora", "pw", &[Role::User]).unwrap();
+        s.set_external_identity(&u.id, "bb22").unwrap();
+        assert!(s.external_identity("bb22").unwrap().is_some());
+        s.set_disabled(&u.id, true).unwrap();
+        assert!(s.external_identity("bb22").unwrap().is_none());
+    }
+
+    #[test]
+    fn external_identity_rebinds_and_cascades_on_user_delete() {
+        let s = store();
+        let a = s.create_user("a", "pw", &[Role::User]).unwrap();
+        let b = s.create_user("b", "pw", &[Role::User]).unwrap();
+        // Re-binding a fingerprint moves it to the new user (upsert).
+        s.set_external_identity(&a.id, "deadbeef").unwrap();
+        s.set_external_identity(&b.id, "deadbeef").unwrap();
+        assert_eq!(
+            s.external_identity("deadbeef").unwrap().map(|(id, _)| id),
+            Some(b.id.clone())
+        );
+        // ON DELETE CASCADE: removing the user drops the mapping.
+        s.lock()
+            .execute("DELETE FROM users WHERE id = ?1", params![b.id])
+            .unwrap();
+        assert!(s.external_identity("deadbeef").unwrap().is_none());
     }
 
     #[test]

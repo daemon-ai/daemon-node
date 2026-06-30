@@ -6,6 +6,17 @@
 
 use super::*;
 
+/// The Auth 4 ownership state of a session id, resolved by
+/// [`NodeApiImpl::session_ownership`](NodeApiImpl::session_ownership).
+pub(crate) enum SessionOwnership {
+    /// No durable row, no live session, no meta — a creation / not-found path.
+    Absent,
+    /// The session exists and is owned by this `user_id`.
+    Owned(String),
+    /// The session exists but carries no owner (a pre-Auth-4 / system row).
+    LegacyUnowned,
+}
+
 impl NodeApiImpl {
     /// The node-wide event feed, when wired (cloned out for an emit / `bump_rev` in the §5 hooks that
     /// hang off `NodeApiImpl` directly — roster/meta changes).
@@ -25,7 +36,14 @@ impl NodeApiImpl {
             let this = self.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                let report = this.tree().await;
+                // The bus carries the FULL (unscoped) snapshot: this runs in a spawned task with no
+                // request principal, and each `tree_subscribe` consumer applies its own Auth 4 owner
+                // scope (operators forward it raw; non-operators re-project owner-scoped). Using the
+                // owner-scoped `tree()` here would broadcast an empty tree (deny-closed, no principal).
+                let report = match &this.fleet {
+                    Some(fleet) => fleet.tree().await,
+                    None => daemon_api::TreeReport::default(),
+                };
                 let _ = tx.send(daemon_api::TreeEvent::Snapshot(report));
             });
         }
@@ -49,20 +67,19 @@ impl NodeApiImpl {
         total
     }
 
-    /// The unified, unscoped roster: every durable `session_record` row plus every live-interactive
-    /// session, each enriched with its host meta (profile/title/last_activity/role/parent). The
-    /// durable status wins when an id exists in both. The scope filter, sort, and pagination are
-    /// applied by [`ControlApi::sessions_query`] on top of this.
-    pub(crate) async fn roster(&self) -> Vec<SessionInfo> {
+    /// The unified, unscoped roster rows: every durable `session_record` row plus every
+    /// live-interactive session, each enriched with its host meta and paired with its owner
+    /// `user_id` (Auth 4). The durable status wins when an id exists in both. The single fan-in for
+    /// [`roster_scoped`](Self::roster_scoped) — so the owner read happens exactly once per session.
+    pub(crate) async fn roster_rows(&self) -> Vec<(SessionInfo, Option<String>)> {
         let mut seen: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
         let mut out = Vec::new();
         for (session, status) in self.store.list_sessions().await {
             let meta = self.store.session_meta(&session).await.unwrap_or_default();
-            out.push(session_info_from(
-                &session,
-                Some(status),
-                &meta,
-                ApiLifecycle::Durable,
+            let owner = meta.owner.clone();
+            out.push((
+                session_info_from(&session, Some(status), &meta, ApiLifecycle::Durable),
+                owner,
             ));
             seen.insert(session);
         }
@@ -71,9 +88,121 @@ impl NodeApiImpl {
                 continue;
             }
             let meta = self.store.session_meta(&session).await.unwrap_or_default();
-            out.push(session_info_from(&session, None, &meta, ApiLifecycle::Live));
+            let owner = meta.owner.clone();
+            out.push((
+                session_info_from(&session, None, &meta, ApiLifecycle::Live),
+                owner,
+            ));
         }
         out
+    }
+
+    /// The roster scoped to the **current request principal** (Auth 4): a peer sees only sessions it
+    /// owns; a `SessionSeeAll` holder (operator) sees every session including legacy `owner IS NULL`
+    /// rows; an absent principal sees nothing (deny-closed). The `SessionScope` filter, sort, and
+    /// pagination are layered on top by [`ControlApi::sessions_query`].
+    pub(crate) async fn roster_scoped(&self) -> Vec<SessionInfo> {
+        let principal = crate::request_context::current_principal();
+        self.roster_rows()
+            .await
+            .into_iter()
+            .filter(|(_info, owner)| owner_visible(&principal, owner))
+            .map(|(info, _owner)| info)
+            .collect()
+    }
+
+    /// Resolve a session's Auth 4 ownership state: `Absent` (no durable row, no live session, no
+    /// meta — a creation/`NotFound` path), `Owned(user_id)`, or `LegacyUnowned` (it exists but
+    /// carries no owner — a pre-Auth-4 / system row, reachable only via an override capability).
+    pub(crate) async fn session_ownership(&self, session: &SessionId) -> SessionOwnership {
+        let meta = self.store.session_meta(session).await;
+        let owner = meta.as_ref().and_then(|m| m.owner.clone());
+        let exists = meta.is_some()
+            || self.store.status(session).await.is_some()
+            || self.live.live_ids().iter().any(|s| s == session);
+        match (exists, owner) {
+            (false, _) => SessionOwnership::Absent,
+            (true, Some(owner)) => SessionOwnership::Owned(owner),
+            (true, None) => SessionOwnership::LegacyUnowned,
+        }
+    }
+
+    /// The per-resource ownership gate (Auth 4), enforced *beneath* Auth 2's coarse capability gate.
+    /// The caller must own `session`, or hold the relevant override capability:
+    /// [`SessionControlAny`](daemon_auth::Capability::SessionControlAny) for an interaction op
+    /// (`control = true`) or [`SessionSeeAll`](daemon_auth::Capability::SessionSeeAll) for a
+    /// read-of-one (`control = false`). An `Absent` session passes so the create/`NotFound` flow runs
+    /// downstream; a `LegacyUnowned` (owner-NULL) session is reachable only via the override.
+    ///
+    /// `None` principal is the trusted in-process / local-embedding path (see [`owner_visible`]): the
+    /// transport gate (`authorize`) has already denied any unauthenticated *network* request before
+    /// dispatch, so a missing principal here is the privileged local caller and passes.
+    pub(crate) async fn require_session_access(
+        &self,
+        session: &SessionId,
+        control: bool,
+    ) -> Result<(), ApiError> {
+        // Trusted in-process caller (no transport principal bound): the network gate guarantees a
+        // principal upstream, so `None` is the local embedding / Unix-socket `system` path.
+        let Some(principal) = crate::request_context::current_principal() else {
+            return Ok(());
+        };
+        let override_cap = if control {
+            daemon_auth::Capability::SessionControlAny
+        } else {
+            daemon_auth::Capability::SessionSeeAll
+        };
+        if principal.has(override_cap) {
+            return Ok(());
+        }
+        match self.session_ownership(session).await {
+            // No such session yet: let the normal create / not-found path handle it.
+            SessionOwnership::Absent => Ok(()),
+            SessionOwnership::Owned(owner) if owner == principal.user_id => Ok(()),
+            _ => Err(ApiError::Forbidden(format!(
+                "session {session} is not owned by the caller"
+            ))),
+        }
+    }
+
+    /// The orchestration tree projected for `principal` (Auth 4). A `SessionSeeAll` holder sees the
+    /// whole tree; any other principal sees only the subtrees it owns (children inherit the parent's
+    /// owner, so a node is retained iff its backing session is owner-visible, and a dropped parent's
+    /// child refs / a dropped root are pruned). A sessionless unit has no owner ⇒ operator-only.
+    pub(crate) async fn tree_owned(
+        &self,
+        principal: &Option<daemon_auth::Principal>,
+    ) -> TreeReport {
+        let mut report = match &self.fleet {
+            Some(fleet) => fleet.tree().await,
+            None => return TreeReport::default(),
+        };
+        if principal
+            .as_ref()
+            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll))
+        {
+            return report;
+        }
+        let mut visible: std::collections::HashSet<UnitId> = std::collections::HashSet::new();
+        for node in &report.nodes {
+            let owner = match &node.session {
+                Some(s) => self.store.session_meta(s).await.and_then(|m| m.owner),
+                None => None,
+            };
+            if owner_visible(principal, &owner) {
+                visible.insert(node.id.clone());
+            }
+        }
+        report.nodes.retain(|n| visible.contains(&n.id));
+        for node in &mut report.nodes {
+            node.children.retain(|c| visible.contains(c));
+        }
+        if let Some(root) = &report.root {
+            if !visible.contains(root) {
+                report.root = None;
+            }
+        }
+        report
     }
 
     /// Record activity on `session` from an inbound `command`: stamp `last_activity_ms` to now
@@ -89,6 +218,12 @@ impl NodeApiImpl {
         };
         let mut meta = self.store.session_meta(session).await.unwrap_or_default();
         meta.last_activity_ms = Some(now_ms());
+        // Auth 4: stamp the owner from the request principal on first touch (creation), never
+        // overwriting an existing owner — the first interactive submit fixes ownership for the
+        // session's life. A principal-less path (none bound) leaves it `None` (legacy/operator-only).
+        if meta.owner.is_none() {
+            meta.owner = crate::request_context::current_principal().map(|p| p.user_id);
+        }
         // Seed a roster title from the opening user turn (truncated) when the session has none yet;
         // a real generated title can replace it later (the field is the foundation).
         if meta.title.is_none() {
@@ -185,6 +320,28 @@ fn now_ms() -> u64 {
 /// The default roster page size when [`SessionQuery::limit`] is `0`.
 const DEFAULT_ROSTER_PAGE: usize = 50;
 
+/// Whether `owner` is visible to `principal` under the Auth 4 enumeration policy:
+/// - a `SessionSeeAll` holder (operator) sees everything, including legacy `owner IS NULL` rows;
+/// - any other authenticated principal sees only rows it owns (a peer never sees another's session,
+///   and a legacy/unowned row is hidden — deny-closed on an *unknown owner*);
+/// - `None` is a **trusted in-process caller** and sees everything. By the time any read reaches
+///   this point a network request has already been bound to a principal by the transport gate
+///   (`authorize`, which denies an unauthenticated request *before* dispatch), so `None` can only be
+///   the local/embedding path (the Unix socket binds the `system` principal, FFI/direct calls are
+///   in-process trust). The "deny-closed with no principal" invariant is enforced at that gate.
+///
+/// Used by every read/enumeration surface (roster, `session_get`, `session_search`, the tree).
+pub(crate) fn owner_visible(
+    principal: &Option<daemon_auth::Principal>,
+    owner: &Option<String>,
+) -> bool {
+    match principal {
+        None => true,
+        Some(p) if p.has(daemon_auth::Capability::SessionSeeAll) => true,
+        Some(p) => owner.as_deref() == Some(p.user_id.as_str()),
+    }
+}
+
 /// Whether a roster entry matches a queried [`SessionScope`]. `owned` is the resolved owned-session
 /// set, used only by `ByTransport` (empty for other scopes).
 pub(crate) fn session_in_scope(
@@ -279,13 +436,16 @@ pub(crate) fn session_info_from(
     }
 }
 
-/// Project a fresh tree snapshot, applying the subscriber's ephemeral filter — the re-projection a
-/// coalescing `tree_subscribe` collapses a burst into, and the re-sync after a broadcast lag.
+/// Project a fresh tree snapshot for `principal`, applying the subscriber's ephemeral filter — the
+/// re-projection a coalescing `tree_subscribe` collapses a burst into, and the re-sync after a
+/// broadcast lag. Owner-scoped (Auth 4): the snapshot is `tree_owned`, so a non-operator subscriber
+/// only ever sees its own subtrees.
 pub(crate) async fn filtered_tree(
     this: &NodeApiImpl,
     filter: &daemon_api::TreeSubFilter,
+    principal: &Option<daemon_auth::Principal>,
 ) -> TreeReport {
-    let mut report = this.tree().await;
+    let mut report = this.tree_owned(principal).await;
     if !filter.include_ephemeral {
         report
             .nodes
@@ -325,5 +485,42 @@ pub(crate) fn forward_event(
                 Some(daemon_api::TreeEvent::Subagent(view))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_visible_tests {
+    use super::owner_visible;
+    use daemon_auth::{Principal, Role};
+
+    fn principal(name: &str, role: Role) -> Option<Principal> {
+        Some(Principal::from_roles(name, name, vec![role]))
+    }
+
+    #[test]
+    fn peer_sees_only_its_own_and_legacy_is_hidden() {
+        let alice = principal("alice", Role::User);
+        // Owns it -> visible.
+        assert!(owner_visible(&alice, &Some("alice".to_string())));
+        // Another user's session -> hidden.
+        assert!(!owner_visible(&alice, &Some("bob".to_string())));
+        // Legacy/unowned (owner NULL) -> hidden from a non-operator (deny-closed on unknown owner).
+        assert!(!owner_visible(&alice, &None));
+    }
+
+    #[test]
+    fn operator_with_see_all_sees_everything_including_legacy() {
+        let op = principal("op", Role::Operator); // Operator grants SessionSeeAll
+        assert!(owner_visible(&op, &Some("alice".to_string())));
+        assert!(owner_visible(&op, &Some("bob".to_string())));
+        assert!(owner_visible(&op, &None));
+    }
+
+    #[test]
+    fn no_principal_is_trusted_in_process_and_sees_all() {
+        // The transport gate denies an unauthenticated network request before dispatch, so a `None`
+        // principal at this layer is the trusted local/embedding caller.
+        assert!(owner_visible(&None, &Some("alice".to_string())));
+        assert!(owner_visible(&None, &None));
     }
 }

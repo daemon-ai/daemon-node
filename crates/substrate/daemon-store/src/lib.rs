@@ -115,6 +115,13 @@ pub struct SessionMeta {
     /// the durable journal. `0` for the first activation / legacy rows.
     #[serde(default)]
     pub activation_epoch: u64,
+    /// The `user_id` of the principal that owns this session (Auth 4 ownership). Stamped at every
+    /// creation path (interactive submit / durable assign from the request principal; delegation,
+    /// background, and cron children inherit their parent/job owner). `None` on legacy rows and on
+    /// system/unattributed sessions — visible only to a `SessionSeeAll` holder, never to a peer
+    /// user. The store treats it as an opaque key (the host enforces the ownership policy).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
@@ -250,6 +257,11 @@ pub struct StoredCronJob {
     pub fire_count: u32,
     /// Unix seconds the job was created.
     pub created_unix: u64,
+    /// The `user_id` of the principal that created this scheduled job (Auth 4 ownership). The cron
+    /// worker stamps it onto each `cron_{id}_{ts}` session it materializes, so a scheduled run is
+    /// owned by (and visible to) its creator. `None` on legacy rows / system jobs.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// One durable recorded run of a scheduled job (I15). Keyed by `job_id` (the wire `CronRun` omits it
@@ -2069,6 +2081,7 @@ mod session_meta_tests {
             archived: false,
             scheduled_job: Some(JobId::from("cron-7")),
             activation_epoch: 3,
+            owner: Some("user-alice".into()),
         }
     }
 
@@ -2119,6 +2132,7 @@ mod session_meta_tests {
             last_detail: None,
             fire_count: 0,
             created_unix: 1_700_000_000,
+            owner: None,
         }
     }
 
@@ -2132,6 +2146,18 @@ mod session_meta_tests {
         store.cron_set(paused).await.unwrap();
         assert_eq!(store.cron_get("j1").await.unwrap().schedule, "0 9 * * *");
         assert_eq!(store.cron_list().await.len(), 3);
+
+        // The Auth 4 `owner` column round-trips (the cron worker stamps the spawned session's owner
+        // from it); a legacy job (sample_job) carries `None`.
+        let mut owned = sample_job("j-owned", Some(400));
+        owned.owner = Some("user-bob".into());
+        store.cron_set(owned).await.unwrap();
+        assert_eq!(
+            store.cron_get("j-owned").await.unwrap().owner.as_deref(),
+            Some("user-bob")
+        );
+        assert!(store.cron_get("j1").await.unwrap().owner.is_none());
+        store.cron_remove("j-owned").await.unwrap();
 
         // cron_due: only enabled jobs with next_fire <= now.
         let due: Vec<String> = store

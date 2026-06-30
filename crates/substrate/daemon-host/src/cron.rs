@@ -204,6 +204,9 @@ impl CronOps {
             last_detail: None,
             fire_count: 0,
             created_unix: now,
+            // Auth 4: record the creating principal so the worker can stamp each spawned cron
+            // session's owner. `None` for a principal-less (system/local) create.
+            owner: crate::request_context::current_principal().map(|p| p.user_id),
         };
         self.store
             .cron_set(stored)

@@ -168,6 +168,15 @@ impl BackgroundSpawner {
             .record_child_edge(parent.clone(), child.clone(), spec.kind.clone())
             .await
             .ok()?;
+        // Auth 4: an attached background child INHERITS the parent's owner (the spawn runs off the
+        // engine/activation path with no request principal — ownership flows down the tree). Stamped
+        // on a fresh meta row; a legacy/unowned parent leaves the child unowned.
+        let owner = self.store.session_meta(parent).await.and_then(|m| m.owner);
+        if owner.is_some() {
+            let mut meta = self.store.session_meta(&child).await.unwrap_or_default();
+            meta.owner = owner;
+            let _ = self.store.set_session_meta(&child, meta).await;
+        }
         self.store.enqueue_wake(child.clone()).await;
         Some(child)
     }

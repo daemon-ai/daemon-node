@@ -92,7 +92,10 @@ impl ControlApi for NodeApiImpl {
             (Some(since), Some(feed)) => feed.roster_delta(since),
             _ => None,
         };
-        let mut roster = self.roster().await;
+        // Auth 4: the roster is scoped to the request principal (a peer sees only its own sessions;
+        // an operator with `SessionSeeAll` sees all, incl. legacy owner-NULL rows) *before* the
+        // `SessionScope`/sort/pagination below.
+        let mut roster = self.roster_scoped().await;
         // The scope predicate, evaluated per session (so a delta can tell "still in scope" from "left
         // the scope"). `ByTransport` needs the live owned-session set, resolved once.
         let owned: std::collections::HashSet<SessionId> = match &query.scope {
@@ -152,6 +155,11 @@ impl ControlApi for NodeApiImpl {
             return None;
         }
         let meta = self.store.session_meta(&session).await.unwrap_or_default();
+        // Auth 4 (read-of-one): a peer cannot inspect another user's session — return `None` (behave
+        // as not-found, no existence oracle) unless the caller owns it or holds `SessionSeeAll`.
+        if !owner_visible(&current_principal(), &meta.owner) {
+            return None;
+        }
         let lifecycle = if status.is_some() {
             ApiLifecycle::Durable
         } else {
@@ -177,7 +185,8 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn sessions_by_profile(&self) -> Vec<(ProfileRef, Vec<SessionInfo>)> {
-        let mut roster = self.roster().await;
+        // Auth 4: owner-scoped to the request principal (see `sessions_query`).
+        let mut roster = self.roster_scoped().await;
         roster.retain(|i| i.role == SessionRole::Primary && i.bound_profile.is_some());
         let mut grouped: std::collections::BTreeMap<String, (ProfileRef, Vec<SessionInfo>)> =
             std::collections::BTreeMap::new();
@@ -193,16 +202,26 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn session_search(&self, query: String, limit: u32) -> Vec<SessionSearchHit> {
-        self.store
-            .search_sessions(&query, limit)
-            .await
-            .into_iter()
-            .map(|hit| SessionSearchHit {
+        // Auth 4 (read-of-one): drop hits the caller may not see (own sessions only, unless the
+        // caller holds `SessionSeeAll`). Owner is read per hit; the result set is small/capped.
+        let principal = current_principal();
+        let mut out = Vec::new();
+        for hit in self.store.search_sessions(&query, limit).await {
+            let owner = self
+                .store
+                .session_meta(&hit.session_id)
+                .await
+                .and_then(|m| m.owner);
+            if !owner_visible(&principal, &owner) {
+                continue;
+            }
+            out.push(SessionSearchHit {
                 session: hit.session_id,
                 title: hit.title,
                 snippet: hit.snippet,
-            })
-            .collect()
+            });
+        }
+        out
     }
 
     async fn session_update_meta(
@@ -210,8 +229,10 @@ impl ControlApi for NodeApiImpl {
         session: SessionId,
         patch: SessionMetaPatch,
     ) -> Result<(), ApiError> {
+        // Auth 4: rename/pin/archive is a control op — owner or `SessionControlAny` only.
+        self.require_session_access(&session, true).await?;
         // Read-modify-write of the durable `SessionMeta`, preserving the fields the patch does not
-        // touch (overlay/role/parent/bound profile/last activity). Each `None` patch field is a
+        // touch (overlay/role/parent/bound profile/last activity/owner). Each `None` patch field is a
         // leave-unchanged; `title: Some(None)` clears the title (rename-to-empty).
         let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
         if let Some(title) = patch.title {
@@ -257,6 +278,8 @@ impl ControlApi for NodeApiImpl {
         request_id: String,
         allow: bool,
     ) -> Result<(), ApiError> {
+        // Auth 4: only the owner (or a `SessionControlAny` operator) may decide a session's approval.
+        self.require_session_access(&session, true).await?;
         // Record the decision + enqueue the wake durably (one transaction in the store), then nudge
         // the activation manager so the dormant session rehydrates promptly and resolves the gated
         // tool call (allow -> runs it; deny -> injects a tool error). Idempotent in the store.
@@ -277,6 +300,10 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn assign(&self, session: SessionId) -> Result<(), ApiError> {
+        // Auth 4: a peer may only (re)assign a session it owns; an `Absent` session is allowed
+        // through so the create-below path can stamp the caller as owner. `SessionControlAny`
+        // (operator) crosses ownership.
+        self.require_session_access(&session, true).await?;
         // Guard-rail: a session driven through the durable control surface must not also be a live
         // interactive session (two divergent engine instances for one id).
         self.claim(&session, Lifecycle::Durable)?;
@@ -289,6 +316,13 @@ impl ControlApi for NodeApiImpl {
                 .create_session(session.clone(), self.partition, blob)
                 .await
                 .map_err(|e| ApiError::Other(format!("create session: {e}")))?;
+            // Stamp ownership from the request principal (Auth 4); inherited paths (delegation /
+            // background / cron) stamp at their own creation sites. Best-effort meta upsert.
+            let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
+            if meta.owner.is_none() {
+                meta.owner = current_principal().map(|p| p.user_id);
+                let _ = self.store.set_session_meta(&session, meta).await;
+            }
         }
         // Wake it: the activation manager runs (or resumes) the engine; the resident services then
         // carry the durable delegate -> suspend -> resume -> complete cycle forward.
@@ -299,6 +333,8 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn cancel(&self, session: SessionId) -> Result<(), ApiError> {
+        // Auth 4: only the owner (or a `SessionControlAny` operator) may cancel a session.
+        self.require_session_access(&session, true).await?;
         // Best-effort: cancel a matching fleet child and interrupt a matching live session.
         if let Some(fleet) = &self.fleet {
             fleet.cancel(&UnitId::new(session.as_str())).await;
@@ -317,10 +353,9 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn tree(&self) -> TreeReport {
-        match &self.fleet {
-            Some(fleet) => fleet.tree().await,
-            None => TreeReport::default(),
-        }
+        // Auth 4: the orchestration tree is scoped to the request principal (children inherit the
+        // parent owner, so an owned subtree is kept whole and a foreign one dropped whole).
+        self.tree_owned(&current_principal()).await
     }
 
     async fn unit(&self, id: UnitId) -> Option<UnitNode> {
@@ -344,16 +379,20 @@ impl ControlApi for NodeApiImpl {
         let this = self.clone();
         let rx = self.fleet_events.as_ref().map(|tx| tx.subscribe());
 
-        // The initial snapshot is always emitted, bus or not.
-        let initial = {
-            let mut report = this.tree().await;
-            if !filter.include_ephemeral {
-                report
-                    .nodes
-                    .retain(|n| n.role != Some(SessionRole::EphemeralSubagent));
-            }
-            daemon_api::TreeEvent::Snapshot(report)
-        };
+        // Auth 4: capture the subscriber's principal AT SUBSCRIBE TIME — the returned long-lived
+        // stream is polled outside this request's task-local scope, so `current_principal()` would be
+        // `None` there. Every snapshot/delta below is owner-scoped to this captured principal.
+        let principal = current_principal();
+        // An operator (`SessionSeeAll`) gets the efficient per-delta stream; any other subscriber
+        // gets owner-scoped *snapshots* re-projected on each bus wake, so a foreign node can never
+        // ride a raw delta to them.
+        let sees_all = principal
+            .as_ref()
+            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll));
+
+        // The initial snapshot is always emitted, bus or not — owner-scoped + ephemeral-filtered.
+        let initial =
+            daemon_api::TreeEvent::Snapshot(filtered_tree(&this, &filter, &principal).await);
 
         // No bus wired: fall back to the snapshot-only foundation (a single initial snapshot).
         let Some(rx) = rx else {
@@ -361,34 +400,44 @@ impl ControlApi for NodeApiImpl {
         };
 
         let live = stream::unfold(
-            (this, rx, filter),
-            move |(this, mut rx, filter)| async move {
+            (this, rx, filter, principal, sees_all),
+            move |(this, mut rx, filter, principal, sees_all)| async move {
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
-                            if let Some(window) = filter.coalesce_ms {
-                                // Debounce: collapse this burst into one fresh re-projection.
-                                tokio::time::sleep(std::time::Duration::from_millis(window.max(1)))
+                            if filter.coalesce_ms.is_some() || !sees_all {
+                                // Coalescing subscribers, and every non-operator subscriber, get a
+                                // fresh owner-scoped re-projection rather than a raw delta (the delta
+                                // owner-filter would otherwise have to map every event variant to a
+                                // session). Drain any burst first when coalescing.
+                                if let Some(window) = filter.coalesce_ms {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        window.max(1),
+                                    ))
                                     .await;
-                                while rx.try_recv().is_ok() {}
-                                let report = filtered_tree(&this, &filter).await;
+                                    while rx.try_recv().is_ok() {}
+                                }
+                                let report = filtered_tree(&this, &filter, &principal).await;
                                 return Some((
                                     daemon_api::TreeEvent::Snapshot(report),
-                                    (this, rx, filter),
+                                    (this, rx, filter, principal, sees_all),
                                 ));
                             }
-                            // No coalescing: forward the delta, applying the ephemeral filter.
+                            // Operator, no coalescing: forward the delta, applying the ephemeral
+                            // filter (an operator sees every owner's nodes by `SessionSeeAll`).
                             match forward_event(event, &filter) {
-                                Some(out) => return Some((out, (this, rx, filter))),
+                                Some(out) => {
+                                    return Some((out, (this, rx, filter, principal, sees_all)))
+                                }
                                 None => continue,
                             }
                         }
                         // We fell behind the bus: re-sync with a fresh authoritative snapshot.
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let report = filtered_tree(&this, &filter).await;
+                            let report = filtered_tree(&this, &filter, &principal).await;
                             return Some((
                                 daemon_api::TreeEvent::Snapshot(report),
-                                (this, rx, filter),
+                                (this, rx, filter, principal, sees_all),
                             ));
                         }
                         Err(broadcast::error::RecvError::Closed) => return None,
@@ -984,6 +1033,8 @@ impl ControlApi for NodeApiImpl {
         session: SessionId,
         checkpoint_id: String,
     ) -> Result<(), ApiError> {
+        // Auth 4: only the owner (or a `SessionControlAny` operator) may rewind a session.
+        self.require_session_access(&session, true).await?;
         tracing::info!(
             trace_id = %current_trace(),
             session = %session,
@@ -1189,6 +1240,8 @@ impl ControlApi for NodeApiImpl {
         session: SessionId,
         point: daemon_api::RewindPoint,
     ) -> Result<(), ApiError> {
+        // Auth 4: only the owner (or a `SessionControlAny` operator) may rewind a session.
+        self.require_session_access(&session, true).await?;
         // The unified rewind (conversation-rewind spec): truncate the transcript at `point.anchor`
         // and, when `point.restore_workspace`, roll the workspace back to the matching checkpoint —
         // sealing the journal on the way out. A resident session rewinds its in-process engine

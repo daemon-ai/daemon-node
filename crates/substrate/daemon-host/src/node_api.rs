@@ -28,6 +28,7 @@ use crate::credstore::CredentialStore;
 use crate::engine_incarnation::JournalConfig;
 use crate::journal::{JournalFeeder, JournalSink};
 use crate::profiles::ProfileStore;
+use crate::request_context::current_principal;
 use crate::routing::RoutingRegistry;
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
@@ -422,7 +423,8 @@ pub(crate) use messaging::participant_label;
 pub(crate) use overlay::approval_mode_to_policy;
 pub(crate) use profile::profile_err;
 pub(crate) use roster::{
-    filtered_tree, forward_event, paginate_roster, session_in_scope, session_info_from,
+    filtered_tree, forward_event, owner_visible, paginate_roster, session_in_scope,
+    session_info_from,
 };
 pub(crate) use routing::{
     room_label, store_route_from_wire, transport_family_matches, wire_route_from_store,

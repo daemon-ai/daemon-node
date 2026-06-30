@@ -271,6 +271,10 @@ impl CronWorker {
             let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
             meta.scheduled_job = Some(daemon_common::JobId::from(job.id.as_str()));
             meta.role = Some(daemon_store::SessionRole::EphemeralSubagent);
+            // Auth 4: the spawned cron session is owned by the job's creator (captured at
+            // `cron_create` from the request principal), so a scheduled run is visible to (and
+            // controllable by) the user who scheduled it. `None` on legacy/system jobs.
+            meta.owner = job.owner.clone();
             if let Some(target) = &spec.target {
                 meta.bound_profile = Some(ProfileRef::new(target));
             }
