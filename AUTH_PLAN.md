@@ -702,6 +702,30 @@ Deliverable (3) + the two held cross-track decisions remain for the coordinator.
   `serve_mux` is **untouched** (still answers `AuthError` to auth frames, as before); unifying the
   two loops + the `[api].local_trust` Unix policy (B5, held) is the convergence step.
 
+## 13. Convergence — deliverable (3) [LANDED]
+
+Auth 2 (`feature/auth2-authz-core` @ 90d48b2) is merged into this branch; the serve_mux
+handshake → auth → context → authorize → dispatch state machine is wired into every dispatch entry
+point using Auth 2's real interface (`request_context` + `authz`). No shim was used (the prior
+commits left TODOs, not a shim).
+
+- **Merge conflicts resolved:** `daemon-host/src/lib.rs` (module list + re-exports — kept BOTH
+  Auth 2's `authz`/`request_context` and Auth 3's `authn`/`tls`), `daemon-host/Cargo.toml` (deduped
+  the `daemon-auth` dependency both branches added), and `AUTH_PLAN.md` (add/add — kept ours). The
+  workspace `Cargo.toml`/`Cargo.lock` auto-merged; `commands.rs` is Auth 2's `caller_access`
+  inversion (principal-driven; kept verbatim).
+- **One shared, context-aware mux loop** (`socket::serve_mux<R,W>`, `AuthMode::{LocalSystem,
+  Required}`) now backs **both** the Unix socket and TLS/TCP; the per-`Call` spawned task
+  re-enters `with_request_context(...)` (the task-local is not inherited by `tokio::spawn`) and runs
+  `authorize` before `dispatch`. Entry points wired: Unix `serve_mux` + `serve_legacy`, TLS TCP,
+  HTTP (`daemon-http`), FFI (`daemon_host_call`). Pre-auth `Call`/`Open` on an auth-required
+  connection → `Unauthenticated` / `End{Unauthenticated}`, connection stays unelevated.
+- **B5 ratified:** `[api].local_trust` defaults to `system` → Unix/FFI/in-process-HTTP bind
+  `RequestContext::system()` (no SASL offered); disabling it makes the Unix socket require SCRAM and
+  fully gates HTTP (deny-all until HTTP SASL lands). TCP/TLS always requires auth.
+- **B3 ratified:** EXTERNAL fingerprint→user stays the fail-closed stub (denies); the
+  `external_identities` migration is deferred to Auth 4's migration batch. TODO left in place.
+
 ### Blockers / risks (need coordinator or upstream confirmation)
 - **B1 (highest):** exact rsasl 2.3.1 **server-side SCRAM stored-material property** shape
   (`ScramStoredPassword` fields vs provider tag). The schema matches the expected fields, but the

@@ -124,7 +124,7 @@ pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
     TransportPattern,
 };
-pub use socket::{serve_api_unix, ApiClient, MuxApiClient};
+pub use socket::{serve_api_unix, serve_api_unix_authenticated, ApiClient, MuxApiClient};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,

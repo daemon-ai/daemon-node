@@ -33,6 +33,9 @@ const API_REQUIRE_CLIENT_CERT_ENV: &str = "DAEMON_API_REQUIRE_CLIENT_CERT";
 const API_TLS_CLIENT_CA_ENV: &str = "DAEMON_API_TLS_CLIENT_CA";
 /// Path to the SQLite identity store backing authentication (default `<data_dir>/auth.sqlite`).
 const API_AUTH_DB_ENV: &str = "DAEMON_API_AUTH_DB";
+/// The local-trust principal name for the Unix socket / FFI / in-process HTTP (`""`/`off`/`none`
+/// disables it, requiring SCRAM on the Unix socket and fully gating HTTP). Default `system`.
+const API_LOCAL_TRUST_ENV: &str = "DAEMON_API_LOCAL_TRUST";
 /// Selects the durable store backend: `memory` (default) or `sqlite`.
 const STORE_ENV: &str = "DAEMON_STORE";
 /// The SQLite database path (when the backend is `sqlite`).
@@ -598,6 +601,11 @@ pub struct ApiConfig {
     pub tls_client_ca: Option<PathBuf>,
     /// SQLite identity store path backing authentication (defaults to `<data_dir>/auth.sqlite`).
     pub auth_db: PathBuf,
+    /// The local-trust principal for the Unix socket / FFI / in-process HTTP. `Some(name)` (default
+    /// `"system"`) binds a full-trust [`RequestContext::system`] on those local paths and offers no
+    /// SASL exchange there; `None` (operator set `""`/`off`/`none`) makes the Unix socket require
+    /// SCRAM and fully gates HTTP. TCP/TLS always requires authentication regardless.
+    pub local_trust: Option<String>,
 }
 
 /// The durable store backend selected by config.
@@ -809,6 +817,7 @@ struct FileApiConfig {
     require_client_cert: Option<bool>,
     tls_client_ca: Option<PathBuf>,
     auth_db: Option<PathBuf>,
+    local_trust: Option<String>,
 }
 
 /// The `[matrix]` TOML table — the Matrix transport surface (every field optional). Carries **no**
@@ -1309,6 +1318,15 @@ impl NodeConfig {
             .map(PathBuf::from)
             .or(file.auth_db)
             .unwrap_or_else(|| data_dir.join("auth.sqlite"));
+        // Local trust defaults to the synthetic `system` principal (B5). An explicit empty / `off` /
+        // `none` disables it (Unix requires SCRAM; HTTP fully gated).
+        let local_trust_raw = env_string(API_LOCAL_TRUST_ENV)
+            .or(file.local_trust)
+            .unwrap_or_else(|| "system".to_string());
+        let local_trust = match local_trust_raw.trim().to_ascii_lowercase().as_str() {
+            "" | "off" | "none" | "false" => None,
+            _ => Some(local_trust_raw.trim().to_string()),
+        };
         ApiConfig {
             tls_addr,
             tls_cert,
@@ -1316,6 +1334,7 @@ impl NodeConfig {
             require_client_cert,
             tls_client_ca,
             auth_db,
+            local_trust,
         }
     }
 

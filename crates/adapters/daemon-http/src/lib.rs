@@ -28,16 +28,18 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daemon_api::{
-    dispatch, ApiRequest, ApiResponse, FsRootId, FsWatchAfterArgs, LogFilter, LogLineStream,
-    LogStream, NodeApi, SessionLogEntry, TreeStream, TreeSubFilter,
+    dispatch, ApiError, ApiRequest, ApiResponse, FsRootId, FsWatchAfterArgs, LogFilter,
+    LogLineStream, LogStream, NodeApi, SessionLogEntry, TreeStream, TreeSubFilter,
 };
 use daemon_common::SessionId;
 use daemon_delivery::{serve_delivery, Projector};
+use daemon_host::{authorize, with_request_context, RequestContext};
 use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId};
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::{Stream, StreamExt};
@@ -47,7 +49,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-/// The shared adapter state: the one node surface every request reaches.
+/// The shared adapter state: the one node surface every request reaches. Trust is decided once in
+/// [`router`] (HTTP carries no SASL yet, so it is all-or-nothing per `[api].local_trust`): when
+/// disabled the routes are not even mounted (a deny-all fallback replaces them), so a mounted
+/// handler always runs under local trust and dispatches as [`RequestContext::system`].
 #[derive(Clone)]
 struct AppState {
     api: Arc<dyn NodeApi>,
@@ -79,7 +84,13 @@ struct CursorQuery {
 ///   adapter enumerates the `http/{tenant}` instance's owned sessions via `daemon-delivery` and
 ///   multiplexes their merged-log subscriptions into one SSE stream. This is the reconnect-safe pull
 ///   path — a reconnecting tenant rediscovers and resumes every session it owns without tracking ids.
-pub fn router(api: Arc<dyn NodeApi>) -> Router {
+pub fn router(api: Arc<dyn NodeApi>, local_trust: bool) -> Router {
+    // Fail-closed: without local trust there is no way to authenticate over HTTP yet (no HTTP SASL),
+    // so the entire surface denies rather than serving ungated. Under local trust the full surface is
+    // mounted and every request dispatches as the `system()` principal.
+    if !local_trust {
+        return Router::new().fallback(deny_all);
+    }
     Router::new()
         .route("/api", post(api_dispatch))
         .route("/tenants/{tenant}/submit", post(submit_routed_tenant))
@@ -95,17 +106,32 @@ pub fn router(api: Arc<dyn NodeApi>) -> Router {
         .with_state(AppState { api })
 }
 
-/// Serve the adapter over a bound [`tokio::net::TcpListener`] until it errors. Spawn it as a
-/// background task alongside the other transports after the host starts.
+/// Serve the adapter over a bound [`tokio::net::TcpListener`] until it errors. `local_trust` mirrors
+/// `[api].local_trust`: when set, requests dispatch as [`RequestContext::system`]; when unset, the
+/// surface is fully gated (fail-closed) until HTTP SASL lands. Spawn it as a background task.
 pub async fn serve_http(
     listener: tokio::net::TcpListener,
     api: Arc<dyn NodeApi>,
+    local_trust: bool,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(api)).await
+    axum::serve(listener, router(api, local_trust)).await
 }
 
-/// `POST /api` — the JSON reflection of [`dispatch`]: decode an [`ApiRequest`], call the interface,
-/// encode the [`ApiResponse`].
+/// The fail-closed handler mounted for every route when local trust is disabled.
+async fn deny_all() -> (StatusCode, Json<ApiResponse>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ApiResponse::Error(ApiError::Unauthenticated(
+            "the http transport requires [api].local_trust (SASL over HTTP is not yet supported)"
+                .into(),
+        ))),
+    )
+}
+
+/// `POST /api` — the JSON reflection of [`dispatch`]: decode an [`ApiRequest`], run it through the
+/// capability gate, call the interface, encode the [`ApiResponse`]. Only mounted under local trust,
+/// so it dispatches inside a [`RequestContext::system`] scope (the gate then passes for the
+/// full-trust principal); `authorize` is still consulted so the path is identical to every other.
 async fn api_dispatch(
     State(state): State<AppState>,
     Json(req): Json<ApiRequest>,
@@ -122,7 +148,13 @@ async fn api_dispatch(
                 event = fields::event::API_REQUEST,
                 "api request received over http"
             );
-            dispatch(state.api.as_ref(), req).await
+            with_request_context(RequestContext::system(), async {
+                match authorize(&req) {
+                    Ok(()) => dispatch(state.api.as_ref(), req).await,
+                    Err(e) => ApiResponse::Error(e),
+                }
+            })
+            .await
         },
     )
     .await;
@@ -155,10 +187,15 @@ async fn submit_routed_tenant(
                 operation = "submit_routed",
                 "tenant routed submit received over http"
             );
-            match state.api.submit_routed(origin, command).await {
-                Ok(session) => ApiResponse::Routed { session },
-                Err(e) => ApiResponse::Error(e),
-            }
+            // Only mounted under local trust: dispatch the routed submit as the `system()` principal
+            // so any downstream ownership/context read sees a bound identity.
+            with_request_context(RequestContext::system(), async {
+                match state.api.submit_routed(origin, command).await {
+                    Ok(session) => ApiResponse::Routed { session },
+                    Err(e) => ApiResponse::Error(e),
+                }
+            })
+            .await
         },
     )
     .await;

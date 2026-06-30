@@ -13,19 +13,23 @@
 //!   streaming requests (`Subscribe`) push `Item`s until `End`/`Cancel`. The disjoint tag sets make
 //!   the first-frame mode select unambiguous.
 
+use crate::authn::{AuthExchange, AuthSuccess, Authenticator, BeginOutcome, StepOutcome, TlsState};
+use crate::authz::authorize;
+use crate::request_context::{with_request_context, AuthMethod, RequestContext};
 use daemon_api::{
     dispatch, from_cbor, is_streaming, to_cbor, ApiError, ApiRequest, ApiResponse, EventsPage,
-    LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM,
-    WIRE_FEATURE_VERSIONING, WIRE_VERSION,
+    LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C, WIRE_FEATURE_AUTH, WIRE_FEATURE_MUX,
+    WIRE_FEATURE_STREAM, WIRE_FEATURE_VERSIONING, WIRE_VERSION,
 };
+use daemon_auth::Principal;
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -36,16 +40,69 @@ pub(crate) const WRITER_QUEUE: usize = 256;
 /// connection-level Health probe. An empty `LogPage` doubles as the keepalive.
 const STREAM_KEEPALIVE: Duration = Duration::from_secs(20);
 
-/// Serve the node surface over a bound [`UnixListener`] until it errors. Each accepted connection
-/// runs independently; within a connection the mode (legacy vs multiplexed) is chosen by its first
-/// frame. Runs forever; spawn it as a background task after `host.start()`.
+/// Server-assigned per-connection id (audit/telemetry correlation; threaded into the request
+/// context as `conn_id`).
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How a connection establishes the [`RequestContext`] every dispatch runs under.
+pub(crate) enum AuthMode {
+    /// Local trust ([`api].local_trust`): bind [`RequestContext::system`] (full-trust admin) for
+    /// every request, advertise NO mechanisms, and run no SASL exchange. The Unix socket / FFI /
+    /// CLI default — the deliberate, audited unauthenticated-but-trusted path.
+    LocalSystem,
+    /// Require a completed SASL exchange before any `Call`/`Open`. Advertises the authenticator's
+    /// permitted mechanisms for the transport; binds the authenticated principal post-`AuthOk`.
+    /// The only mode used on TCP/TLS (and on the Unix socket when `local_trust` is disabled).
+    Required {
+        /// The SASL authenticator driving the handshake.
+        auth: Arc<Authenticator>,
+        /// Transport security facts (gates PLAIN/EXTERNAL, carries the client-cert fingerprint).
+        tls_state: TlsState,
+    },
+}
+
+impl AuthMode {
+    fn is_local_system(&self) -> bool {
+        matches!(self, AuthMode::LocalSystem)
+    }
+}
+
+/// Serve the node surface over a bound [`UnixListener`] until it errors, under **local trust**: the
+/// Unix socket is the deployment-trusted local path, so every request runs as
+/// [`RequestContext::system`] and no SASL exchange is offered. This is the default + the
+/// FFI/CLI/conformance entry point. For an authenticated Unix socket (operator disabled
+/// `local_trust`) use [`serve_api_unix_authenticated`]. Runs forever; spawn it as a background task.
 pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
+    accept_unix(listener, api, Arc::new(AuthMode::LocalSystem)).await;
+}
+
+/// As [`serve_api_unix`], but the Unix socket **requires** a SASL exchange (no local trust): the
+/// connection must authenticate via the [`Authenticator`] before any `Call`/`Open`. Used when
+/// `[api].local_trust` is disabled.
+pub async fn serve_api_unix_authenticated(
+    listener: UnixListener,
+    api: Arc<dyn NodeApi>,
+    auth: Arc<Authenticator>,
+) {
+    let mode = Arc::new(AuthMode::Required {
+        auth,
+        tls_state: TlsState::plaintext(),
+    });
+    accept_unix(listener, api, mode).await;
+}
+
+async fn accept_unix(listener: UnixListener, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let api = api.clone();
+                let mode = mode.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_conn(stream, api).await {
+                    if let Err(e) = serve_conn(stream, api, mode).await {
                         tracing::debug!("api socket connection ended: {e}");
                     }
                 });
@@ -58,8 +115,13 @@ pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
     }
 }
 
-async fn serve_conn(stream: UnixStream, api: Arc<dyn NodeApi>) -> std::io::Result<()> {
+async fn serve_conn(
+    stream: UnixStream,
+    api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
+) -> std::io::Result<()> {
     let (mut rd, wr) = stream.into_split();
+    let conn_id = next_conn_id();
     let first = match read_frame(&mut rd).await? {
         Some(bytes) => bytes,
         None => return Ok(()),
@@ -68,18 +130,27 @@ async fn serve_conn(stream: UnixStream, api: Arc<dyn NodeApi>) -> std::io::Resul
     // client sends a bare `ApiRequest`, whose externally-tagged variants are disjoint from
     // `WireC2S` (`Hello`/`Call`/`Cancel`), so it never decodes as one.
     match from_cbor::<WireC2S>(&first) {
-        Ok(frame) => serve_mux(rd, wr, api, frame).await,
-        Err(_) => serve_legacy(rd, wr, api, first).await,
+        Ok(frame) => serve_mux(rd, wr, api, mode, Some(frame), conn_id).await,
+        Err(_) => serve_legacy(rd, wr, api, mode, first, conn_id).await,
     }
 }
 
 /// Legacy one-shot: bare `ApiRequest` -> `dispatch` -> bare `ApiResponse`, sequential per connection.
-async fn serve_legacy(
-    mut rd: OwnedReadHalf,
-    mut wr: OwnedWriteHalf,
+/// The bare protocol carries no SASL handshake, so it is served only under [`AuthMode::LocalSystem`]
+/// (the FFI/CLI local-trust path); when auth is required this transport refuses with
+/// [`ApiError::Unauthenticated`] (a networked client must use the multiplexed SASL path).
+async fn serve_legacy<R, W>(
+    mut rd: R,
+    mut wr: W,
     api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
     first: Vec<u8>,
-) -> std::io::Result<()> {
+    conn_id: u64,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut bytes = first;
     loop {
         let trace = ingress_trace(None);
@@ -96,7 +167,15 @@ async fn serve_legacy(
                             event = fields::event::API_REQUEST,
                             "api request received over unix socket"
                         );
-                        dispatch(api.as_ref(), request).await
+                        if mode.is_local_system() {
+                            let ctx = RequestContext::system().with_conn_id(conn_id);
+                            authorize_and_dispatch(api.as_ref(), request, ctx).await
+                        } else {
+                            // No SASL handshake on the bare protocol: fail closed.
+                            ApiResponse::Error(ApiError::Unauthenticated(
+                                "authentication required; use the multiplexed SASL protocol".into(),
+                            ))
+                        }
                     }
                     Err(e) => ApiResponse::Error(e),
                 }
@@ -111,14 +190,90 @@ async fn serve_legacy(
     }
 }
 
-/// Multiplexed: decode each `WireC2S`, spawning a task per `Call` and multiplexing results back over
-/// a single writer task. One slow handler no longer blocks others on the same connection.
-async fn serve_mux(
-    mut rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
+/// The per-connection authentication state.
+enum ConnAuth {
+    /// No successful auth yet; `Call`/`Open` are refused with `Unauthenticated`.
+    Unauthenticated,
+    /// A multi-step mechanism (SCRAM) is mid-exchange; carries the method for the eventual success.
+    InProgress(AuthExchange, AuthMethod),
+    /// Authenticated (or local-trust): every dispatch binds this principal + method.
+    Authenticated {
+        principal: Principal,
+        method: AuthMethod,
+    },
+}
+
+/// Map a SASL mechanism name to its [`AuthMethod`] (audit/telemetry tag).
+fn auth_method_for(mechanism: &str) -> AuthMethod {
+    use crate::authn::{MECH_EXTERNAL, MECH_PLAIN, MECH_SCRAM_SHA_256};
+    match mechanism {
+        m if m == MECH_SCRAM_SHA_256 => AuthMethod::Scram,
+        m if m == MECH_PLAIN => AuthMethod::Plain,
+        m if m == MECH_EXTERNAL => AuthMethod::External,
+        _ => AuthMethod::Scram,
+    }
+}
+
+/// Run `req` through the capability gate then `dispatch`, all inside `ctx`'s task-local scope.
+/// `tokio::spawn`ed tasks do NOT inherit the caller's task-local, so EVERY spawned per-`Call` task
+/// re-establishes the scope here (the Auth 2 caveat); `current_principal` is otherwise `None`
+/// (fail-closed) and the gate denies.
+async fn authorize_and_dispatch(
+    api: &dyn NodeApi,
+    req: ApiRequest,
+    ctx: RequestContext,
+) -> ApiResponse {
+    with_request_context(ctx, async {
+        match authorize(&req) {
+            Ok(()) => dispatch(api, req).await,
+            Err(e) => ApiResponse::Error(e),
+        }
+    })
+    .await
+}
+
+/// Deliver a completed authentication to the client: any trailing mechanism bytes (the SCRAM
+/// server-final message) ride a final `AuthChallenge` before `AuthOk` (the frozen `AuthOk` carries
+/// no mechanism bytes), then `AuthOk { token, principal }`. Returns the bound principal.
+async fn complete_auth(
+    tx: &mpsc::Sender<WireS2C>,
+    final_data: Option<Vec<u8>>,
+    success: Box<AuthSuccess>,
+) -> Principal {
+    if let Some(data) = final_data {
+        let _ = tx.send(WireS2C::AuthChallenge { data }).await;
+    }
+    let AuthSuccess {
+        principal,
+        token,
+        principal_view,
+    } = *success;
+    let _ = tx
+        .send(WireS2C::AuthOk {
+            token,
+            principal: principal_view,
+        })
+        .await;
+    principal
+}
+
+/// Multiplexed serve loop, generic over the byte stream halves so it backs both the Unix socket and
+/// the TLS/TCP transport. Decodes each `WireC2S`, runs the SASL handshake (when [`AuthMode::Required`]),
+/// and — only once authenticated (or under local trust) — spawns a task per `Call` that
+/// re-establishes the request context, runs the capability gate, and dispatches. A single writer
+/// task multiplexes `Reply`/`Item`/`End` frames back.
+pub(crate) async fn serve_mux<R, W>(
+    mut rd: R,
+    wr: W,
     api: Arc<dyn NodeApi>,
-    first: WireC2S,
-) -> std::io::Result<()> {
+    mode: Arc<AuthMode>,
+    first: Option<WireC2S>,
+    conn_id: u64,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<WireS2C>(WRITER_QUEUE);
     let writer = tokio::spawn(async move {
         let mut wr = wr;
@@ -129,18 +284,26 @@ async fn serve_mux(
         }
     });
 
-    // Streaming `Call`s register an abort handle so a later `Cancel { id }` can tear them down. The
-    // map is owned solely by this reader loop, so no lock is needed.
+    // Local trust pre-binds the system principal; an auth-required transport starts unelevated.
+    let mut conn = if mode.is_local_system() {
+        ConnAuth::Authenticated {
+            principal: RequestContext::system().principal,
+            method: AuthMethod::LocalTrust,
+        }
+    } else {
+        ConnAuth::Unauthenticated
+    };
+
+    // Streaming `Open`s register an abort handle so a later `Cancel { id }` can tear them down.
     let mut streams: HashMap<u64, AbortHandle> = HashMap::new();
-    let mut pending = Some(first);
+    let mut pending = first;
     loop {
         let frame = match pending.take() {
             Some(f) => f,
             None => match read_frame(&mut rd).await? {
                 Some(bytes) => match from_cbor::<WireC2S>(&bytes) {
                     Ok(f) => f,
-                    // A frame we cannot decode is dropped rather than killing the connection; a
-                    // well-behaved client never sends one.
+                    // A frame we cannot decode is dropped rather than killing the connection.
                     Err(_) => continue,
                 },
                 None => break,
@@ -148,9 +311,6 @@ async fn serve_mux(
         };
         match frame {
             WireC2S::Hello { .. } => {
-                // Advertise the always-on envelope capabilities plus any optional surface the node
-                // actually hosts (versioning needs a bound revision log), so the client can hide
-                // unavailable affordances up front.
                 let mut features = vec![
                     WIRE_FEATURE_MUX.to_string(),
                     WIRE_FEATURE_STREAM.to_string(),
@@ -158,51 +318,202 @@ async fn serve_mux(
                 if api.supports_versioning() {
                     features.push(WIRE_FEATURE_VERSIONING.to_string());
                 }
+                // Advertise mechanisms only when an exchange is required; local trust offers none.
+                let auth_mechanisms = match mode.as_ref() {
+                    AuthMode::Required { auth, tls_state } => {
+                        features.push(WIRE_FEATURE_AUTH.to_string());
+                        auth.advertised_mechanisms(tls_state)
+                    }
+                    AuthMode::LocalSystem => Vec::new(),
+                };
                 let _ = tx
                     .send(WireS2C::Hello {
                         wire_version: WIRE_VERSION,
                         features,
-                        // Auth is not yet enforced on this transport (the SASL exchange lands in a
-                        // later increment); advertise no mechanisms so existing clients negotiate
-                        // exactly as before.
-                        auth_mechanisms: Vec::new(),
+                        auth_mechanisms,
                     })
                     .await;
             }
+            WireC2S::AuthStart { mechanism, initial } => match mode.as_ref() {
+                AuthMode::Required { auth, tls_state } => {
+                    if matches!(conn, ConnAuth::Authenticated { .. }) {
+                        let _ = tx
+                            .send(WireS2C::AuthError {
+                                reason: "already authenticated".into(),
+                            })
+                            .await;
+                    } else {
+                        let method = auth_method_for(&mechanism);
+                        conn = match auth.begin(&mechanism, &initial, tls_state.clone()) {
+                            BeginOutcome::Challenge { data, exchange } => {
+                                let _ = tx.send(WireS2C::AuthChallenge { data }).await;
+                                ConnAuth::InProgress(exchange, method)
+                            }
+                            BeginOutcome::Success {
+                                final_data,
+                                success,
+                            } => ConnAuth::Authenticated {
+                                principal: complete_auth(&tx, final_data, success).await,
+                                method,
+                            },
+                            BeginOutcome::Failed(reject) => {
+                                let _ = tx
+                                    .send(WireS2C::AuthError {
+                                        reason: reject.reason,
+                                    })
+                                    .await;
+                                ConnAuth::Unauthenticated
+                            }
+                        };
+                    }
+                }
+                // Local trust offers no mechanisms; an auth frame here is a protocol error by the
+                // client, refused without disturbing the (already trusted) connection.
+                AuthMode::LocalSystem => {
+                    let _ = tx
+                        .send(WireS2C::AuthError {
+                            reason: "authentication is not offered on this transport".into(),
+                        })
+                        .await;
+                }
+            },
+            WireC2S::AuthStep { data } => {
+                match std::mem::replace(&mut conn, ConnAuth::Unauthenticated) {
+                    ConnAuth::InProgress(mut exchange, method) => {
+                        conn = match exchange.step(&data) {
+                            StepOutcome::Challenge(challenge) => {
+                                let _ = tx.send(WireS2C::AuthChallenge { data: challenge }).await;
+                                ConnAuth::InProgress(exchange, method)
+                            }
+                            StepOutcome::Success {
+                                final_data,
+                                success,
+                            } => ConnAuth::Authenticated {
+                                principal: complete_auth(&tx, final_data, success).await,
+                                method,
+                            },
+                            StepOutcome::Failed(reject) => {
+                                let _ = tx
+                                    .send(WireS2C::AuthError {
+                                        reason: reject.reason,
+                                    })
+                                    .await;
+                                ConnAuth::Unauthenticated
+                            }
+                        };
+                    }
+                    // No exchange in progress: refuse, restoring the prior state.
+                    other => {
+                        conn = other;
+                        let _ = tx
+                            .send(WireS2C::AuthError {
+                                reason: "no authentication in progress".into(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            WireC2S::AuthResume { token } => match mode.as_ref() {
+                AuthMode::Required { auth, .. } => {
+                    if matches!(conn, ConnAuth::Authenticated { .. }) {
+                        let _ = tx
+                            .send(WireS2C::AuthError {
+                                reason: "already authenticated".into(),
+                            })
+                            .await;
+                    } else {
+                        conn = match auth.resume(&token) {
+                            BeginOutcome::Success {
+                                final_data,
+                                success,
+                            } => ConnAuth::Authenticated {
+                                principal: complete_auth(&tx, final_data, success).await,
+                                method: AuthMethod::Token,
+                            },
+                            BeginOutcome::Failed(reject) => {
+                                let _ = tx
+                                    .send(WireS2C::AuthError {
+                                        reason: reject.reason,
+                                    })
+                                    .await;
+                                ConnAuth::Unauthenticated
+                            }
+                            BeginOutcome::Challenge { .. } => ConnAuth::Unauthenticated,
+                        };
+                    }
+                }
+                AuthMode::LocalSystem => {
+                    let _ = tx
+                        .send(WireS2C::AuthError {
+                            reason: "authentication is not offered on this transport".into(),
+                        })
+                        .await;
+                }
+            },
             WireC2S::Call { id, req } => {
-                // One-shot: dispatch (Subscribe here is the non-destructive cursor read) -> Reply.
-                let api = api.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let trace = ingress_trace(None);
-                    let res = with_trace_span(
-                        trace,
-                        fields::span::API_UNIX_REQUEST,
-                        SpanKind::Boundary,
-                        async {
-                            tracing::debug!(
-                                trace_id = %trace,
-                                api_variant = ?std::mem::discriminant(&req),
-                                event = fields::event::API_REQUEST,
-                                "api request received over unix socket (mux)"
-                            );
-                            dispatch(api.as_ref(), req).await
-                        },
-                    )
-                    .await;
-                    let _ = tx.send(WireS2C::Reply { id, res }).await;
-                });
+                if let ConnAuth::Authenticated { principal, method } = &conn {
+                    let api = api.clone();
+                    let tx = tx.clone();
+                    let ctx = RequestContext::authenticated(principal.clone(), None)
+                        .with_conn_id(conn_id)
+                        .with_auth_method(*method);
+                    // The spawned task does NOT inherit the task-local; `authorize_and_dispatch`
+                    // re-enters the scope before the gate + dispatch (Auth 2 caveat).
+                    tokio::spawn(async move {
+                        let trace = ingress_trace(None);
+                        let res = with_trace_span(
+                            trace,
+                            fields::span::API_UNIX_REQUEST,
+                            SpanKind::Boundary,
+                            authorize_and_dispatch(api.as_ref(), req, ctx),
+                        )
+                        .await;
+                        let _ = tx.send(WireS2C::Reply { id, res }).await;
+                    });
+                } else {
+                    let _ = tx
+                        .send(WireS2C::Reply {
+                            id,
+                            res: ApiResponse::Error(ApiError::Unauthenticated(
+                                "authenticate before issuing requests".into(),
+                            )),
+                        })
+                        .await;
+                }
             }
             WireC2S::Open { id, req } => {
-                // Server-stream a streaming-capable request; reject anything else with End{error}.
-                if is_streaming(&req) {
-                    streams.insert(id, spawn_stream(api.clone(), tx.clone(), id, req));
+                if let ConnAuth::Authenticated { principal, method } = &conn {
+                    if is_streaming(&req) {
+                        // Gate the stream at open time under the request context (the pump itself
+                        // does not re-dispatch). On allow, spawn the stream; else End{error}.
+                        let ctx = RequestContext::authenticated(principal.clone(), None)
+                            .with_conn_id(conn_id)
+                            .with_auth_method(*method);
+                        let allowed = with_request_context(ctx, async { authorize(&req) }).await;
+                        match allowed {
+                            Ok(()) => {
+                                streams.insert(id, spawn_stream(api.clone(), tx.clone(), id, req));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(WireS2C::End { id, error: Some(e) }).await;
+                            }
+                        }
+                    } else {
+                        let _ = tx
+                            .send(WireS2C::End {
+                                id,
+                                error: Some(ApiError::Unsupported(
+                                    "request is not streamable; use Call".into(),
+                                )),
+                            })
+                            .await;
+                    }
                 } else {
                     let _ = tx
                         .send(WireS2C::End {
                             id,
-                            error: Some(ApiError::Unsupported(
-                                "request is not streamable; use Call".into(),
+                            error: Some(ApiError::Unauthenticated(
+                                "authenticate before opening a stream".into(),
                             )),
                         })
                         .await;
@@ -213,18 +524,6 @@ async fn serve_mux(
                     handle.abort();
                     let _ = tx.send(WireS2C::End { id, error: None }).await;
                 }
-            }
-            // The SASL exchange is part of the v2 envelope contract but not yet served on this
-            // transport (it lands in a later increment, gated by the authenticator). A client that
-            // sends an auth frame here gets a clean refusal rather than a protocol error; the
-            // connection is unaffected (it was never authenticated to begin with). Auth is not yet
-            // *required* either, so existing clients that never send these keep working.
-            WireC2S::AuthStart { .. } | WireC2S::AuthStep { .. } | WireC2S::AuthResume { .. } => {
-                let _ = tx
-                    .send(WireS2C::AuthError {
-                        reason: "authentication is not supported on this transport yet".into(),
-                    })
-                    .await;
             }
         }
     }
@@ -432,6 +731,62 @@ impl MuxApiClient {
             other => Err(ApiError::Other(format!(
                 "expected Hello ack, got {other:?}"
             ))),
+        }
+    }
+
+    /// Authenticate this connection with `SCRAM-SHA-256` (post-`Hello`), driving the SASL exchange
+    /// with an `rsasl` client and returning the authenticated [`daemon_api::PrincipalView`] from
+    /// `AuthOk`. The reusable client side of the handshake (also the shape a real GUI/TUI client
+    /// uses); used by the auth-transport integration tests.
+    pub async fn authenticate_scram(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<daemon_api::PrincipalView, ApiError> {
+        use rsasl::prelude::{Mechname, SASLClient, SASLConfig, State as ClientState};
+
+        let config = SASLConfig::with_credentials(None, username.into(), password.into())
+            .map_err(|e| ApiError::Other(format!("sasl client config: {e}")))?;
+        let mechname = Mechname::parse(crate::authn::MECH_SCRAM_SHA_256.as_bytes())
+            .map_err(|e| ApiError::Other(format!("mechname: {e}")))?;
+        let mut session = SASLClient::new(config)
+            .start_suggested_iter([mechname])
+            .map_err(|e| ApiError::Other(format!("sasl client start: {e}")))?;
+
+        // SCRAM is client-first: produce the client-first message with no input.
+        let mut out = Vec::new();
+        session
+            .step(None, &mut out)
+            .map_err(|e| ApiError::Other(format!("sasl client step: {e}")))?;
+        self.send(WireC2S::AuthStart {
+            mechanism: crate::authn::MECH_SCRAM_SHA_256.to_string(),
+            initial: out.clone(),
+        })
+        .await?;
+
+        loop {
+            match self.next().await? {
+                WireS2C::AuthChallenge { data } => {
+                    out.clear();
+                    let state = session
+                        .step(Some(&data), &mut out)
+                        .map_err(|e| ApiError::Unauthenticated(format!("sasl: {e}")))?;
+                    // Only respond when the mechanism produced output; the final server message
+                    // (server-final) leaves the client `Finished` with nothing to send.
+                    if !out.is_empty() {
+                        self.send(WireC2S::AuthStep { data: out.clone() }).await?;
+                    } else if state == ClientState::Running {
+                        // Running with no output is unexpected for SCRAM; keep waiting for AuthOk.
+                    }
+                }
+                WireS2C::AuthOk { principal, .. } => return Ok(principal),
+                WireS2C::AuthError { reason } => return Err(ApiError::Unauthenticated(reason)),
+                other => {
+                    return Err(ApiError::Other(format!(
+                        "unexpected frame during authentication: {other:?}"
+                    )))
+                }
+            }
         }
     }
 

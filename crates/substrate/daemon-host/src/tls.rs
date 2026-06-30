@@ -7,44 +7,31 @@
 //! access goes over TLS and **always requires authentication**. [`serve_api_tls_tcp`] accepts TCP
 //! connections, performs the `rustls` handshake (server cert always; client cert verified when
 //! `require_client_cert` is set, i.e. mTLS), captures the peer-certificate fingerprint for the
-//! EXTERNAL mechanism, and then runs an authenticated multiplexed loop: a connection must complete a
-//! SASL exchange (driven by the [`Authenticator`]) before any `Call`/`Open` is served — a pre-auth
-//! request resolves to [`ApiError::Unauthenticated`] and the connection stays unelevated.
+//! EXTERNAL mechanism, and then hands the connection to the shared, context-aware multiplexed loop
+//! [`crate::socket::serve_mux`] in [`crate::socket::AuthMode::Required`] mode: a connection must
+//! complete a SASL exchange before any `Call`/`Open` is served (pre-auth resolves to
+//! [`daemon_api::ApiError::Unauthenticated`] and the connection stays unelevated), and once
+//! authenticated every dispatch runs under the principal's [`crate::request_context::RequestContext`]
+//! through the capability gate ([`crate::authz::authorize`]).
 //!
 //! Crypto provider: this module pins the **aws-lc-rs** `rustls` provider, matching the provider the
 //! rest of the dependency tree already resolves (`cargo tree -i rustls` -> rustls 0.23 + aws-lc-rs),
 //! so no second crypto backend is introduced.
-//!
-//! Scope boundary (held for the convergence step, deliverable (3)): the per-request **authorization
-//! gate + request context** are *not* applied here yet — they depend on Track A (Auth 2), which is
-//! not merged. The dispatch site below carries a `TODO(auth3-deliverable3)` marking exactly where
-//! `with_request_context(principal)` + `authorize(&req)` will wrap `dispatch`. This module also does
-//! **not** modify the existing Unix [`crate::socket::serve_mux`]; unifying the two loops under the
-//! authenticated state machine is likewise part of the convergence step.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use daemon_api::{
-    dispatch, from_cbor, is_streaming, to_cbor, ApiError, ApiResponse, NodeApi, WireC2S, WireS2C,
-    WIRE_FEATURE_AUTH, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM, WIRE_FEATURE_VERSIONING,
-    WIRE_VERSION,
-};
-use daemon_auth::Principal;
+use daemon_api::NodeApi;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
-use crate::authn::{AuthExchange, AuthSuccess, Authenticator, BeginOutcome, StepOutcome, TlsState};
-use crate::socket::{read_frame, spawn_stream, write_frame, WRITER_QUEUE};
+use crate::authn::{Authenticator, TlsState};
+use crate::socket::{next_conn_id, serve_mux, AuthMode};
 
 /// Resolved `[api]` TLS configuration (the cert/key + client-auth policy). Built by `bins/daemon`
 /// from the `[api]` table and handed to [`build_server_config`].
@@ -157,8 +144,10 @@ fn peer_fingerprint<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> Option<
 }
 
 /// Serve the node api surface over TLS/TCP until the listener errors. Every connection is mux-only
-/// and **must authenticate** (TCP is never local-trusted). Spawn it as a background task alongside
-/// the Unix listener.
+/// and **must authenticate** (TCP is never local-trusted): the connection is handed to the shared
+/// [`serve_mux`] in [`AuthMode::Required`] mode with the per-connection [`TlsState`] (carrying the
+/// verified client-cert fingerprint for EXTERNAL). Spawn it as a background task alongside the Unix
+/// listener.
 pub async fn serve_api_tls_tcp(
     listener: TcpListener,
     tls: Arc<ServerConfig>,
@@ -179,9 +168,9 @@ pub async fn serve_api_tls_tcp(
                                 is_tls: true,
                                 peer_cert_fingerprint: peer_fingerprint(&tls_stream),
                             };
+                            let mode = Arc::new(AuthMode::Required { auth, tls_state });
                             let (rd, wr) = tokio::io::split(tls_stream);
-                            if let Err(e) =
-                                serve_authenticated_mux(rd, wr, api, auth, tls_state).await
+                            if let Err(e) = serve_mux(rd, wr, api, mode, None, next_conn_id()).await
                             {
                                 tracing::debug!("tls api connection ended: {e}");
                             }
@@ -198,253 +187,6 @@ pub async fn serve_api_tls_tcp(
             }
         }
     }
-}
-
-/// The per-connection authentication state.
-enum ConnAuth {
-    /// No successful auth yet; `Call`/`Open` are refused with `Unauthenticated`.
-    Unauthenticated,
-    /// A multi-step mechanism (SCRAM) is mid-exchange.
-    InProgress(AuthExchange),
-    /// Authenticated; the bound principal gates dispatch now and, in deliverable (3), will be
-    /// threaded into the Track-A request context + authorize gate at the dispatch site.
-    // The principal is intentionally retained but not yet read (see the `TODO(auth3-deliverable3)`
-    // at the `Call` dispatch site); the convergence step consumes it.
-    #[allow(dead_code)]
-    Authenticated(Principal),
-}
-
-/// Deliver a completed authentication to the client: any trailing mechanism bytes (the SCRAM
-/// server-final message) ride a final `AuthChallenge` before `AuthOk` (the frozen `AuthOk` carries
-/// no mechanism bytes), then `AuthOk { token, principal }`. Returns the bound principal.
-async fn complete_auth(
-    tx: &mpsc::Sender<WireS2C>,
-    final_data: Option<Vec<u8>>,
-    success: Box<AuthSuccess>,
-) -> Principal {
-    if let Some(data) = final_data {
-        let _ = tx.send(WireS2C::AuthChallenge { data }).await;
-    }
-    let AuthSuccess {
-        principal,
-        token,
-        principal_view,
-    } = *success;
-    let _ = tx
-        .send(WireS2C::AuthOk {
-            token,
-            principal: principal_view,
-        })
-        .await;
-    principal
-}
-
-/// The authenticated mux loop, generic over the (TLS) byte stream halves. Mirrors
-/// [`crate::socket::serve_mux`] but gates every `Call`/`Open` behind a completed SASL exchange.
-async fn serve_authenticated_mux<R, W>(
-    mut rd: R,
-    wr: W,
-    api: Arc<dyn NodeApi>,
-    auth: Arc<Authenticator>,
-    tls_state: TlsState,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let (tx, mut rx) = mpsc::channel::<WireS2C>(WRITER_QUEUE);
-    let writer = tokio::spawn(async move {
-        let mut wr = wr;
-        while let Some(frame) = rx.recv().await {
-            if write_frame(&mut wr, &to_cbor(&frame)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut streams: HashMap<u64, AbortHandle> = HashMap::new();
-    let mut conn = ConnAuth::Unauthenticated;
-
-    loop {
-        let bytes = match read_frame(&mut rd).await? {
-            Some(b) => b,
-            None => break,
-        };
-        let frame = match from_cbor::<WireC2S>(&bytes) {
-            Ok(f) => f,
-            // Undecodable frames are dropped rather than killing the connection.
-            Err(_) => continue,
-        };
-        match frame {
-            WireC2S::Hello { .. } => {
-                let mut features = vec![
-                    WIRE_FEATURE_MUX.to_string(),
-                    WIRE_FEATURE_STREAM.to_string(),
-                ];
-                if api.supports_versioning() {
-                    features.push(WIRE_FEATURE_VERSIONING.to_string());
-                }
-                // TCP always requires auth: advertise the auth feature + the permitted mechanisms.
-                features.push(WIRE_FEATURE_AUTH.to_string());
-                let _ = tx
-                    .send(WireS2C::Hello {
-                        wire_version: WIRE_VERSION,
-                        features,
-                        auth_mechanisms: auth.advertised_mechanisms(&tls_state),
-                    })
-                    .await;
-            }
-            WireC2S::AuthStart { mechanism, initial } => {
-                if matches!(conn, ConnAuth::Authenticated(_)) {
-                    let _ = tx
-                        .send(WireS2C::AuthError {
-                            reason: "already authenticated".into(),
-                        })
-                        .await;
-                } else {
-                    conn = match auth.begin(&mechanism, &initial, tls_state.clone()) {
-                        BeginOutcome::Challenge { data, exchange } => {
-                            let _ = tx.send(WireS2C::AuthChallenge { data }).await;
-                            ConnAuth::InProgress(exchange)
-                        }
-                        BeginOutcome::Success {
-                            final_data,
-                            success,
-                        } => ConnAuth::Authenticated(complete_auth(&tx, final_data, success).await),
-                        BeginOutcome::Failed(reject) => {
-                            let _ = tx
-                                .send(WireS2C::AuthError {
-                                    reason: reject.reason,
-                                })
-                                .await;
-                            ConnAuth::Unauthenticated
-                        }
-                    };
-                }
-            }
-            WireC2S::AuthStep { data } => {
-                match std::mem::replace(&mut conn, ConnAuth::Unauthenticated) {
-                    ConnAuth::InProgress(mut exchange) => {
-                        conn = match exchange.step(&data) {
-                            StepOutcome::Challenge(challenge) => {
-                                let _ = tx.send(WireS2C::AuthChallenge { data: challenge }).await;
-                                ConnAuth::InProgress(exchange)
-                            }
-                            StepOutcome::Success {
-                                final_data,
-                                success,
-                            } => ConnAuth::Authenticated(
-                                complete_auth(&tx, final_data, success).await,
-                            ),
-                            StepOutcome::Failed(reject) => {
-                                let _ = tx
-                                    .send(WireS2C::AuthError {
-                                        reason: reject.reason,
-                                    })
-                                    .await;
-                                ConnAuth::Unauthenticated
-                            }
-                        };
-                    }
-                    // An AuthStep with no exchange in progress (or after auth): refuse, stay
-                    // unelevated. `conn` was already reset to Unauthenticated by the take above for
-                    // the non-Authenticated cases; restore Authenticated if that was the state.
-                    other => {
-                        conn = other;
-                        let _ = tx
-                            .send(WireS2C::AuthError {
-                                reason: "no authentication in progress".into(),
-                            })
-                            .await;
-                    }
-                }
-            }
-            WireC2S::AuthResume { token } => {
-                if matches!(conn, ConnAuth::Authenticated(_)) {
-                    let _ = tx
-                        .send(WireS2C::AuthError {
-                            reason: "already authenticated".into(),
-                        })
-                        .await;
-                } else {
-                    conn = match auth.resume(&token) {
-                        BeginOutcome::Success {
-                            final_data,
-                            success,
-                        } => ConnAuth::Authenticated(complete_auth(&tx, final_data, success).await),
-                        BeginOutcome::Failed(reject) => {
-                            let _ = tx
-                                .send(WireS2C::AuthError {
-                                    reason: reject.reason,
-                                })
-                                .await;
-                            ConnAuth::Unauthenticated
-                        }
-                        // `resume` never yields a challenge.
-                        BeginOutcome::Challenge { .. } => ConnAuth::Unauthenticated,
-                    };
-                }
-            }
-            WireC2S::Call { id, req } => {
-                if matches!(conn, ConnAuth::Authenticated(_)) {
-                    let api = api.clone();
-                    let tx = tx.clone();
-                    // TODO(auth3-deliverable3): once Auth 2 merges, wrap this dispatch in
-                    // `with_request_context(RequestContext { principal, .. })` and call
-                    // `authorize(&req)` first (Forbidden on missing capability). The principal is
-                    // available from the `Authenticated` arm; it is intentionally not yet threaded
-                    // here because the request-context/authorize interface is owned by Track A.
-                    tokio::spawn(async move {
-                        let res = dispatch(api.as_ref(), req).await;
-                        let _ = tx.send(WireS2C::Reply { id, res }).await;
-                    });
-                } else {
-                    let _ = tx
-                        .send(WireS2C::Reply {
-                            id,
-                            res: ApiResponse::Error(ApiError::Unauthenticated(
-                                "authenticate before issuing requests".into(),
-                            )),
-                        })
-                        .await;
-                }
-            }
-            WireC2S::Open { id, req } => {
-                if matches!(conn, ConnAuth::Authenticated(_)) {
-                    if is_streaming(&req) {
-                        streams.insert(id, spawn_stream(api.clone(), tx.clone(), id, req));
-                    } else {
-                        let _ = tx
-                            .send(WireS2C::End {
-                                id,
-                                error: Some(ApiError::Unsupported(
-                                    "request is not streamable; use Call".into(),
-                                )),
-                            })
-                            .await;
-                    }
-                } else {
-                    let _ = tx
-                        .send(WireS2C::End {
-                            id,
-                            error: Some(ApiError::Unauthenticated(
-                                "authenticate before opening a stream".into(),
-                            )),
-                        })
-                        .await;
-                }
-            }
-            WireC2S::Cancel { id } => {
-                if let Some(handle) = streams.remove(&id) {
-                    handle.abort();
-                    let _ = tx.send(WireS2C::End { id, error: None }).await;
-                }
-            }
-        }
-    }
-    drop(tx);
-    let _ = writer.await;
-    Ok(())
 }
 
 #[cfg(test)]

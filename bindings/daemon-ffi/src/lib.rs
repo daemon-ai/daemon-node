@@ -36,7 +36,9 @@ use daemon_core::{
     Config, CredentialBuilder, CredentialProvider, EmbeddedCredentialPool, MockProvider, Provider,
     ProviderBuilder, ProviderRegistry,
 };
-use daemon_host::{HostConfig, NodeApiImpl, SupervisorHandle};
+use daemon_host::{
+    authorize, with_request_context, HostConfig, NodeApiImpl, RequestContext, SupervisorHandle,
+};
 use daemon_node::{assemble, AssembledNode, NodeAssembly};
 use daemon_providers::GenAiProvider;
 use daemon_store::{InMemoryStore, SessionStore, SqliteStore};
@@ -368,7 +370,18 @@ pub unsafe extern "C" fn daemon_host_call(
         let host = unsafe { &*h };
         let bytes = unsafe { std::slice::from_raw_parts(req, req_len) };
         let request: ApiRequest = from_cbor(bytes).map_err(|e| e.to_string())?;
-        let response: ApiResponse = host.rt.block_on(dispatch(host.node.as_ref(), request));
+        // In-process embedder = full local trust: dispatch under a `system()` request context so the
+        // capability gate (and any downstream identity read) sees the deliberate full-trust principal
+        // (the FFI is the embedding application itself, not a network client).
+        let node = host.node.clone();
+        let response: ApiResponse =
+            host.rt
+                .block_on(with_request_context(RequestContext::system(), async move {
+                    match authorize(&request) {
+                        Ok(()) => dispatch(node.as_ref(), request).await,
+                        Err(e) => ApiResponse::Error(e),
+                    }
+                }));
         Ok::<_, String>(to_cbor(&response))
     }));
     match result {
@@ -578,10 +591,45 @@ mod dispatch_tests {
     //! generic CBOR call carries the §17 session surface on top of a real durable node.
 
     use super::*;
-    use daemon_api::Outbound;
+    use daemon_api::{ApiError, Outbound};
     use daemon_common::{ReqId, SessionId};
     use daemon_protocol::{AgentCommand, AgentEvent, UserMsg};
     use std::time::Duration;
+
+    /// (Auth 3, deliverable 3, guard (e)) The C ABI `daemon_host_call` dispatches under
+    /// `RequestContext::system()` — the in-process embedder is full local trust. Proven by an op
+    /// that the capability gate would *deny* with no context (fail-closed): `Health` requires
+    /// `ControlRead`, so an ungated call would return `Unauthenticated`; under `system()` it
+    /// succeeds.
+    #[test]
+    fn host_call_dispatches_as_system() {
+        let host = build_host(HostFfiConfig::default());
+        assert!(!host.is_null(), "host must boot");
+
+        let req = to_cbor(&ApiRequest::Health);
+        let mut out_resp: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc =
+            unsafe { daemon_host_call(host, req.as_ptr(), req.len(), &mut out_resp, &mut out_len) };
+        assert_eq!(rc, DAEMON_OK, "daemon_host_call must succeed");
+        let bytes = unsafe { std::slice::from_raw_parts(out_resp, out_len) };
+        let resp: ApiResponse = from_cbor(bytes).expect("decode response");
+        assert!(
+            !matches!(
+                resp,
+                ApiResponse::Error(ApiError::Unauthenticated(_))
+                    | ApiResponse::Error(ApiError::Forbidden(_))
+            ),
+            "FFI must dispatch as the full-trust system principal, got {resp:?}"
+        );
+        unsafe { daemon_buf_free(out_resp, out_len) };
+
+        let host = unsafe { &mut *host };
+        if let Some(handle) = host.handle.take() {
+            host.rt.block_on(handle.shutdown());
+        }
+        drop(unsafe { Box::from_raw(host as *mut daemon_host_t) });
+    }
 
     #[test]
     fn boots_a_node_and_drains_turn_finished() {

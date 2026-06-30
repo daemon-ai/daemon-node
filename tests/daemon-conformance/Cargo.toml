@@ -14,6 +14,7 @@ daemon-api = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }
 daemon-activation = { workspace = true }
+daemon-auth = { workspace = true }
 daemon-host = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }

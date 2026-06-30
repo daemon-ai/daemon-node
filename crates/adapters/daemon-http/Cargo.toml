@@ -15,6 +15,10 @@ daemon-common = { workspace = true }
 daemon-telemetry = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-delivery = { workspace = true }
+# The request-context + capability gate (authz core): every dispatch over HTTP runs inside a
+# `RequestContext` (full-trust `system()` under `[api].local_trust`) through `authorize`. No HTTP
+# SASL yet, so without local trust the surface is fully gated (fail-closed).
+daemon-host = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

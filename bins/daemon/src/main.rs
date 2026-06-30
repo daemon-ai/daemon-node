@@ -1627,20 +1627,35 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     node.load_routing_pins().await;
     tracing::info!("daemon host node started");
 
-    // Bind the api socket (fresh) and serve the unified surface over it.
-    let _ = std::fs::remove_file(&cfg.socket_path);
-    let listener = tokio::net::UnixListener::bind(&cfg.socket_path)?;
-    tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket");
-    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
-
-    // The networked TLS/TCP api transport (opt-in via `[api].tls_addr`). The Unix socket stays
-    // plaintext (local trust); TCP always requires authentication. The identity store is opened
-    // (created if absent) regardless, so the authenticator is ready for the convergence step.
+    // The identity store backing the authenticator (created if absent), shared by every
+    // auth-required transport (the Unix socket when local trust is disabled, and TCP/TLS always).
     let auth_store =
         Arc::new(daemon_auth::AuthStore::open(&cfg.api.auth_db).map_err(|e| {
             anyhow::anyhow!("opening auth store {}: {e}", cfg.api.auth_db.display())
         })?);
     let authenticator = Arc::new(daemon_host::Authenticator::new(auth_store));
+    // B5: `[api].local_trust` defaults to `system` — the Unix socket / FFI / in-process HTTP run as
+    // the deliberate full-trust principal. Disable it to require SCRAM on the Unix socket and fully
+    // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
+    let local_trust = cfg.api.local_trust.is_some();
+
+    // Bind the api socket (fresh) and serve the unified surface over it.
+    let _ = std::fs::remove_file(&cfg.socket_path);
+    let listener = tokio::net::UnixListener::bind(&cfg.socket_path)?;
+    let server = if local_trust {
+        tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (local trust: system)");
+        tokio::spawn(serve_api_unix(listener, node.clone()))
+    } else {
+        tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (SCRAM required)");
+        tokio::spawn(daemon_host::serve_api_unix_authenticated(
+            listener,
+            node.clone(),
+            authenticator.clone(),
+        ))
+    };
+
+    // The networked TLS/TCP api transport (opt-in via `[api].tls_addr`). TCP always requires
+    // authentication (never local-trusted).
     let tls_server = match (&cfg.api.tls_addr, &cfg.api.tls_cert, &cfg.api.tls_key) {
         (Some(addr), Some(cert), Some(key)) => {
             let tls_cfg = daemon_host::ApiTlsConfig {
@@ -1709,7 +1724,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             tracing::info!(%addr, "serving daemon-api over http (json dispatch + sse/ws subscribe)");
             let api: Arc<dyn daemon_api::NodeApi> = node;
             Some(tokio::spawn(async move {
-                if let Err(e) = daemon_http::serve_http(http_listener, api).await {
+                if let Err(e) = daemon_http::serve_http(http_listener, api, local_trust).await {
                     tracing::warn!(error = %e, "http surface ended");
                 }
             }))
