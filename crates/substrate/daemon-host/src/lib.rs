@@ -36,6 +36,7 @@ pub mod adapters;
 pub mod agent_session;
 pub mod auth;
 pub mod authn;
+pub mod authz;
 pub mod background;
 pub mod blob_store;
 pub mod commands;
@@ -51,6 +52,7 @@ pub mod journal;
 pub mod node_api;
 pub mod process_agent;
 pub mod profiles;
+pub mod request_context;
 pub mod revision;
 pub mod routing;
 pub mod services;
@@ -72,6 +74,7 @@ pub use authn::{
     principal_view, AuthExchange, AuthReject, AuthSuccess, Authenticator, BeginOutcome,
     StepOutcome, TlsState, MECH_EXTERNAL, MECH_PLAIN, MECH_SCRAM_SHA_256,
 };
+pub use authz::{authorize, required_capability};
 pub use background::{
     background_child_id, background_kind_of, BackgroundProfile, BackgroundProfileRegistry,
     BackgroundSpawner,
@@ -112,6 +115,10 @@ pub use node_api::{
 };
 pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
+pub use request_context::{
+    current_context, current_principal, with_request_context, AuthMethod, RequestContext,
+    SYSTEM_USERNAME,
+};
 pub use revision::FileRevisionLog;
 pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,

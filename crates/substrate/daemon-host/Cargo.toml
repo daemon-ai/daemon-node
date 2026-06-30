@@ -15,11 +15,12 @@ daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }
+# RBAC + identity foundation: the per-request capability gate + task-local request context (authz
+# core, Auth 2) and the node authenticator (authn.rs, Auth 3, a SessionCallback over `AuthStore`)
+# both consume the transport-agnostic Capability/Role/Principal vocabulary + the identity store.
+daemon-auth = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true }
-# Identity / credential / RBAC foundation: the node authenticator (authn.rs) is a SessionCallback
-# over `AuthStore` (SCRAM material, Argon2id passwords, opaque session tokens, Principal).
-daemon-auth = { workspace = true }
 daemon-activation = { workspace = true }
 # I15 cron: schedule parsing + next-fire (croner) for the CronOps create/update/list surface.
 daemon-schedule = { workspace = true }
