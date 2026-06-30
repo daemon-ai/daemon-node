@@ -320,3 +320,135 @@ impl ProfileApi for NodeApiImpl {
         Ok(changes)
     }
 }
+
+impl NodeApiImpl {
+    /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.
+    pub(crate) fn profile_store(&self) -> Result<&Arc<dyn ProfileStore>, ApiError> {
+        self.profiles
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("profile management not available".into()))
+    }
+
+    /// Resolve the spec for an explicit id, or the active default when `profile` is `None`.
+    pub(crate) fn resolve_profile(
+        &self,
+        profile: Option<String>,
+    ) -> Result<Option<ProfileSpec>, ApiError> {
+        let store = self.profile_store()?;
+        let id = match profile {
+            Some(id) => Some(id),
+            None => store.active().map_err(profile_err)?,
+        };
+        match id {
+            Some(id) => store.get(&id).map_err(profile_err),
+            None => Ok(None),
+        }
+    }
+
+    /// The revision log, or [`ApiError::Unsupported`] when this node hosts no versioning.
+    fn revision_log(&self) -> Result<&Arc<dyn daemon_common::RevisionLog>, ApiError> {
+        self.revisions
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("versioning not available".into()))
+    }
+
+    /// The skills provider, or [`ApiError::Unsupported`] when this node hosts no skills.
+    fn skills_provider(&self) -> Result<&Arc<daemon_skills::SkillsProvider>, ApiError> {
+        self.skills
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("skills not available".into()))
+    }
+
+    /// Resolve the [`SkillStore`](daemon_skills::SkillStore) for an explicit profile `id`.
+    fn skills_store_for(&self, id: &str) -> Result<Arc<daemon_skills::SkillStore>, ApiError> {
+        Ok(self.skills_provider()?.for_profile(id))
+    }
+
+    /// Resolve the skills store for the profile a skill *versioning* op targets: the node's active
+    /// default profile (falling back to the node's `default_local_profile` when no profile store /
+    /// active default is set). The skill revision history is keyed by bare skill name, so this picks
+    /// the library a name-keyed `skill_revert` writes back into.
+    fn active_skills_store(&self) -> Result<Arc<daemon_skills::SkillStore>, ApiError> {
+        let id = self
+            .profiles
+            .as_ref()
+            .and_then(|p| p.active().ok().flatten())
+            .unwrap_or_else(|| self.default_local_profile.clone());
+        self.skills_store_for(&id)
+    }
+
+    /// Resolve the skills store a curator op targets: an explicit `profile`, else the active default.
+    fn curator_store(
+        &self,
+        profile: Option<String>,
+    ) -> Result<Arc<daemon_skills::SkillStore>, ApiError> {
+        match profile {
+            Some(id) => self.skills_store_for(&id),
+            None => self.active_skills_store(),
+        }
+    }
+
+    /// The per-profile usage sidecar for a curator op, or [`ApiError::Unsupported`] when usage
+    /// tracking is off (no `.usage.json` factory wired).
+    fn curator_usage(
+        &self,
+        store: &Arc<daemon_skills::SkillStore>,
+    ) -> Result<Arc<dyn daemon_common::SkillUsageLog>, ApiError> {
+        store
+            .usage()
+            .cloned()
+            .ok_or_else(|| ApiError::Unsupported("skill usage tracking not available".into()))
+    }
+
+    /// Record a profile revision of `id`'s current on-disk spec under `author`/`reason`. Best-effort:
+    /// only when both a profile store and a revision log are wired, and a revision-log hiccup never
+    /// fails the underlying profile mutation.
+    fn record_profile(&self, id: &str, author: daemon_common::Author, reason: &str) {
+        let (Some(store), Some(log)) = (self.profiles.as_ref(), self.revisions.as_ref()) else {
+            return;
+        };
+        let Ok(Some(spec)) = store.get(id) else {
+            return;
+        };
+        let mut blob = Vec::new();
+        if ciborium::into_writer(&spec, &mut blob).is_ok() {
+            let _ = log.append(
+                daemon_common::RevisionKind::Profile,
+                id,
+                &blob,
+                author,
+                reason,
+            );
+        }
+    }
+}
+
+/// Map a profile-store error onto the wire [`ApiError`].
+pub(crate) fn profile_err(e: crate::profiles::ProfileError) -> ApiError {
+    use crate::profiles::ProfileError;
+    match e {
+        ProfileError::NotFound(id) => ApiError::UnknownSession(id),
+        ProfileError::Exists(id) => ApiError::Conflict(format!("profile exists: {id}")),
+        other => ApiError::Other(other.to_string()),
+    }
+}
+
+/// Map a revision-log error onto the wire [`ApiError`].
+fn revision_err(e: daemon_common::RevisionError) -> ApiError {
+    use daemon_common::RevisionError;
+    match e {
+        RevisionError::NotFound { kind, id, seq } => {
+            ApiError::UnknownSession(format!("{kind}/{id}@{seq}"))
+        }
+        other => ApiError::Other(other.to_string()),
+    }
+}
+
+fn skill_err(e: daemon_skills::SkillError) -> ApiError {
+    use daemon_skills::SkillError;
+    match e {
+        SkillError::NotFound(id) => ApiError::UnknownSession(format!("skill/{id}")),
+        SkillError::Exists(id) => ApiError::Conflict(format!("skill exists: {id}")),
+        other => ApiError::Other(other.to_string()),
+    }
+}

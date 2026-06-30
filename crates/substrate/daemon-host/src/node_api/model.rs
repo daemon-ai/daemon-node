@@ -165,3 +165,23 @@ impl ModelApi for NodeApiImpl {
         }))
     }
 }
+
+impl NodeApiImpl {
+    /// The model-management facade, or [`ApiError::Unsupported`] when this node has none.
+    fn require_models(&self) -> Result<&Arc<ModelManager>, ApiError> {
+        self.models
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("model management is not enabled".into()))
+    }
+}
+
+/// Map a `daemon-models` error onto the transport-stable [`ApiError`].
+fn map_model_err(e: ModelError) -> ApiError {
+    match e {
+        ModelError::NotFound(m) => ApiError::Other(format!("not found: {m}")),
+        ModelError::AccessDenied(m) => ApiError::Other(format!("access denied: {m}")),
+        ModelError::Invalid(m) => ApiError::Unsupported(m),
+        ModelError::Unknown(m) => ApiError::Other(format!("unknown id: {m}")),
+        other => ApiError::Other(other.to_string()),
+    }
+}

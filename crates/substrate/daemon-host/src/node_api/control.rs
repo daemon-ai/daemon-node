@@ -1269,3 +1269,77 @@ impl ControlApi for NodeApiImpl {
         }
     }
 }
+
+impl NodeApiImpl {
+    /// The gated workspace write shared by `fs_write` and `fs_write_from_blob`: `Workspace`/`Session`
+    /// roots only, sensitive-path + per-session `Deny` gate (overridable by `force`), a pre-mutation
+    /// checkpoint for session roots, and the `Conflict`-on-stale-`base_revision` guard inside
+    /// `WorkspaceFs::write`.
+    async fn write_gated(&self, args: FsWriteArgs) -> Result<FsRevision, ApiError> {
+        let FsWriteArgs {
+            root,
+            path,
+            bytes,
+            base_revision,
+            force,
+        } = args;
+        let ws = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("fs_write".into()))?;
+        // Host browse roots are read-only.
+        if !ws.writable(&root)? {
+            return Err(ApiError::Unsupported(
+                "host browse roots are read-only".into(),
+            ));
+        }
+        // Sensitive-path gate (the same `.git`/`.ssh`/dotenv/keys rule the agent fs tool uses);
+        // `force` overrides. The operator *is* the human, so this never routes through a host ask.
+        if !force && is_sensitive_path(&path) {
+            return Err(ApiError::Other(format!(
+                "sensitive path {path:?} blocked; set force to override"
+            )));
+        }
+        if let FsRootId::Session(sid) = &root {
+            self.deny_gate_session(sid, force)?;
+            self.capture_pre_write(sid, &path, ws).await;
+        }
+        ws.write(&root, &path, &bytes, base_revision).await
+    }
+
+    /// A `Deny`-mode session blocks operator writes too, unless `force`d.
+    fn deny_gate_session(&self, sid: &SessionId, force: bool) -> Result<(), ApiError> {
+        if force {
+            return Ok(());
+        }
+        let Some(policy) = self.session_modes.get(sid) else {
+            return Ok(());
+        };
+        if *policy == ApprovalPolicy::Deny {
+            return Err(ApiError::Other(format!(
+                "session {} is in deny mode; set force to override",
+                sid.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Capture a checkpoint before mutating a session root, so an operator edit is rewindable like an
+    /// agent edit (best-effort; a capture failure never blocks the write). No-op when no checkpoint
+    /// store is wired.
+    async fn capture_pre_write(
+        &self,
+        sid: &SessionId,
+        path: &str,
+        ws: &Arc<crate::workspace_fs::WorkspaceFs>,
+    ) {
+        let Some(store) = &self.checkpoints else {
+            return;
+        };
+        let env = LocalEnvironment::new(ws.roots().session_root(sid.as_str()));
+        let call_id = format!("operator-fs-write:{path}");
+        let _ = store
+            .capture(sid.as_str(), &call_id, "operator_fs_write", &env)
+            .await;
+    }
+}
