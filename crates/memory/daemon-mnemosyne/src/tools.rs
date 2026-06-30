@@ -13,7 +13,10 @@
 //! the synchronous [`Engine`] is touched.
 
 use crate::embeddings::Embedder;
-use crate::engine::{Engine, RememberArgs, SleepGroup};
+use crate::engine::{
+    CanonicalRemember, Engine, GraphLink, RecallReq, RememberArgs, SleepGroup, TripleAdd,
+    TripleEnd, TripleQuery, ValidateArgs,
+};
 use crate::extract::Extractor;
 use daemon_core::tools::ToolDef;
 use serde_json::{json, Value};
@@ -256,7 +259,12 @@ pub async fn dispatch(
             if let Some(v) = s(&args, "channel_id") {
                 scope.channel_id = Some(v.to_string());
             }
-            match engine.recall_with_scope(query, top_k, query_vec.as_deref(), &scope) {
+            match engine.recall_with_scope(&RecallReq {
+                query,
+                top_k,
+                query_vector: query_vec.as_deref(),
+                scope: &scope,
+            }) {
                 Ok(rows) => {
                     let results: Vec<Value> = rows
                         .iter()
@@ -296,13 +304,13 @@ pub async fn dispatch(
             }
         }
         "mnemosyne_validate" => {
-            match engine.validate(
-                s(&args, "id").unwrap_or(""),
-                s(&args, "action").unwrap_or("confirm"),
-                s(&args, "validator"),
-                s(&args, "new_content"),
-                s(&args, "note"),
-            ) {
+            match engine.validate(&ValidateArgs {
+                id: s(&args, "id").unwrap_or(""),
+                action: s(&args, "action").unwrap_or("confirm"),
+                validator: s(&args, "validator"),
+                new_content: s(&args, "new_content"),
+                note: s(&args, "note"),
+            }) {
                 Ok(found) => json!({"status": "ok", "found": found}).to_string(),
                 Err(e) => err(e),
             }
@@ -323,38 +331,38 @@ pub async fn dispatch(
             Err(e) => err(e),
         },
         "mnemosyne_triple_add" => {
-            match engine.triple_add(
-                s(&args, "subject").unwrap_or(""),
-                s(&args, "predicate").unwrap_or(""),
-                s(&args, "object").unwrap_or(""),
-                s(&args, "valid_from"),
-                s(&args, "valid_until"),
-                s(&args, "source").unwrap_or("tool"),
-                args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0),
-                args.get("supersede").and_then(|v| v.as_bool()).unwrap_or(true),
-            ) {
+            match engine.triple_add(&TripleAdd {
+                subject: s(&args, "subject").unwrap_or(""),
+                predicate: s(&args, "predicate").unwrap_or(""),
+                object: s(&args, "object").unwrap_or(""),
+                valid_from: s(&args, "valid_from"),
+                valid_until: s(&args, "valid_until"),
+                source: s(&args, "source").unwrap_or("tool"),
+                confidence: args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0),
+                supersede: args.get("supersede").and_then(|v| v.as_bool()).unwrap_or(true),
+            }) {
                 Ok(id) => json!({"status": "ok", "row_id": id}).to_string(),
                 Err(e) => err(e),
             }
         }
         "mnemosyne_triple_end" => {
-            match engine.triple_end(
-                s(&args, "subject").unwrap_or(""),
-                s(&args, "predicate").unwrap_or(""),
-                s(&args, "object"),
-                s(&args, "valid_until"),
-            ) {
+            match engine.triple_end(&TripleEnd {
+                subject: s(&args, "subject").unwrap_or(""),
+                predicate: s(&args, "predicate").unwrap_or(""),
+                object: s(&args, "object"),
+                valid_until: s(&args, "valid_until"),
+            }) {
                 Ok(n) => json!({"status": "ok", "closed": n}).to_string(),
                 Err(e) => err(e),
             }
         }
         "mnemosyne_triple_query" => {
-            match engine.triple_query(
-                s(&args, "subject"),
-                s(&args, "predicate"),
-                s(&args, "object"),
-                s(&args, "as_of"),
-            ) {
+            match engine.triple_query(&TripleQuery {
+                subject: s(&args, "subject"),
+                predicate: s(&args, "predicate"),
+                object: s(&args, "object"),
+                as_of: s(&args, "as_of"),
+            }) {
                 Ok(rows) => {
                     let triples: Vec<Value> = rows
                         .iter()
@@ -366,14 +374,14 @@ pub async fn dispatch(
             }
         }
         "mnemosyne_remember_canonical" => {
-            match engine.canonical_remember(
-                s(&args, "owner_id").unwrap_or(""),
-                s(&args, "category").unwrap_or(""),
-                s(&args, "name").unwrap_or(""),
-                s(&args, "body").unwrap_or(""),
-                s(&args, "source").unwrap_or("tool"),
-                args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0),
-            ) {
+            match engine.canonical_remember(&CanonicalRemember {
+                owner_id: s(&args, "owner_id").unwrap_or(""),
+                category: s(&args, "category").unwrap_or(""),
+                name: s(&args, "name").unwrap_or(""),
+                body: s(&args, "body").unwrap_or(""),
+                source: s(&args, "source").unwrap_or("tool"),
+                confidence: args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0),
+            }) {
                 Ok((row, status)) => json!({"status": "ok", "outcome": format!("{status:?}"), "version": row.version}).to_string(),
                 Err(e) => err(e),
             }
@@ -428,12 +436,12 @@ pub async fn dispatch(
             }
         }
         "mnemosyne_graph_link" => {
-            match engine.graph_link(
-                s(&args, "source").unwrap_or(""),
-                s(&args, "target").unwrap_or(""),
-                s(&args, "edge_type").unwrap_or("related_to"),
-                args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0),
-            ) {
+            match engine.graph_link(&GraphLink {
+                source: s(&args, "source").unwrap_or(""),
+                target: s(&args, "target").unwrap_or(""),
+                edge_type: s(&args, "edge_type").unwrap_or("related_to"),
+                weight: args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0),
+            }) {
                 Ok(()) => json!({"status": "ok"}).to_string(),
                 Err(e) => err(e),
             }
