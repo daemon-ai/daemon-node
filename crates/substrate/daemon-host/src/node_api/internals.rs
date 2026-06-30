@@ -5,6 +5,24 @@
 
 use super::*;
 
+/// The session's own attribution for engine-emitted (outbound) merged-log entries.
+fn engine_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("engine"),
+        scope: OriginScope::Internal,
+    }
+}
+
+/// The attribution stamped on inbound items entering through the node api surface. The api `submit`
+/// op carries no per-event origin yet (the surface-aware transports thread real origins in a later
+/// phase), so node-api inbound is tagged with this generic local-api origin.
+fn api_origin() -> Origin {
+    Origin {
+        transport: TransportId::new("api"),
+        scope: OriginScope::Internal,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Live interactive sessions (the §17 actor, exposed via the poll/drain model)
 // ---------------------------------------------------------------------------
