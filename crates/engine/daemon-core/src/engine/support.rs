@@ -12,7 +12,10 @@ use super::Engine;
 use crate::config::Config;
 use crate::conversation::{SystemPrompt, ToolCall};
 use crate::events::EventSink;
-use crate::provider::{Capabilities, MockProvider, ModelOutput, Provider, Request, ToolCallFormat};
+use crate::provider::{
+    Capabilities, MockProvider, ModelOutput, Provider, Request, ScriptStep, ScriptedProvider,
+    ToolCallFormat,
+};
 use crate::tools::{Tool, ToolConcurrency, ToolOutcome, ToolRegistry};
 use crate::turn::TurnCx;
 use crate::Failure;
@@ -43,6 +46,26 @@ pub(super) fn ok_output(text: &str) -> ModelOutput {
         tool_calls: Vec::new(),
         usage: UsageDelta::default(),
     }
+}
+
+/// The over-budget [`Pressure`](crate::context::Pressure) reading the deterministic
+/// `ContextEngine` test doubles return from `before_turn`: a huge `used_tokens` against the host
+/// `budget` (defaulting to `1` when unset) so the §10 compaction path always fires. Hoisted so the
+/// identical reading stops being copied into each test `ContextEngine`.
+pub(super) fn over_budget_pressure(budget: Option<usize>) -> crate::context::Pressure {
+    crate::context::Pressure {
+        used_tokens: 1_000_000,
+        budget_tokens: budget.or(Some(1)),
+    }
+}
+
+/// A [`ScriptedProvider`] that re-issues the same single tool `name` (`{}` args) every round — the
+/// looping model the iteration-budget / no-progress / cancel-mid-loop tests drive.
+pub(super) fn looping_call_provider(name: &str) -> Arc<ScriptedProvider> {
+    Arc::new(ScriptedProvider::looping(ScriptStep::Call {
+        name: name.into(),
+        args: "{}".into(),
+    }))
 }
 
 /// Build a fresh engine for a session `id` over `provider` + `registry` with the shared `"test"`
@@ -184,6 +207,22 @@ impl Tool for ProbeTool {
         self.active.fetch_sub(1, Ordering::SeqCst);
         ToolOutcome::text(call.call_id.clone(), true, "ok")
     }
+}
+
+/// Construct a [`ProbeTool`] sharing the batch-wide `active`/`max_seen` counters — the per-tool
+/// boilerplate the §12 batch-concurrency tests would otherwise repeat verbatim.
+pub(super) fn probe_tool(
+    name: &'static str,
+    concurrency: ToolConcurrency,
+    active: &Arc<AtomicU64>,
+    max_seen: &Arc<AtomicU64>,
+) -> Arc<ProbeTool> {
+    Arc::new(ProbeTool {
+        name,
+        concurrency,
+        active: active.clone(),
+        max_seen: max_seen.clone(),
+    })
 }
 
 /// An engine over an arbitrary set of [`Tool`]s (used to probe §12 batch concurrency).

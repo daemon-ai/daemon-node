@@ -29,8 +29,8 @@ use daemon_common::{
 };
 use daemon_protocol::{
     AgentEvent, CompletionSource, ContextStatus, ConvTurnView, ConvView, EndReason, HostRequest,
-    HostRequestHandler, HostRequestKind, RewindAnchor, SpawnSeed, SpawnSpec, ToolCallView,
-    ToolDetail, ToolResultView, TurnSummary, TurnTrigger, UserMsg,
+    HostRequestHandler, HostRequestKind, RewindAnchor, SpawnSeed, SpawnSpec, TurnSummary,
+    TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -150,127 +150,41 @@ pub struct Engine {
     lifecycle_started: bool,
 }
 
+/// The runtime handles a turn's early-stop finalizer needs: the §17 event sink, the cancel token for
+/// the final summary call, and the folded usage so far. Bundles the shared trio threaded through
+/// [`Engine::finish_with_final_summary`] and its budget/no-progress wrappers.
+struct EarlyStop<'a> {
+    events: &'a EventSink,
+    cancel: &'a CancellationToken,
+    turn_usage: UsageDelta,
+}
+
+/// The §4.3 post-turn review-cadence inputs `run_turn` accumulates over a turn and hands to
+/// [`Engine::maybe_emit_reviews`]: the tool-executing rounds and whether a skill / memory tool ran.
+struct ReviewSignals {
+    tool_rounds: u32,
+    used_skill_tool: bool,
+    used_memory_tool: bool,
+}
+
+/// A durable suspension handoff: the delegated job id and its opaque worker payload. Bundles the two
+/// values [`Engine::suspend`] threads onto the [`Suspension`].
+struct Handoff {
+    job_id: JobId,
+    payload: Vec<u8>,
+}
+
+/// The pre-cloned handles [`Engine::execute_tool_batch`] runs a tool batch against without holding
+/// `&mut self` across an await: the per-turn [`TurnCx`], the tool registry, the shared
+/// [`TurnControl`] (boundary checks), and the §17 event sink.
+struct BatchCtx<'a, 'c> {
+    cx: &'a TurnCx<'c>,
+    registry: &'a Arc<ToolRegistry>,
+    control: &'a TurnControl,
+    events: &'a EventSink,
+}
+
 impl Engine {
-    /// Construct an engine over an existing snapshot.
-    pub fn from_snapshot(
-        snapshot: Snapshot,
-        provider: Arc<dyn Provider>,
-        registry: Arc<ToolRegistry>,
-    ) -> Self {
-        // Default sandbox keyed by session id; a host injects a workspace-rooted env via the profile.
-        let exec: Arc<dyn ExecutionEnvironment> =
-            Arc::new(LocalEnvironment::sandbox(snapshot.session_id.as_str()));
-        Self {
-            snapshot,
-            provider,
-            registry,
-            pending: Vec::new(),
-            budget: Budget::unlimited(),
-            // L1 default: the in-tree embedded pool. Under a host an authority-backed provider is
-            // injected via `with_credentials` (host-spec §6).
-            credentials: Arc::new(EmbeddedCredentialPool::single_key()),
-            profile: ProfileRef::new("default"),
-            fallback_profile: None,
-            subsystem_profile: None,
-            config: Config::default(),
-            exec,
-            checkpoints: None,
-            context: Arc::new(BudgetedContextEngine::default()),
-            assembler: PromptAssembler::default(),
-            memory: Vec::new(),
-            prompt_sources: Vec::new(),
-            next_trigger: None,
-            lifecycle_started: false,
-        }
-    }
-
-    /// Construct a fresh engine for a new session with the given system prompt.
-    pub fn fresh(
-        session_id: SessionId,
-        system: SystemPrompt,
-        provider: Arc<dyn Provider>,
-        registry: Arc<ToolRegistry>,
-    ) -> Self {
-        let mut snapshot = Snapshot::fresh(session_id);
-        snapshot.conversation = Conversation::new(system);
-        Self::from_snapshot(snapshot, provider, registry)
-    }
-
-    /// Set the budget governing this engine's turns.
-    pub fn with_budget(mut self, budget: Budget) -> Self {
-        self.budget = budget;
-        self
-    }
-
-    /// Inject the engine tunables (§20) the host loaded from its config.
-    pub fn with_config(mut self, config: Config) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Inject the execution environment (§13) this engine's tools run in (a per-session
-    /// workspace-rooted [`LocalEnvironment`], or a host-routed env).
-    pub fn with_exec(mut self, exec: Arc<dyn ExecutionEnvironment>) -> Self {
-        self.exec = exec;
-        self
-    }
-
-    /// Inject the checkpoint store (§12 safety): the pipeline will record a workspace checkpoint
-    /// before each [`mutates`](crate::tools::Tool::mutates) tool runs. Without it, checkpointing is off.
-    pub fn with_checkpoints(
-        mut self,
-        checkpoints: Arc<dyn crate::checkpoint::CheckpointStore>,
-    ) -> Self {
-        self.checkpoints = Some(checkpoints);
-        self
-    }
-
-    /// Inject the context engine (§10) this engine assembles/compacts context with (the default is
-    /// the cheap [`BudgetedContextEngine`]).
-    pub fn with_context_engine(mut self, context: Arc<dyn ContextEngine>) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// Register the memory providers (§11) this engine consults around each turn (default empty).
-    pub fn with_memory(mut self, memory: Vec<Arc<dyn MemoryProvider>>) -> Self {
-        self.memory = memory;
-        self
-    }
-
-    /// Register generic stable-tier prompt sources (§10) folded into the system prompt each turn
-    /// (e.g. the skills index). Independent of memory; expected to be cache-stable.
-    pub fn with_prompt_sources(mut self, sources: Vec<Arc<dyn StablePromptSource>>) -> Self {
-        self.prompt_sources = sources;
-        self
-    }
-
-    /// Inject the credential provider + profile this engine acquires capabilities from (the host
-    /// injects an authority-backed or brokered impl; the default is the embedded L1 pool).
-    pub fn with_credentials(
-        mut self,
-        credentials: Arc<dyn CredentialProvider>,
-        profile: ProfileRef,
-    ) -> Self {
-        self.credentials = credentials;
-        self.profile = profile;
-        self
-    }
-
-    /// Set the single fallback profile the §8 recovery loop hops to when the active profile cannot
-    /// recover a model failure (persistent auth/billing/content-policy).
-    pub fn with_fallback_profile(mut self, profile: ProfileRef) -> Self {
-        self.fallback_profile = Some(profile);
-        self
-    }
-
-    /// Bind the owning *identity* profile (§5.9) this engine's §10/§11 stores are scoped under and
-    /// that is surfaced to tools via [`TurnCx::profile`](crate::turn::TurnCx). `None` => node default.
-    pub fn with_subsystem_profile(mut self, profile: Option<ProfileRef>) -> Self {
-        self.subsystem_profile = profile;
-        self
-    }
-
     /// Stash background-job completions to be applied (idempotently) before the next turn runs.
     ///
     /// Epoch fence (conversation-rewind spec §6): only completions for a job still in `waiting_for`
@@ -337,128 +251,6 @@ impl Engine {
     /// default `User`. Has no effect if a turn is already mid-flight.
     pub fn set_next_trigger(&mut self, trigger: TurnTrigger) {
         self.next_trigger = Some(trigger);
-    }
-
-    /// Rewind the conversation to `anchor` (conversation-rewind spec §2/§4): truncate the turns after
-    /// the anchor, reconstruct the engine state for that point (clear transient/in-flight state), bump
-    /// the [`Epoch`] to fence late arrivals from the abandoned turn, and emit [`AgentEvent::Rewound`].
-    ///
-    /// No per-turn snapshots are stored, so the snapshot is *reconstructed* by truncating the live
-    /// conversation in place (the same vec compaction mutates) and resetting the derived/transient
-    /// fields that only make sense relative to the dropped tail. Returns the [`RewindOutcome`] (the
-    /// retained turn count + the new epoch) so the caller can drive the durable journal seal.
-    ///
-    /// Must be called when no turn is live (the actor interrupts first). Anchors that resolve outside
-    /// the live conversation (out of range, or compacted away below the live floor) are rejected.
-    pub fn rewind_to(
-        &mut self,
-        anchor: &RewindAnchor,
-        request_id: ReqId,
-        events: &EventSink,
-    ) -> Result<RewindOutcome, RewindError> {
-        let span = tracing::info_span!(
-            "engine.rewind",
-            session = %self.snapshot.session_id,
-            request_id = request_id.0,
-            anchor = ?anchor
-        );
-        let _guard = span.enter();
-        let len = self.snapshot.conversation.turns.len();
-        let retained = match self.resolve_anchor(anchor, len) {
-            Ok(retained) => retained,
-            Err(err) => {
-                tracing::warn!(error = ?err, turns_before = len, "engine.rewind.rejected");
-                return Err(err);
-            }
-        };
-
-        // Collect the tool call-ids in the sealed-off tail (oldest first) so the host can roll the
-        // workspace back via the §12 checkpoints captured before those tools ran.
-        let dropped_call_ids: Vec<String> = self.snapshot.conversation.turns[retained..]
-            .iter()
-            .filter_map(|t| match t {
-                Turn::Tool(tt) => Some(tt),
-                _ => None,
-            })
-            .flat_map(|tt| tt.calls.iter().map(|(call, _)| call.call_id.clone()))
-            .collect();
-
-        // Reconstruct the snapshot for the rewound point: drop the sealed-off tail and reset every
-        // derived/transient field that described the now-abandoned suffix.
-        self.snapshot.conversation.turns.truncate(retained);
-        self.pending.clear();
-        self.next_trigger = None;
-        self.snapshot.waiting_for.clear();
-        self.snapshot.pending_approvals.clear();
-        // Cadence counters are relative to the dropped tail; reset so the rewound point starts clean.
-        self.snapshot.iters_since_skill = 0;
-        self.snapshot.turns_since_memory = 0;
-
-        // Bump the incarnation epoch so any in-flight commit/event from the interrupted turn that
-        // arrives late is fenced and dropped (mirrors the suspension epoch bump).
-        self.snapshot.epoch = self.snapshot.epoch.next();
-        let epoch = self.snapshot.epoch;
-        let to_cursor = retained as u64;
-
-        events.emit(|seq| AgentEvent::Rewound {
-            seq,
-            request_id,
-            to_cursor,
-            epoch: epoch.0,
-        });
-        tracing::info!(
-            turns_before = len,
-            turns_after = retained,
-            dropped_call_ids = dropped_call_ids.len(),
-            new_epoch = epoch.0,
-            to_cursor,
-            "engine.rewind.applied"
-        );
-
-        Ok(RewindOutcome {
-            retained_turns: retained,
-            epoch,
-            dropped_call_ids,
-        })
-    }
-
-    /// Resolve a [`RewindAnchor`] to the number of turns to retain (`[0, retained)` survive). `len` is
-    /// the live conversation turn count.
-    fn resolve_anchor(&self, anchor: &RewindAnchor, len: usize) -> Result<usize, RewindError> {
-        match anchor {
-            // Seal off the user turn at `ordinal` and everything after: keep `[0, ordinal)`.
-            RewindAnchor::UserTurn { ordinal } => {
-                let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
-                if o >= len {
-                    return Err(RewindError::OutOfRange);
-                }
-                if !matches!(self.snapshot.conversation.turns.get(o), Some(Turn::User(_))) {
-                    return Err(RewindError::NotAUserTurn);
-                }
-                Ok(o)
-            }
-            // Keep the user turn at `ordinal`, seal off its reply: keep `[0, ordinal]`.
-            RewindAnchor::ReplyAfter { ordinal } => {
-                let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
-                if o >= len {
-                    return Err(RewindError::OutOfRange);
-                }
-                if !matches!(self.snapshot.conversation.turns.get(o), Some(Turn::User(_))) {
-                    return Err(RewindError::NotAUserTurn);
-                }
-                Ok(o + 1)
-            }
-            // A durable journal cursor maps 1:1 onto a retained turn count in this engine's
-            // coordinate space (each kept turn is one journal-addressable position). A cursor past
-            // the live conversation is out of range.
-            RewindAnchor::Cursor { seq } => {
-                let keep = usize::try_from(*seq).map_err(|_| RewindError::OutOfRange)?;
-                if keep > len {
-                    return Err(RewindError::OutOfRange);
-                }
-                Ok(keep)
-            }
-        }
     }
 
     /// The current snapshot (the only durable state).
@@ -1040,7 +832,14 @@ impl Engine {
                 // Recovery re-suspend of an already-enqueued job: the durable outbox `OR IGNORE`-dedupes
                 // the re-enqueue on `(session, epoch, job_id)`, so this payload is discarded in favor of
                 // the original. Pass the legacy marker to preserve prior bytes for this path.
-                return Ok(self.suspend(job_id, b"delegated-work".to_vec(), events, false));
+                return Ok(self.suspend(
+                    Handoff {
+                        job_id,
+                        payload: b"delegated-work".to_vec(),
+                    },
+                    events,
+                    false,
+                ));
             }
 
             // §10/§11 once-per-incarnation lifecycle hooks before the first turn's work.
@@ -1126,8 +925,15 @@ impl Engine {
                     self.context.after_response(&out.usage);
                     // §4.3 engine-native post-turn trigger: advance the review cadence counters and, on
                     // a threshold, fire-and-forget a background-review child (no suspend).
-                    self.maybe_emit_reviews(host, tool_rounds, used_skill_tool, used_memory_tool)
-                        .await;
+                    self.maybe_emit_reviews(
+                        host,
+                        ReviewSignals {
+                            tool_rounds,
+                            used_skill_tool,
+                            used_memory_tool,
+                        },
+                    )
+                    .await;
                     return Ok(self.complete(out, events, turn_usage));
                 }
 
@@ -1158,7 +964,15 @@ impl Engine {
                 // execute_tools: run the model's tool batch through the §12 pipeline, collecting result
                 // slots, effects, and structured detail for the rich §17 transcript views.
                 let (calls, effects, interrupted) = self
-                    .execute_tool_batch(&out.tool_calls, &cx, &registry, control, events)
+                    .execute_tool_batch(
+                        &out.tool_calls,
+                        BatchCtx {
+                            cx: &cx,
+                            registry: &registry,
+                            control,
+                            events,
+                        },
+                    )
                     .await;
 
                 // §4.2 no-progress signature of this round (the tool calls + their results), computed
@@ -1215,7 +1029,7 @@ impl Engine {
                     // suspend the turn and wait for the wake.
                     self.notify_session_switch(SwitchReason::Handoff).await;
                     self.snapshot.waiting_for.push(job_id.clone());
-                    return Ok(self.suspend(job_id, payload, events, true));
+                    return Ok(self.suspend(Handoff { job_id, payload }, events, true));
                 }
 
                 // §4.2 no-progress guard: a tool round whose calls + results are byte-identical to the
@@ -1259,8 +1073,15 @@ impl Engine {
         cancel: &CancellationToken,
         turn_usage: UsageDelta,
     ) -> TurnOutcome {
-        self.finish_with_final_summary(EndReason::BudgetExhausted, events, cancel, turn_usage)
-            .await
+        self.finish_with_final_summary(
+            EndReason::BudgetExhausted,
+            EarlyStop {
+                events,
+                cancel,
+                turn_usage,
+            },
+        )
+        .await
     }
 
     /// Finalize a turn stopped early by the §4.2 no-progress guard: one final toolless summary call,
@@ -1272,8 +1093,15 @@ impl Engine {
         cancel: &CancellationToken,
         turn_usage: UsageDelta,
     ) -> TurnOutcome {
-        self.finish_with_final_summary(EndReason::NoProgress, events, cancel, turn_usage)
-            .await
+        self.finish_with_final_summary(
+            EndReason::NoProgress,
+            EarlyStop {
+                events,
+                cancel,
+                turn_usage,
+            },
+        )
+        .await
     }
 
     /// Shared early-stop finalizer: make one final **toolless** model call so the model can produce a
@@ -1282,10 +1110,13 @@ impl Engine {
     async fn finish_with_final_summary(
         &mut self,
         end_reason: EndReason,
-        events: &EventSink,
-        cancel: &CancellationToken,
-        mut turn_usage: UsageDelta,
+        stop: EarlyStop<'_>,
     ) -> TurnOutcome {
+        let EarlyStop {
+            events,
+            cancel,
+            mut turn_usage,
+        } = stop;
         let out = match self.call_model(events, false, cancel).await {
             Ok(out) => out,
             Err(f) => return self.finish_failed(f, events),
@@ -1328,13 +1159,8 @@ impl Engine {
 
     /// Emit the suspending `TurnFinished` and build the suspension handoff, bumping the epoch on a
     /// fresh suspension (but not on a deterministic recovery re-suspend).
-    fn suspend(
-        &mut self,
-        job_id: JobId,
-        payload: Vec<u8>,
-        events: &EventSink,
-        bump_epoch: bool,
-    ) -> TurnOutcome {
+    fn suspend(&mut self, handoff: Handoff, events: &EventSink, bump_epoch: bool) -> TurnOutcome {
+        let Handoff { job_id, payload } = handoff;
         if bump_epoch {
             self.snapshot.epoch = self.snapshot.epoch.next();
         }
@@ -1395,10 +1221,7 @@ impl Engine {
     async fn execute_tool_batch(
         &self,
         tool_calls: &[crate::conversation::ToolCall],
-        cx: &TurnCx<'_>,
-        registry: &Arc<ToolRegistry>,
-        control: &TurnControl,
-        events: &EventSink,
+        batch: BatchCtx<'_, '_>,
     ) -> (
         Vec<(
             crate::conversation::ToolCall,
@@ -1407,6 +1230,12 @@ impl Engine {
         Vec<Effect>,
         bool,
     ) {
+        let BatchCtx {
+            cx,
+            registry,
+            control,
+            events,
+        } = batch;
         let mut calls = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
         let mut interrupted = false;
@@ -1553,13 +1382,12 @@ impl Engine {
     /// in completed turns (reset on a memory write). A `0` interval disables that review. Counters
     /// live in the durable [`Snapshot`] so the cadence survives suspension. Mirrors hermes'
     /// `turn_finalizer.py:375-401` nudge gates without forking on the parent's thread.
-    async fn maybe_emit_reviews(
-        &mut self,
-        host: &dyn HostRequestHandler,
-        tool_rounds: u32,
-        used_skill_tool: bool,
-        used_memory_tool: bool,
-    ) {
+    async fn maybe_emit_reviews(&mut self, host: &dyn HostRequestHandler, signals: ReviewSignals) {
+        let ReviewSignals {
+            tool_rounds,
+            used_skill_tool,
+            used_memory_tool,
+        } = signals;
         let mut spawns: Vec<SpawnSpec> = Vec::new();
 
         // Skill review: count this turn's tool iterations, but a `skill_manage` use this turn resets
@@ -1611,1298 +1439,16 @@ impl Engine {
     }
 }
 
-/// The single-owner applier's view of a tool batch's [`Effect`]s, partitioned by kind (§4.3): the
-/// `Persist` turns to append to the conversation, the at-most-one `Delegate` (job + payload) that
-/// drives suspension, the fire-and-forget `Spawn`s, and the `AwaitDecision` parks (§12 HITL). Pure:
-/// the caller replays `persists` and acts on the rest, so no conversation mutation hides in here.
-struct PartitionedEffects {
-    /// Turns to append to the conversation (durable record), in effect order.
-    persists: Vec<Turn>,
-    /// The delegated job + opaque payload to suspend on, if the batch delegated (last one wins,
-    /// matching the original inline router).
-    delegated: Option<(JobId, Vec<u8>)>,
-    /// Attached, non-joining background children to spawn fire-and-forget.
-    spawns: Vec<daemon_protocol::SpawnSpec>,
-    /// Gated tool calls awaiting a durable operator decision.
-    awaiting: Vec<crate::snapshot::PendingApproval>,
-}
-
-/// Partition a tool batch's [`Effect`]s into [`PartitionedEffects`] (§4.3 effect router). Verbatim
-/// of the original inline `match`, but pure: `Persist` turns are collected (not pushed) so the
-/// single-owner applier remains the sole mutator of the conversation.
-fn partition_tool_effects(effects: Vec<Effect>) -> PartitionedEffects {
-    let mut persists: Vec<Turn> = Vec::new();
-    let mut delegated: Option<(JobId, Vec<u8>)> = None;
-    let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
-    let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
-    for effect in effects {
-        match effect {
-            Effect::Persist(turn) => persists.push(turn),
-            Effect::Delegate { job, payload } => delegated = Some((job, payload)),
-            Effect::Spawn(spec) => spawns.push(spec),
-            Effect::AwaitDecision {
-                job_id,
-                call,
-                prompt,
-                path,
-            } => awaiting.push(crate::snapshot::PendingApproval {
-                job_id,
-                call,
-                prompt,
-                path,
-            }),
-        }
-    }
-    PartitionedEffects {
-        persists,
-        delegated,
-        spawns,
-        awaiting,
-    }
-}
-
-/// The §17 transcript view of a tool *call* (`ToolStarted`): name + a generic structured echo of
-/// the call arguments, opaque to the daemon. A tool with a richer call schema can refine `detail`
-/// once providers carry structured args.
-fn tool_call_view(call: &crate::conversation::ToolCall) -> ToolCallView {
-    ToolCallView {
-        call_id: call.call_id.clone(),
-        name: call.name.clone(),
-        args_summary: call.args.clone(),
-        detail: Some(ToolDetail {
-            kind: call.name.clone(),
-            body: call.args.clone().into_bytes(),
-        }),
-    }
-}
-
-/// The §17 transcript view of a tool *result* (`ToolFinished`): the summary text plus the tool's
-/// typed output (`detail`) for a rich consumer; `detail` is `None` for plain-text tools.
-fn tool_result_view(outcome: &crate::tools::ToolOutcome) -> ToolResultView {
-    ToolResultView {
-        call_id: outcome.result.call_id.clone(),
-        ok: outcome.result.ok,
-        summary: outcome.result.content.clone(),
-        detail: outcome.detail.clone(),
-    }
-}
-
-/// A stable hash of one tool round's calls and results (§4.2 no-progress guard). Hashes each call's
-/// `name` + `args` and its result's `ok` + `content`, but **not** the per-call `call_id` (freshly
-/// minted each round), so two rounds that issue the same calls and get the same results hash equal —
-/// the signal that the model is looping without converging.
-fn round_signature(
-    calls: &[(
-        crate::conversation::ToolCall,
-        crate::conversation::ToolResult,
-    )],
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    calls.len().hash(&mut hasher);
-    for (call, result) in calls {
-        call.name.hash(&mut hasher);
-        call.args.hash(&mut hasher);
-        result.ok.hash(&mut hasher);
-        result.content.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-fn failure_kind(failure: &Failure) -> &'static str {
-    match failure {
-        Failure::Provider(_) => "provider",
-        Failure::Rotatable(_) => "rotatable",
-        Failure::RateLimit { .. } => "rate_limit",
-        Failure::Billing(_) => "billing",
-        Failure::Auth(_) => "auth",
-        Failure::ContextOverflow(_) => "context_overflow",
-        Failure::PayloadTooLarge(_) => "payload_too_large",
-        Failure::ContentPolicy(_) => "content_policy",
-        Failure::FormatError(_) => "format_error",
-        Failure::TransientTransport(_) => "transient_transport",
-        Failure::ProviderOverloaded(_) => "provider_overloaded",
-        Failure::Fatal(_) => "fatal",
-        Failure::Cancelled => "cancelled",
-        Failure::Other(_) => "other",
-    }
-}
-
-fn recovery_step_kind(step: &RecoveryStep) -> &'static str {
-    match step {
-        RecoveryStep::Retry { .. } => "retry",
-        RecoveryStep::Rotate => "rotate",
-        RecoveryStep::Compact => "compact",
-        RecoveryStep::Fallback => "fallback",
-        RecoveryStep::Abort => "abort",
-    }
-}
+mod builder;
+mod rewind;
+mod views;
+use views::{
+    failure_kind, partition_tool_effects, recovery_step_kind, round_signature, tool_call_view,
+    tool_result_view, PartitionedEffects,
+};
 
 #[cfg(test)]
 mod support;
 
 #[cfg(test)]
-mod tests {
-    use super::support::*;
-    use super::*;
-    use crate::provider::{Capabilities, ModelOutput, Request};
-    use daemon_common::{CredScope, ReqId, UsageDelta};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// A provider that fails the first call with a rotatable error, then completes.
-    struct FlakyProvider {
-        calls: AtomicU64,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for FlakyProvider {
-        fn capabilities(&self) -> Capabilities {
-            test_caps()
-        }
-
-        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
-            let n = self.calls.fetch_add(1, Ordering::Relaxed);
-            if n == 0 {
-                Err(Failure::Rotatable("quota exceeded (429)".into()))
-            } else {
-                Ok(ok_output("done after rotation"))
-            }
-        }
-    }
-
-    /// A rotatable provider failure rotates the credential and retries on a second key — the turn
-    /// completes, the provider was called twice, and one key is now cooling down.
-    #[tokio::test]
-    async fn rotatable_failure_rotates_credential_and_retries() {
-        let provider = Arc::new(FlakyProvider {
-            calls: AtomicU64::new(0),
-        });
-        let pool = Arc::new(EmbeddedCredentialPool::new(
-            "openai",
-            CredScope::new(["openai"], ["chat"], None),
-            [
-                ("key-a".to_string(), "secret-a".to_string()),
-                ("key-b".to_string(), "secret-b".to_string()),
-            ],
-            60_000,
-            30_000,
-        ));
-        let mut engine = Engine::fresh(
-            SessionId::new("rotate"),
-            SystemPrompt::new("test"),
-            provider.clone(),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_credentials(pool.clone(), ProfileRef::new("openai"));
-        engine.push_user(UserMsg::new("hello"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .expect("turn completes after a single rotation");
-        assert!(matches!(outcome, TurnOutcome::Completed(_)));
-        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "retried once");
-        assert_eq!(pool.live_count(), 1, "the rotated key is cooling down");
-    }
-
-    /// A provider that records the system prompt of the request it receives, then completes.
-    struct SystemRecordingProvider {
-        seen: std::sync::Mutex<String>,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for SystemRecordingProvider {
-        fn capabilities(&self) -> Capabilities {
-            test_caps()
-        }
-        async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
-            *self.seen.lock().unwrap() = req.system.clone();
-            Ok(ok_output("ok"))
-        }
-    }
-
-    /// A stable-tier source emitting a fixed block.
-    struct FixedBlock(&'static str);
-    impl crate::context::StablePromptSource for FixedBlock {
-        fn block(&self) -> Option<String> {
-            Some(self.0.to_string())
-        }
-    }
-
-    /// A registered [`StablePromptSource`] is folded into the request's system preamble each turn.
-    #[tokio::test]
-    async fn prompt_source_block_is_injected_into_system() {
-        let provider = Arc::new(SystemRecordingProvider {
-            seen: std::sync::Mutex::new(String::new()),
-        });
-        let mut engine = Engine::fresh(
-            SessionId::new("ps"),
-            SystemPrompt::new("base system"),
-            provider.clone(),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_prompt_sources(vec![Arc::new(FixedBlock(
-            "<available_skills>\n  x\n</available_skills>",
-        ))]);
-        engine.push_user(UserMsg::new("hi"));
-        engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        let seen = provider.seen.lock().unwrap().clone();
-        assert!(seen.contains("base system"), "keeps the base system prompt");
-        assert!(
-            seen.contains("<available_skills>"),
-            "folds the stable block in"
-        );
-    }
-
-    /// With `memory_review_interval = 1`, a completed turn (no memory write) fires exactly one
-    /// fire-and-forget `memory_review` spawn and the turn still completes normally (no suspend).
-    #[tokio::test]
-    async fn memory_review_nudge_emits_spawn_on_threshold() {
-        let host = SpawnRecordingHost::default();
-        let mut engine = Engine::fresh(
-            SessionId::new("nudge"),
-            SystemPrompt::new("test"),
-            Arc::new(TextProvider),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_config(Config {
-            memory_review_interval: 1,
-            ..Config::default()
-        });
-        engine.push_user(UserMsg::new("hi"));
-
-        let outcome = engine
-            .run_turn(&host, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .expect("turn completes");
-        assert!(matches!(outcome, TurnOutcome::Completed(_)));
-        assert!(
-            engine.snapshot().waiting_for.is_empty(),
-            "spawn does not suspend"
-        );
-        assert_eq!(
-            *host.spawns.lock().unwrap(),
-            vec!["memory_review".to_string()],
-        );
-        assert_eq!(engine.snapshot().turns_since_memory, 0, "counter reset");
-    }
-
-    /// The default `0` intervals disable the engine-native trigger entirely.
-    #[tokio::test]
-    async fn review_nudges_disabled_by_default() {
-        let host = SpawnRecordingHost::default();
-        let mut engine = Engine::fresh(
-            SessionId::new("no-nudge"),
-            SystemPrompt::new("test"),
-            Arc::new(TextProvider),
-            Arc::new(ToolRegistry::new()),
-        );
-        engine.push_user(UserMsg::new("hi"));
-        engine
-            .run_turn(&host, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .expect("turn completes");
-        assert!(
-            host.spawns.lock().unwrap().is_empty(),
-            "no spawns when disabled"
-        );
-    }
-
-    /// A credential provider serving two profiles with distinct secrets, recording each acquisition
-    /// — so a test can observe the engine hopping from the primary to the fallback profile.
-    struct TwoProfileCreds {
-        acquired: std::sync::Mutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::credentials::CredentialProvider for TwoProfileCreds {
-        async fn acquire(
-            &self,
-            profile: &ProfileRef,
-            scope: &CredScope,
-        ) -> Result<daemon_common::CapabilityLease, daemon_common::CredError> {
-            self.acquired.lock().unwrap().push(profile.to_string());
-            Ok(daemon_common::CapabilityLease {
-                cap_id: daemon_common::CredId::new(format!("{profile}-cap")),
-                profile: profile.clone(),
-                scope: scope.clone(),
-                mode: daemon_common::CredMode::Native,
-                expires_at_ms: crate::credentials::now_ms() + 60_000,
-                secret: Some(daemon_common::LeaseSecret::new(format!("sk-{profile}"))),
-                signature: Vec::new(),
-            })
-        }
-        async fn release(&self, _lease: &daemon_common::CapabilityLease) {}
-        async fn rotate(&self, _profile: &ProfileRef, _cap_id: &daemon_common::CredId) {}
-    }
-
-    /// A provider that rejects every credential with a content-policy failure *except* the fallback
-    /// profile's secret — so the turn only completes once the engine has hopped profiles.
-    struct PolicyGatedProvider {
-        ok_secret: String,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for PolicyGatedProvider {
-        fn capabilities(&self) -> Capabilities {
-            test_caps()
-        }
-
-        async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
-            if req.auth.as_deref() == Some(self.ok_secret.as_str()) {
-                Ok(ModelOutput {
-                    text: "ok on fallback profile".into(),
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    usage: UsageDelta::default(),
-                })
-            } else {
-                Err(Failure::ContentPolicy("blocked on primary".into()))
-            }
-        }
-    }
-
-    /// A persistent content-policy failure hops once to the configured fallback profile (wired via
-    /// `EngineProfile::with_fallback_profile`); the engine then completes on the fallback's
-    /// credential, having acquired the primary first and the fallback second.
-    #[tokio::test]
-    async fn fallback_profile_hops_credential_profile() {
-        use crate::EngineProfile;
-        use std::sync::Arc;
-
-        let creds = Arc::new(TwoProfileCreds {
-            acquired: std::sync::Mutex::new(Vec::new()),
-        });
-        let creds_for_builder = creds.clone();
-        let profile = EngineProfile::new(
-            Arc::new(|| {
-                Arc::new(PolicyGatedProvider {
-                    ok_secret: "sk-fallback".into(),
-                }) as Arc<dyn Provider>
-            }),
-            Arc::new(ToolRegistry::new()),
-            SystemPrompt::new("test"),
-        )
-        .with_credentials(
-            Arc::new(move || {
-                creds_for_builder.clone() as Arc<dyn crate::credentials::CredentialProvider>
-            }),
-            ProfileRef::new("primary"),
-        )
-        .with_fallback_profile(ProfileRef::new("fallback"));
-
-        let mut engine = profile.fresh(SessionId::new("fallback-hop"));
-        engine.push_user(UserMsg::new("hello"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .expect("turn completes after hopping to the fallback profile");
-        assert!(matches!(outcome, TurnOutcome::Completed(_)));
-        let acquired = creds.acquired.lock().unwrap().clone();
-        assert_eq!(
-            acquired,
-            vec!["primary".to_string(), "fallback".to_string()],
-            "acquired the primary first, then hopped to the fallback profile"
-        );
-    }
-
-    /// A provider that always fails with a non-rotatable error.
-    struct FailingProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for FailingProvider {
-        fn capabilities(&self) -> Capabilities {
-            test_caps()
-        }
-
-        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
-            Err(Failure::Provider("model exploded".into()))
-        }
-    }
-
-    /// An interrupt observed at the opening phase boundary finalizes the turn as `Interrupted`.
-    #[tokio::test]
-    async fn interrupt_at_boundary_finalizes_interrupted() {
-        let mut engine = completing_engine("int");
-        engine.push_user(UserMsg::new("hello"));
-        let control = TurnControl::new();
-        control.cancel();
-        let (sink, log) = collecting();
-
-        let outcome = engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
-            _ => panic!("expected a completed-but-interrupted outcome"),
-        }
-        assert!(log.lock().unwrap().iter().any(|e| matches!(
-            e,
-            AgentEvent::TurnFinished { summary, .. } if summary.end_reason == EndReason::Interrupted
-        )));
-    }
-
-    /// A provider failure ends the turn as `Failed`, after an `Error` event.
-    #[tokio::test]
-    async fn provider_failure_emits_error_and_failed() {
-        let mut engine = Engine::fresh(
-            SessionId::new("fail"),
-            SystemPrompt::new("test"),
-            Arc::new(FailingProvider),
-            Arc::new(ToolRegistry::new()),
-        );
-        engine.push_user(UserMsg::new("hello"));
-        let (sink, log) = collecting();
-
-        let outcome = engine
-            .run_turn(&NoopHost, &sink, &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
-            _ => panic!("expected a failed outcome"),
-        }
-        let log = log.lock().unwrap();
-        assert!(log.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
-        assert!(log.iter().any(|e| matches!(
-            e,
-            AgentEvent::TurnFinished { summary, .. } if summary.end_reason == EndReason::Failed
-        )));
-    }
-
-    /// A pending snapshot request is served at a phase boundary with a `ConvView` reflecting the
-    /// conversation.
-    #[tokio::test]
-    async fn snapshot_request_served_with_conv_view() {
-        let mut engine = completing_engine("snap");
-        engine.push_user(UserMsg::new("question"));
-        let control = TurnControl::new();
-        control.push_snapshot(ReqId(7));
-        let (sink, log) = collecting();
-
-        engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
-        let log = log.lock().unwrap();
-        let (request_id, view) = log
-            .iter()
-            .find_map(|e| match e {
-                AgentEvent::Snapshot {
-                    request_id, view, ..
-                } => Some((*request_id, view.clone())),
-                _ => None,
-            })
-            .expect("a snapshot event");
-        assert_eq!(request_id, ReqId(7));
-        assert!(view
-            .turns
-            .iter()
-            .any(|t| t.role == "user" && t.text == "question"));
-    }
-
-    /// A queued steer is drained at a boundary: the marker lands in the conversation and a
-    /// `Steered` ack is emitted.
-    #[tokio::test]
-    async fn steer_drained_appends_marker_and_acks() {
-        let mut engine = completing_engine("steer");
-        engine.push_user(UserMsg::new("hi"));
-        let control = TurnControl::new();
-        control.push_steer(SteerReq {
-            request_id: ReqId(3),
-            text: "focus".into(),
-        });
-        let (sink, log) = collecting();
-
-        engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
-        assert!(log.lock().unwrap().iter().any(|e| matches!(
-            e,
-            AgentEvent::Steered { request_id, accepted, .. } if *request_id == ReqId(3) && *accepted
-        )));
-        assert!(engine
-            .snapshot()
-            .conversation
-            .turns
-            .iter()
-            .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer] focus"))));
-    }
-
-    // --- ReAct loop (§4.2) ---
-
-    use crate::conversation::ToolCall;
-    use crate::provider::{ScriptStep, ScriptedProvider};
-
-    /// The model calls a tool twice across two rounds, then returns final text — one activation runs
-    /// the whole multi-round loop and completes (no suspension).
-    #[tokio::test]
-    async fn multi_round_loop_runs_tools_then_completes() {
-        let runs = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![
-                ScriptStep::Call {
-                    name: "counter".into(),
-                    args: "{}".into(),
-                },
-                ScriptStep::Call {
-                    name: "counter".into(),
-                    args: "{}".into(),
-                },
-            ],
-            "all done",
-        ));
-        let mut engine = looping_engine(provider.clone(), runs.clone(), 90);
-        engine.push_user(UserMsg::new("do work"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => {
-                assert_eq!(s.end_reason, EndReason::Completed);
-                assert_eq!(s.final_text.as_deref(), Some("all done"));
-            }
-            _ => panic!("expected completion after the loop"),
-        }
-        assert_eq!(
-            runs.load(Ordering::Relaxed),
-            2,
-            "the tool ran on both rounds"
-        );
-        // 3 model rounds: two tool rounds + the final-text round.
-        assert_eq!(provider.call_count(), 3);
-        // Two tool turns are recorded in the durable conversation.
-        let tool_turns = engine
-            .snapshot()
-            .conversation
-            .turns
-            .iter()
-            .filter(|t| matches!(t, Turn::Tool(_)))
-            .count();
-        assert_eq!(tool_turns, 2);
-    }
-
-    /// A batch of two `Parallel` tool calls runs concurrently: the peak observed in-flight count is 2.
-    #[tokio::test]
-    async fn parallel_tool_batch_runs_concurrently() {
-        let active = Arc::new(AtomicU64::new(0));
-        let max_seen = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![ScriptStep::Calls(vec![
-                ("para".into(), "{}".into()),
-                ("para".into(), "{}".into()),
-            ])],
-            "done",
-        ));
-        let tool = Arc::new(ProbeTool {
-            name: "para",
-            concurrency: crate::tools::ToolConcurrency::Parallel,
-            active: active.clone(),
-            max_seen: max_seen.clone(),
-        });
-        let mut engine = probe_engine(provider, vec![tool]);
-        engine.push_user(UserMsg::new("go"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, TurnOutcome::Completed(_)));
-        assert_eq!(
-            max_seen.load(Ordering::SeqCst),
-            2,
-            "both parallel calls should be in flight at once"
-        );
-    }
-
-    /// A mixed batch (one `Parallel`, one `Exclusive`) is serialized all-or-nothing: peak in-flight is 1.
-    #[tokio::test]
-    async fn exclusive_call_serializes_the_batch() {
-        let active = Arc::new(AtomicU64::new(0));
-        let max_seen = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![ScriptStep::Calls(vec![
-                ("para".into(), "{}".into()),
-                ("excl".into(), "{}".into()),
-            ])],
-            "done",
-        ));
-        let para = Arc::new(ProbeTool {
-            name: "para",
-            concurrency: crate::tools::ToolConcurrency::Parallel,
-            active: active.clone(),
-            max_seen: max_seen.clone(),
-        });
-        let excl = Arc::new(ProbeTool {
-            name: "excl",
-            concurrency: crate::tools::ToolConcurrency::Exclusive,
-            active: active.clone(),
-            max_seen: max_seen.clone(),
-        });
-        let mut engine = probe_engine(provider, vec![para, excl]);
-        engine.push_user(UserMsg::new("go"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, TurnOutcome::Completed(_)));
-        assert_eq!(
-            max_seen.load(Ordering::SeqCst),
-            1,
-            "an exclusive call must force the whole batch to run sequentially"
-        );
-    }
-
-    /// A provider that never stops calling a (non-delegating) tool exhausts the iteration budget; the
-    /// turn ends `BudgetExhausted` after one final toolless summary call.
-    #[tokio::test]
-    async fn iteration_budget_exhaustion_ends_with_summary() {
-        let runs = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
-            name: "counter".into(),
-            args: "{}".into(),
-        }));
-        let mut engine = looping_engine(provider.clone(), runs.clone(), 4);
-        engine.push_user(UserMsg::new("loop forever"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::BudgetExhausted),
-            _ => panic!("expected budget exhaustion"),
-        }
-        // The tool ran exactly `max_iterations` times; the budget is the hard stop.
-        assert_eq!(runs.load(Ordering::Relaxed), 4);
-        // 4 loop rounds + 1 toolless summary round.
-        assert_eq!(provider.call_count(), 5);
-    }
-
-    /// A model that re-issues the identical tool call every round, where the tool returns the
-    /// identical result, is looping: the §4.2 no-progress guard ends the turn `NoProgress` after
-    /// `max_repeated_rounds` identical rounds — well before the (much larger) iteration budget.
-    #[tokio::test]
-    async fn no_progress_guard_ends_repeated_identical_rounds() {
-        let runs = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
-            name: "constant".into(),
-            args: "{}".into(),
-        }));
-        let mut engine = constant_engine(provider.clone(), runs.clone(), 90, 3);
-        engine.push_user(UserMsg::new("loop"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::NoProgress),
-            _ => panic!("expected a no-progress stop"),
-        }
-        // Stopped after 3 identical rounds, not the 90-round iteration budget.
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
-        // 3 loop rounds + 1 toolless summary round.
-        assert_eq!(provider.call_count(), 4);
-    }
-
-    /// With the guard disabled (`max_repeated_rounds = 0`), the same looping/constant scenario runs
-    /// all the way to the iteration cap — proving the guard, not the budget, is what stops it above.
-    #[tokio::test]
-    async fn no_progress_guard_disabled_runs_to_iteration_budget() {
-        let runs = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
-            name: "constant".into(),
-            args: "{}".into(),
-        }));
-        let mut engine = constant_engine(provider, runs.clone(), 4, 0);
-        engine.push_user(UserMsg::new("loop"));
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::BudgetExhausted),
-            _ => panic!("expected budget exhaustion"),
-        }
-        assert_eq!(runs.load(Ordering::Relaxed), 4);
-    }
-
-    /// Cancellation observed mid-loop (after a tool runs) finalizes the turn as `Interrupted` rather
-    /// than looping back to the model.
-    #[tokio::test]
-    async fn cancel_mid_loop_finalizes_interrupted() {
-        let runs = Arc::new(AtomicU64::new(0));
-        let provider = Arc::new(ScriptedProvider::looping(ScriptStep::Call {
-            name: "counter".into(),
-            args: "{}".into(),
-        }));
-        let mut engine = looping_engine(provider, runs, 90);
-        engine.push_user(UserMsg::new("go"));
-        let control = TurnControl::new();
-        // Cancel before the first boundary: the turn finalizes interrupted immediately.
-        control.cancel();
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &control)
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
-            _ => panic!("expected interruption"),
-        }
-    }
-
-    // --- §8 recovery + §10/§11 hooks ---
-
-    use std::collections::VecDeque;
-
-    /// A provider that replays a scripted sequence of results (failures then success), defaulting to
-    /// a completing response once the script is exhausted.
-    struct FaultProvider {
-        script: std::sync::Mutex<VecDeque<Result<ModelOutput, Failure>>>,
-        calls: AtomicU64,
-    }
-
-    impl FaultProvider {
-        fn new(seq: Vec<Result<ModelOutput, Failure>>) -> Self {
-            Self {
-                script: std::sync::Mutex::new(seq.into_iter().collect()),
-                calls: AtomicU64::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for FaultProvider {
-        fn capabilities(&self) -> Capabilities {
-            test_caps()
-        }
-        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            self.script
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Ok(ok_output("default")))
-        }
-    }
-
-    /// A 429 with backoff retries (emitting `RateLimit`) and then completes on a fresh attempt.
-    #[tokio::test]
-    async fn rate_limit_retries_with_backoff_then_completes() {
-        let provider = Arc::new(FaultProvider::new(vec![
-            Err(Failure::RateLimit {
-                retry_after: None,
-                message: "slow down".into(),
-            }),
-            Err(Failure::RateLimit {
-                retry_after: None,
-                message: "slow down".into(),
-            }),
-            Ok(ok_output("recovered")),
-        ]));
-        // Tiny backoff so the test is fast.
-        let config = Config {
-            model_backoff_base_ms: 1,
-            model_backoff_max_ms: 2,
-            model_max_retries: 3,
-            ..Config::default()
-        };
-        let mut engine = Engine::fresh(
-            SessionId::new("rl"),
-            SystemPrompt::new("test"),
-            provider.clone(),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_config(config);
-        engine.push_user(UserMsg::new("hello"));
-        let (sink, log) = collecting();
-
-        let outcome = engine
-            .run_turn(&NoopHost, &sink, &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => {
-                assert_eq!(s.end_reason, EndReason::Completed);
-                assert_eq!(s.final_text.as_deref(), Some("recovered"));
-            }
-            _ => panic!("expected completion after backoff retries"),
-        }
-        assert_eq!(
-            provider.calls.load(Ordering::Relaxed),
-            3,
-            "two retries then success"
-        );
-        assert!(
-            log.lock()
-                .unwrap()
-                .iter()
-                .any(|e| matches!(e, AgentEvent::RateLimit { .. })),
-            "a RateLimit event was emitted during backoff"
-        );
-    }
-
-    /// A `ContextOverflow` compacts the conversation once (the §8 -> §10 tie-in) then retries and
-    /// completes; the conversation is shorter afterwards.
-    #[tokio::test]
-    async fn context_overflow_compacts_then_retries() {
-        let provider = Arc::new(FaultProvider::new(vec![
-            Err(Failure::ContextOverflow("too long".into())),
-            Ok(ok_output("after compact")),
-        ]));
-        let mut engine = Engine::fresh(
-            SessionId::new("overflow"),
-            SystemPrompt::new("test"),
-            provider.clone(),
-            Arc::new(ToolRegistry::new()),
-        );
-        // Enough turns that drop-oldest frees > 10%.
-        for i in 0..8 {
-            engine.push_user(UserMsg::new(format!("message {i} ").repeat(20)));
-        }
-        let before = engine.snapshot().conversation.turns.len();
-
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("after compact")),
-            _ => panic!("expected completion after compaction"),
-        }
-        assert_eq!(
-            provider.calls.load(Ordering::Relaxed),
-            2,
-            "overflow then retry"
-        );
-        assert!(
-            engine.snapshot().conversation.turns.len() < before,
-            "the conversation was compacted"
-        );
-    }
-
-    /// An always-overflowing provider compacts once then aborts (no infinite loop): the turn ends
-    /// `Failed` rather than hanging.
-    #[tokio::test]
-    async fn unrecoverable_overflow_aborts() {
-        let provider = Arc::new(FaultProvider::new(vec![
-            Err(Failure::ContextOverflow("a".into())),
-            Err(Failure::ContextOverflow("b".into())),
-            Err(Failure::ContextOverflow("c".into())),
-        ]));
-        let mut engine = Engine::fresh(
-            SessionId::new("overflow2"),
-            SystemPrompt::new("test"),
-            provider.clone(),
-            Arc::new(ToolRegistry::new()),
-        );
-        for i in 0..8 {
-            engine.push_user(UserMsg::new(format!("message {i} ").repeat(20)));
-        }
-        let outcome = engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        match outcome {
-            TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
-            _ => panic!("expected a failed outcome, not a hang"),
-        }
-    }
-
-    /// A context engine that always reports over-budget and drops one turn on compaction — used to
-    /// prove the §10 compaction signal reaches the §17 stream as an `AgentEvent::Context`.
-    struct DroppingContext;
-    #[async_trait::async_trait]
-    impl ContextEngine for DroppingContext {
-        fn before_turn(
-            &self,
-            _conv: &Conversation,
-            budget: Option<usize>,
-        ) -> crate::context::Pressure {
-            crate::context::Pressure {
-                used_tokens: 1_000_000,
-                budget_tokens: budget.or(Some(1)),
-            }
-        }
-        async fn compact(&self, mut conv: Conversation, _budget: usize) -> Conversation {
-            // Drop the oldest turn so the engine observes a non-zero `dropped_turns`.
-            if !conv.turns.is_empty() {
-                conv.turns.remove(0);
-            }
-            conv
-        }
-    }
-
-    /// A context engine that reports over-budget but whose `compact` frees **nothing** (returns the
-    /// conversation unchanged) — used to prove the C6 hard last-resort truncation in
-    /// `prepare_turn_context` reduces the context even when the engine's own compaction is a no-op.
-    struct StubbornContext;
-    #[async_trait::async_trait]
-    impl ContextEngine for StubbornContext {
-        fn before_turn(
-            &self,
-            _conv: &Conversation,
-            budget: Option<usize>,
-        ) -> crate::context::Pressure {
-            crate::context::Pressure {
-                used_tokens: 1_000_000,
-                budget_tokens: budget.or(Some(1)),
-            }
-        }
-        async fn compact(&self, conv: Conversation, _budget: usize) -> Conversation {
-            // Stubborn: frees nothing. Any reduction the engine observes is the C6 hard cap.
-            conv
-        }
-    }
-
-    /// When the §10 context engine reports over-budget but its `compact` frees nothing, the C6 hard
-    /// last-resort cap deterministically drops oldest turns so the turn does not proceed over budget
-    /// — observable as a non-zero `dropped_turns` on the `AgentEvent::Context` and a shorter
-    /// conversation, despite the engine's compaction being a no-op.
-    #[tokio::test]
-    async fn hard_cap_truncates_when_engine_compaction_frees_nothing() {
-        let mut engine = Engine::fresh(
-            SessionId::new("hard-cap"),
-            SystemPrompt::new("test"),
-            Arc::new(crate::provider::MockProvider::completing("done")),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_config(Config {
-            context_budget_tokens: Some(1),
-            ..Config::default()
-        })
-        .with_context_engine(Arc::new(StubbornContext));
-        engine.push_user(UserMsg::new("first"));
-        engine.push_user(UserMsg::new("second"));
-        engine.push_user(UserMsg::new("third"));
-        let before = engine.snapshot().conversation.turns.len();
-        let (sink, log) = collecting();
-
-        engine
-            .run_turn(&NoopHost, &sink, &TurnControl::new())
-            .await
-            .unwrap();
-
-        let log = log.lock().unwrap();
-        assert!(
-            log.iter().any(|e| matches!(
-                e,
-                AgentEvent::Context { status, .. } if status.compacted && status.dropped_turns >= 1
-            )),
-            "expected the hard cap to drop turns, got: {log:?}"
-        );
-        // The conversation the turn ran on was truncated below the pre-turn turn count even though
-        // the engine's `compact` returned everything unchanged.
-        assert!(
-            engine
-                .snapshot()
-                .conversation
-                .turns
-                .iter()
-                .filter(|t| matches!(t, Turn::User(_)))
-                .count()
-                < before
-        );
-    }
-
-    /// Compaction at the pre-turn pressure check emits an `AgentEvent::Context { compacted: true,
-    /// dropped_turns >= 1 }` on the stream — the data a GUI renders as a "compacted" toast.
-    #[tokio::test]
-    async fn compaction_surfaces_context_event() {
-        let mut engine = Engine::fresh(
-            SessionId::new("compact-evt"),
-            SystemPrompt::new("test"),
-            Arc::new(crate::provider::MockProvider::completing("done")),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_config(Config {
-            context_budget_tokens: Some(1),
-            ..Config::default()
-        })
-        .with_context_engine(Arc::new(DroppingContext));
-        engine.push_user(UserMsg::new("first"));
-        engine.push_user(UserMsg::new("second"));
-        let (sink, log) = collecting();
-
-        engine
-            .run_turn(&NoopHost, &sink, &TurnControl::new())
-            .await
-            .unwrap();
-
-        let log = log.lock().unwrap();
-        assert!(
-            log.iter().any(|e| matches!(
-                e,
-                AgentEvent::Context { status, .. } if status.compacted && status.dropped_turns >= 1
-            )),
-            "expected a compaction Context event, got: {log:?}"
-        );
-    }
-
-    // §10/§11 hook-order instrumentation.
-    struct RecordingContext {
-        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
-    }
-    #[async_trait::async_trait]
-    impl ContextEngine for RecordingContext {
-        fn on_model(&self, _model: &crate::context::ModelInfo) {
-            self.log.lock().unwrap().push("on_model");
-        }
-        fn before_turn(
-            &self,
-            _conv: &Conversation,
-            budget: Option<usize>,
-        ) -> crate::context::Pressure {
-            self.log.lock().unwrap().push("before_turn");
-            // Force over-budget so the compaction hooks fire.
-            crate::context::Pressure {
-                used_tokens: 10_000,
-                budget_tokens: budget,
-            }
-        }
-        async fn compact(&self, conv: Conversation, _budget: usize) -> Conversation {
-            self.log.lock().unwrap().push("compact");
-            conv
-        }
-        fn after_response(&self, _usage: &UsageDelta) {
-            self.log.lock().unwrap().push("after_response");
-        }
-        fn on_session_start(&self, _session: &SessionId) {
-            self.log.lock().unwrap().push("session_start");
-        }
-        fn on_session_end(&self, _session: &SessionId, _conv: &Conversation) {
-            self.log.lock().unwrap().push("session_end");
-        }
-    }
-
-    struct RecordingMemory {
-        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
-    }
-    #[async_trait::async_trait]
-    impl MemoryProvider for RecordingMemory {
-        fn name(&self) -> &str {
-            "rec"
-        }
-        fn prompt_block(&self) -> Option<crate::memory::PromptBlock> {
-            self.log.lock().unwrap().push("prompt_block");
-            None
-        }
-        async fn recall(&self, _q: &RecallQuery) -> Option<crate::memory::RecalledBlock> {
-            self.log.lock().unwrap().push("recall");
-            None
-        }
-        async fn after_turn(&self, _turn: &Turn, _conv: &Conversation) {
-            self.log.lock().unwrap().push("after_turn");
-        }
-        async fn before_compact(&self, _conv: &Conversation) {
-            self.log.lock().unwrap().push("before_compact");
-        }
-        async fn on_session_switch(&self, reason: SwitchReason) {
-            let label = match reason {
-                SwitchReason::Start => "switch:start",
-                SwitchReason::Compaction => "switch:compaction",
-                SwitchReason::Handoff => "switch:handoff",
-                SwitchReason::Resume => "switch:resume",
-                SwitchReason::End => "switch:end",
-                SwitchReason::Manual => "switch:manual",
-            };
-            self.log.lock().unwrap().push(label);
-        }
-    }
-
-    /// The §10/§11 hooks fire in spec order across an incarnation: the once-per-incarnation
-    /// lifecycle hooks (`on_model -> session_start -> switch:start`) precede the per-turn hooks
-    /// (`recall -> prompt_block -> before_turn -> before_compact -> compact -> switch:compaction ->
-    /// after_turn -> after_response`), and `end_session` fires the teardown hooks
-    /// (`session_end -> switch:end`).
-    #[tokio::test]
-    async fn memory_and_context_hooks_fire_in_spec_order() {
-        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
-        let config = Config {
-            context_budget_tokens: Some(1),
-            ..Config::default()
-        };
-        let mut engine = Engine::fresh(
-            SessionId::new("hooks"),
-            SystemPrompt::new("test"),
-            Arc::new(crate::provider::MockProvider::completing("done")),
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_config(config)
-        .with_context_engine(Arc::new(RecordingContext { log: log.clone() }))
-        .with_memory(vec![Arc::new(RecordingMemory { log: log.clone() })]);
-        engine.push_user(UserMsg::new("hello"));
-
-        engine
-            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
-            .await
-            .unwrap();
-        engine.end_session().await;
-
-        let order = log.lock().unwrap().clone();
-        assert_eq!(
-            order,
-            vec![
-                "on_model",
-                "session_start",
-                "switch:start",
-                "recall",
-                "prompt_block",
-                "before_turn",
-                "before_compact",
-                "compact",
-                "switch:compaction",
-                "after_turn",
-                "after_response",
-                "session_end",
-                "switch:end",
-            ]
-        );
-    }
-
-    // ---- conversation rewind (conversation-rewind spec) -----------------------------------------
-
-    use crate::conversation::ToolResult;
-
-    /// Build an engine whose conversation is `[User, Assistant, User, Tool(call_id=cp-1), Assistant]`.
-    fn rewind_engine() -> Engine {
-        let mut engine = completing_engine("rw");
-        let conv = &mut engine.snapshot.conversation;
-        conv.push_user(UserMsg::new("u0"));
-        conv.push_assistant(AssistantMsg::text("a1"));
-        conv.push_user(UserMsg::new("u2"));
-        conv.push_tool(ToolTurn {
-            assistant: AssistantMsg::text("a3 (tool)"),
-            calls: vec![(
-                ToolCall {
-                    call_id: "cp-1".into(),
-                    name: "write".into(),
-                    args: "{}".into(),
-                },
-                ToolResult {
-                    call_id: "cp-1".into(),
-                    ok: true,
-                    content: "ok".into(),
-                },
-            )],
-        });
-        conv.push_assistant(AssistantMsg::text("a4"));
-        engine
-    }
-
-    /// `UserTurn { ordinal }` keeps `[0, ordinal)`, bumps the epoch, and emits `Rewound`.
-    #[tokio::test]
-    async fn rewind_user_turn_truncates_and_bumps_epoch() {
-        let mut engine = rewind_engine();
-        let epoch_before = engine.epoch();
-        let (sink, log) = collecting();
-
-        let outcome = engine
-            .rewind_to(&RewindAnchor::UserTurn { ordinal: 2 }, ReqId(7), &sink)
-            .expect("user-turn rewind resolves");
-
-        assert_eq!(outcome.retained_turns, 2);
-        assert_eq!(engine.snapshot.conversation.turns.len(), 2);
-        assert_eq!(engine.epoch(), epoch_before.next());
-        // The sealed-off tail held one tool call.
-        assert_eq!(outcome.dropped_call_ids, vec!["cp-1".to_string()]);
-        let events = log.lock().unwrap();
-        assert!(events.iter().any(|e| matches!(
-            e,
-            AgentEvent::Rewound { to_cursor, epoch, request_id, .. }
-                if *to_cursor == 2 && *epoch == engine.epoch().0 && *request_id == ReqId(7)
-        )));
-    }
-
-    /// `ReplyAfter { ordinal }` keeps the user turn and drops its reply: keeps `[0, ordinal]`.
-    #[tokio::test]
-    async fn rewind_reply_after_keeps_user_turn() {
-        let mut engine = rewind_engine();
-        let outcome = engine
-            .rewind_to(
-                &RewindAnchor::ReplyAfter { ordinal: 2 },
-                ReqId(1),
-                &EventSink::discarding(),
-            )
-            .expect("reply-after rewind resolves");
-        assert_eq!(outcome.retained_turns, 3);
-        assert!(matches!(
-            engine.snapshot.conversation.turns.last(),
-            Some(Turn::User(u)) if u.text == "u2"
-        ));
-    }
-
-    /// `Cursor { seq }` maps 1:1 to a retained turn count.
-    #[tokio::test]
-    async fn rewind_cursor_truncates_to_count() {
-        let mut engine = rewind_engine();
-        let outcome = engine
-            .rewind_to(
-                &RewindAnchor::Cursor { seq: 1 },
-                ReqId(1),
-                &EventSink::discarding(),
-            )
-            .expect("cursor rewind resolves");
-        assert_eq!(outcome.retained_turns, 1);
-        assert_eq!(engine.snapshot.conversation.turns.len(), 1);
-    }
-
-    /// An out-of-range anchor is rejected (the actor maps this to an error rather than truncating).
-    #[tokio::test]
-    async fn rewind_out_of_range_is_rejected() {
-        let mut engine = rewind_engine();
-        let err = engine
-            .rewind_to(
-                &RewindAnchor::UserTurn { ordinal: 99 },
-                ReqId(1),
-                &EventSink::discarding(),
-            )
-            .unwrap_err();
-        assert_eq!(err, RewindError::OutOfRange);
-        // The conversation is untouched on rejection.
-        assert_eq!(engine.snapshot.conversation.turns.len(), 5);
-    }
-
-    /// A `UserTurn`/`ReplyAfter` anchor that does not point at a user turn is rejected.
-    #[tokio::test]
-    async fn rewind_non_user_anchor_is_rejected() {
-        let mut engine = rewind_engine();
-        // Ordinal 1 is the assistant turn `a1`.
-        let err = engine
-            .rewind_to(
-                &RewindAnchor::UserTurn { ordinal: 1 },
-                ReqId(1),
-                &EventSink::discarding(),
-            )
-            .unwrap_err();
-        assert_eq!(err, RewindError::NotAUserTurn);
-    }
-
-    /// Rewind clears the awaited-job set, so a late completion for a now-unawaited job is fenced.
-    #[tokio::test]
-    async fn rewind_fences_late_completion() {
-        let mut engine = rewind_engine();
-        engine.snapshot.waiting_for.push(JobId::new("job-1"));
-        engine
-            .rewind_to(
-                &RewindAnchor::UserTurn { ordinal: 0 },
-                ReqId(1),
-                &EventSink::discarding(),
-            )
-            .expect("rewind resolves");
-        assert!(engine.snapshot.waiting_for.is_empty());
-        // A completion for the abandoned job is dropped (not stashed) post-rewind.
-        engine.apply_completions(vec![Completion {
-            job_id: JobId::new("job-1"),
-            payload: b"late".to_vec(),
-        }]);
-        assert!(
-            engine.pending.is_empty(),
-            "late completion fenced by rewind"
-        );
-    }
-}
+mod tests;
