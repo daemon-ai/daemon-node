@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+[package]
+name = "daemon-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Identity, credentials, and the RBAC model for the node access-control layer."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+# SQLite identity store (bundled amalgamation; mirrors the other stores). PRAGMA user_version
+# migrations via rusqlite_migration (pinned to the rusqlite 0.37 line workspace-wide).
+rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite_migration = { workspace = true }
+# Argon2id PHC password hashing/verification (OWASP-recommended). Pulls RustCrypto argon2 + OsRng.
+password-auth = "1"
+# CSPRNG for opaque session tokens, and SHA-256 to store only a hash of each token (never raw).
+getrandom = "0.2"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
