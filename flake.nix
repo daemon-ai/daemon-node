@@ -35,6 +35,20 @@
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
 
+        # Version: the SemVer base lives in `./VERSION` (mirrored by `[workspace.package].version`
+        # in Cargo.toml; the `just check-version` gate asserts they agree). The build-metadata
+        # identifier is derived from the flake source revision (no `.git` in the sandbox), retaining
+        # the off-tag / dirty marker like phosphor: `g<rev>` clean, `g<rev>.dirty` dirty, else a
+        # narHash fallback. It is wrapped as `+<id>` by daemon-common's build.rs (via DAEMON_BUILD_ID).
+        baseVersion = lib.strings.trim (builtins.readFile ./VERSION);
+        buildId =
+          if self ? shortRev then
+            "g${self.shortRev}"
+          else if self ? dirtyShortRev then
+            "g${lib.removeSuffix "-dirty" self.dirtyShortRev}.dirty"
+          else
+            "nar${builtins.substring 0 8 (lib.removePrefix "sha256-" (self.narHash or "sha256-unknown"))}";
+
         # Native build inputs for the `daemon-infer` worker's optional engine backends
         # (llama-cpp-4 / mistral.rs). These are only consumed when a worker is built with an engine
         # feature (`--features llama`, etc.); the default workspace gate compiles only the stub worker
@@ -156,7 +170,7 @@
         commonArgs = {
           inherit src cargoVendorDir;
           pname = "daemon-workspace";
-          version = "0.0.0";
+          version = baseVersion;
           strictDeps = true;
         };
 
@@ -168,9 +182,13 @@
             commonArgs
             // {
               pname = packageName;
-              version = "0.0.0";
+              version = baseVersion;
               inherit cargoArtifacts;
               cargoExtraArgs = "-p ${packageName}";
+              # Inject the reproducible build-metadata id here (not in commonArgs) so the shared
+              # dependency artifacts stay cached across revisions; only the final crates rebuild
+              # when the revision changes. daemon-common's build.rs reads this.
+              DAEMON_BUILD_ID = buildId;
             }
           );
 
@@ -232,7 +250,7 @@
           commonArgs
           // {
             pname = "daemon-metta";
-            version = "0.0.0";
+            version = baseVersion;
             inherit cargoArtifacts;
             cargoExtraArgs = "-p daemon-metta --features hyperon";
             nativeBuildInputs = [ pkgs.pkg-config ];
@@ -282,7 +300,7 @@
             commonArgs
             // {
               pname = "daemon-verify-codec";
-              version = "0.0.0";
+              version = baseVersion;
               inherit cargoArtifacts;
               doInstallCargoArtifacts = false;
               buildPhaseCargoCommand = "cargo run -p xtask -- verify-codec";

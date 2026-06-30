@@ -48,6 +48,19 @@ CDDL must mirror them exactly and stay clean.
   the item and add a one-line reason; never blanket-allow at module or crate level.
 - Don't add dependencies you don't use — `cargo machete` (`just audit-cleanup`) will flag them.
 
+## Versioning
+
+`VERSION` (repo root, clean SemVer) is the source of truth; `[workspace.package].version` mirrors it
+because Cargo needs a literal (every member inherits via `version.workspace = true`; internal path
+deps carry no `version`). `daemon-common`'s `build.rs` appends a git build-metadata suffix
+(`+<n>.g<hash>[.dirty]` from `git describe`, or the Nix-injected `DAEMON_BUILD_ID`) to form
+`daemon_common::VERSION` — what `daemon --version` and `daemon-cli --version` print. Do NOT bake a
+version literal anywhere else.
+
+Bump in the monorepo with `just set-version daemon-node X.Y.Z` (writes `VERSION` and syncs
+`Cargo.toml`); standalone, edit `VERSION` and `[workspace.package].version` together. The
+`just check-version` gate (part of `just lint`) fails if they drift.
+
 ## Features / engines
 
 - The default workspace gate builds default features only. The `llama` / `mistralrs` / `hyperon`

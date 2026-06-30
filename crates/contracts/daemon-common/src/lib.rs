@@ -19,6 +19,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+/// The full build version string: the crate SemVer (`CARGO_PKG_VERSION`, the workspace
+/// `[workspace.package].version`, mirrored by the repo `VERSION` file) plus a build-metadata
+/// suffix identifying the exact source revision (`+<commits>.g<hash>[.dirty]`, or `+g<hash>` with
+/// no tags yet). The suffix is empty on a clean release tag, so a tagged build reports a bare
+/// `X.Y.Z`. Computed by this crate's `build.rs` (Nix injects `DAEMON_BUILD_ID`; dev builds use
+/// `git describe`). This is the single in-binary version surfaced by the `daemon` / `daemon-cli`
+/// binaries.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), env!("DAEMON_BUILD_SUFFIX"));
+
 /// Macro to declare a string-backed, stable logical identifier newtype.
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {

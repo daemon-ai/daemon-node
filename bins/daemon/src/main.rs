@@ -79,6 +79,16 @@ const TRANSPORT_SERVER_ENV: &str = "DAEMON_TRANSPORT_SERVER";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `daemon --version` / `-V`: report the build version and exit before any setup (so the output
+    // stays clean and no log subscriber / transport is initialized).
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--version" || a == "-V")
+    {
+        println!("daemon {}", daemon_common::VERSION);
+        return Ok(());
+    }
+
     // Stderr-only structured logging (stdout is the cut transport in the child role).
     daemon_telemetry::init_subscriber();
 

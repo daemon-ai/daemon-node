@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 /// Operate a running `daemon` host node over its api socket.
 #[derive(Parser)]
-#[command(name = "daemon-cli", version, about)]
+#[command(name = "daemon-cli", version = daemon_common::VERSION, about)]
 pub(crate) struct Cli {
     /// Path to the node's api socket (defaults to `$DAEMON_API_SOCKET` or `$TMPDIR/daemon-api.sock`).
     #[arg(long, global = true)]
