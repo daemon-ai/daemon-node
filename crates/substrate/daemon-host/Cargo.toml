@@ -42,6 +42,9 @@ serde_json = { workspace = true }
 ciborium = { workspace = true }
 # SASL authentication state machine for the api handshake (authn.rs).
 rsasl = { workspace = true }
+# TLS for the TCP api transport (tls.rs). PEM cert/key loading uses the maintained `PemObject`
+# reader re-exported by rustls' pki-types (no separate rustls-pemfile dep).
+tokio-rustls = { workspace = true }
 # content hashing for the append-only profile/skill revision log (content-addressed snapshot blobs).
 sha2 = { workspace = true }
 # HMAC-SHA256 for deterministic decoy SCRAM material (anti-oracle) + OS entropy for the decoy secret.
@@ -51,6 +54,13 @@ getrandom = "0.2"
 regex = { workspace = true }
 # the file-backed skills store backing the node's skill versioning + distribution ops.
 daemon-skills = { workspace = true }
+
+[dev-dependencies]
+# Ephemeral self-signed certs (server + CA-signed client + untrusted client) for the TLS listener
+# handshake / client-cert-rejection tests. Test-only; never compiled into the node.
+rcgen = "0.13"
+# Temp files for the on-disk cert/key paths `build_server_config` reads in the TLS tests.
+tempfile = "3"
 
 [lints]
 workspace = true

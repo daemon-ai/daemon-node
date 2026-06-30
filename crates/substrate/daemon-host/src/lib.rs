@@ -57,6 +57,7 @@ pub mod services;
 pub mod socket;
 pub mod streamjson;
 pub mod supervisor;
+pub mod tls;
 pub mod transcript;
 pub mod unit;
 pub mod workspace_fs;
@@ -122,6 +123,7 @@ pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle, SupervisorObserver,
 };
+pub use tls::{build_server_config, serve_api_tls_tcp, ApiTlsConfig, TlsConfigError};
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use unit::{EngineUnit, RewindHooks};
 pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};

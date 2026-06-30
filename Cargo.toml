@@ -56,6 +56,10 @@ rsasl = { version = "2.3.1", default-features = false, features = [
     "plain",          # PLAIN (verified against Argon2id; TLS-only by policy)
     "external",       # EXTERNAL (mTLS client-cert -> user)
 ] }
+# TLS for the TCP api transport. Re-exports the tree's already-resolved rustls 0.23 (verified via
+# `cargo tree -i rustls`); default features keep the aws-lc-rs crypto provider the rest of the tree
+# already uses (no second backend). Isolated to `daemon-host`.
+tokio-rustls = "0.26"
 # Schema migrations for the rusqlite-backed stores, gated by `PRAGMA user_version` (no bookkeeping
 # table). Pinned to the release that targets rusqlite 0.37 — 2.4+ require newer rusqlite (2.4->0.38,
 # 2.5->0.39, 2.6->0.40), so bump this in lockstep only when the workspace rusqlite pin moves.

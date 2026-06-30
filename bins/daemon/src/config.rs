@@ -19,6 +19,20 @@ const API_SOCKET_ENV: &str = "DAEMON_API_SOCKET";
 /// Enables the optional in-process HTTP/WS surface (the `daemon-http` adapter) and sets its bind
 /// address (e.g. `127.0.0.1:8787`). Absent => the HTTP surface is off (toggle-on-launch, like MCP).
 const HTTP_ADDR_ENV: &str = "DAEMON_HTTP_ADDR";
+/// Enables the networked TLS/TCP api transport and sets its bind address (e.g. `0.0.0.0:8443`).
+/// Absent => TCP is off and the node serves only the local Unix socket (the prior behavior).
+const API_TLS_ADDR_ENV: &str = "DAEMON_API_TLS_ADDR";
+/// PEM file with the TLS server certificate chain (required when `tls_addr` is set).
+const API_TLS_CERT_ENV: &str = "DAEMON_API_TLS_CERT";
+/// PEM file with the TLS server private key (required when `tls_addr` is set).
+const API_TLS_KEY_ENV: &str = "DAEMON_API_TLS_KEY";
+/// Require + verify a client certificate (mTLS) on the TLS transport, enabling the EXTERNAL
+/// mechanism and rejecting untrusted client certs at the handshake.
+const API_REQUIRE_CLIENT_CERT_ENV: &str = "DAEMON_API_REQUIRE_CLIENT_CERT";
+/// PEM bundle of CA certs trusted to sign client certificates (required with `require_client_cert`).
+const API_TLS_CLIENT_CA_ENV: &str = "DAEMON_API_TLS_CLIENT_CA";
+/// Path to the SQLite identity store backing authentication (default `<data_dir>/auth.sqlite`).
+const API_AUTH_DB_ENV: &str = "DAEMON_API_AUTH_DB";
 /// Selects the durable store backend: `memory` (default) or `sqlite`.
 const STORE_ENV: &str = "DAEMON_STORE";
 /// The SQLite database path (when the backend is `sqlite`).
@@ -563,6 +577,29 @@ pub struct ModelsConfig {
     pub endpoint: Option<String>,
 }
 
+/// The `[api]` transport surface configuration: the networked TLS/TCP listener (off unless
+/// `tls_addr` is set) and the identity-store path backing authentication. The local Unix socket
+/// stays plaintext and is configured separately (`socket_path`).
+///
+/// Note: `[api].local_trust` (the explicit local-system principal for the Unix socket) is
+/// intentionally **not** resolved here yet — its default polarity is a cross-track decision
+/// (sequenced with Track A's fail-closed inversion) and lands with the serve_mux convergence step.
+#[derive(Clone, Debug)]
+pub struct ApiConfig {
+    /// TLS/TCP bind address; `None` keeps the node Unix-socket-only (the prior behavior).
+    pub tls_addr: Option<String>,
+    /// PEM server certificate chain (required when `tls_addr` is set).
+    pub tls_cert: Option<PathBuf>,
+    /// PEM server private key (required when `tls_addr` is set).
+    pub tls_key: Option<PathBuf>,
+    /// Require + verify a client certificate (mTLS) on the TLS transport.
+    pub require_client_cert: bool,
+    /// PEM CA bundle trusted to sign client certs (required with `require_client_cert`).
+    pub tls_client_ca: Option<PathBuf>,
+    /// SQLite identity store path backing authentication (defaults to `<data_dir>/auth.sqlite`).
+    pub auth_db: PathBuf,
+}
+
 /// The durable store backend selected by config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreBackend {
@@ -711,6 +748,8 @@ pub struct NodeConfig {
     /// The internal Rooms loopback transport (`daemon-rooms`) config (`enabled = false` by default —
     /// opt-in). Rooms + membership are durable in the store, not in this config.
     pub rooms: daemon_rooms::RoomsConfig,
+    /// The `[api]` transport surface: the networked TLS/TCP listener + identity-store path.
+    pub api: ApiConfig,
 }
 
 /// The TOML file shape — every field optional, so a partial file is valid and env fills the rest.
@@ -756,6 +795,20 @@ struct FileConfig {
     routing: Option<FileRoutingConfig>,
     matrix: Option<FileMatrixConfig>,
     rooms: Option<FileRoomsConfig>,
+    api: Option<FileApiConfig>,
+}
+
+/// The `[api]` TOML table — the networked TLS transport + identity-store path (every field
+/// optional; env wins). `[api].local_trust` is reserved for the serve_mux convergence step.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileApiConfig {
+    tls_addr: Option<String>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    require_client_cert: Option<bool>,
+    tls_client_ca: Option<PathBuf>,
+    auth_db: Option<PathBuf>,
 }
 
 /// The `[matrix]` TOML table — the Matrix transport surface (every field optional). Carries **no**
@@ -1194,6 +1247,7 @@ impl NodeConfig {
         let routing = Self::resolve_routing(file.routing.unwrap_or_default())?;
         let matrix = Self::resolve_matrix(file.matrix.unwrap_or_default(), &data_dir);
         let rooms = Self::resolve_rooms(file.rooms.unwrap_or_default());
+        let api = Self::resolve_api(file.api.unwrap_or_default(), &data_dir);
 
         Ok(Self {
             partition,
@@ -1229,7 +1283,40 @@ impl NodeConfig {
             routing,
             matrix,
             rooms,
+            api,
         })
+    }
+
+    /// Resolve the `[api]` table (env overriding TOML). The identity-store path defaults to
+    /// `<data_dir>/auth.sqlite`. TLS is off unless `tls_addr` is set; `main` validates that a TLS
+    /// address is accompanied by a cert + key.
+    fn resolve_api(file: FileApiConfig, data_dir: &std::path::Path) -> ApiConfig {
+        let tls_addr = env_string(API_TLS_ADDR_ENV).or(file.tls_addr);
+        let tls_cert = env_string(API_TLS_CERT_ENV)
+            .map(PathBuf::from)
+            .or(file.tls_cert);
+        let tls_key = env_string(API_TLS_KEY_ENV)
+            .map(PathBuf::from)
+            .or(file.tls_key);
+        let mut require_client_cert = file.require_client_cert.unwrap_or(false);
+        if let Some(s) = env_string(API_REQUIRE_CLIENT_CERT_ENV) {
+            require_client_cert = parse_bool(&s);
+        }
+        let tls_client_ca = env_string(API_TLS_CLIENT_CA_ENV)
+            .map(PathBuf::from)
+            .or(file.tls_client_ca);
+        let auth_db = env_string(API_AUTH_DB_ENV)
+            .map(PathBuf::from)
+            .or(file.auth_db)
+            .unwrap_or_else(|| data_dir.join("auth.sqlite"));
+        ApiConfig {
+            tls_addr,
+            tls_cert,
+            tls_key,
+            require_client_cert,
+            tls_client_ca,
+            auth_db,
+        }
     }
 
     /// Resolve the `[rooms]` table (env overriding TOML overriding defaults). Rooms carry no secrets

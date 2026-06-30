@@ -26,6 +26,8 @@ daemon-providers = { workspace = true }
 daemon-infer = { workspace = true }
 daemon-host = { workspace = true }
 daemon-node = { workspace = true }
+# The identity store backing the networked-transport authenticator (`[api]` TLS listener).
+daemon-auth = { workspace = true }
 # The MeTTa symbolic coprocessor: the supervised client + the `metta` tool. Both pull `daemon-metta`
 # default-features = false (wire types only), so `hyperon` never reaches the daemon binary — the
 # engine lives entirely in the separately-built worker process.

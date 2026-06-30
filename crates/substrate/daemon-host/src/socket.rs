@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 /// Bound on buffered server -> client frames per connection before the writer applies backpressure.
-const WRITER_QUEUE: usize = 256;
+pub(crate) const WRITER_QUEUE: usize = 256;
 /// Idle keepalive cadence on a live subscription so a silently dead socket is noticed without the
 /// connection-level Health probe. An empty `LogPage` doubles as the keepalive.
 const STREAM_KEEPALIVE: Duration = Duration::from_secs(20);
@@ -237,7 +237,7 @@ async fn serve_mux(
 /// frames (one entry per page in L0), each stamped with the session-activation `epoch` (L2). A lossy
 /// broadcast lag becomes a `Reset { epoch, head_seq }` so the client re-baselines. Idle ticks send an
 /// empty keepalive page; the stream ends with `End`.
-fn spawn_stream(
+pub(crate) fn spawn_stream(
     api: Arc<dyn NodeApi>,
     tx: mpsc::Sender<WireS2C>,
     id: u64,
@@ -488,7 +488,7 @@ impl MuxApiClient {
 }
 
 /// Read one length-framed message. Returns `Ok(None)` on a clean EOF at a frame boundary.
-async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
@@ -504,7 +504,7 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Write one length-framed message.
-async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
     bytes: &[u8],
 ) -> std::io::Result<()> {

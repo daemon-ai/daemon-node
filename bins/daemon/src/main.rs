@@ -1633,6 +1633,43 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket");
     let server = tokio::spawn(serve_api_unix(listener, node.clone()));
 
+    // The networked TLS/TCP api transport (opt-in via `[api].tls_addr`). The Unix socket stays
+    // plaintext (local trust); TCP always requires authentication. The identity store is opened
+    // (created if absent) regardless, so the authenticator is ready for the convergence step.
+    let auth_store =
+        Arc::new(daemon_auth::AuthStore::open(&cfg.api.auth_db).map_err(|e| {
+            anyhow::anyhow!("opening auth store {}: {e}", cfg.api.auth_db.display())
+        })?);
+    let authenticator = Arc::new(daemon_host::Authenticator::new(auth_store));
+    let tls_server = match (&cfg.api.tls_addr, &cfg.api.tls_cert, &cfg.api.tls_key) {
+        (Some(addr), Some(cert), Some(key)) => {
+            let tls_cfg = daemon_host::ApiTlsConfig {
+                cert_path: cert.clone(),
+                key_path: key.clone(),
+                require_client_cert: cfg.api.require_client_cert,
+                client_ca_path: cfg.api.tls_client_ca.clone(),
+            };
+            let server_config = daemon_host::build_server_config(&tls_cfg)
+                .map_err(|e| anyhow::anyhow!("building TLS server config: {e}"))?;
+            let tls_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                %addr,
+                require_client_cert = cfg.api.require_client_cert,
+                "serving daemon-api over TLS/TCP (authentication required)"
+            );
+            Some(tokio::spawn(daemon_host::serve_api_tls_tcp(
+                tls_listener,
+                server_config,
+                node.clone(),
+                authenticator,
+            )))
+        }
+        (Some(_), _, _) => {
+            anyhow::bail!("[api].tls_addr is set but [api].tls_cert / [api].tls_key are missing")
+        }
+        _ => None,
+    };
+
     // Optionally bind the in-process HTTP/WS surface (the `daemon-http` adapter), toggled on by a
     // configured bind address (like the MCP surface). It shares the same `Arc<dyn NodeApi>`, so it is
     // just another transport over the one canonical interface — JSON dispatch plus SSE/WS streaming
@@ -1683,6 +1720,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("ctrl_c received; shutting down");
     server.abort();
+    if let Some(tls_server) = tls_server {
+        tls_server.abort();
+    }
     if let Some(http_server) = http_server {
         http_server.abort();
     }
