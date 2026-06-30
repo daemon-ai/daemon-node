@@ -2199,8 +2199,12 @@ dependencies = [
  "daemon-tool-orchestrate",
  "daemon-tool-web",
  "futures",
+ "rcgen",
+ "rsasl",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
 ]
 

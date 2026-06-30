@@ -38,6 +38,15 @@ async-trait = { workspace = true }
 ciborium = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# Auth 7 e2e/negative suites: drive the real authenticated transports with the same `rsasl`
+# SCRAM-SHA-256 client a GUI/TUI uses, over a real `rustls` TLS/TCP connection with throwaway certs.
+# Test-only; never compiled into a shipped artifact.
+rsasl = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = "0.13"
+tempfile = "3"
+
 [lints]
 workspace = true
 
