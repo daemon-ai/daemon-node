@@ -124,6 +124,7 @@ impl ModelApi for MockApi {}
 impl daemon_api::ProfileApi for MockApi {}
 impl daemon_api::CredentialApi for MockApi {}
 impl daemon_api::AuthApi for MockApi {}
+impl daemon_api::AccessControlApi for MockApi {}
 
 /// A projector that records every `(session, seq)` it is handed.
 #[derive(Default)]

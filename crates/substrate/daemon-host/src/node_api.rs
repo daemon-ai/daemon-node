@@ -366,6 +366,15 @@ pub struct NodeApiImpl {
     /// binary can bind it *after* the node is wrapped in an `Arc` (see [`NodeApiImpl::set_commands`]),
     /// since the registry needs node-resolved provider handles the node construction does not own.
     commands: Arc<ArcSwapOption<crate::commands::CommandRegistry>>,
+    /// The identity store backing the admin access-control sub-surface ([`daemon_api::AccessControlApi`]).
+    /// `None` => every admin op resolves to [`ApiError::Unsupported`] (a node assembled without an
+    /// identity store — the FFI / conformance harness). `who_am_i` needs no store (it reads the
+    /// request principal); `role_list` is store-free (the built-in role→capability matrix).
+    auth_store: Option<Arc<daemon_auth::AuthStore>>,
+    /// The shared auth-audit sink (the `node-auth` verifiable journal chain). `None` => admin-op
+    /// audit is a no-op (no journaling). The same handle is given to the transport's
+    /// [`Authenticator`](crate::authn::Authenticator) so login/denial events ride the same chain.
+    auth_audit: Option<Arc<crate::auth_audit::AuthAudit>>,
 }
 
 impl NodeApiImpl {
@@ -389,6 +398,7 @@ impl NodeApiImpl {
     }
 }
 
+mod access;
 mod assembly;
 mod builtins;
 mod control;

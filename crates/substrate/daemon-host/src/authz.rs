@@ -24,15 +24,29 @@ use crate::request_context::current_principal;
 use daemon_api::{ApiError, ApiRequest};
 use daemon_auth::Capability;
 
-/// The single [`Capability`] gating `req`. ONE exhaustive match, NO `_` arm: a new [`ApiRequest`]
+/// What a request requires to be authorized. Most ops require a specific [`Capability`]; a few
+/// (e.g. [`ApiRequest::WhoAmI`]) require only that *some* principal is authenticated, with no
+/// particular capability. Modeling the latter explicitly (rather than mapping it to a nominal
+/// capability) keeps the gate honest: "any authenticated principal" is a distinct requirement from
+/// "holds capability X".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequiredAccess {
+    /// Allowed for any authenticated principal (no specific capability). Still fail-closed: an
+    /// unauthenticated caller (no bound principal) is rejected.
+    Authenticated,
+    /// Requires the named [`Capability`].
+    Cap(Capability),
+}
+
+/// The [`RequiredAccess`] gating `req`. ONE exhaustive match, NO `_` arm: a new [`ApiRequest`]
 /// variant that lands without a mapping breaks the build (and thus the test suite). Arms are grouped
 /// to parallel the `serve_*` dispatch surfaces.
-pub fn required_capability(req: &ApiRequest) -> Capability {
+pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
     // `Capability` is aliased (`C`) because two of its variant names collide with `ApiRequest`'s
     // (`FsRead`/`FsWrite`): bare names in patterns resolve to `ApiRequest`; capabilities are `C::*`.
     use ApiRequest::*;
     use Capability as C;
-    match req {
+    let cap = match req {
         // -- serve_session: own-session interaction --------------------------------------------
         Submit { .. }
         | SubmitRouted { .. }
@@ -199,7 +213,23 @@ pub fn required_capability(req: &ApiRequest) -> Capability {
         | BlobGet { .. }
         | BlobStat { .. } => C::FsRead,
         FsWrite(_) | BlobPut { .. } | FsWriteFromBlob(_) => C::FsWrite,
-    }
+
+        // -- serve_access: admin user/role/session management + reserved per-resource grants ----
+        // WhoAmI is allowed to ANY authenticated principal (no specific capability); the `return`
+        // diverges, so this arm unifies with the surrounding `Capability`-typed match.
+        WhoAmI => return RequiredAccess::Authenticated,
+        UserCreate { .. }
+        | UserList
+        | UserDisable { .. }
+        | UserSetRoles { .. }
+        | UserSetPassword { .. }
+        | RoleList
+        | SessionRevoke { .. }
+        | ResourceGrantCreate { .. }
+        | ResourceGrantList { .. }
+        | ResourceGrantRevoke { .. } => C::AccessAdmin,
+    };
+    RequiredAccess::Cap(cap)
 }
 
 /// Authorize `req` against the task-local request principal.
@@ -209,14 +239,16 @@ pub fn required_capability(req: &ApiRequest) -> Capability {
 /// missing the [`required_capability`] gets [`ApiError::Forbidden`]. Per-resource ownership is a
 /// separate, downstream check (Track C).
 pub fn authorize(req: &ApiRequest) -> Result<(), ApiError> {
-    let needed = required_capability(req);
-    match current_principal() {
-        None => Err(ApiError::Unauthenticated(
-            "no authenticated principal bound to this request".into(),
-        )),
-        Some(principal) if principal.has(needed) => Ok(()),
-        Some(_) => Err(ApiError::Forbidden(format!(
-            "operation requires capability {needed:?}"
+    // Fail-closed: every requirement first needs *a* bound principal.
+    let principal = current_principal().ok_or_else(|| {
+        ApiError::Unauthenticated("no authenticated principal bound to this request".into())
+    })?;
+    match required_capability(req) {
+        // Any authenticated principal satisfies an `Authenticated` requirement (e.g. `WhoAmI`).
+        RequiredAccess::Authenticated => Ok(()),
+        RequiredAccess::Cap(cap) if principal.has(cap) => Ok(()),
+        RequiredAccess::Cap(cap) => Err(ApiError::Forbidden(format!(
+            "operation requires capability {cap:?}"
         ))),
     }
 }
@@ -344,7 +376,7 @@ mod tests {
         {
             assert_eq!(
                 required_capability(&req),
-                cap,
+                RequiredAccess::Cap(cap),
                 "mapping drifted for {req:?}"
             );
         }
@@ -411,6 +443,58 @@ mod tests {
         }
     }
 
+    /// Admin-tier ops (Auth 5 access-control surface): every one maps to `AccessAdmin`.
+    fn admin_ops() -> Vec<ApiRequest> {
+        vec![
+            ApiRequest::UserCreate {
+                username: "x".into(),
+                password: "x".into(),
+                roles: vec!["user".into()],
+            },
+            ApiRequest::UserList,
+            ApiRequest::UserDisable {
+                user_id: "u".into(),
+                disabled: true,
+            },
+            ApiRequest::UserSetRoles {
+                user_id: "u".into(),
+                roles: vec!["user".into()],
+            },
+            ApiRequest::UserSetPassword {
+                user_id: "u".into(),
+                password: "x".into(),
+            },
+            ApiRequest::RoleList,
+            ApiRequest::SessionRevoke {
+                user_id: "u".into(),
+            },
+            ApiRequest::ResourceGrantCreate {
+                user_id: "u".into(),
+                resource_kind: "session".into(),
+                resource_id: "s".into(),
+                capability: "session_read".into(),
+            },
+            ApiRequest::ResourceGrantList { user_id: None },
+            ApiRequest::ResourceGrantRevoke { id: "g".into() },
+        ]
+    }
+
+    #[test]
+    fn admin_ops_require_access_admin() {
+        for req in admin_ops() {
+            assert_eq!(
+                required_capability(&req),
+                RequiredAccess::Cap(Capability::AccessAdmin),
+                "admin op {req:?} must require AccessAdmin"
+            );
+        }
+        // WhoAmI is the lone "any authenticated principal" requirement.
+        assert_eq!(
+            required_capability(&ApiRequest::WhoAmI),
+            RequiredAccess::Authenticated
+        );
+    }
+
     #[tokio::test]
     async fn role_matrix_operator_drives_node_but_lacks_access_admin() {
         for (req, _) in read_samples()
@@ -423,9 +507,52 @@ mod tests {
                 "operator allowed {req:?}"
             );
         }
-        // No v2 ApiRequest maps to AccessAdmin (admin DTOs are Track D), so the "Operator lacks
-        // AccessAdmin" guard is asserted at the Principal level.
+        // The Auth 5 admin ops DO map to AccessAdmin: an Operator (no AccessAdmin) is forbidden.
         assert!(!principal(Role::Operator).has(Capability::AccessAdmin));
+        for req in admin_ops() {
+            assert!(
+                matches!(
+                    gate(Role::Operator, req.clone()).await,
+                    Err(ApiError::Forbidden(_))
+                ),
+                "operator must be denied admin op {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_ops_deny_every_non_admin_role() {
+        for role in [Role::Viewer, Role::User, Role::Operator] {
+            for req in admin_ops() {
+                assert!(
+                    matches!(gate(role, req.clone()).await, Err(ApiError::Forbidden(_))),
+                    "{role:?} must be denied admin op {req:?}"
+                );
+            }
+        }
+        // Admin is allowed every admin op.
+        for req in admin_ops() {
+            assert!(
+                gate(Role::Admin, req.clone()).await.is_ok(),
+                "admin allowed {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn who_am_i_allowed_for_any_authenticated_principal() {
+        // Even the lowest role (Viewer) may call WhoAmI; no capability is required.
+        for role in [Role::Viewer, Role::User, Role::Operator, Role::Admin] {
+            assert!(
+                gate(role, ApiRequest::WhoAmI).await.is_ok(),
+                "{role:?} may call WhoAmI"
+            );
+        }
+        // But an unauthenticated caller (no bound principal) is still rejected (fail-closed).
+        assert!(matches!(
+            authorize(&ApiRequest::WhoAmI),
+            Err(ApiError::Unauthenticated(_))
+        ));
     }
 
     #[tokio::test]

@@ -1092,6 +1092,20 @@ request-blob-get = { "BlobGet": { "hash": content-hash, ? "range": (byte-range /
 request-blob-stat = { "BlobStat": { "hash": content-hash } }
 fs-write-from-blob-args = { "root": fs-root-id-t, "path": tstr, "hash": content-hash, ? "base_revision": (fs-revision / null), ? "force": bool }
 request-fs-write-from-blob = { "FsWriteFromBlob": fs-write-from-blob-args }
+
+; ----- access control (Auth 5): admin user/role/session management -----
+; `password` is a request-only input; it never appears in any response or audit payload.
+request-user-create        = { "UserCreate": { "username": tstr, "password": tstr, "roles": [* tstr] } }
+request-user-list          = "UserList"
+request-user-disable       = { "UserDisable": { "user_id": tstr, "disabled": bool } }
+request-user-set-roles     = { "UserSetRoles": { "user_id": tstr, "roles": [* tstr] } }
+request-user-set-password  = { "UserSetPassword": { "user_id": tstr, "password": tstr } }
+request-role-list          = "RoleList"
+request-who-am-i           = "WhoAmI"
+request-session-revoke     = { "SessionRevoke": { "user_id": tstr } }
+request-resource-grant-create = { "ResourceGrantCreate": { "user_id": tstr, "resource_kind": tstr, "resource_id": tstr, "capability": tstr } }
+request-resource-grant-list   = { "ResourceGrantList": { ? "user_id": (tstr / null) } }
+request-resource-grant-revoke = { "ResourceGrantRevoke": { "id": tstr } }
 api-request = request-submit
             / request-submit-routed
             / request-poll
@@ -1240,6 +1254,17 @@ api-request = request-submit
             / request-blob-get
             / request-blob-stat
             / request-fs-write-from-blob
+            / request-user-create
+            / request-user-list
+            / request-user-disable
+            / request-user-set-roles
+            / request-user-set-password
+            / request-role-list
+            / request-who-am-i
+            / request-session-revoke
+            / request-resource-grant-create
+            / request-resource-grant-list
+            / request-resource-grant-revoke
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
@@ -1321,6 +1346,15 @@ response-fs-watch = { "FsWatch": fs-watch-page-view }
 response-blob-put = { "BlobPut": blob-ref }
 response-blob-get = { "BlobGet": byte-array }
 response-blob-stat = { "BlobStat": blob-stat }
+
+; ----- access control (Auth 5) DTOs + responses -----
+; access-user mirrors daemon_auth::UserRecord + resolved roles; carries NO credential material.
+access-user = { "user_id": tstr, "username": tstr, "disabled": bool, "created_at": int, "roles": [* tstr] }
+role-info   = { "role": tstr, "capabilities": [* tstr] }
+response-access-user  = { "AccessUser": access-user }
+response-access-users = { "AccessUsers": [* access-user] }
+response-access-roles = { "AccessRoles": [* role-info] }
+response-who-am-i     = { "WhoAmI": principal-view }
 api-response = response-ok
              / response-routed
              / response-drained
@@ -1400,6 +1434,10 @@ api-response = response-ok
              / response-blob-put
              / response-blob-get
              / response-blob-stat
+             / response-access-user
+             / response-access-users
+             / response-access-roles
+             / response-who-am-i
 
 ; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
 ; Wraps api-request/api-response so one connection carries many correlated exchanges, with

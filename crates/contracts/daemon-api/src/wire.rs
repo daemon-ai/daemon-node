@@ -793,6 +793,73 @@ pub enum ApiRequest {
     },
     /// [`ControlApi::fs_write_from_blob`].
     FsWriteFromBlob(FsWriteFromBlobArgs),
+
+    // -- access control (Auth 5): admin user/role/session management -----------------------------
+    /// [`AccessControlApi::user_create`].
+    UserCreate {
+        /// The new account's username.
+        username: String,
+        /// The initial password (request-only; never echoed, logged, or audited).
+        password: String,
+        /// The initial role set (snake_case names, e.g. `"operator"`).
+        roles: Vec<String>,
+    },
+    /// [`AccessControlApi::user_list`].
+    UserList,
+    /// [`AccessControlApi::user_disable`].
+    UserDisable {
+        /// The target user's stable id.
+        user_id: String,
+        /// `true` disables the account (and revokes its sessions); `false` re-enables it.
+        disabled: bool,
+    },
+    /// [`AccessControlApi::user_set_roles`].
+    UserSetRoles {
+        /// The target user's stable id.
+        user_id: String,
+        /// The replacement role set (snake_case names).
+        roles: Vec<String>,
+    },
+    /// [`AccessControlApi::user_set_password`].
+    UserSetPassword {
+        /// The target user's stable id.
+        user_id: String,
+        /// The new password (request-only; never echoed, logged, or audited).
+        password: String,
+    },
+    /// [`AccessControlApi::role_list`].
+    RoleList,
+    /// [`AccessControlApi::who_am_i`] — the caller's own [`PrincipalView`]. Allowed for any
+    /// authenticated principal (no `AccessAdmin` required).
+    WhoAmI,
+    /// [`AccessControlApi::session_revoke`] — revoke **all** session tokens for a user.
+    SessionRevoke {
+        /// The user whose sessions to revoke.
+        user_id: String,
+    },
+    /// [`AccessControlApi::resource_grant_create`] — reserved (option B per the access-control spec
+    /// §5); the handler returns [`ApiError::Unsupported`] until per-resource grants are enforced.
+    ResourceGrantCreate {
+        /// The grantee user id.
+        user_id: String,
+        /// The resource kind (e.g. `"session"`).
+        resource_kind: String,
+        /// The resource id.
+        resource_id: String,
+        /// The capability granted over the resource (snake_case name).
+        capability: String,
+    },
+    /// [`AccessControlApi::resource_grant_list`] — reserved; returns [`ApiError::Unsupported`].
+    ResourceGrantList {
+        /// Filter to one grantee, or `None` for all grants.
+        #[serde(default)]
+        user_id: Option<String>,
+    },
+    /// [`AccessControlApi::resource_grant_revoke`] — reserved; returns [`ApiError::Unsupported`].
+    ResourceGrantRevoke {
+        /// The grant id to revoke.
+        id: String,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -960,6 +1027,16 @@ pub enum ApiResponse {
     BlobGet(#[serde(with = "serde_bytes")] Vec<u8>),
     /// A blob's metadata (blob_stat).
     BlobStat(BlobStat),
+
+    // -- access control (Auth 5) -----------------------------------------------------------------
+    /// A single user record (user_create).
+    AccessUser(AccessUser),
+    /// The user listing (user_list).
+    AccessUsers(Vec<AccessUser>),
+    /// The built-in roles and their effective capabilities (role_list).
+    AccessRoles(Vec<RoleInfo>),
+    /// The caller's own principal view (who_am_i).
+    WhoAmI(PrincipalView),
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1074,36 @@ pub struct PrincipalView {
     /// Assigned role names (snake_case, e.g. `"operator"`).
     pub roles: Vec<String>,
     /// Effective capability names (snake_case, e.g. `"session_write"`).
+    pub capabilities: Vec<String>,
+}
+
+/// A persisted user record as surfaced over the admin access-control surface (`AccessControlApi`).
+/// The wire mirror of `daemon_auth::UserRecord` enriched with the user's resolved role names. Carries
+/// **no** credential material (no password, PHC, or token).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessUser {
+    /// Stable opaque user id.
+    pub user_id: String,
+    /// Unique username.
+    pub username: String,
+    /// Whether an admin has disabled the account.
+    pub disabled: bool,
+    /// Unix seconds at creation.
+    pub created_at: i64,
+    /// The user's assigned role names (snake_case).
+    pub roles: Vec<String>,
+}
+
+/// A built-in role and the effective capabilities it grants, surfaced by `role_list` so an admin UI
+/// can render the role→capability matrix. The wire mirror of `daemon_auth::Role` + its
+/// `capabilities()` (snake_case capability names).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleInfo {
+    /// The role name (snake_case, e.g. `"operator"`).
+    pub role: String,
+    /// The capability names the role grants (snake_case).
     pub capabilities: Vec<String>,
 }
 
@@ -1449,6 +1556,73 @@ mod auth_contract_tests {
             } => assert_eq!(auth_mechanisms, vec!["SCRAM-SHA-256", "PLAIN"]),
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn access_control_frames_round_trip() {
+        fn rt_req(req: &ApiRequest) {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(req, &mut bytes).expect("encode ApiRequest");
+            let decoded: ApiRequest = ciborium::from_reader(&bytes[..]).expect("decode ApiRequest");
+            assert_eq!(&decoded, req);
+        }
+        fn rt_res(res: &ApiResponse) {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(res, &mut bytes).expect("encode ApiResponse");
+            let decoded: ApiResponse =
+                ciborium::from_reader(&bytes[..]).expect("decode ApiResponse");
+            assert_eq!(&decoded, res);
+        }
+        rt_req(&ApiRequest::UserCreate {
+            username: "alice".into(),
+            password: "s3cret".into(),
+            roles: vec!["user".into()],
+        });
+        rt_req(&ApiRequest::UserList);
+        rt_req(&ApiRequest::UserDisable {
+            user_id: "u1".into(),
+            disabled: true,
+        });
+        rt_req(&ApiRequest::UserSetRoles {
+            user_id: "u1".into(),
+            roles: vec!["operator".into()],
+        });
+        rt_req(&ApiRequest::UserSetPassword {
+            user_id: "u1".into(),
+            password: "next".into(),
+        });
+        rt_req(&ApiRequest::RoleList);
+        rt_req(&ApiRequest::WhoAmI);
+        rt_req(&ApiRequest::SessionRevoke {
+            user_id: "u1".into(),
+        });
+        rt_req(&ApiRequest::ResourceGrantCreate {
+            user_id: "u1".into(),
+            resource_kind: "session".into(),
+            resource_id: "s1".into(),
+            capability: "session_read".into(),
+        });
+        rt_req(&ApiRequest::ResourceGrantList { user_id: None });
+        rt_req(&ApiRequest::ResourceGrantRevoke { id: "g1".into() });
+
+        rt_res(&ApiResponse::AccessUser(AccessUser {
+            user_id: "u1".into(),
+            username: "alice".into(),
+            disabled: false,
+            created_at: 42,
+            roles: vec!["user".into()],
+        }));
+        rt_res(&ApiResponse::AccessUsers(Vec::new()));
+        rt_res(&ApiResponse::AccessRoles(vec![RoleInfo {
+            role: "admin".into(),
+            capabilities: vec!["access_admin".into()],
+        }]));
+        rt_res(&ApiResponse::WhoAmI(PrincipalView {
+            user_id: "u1".into(),
+            username: "alice".into(),
+            roles: vec!["admin".into()],
+            capabilities: vec!["access_admin".into()],
+        }));
     }
 
     #[test]

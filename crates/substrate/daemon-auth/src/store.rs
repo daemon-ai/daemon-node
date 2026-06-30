@@ -505,6 +505,96 @@ impl AuthStore {
         )?;
         Ok(())
     }
+
+    // --- last-admin lockout (atomic) --------------------------------------------------------
+    //
+    // The check-and-modify runs in ONE SQLite transaction so two concurrent demotions/disables
+    // cannot each observe "another admin still exists" and both commit, orphaning the node. These
+    // are the only access-admin mutations that can reduce the enabled-admin set, so they are the
+    // only ones that need the guard (role *grants* and *enables* can never orphan admins).
+
+    /// Count enabled admins **other than** `exclude_user_id` (the survivors if that user is
+    /// disabled/demoted). Run inside the guarded transaction.
+    fn other_enabled_admins(conn: &Connection, exclude_user_id: &str) -> Result<i64> {
+        conn.query_row(
+            "SELECT COUNT(DISTINCT u.id) FROM users u \
+             JOIN user_roles r ON r.user_id = u.id \
+             WHERE r.role = ?1 AND u.disabled = 0 AND u.id <> ?2",
+            params![Role::Admin.as_str(), exclude_user_id],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
+    }
+
+    /// Whether `user_id` is currently an enabled administrator. Run inside the guarded transaction.
+    fn is_enabled_admin(conn: &Connection, user_id: &str) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users u \
+             JOIN user_roles r ON r.user_id = u.id \
+             WHERE u.id = ?1 AND r.role = ?2 AND u.disabled = 0)",
+            params![user_id, Role::Admin.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n != 0)
+        .map_err(Error::from)
+    }
+
+    /// Enable/disable an account atomically, refusing (`Err(Error::LastAdmin)`) to disable the last
+    /// enabled administrator. On disable, the user's sessions are revoked in the same transaction so
+    /// the lockout decision and its effects commit together. `Err(Error::NotFound)` for an unknown
+    /// user. Prefer this over [`set_disabled`] on the admin surface.
+    pub fn set_disabled_guarded(&self, user_id: &str, disabled: bool) -> Result<()> {
+        let mut guard = self.lock();
+        let tx = guard.transaction()?;
+        if disabled
+            && Self::is_enabled_admin(&tx, user_id)?
+            && Self::other_enabled_admins(&tx, user_id)? == 0
+        {
+            return Err(Error::LastAdmin);
+        }
+        let n = tx.execute(
+            "UPDATE users SET disabled = ?2 WHERE id = ?1",
+            params![user_id, i64::from(disabled)],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound);
+        }
+        if disabled {
+            tx.execute(
+                "DELETE FROM auth_sessions WHERE user_id = ?1",
+                params![user_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace a user's role set atomically, refusing (`Err(Error::LastAdmin)`) to demote the last
+    /// enabled administrator out of `admin`. Granting roles (or keeping `admin`) never trips the
+    /// guard. Prefer this over [`set_roles`] on the admin surface.
+    pub fn set_roles_guarded(&self, user_id: &str, roles: &[Role]) -> Result<()> {
+        let mut guard = self.lock();
+        let tx = guard.transaction()?;
+        let new_is_admin = roles.contains(&Role::Admin);
+        if !new_is_admin
+            && Self::is_enabled_admin(&tx, user_id)?
+            && Self::other_enabled_admins(&tx, user_id)? == 0
+        {
+            return Err(Error::LastAdmin);
+        }
+        tx.execute(
+            "DELETE FROM user_roles WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        for role in roles {
+            tx.execute(
+                "INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?1, ?2)",
+                params![user_id, role.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -654,5 +744,68 @@ mod tests {
             s.principal_for_token(&token),
             Err(Error::NotFound)
         ));
+    }
+
+    #[test]
+    fn last_admin_cannot_be_disabled_or_demoted() {
+        let s = store();
+        let admin = s.create_user("root", "pw", &[Role::Admin]).unwrap();
+        // Sole admin: disabling or demoting is refused.
+        assert!(matches!(
+            s.set_disabled_guarded(&admin.id, true),
+            Err(Error::LastAdmin)
+        ));
+        assert!(matches!(
+            s.set_roles_guarded(&admin.id, &[Role::Operator]),
+            Err(Error::LastAdmin)
+        ));
+        // The guard did not mutate: the admin is still an enabled admin.
+        assert!(!s.find_user("root").unwrap().unwrap().disabled);
+        assert_eq!(s.roles_of(&admin.id).unwrap(), vec![Role::Admin]);
+
+        // With a second admin, demoting/disabling the first is allowed.
+        let admin2 = s.create_user("root2", "pw", &[Role::Admin]).unwrap();
+        s.set_roles_guarded(&admin.id, &[Role::Operator]).unwrap();
+        assert_eq!(s.roles_of(&admin.id).unwrap(), vec![Role::Operator]);
+        // Now admin2 is the last admin again -> refused.
+        assert!(matches!(
+            s.set_disabled_guarded(&admin2.id, true),
+            Err(Error::LastAdmin)
+        ));
+    }
+
+    #[test]
+    fn disabling_a_non_admin_is_never_blocked_by_the_guard() {
+        let s = store();
+        // No admins at all; disabling a plain user must still work (guard only protects admins).
+        let u = s.create_user("viewer", "pw", &[Role::Viewer]).unwrap();
+        s.set_disabled_guarded(&u.id, true).unwrap();
+        assert!(s.find_user("viewer").unwrap().unwrap().disabled);
+    }
+
+    #[test]
+    fn concurrent_disable_of_two_admins_keeps_one() {
+        use std::sync::Arc;
+        // Two admins; two threads each try to disable a *different* admin at the same time. The
+        // single-transaction guard must let exactly one succeed (the other sees itself as the last
+        // enabled admin and is refused), so the node never loses every admin.
+        let s = Arc::new(store());
+        let a = s.create_user("a", "pw", &[Role::Admin]).unwrap();
+        let b = s.create_user("b", "pw", &[Role::Admin]).unwrap();
+        let (s1, s2) = (s.clone(), s.clone());
+        let (ida, idb) = (a.id.clone(), b.id.clone());
+        let t1 = std::thread::spawn(move || s1.set_disabled_guarded(&ida, true));
+        let t2 = std::thread::spawn(move || s2.set_disabled_guarded(&idb, true));
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        // Exactly one succeeded; the other hit the last-admin guard.
+        let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|ok| **ok).count();
+        assert_eq!(successes, 1, "exactly one disable may win");
+        // At least one enabled admin remains.
+        let enabled = [&a, &b]
+            .iter()
+            .filter(|u| !s.find_user(&u.username).unwrap().unwrap().disabled)
+            .count();
+        assert!(enabled >= 1, "an enabled admin must survive");
     }
 }

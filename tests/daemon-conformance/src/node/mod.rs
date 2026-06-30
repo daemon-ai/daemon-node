@@ -11,6 +11,7 @@
 //! The session sub-surface's cross-language twin (the C FFI driving `StartTurn -> TurnFinished`)
 //! is proven by the `bindings/daemon-core-ffi` C harness, not here.
 
+mod access_control;
 mod auth_transport;
 mod cron;
 mod delivery_memory;
