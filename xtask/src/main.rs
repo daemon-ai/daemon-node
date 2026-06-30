@@ -676,6 +676,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             &WireS2C::Hello {
                 wire_version: WIRE_VERSION,
                 features,
+                auth_mechanisms: Vec::new(),
             },
         )?;
         write_cbor(

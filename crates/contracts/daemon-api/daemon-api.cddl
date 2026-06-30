@@ -485,10 +485,14 @@ delivery-target = { "transport": transport-id, "route": route-addr, "kind": sink
 api-error-unknown-session = { "UnknownSession": tstr }
 api-error-unsupported = { "Unsupported": tstr }
 api-error-conflict = { "Conflict": tstr }
+api-error-unauthenticated = { "Unauthenticated": tstr }
+api-error-forbidden = { "Forbidden": tstr }
 api-error-other = { "Other": tstr }
 api-error = api-error-unknown-session
           / api-error-unsupported
           / api-error-conflict
+          / api-error-unauthenticated
+          / api-error-forbidden
           / api-error-other
 
 ; ----- model-management DTOs (daemon-common; the ModelApi sub-surface) -----
@@ -1403,24 +1407,43 @@ api-response = response-ok
 ; codec hand-codes this tiny envelope and the generated codec stays scoped to api-request/-response);
 ; they are here as the authoritative schema + cddl-cat conformance target. The legacy bare
 ; api-request / api-response path (a connection that sends no Hello) stays valid.
-wire-hello  = { "Hello":  { "wire_version": uint, "features": [* tstr] } }
+; The client and server `Hello` differ: the server's additionally lists the SASL `auth_mechanisms`
+; it offers (empty on an unauthenticated/local-trust node). Auth byte payloads are plain `Vec<u8>`
+; (no serde_bytes), so they encode as a CBOR array of ints (`[* uint]`), not `bstr`; the envelope is
+; not a zcbor entry type, so this is a cddl-cat conformance target only.
+wire-hello-c2s = { "Hello": { "wire_version": uint, "features": [* tstr] } }
+wire-hello-s2c = { "Hello": { "wire_version": uint, "features": [* tstr], "auth_mechanisms": [* tstr] } }
 wire-call   = { "Call":   { "id": uint64, "req": api-request } }
 wire-open   = { "Open":   { "id": uint64, "req": api-request } }
 wire-cancel = { "Cancel": { "id": uint64 } }
-wire-c2s = wire-hello
+wire-auth-start  = { "AuthStart":  { "mechanism": tstr, "initial": [* uint] } }
+wire-auth-step   = { "AuthStep":   { "data": [* uint] } }
+wire-auth-resume = { "AuthResume": { "token": tstr } }
+wire-c2s = wire-hello-c2s
          / wire-call
          / wire-open
          / wire-cancel
+         / wire-auth-start
+         / wire-auth-step
+         / wire-auth-resume
 
 wire-reply = { "Reply": { "id": uint64, "res": api-response } }
 wire-item  = { "Item":  { "id": uint64, "res": api-response } }
 wire-end   = { "End":   { "id": uint64, "error": (api-error / null) } }
 wire-reset = { "Reset": { "id": uint64, "epoch": uint64, "head_seq": uint64 } }
-wire-s2c = wire-hello
+; The authenticated principal surfaced on AuthOk (wire mirror of daemon_auth::Principal).
+principal-view = { "user_id": tstr, "username": tstr, "roles": [* tstr], "capabilities": [* tstr] }
+wire-auth-challenge = { "AuthChallenge": { "data": [* uint] } }
+wire-auth-ok        = { "AuthOk": { "token": tstr, "principal": principal-view } }
+wire-auth-error     = { "AuthError": { "reason": tstr } }
+wire-s2c = wire-hello-s2c
          / wire-reply
          / wire-item
          / wire-end
          / wire-reset
+         / wire-auth-challenge
+         / wire-auth-ok
+         / wire-auth-error
 
 ; ----- filesystem / workspace surface DTOs (wire v14; daemon-fs-surface-spec.md) -----
 fs-root-id-host = { "host": tstr }

@@ -162,6 +162,10 @@ async fn serve_mux(
                     .send(WireS2C::Hello {
                         wire_version: WIRE_VERSION,
                         features,
+                        // Auth is not yet enforced on this transport (the SASL exchange lands in a
+                        // later increment); advertise no mechanisms so existing clients negotiate
+                        // exactly as before.
+                        auth_mechanisms: Vec::new(),
                     })
                     .await;
             }
@@ -209,6 +213,18 @@ async fn serve_mux(
                     handle.abort();
                     let _ = tx.send(WireS2C::End { id, error: None }).await;
                 }
+            }
+            // The SASL exchange is part of the v2 envelope contract but not yet served on this
+            // transport (it lands in a later increment, gated by the authenticator). A client that
+            // sends an auth frame here gets a clean refusal rather than a protocol error; the
+            // connection is unaffected (it was never authenticated to begin with). Auth is not yet
+            // *required* either, so existing clients that never send these keep working.
+            WireC2S::AuthStart { .. } | WireC2S::AuthStep { .. } | WireC2S::AuthResume { .. } => {
+                let _ = tx
+                    .send(WireS2C::AuthError {
+                        reason: "authentication is not supported on this transport yet".into(),
+                    })
+                    .await;
             }
         }
     }

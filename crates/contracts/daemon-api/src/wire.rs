@@ -967,7 +967,9 @@ pub enum ApiResponse {
 // ---------------------------------------------------------------------------
 
 /// The wire protocol version a `Hello` negotiates. Bumped when the envelope shape changes.
-pub const WIRE_VERSION: u32 = 1;
+/// v2 adds the SASL-style authentication exchange (`AuthStart`/`AuthStep`/`AuthResume` ->
+/// `AuthChallenge`/`AuthOk`/`AuthError`) and the `auth_mechanisms` list on the server `Hello`.
+pub const WIRE_VERSION: u32 = 2;
 /// Feature flag: the connection speaks the multiplexed `Call`/`Reply` envelope.
 pub const WIRE_FEATURE_MUX: &str = "mux";
 /// Feature flag: the server can push `Item`/`End` frames for streaming requests.
@@ -975,6 +977,28 @@ pub const WIRE_FEATURE_STREAM: &str = "stream";
 /// Feature flag: the node hosts profile/skill versioning (a bound revision log), so the
 /// `Profile{History,At,Revert}` (+ skill) ops are available rather than `Unsupported`.
 pub const WIRE_FEATURE_VERSIONING: &str = "versioning";
+/// Feature flag: the node requires/offers SASL-style authentication before it accepts `Call`/`Open`.
+/// When advertised, the server `Hello` carries the offered `auth_mechanisms` and the client must
+/// complete an `AuthStart`/`AuthStep` (or `AuthResume`) exchange ending in `AuthOk` first.
+pub const WIRE_FEATURE_AUTH: &str = "auth";
+
+/// The authenticated principal as surfaced to a client on [`WireS2C::AuthOk`] (and the future
+/// `WhoAmI` admin op): the user identity plus its effective role/capability names. This is the wire
+/// mirror of `daemon_auth::Principal` (`roles`/`capabilities` are the model's stable snake_case
+/// strings). Advisory, for client-side UI gating only — the node independently enforces every
+/// capability server-side; a client must never trust this in lieu of the server's own checks.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalView {
+    /// Stable opaque user id.
+    pub user_id: String,
+    /// Human-facing username.
+    pub username: String,
+    /// Assigned role names (snake_case, e.g. `"operator"`).
+    pub roles: Vec<String>,
+    /// Effective capability names (snake_case, e.g. `"session_write"`).
+    pub capabilities: Vec<String>,
+}
 
 /// A client -> server multiplexed frame. Wraps an [`ApiRequest`] so one connection can carry many
 /// correlated exchanges. Absent on the legacy path: a connection whose first frame decodes as a
@@ -1012,6 +1036,27 @@ pub enum WireC2S {
         /// The exchange to abort.
         id: u64,
     },
+    /// Begin a SASL authentication exchange with the named mechanism (e.g. `"SCRAM-SHA-256"`,
+    /// `"PLAIN"`, `"EXTERNAL"`), carrying that mechanism's optional initial response. The server
+    /// answers with [`WireS2C::AuthChallenge`] (more steps), [`WireS2C::AuthOk`], or
+    /// [`WireS2C::AuthError`]. `initial` is opaque mechanism bytes.
+    AuthStart {
+        /// The chosen mechanism name (must be one the server advertised in its `Hello`).
+        mechanism: String,
+        /// The mechanism's initial client response (may be empty).
+        initial: Vec<u8>,
+    },
+    /// A subsequent client response in a multi-step mechanism, answering a prior `AuthChallenge`.
+    AuthStep {
+        /// Opaque mechanism bytes.
+        data: Vec<u8>,
+    },
+    /// Re-authenticate a reconnecting client by presenting a previously issued opaque session
+    /// token (the fast path that skips the full mechanism exchange). Answered by `AuthOk`/`AuthError`.
+    AuthResume {
+        /// The opaque server-issued session token from a prior `AuthOk`.
+        token: String,
+    },
 }
 
 /// A server -> client multiplexed frame.
@@ -1025,6 +1070,10 @@ pub enum WireS2C {
         wire_version: u32,
         /// Supported capabilities.
         features: Vec<String>,
+        /// SASL mechanisms the server offers, in preference order (e.g. `["SCRAM-SHA-256",
+        /// "EXTERNAL", "PLAIN"]`). Empty when the server does not advertise [`WIRE_FEATURE_AUTH`]
+        /// (an unauthenticated/local-trust node), so an older client still negotiates cleanly.
+        auth_mechanisms: Vec<String>,
     },
     /// The single result of a one-shot `Call` (closes `id`).
     Reply {
@@ -1056,6 +1105,27 @@ pub enum WireS2C {
         epoch: u64,
         /// The current high-water `seq`.
         head_seq: u64,
+    },
+    /// A server challenge in a multi-step authentication mechanism; the client replies with
+    /// [`WireC2S::AuthStep`]. Opaque mechanism bytes.
+    AuthChallenge {
+        /// Opaque mechanism bytes.
+        data: Vec<u8>,
+    },
+    /// Authentication succeeded: the connection is now bound to `principal`, and `token` is an
+    /// opaque session token the client may present via [`WireC2S::AuthResume`] on reconnect.
+    AuthOk {
+        /// The opaque server-issued session token (store it, never the password).
+        token: String,
+        /// The authenticated principal and its effective capabilities (for client-side UI gating;
+        /// the server independently enforces).
+        principal: PrincipalView,
+    },
+    /// Authentication did not succeed (wrong password, no such or disabled account, or an
+    /// unsupported mechanism). The `reason` is deliberately coarse to avoid an account-probing oracle.
+    AuthError {
+        /// A short, non-revealing failure reason.
+        reason: String,
     },
 }
 
@@ -1296,7 +1366,101 @@ pub enum ApiError {
     /// (control surface, `assign`) **or** live-interactive (session surface, `submit`), never both.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The caller has not authenticated (no principal bound to the connection), so the node refuses
+    /// the operation. Fail-closed: the absence of identity never implies access.
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    /// The caller is authenticated but lacks the capability (or resource ownership) the operation
+    /// requires.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     /// Any other failure.
     #[error("{0}")]
     Other(String),
+}
+
+#[cfg(test)]
+mod auth_contract_tests {
+    use super::*;
+
+    fn rt_c2s(frame: &WireC2S) {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(frame, &mut bytes).expect("encode WireC2S");
+        let decoded: WireC2S = ciborium::from_reader(&bytes[..]).expect("decode WireC2S");
+        assert_eq!(&decoded, frame);
+    }
+
+    fn rt_s2c(frame: &WireS2C) {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(frame, &mut bytes).expect("encode WireS2C");
+        let decoded: WireS2C = ciborium::from_reader(&bytes[..]).expect("decode WireS2C");
+        assert_eq!(&decoded, frame);
+    }
+
+    #[test]
+    fn wire_version_is_two() {
+        assert_eq!(WIRE_VERSION, 2);
+    }
+
+    #[test]
+    fn client_auth_frames_round_trip() {
+        rt_c2s(&WireC2S::AuthStart {
+            mechanism: "SCRAM-SHA-256".into(),
+            initial: vec![1, 2, 3],
+        });
+        rt_c2s(&WireC2S::AuthStep { data: Vec::new() });
+        rt_c2s(&WireC2S::AuthResume {
+            token: "session-token".into(),
+        });
+    }
+
+    #[test]
+    fn server_auth_frames_round_trip() {
+        rt_s2c(&WireS2C::AuthChallenge {
+            data: vec![9, 8, 7],
+        });
+        rt_s2c(&WireS2C::AuthOk {
+            token: "tok".into(),
+            principal: PrincipalView {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                roles: vec!["user".into()],
+                capabilities: vec!["session_write".into()],
+            },
+        });
+        rt_s2c(&WireS2C::AuthError {
+            reason: "invalid credentials".into(),
+        });
+    }
+
+    #[test]
+    fn server_hello_carries_auth_mechanisms() {
+        let hello = WireS2C::Hello {
+            wire_version: WIRE_VERSION,
+            features: vec![WIRE_FEATURE_MUX.into(), WIRE_FEATURE_AUTH.into()],
+            auth_mechanisms: vec!["SCRAM-SHA-256".into(), "PLAIN".into()],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&hello, &mut bytes).unwrap();
+        let decoded: WireS2C = ciborium::from_reader(&bytes[..]).unwrap();
+        match decoded {
+            WireS2C::Hello {
+                auth_mechanisms, ..
+            } => assert_eq!(auth_mechanisms, vec!["SCRAM-SHA-256", "PLAIN"]),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_api_error_variants_round_trip() {
+        for err in [
+            ApiError::Unauthenticated("no principal".into()),
+            ApiError::Forbidden("missing capability".into()),
+        ] {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&err, &mut bytes).unwrap();
+            let decoded: ApiError = ciborium::from_reader(&bytes[..]).unwrap();
+            assert_eq!(decoded, err);
+        }
+    }
 }
