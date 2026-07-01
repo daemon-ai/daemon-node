@@ -34,11 +34,8 @@ const JOURNAL_SEED_HEX: &str = "111111111111111111111111111111111111111111111111
 fn placement_spec() -> PlacementSpec {
     PlacementSpec {
         program: env!("CARGO_BIN_EXE_daemon").into(),
-        args: Vec::new(),
-        env: vec![
-            ("DAEMON_PLACED_CHILD".into(), "1".into()),
-            ("DAEMON_JOURNAL_SEED".into(), JOURNAL_SEED_HEX.into()),
-        ],
+        args: vec!["internal".into(), "placed-child".into()],
+        env: vec![("DAEMON_JOURNAL_SEED".into(), JOURNAL_SEED_HEX.into())],
     }
 }
 

@@ -16,26 +16,46 @@
 
 #![forbid(unsafe_code)]
 
+use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// `xtask` — repo automation (codegen, CI helpers).
+#[derive(Parser)]
+#[command(name = "xtask", about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// (Re)generate the committed C headers for both binding crates via `cbindgen`.
+    GenHeaders,
+    /// Check the `daemon-api` mirror CDDL covers the Rust wire enum variants.
+    Cddl,
+    /// Write canonical CBOR request/response fixtures for non-Rust clients.
+    ApiFixtures,
+    /// Generate the client zcbor C codec from a CDDL.
+    GenZcbor {
+        /// The CDDL contract (defaults to the pinned `daemon-api.cddl`).
+        #[arg(long)]
+        cddl: Option<PathBuf>,
+        /// The output directory (defaults to `target/zcbor-codec`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Decode every CBOR fixture with the generated C codec (wire-compat gate).
+    VerifyCodec,
+}
+
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let sub = args.get(1).map(String::as_str).unwrap_or_default();
-    match sub {
-        "gen-headers" => gen_headers(),
-        "cddl" => check_cddl(),
-        "api-fixtures" => gen_api_fixtures(),
-        "gen-zcbor" => gen_zcbor(&args[2..]),
-        "verify-codec" => verify_codec(),
-        other => {
-            eprintln!(
-                "usage: xtask <gen-headers|cddl|api-fixtures|gen-zcbor|verify-codec>\n\
-                 \n  gen-zcbor [--cddl <path>] [--out <dir>]  generate the client zcbor C codec\
-                 \n  verify-codec                             decode every CBOR fixture with it"
-            );
-            anyhow::bail!("unknown xtask subcommand: {other:?}");
-        }
+    match Cli::parse().command {
+        Cmd::GenHeaders => gen_headers(),
+        Cmd::Cddl => check_cddl(),
+        Cmd::ApiFixtures => gen_api_fixtures(),
+        Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
+        Cmd::VerifyCodec => verify_codec(),
     }
 }
 
@@ -845,28 +865,10 @@ fn run_codegen(root: &Path, cddl: &Path, out: &Path, extra: &[&str]) -> anyhow::
 /// authoritative here and zcbor lives in this flake; the output is the committed artifact
 /// `daemon-app` vendors (no Python/zcbor in the Qt build). The superproject's pure
 /// `packages.daemon-zcbor-codec` derivation invokes the same script.
-fn gen_zcbor(args: &[String]) -> anyhow::Result<()> {
+fn gen_zcbor(cddl: Option<PathBuf>, out: Option<PathBuf>) -> anyhow::Result<()> {
     let root = workspace_root();
-    let mut cddl = default_cddl(&root);
-    let mut out = root.join("target/zcbor-codec");
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--cddl" => {
-                cddl = PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| anyhow::anyhow!("--cddl needs a path"))?,
-                )
-            }
-            "--out" => {
-                out = PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| anyhow::anyhow!("--out needs a path"))?,
-                )
-            }
-            other => anyhow::bail!("unknown gen-zcbor arg: {other:?}"),
-        }
-    }
+    let cddl = cddl.unwrap_or_else(|| default_cddl(&root));
+    let out = out.unwrap_or_else(|| root.join("target/zcbor-codec"));
     run_codegen(&root, &cddl, &out, &[])?;
     println!(
         "generated zcbor codec from {} in {}",

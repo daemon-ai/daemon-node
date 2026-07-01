@@ -33,6 +33,7 @@ mistralrs-cuda = ["mistralrs", "mistralrs/cuda"]
 mistralrs-metal = ["mistralrs", "mistralrs/metal"]
 
 [dependencies]
+clap = { workspace = true }
 # Protocol (light; this is all `daemon-providers` pulls with default-features = false).
 serde = { workspace = true }
 serde_json = { workspace = true }

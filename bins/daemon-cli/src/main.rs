@@ -24,7 +24,7 @@ mod render;
 use cli::Cli;
 
 fn default_socket() -> PathBuf {
-    if let Some(p) = std::env::var_os("DAEMON_API_SOCKET") {
+    if let Some(p) = std::env::var_os("DAEMON_SOCKET_PATH") {
         return PathBuf::from(p);
     }
     let dir = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());

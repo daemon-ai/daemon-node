@@ -5,14 +5,13 @@
 //!
 //! Detects binary-shaped content (base64 data URIs, oversized payloads, high-entropy encoded blobs)
 //! and spills it to a content-addressed blob store, replacing the in-row content with a stub and
-//! recording a blob reference in metadata. Blobs live at
-//! `{root}/{sha[..2]}/{sha[..4]}/{sha}` where `root` is `$MNEMOSYNE_BLOB_DIR` or
-//! `~/.hermes/mnemosyne/blobs` (`content_sanitizer.py` L8, L32-L37).
+//! recording a blob reference in metadata. Blobs live at `{root}/{sha[..2]}/{sha[..4]}/{sha}` where
+//! `root` is the injected blob directory ([`crate::MnemosyneConfig::blob_dir`]) — no env read.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Size hard cap in bytes — always extract regardless of content type (`content_sanitizer.py` L22).
 pub const SIZE_HARD_CAP: usize = 1_000_000;
@@ -30,13 +29,13 @@ pub const ENTROPY_THRESHOLD: f64 = 5.0;
 ///
 /// On a blob-store I/O error the original content is returned unchanged (ingest is never broken by
 /// a failed spill).
-pub fn sanitize_content(content: &str) -> (String, Value) {
+pub fn sanitize_content(content: &str, blob_root: &Path) -> (String, Value) {
     let original_size = content.len();
 
     // Rule 1: data: URI -> decode the base64 payload and extract.
     if content.starts_with("data:") {
         if let Some((mime_type, raw_bytes)) = parse_data_uri(content) {
-            if let Ok(sha256) = store_blob(&raw_bytes) {
+            if let Ok(sha256) = store_blob(&raw_bytes, blob_root) {
                 let meta = json!({
                     "blob_ref": format!("blob://sha256/{sha256}"),
                     "original_size": raw_bytes.len(),
@@ -54,7 +53,7 @@ pub fn sanitize_content(content: &str) -> (String, Value) {
 
     // Rule 2: size hard cap.
     if original_size > SIZE_HARD_CAP {
-        if let Ok(sha256) = store_blob(content.as_bytes()) {
+        if let Ok(sha256) = store_blob(content.as_bytes(), blob_root) {
             let meta = json!({
                 "blob_ref": format!("blob://sha256/{sha256}"),
                 "original_size": original_size,
@@ -70,7 +69,7 @@ pub fn sanitize_content(content: &str) -> (String, Value) {
 
     // Rule 3: high-entropy (likely encoded blob).
     if original_size > SIZE_BASE64_CHECK && looks_like_base64_blob(content) {
-        if let Ok(sha256) = store_blob(content.as_bytes()) {
+        if let Ok(sha256) = store_blob(content.as_bytes(), blob_root) {
             let entropy = round2(shannon_entropy(content));
             let meta = json!({
                 "blob_ref": format!("blob://sha256/{sha256}"),
@@ -143,30 +142,15 @@ fn shannon_entropy(text: &str) -> f64 {
 
 /// Store `raw_bytes` as a content-addressed blob, returning the sha256 hex digest
 /// (`content_sanitizer.py` L91-L100). Idempotent: an existing blob is not rewritten.
-fn store_blob(raw_bytes: &[u8]) -> std::io::Result<String> {
+fn store_blob(raw_bytes: &[u8], blob_root: &Path) -> std::io::Result<String> {
     let sha256 = sha256_hex(raw_bytes);
-    let blob_dir = blob_root().join(&sha256[..2]).join(&sha256[..4]);
+    let blob_dir = blob_root.join(&sha256[..2]).join(&sha256[..4]);
     std::fs::create_dir_all(&blob_dir)?;
     let blob_path = blob_dir.join(&sha256);
     if !blob_path.exists() {
         std::fs::write(&blob_path, raw_bytes)?;
     }
     Ok(sha256)
-}
-
-/// The content-addressed blob root: `$MNEMOSYNE_BLOB_DIR` or `~/.hermes/mnemosyne/blobs`
-/// (`content_sanitizer.py` L32-L37).
-fn blob_root() -> PathBuf {
-    match std::env::var("MNEMOSYNE_BLOB_DIR") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home)
-                .join(".hermes")
-                .join("mnemosyne")
-                .join("blobs")
-        }
-    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -204,28 +188,31 @@ fn thousands(n: usize) -> String {
 mod tests {
     use super::*;
 
-    fn with_temp_blob_dir<T>(f: impl FnOnce() -> T) -> T {
-        let dir = std::env::temp_dir().join(format!("mnemo-blob-{}", std::process::id()));
+    /// A unique, freshly-created temp blob root for one test (no process-global env).
+    fn temp_blob_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mnemo-blob-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("MNEMOSYNE_BLOB_DIR", &dir);
-        let out = f();
-        std::env::remove_var("MNEMOSYNE_BLOB_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-        out
+        std::fs::create_dir_all(&dir).expect("create blob dir");
+        dir
     }
 
     #[test]
     fn plain_text_passes_through() {
-        let (content, meta) = sanitize_content("just a normal note about the deploy");
+        let (content, meta) = sanitize_content(
+            "just a normal note about the deploy",
+            &temp_blob_dir("plain"),
+        );
         assert_eq!(content, "just a normal note about the deploy");
         assert_eq!(meta, json!({}));
     }
 
     #[test]
     fn data_uri_is_extracted() {
-        with_temp_blob_dir(|| {
+        {
+            let blobs = temp_blob_dir("datauri");
             // "hello world" base64 -> aGVsbG8gd29ybGQ=
-            let (content, meta) = sanitize_content("data:text/plain;base64,aGVsbG8gd29ybGQ=");
+            let (content, meta) =
+                sanitize_content("data:text/plain;base64,aGVsbG8gd29ybGQ=", &blobs);
             assert!(content.starts_with("[Binary content extracted: text/plain, 11 bytes"));
             assert_eq!(meta["extraction_reason"], "data_uri");
             assert_eq!(meta["mime"], "text/plain");
@@ -234,48 +221,44 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("blob://sha256/"));
-        });
+        }
     }
 
     #[test]
     fn invalid_data_uri_payload_falls_through() {
         // "hello" is not valid-length base64 -> rule 1 skipped, content unchanged.
-        let (content, meta) = sanitize_content("data:text/plain,hello");
+        let (content, meta) = sanitize_content("data:text/plain,hello", &temp_blob_dir("invalid"));
         assert_eq!(content, "data:text/plain,hello");
         assert_eq!(meta, json!({}));
     }
 
     #[test]
     fn oversized_content_spills_to_blob() {
-        with_temp_blob_dir(|| {
-            let big = "a".repeat(SIZE_HARD_CAP + 10);
-            let (content, meta) = sanitize_content(&big);
-            assert!(content.starts_with("[Large content extracted:"));
-            assert_eq!(meta["extraction_reason"], "size_cap");
-            assert_eq!(meta["original_size"], (SIZE_HARD_CAP + 10) as u64);
-        });
+        let big = "a".repeat(SIZE_HARD_CAP + 10);
+        let (content, meta) = sanitize_content(&big, &temp_blob_dir("oversized"));
+        assert!(content.starts_with("[Large content extracted:"));
+        assert_eq!(meta["extraction_reason"], "size_cap");
+        assert_eq!(meta["original_size"], (SIZE_HARD_CAP + 10) as u64);
     }
 
     #[test]
     fn high_entropy_blob_is_extracted() {
-        with_temp_blob_dir(|| {
-            // A long, near-uniform base64-ish string (> 100 KB) has entropy > 5.0.
-            let alphabet: Vec<char> =
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-                    .chars()
-                    .collect();
-            let mut s = String::with_capacity(SIZE_BASE64_CHECK + 64);
-            for i in 0..(SIZE_BASE64_CHECK + 64) {
-                s.push(alphabet[i % alphabet.len()]);
-            }
-            let (content, meta) = sanitize_content(&s);
-            assert!(
-                content.starts_with("[Encoded content extracted:"),
-                "got: {content}"
-            );
-            assert_eq!(meta["extraction_reason"], "high_entropy");
-            assert!(meta["entropy"].as_f64().unwrap() > ENTROPY_THRESHOLD);
-        });
+        // A long, near-uniform base64-ish string (> 100 KB) has entropy > 5.0.
+        let alphabet: Vec<char> =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                .chars()
+                .collect();
+        let mut s = String::with_capacity(SIZE_BASE64_CHECK + 64);
+        for i in 0..(SIZE_BASE64_CHECK + 64) {
+            s.push(alphabet[i % alphabet.len()]);
+        }
+        let (content, meta) = sanitize_content(&s, &temp_blob_dir("entropy"));
+        assert!(
+            content.starts_with("[Encoded content extracted:"),
+            "got: {content}"
+        );
+        assert_eq!(meta["extraction_reason"], "high_entropy");
+        assert!(meta["entropy"].as_f64().unwrap() > ENTROPY_THRESHOLD);
     }
 
     #[test]

@@ -3,14 +3,16 @@
 
 //! Engine configuration (data root, bank, session, decay/TTL knobs).
 //!
-//! Mirrors the Mnemosyne env-var surface (`MNEMOSYNE_DATA_DIR`, `MNEMOSYNE_RECENCY_HALFLIFE`,
-//! `MNEMOSYNE_WM_TTL_HOURS`, ...). Current slice includes the fields referenced by the Rust port.
+//! Pure data — no environment reads. The node binary's `NodeConfig` (figment) owns all layering and
+//! injects the resolved values (`data_dir`, `[mnemosyne]` recall/identity knobs) at construction.
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Which recall pipeline `Engine::recall` dispatches to (`beam.py` `recall` L5098 polyphonic reroute
-/// / `recall_enhanced` L6202 gate). Selected from the Mnemosyne env flags, defaulting to `Base`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// / `recall_enhanced` L6202 gate). Defaults to `Base`; the host selects it via `[mnemosyne].recall_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecallMode {
     /// The base hybrid cross-tier recall (`recall`), default.
     #[default]
@@ -71,52 +73,29 @@ impl RecallScope {
 
 impl Default for MnemosyneConfig {
     fn default() -> Self {
-        let data_dir = std::env::var("MNEMOSYNE_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HERMES_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| std::env::temp_dir().join("hermes"));
-                home.join("mnemosyne").join("data")
-            });
         Self {
-            data_dir,
+            data_dir: PathBuf::from("mnemosyne-data"),
             bank: "default".to_string(),
             session_id: "default".to_string(),
             recency_halflife_hours: 168.0,
             working_memory_ttl_hours: 168.0,
-            recall_mode: recall_mode_from_env(),
-            llm_conflict_detection: env_flag("MNEMOSYNE_LLM_CONFLICT_DETECTION"),
-            author_id: env_opt("MNEMOSYNE_AUTHOR_ID"),
-            author_type: env_opt("MNEMOSYNE_AUTHOR_TYPE"),
-            channel_id: env_opt("MNEMOSYNE_CHANNEL_ID"),
+            recall_mode: RecallMode::Base,
+            llm_conflict_detection: false,
+            author_id: None,
+            author_type: None,
+            channel_id: None,
         }
     }
 }
 
-/// The non-empty value of the named env var, else `None`.
-fn env_opt(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-/// True if the named env var is set to `1` (the Mnemosyne flag convention).
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).map(|v| v == "1").unwrap_or(false)
-}
-
-/// Select the recall pipeline from the Mnemosyne env flags. Polyphonic takes precedence over
-/// enhanced (matching `recall`'s reroute order), both default off.
-fn recall_mode_from_env() -> RecallMode {
-    if env_flag("MNEMOSYNE_POLYPHONIC_RECALL") {
-        RecallMode::Polyphonic
-    } else if env_flag("MNEMOSYNE_ENHANCED_RECALL") {
-        RecallMode::Enhanced
-    } else {
-        RecallMode::Base
-    }
-}
-
 impl MnemosyneConfig {
+    /// The content-addressed blob root for the sanitizer's externalized payloads
+    /// (`<data_dir>/blobs`). Threaded into [`crate::sanitize::sanitize_content`] so blob storage
+    /// follows the injected data dir rather than a process-global env var.
+    pub fn blob_dir(&self) -> PathBuf {
+        self.data_dir.join("blobs")
+    }
+
     /// The resolved SQLite path for the configured bank (`banks.py` `get_bank_db_path`).
     pub fn bank_db_path(&self) -> PathBuf {
         if self.bank == "default" {

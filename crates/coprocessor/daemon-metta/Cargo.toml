@@ -23,6 +23,7 @@ default = []
 hyperon = ["dep:hyperon"]
 
 [dependencies]
+clap = { workspace = true }
 # Protocol + state are pure: serde + ciborium + serde_json only (no daemon-core, no engine).
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -271,8 +271,10 @@ One SQLite file per **bank** (`banks.py`): default bank at `{data_dir}/mnemosyne
 *not* per-session — all of a profile's sessions share one bank and are separated at the row level by
 `session_id` (§5.x). In the daemon the `data_dir` is **profile-scoped**: the host sets it to
 `<DAEMON_DATA_DIR>/<profile>/` (mirroring hermes' per-profile home), so different profiles never share
-a bank; the crate-level `MNEMOSYNE_DATA_DIR` / `$HERMES_HOME` fallbacks (`banks.py` L31-L37) remain a
-manual escape hatch. Durability follows the session store — an in-memory `daemon-store` keeps the
+a bank. The crate itself reads **no environment** (the legacy `MNEMOSYNE_DATA_DIR` / `$HERMES_HOME`
+fallbacks are gone); `MnemosyneConfig::default()` is pure data and the host injects `data_dir` plus
+the `[mnemosyne]` recall/identity knobs (`DAEMON_MNEMOSYNE__*`) from its layered `NodeConfig`.
+Durability follows the session store — an in-memory `daemon-store` keeps the
 bank in-memory too (a private per-session in-memory bank, since `:memory:` connections can't be
 shared), so the zero-config default node stays fully ephemeral. Bank names: alphanumeric + `-_`, max
 64 (`banks.py` L176-L185).
@@ -978,10 +980,10 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
   invalidated on `remember`; `Engine::recall_enhanced` (intent→expand→cache→base→weibull→MMR→graph
   expansion→store) and `Engine::recall_polyphonic` (vector/graph/fact/temporal voices → RRF fusion
   (`RRF_K=60`) → 0.8-Jaccard diversity rerank), dispatched by `MnemosyneConfig::recall_mode`
-  (`MNEMOSYNE_ENHANCED_RECALL`/`MNEMOSYNE_POLYPHONIC_RECALL`, default `Base`). Recall-adjacent
+  (host-injected from `[mnemosyne].recall_mode` / `DAEMON_MNEMOSYNE__RECALL_MODE`, default `base`). Recall-adjacent
   carryover also closed: rule-based `extract_gist` (participants/temporal/location/emotion) stored to
   `gists` and consumed by the polyphonic graph voice; the opt-in tier-2 LLM conflict detector
-  (`validate_conflict_pair` via the injected `daemon_core::Provider`, `MNEMOSYNE_LLM_CONFLICT_DETECTION`,
+  (`validate_conflict_pair` via the injected `daemon_core::Provider`, `[mnemosyne].llm_conflict_detection`,
   layered atop the `(S,P)` veracity path in `run_sleep`); and threshold-0.8 fuzzy entity matching
   (`entities::find_similar_entities`) wired into `inject_entity_candidates`. MIB binary bonus shipped
   in P0; plugins remain P3.

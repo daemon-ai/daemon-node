@@ -18,11 +18,24 @@
 use daemon_provision::CutChannel;
 use daemon_pytool::protocol::{self, Command, Concurrency, Event, ToolManifest, PROTOCOL_VERSION};
 
+/// The fake pytool worker CLI (test fixture): fault-injection flags for the client tests.
+#[derive(clap::Parser)]
+#[command(name = "fake-pytool-worker", version, about)]
+struct Cli {
+    /// Exit uncleanly on the first tool call (crash-loop meltdown test).
+    #[arg(long)]
+    crash_on_call: bool,
+    /// Never reply to a tool call (op-timeout watchdog test).
+    #[arg(long)]
+    hang_on_call: bool,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let crash_on_call = args.iter().any(|a| a == "--crash-on-call");
-    let hang_on_call = args.iter().any(|a| a == "--hang-on-call");
+    let Cli {
+        crash_on_call,
+        hang_on_call,
+    } = <Cli as clap::Parser>::parse();
 
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();

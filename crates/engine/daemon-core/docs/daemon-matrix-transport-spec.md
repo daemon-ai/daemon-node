@@ -310,8 +310,8 @@ The megolm / device / cross-signing crypto store + room-state store is a large b
 
 ### 7.1 Config — [`bins/daemon/src/config.rs`](../../../../bins/daemon/src/config.rs)
 
-Add `MatrixConfig` + `FileMatrixConfig` (+ `DAEMON_MATRIX_*` env), shaped like `WebConfig` /
-`MettaConfig`:
+`MatrixConfig` is serde-native (figment deserializes it as the `[matrix]` table / `DAEMON_MATRIX__*`
+env, no separate `File*` mirror), shaped like `WebConfig` / `MettaConfig`:
 
 ```toml
 [matrix]

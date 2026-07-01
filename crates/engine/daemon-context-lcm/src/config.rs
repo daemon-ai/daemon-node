@@ -12,13 +12,6 @@
 
 use std::path::PathBuf;
 
-/// Environment override for the LCM data directory.
-const DATA_DIR_ENV: &str = "LCM_DATA_DIR";
-/// Environment override for the compaction threshold (a fraction of the model context window).
-const CONTEXT_THRESHOLD_ENV: &str = "LCM_CONTEXT_THRESHOLD";
-/// Environment override for the verbatim-kept fresh-tail turn count.
-const FRESH_TAIL_ENV: &str = "LCM_FRESH_TAIL_COUNT";
-
 /// The fraction of the model context window at which compaction triggers (Appendix A).
 const DEFAULT_CONTEXT_THRESHOLD: f64 = 0.35;
 /// The number of most-recent turns always kept verbatim (Appendix A).
@@ -133,24 +126,13 @@ pub struct LcmConfig {
 
 impl Default for LcmConfig {
     fn default() -> Self {
-        let data_dir = std::env::var_os(DATA_DIR_ENV)
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HERMES_HOME").map(|h| PathBuf::from(h).join("lcm/data")))
-            .unwrap_or_else(|| PathBuf::from("lcm-data"));
-        let context_threshold = std::env::var(CONTEXT_THRESHOLD_ENV)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &f64| *v > 0.0 && *v <= 1.0)
-            .unwrap_or(DEFAULT_CONTEXT_THRESHOLD);
-        let fresh_tail_count = std::env::var(FRESH_TAIL_ENV)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_FRESH_TAIL_COUNT);
+        // Pure data — no environment reads. The node binary injects `data_dir` (the profile home)
+        // at construction; the compaction knobs carry the Appendix-A defaults.
         Self {
-            data_dir,
+            data_dir: PathBuf::from("lcm-data"),
             bank: "default".to_string(),
-            context_threshold,
-            fresh_tail_count,
+            context_threshold: DEFAULT_CONTEXT_THRESHOLD,
+            fresh_tail_count: DEFAULT_FRESH_TAIL_COUNT,
             leaf_chunk_tokens: DEFAULT_LEAF_CHUNK_TOKENS,
             condensation_fanin: DEFAULT_CONDENSATION_FANIN,
             incremental_max_depth: DEFAULT_INCREMENTAL_MAX_DEPTH,

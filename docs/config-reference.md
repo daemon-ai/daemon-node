@@ -1,0 +1,116 @@
+# daemon configuration reference
+
+This file is generated from `NodeConfig` (the single source of truth) by `daemon config reference`. Do not edit by hand; run the generator and commit the result (the `check-config-docs` gate diffs it).
+
+Configuration is layered by [figment](https://docs.rs/figment), later sources winning: built-in defaults, then an optional TOML file (`$DAEMON_CONFIG`), then environment variables, then CLI flags. Every environment variable is `DAEMON_` + the TOML path uppercased with `__` between table levels (e.g. `python.op_timeout_ms` ← `DAEMON_PYTHON__OP_TIMEOUT_MS`).
+
+| TOML path | Environment variable | Type | Default |
+|-----------|----------------------|------|---------|
+| `api.auth_db` | `DAEMON_API__AUTH_DB` | optional | _(unset)_ |
+| `api.local_trust` | `DAEMON_API__LOCAL_TRUST` | string | `system` |
+| `api.require_client_cert` | `DAEMON_API__REQUIRE_CLIENT_CERT` | bool | `false` |
+| `api.tls_addr` | `DAEMON_API__TLS_ADDR` | optional | _(unset)_ |
+| `api.tls_cert` | `DAEMON_API__TLS_CERT` | optional | _(unset)_ |
+| `api.tls_client_ca` | `DAEMON_API__TLS_CLIENT_CA` | optional | _(unset)_ |
+| `api.tls_key` | `DAEMON_API__TLS_KEY` | optional | _(unset)_ |
+| `base_url` | `DAEMON_BASE_URL` | optional | _(unset)_ |
+| `blob_root` | `DAEMON_BLOB_ROOT` | optional | _(unset)_ |
+| `browser.approve_navigation` | `DAEMON_BROWSER__APPROVE_NAVIGATION` | bool | `false` |
+| `browser.auto_dismiss_dialogs` | `DAEMON_BROWSER__AUTO_DISMISS_DIALOGS` | bool | `true` |
+| `browser.chrome_path` | `DAEMON_BROWSER__CHROME_PATH` | optional | _(unset)_ |
+| `browser.enable` | `DAEMON_BROWSER__ENABLE` | bool | `false` |
+| `browser.headless` | `DAEMON_BROWSER__HEADLESS` | bool | `true` |
+| `browser.launch_timeout_ms` | `DAEMON_BROWSER__LAUNCH_TIMEOUT_MS` | number | `20000` |
+| `browser.screenshot_dir` | `DAEMON_BROWSER__SCREENSHOT_DIR` | optional | _(unset)_ |
+| `context_engine` | `DAEMON_CONTEXT_ENGINE` | string | `lcm` |
+| `credential_key` | `DAEMON_CREDENTIAL_KEY` | string | `""` |
+| `data_dir` | `DAEMON_DATA_DIR` | string | `$XDG_DATA_HOME/daemon` |
+| `dispatch_interval_ms` | `DAEMON_DISPATCH_INTERVAL_MS` | number | `2` |
+| `embed.base_url` | `DAEMON_EMBED__BASE_URL` | optional | _(unset)_ |
+| `embed.dims` | `DAEMON_EMBED__DIMS` | number | `0` |
+| `embed.engine` | `DAEMON_EMBED__ENGINE` | string | `llama` |
+| `embed.model` | `DAEMON_EMBED__MODEL` | string | `""` |
+| `embed.provider` | `DAEMON_EMBED__PROVIDER` | string | `off` |
+| `engine.approval_policy` | `DAEMON_ENGINE__APPROVAL_POLICY` | string | `ask` |
+| `engine.context_budget_tokens` | `DAEMON_ENGINE__CONTEXT_BUDGET_TOKENS` | optional | _(unset)_ |
+| `engine.max_iterations` | `DAEMON_ENGINE__MAX_ITERATIONS` | number | `90` |
+| `engine.max_repeated_rounds` | `DAEMON_ENGINE__MAX_REPEATED_ROUNDS` | number | `3` |
+| `engine.memory_review_interval` | `DAEMON_ENGINE__MEMORY_REVIEW_INTERVAL` | number | `0` |
+| `engine.model_backoff_base_ms` | `DAEMON_ENGINE__MODEL_BACKOFF_BASE_MS` | number | `2000` |
+| `engine.model_backoff_max_ms` | `DAEMON_ENGINE__MODEL_BACKOFF_MAX_MS` | number | `120000` |
+| `engine.model_max_retries` | `DAEMON_ENGINE__MODEL_MAX_RETRIES` | number | `3` |
+| `engine.model_retry_attempts` | `DAEMON_ENGINE__MODEL_RETRY_ATTEMPTS` | number | `1` |
+| `engine.model_stream_watchdog_ms` | `DAEMON_ENGINE__MODEL_STREAM_WATCHDOG_MS` | number | `180000` |
+| `engine.skill_review_interval` | `DAEMON_ENGINE__SKILL_REVIEW_INTERVAL` | number | `0` |
+| `engine.tool_result_budget` | `DAEMON_ENGINE__TOOL_RESULT_BUDGET` | number | `65536` |
+| `engine.tool_search_threshold_bytes` | `DAEMON_ENGINE__TOOL_SEARCH_THRESHOLD_BYTES` | number | `16384` |
+| `http_addr` | `DAEMON_HTTP_ADDR` | optional | _(unset)_ |
+| `infer.flash_attn` | `DAEMON_INFER__FLASH_ATTN` | bool | `false` |
+| `infer.inter_token_timeout_ms` | `DAEMON_INFER__INTER_TOKEN_TIMEOUT_MS` | number | `30000` |
+| `infer.isq` | `DAEMON_INFER__ISQ` | optional | _(unset)_ |
+| `infer.load_timeout_ms` | `DAEMON_INFER__LOAD_TIMEOUT_MS` | number | `120000` |
+| `infer.max_restarts` | `DAEMON_INFER__MAX_RESTARTS` | number | `3` |
+| `infer.max_tokens` | `DAEMON_INFER__MAX_TOKENS` | number | `0` |
+| `infer.n_ctx` | `DAEMON_INFER__N_CTX` | number | `0` |
+| `infer.n_gpu_layers` | `DAEMON_INFER__N_GPU_LAYERS` | number | `0` |
+| `infer.n_threads` | `DAEMON_INFER__N_THREADS` | optional | _(unset)_ |
+| `infer.restart_window_ms` | `DAEMON_INFER__RESTART_WINDOW_MS` | number | `60000` |
+| `infer.ttft_timeout_ms` | `DAEMON_INFER__TTFT_TIMEOUT_MS` | number | `60000` |
+| `infer.worker_bin` | `DAEMON_INFER__WORKER_BIN` | string | `daemon-infer (next to the daemon binary)` |
+| `journal_seed` | `DAEMON_JOURNAL_SEED` | optional | _(unset)_ |
+| `lcm.context_threshold` | `DAEMON_LCM__CONTEXT_THRESHOLD` | number | `0.35` |
+| `lcm.fresh_tail_count` | `DAEMON_LCM__FRESH_TAIL_COUNT` | number | `32` |
+| `matrix.enabled` | `DAEMON_MATRIX__ENABLED` | bool | `false` |
+| `matrix.route` | `DAEMON_MATRIX__ROUTE` | array | `[]` |
+| `matrix.store_root` | `DAEMON_MATRIX__STORE_ROOT` | string | `matrix` |
+| `mcp.servers` | `DAEMON_MCP__SERVERS` | array | `[]` |
+| `memory_file` | `DAEMON_MEMORY_FILE` | optional | _(unset)_ |
+| `memory_provider` | `DAEMON_MEMORY_PROVIDER` | string | `mnemosyne` |
+| `metta.enable` | `DAEMON_METTA__ENABLE` | bool | `false` |
+| `metta.max_restarts` | `DAEMON_METTA__MAX_RESTARTS` | number | `3` |
+| `metta.max_results` | `DAEMON_METTA__MAX_RESULTS` | number | `100` |
+| `metta.max_steps` | `DAEMON_METTA__MAX_STEPS` | number | `1000` |
+| `metta.restart_window_ms` | `DAEMON_METTA__RESTART_WINDOW_MS` | number | `60000` |
+| `metta.state_dir` | `DAEMON_METTA__STATE_DIR` | optional | _(unset)_ |
+| `metta.timeout_ms` | `DAEMON_METTA__TIMEOUT_MS` | number | `1000` |
+| `metta.worker_bin` | `DAEMON_METTA__WORKER_BIN` | string | `daemon-metta (next to the daemon binary)` |
+| `mnemosyne.author_id` | `DAEMON_MNEMOSYNE__AUTHOR_ID` | optional | _(unset)_ |
+| `mnemosyne.author_type` | `DAEMON_MNEMOSYNE__AUTHOR_TYPE` | optional | _(unset)_ |
+| `mnemosyne.channel_id` | `DAEMON_MNEMOSYNE__CHANNEL_ID` | optional | _(unset)_ |
+| `mnemosyne.llm_conflict_detection` | `DAEMON_MNEMOSYNE__LLM_CONFLICT_DETECTION` | bool | `false` |
+| `mnemosyne.recall_mode` | `DAEMON_MNEMOSYNE__RECALL_MODE` | string | `base` |
+| `mock_script` | `DAEMON_MOCK_SCRIPT` | optional | _(unset)_ |
+| `model` | `DAEMON_MODEL` | string | `""` |
+| `model_provider` | `DAEMON_MODEL_PROVIDER` | optional | _(unset)_ |
+| `models.cache_dir` | `DAEMON_MODELS__CACHE_DIR` | optional | _(unset)_ |
+| `models.endpoint` | `DAEMON_MODELS__ENDPOINT` | optional | _(unset)_ |
+| `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
+| `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
+| `partition` | `DAEMON_PARTITION` | number | `0` |
+| `profile` | `DAEMON_PROFILE` | string | `openai` |
+| `python.enable` | `DAEMON_PYTHON__ENABLE` | bool | `false` |
+| `python.interpreter` | `DAEMON_PYTHON__INTERPRETER` | string | `python3` |
+| `python.max_restarts` | `DAEMON_PYTHON__MAX_RESTARTS` | number | `3` |
+| `python.op_timeout_ms` | `DAEMON_PYTHON__OP_TIMEOUT_MS` | number | `60000` |
+| `python.package_path` | `DAEMON_PYTHON__PACKAGE_PATH` | optional | _(unset)_ |
+| `python.restart_window_ms` | `DAEMON_PYTHON__RESTART_WINDOW_MS` | number | `60000` |
+| `python.spawn_timeout_ms` | `DAEMON_PYTHON__SPAWN_TIMEOUT_MS` | number | `30000` |
+| `python.tools_dir` | `DAEMON_PYTHON__TOOLS_DIR` | optional | _(unset)_ |
+| `python.worker_bin` | `DAEMON_PYTHON__WORKER_BIN` | optional | _(unset)_ |
+| `python.worker_module` | `DAEMON_PYTHON__WORKER_MODULE` | string | `daemon_pytool` |
+| `rooms.enabled` | `DAEMON_ROOMS__ENABLED` | bool | `false` |
+| `rooms.max_turns` | `DAEMON_ROOMS__MAX_TURNS` | number | `16` |
+| `routing.default_profile` | `DAEMON_ROUTING__DEFAULT_PROFILE` | optional | _(unset)_ |
+| `routing.instance_profile` | `DAEMON_ROUTING__INSTANCE_PROFILE` | array | `[]` |
+| `routing.route` | `DAEMON_ROUTING__ROUTE` | array | `[]` |
+| `scan_interval_ms` | `DAEMON_SCAN_INTERVAL_MS` | number | `10` |
+| `skills.dir` | `DAEMON_SKILLS__DIR` | optional | _(unset)_ |
+| `skills.enable` | `DAEMON_SKILLS__ENABLE` | bool | `true` |
+| `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
+| `store` | `DAEMON_STORE` | string | `memory` |
+| `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |
+| `web.enable` | `DAEMON_WEB__ENABLE` | bool | `false` |
+| `web.firecrawl_key_id` | `DAEMON_WEB__FIRECRAWL_KEY_ID` | string | `firecrawl` |
+| `web.local_fallback` | `DAEMON_WEB__LOCAL_FALLBACK` | bool | `true` |
+| `web.tavily_key_id` | `DAEMON_WEB__TAVILY_KEY_ID` | string | `tavily` |
+| `workspace_root` | `DAEMON_WORKSPACE_ROOT` | optional | _(unset)_ |

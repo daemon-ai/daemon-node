@@ -78,8 +78,16 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
+# The node's launch/composition config: layered defaults <- TOML <- env <- CLI, merged into NodeConfig.
+# (figment's `toml` feature pulls the TOML parser transitively; the binary no longer uses it directly.)
+figment = { workspace = true }
+# The daemon CLI grammar (host role default + `matrix login` + internal roles + `config` reference).
+clap = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# `figment::Jail` (hermetic, race-free env + temp-file fixtures) for the config-loading tests.
+figment = { workspace = true, features = ["test"] }
 
 [lints]
 workspace = true

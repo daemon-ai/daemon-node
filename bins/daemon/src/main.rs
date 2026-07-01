@@ -7,14 +7,16 @@
 //! - default **host** role: build the policy inputs (store, credentials, provider registry, engine
 //!   tunables) and hand them to [`daemon_node::assemble`] — the single host-composition root shared
 //!   with the conformance harness — then serve the one [`daemon_api`] surface over a Unix socket.
-//! - **placed-child** role (`DAEMON_PLACED_CHILD`): the far side of a placement cut, driving an
-//!   engine whose durable state is brokered back to the parent's store.
-//! - **transport-server** role (`DAEMON_TRANSPORT_SERVER=<addr>`): host a unit + authoritative
+//! - **placed-child** role (`daemon internal placed-child`): the far side of a placement cut, driving
+//!   an engine whose durable state is brokered back to the parent's store.
+//! - **transport-server** role (`daemon internal transport-server <addr>`): host a unit + authoritative
 //!   store reached over a socket ([`daemon_transport::RemoteHost`]).
 
 #![forbid(unsafe_code)]
 
 mod config;
+
+use clap::Parser as _;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -72,22 +74,108 @@ use config::{
     StoreBackend,
 };
 
-/// The environment variable that selects the placed-child role.
-const PLACED_CHILD_ENV: &str = "DAEMON_PLACED_CHILD";
-/// The environment variable that selects the transport-server role (its value is the bind address).
-const TRANSPORT_SERVER_ENV: &str = "DAEMON_TRANSPORT_SERVER";
+/// `daemon` — the role-by-config host node. With no subcommand it runs the host role, loading the
+/// layered [`NodeConfig`] (defaults <- TOML <- env <- these CLI overrides).
+#[derive(clap::Parser)]
+#[command(name = "daemon", version = daemon_common::VERSION, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    overrides: ConfigOverrides,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Operate a Matrix account (SSO login + session persistence).
+    Matrix {
+        #[command(subcommand)]
+        cmd: MatrixCmd,
+    },
+    /// Inspect the layered configuration.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Internal process roles used by the node itself (not for direct use).
+    #[command(hide = true, subcommand)]
+    Internal(InternalCmd),
+}
+
+#[derive(clap::Subcommand)]
+enum ConfigCmd {
+    /// Print the generated Markdown configuration reference (every key: TOML path, env var, type,
+    /// default) — the source for `docs/config-reference.md` and its drift gate.
+    Reference,
+}
+
+#[derive(clap::Subcommand)]
+enum MatrixCmd {
+    /// SSO-login one account and persist its session under a credential-ref (the same key the
+    /// profile's `bound_accounts` declares). Writes to the durable `FileCredentialStore`.
+    Login {
+        /// The homeserver base URL.
+        #[arg(long)]
+        homeserver: String,
+        /// The credential-ref key the resulting session is stored under.
+        #[arg(long, alias = "credential_ref")]
+        credential_ref: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum InternalCmd {
+    /// The far side of a placement cut, driving an engine over stdio brokered by the parent.
+    PlacedChild,
+    /// Host a unit + authoritative store reached over a socket at `<addr>`.
+    TransportServer {
+        /// The bind address (e.g. a Unix socket path).
+        addr: String,
+    },
+}
+
+/// Top-level config overrides — the highest-precedence layer. Only flags that are set serialize
+/// (unset flags never clobber env/TOML/defaults). Field names match the [`NodeConfig`] serde keys.
+#[derive(clap::Args, serde::Serialize)]
+struct ConfigOverrides {
+    /// The Unix socket the node serves its api on.
+    #[arg(long = "socket")]
+    #[serde(rename = "socket_path", skip_serializing_if = "Option::is_none")]
+    socket_path: Option<std::path::PathBuf>,
+    /// The host data directory rooting the profile-scoped subsystem databases.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir: Option<std::path::PathBuf>,
+    /// The provider/credential profile name.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    /// The model provider (mock|scripted|genai|daemon_api|llama|mistralrs).
+    #[arg(long = "model-provider")]
+    #[serde(rename = "model_provider", skip_serializing_if = "Option::is_none")]
+    model_provider: Option<String>,
+    /// The model name sent to a real provider (or the model path / HF id for a local provider).
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// The launch credential key (the daemon-api / provider bearer).
+    #[arg(long = "credential-key")]
+    #[serde(rename = "credential_key", skip_serializing_if = "Option::is_none")]
+    credential_key: Option<String>,
+    /// The durable store backend (memory|sqlite).
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
+    /// The in-process HTTP/WS surface bind address (enables it).
+    #[arg(long = "http-addr")]
+    #[serde(rename = "http_addr", skip_serializing_if = "Option::is_none")]
+    http_addr: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `daemon --version` / `-V`: report the build version and exit before any setup (so the output
-    // stays clean and no log subscriber / transport is initialized).
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|a| a == "--version" || a == "-V")
-    {
-        println!("daemon {}", daemon_common::VERSION);
-        return Ok(());
-    }
+    // clap owns `--version`/`-h` (exiting before any setup keeps their output clean).
+    let cli = Cli::parse();
 
     // Stderr-only structured logging (stdout is the cut transport in the child role), plus the
     // OpenTelemetry OTLP export layer when built with `--features otel` and an endpoint is set. The
@@ -100,50 +188,39 @@ async fn main() -> anyhow::Result<()> {
         daemon_core::set_genai_capture(true);
     }
 
-    if std::env::var_os(PLACED_CHILD_ENV).is_some() {
-        run_as_placed_child().await;
-        return Ok(());
+    match cli.command {
+        Some(Command::Internal(InternalCmd::PlacedChild)) => {
+            run_as_placed_child().await;
+            Ok(())
+        }
+        Some(Command::Internal(InternalCmd::TransportServer { addr })) => {
+            run_as_transport_server(addr).await
+        }
+        Some(Command::Config {
+            cmd: ConfigCmd::Reference,
+        }) => {
+            print!("{}", config::config_reference());
+            Ok(())
+        }
+        Some(Command::Matrix {
+            cmd:
+                MatrixCmd::Login {
+                    homeserver,
+                    credential_ref,
+                },
+        }) => run_matrix_login(&homeserver, &credential_ref).await,
+        None => {
+            // defaults <- TOML <- env <- CLI overrides (later wins).
+            let fig = NodeConfig::base_figment()
+                .merge(figment::providers::Serialized::defaults(cli.overrides));
+            run_as_host(NodeConfig::from_figment(fig)?).await
+        }
     }
-
-    if let Some(addr) = std::env::var_os(TRANSPORT_SERVER_ENV) {
-        run_as_transport_server(addr.to_string_lossy().into_owned()).await?;
-        return Ok(());
-    }
-
-    // One-shot operator subcommand: `daemon matrix login --homeserver <url> --credential-ref <key>`
-    // performs the interactive SSO flow and writes the resulting session into the credential store
-    // (daemon-matrix-transport-spec §6.1). Everything else falls through to the host role.
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("matrix")
-        && args.get(2).map(String::as_str) == Some("login")
-    {
-        return run_matrix_login(&args[3..]).await;
-    }
-
-    run_as_host(NodeConfig::load()?).await
 }
 
 /// The `daemon matrix login` subcommand: SSO-login one account and persist its session under the
-/// given credential-ref (the same key the profile's `bound_accounts` declares). Writes to the
-/// durable `FileCredentialStore` the host reads at startup.
-async fn run_matrix_login(args: &[String]) -> anyhow::Result<()> {
-    let mut homeserver: Option<String> = None;
-    let mut credential_ref: Option<String> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--homeserver" => homeserver = it.next().cloned(),
-            "--credential-ref" | "--credential_ref" => credential_ref = it.next().cloned(),
-            other => anyhow::bail!(
-                "unknown `matrix login` arg {other:?} (use --homeserver <url> --credential-ref <key>)"
-            ),
-        }
-    }
-    let homeserver =
-        homeserver.ok_or_else(|| anyhow::anyhow!("`matrix login` requires --homeserver <url>"))?;
-    let credential_ref = credential_ref
-        .ok_or_else(|| anyhow::anyhow!("`matrix login` requires --credential-ref <key>"))?;
-
+/// given credential-ref. Writes to the durable `FileCredentialStore` the host reads at startup.
+async fn run_matrix_login(homeserver: &str, credential_ref: &str) -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
     // Login implies persistence: write to the same on-disk credential store the host reads.
     std::fs::create_dir_all(&cfg.data_dir)
@@ -153,9 +230,9 @@ async fn run_matrix_login(args: &[String]) -> anyhow::Result<()> {
     )?);
     daemon_matrix::login(
         credential_store,
-        &homeserver,
+        homeserver,
         &cfg.matrix.store_root,
-        &credential_ref,
+        credential_ref,
     )
     .await
 }
@@ -498,7 +575,7 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
             let persist = cfg.persist_providers();
             // The base config carries the *root*; the bank cache re-roots `data_dir` to
             // `<data_root>/<profile>/` per resolved profile (in-memory banks ignore the path).
-            let lcm_cfg = if persist {
+            let mut lcm_cfg = if persist {
                 LcmConfig {
                     data_dir: cfg.data_root(),
                     bank: "default".to_string(),
@@ -507,6 +584,9 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
             } else {
                 LcmConfig::in_memory()
             };
+            // Inject the `[lcm]` tunables (the context crate reads no env itself).
+            lcm_cfg.context_threshold = cfg.lcm.context_threshold;
+            lcm_cfg.fresh_tail_count = cfg.lcm.fresh_tail_count;
             let banks = Arc::new(LcmBanks::new(
                 lcm_cfg,
                 persist,
@@ -768,7 +848,7 @@ fn build_memory(
         MemoryProviderKind::Mnemosyne => {
             // The base config carries the *root*; the bank cache re-roots `data_dir` to
             // `<data_root>/<profile>/` per resolved profile (in-memory banks ignore the path).
-            let base = if cfg.persist_providers() {
+            let mut base = if cfg.persist_providers() {
                 MnemosyneConfig {
                     data_dir: cfg.data_root(),
                     ..MnemosyneConfig::default()
@@ -776,6 +856,12 @@ fn build_memory(
             } else {
                 MnemosyneConfig::default()
             };
+            // Inject the `[mnemosyne]` recall + identity knobs (the memory crate reads no env itself).
+            base.recall_mode = cfg.mnemosyne.recall_mode;
+            base.llm_conflict_detection = cfg.mnemosyne.llm_conflict_detection;
+            base.author_id = cfg.mnemosyne.author_id.clone();
+            base.author_type = cfg.mnemosyne.author_type.clone();
+            base.channel_id = cfg.mnemosyne.channel_id.clone();
             let banks = Arc::new(MnemosyneBanks::new(
                 base,
                 cfg.persist_providers(),
@@ -1213,7 +1299,7 @@ fn parse_model_ref(kind: ProviderKind, s: &str) -> Option<ModelRef> {
 
 /// Build the [`WorkerConfig`] for a local provider from the node config's `[local]` tuning.
 fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
-    let local = &cfg.local;
+    let local = &cfg.infer;
     let mut wc = WorkerConfig::new(local.worker_bin.clone(), engine, cfg.model.clone());
     wc.params = ModelParams {
         n_gpu_layers: local.n_gpu_layers,
@@ -1331,23 +1417,23 @@ async fn build_embedder(
                 ModelEngine::Llama => Engine::Llama,
             };
             let mut wc = WorkerConfig::new(
-                cfg.local.worker_bin.clone(),
+                cfg.infer.worker_bin.clone(),
                 infer_engine,
                 artifact.local_path.to_string_lossy().into_owned(),
             );
             wc.params = ModelParams {
-                n_gpu_layers: cfg.local.n_gpu_layers,
-                n_ctx: cfg.local.n_ctx,
-                n_threads: cfg.local.n_threads,
-                flash_attn: cfg.local.flash_attn,
+                n_gpu_layers: cfg.infer.n_gpu_layers,
+                n_ctx: cfg.infer.n_ctx,
+                n_threads: cfg.infer.n_threads,
+                flash_attn: cfg.infer.flash_attn,
                 isq: None,
                 embeddings: true,
             };
             // Load from the warmed cache offline (the daemon owns acquisition).
             wc.env.extend(manager.cache().sidecar_env());
-            wc.load_timeout = cfg.local.load_timeout;
-            wc.max_restarts = cfg.local.max_restarts;
-            wc.restart_window = cfg.local.restart_window;
+            wc.load_timeout = cfg.infer.load_timeout;
+            wc.max_restarts = cfg.infer.max_restarts;
+            wc.restart_window = cfg.infer.restart_window;
             Some(Arc::new(LocalEmbedder::new(
                 wc,
                 cfg.embed.dims,
@@ -1477,7 +1563,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // networked provider (`genai`/`daemon_api`) additionally requires a model + credential. The
     // resolved kind is threaded into provider construction below.
     let provider_kind = cfg.validate_for_host()?;
-    let store = build_store(&cfg.store)?;
+    let store = build_store(&cfg.store_backend())?;
 
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.
     // Durable nodes persist secrets under the data root; the ephemeral default keeps them in memory.
@@ -1538,7 +1624,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             endpoint: cfg.models.endpoint.clone(),
             // Offline quantization runs out-of-process via the llama-enabled inference worker; reuse
             // the configured worker binary (it has the `quantize` subcommand when built with llama).
-            quantize_worker_bin: Some(cfg.local.worker_bin.clone()),
+            quantize_worker_bin: Some(cfg.infer.worker_bin.clone()),
         })
         .await?,
     );
@@ -1761,8 +1847,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         routing,
         checkpoints,
         auth_factories,
-        workspace_root: Some(cfg.workspace_root.clone()),
-        blob_root: Some(cfg.blob_root.clone()),
+        workspace_root: Some(cfg.workspace_root()),
+        blob_root: Some(cfg.blob_root()),
     });
     // Build the daemon-authoritative command catalog (`command_list`/`command_invoke`): the built-in
     // node-op commands unified with the provider commands the context engine (`/lcm`) and memory
@@ -1785,10 +1871,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 
     // The identity store backing the authenticator (created if absent), shared by every
     // auth-required transport (the Unix socket when local trust is disabled, and TCP/TLS always).
-    let auth_store =
-        Arc::new(daemon_auth::AuthStore::open(&cfg.api.auth_db).map_err(|e| {
-            anyhow::anyhow!("opening auth store {}: {e}", cfg.api.auth_db.display())
-        })?);
+    let auth_db = cfg.auth_db();
+    let auth_store = Arc::new(
+        daemon_auth::AuthStore::open(&auth_db)
+            .map_err(|e| anyhow::anyhow!("opening auth store {}: {e}", auth_db.display()))?,
+    );
 
     // #2 first-admin bootstrap: seed exactly one admin when the users table is empty (idempotent).
     // The default `local_trust=system` operator is already admin without SASL; this human seed is
@@ -2114,7 +2201,7 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
         cache_dir: cfg.models.cache_dir.clone(),
         registry_path: cfg.models.registry_path.clone(),
         endpoint: cfg.models.endpoint.clone(),
-        quantize_worker_bin: Some(cfg.local.worker_bin.clone()),
+        quantize_worker_bin: Some(cfg.infer.worker_bin.clone()),
     })
     .await
     {

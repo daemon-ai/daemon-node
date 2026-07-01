@@ -21,16 +21,38 @@ use daemon_provision::{CutChannel, CutWriter};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
+/// The `daemon-infer` worker CLI. With no subcommand it speaks the stdio inference protocol; the
+/// one-shot `quantize` subcommand offline-quantizes a GGUF and exits (the model manager shells out
+/// to it). `--engine` is the spawn-time engine hint (the `Load` frame is authoritative).
+#[derive(clap::Parser)]
+#[command(name = "daemon-infer", version, about)]
+struct Cli {
+    /// The spawn-time engine selector (`llama`/`mistralrs`).
+    #[arg(long)]
+    engine: Option<String>,
+    #[command(subcommand)]
+    cmd: Option<InferCmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum InferCmd {
+    /// Offline-quantize a GGUF via llama.cpp's native quantizer, then exit.
+    Quantize {
+        /// The quantizer arguments (`--in <p> --out <p> --ftype <q> --nthread <n>`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() {
-    // A one-shot `quantize` subcommand (not part of the stdio protocol): offline-quantize a GGUF
-    // via llama.cpp's native quantizer, then exit. The daemon's model manager shells out to this.
-    let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(String::as_str) == Some("quantize") {
-        std::process::exit(run_quantize_cli(&raw_args[2..]));
+    let cli = <Cli as clap::Parser>::parse();
+    // A one-shot `quantize` subcommand (not part of the stdio protocol).
+    if let Some(InferCmd::Quantize { args }) = cli.cmd {
+        std::process::exit(run_quantize_cli(&args));
     }
 
-    let selected_engine = parse_engine_arg();
+    let selected_engine = cli.engine.as_deref().and_then(Engine::parse);
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
 
@@ -295,18 +317,4 @@ fn run_quantize_cli(args: &[String]) -> i32 {
         );
         3
     }
-}
-
-/// Parse an optional `--engine <name>` flag (the spawn-time selector; `Load` is authoritative).
-fn parse_engine_arg() -> Option<Engine> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--engine=") {
-            return Engine::parse(value);
-        }
-        if arg == "--engine" {
-            return args.next().and_then(|v| Engine::parse(&v));
-        }
-    }
-    None
 }

@@ -32,7 +32,7 @@ impl Engine {
     ) -> Result<String> {
         // Sanitize first (`beam.py` L2874-L2880): binary/oversized/high-entropy payloads spill to the
         // blob store, leaving a placeholder + `{"_blob": {...}}` metadata persisted on the row.
-        let (content, blob_meta) = sanitize::sanitize_content(content);
+        let (content, blob_meta) = sanitize::sanitize_content(content, &self.config.blob_dir());
         let metadata_json = if blob_meta.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             "{}".to_string()
         } else {

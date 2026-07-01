@@ -11,12 +11,16 @@
 
 use daemon_ingest::IngestPolicy;
 use daemon_protocol::IsolationPolicy;
+use serde::{Deserialize, Serialize};
 
 /// The resolved `[rooms]` config the host hands to [`crate::serve`]. `enabled = false` (default)
-/// leaves the Rooms loopback transport off, exactly like `[matrix].enabled`.
-#[derive(Clone, Debug)]
+/// leaves the Rooms loopback transport off, exactly like `[matrix].enabled`. Deserialized by the
+/// binary's `NodeConfig` (figment) as the `[rooms]` table / `DAEMON_ROOMS__*` env.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoomsConfig {
     /// Whether the Rooms loopback transport is spawned at all. `false` (default) leaves it off.
+    #[serde(with = "daemon_common::flex_bool")]
     pub enabled: bool,
     /// The per-Room turn budget cap (echo-storm prevention): the maximum number of re-injected turns
     /// a single post may fan into before the RoomRouter stops the cascade. `0` = unbounded.

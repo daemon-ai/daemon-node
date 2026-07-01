@@ -117,6 +117,10 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 gguf-rs = "0.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# layered configuration (the node's launch/composition config): defaults <- TOML file <- env <- CLI,
+# merged and deserialized once into `NodeConfig`. The `env` provider maps `DAEMON_FOO__BAR` -> the
+# `foo.bar` serde path (mechanical, no hand-maintained name list). Isolated to the `daemon` binary.
+figment = { version = "0.10", features = ["toml", "env"] }
 # I15 cron backing: croner parses/evaluates full cron expressions (incl. L/W/# extensions) and is
 # timezone-aware via chrono/chrono-tz. Pure Rust (no native deps), isolated to `daemon-schedule`.
 # `chrono` is already in the tree (transitive); `chrono-tz` adds the IANA database for per-job tz.

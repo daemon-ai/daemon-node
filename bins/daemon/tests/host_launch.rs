@@ -34,7 +34,7 @@ fn run_host_launch(extra: &[(&str, &str)], timeout: Duration) -> (bool, String) 
         std::env::temp_dir().join(format!("daemon-host-launch-{}-{uniq}", std::process::id()));
     cmd.env("DAEMON_STORE", "memory");
     cmd.env("DAEMON_DATA_DIR", &tmp);
-    cmd.env("DAEMON_API_SOCKET", tmp.join("api.sock"));
+    cmd.env("DAEMON_SOCKET_PATH", tmp.join("api.sock"));
     for (k, v) in extra {
         cmd.env(k, v);
     }

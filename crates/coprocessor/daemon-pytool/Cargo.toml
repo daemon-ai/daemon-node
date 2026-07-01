@@ -16,6 +16,7 @@ name = "fake-pytool-worker"
 path = "src/bin/fake-pytool-worker.rs"
 
 [dependencies]
+clap = { workspace = true }
 # The wire protocol is pure: serde + serde_json (JSON body codec — keeps the Python SDK stdlib-only).
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -222,7 +222,8 @@ a single ordered chain to see *who managed what* and *what was said*, end to end
 **Role parity.** Every engine the node binary constructs is built through the same `EngineProfile`
 seam (engine tunables applied) and journals per turn under the node signer — none is a bespoke,
 unjournaled loop. This holds across the in-process host engines, the fleet children, the far side of
-a placement cut (`DAEMON_PLACED_CHILD`), and a transport-hosted unit (`DAEMON_TRANSPORT_SERVER`). A
+a placement cut (`daemon internal placed-child`), and a transport-hosted unit
+(`daemon internal transport-server <addr>`). A
 placed child seals through the parent's brokered store under the config-seeded key (above); a
 transport node, owning its own store, seals locally and mints its own credentials via the host's
 owner broker. **One deferral:** a placed child does not yet consume the parent's *credentials* over
@@ -384,10 +385,16 @@ model/credential) **fails fast** at `NodeConfig::validate_for_host()` before any
 | credential | The provider bearer. Set at launch via `DAEMON_CREDENTIAL_KEY` (seeded onto the launch profile), or provisioned later over the API via `CredentialSet` on the profile. A networked provider with no credential fails fast. |
 
 Mock/Scripted are keyless and modelless (reachable only via explicit `DAEMON_MODEL_PROVIDER=mock`/
-`scripted`). Local-inference (`llama`/`mistralrs`) tuning lives under `DAEMON_INFER_*` — see
-[local-inference-spec.md](local-inference-spec.md) §7. The first-admin bootstrap env keys
-(`DAEMON_ADMIN_USERNAME`/`_PASSWORD`/`_PASSWORD_FILE`) are documented in
+`scripted`). Local-inference (`llama`/`mistralrs`) tuning lives under the `[infer]` table
+(`DAEMON_INFER__*`) — see [local-inference-spec.md](local-inference-spec.md) §7. The first-admin
+bootstrap env keys (`DAEMON_ADMIN_USERNAME`/`_PASSWORD`/`_PASSWORD_FILE`) are documented in
 [daemon-access-control.md](daemon-access-control.md) §9.
+
+The configuration is layered by [figment](https://docs.rs/figment) (defaults <- optional TOML at
+`$DAEMON_CONFIG` <- `DAEMON_*` env <- CLI flags); every key, its environment variable, type, and
+default are enumerated in the generated [config reference](../config-reference.md) (regenerate with
+`daemon config reference`). Environment variables are `DAEMON_` + the TOML path uppercased with `__`
+between table levels (e.g. `DAEMON_PYTHON__OP_TIMEOUT_MS` for `python.op_timeout_ms`).
 
 **Background spawn — attached, fire-and-forget self-improvement.** `daemon-core` emits
 `Effect::Spawn(SpawnSpec)` (→ `HostRequestKind::Spawn`, §4.6 of the core spec) for post-turn

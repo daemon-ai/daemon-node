@@ -15,6 +15,11 @@
 /// streams (merged log, node-event feed, fs-watch). Pure + sync.
 pub mod cursored;
 
+/// A permissive boolean serde helper (`#[serde(with = "daemon_common::flex_bool")]`) accepting
+/// `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. Used by the node's layered config so an env var
+/// (`DAEMON_*__ENABLE=1`, auto-typed to an integer by figment) or a `=on` string both parse.
+pub mod flex_bool;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;

@@ -19,11 +19,21 @@
 
 #![forbid(unsafe_code)]
 
+use clap::Parser;
 use daemon_metta::protocol::{self, Command, Event, Space};
 use daemon_metta::state::MettaState;
 use daemon_metta::worker::Worker;
 use daemon_provision::CutChannel;
 use tokio::sync::oneshot;
+
+/// The `daemon-metta` worker CLI. No `--state-dir` => an ephemeral in-memory store.
+#[derive(Parser)]
+#[command(name = "daemon-metta", version, about)]
+struct Cli {
+    /// The worker's durable state directory (omit for an in-memory store).
+    #[arg(long)]
+    state_dir: Option<std::path::PathBuf>,
+}
 
 /// A request handed to the actor thread: the command plus the channel its reply is returned on.
 type ActorMsg = (Command, oneshot::Sender<Option<Event>>);
@@ -31,7 +41,7 @@ type ActorMsg = (Command, oneshot::Sender<Option<Event>>);
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // stdout is the cut transport, so all diagnostics go to stderr (eprintln!), like daemon-infer.
-    let state_dir = parse_state_dir();
+    let state_dir = Cli::parse().state_dir;
     let state = match &state_dir {
         Some(dir) => match MettaState::open(dir) {
             Ok(s) => s,
@@ -118,18 +128,4 @@ async fn main() {
 
     drop(cmd_tx);
     let _ = actor.join();
-}
-
-/// Parse `--state-dir <path>` from the argument vector.
-fn parse_state_dir() -> Option<std::path::PathBuf> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--state-dir" {
-            return args.next().map(std::path::PathBuf::from);
-        }
-        if let Some(rest) = arg.strip_prefix("--state-dir=") {
-            return Some(std::path::PathBuf::from(rest));
-        }
-    }
-    None
 }

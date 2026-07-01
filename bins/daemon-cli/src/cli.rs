@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "daemon-cli", version = daemon_common::VERSION, about)]
 pub(crate) struct Cli {
-    /// Path to the node's api socket (defaults to `$DAEMON_API_SOCKET` or `$TMPDIR/daemon-api.sock`).
+    /// Path to the node's api socket (defaults to `$DAEMON_SOCKET_PATH` or `$TMPDIR/daemon-api.sock`).
     #[arg(long, global = true)]
     pub(crate) socket: Option<PathBuf>,
     #[command(subcommand)]

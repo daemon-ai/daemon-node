@@ -27,16 +27,13 @@ const PARTITION: PartitionId = PartitionId::DEFAULT;
 fn placement_spec() -> PlacementSpec {
     PlacementSpec {
         program: env!("CARGO_BIN_EXE_daemon").into(),
-        args: Vec::new(),
+        args: vec!["internal".into(), "placed-child".into()],
         // Journal the child too, so its brokered journal appends/seals are also trace-stamped — the
         // trace must ride *every* child-originated frame, including the journaling store calls.
-        env: vec![
-            ("DAEMON_PLACED_CHILD".into(), "1".into()),
-            (
-                "DAEMON_JOURNAL_SEED".into(),
-                "1111111111111111111111111111111111111111111111111111111111111111".into(),
-            ),
-        ],
+        env: vec![(
+            "DAEMON_JOURNAL_SEED".into(),
+            "1111111111111111111111111111111111111111111111111111111111111111".into(),
+        )],
     }
 }
 

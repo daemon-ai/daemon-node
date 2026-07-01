@@ -13,20 +13,23 @@
 
 use daemon_ingest::IngestPolicy;
 use daemon_protocol::IsolationPolicy;
+use serde::{Deserialize, Serialize};
 
-/// The resolved `[matrix]` config the host hands to [`crate::serve`]. Built in `bins/daemon`'s
-/// `config.rs` from the TOML table + `DAEMON_MATRIX_*` env (the adapter owns the *shape*, the binary
-/// owns the parsing — mirroring `WebConfig`).
-#[derive(Clone, Debug)]
+/// The resolved `[matrix]` config the host hands to [`crate::serve`]. The adapter owns the *shape*;
+/// the binary's `NodeConfig` deserializes it (figment) as the `[matrix]` table / `DAEMON_MATRIX__*`
+/// env and resolves `store_root` against the node `data_dir`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MatrixConfig {
     /// Whether the adapter is spawned at all. `false` (default) leaves Matrix off.
+    #[serde(with = "daemon_common::flex_bool")]
     pub enabled: bool,
-    /// The absolute per-account store root (the binary resolves `[matrix].store_root` against the
-    /// node `data_dir`). Each account gets its own `<store_root>/<instance>/` subdir holding the
-    /// matrix-sdk state + E2EE crypto SQLite store.
+    /// The per-account store root (the binary resolves it against the node `data_dir`). Each account
+    /// gets its own `<store_root>/<instance>/` subdir holding the matrix-sdk state + E2EE crypto store.
     pub store_root: std::path::PathBuf,
     /// The route table — which rooms to engage + how addressing is classified. Empty engages every
-    /// room of every account with mention-gating on.
+    /// room of every account with mention-gating on. TOML key `route` (`[[matrix.route]]`).
+    #[serde(rename = "route")]
     pub routes: Vec<MatrixRoute>,
 }
 
@@ -54,7 +57,8 @@ impl MatrixConfig {
 
 /// One `[[matrix.route]]` entry. All matchers are optional; an empty route matches every room of
 /// every account with mention-gating on.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MatrixRoute {
     /// Match only this account instance (the bare `@user:hs.org`); `None` matches any account.
     pub account: Option<String>,

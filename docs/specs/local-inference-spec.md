@@ -191,10 +191,10 @@ and emits cleaned text + `ToolCall` frames so the markup never leaks into the ca
 ## 7. Configuration & wiring
 
 `bins/daemon` config (`config.rs`) selects a local engine via `DAEMON_MODEL_PROVIDER=llama|mistralrs`
-(TOML `model_provider`), with `DAEMON_MODEL` as the resolved model string. A `[local]` TOML table /
-`DAEMON_INFER_*` env block tunes the worker:
+(TOML `model_provider`), with `DAEMON_MODEL` as the resolved model string. An `[infer]` TOML table /
+`DAEMON_INFER__*` env block tunes the worker:
 
-- `worker_bin` (`DAEMON_INFER_BIN`, default: a `daemon-infer` next to the daemon binary), and the
+- `worker_bin` (`DAEMON_INFER__WORKER_BIN`, default: a `daemon-infer` next to the daemon binary), and the
   `ModelParams` knobs `n_gpu_layers`, `n_ctx`, `n_threads`, `flash_attn`, `isq`, plus `max_tokens`.
 - Watchdog/meltdown: `load_timeout`, `ttft_timeout`, `inter_token_timeout` (all `*_MS` env), and
   `max_restarts` / `restart_window`.
