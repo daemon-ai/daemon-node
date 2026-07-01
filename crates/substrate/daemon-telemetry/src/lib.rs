@@ -23,6 +23,8 @@
 pub mod fields;
 pub mod journal;
 pub mod metrics;
+#[cfg(feature = "otel")]
+mod otel;
 pub mod spans;
 pub mod trace;
 
@@ -57,4 +59,76 @@ pub fn init_subscriber() {
             .with_writer(std::io::stderr)
             .try_init();
     });
+}
+
+/// Holds process-lifetime telemetry resources; flushing them on drop.
+///
+/// When the `otel` feature is on and an OTLP endpoint is configured, this owns the
+/// `SdkTracerProvider` and calls `shutdown()` on drop so the batch exporter flushes any buffered
+/// spans before the process exits. Without the feature (or without an endpoint) it is a zero-sized
+/// no-op. Hold it for the whole process (bind it in `main`, e.g. `let _telemetry = init_telemetry();`).
+#[derive(Default)]
+pub struct TelemetryGuard {
+    #[cfg(feature = "otel")]
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
+
+impl TelemetryGuard {
+    /// Whether an OpenTelemetry exporter is actually installed (feature on + endpoint configured).
+    /// The host uses this to switch on GenAI span content capture only when export is live.
+    pub fn is_exporting(&self) -> bool {
+        #[cfg(feature = "otel")]
+        {
+            self.provider.is_some()
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            false
+        }
+    }
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "otel")]
+        if let Some(provider) = self.provider.take() {
+            // Flush buffered spans; a shutdown error at exit is not actionable, so it is ignored.
+            let _ = provider.shutdown();
+        }
+    }
+}
+
+/// Install the process tracing subscriber and (when built with `--features otel` and
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set) an OpenTelemetry OTLP export layer alongside the `fmt`
+/// layer. Idempotent via the same [`Once`] as [`init_subscriber`] (whichever runs first wins), so a
+/// binary that wants OTLP export should call this once at startup **before** any other telemetry
+/// init. Returns a [`TelemetryGuard`] the caller must keep alive to flush the exporter on shutdown.
+pub fn init_telemetry() -> TelemetryGuard {
+    #[allow(unused_mut)]
+    let mut guard = TelemetryGuard::default();
+    SUBSCRIBER.call_once(|| {
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::{fmt, EnvFilter};
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let fmt_layer = fmt::layer().with_target(true).with_writer(std::io::stderr);
+
+        #[cfg(feature = "otel")]
+        {
+            if let Some((otel_layer, provider)) = otel::otel_layer() {
+                let _ = tracing_subscriber::registry()
+                    .with(filter)
+                    .with(fmt_layer)
+                    .with(otel_layer)
+                    .try_init();
+                guard.provider = Some(provider);
+                return;
+            }
+        }
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+    });
+    guard
 }

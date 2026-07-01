@@ -770,8 +770,34 @@ impl Engine {
             session = %self.snapshot.session_id,
             epoch = self.snapshot.epoch.0,
             rounds_budget = self.config.max_iterations,
+            // OpenTelemetry GenAI attributes (recorded only under `--features otel` + capture on).
+            "gen_ai.operation.name" = tracing::field::Empty,
+            "gen_ai.conversation.id" = tracing::field::Empty,
+            "gen_ai.agent.id" = tracing::field::Empty,
+            "gen_ai.request.model" = tracing::field::Empty,
+            "gen_ai.agent.description" = tracing::field::Empty,
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
+            "gen_ai.usage.cache_read.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.cache_creation.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.reasoning.output_tokens" = tracing::field::Empty,
+            "daemon.usage.cost_micros" = tracing::field::Empty,
+            "daemon.usage.api_calls" = tracing::field::Empty,
+            "daemon.turn.end_reason" = tracing::field::Empty,
         );
-        async {
+        #[cfg(feature = "otel")]
+        crate::genai_telemetry::record_turn_identity(
+            &span,
+            self.snapshot.session_id.as_str(),
+            self.profile.as_str(),
+            &self.model_info().model,
+            &self.snapshot.conversation.system.text,
+        );
+        #[cfg(feature = "otel")]
+        let summary_span = span.clone();
+        // `otel` off makes the trailing record a no-op, leaving `let outcome = …; outcome`.
+        #[cfg_attr(not(feature = "otel"), allow(clippy::let_and_return))]
+        let outcome = async {
             let resuming = !self.pending.is_empty();
             let trigger = self.next_trigger.take().unwrap_or(if resuming {
                 TurnTrigger::BackgroundCompletion {
@@ -1061,7 +1087,12 @@ impl Engine {
             }
         }
         .instrument(span)
-        .await
+        .await;
+        #[cfg(feature = "otel")]
+        if let Ok(TurnOutcome::Completed(summary)) = &outcome {
+            crate::genai_telemetry::record_turn_summary(&summary_span, summary);
+        }
+        outcome
     }
 
     /// Finalize a turn that hit its iteration budget: one final toolless model call to summarize,

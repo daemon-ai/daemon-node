@@ -95,6 +95,7 @@ pub(crate) fn finalize_output(
         reasoning: (!reasoning_acc.is_empty()).then_some(reasoning_acc),
         tool_calls,
         usage,
+        ..Default::default()
     }
 }
 

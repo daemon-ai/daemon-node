@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use daemon_common::{ModelRef, ModelSource, SessionId, UsageDelta};
 use daemon_core::{
     Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestMsg,
-    StreamEvent, ToolCallFormat,
+    RequestParams, ResponseMeta, StreamEvent, ToolCallFormat,
 };
 use daemon_infer::protocol::{self, Command, Engine, Event, ModelParams, Sampling};
 use daemon_models::{ActiveModels, ModelManager};
@@ -520,13 +520,31 @@ async fn drive_generation(
     }
 
     let reasoning = (!reasoning.is_empty()).then_some(reasoning);
-    Ok(finalize_output(
-        text,
-        reasoning,
-        raw_calls,
-        usage,
-        &req.tool_names(),
-    ))
+    let mut out = finalize_output(text, reasoning, raw_calls, usage, &req.tool_names());
+    // The local worker reports no stop reason / response id, but the effective sampling params and
+    // vendor are known from the worker config — surface them for telemetry.
+    out.meta = Some(Box::new(ResponseMeta {
+        provider_name: Some(provider_name_otel(cfg.engine).to_string()),
+        params: Some(RequestParams {
+            temperature: Some(cfg.sampling.temperature as f64),
+            top_p: Some(cfg.sampling.top_p as f64),
+            top_k: Some(cfg.sampling.top_k),
+            max_tokens: Some(effective_max_output(cfg)),
+            seed: Some(cfg.sampling.seed),
+        }),
+        ..Default::default()
+    }));
+    Ok(out)
+}
+
+/// The OpenTelemetry `gen_ai.provider.name` value for a local engine. `mistral_ai` is the closest
+/// well-known spec value for the mistral.rs engine; `llama.cpp` is a custom value (the spec has no
+/// llama.cpp vendor).
+fn provider_name_otel(engine: Engine) -> &'static str {
+    match engine {
+        Engine::MistralRs => "mistral_ai",
+        Engine::Llama => "llama.cpp",
+    }
 }
 
 /// The per-generation output-token cap to send the worker (E5). The configured cap wins; when unset

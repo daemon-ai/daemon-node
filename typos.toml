@@ -1,0 +1,9 @@
+# `typos` allowlist (the pre-commit spell gate). These are false positives on intentional/valid
+# spellings that surface when their files are staged; none are actual typos.
+[default.extend-words]
+# Deliberate partial of "Hello" split across two streamed `TextDelta` chunks (a provider stream test).
+Hel = "Hel"
+# Valid English variant, kept as authored in a doc comment.
+unparseable = "unparseable"
+# The "mis-" prefix token from the hyphenated word "mis-attributed".
+mis = "mis"

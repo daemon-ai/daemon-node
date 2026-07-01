@@ -45,6 +45,7 @@ impl Provider for WriteThenDone {
                 reasoning: None,
                 tool_calls: Vec::new(),
                 usage,
+                ..Default::default()
             })
         } else {
             Ok(ModelOutput {
@@ -56,6 +57,7 @@ impl Provider for WriteThenDone {
                     args: r#"{"op":"write","path":"approved.txt","content":"hi"}"#.into(),
                 }],
                 usage,
+                ..Default::default()
             })
         }
     }

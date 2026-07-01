@@ -45,6 +45,7 @@ pub(super) fn ok_output(text: &str) -> ModelOutput {
         reasoning: None,
         tool_calls: Vec::new(),
         usage: UsageDelta::default(),
+        ..Default::default()
     }
 }
 
