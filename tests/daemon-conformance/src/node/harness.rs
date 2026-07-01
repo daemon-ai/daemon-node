@@ -160,6 +160,110 @@ pub fn assemble_demo() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
     (node, handle)
 }
 
+/// Assemble a node whose per-session provider is the **real** `genai` OpenAI adapter (the
+/// `DaemonApi` gateway path), pointed at a caller-supplied mock upstream `base_url`, with a working
+/// credential broker + profile store — mirroring how `bins/daemon`'s `run_as_host` wires the live
+/// agent (`build_multi_profile_broker` + `provider_resolver` + `credential_store` + `profiles`).
+///
+/// The top-level provider registry stays mock (`gate_providers`), so only the turn's provider hits
+/// the upstream (LCM-aux / mnemosyne summarization never do — no context/memory builders are wired).
+/// Returns the in-process surface, the shared credential store (so a test can seed/inspect keys
+/// directly, e.g. the local-trust path), and the started resident-service handle.
+pub fn assemble_daemon_api_gateway(
+    base_url: String,
+) -> (
+    Arc<NodeApiImpl>,
+    Arc<dyn daemon_host::CredentialStore>,
+    daemon_host::SupervisorHandle,
+) {
+    use daemon_api::{ProfileSpec, ProviderSelector};
+    use daemon_common::CredMode;
+    use daemon_core::{CredentialBuilder, CredentialProvider, ProviderBuilder};
+    use daemon_credentials::CapabilitySigner;
+    use daemon_host::{
+        BrokeredCredentialProvider, CredentialBroker, CredentialStore, MemCredentialStore,
+        MemProfileStore, MultiProfileStoreBroker,
+    };
+    use daemon_providers::GenAiProvider;
+
+    // A shared credential store: a wire `CredentialSet` (or a direct `.set`) writes here, and the
+    // per-profile broker leases the stored key into `Request.auth` (Bearer). Mirrors `run_as_host`.
+    let cred_store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+    let broker: Arc<MultiProfileStoreBroker> = Arc::new(MultiProfileStoreBroker::new(
+        cred_store.clone(),
+        Arc::new(CapabilitySigner::generate()),
+        "", // no launch fallback key: the test provisions the profile key explicitly
+        ["chat", "embed"],
+        Some(1_000),
+        CredMode::Bearer,
+        60_000,
+    ));
+    let owner: Arc<dyn CredentialBroker> = broker;
+    let credentials: CredentialBuilder = Arc::new(move || {
+        Arc::new(BrokeredCredentialProvider::new(owner.clone(), None))
+            as Arc<dyn CredentialProvider>
+    });
+
+    // The per-session resolver: a `DaemonApi` profile builds the real OpenAI adapter pinned at the
+    // profile's base URL (falling back to the mock upstream); every other selector stays a mock.
+    let resolver: daemon_node::ProviderResolver = {
+        let default_base = base_url;
+        Arc::new(move |spec: &ProfileSpec| match spec.provider {
+            ProviderSelector::DaemonApi => {
+                let base = spec
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| default_base.clone());
+                let model = spec.model.clone();
+                let builder: ProviderBuilder = Arc::new(move || {
+                    Arc::new(GenAiProvider::openai(model.clone()).with_endpoint(base.clone()))
+                        as Arc<dyn Provider>
+                });
+                builder
+            }
+            _ => {
+                let reply = format!("[{}] mock reply", spec.id);
+                let builder: ProviderBuilder = Arc::new(move || {
+                    Arc::new(MockProvider::completing(reply.clone())) as Arc<dyn Provider>
+                });
+                builder
+            }
+        })
+    };
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: Some(credentials),
+        profile: ProfileRef::new("gateway"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x55; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: Some(Arc::new(MemProfileStore::new())),
+        provider_resolver: Some(resolver),
+        credential_store: Some(cred_store.clone()),
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![],
+        workspace_root: None,
+        blob_root: None,
+    });
+    (node, cred_store, handle)
+}
+
 /// `ConvGet` helper: fetch a conversation and unwrap it (panics if absent).
 pub async fn conv_get(
     client: &ApiClient,

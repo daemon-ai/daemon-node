@@ -21,6 +21,7 @@ mod fs_content;
 mod harness;
 mod history;
 mod ingest;
+mod live_agent_e2e;
 mod messaging;
 mod negative_auth;
 mod ownership;

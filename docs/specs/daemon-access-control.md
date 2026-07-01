@@ -172,3 +172,37 @@ Audit payloads carry identifiers and outcomes only (`user_id=…`, `username=…
 `roles=[…]`, `op=…`) and **never** credential material: no passwords, no session tokens, no
 PHC/SCRAM blobs. A denial records the payload-free op tag (the variant name), never the request body,
 which may itself carry a credential (e.g. `UserCreate`).
+
+## 9. First-admin bootstrap (empty-store seeding)
+
+A fresh node has an empty identity store, so a networked/TLS operator would have no account to log
+in as. The bootstrap seeds **exactly one `Admin` user, iff the users table is empty**, and is
+idempotent — a second boot (any user already present) is a no-op that never re-seeds. The pure store
+decision is `AuthStore::seed_first_admin_if_empty(AdminSeed)`
+([daemon-auth/src/bootstrap.rs](../../crates/substrate/daemon-auth/src/bootstrap.rs)); environment
+resolution + the one-time secret emission are the binary's responsibility
+([bins/daemon/src/main.rs](../../bins/daemon/src/main.rs) `resolve_admin_seed` /
+`seed_first_admin_if_empty` / `emit_generated_admin`), run once in `run_as_host` after the
+`AuthStore` is bound.
+
+- **Env-first.** With `DAEMON_ADMIN_USERNAME` set, the password is taken from `DAEMON_ADMIN_PASSWORD`
+  or, failing that, from the file at `DAEMON_ADMIN_PASSWORD_FILE`. An empty/whitespace password is
+  **refused** (the launch errors) — the node never seeds `admin`/`<blank>` or any password-less user.
+- **Auto-generate otherwise.** With no `DAEMON_ADMIN_USERNAME`, the node mints a random
+  `admin-<hex>` username and a strong random password.
+- **One-time emission (the sole deliberate secret print).** The auto-generated password is emitted
+  **exactly once**: to stderr and to a `0600` `first-admin-credentials.txt` under the data dir. It is
+  never routed through `tracing` (so it stays out of structured logs/journald) and, unlike every
+  other credential, this is the one documented exception to §8's "no credential material" rule — it
+  never enters the audit journal. The operator-supplied (env) path emits nothing (the operator
+  already knows the password); only the id is logged.
+- **Interaction with `local_trust` (§4).** Under the default `local_trust=system` the local
+  operator is already a full-trust admin over the Unix socket/FFI **without** any SASL exchange, so
+  the seeded admin exists primarily to give a **networked/TLS** operator a real Admin identity to
+  authenticate as (SCRAM/PLAIN) and to make the admin `AccessControl` API usable off the local path.
+  Seeding never weakens the fail-closed gate: it adds an identity, it does not grant access by
+  absence of one.
+
+The over-the-wire proof that a seeded admin authenticates (SCRAM) and drives audited user CRUD is in
+the `daemon-conformance` `node::positive_e2e` suite; the whole login→profile→credential→chat chain
+(seeded admin → SCRAM → `CredentialSet` → `DaemonApi` profile → turn) is `node::live_agent_e2e`.

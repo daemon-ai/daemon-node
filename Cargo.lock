@@ -2189,6 +2189,7 @@ dependencies = [
  "daemon-node",
  "daemon-orchestration",
  "daemon-protocol",
+ "daemon-providers",
  "daemon-provision",
  "daemon-rooms",
  "daemon-skills",
@@ -2206,6 +2207,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "wiremock",
 ]
 
 [[package]]

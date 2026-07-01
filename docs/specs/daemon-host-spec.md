@@ -346,16 +346,48 @@ engine shape, provider selection, brokered credentials, and engine tunables (`da
 `daemon-node` sits *above* `daemon-host` because the fleet + orchestrate-tool glue is composition
 policy; `daemon-host` itself stays free of `daemon-orchestration`.
 
-> **Provider selection is genai-native (wire v3).** The host keeps **no** cloud-provider registry:
-> the `ProviderSelector` is just `mock | genai | llama_cpp | mistral_rs`, and for `genai` the adapter
-> (Anthropic/OpenAI/Gemini/Groq/DeepSeek/xAI/OpenRouter/Cohere/…) is *inferred from the model id* by
-> `genai` (`GenAiProvider::for_model`), with namespaced ids (`groq::…`) forcing the adapter. Live
-> model listing for the GUI picker (`ModelApi::models()`) is delegated to
+> **Provider selection is genai-native.** The host keeps **no** cloud-provider registry: the
+> `ProviderSelector` is `mock | genai | daemon_api | llama_cpp | mistral_rs`, and for `genai` the
+> adapter (Anthropic/OpenAI/Gemini/Groq/DeepSeek/xAI/OpenRouter/Cohere/…) is *inferred from the model
+> id* by `genai` (`GenAiProvider::for_model`), with namespaced ids (`groq::…`) forcing the adapter.
+> Live model listing for the GUI picker (`ModelApi::models()`) is delegated to
 > `genai::Client::all_model_names` for every adapter whose key resolves, injected into the
 > provider-agnostic host through the `CloudCatalog` hook (the binary owns `genai`; the host never
 > links it) with a static catalog as the no-key fallback + the pricing/context overlay. Local GGUF
 > models continue to come from the `ModelManager` catalog. Legacy per-provider profile names migrate
 > to `genai` via serde aliases.
+>
+> **`daemon_api` — the OpenRouter-clone gateway (additive, WireVersion 21).** `ProviderSelector::
+> DaemonApi` is a first-class, networked (not local) selector that pins genai's **OpenAI** adapter at
+> the daemon-api gateway base — `https://api.daemon.ai/api/v1/` by default, overridable per profile
+> (`base_url`) or at launch (`DAEMON_BASE_URL`, e.g. a local `http://127.0.0.1:8787/api/v1/`). The
+> trailing slash is load-bearing: genai resolves the request URL with a relative
+> `Url::join("chat/completions")`, so the base must end in `/` to yield `…/api/v1/chat/completions`
+> (a base without it drops the last segment). Model ids are OpenRouter-style `author/slug` (e.g.
+> `anthropic/claude-sonnet-4-5`) and the bearer is a daemon-api key. It **never** resolves the
+> Anthropic-native adapter for `claude-*` ids — the gateway speaks the OpenAI Chat-Completions wire.
+> Adding the selector is additive (a new enum value + serde/CDDL rule), reflected in the wire version
+> bump to **21**.
+
+### Host provider configuration (env / TOML)
+
+The host launch reads its provider selection from environment (overriding an optional TOML file);
+`config.rs` holds the authoritative doc comments for each key. There is **no silent default** — a
+host launch that does not configure a provider (or configures a networked provider without a
+model/credential) **fails fast** at `NodeConfig::validate_for_host()` before any store/socket setup:
+
+| Key | Meaning |
+|---|---|
+| `DAEMON_MODEL_PROVIDER` | `mock \| scripted \| genai \| daemon_api \| llama \| mistralrs`. **Required** — unset fails fast. Legacy per-family names (`openai`/`anthropic`/…) map to `genai`. |
+| `DAEMON_MODEL` | The model id sent to the provider. **Required** for `genai`/`daemon_api` (empty fails fast); for local kinds it is the GGUF path / HF id. |
+| `DAEMON_BASE_URL` | Provider API base-URL override. For `daemon_api` it defaults to `https://api.daemon.ai/api/v1/` (slash-normalized); unset for `genai` uses the adapter's default endpoint. |
+| credential | The provider bearer. Set at launch via `DAEMON_CREDENTIAL_KEY` (seeded onto the launch profile), or provisioned later over the API via `CredentialSet` on the profile. A networked provider with no credential fails fast. |
+
+Mock/Scripted are keyless and modelless (reachable only via explicit `DAEMON_MODEL_PROVIDER=mock`/
+`scripted`). Local-inference (`llama`/`mistralrs`) tuning lives under `DAEMON_INFER_*` — see
+[local-inference-spec.md](local-inference-spec.md) §7. The first-admin bootstrap env keys
+(`DAEMON_ADMIN_USERNAME`/`_PASSWORD`/`_PASSWORD_FILE`) are documented in
+[daemon-access-control.md](daemon-access-control.md) §9.
 
 **Background spawn — attached, fire-and-forget self-improvement.** `daemon-core` emits
 `Effect::Spawn(SpawnSpec)` (→ `HostRequestKind::Spawn`, §4.6 of the core spec) for post-turn

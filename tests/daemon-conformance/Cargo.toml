@@ -25,6 +25,10 @@ daemon-tool-web = { workspace = true }
 daemon-tool-fs = { workspace = true }
 daemon-skills = { workspace = true }
 daemon-node = { workspace = true }
+# Track D live-agent e2e: the real genai OpenAI adapter (`GenAiProvider::openai`) the
+# `assemble_daemon_api_gateway` harness helper points at a mock upstream. Used from `src/` (the
+# harness), so it is a normal dependency, not dev-only.
+daemon-providers = { workspace = true }
 daemon-acp = { workspace = true }
 daemon-rooms = { workspace = true }
 daemon-matrix = { workspace = true }
@@ -46,6 +50,9 @@ rsasl = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
+# Track D live-agent e2e: an in-process mock upstream standing in for the daemon-api gateway, so a
+# real session turn drives the OpenAI adapter over HTTP without a network. Test-only.
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
