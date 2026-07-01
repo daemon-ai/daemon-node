@@ -1,9 +1,49 @@
 # `typos` allowlist (the pre-commit spell gate). These are false positives on intentional/valid
 # spellings that surface when their files are staged; none are actual typos.
+#
+# Kept in sync with the superproject `../.typos.toml`: `typos` applies the *nearest* config to each
+# file, so daemon-node files are governed by this file (not the superproject's). The superproject's
+# submodule-bump gate spell-checks the whole daemon-node tree, so this must cover the same terms.
+
+[files]
+extend-exclude = [
+  # Vendored third-party clones and build/codegen output - not ours to spell-check.
+  "research/**",
+  "**/target/**",
+  "**/build*/**",
+  "**/result-*/**",
+  "*.lock",
+]
+
+# Domain terms / library names / valid spelling variants / short identifier fragments that typos
+# misreads as errors (each verified a false positive in this codebase).
 [default.extend-words]
-# Deliberate partial of "Hello" split across two streamed `TextDelta` chunks (a provider stream test).
-Hel = "Hel"
-# Valid English variant, kept as authored in a doc comment.
-unparseable = "unparseable"
-# The "mis-" prefix token from the hyphenated word "mis-attributed".
+unparseable = "unparseable" # accepted variant of "unparsable"
+clonable = "clonable"       # accepted variant of "cloneable"
+togglable = "togglable"     # accepted variant of "toggleable"
+invokable = "invokable"     # Qt's Q_INVOKABLE macro
+cose = "cose"               # COSE: CBOR Object Signing and Encryption
+tpe = "tpe"                 # common `type` placeholder identifier
+lod = "lod"                 # LOD: level-of-detail
+muc = "muc"                 # MUC: XMPP multi-user chat
+arange = "arange"           # numpy np.arange in skill examples
+canva = "canva"             # Canva (product name)
+# Short fragments typos extracts from larger identifiers/words/fixtures (PNGs, MorAlekss, ...).
+nd = "nd"
+ot = "ot"
+pn = "pn"
+ba = "ba"
+thm = "thm"
+thi = "thi"
+dout = "dout"
 mis = "mis"
+assum = "assum"
+slee = "slee"
+selec = "selec"
+hel = "hel"
+mor = "mor"
+alikes = "alikes"
+
+[default.extend-identifiers]
+ratatui = "ratatui"         # the Rust TUI crate
+Ratatui = "Ratatui"
