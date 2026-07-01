@@ -22,12 +22,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 pub mod capability;
 pub mod error;
 pub mod scram;
 pub mod store;
 
+pub use bootstrap::{AdminSeed, SeededAdmin};
 pub use capability::{Capability, Principal, Role};
 pub use error::{Error, Result};
 pub use scram::{ScramMaterial, SCRAM_DEFAULT_ITERATIONS, SCRAM_SHA_256};
-pub use store::{AuthStore, UserRecord, DEFAULT_SESSION_TTL_SECS};
+pub use store::{generate_secret_hex, AuthStore, UserRecord, DEFAULT_SESSION_TTL_SECS};

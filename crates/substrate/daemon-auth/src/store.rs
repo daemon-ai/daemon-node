@@ -145,6 +145,15 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// `nbytes` of OS entropy, hex-encoded (`2 * nbytes` chars). Used by the first-admin bootstrap to
+/// mint a strong auto-generated admin password and a random username suffix; kept here (beside
+/// [`random_hex`]) so all CSPRNG use funnels through this crate's `getrandom` + hex helpers.
+pub fn generate_secret_hex(nbytes: usize) -> Result<String> {
+    let mut buf = vec![0u8; nbytes];
+    getrandom::getrandom(&mut buf).map_err(|e| Error::Entropy(e.to_string()))?;
+    Ok(hex(&buf))
+}
+
 /// 32 bytes of OS entropy, hex-encoded — used for user ids and session tokens.
 fn random_hex() -> Result<String> {
     let mut buf = [0u8; 32];
@@ -289,6 +298,14 @@ impl AuthStore {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
+    }
+
+    /// Number of stored users. Mirrors [`Self::session_count`]; lets the first-admin bootstrap gate
+    /// on an empty users table (`user_count()? == 0`) without materializing every row.
+    pub fn user_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .map_err(Error::from)
     }
 

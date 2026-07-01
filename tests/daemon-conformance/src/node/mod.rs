@@ -13,6 +13,7 @@
 
 mod access_control;
 mod auth_transport;
+mod bootstrap_wiring;
 mod cron;
 mod delivery_memory;
 mod events_transport;

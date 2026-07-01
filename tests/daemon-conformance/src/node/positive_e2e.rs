@@ -18,11 +18,13 @@ use super::harness::*;
 use super::wire_client::MuxConn;
 
 use daemon_api::{ApiError, ApiRequest, ApiResponse, SessionQuery, SessionScope};
-use daemon_auth::{AuthStore, Role};
-use daemon_common::ReqId;
-use daemon_host::{serve_api_unix_authenticated, AuthAudit, Authenticator};
+use daemon_auth::{AdminSeed, AuthStore, Role};
+use daemon_common::{JournalStreamId, ReqId, UnitId};
+use daemon_host::{
+    auth_audit::AUTH_JOURNAL_UNIT, serve_api_unix_authenticated, AuthAudit, Authenticator,
+};
 use daemon_protocol::{AgentCommand, UserMsg};
-use daemon_telemetry::TraceSigner;
+use daemon_telemetry::{decode_entry, JournalPayload, TraceSigner};
 use tokio::net::UnixStream;
 
 /// Open + `Hello`-handshake a fresh mux connection to the authenticated socket.
@@ -263,6 +265,111 @@ async fn full_auth_lifecycle_over_the_wire() {
         resumed_roster.contains(&s_alice) && !resumed_roster.contains(&s_bob),
         "the resumed connection stays owner-scoped, got {resumed_roster:?}"
     );
+
+    server.abort();
+    handle.shutdown().await;
+}
+
+/// Track A (#2 + #3) over the wire: an admin seeded by the first-admin bootstrap (env/explicit path)
+/// logs in over SCRAM, holds `access_admin`, and drives user CRUD — and the shared audit sink
+/// records `auth.login_ok` + `auth.user_created` with NO secret material in any payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_seeded_admin_authenticates_and_is_audited_over_the_wire() {
+    let (node, handle) = assemble();
+
+    // Seed the FIRST admin exactly as `run_as_host` does (idempotent, empty-store only) instead of a
+    // hand-rolled `create_user`. A password that must never appear in the audit chain.
+    let admin_pw = "correct horse battery staple";
+    let store = Arc::new(AuthStore::open_in_memory().expect("auth store"));
+    let seeded = store
+        .seed_first_admin_if_empty(AdminSeed::Explicit {
+            username: "root".to_string(),
+            password: admin_pw.to_string(),
+        })
+        .expect("seed")
+        .expect("seeded on empty store");
+    assert_eq!(seeded.username, "root");
+    // Idempotent: a second boot does not re-seed.
+    assert!(store
+        .seed_first_admin_if_empty(AdminSeed::Generate)
+        .expect("second seed")
+        .is_none());
+
+    let audit_store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+    let signer = Arc::new(TraceSigner::generate());
+    let audit = AuthAudit::shared(audit_store.clone(), signer);
+    let node = Arc::new(
+        (*node)
+            .clone()
+            .with_auth_store(store.clone())
+            .with_auth_audit(audit.clone()),
+    );
+    let auth = Arc::new(Authenticator::new(store.clone()).with_audit(audit));
+
+    let path = temp_socket();
+    let listener = UnixListener::bind(&path).expect("bind socket");
+    let server = tokio::spawn(serve_api_unix_authenticated(listener, node.clone(), auth));
+
+    // The seeded admin logs in over SCRAM and holds access_admin.
+    let mut admin = connect(&path).await;
+    let (admin_view, _token) = admin
+        .authenticate_scram("root", admin_pw)
+        .await
+        .expect("seeded admin scram");
+    assert_eq!(admin_view.username, "root");
+    assert!(
+        admin_view
+            .capabilities
+            .contains(&"access_admin".to_string()),
+        "seeded admin advertises access_admin, got {:?}",
+        admin_view.capabilities
+    );
+
+    // The seeded admin drives user CRUD over the wire.
+    match admin
+        .call(ApiRequest::UserCreate {
+            username: "carol".into(),
+            password: "carolpw".into(),
+            roles: vec!["user".into()],
+        })
+        .await
+        .expect("user create")
+    {
+        ApiResponse::AccessUser(u) => assert_eq!(u.username, "carol"),
+        other => panic!("expected AccessUser, got {other:?}"),
+    }
+    match admin.call(ApiRequest::UserList).await.expect("user list") {
+        ApiResponse::AccessUsers(users) => {
+            assert!(users.iter().any(|u| u.username == "root"));
+            assert!(users.iter().any(|u| u.username == "carol"));
+        }
+        other => panic!("expected AccessUsers, got {other:?}"),
+    }
+
+    // The audit chain recorded login + the admin mutation, and NO payload leaks the password.
+    let stream = JournalStreamId::unit(&UnitId::new(AUTH_JOURNAL_UNIT));
+    let page = audit_store.load_journal(&stream, 0, 100).await;
+    let mut saw_login = false;
+    let mut saw_created = false;
+    for je in &page.entries {
+        let view = decode_entry(&je.entry.bytes).expect("decode audit entry");
+        match view.kind.as_str() {
+            "auth.login_ok" => saw_login = true,
+            "auth.user_created" => saw_created = true,
+            _ => {}
+        }
+        if let JournalPayload::Management { detail } = view.payload {
+            assert!(
+                !detail.contains(admin_pw) && !detail.contains("carolpw"),
+                "audit payload must NOT contain any password: {detail}"
+            );
+        }
+    }
+    assert!(
+        saw_login,
+        "an auth.login_ok record was written for the seeded admin"
+    );
+    assert!(saw_created, "an auth.user_created record was written");
 
     server.abort();
     handle.shutdown().await;

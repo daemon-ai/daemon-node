@@ -1322,6 +1322,106 @@ fn build_store(backend: &StoreBackend) -> anyhow::Result<Arc<dyn SessionStore>> 
     }
 }
 
+/// Environment keys for the first-admin bootstrap (#2). Read directly here (one-shot startup reads)
+/// rather than threaded through [`NodeConfig`], keeping this concern out of `config.rs`.
+const ADMIN_USERNAME_ENV: &str = "DAEMON_ADMIN_USERNAME";
+const ADMIN_PASSWORD_ENV: &str = "DAEMON_ADMIN_PASSWORD";
+const ADMIN_PASSWORD_FILE_ENV: &str = "DAEMON_ADMIN_PASSWORD_FILE";
+
+/// Resolve the first-admin seeding policy from the environment: **env-first** — if
+/// `DAEMON_ADMIN_USERNAME` is set, require a password from `DAEMON_ADMIN_PASSWORD` or
+/// `DAEMON_ADMIN_PASSWORD_FILE` and refuse an empty/whitespace one (never seed `admin`/`<blank>`);
+/// otherwise auto-generate. Factored out so it is unit-testable without touching the store.
+fn resolve_admin_seed() -> anyhow::Result<daemon_auth::AdminSeed> {
+    let username = std::env::var(ADMIN_USERNAME_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(username) = username else {
+        return Ok(daemon_auth::AdminSeed::Generate);
+    };
+    let password = match std::env::var(ADMIN_PASSWORD_ENV).ok().filter(|s| !s.is_empty()) {
+        Some(p) => p,
+        None => match std::env::var(ADMIN_PASSWORD_FILE_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(path) => std::fs::read_to_string(&path).map_err(|e| {
+                anyhow::anyhow!("reading {ADMIN_PASSWORD_FILE_ENV} ({path}): {e}")
+            })?,
+            None => anyhow::bail!(
+                "{ADMIN_USERNAME_ENV} is set without a password; set {ADMIN_PASSWORD_ENV} or {ADMIN_PASSWORD_FILE_ENV}"
+            ),
+        },
+    };
+    let password = password.trim().to_string();
+    if password.is_empty() {
+        anyhow::bail!("first-admin password is empty/whitespace; refusing to seed an admin");
+    }
+    Ok(daemon_auth::AdminSeed::Explicit { username, password })
+}
+
+/// Idempotently seed the first admin (delegates the empty-table guard + create to
+/// [`daemon_auth::AuthStore::seed_first_admin_if_empty`]). For the auto-generated path, emit the
+/// password EXACTLY ONCE — to stderr and to a `0600` file under the data dir. This one-time
+/// emission is the sole deliberate secret-print exception; it is never routed through `tracing`
+/// (so it stays out of structured logs/journald) and never enters the audit journal.
+fn seed_first_admin_if_empty(
+    auth_store: &daemon_auth::AuthStore,
+    cfg: &NodeConfig,
+) -> anyhow::Result<()> {
+    let seed = resolve_admin_seed()?;
+    let Some(created) = auth_store.seed_first_admin_if_empty(seed)? else {
+        return Ok(()); // users already exist — idempotent no-op
+    };
+    match created.generated_password {
+        // Operator-supplied identity: they already know the password; log the id only (no secret).
+        None => tracing::info!(username = %created.username, "seeded first admin from environment"),
+        // Auto-generated: emit once to a 0600 file + stderr.
+        Some(password) => emit_generated_admin(cfg, &created.username, &password),
+    }
+    Ok(())
+}
+
+/// Write the auto-generated first-admin credentials to a `0600` file under the data dir and print
+/// them once to stderr. Best-effort on the file (a write failure warns but never blocks startup —
+/// stderr still carries the secret). Called only on a fresh node with no configured admin.
+fn emit_generated_admin(cfg: &NodeConfig, username: &str, password: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = cfg.data_dir.join("first-admin-credentials.txt");
+    let contents = format!(
+        "daemon first-admin bootstrap (delete this file once you have saved the password)\n\
+         username: {username}\npassword: {password}\n"
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(contents.as_bytes()) {
+                tracing::warn!(error = %e, path = %path.display(), "writing first-admin credentials file");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "creating first-admin credentials file");
+        }
+    }
+    // The one deliberate secret print: stderr, once, on first boot only.
+    eprintln!(
+        "\n==== daemon first-admin bootstrap (generated) ====\n  \
+         username: {username}\n  password: {password}\n  \
+         (also written 0600 to {})\n  \
+         Save it now and log in over TLS/SCRAM — it will not be shown again.\n\
+         ==================================================\n",
+        path.display()
+    );
+}
+
 /// Assemble and run the default host node, serving the unified surface over a Unix socket until
 /// `ctrl_c` trips a graceful shutdown. The wiring itself lives in [`daemon_node::assemble`]; this
 /// role only builds the policy inputs (store, credentials, provider registry, engine tunables).
@@ -1633,7 +1733,27 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         Arc::new(daemon_auth::AuthStore::open(&cfg.api.auth_db).map_err(|e| {
             anyhow::anyhow!("opening auth store {}: {e}", cfg.api.auth_db.display())
         })?);
-    let authenticator = Arc::new(daemon_host::Authenticator::new(auth_store));
+
+    // #2 first-admin bootstrap: seed exactly one admin when the users table is empty (idempotent).
+    // The default `local_trust=system` operator is already admin without SASL; this human seed is
+    // for TLS/networked SCRAM login and to make the admin `AccessControl` API usable.
+    seed_first_admin_if_empty(&auth_store, &cfg)?;
+
+    // #3 bind the identity store + a shared auth-audit sink onto BOTH the node and the transport
+    // authenticator (the SAME `Arc`s), so admin `AccessControl` ops resolve (instead of
+    // `Unsupported`) and login/denial/admin events chain together on the verifiable `node-auth`
+    // journal stream. `NodeApiImpl` is `Clone`; deref-clone-rewrap (see conformance positive_e2e),
+    // reassigning `node` before any listener spawn. The audit shares the node's durable `store` +
+    // journal `signer` so its records land on — and verify against — the node's own journal.
+    let auth_audit = daemon_host::AuthAudit::shared(store.clone(), signer.clone());
+    let node = Arc::new(
+        (*node)
+            .clone()
+            .with_auth_store(auth_store.clone())
+            .with_auth_audit(auth_audit.clone()),
+    );
+    let authenticator =
+        Arc::new(daemon_host::Authenticator::new(auth_store).with_audit(auth_audit));
     // B5: `[api].local_trust` defaults to `system` — the Unix socket / FFI / in-process HTTP run as
     // the deliberate full-trust principal. Disable it to require SCRAM on the Unix socket and fully
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
@@ -1996,5 +2116,91 @@ async fn run_as_placed_child() {
             run_placed_child_journaled(channel, factory, cfg.partition, signer, cred_profile).await;
         }
         None => run_placed_child(channel, factory, cfg.partition, cred_profile).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_auth::AdminSeed;
+    use std::sync::Mutex;
+
+    /// Serializes the env-mutating bootstrap tests (they share the process environment).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Clear all three bootstrap env keys so each case starts from a known state.
+    fn clear_admin_env() {
+        std::env::remove_var(ADMIN_USERNAME_ENV);
+        std::env::remove_var(ADMIN_PASSWORD_ENV);
+        std::env::remove_var(ADMIN_PASSWORD_FILE_ENV);
+    }
+
+    #[test]
+    fn no_env_selects_auto_generate() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_admin_env();
+        assert!(matches!(resolve_admin_seed().unwrap(), AdminSeed::Generate));
+    }
+
+    #[test]
+    fn username_plus_password_is_explicit() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_admin_env();
+        std::env::set_var(ADMIN_USERNAME_ENV, "root");
+        std::env::set_var(ADMIN_PASSWORD_ENV, "s3cret-pw");
+        match resolve_admin_seed().unwrap() {
+            AdminSeed::Explicit { username, password } => {
+                assert_eq!(username, "root");
+                assert_eq!(password, "s3cret-pw");
+            }
+            AdminSeed::Generate => panic!("expected explicit seed from env"),
+        }
+        clear_admin_env();
+    }
+
+    #[test]
+    fn username_without_password_is_refused() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_admin_env();
+        std::env::set_var(ADMIN_USERNAME_ENV, "root");
+        assert!(
+            resolve_admin_seed().is_err(),
+            "username without any password source must be refused"
+        );
+        clear_admin_env();
+    }
+
+    #[test]
+    fn empty_or_whitespace_password_is_refused() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_admin_env();
+        std::env::set_var(ADMIN_USERNAME_ENV, "root");
+        std::env::set_var(ADMIN_PASSWORD_ENV, "   ");
+        assert!(
+            resolve_admin_seed().is_err(),
+            "whitespace-only password must be refused (never seed admin/<blank>)"
+        );
+        clear_admin_env();
+    }
+
+    #[test]
+    fn password_file_is_read_and_trimmed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_admin_env();
+        let dir = std::env::temp_dir().join(format!("daemon-admin-pw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pw.txt");
+        std::fs::write(&path, "  file-pw\n").unwrap();
+        std::env::set_var(ADMIN_USERNAME_ENV, "root");
+        std::env::set_var(ADMIN_PASSWORD_FILE_ENV, &path);
+        match resolve_admin_seed().unwrap() {
+            AdminSeed::Explicit { username, password } => {
+                assert_eq!(username, "root");
+                assert_eq!(password, "file-pw", "file contents are trimmed");
+            }
+            AdminSeed::Generate => panic!("expected explicit seed from password file"),
+        }
+        clear_admin_env();
+        let _ = std::fs::remove_file(&path);
     }
 }
