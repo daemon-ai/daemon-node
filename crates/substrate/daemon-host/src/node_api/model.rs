@@ -238,7 +238,9 @@ impl NodeApiImpl {
                 display_name: "Daemon Cloud".into(),
                 kind: ProviderKindWire::DaemonCloud,
                 wire_selector: ProviderSelector::DaemonApi,
-                requires_key: false,
+                // Needs a key to RUN TURNS (bearer-authed inference); model LISTING stays keyless
+                // (the public gateway `/models` is unauth; `provider_models` never gates on this).
+                requires_key: true,
                 supports_model_discovery: true,
                 default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
             },

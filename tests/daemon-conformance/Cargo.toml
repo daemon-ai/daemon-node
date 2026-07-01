@@ -53,6 +53,9 @@ tempfile = "3"
 # Track D live-agent e2e: an in-process mock upstream standing in for the daemon-api gateway, so a
 # real session turn drives the OpenAI adapter over HTTP without a network. Test-only.
 wiremock = { workspace = true }
+# Track 5 discovery e2e: the keyless `GET /models` listing the Daemon Cloud discovery hook performs
+# against the mock gateway (mirrors the binary's `daemon_cloud_gateway_models`). Test-only.
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

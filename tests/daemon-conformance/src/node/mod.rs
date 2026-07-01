@@ -15,6 +15,7 @@ mod access_control;
 mod auth_transport;
 mod bootstrap_wiring;
 mod cron;
+mod daemon_cloud_e2e;
 mod delivery_memory;
 mod events_transport;
 mod fs_content;

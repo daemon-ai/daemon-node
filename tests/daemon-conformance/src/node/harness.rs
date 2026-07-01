@@ -176,6 +176,32 @@ pub fn assemble_daemon_api_gateway(
     Arc<dyn daemon_host::CredentialStore>,
     daemon_host::SupervisorHandle,
 ) {
+    assemble_daemon_api_gateway_inner(base_url, None)
+}
+
+/// As [`assemble_daemon_api_gateway`], but also wires a `CloudCatalog` discovery hook so the same
+/// node serves the setup-picker ops (`ProviderCatalog` / `ProviderModels`) alongside the live turn
+/// path. Used by the Track 5 discovery→configure→chat e2e, where the mock upstream doubles as the
+/// Daemon Cloud gateway (serving both `GET /models` and `POST /chat/completions`).
+pub fn assemble_daemon_api_gateway_with_catalog(
+    base_url: String,
+    catalog: Arc<dyn daemon_host::CloudCatalog>,
+) -> (
+    Arc<NodeApiImpl>,
+    Arc<dyn daemon_host::CredentialStore>,
+    daemon_host::SupervisorHandle,
+) {
+    assemble_daemon_api_gateway_inner(base_url, Some(catalog))
+}
+
+fn assemble_daemon_api_gateway_inner(
+    base_url: String,
+    cloud_catalog: Option<Arc<dyn daemon_host::CloudCatalog>>,
+) -> (
+    Arc<NodeApiImpl>,
+    Arc<dyn daemon_host::CredentialStore>,
+    daemon_host::SupervisorHandle,
+) {
     use daemon_api::{ProfileSpec, ProviderSelector};
     use daemon_common::CredMode;
     use daemon_core::{CredentialBuilder, CredentialProvider, ProviderBuilder};
@@ -204,8 +230,10 @@ pub fn assemble_daemon_api_gateway(
             as Arc<dyn CredentialProvider>
     });
 
-    // The per-session resolver: a `DaemonApi` profile builds the real OpenAI adapter pinned at the
-    // profile's base URL (falling back to the mock upstream); every other selector stays a mock.
+    // The per-session resolver: a `DaemonApi` profile builds the Daemon Cloud provider (genai's
+    // OpenAI-compatible adapter pinned at the profile's base URL, falling back to the mock upstream);
+    // every other selector stays a mock. `GenAiProvider::daemon_cloud` is the named Daemon Cloud
+    // constructor — an OpenAI adapter + endpoint override, byte-identical on the wire.
     let resolver: daemon_node::ProviderResolver = {
         let default_base = base_url;
         Arc::new(move |spec: &ProfileSpec| match spec.provider {
@@ -216,7 +244,7 @@ pub fn assemble_daemon_api_gateway(
                     .unwrap_or_else(|| default_base.clone());
                 let model = spec.model.clone();
                 let builder: ProviderBuilder = Arc::new(move || {
-                    Arc::new(GenAiProvider::openai(model.clone()).with_endpoint(base.clone()))
+                    Arc::new(GenAiProvider::daemon_cloud(model.clone()).with_endpoint(base.clone()))
                         as Arc<dyn Provider>
                 });
                 builder
@@ -250,7 +278,7 @@ pub fn assemble_daemon_api_gateway(
         profiles: Some(Arc::new(MemProfileStore::new())),
         provider_resolver: Some(resolver),
         credential_store: Some(cred_store.clone()),
-        cloud_catalog: None,
+        cloud_catalog,
         prompt_sources: vec![],
         revisions: None,
         skills: None,

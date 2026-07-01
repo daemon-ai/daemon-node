@@ -48,7 +48,8 @@ impl CloudCatalog for RecordingCatalog {
                 display_name: "Daemon Cloud".into(),
                 kind: ProviderKindWire::DaemonCloud,
                 wire_selector: ProviderSelector::DaemonApi,
-                requires_key: false,
+                // Needs a key to run turns; LISTING stays keyless (asserted below).
+                requires_key: true,
                 supports_model_discovery: true,
                 default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
             },

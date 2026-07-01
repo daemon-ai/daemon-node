@@ -388,14 +388,16 @@ impl CloudCatalog for GenAiCloudCatalog {
                 default_base_url: None,
             });
         }
-        // Daemon Cloud (OpenRouter clone). Lists keyless; carries the gateway base so the app never
-        // hardcodes it.
+        // Daemon Cloud (OpenRouter clone). Needs a key to RUN TURNS (its
+        // `/api/v1/chat/completions` is bearer-authed), so `requires_key` is true — but model
+        // LISTING stays keyless (the public gateway `/models` is unauth; `provider_models` never
+        // gates on this flag). Carries the gateway base so the app never hardcodes it.
         out.push(ProviderDescriptor {
             id: "daemon_cloud".into(),
             display_name: "Daemon Cloud".into(),
             kind: ProviderKindWire::DaemonCloud,
             wire_selector: ProviderSelector::DaemonApi,
-            requires_key: false,
+            requires_key: true,
             supports_model_discovery: true,
             default_base_url: Some(DAEMON_CLOUD_BASE.to_string()),
         });
@@ -2536,23 +2538,27 @@ mod tests {
                 "missing genai vendor {vendor_id}: {ids:?}"
             );
         }
-        // Daemon Cloud carries the gateway base so the app never hardcodes it, lists keyless, and
-        // binds the DaemonApi selector.
+        // Daemon Cloud carries the gateway base so the app never hardcodes it, needs a key to RUN
+        // TURNS (requires_key = true; model LISTING stays keyless — see the keyless-gateway test),
+        // and binds the DaemonApi selector.
         let daemon_cloud = providers
             .iter()
             .find(|p| p.id == "daemon_cloud")
             .expect("daemon_cloud present");
         assert_eq!(daemon_cloud.kind, ProviderKindWire::DaemonCloud);
         assert_eq!(daemon_cloud.wire_selector, ProviderSelector::DaemonApi);
-        assert!(!daemon_cloud.requires_key, "Daemon Cloud lists keyless");
+        assert!(
+            daemon_cloud.requires_key,
+            "Daemon Cloud needs a key to run turns (lists keyless)"
+        );
         assert_eq!(
             daemon_cloud.default_base_url.as_deref(),
             Some(DAEMON_CLOUD_BASE)
         );
 
-        // Genai vendors require a key to LIST; local engines do not.
+        // Genai vendors require a key to run turns; local engines do not.
         let anthropic = providers.iter().find(|p| p.id == "anthropic").unwrap();
-        assert!(anthropic.requires_key, "genai vendors need a key to list");
+        assert!(anthropic.requires_key, "genai vendors need a key");
         assert_eq!(anthropic.wire_selector, ProviderSelector::GenAi);
     }
 

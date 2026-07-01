@@ -369,20 +369,56 @@ policy; `daemon-host` itself stays free of `daemon-orchestration`.
 > Anthropic-native adapter for `claude-*` ids — the gateway speaks the OpenAI Chat-Completions wire.
 > Adding the selector is additive (a new enum value + serde/CDDL rule), reflected in the wire version
 > bump to **21**.
+>
+> **Daemon Cloud = a clone of genai's OpenRouter adapter via the PUBLIC API (no vendoring).** The
+> `daemon_api` selector surfaces to users as **"Daemon Cloud"** and is built by
+> `GenAiProvider::daemon_cloud(model)` — genai's OpenAI-compatible `AdapterKind` pinned at the daemon
+> base via `with_endpoint(...)`. genai's own `OpenRouterAdapter` is just a pass-through delegating to
+> `OpenAIAdapter` with a fixed endpoint + its own `key_env`, so this "clone" is achieved purely
+> through genai's **public** API (an OpenAI adapter + endpoint override) — byte-identical on the wire
+> — with **no forking, vendoring, or path/build dependency on genai's source**. OpenRouter remains a
+> separate genai vendor for direct use; `research/rust-genai` is study-only.
+>
+> **Provider + model discovery ops (setup picker).** Two additive, `Capability::ModelsRead`-gated
+> ops let the GUI/TUI drive a zero-env "pick provider → pick a model it offers → chat" setup,
+> injected through the same provider-agnostic `CloudCatalog` hook (static fallback = local engines +
+> Daemon Cloud when no hook is wired):
+> - `ProviderCatalog` → `Vec<ProviderDescriptor>`: enumerates local engines (`llama.cpp`,
+>   `mistral.rs`) + every genai cloud vendor + Daemon Cloud. Static metadata (no network),
+>   independent of the launch default, so an **unconfigured node still lists providers**.
+> - `ProviderModels { provider, credential_ref?, transient_key? }` → `Vec<ModelDescriptor>`: one
+>   provider's discoverable models. Credential-aware for genai vendors (a first-run `transient_key`
+>   wins, else the stored `credential_ref` is resolved through the credential store); **Daemon Cloud
+>   lists KEYLESS** via the public gateway `GET /models` (`author/slug` ids); local engines come from
+>   the `ModelManager` catalog.
+>
+> **`requires_key` semantics — a key to RUN TURNS, not to LIST.** Each `ProviderDescriptor` carries
+> `requires_key`, meaning "this provider needs a credential to run turns (inference)", **not**
+> "listing needs a key". So **Daemon Cloud = `true`** (its `/api/v1/chat/completions` is bearer-authed
+> — setup MUST collect+persist a key), all genai vendors = `true`, local engines = `false`. Model
+> LISTING is a separate concern and never gates on the flag: Daemon Cloud's public `/models` is
+> unauth, so a picker can browse its models with **no** key (browse first; the inference key is still
+> mandatory to finish setup and drive a turn), while genai vendors need the key to list. The setup UI
+> (GUI first-run / ProfileEditor / TUI) honors `requires_key` generically — Daemon Cloud included.
 
 ### Host provider configuration (env / TOML)
 
 The host launch reads its provider selection from environment (overriding an optional TOML file);
-`config.rs` holds the authoritative doc comments for each key. There is **no silent default** — a
-host launch that does not configure a provider (or configures a networked provider without a
-model/credential) **fails fast** at `NodeConfig::validate_for_host()` before any store/socket setup:
+`config.rs` holds the authoritative doc comments for each key. There is **no silent default and no
+silent mock** — but the node **boots unconfigured**: if no provider is set it comes up with the
+`UnconfiguredProvider` installed (it serves the control surface + discovery ops, and a turn against
+an unconfigured profile returns a clear `AgentEvent::Error`, never mock text). Provider *validation
+is deferred to turn time*, not a boot abort. The one exception is an **explicitly-set-but-incomplete**
+networked provider (`genai`/`daemon_api` set with no model): that is a deliberate misconfiguration and
+still **fails fast** at `NodeConfig::resolve_for_host()`. A credential is **not** required at boot —
+it arrives per-profile over the API via `CredentialSet`.
 
 | Key | Meaning |
 |---|---|
-| `DAEMON_MODEL_PROVIDER` | `mock \| scripted \| genai \| daemon_api \| llama \| mistralrs`. **Required** — unset fails fast. Legacy per-family names (`openai`/`anthropic`/…) map to `genai`. |
-| `DAEMON_MODEL` | The model id sent to the provider. **Required** for `genai`/`daemon_api` (empty fails fast); for local kinds it is the GGUF path / HF id. |
+| `DAEMON_MODEL_PROVIDER` | `mock \| scripted \| genai \| daemon_api \| llama \| mistralrs`. **Optional** — unset boots unconfigured (pick a provider + model over the API / in Settings). Legacy per-family names (`openai`/`anthropic`/…) map to `genai`. |
+| `DAEMON_MODEL` | The model id sent to the provider. **Required when `genai`/`daemon_api` is explicitly set** (empty then fails fast); for local kinds it is the GGUF path / HF id. |
 | `DAEMON_BASE_URL` | Provider API base-URL override. For `daemon_api` it defaults to `https://api.daemon.ai/api/v1/` (slash-normalized); unset for `genai` uses the adapter's default endpoint. |
-| credential | The provider bearer. Set at launch via `DAEMON_CREDENTIAL_KEY` (seeded onto the launch profile), or provisioned later over the API via `CredentialSet` on the profile. A networked provider with no credential fails fast. |
+| credential | The provider bearer. **Not required at boot.** Set at launch via `DAEMON_CREDENTIAL_KEY` (seeded onto the launch profile), or provisioned later over the API via `CredentialSet` on the profile. A `requires_key` provider (Daemon Cloud + every genai vendor) needs one to run a turn — a turn without it errors clearly, never a silent mock. |
 
 Mock/Scripted are keyless and modelless (reachable only via explicit `DAEMON_MODEL_PROVIDER=mock`/
 `scripted`). Local-inference (`llama`/`mistralrs`) tuning lives under the `[infer]` table
