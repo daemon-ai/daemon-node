@@ -406,3 +406,50 @@ async fn anthropic_cache_breakpoints_serialize_to_wire() {
         "last message should carry a cache_control block: {last}"
     );
 }
+
+/// The `DaemonApi` provider path: genai's **OpenAI** adapter pointed at the daemon-api gateway base
+/// (`.../api/v1/`, trailing slash) must hit exactly `/api/v1/chat/completions` — proving the `v1`
+/// segment is neither dropped (missing-slash `Url::join`) nor doubled (`/v1/v1/...`), and that the
+/// OpenAI Chat-Completions wire is used (never the Anthropic-native `/v1/messages`) even for a
+/// `claude-*`/`author/slug` model id. This mirrors how `bins/daemon` builds the DaemonApi provider:
+/// `GenAiProvider::openai(model).with_endpoint(<daemon base with trailing slash>)`.
+#[tokio::test]
+async fn daemon_api_openai_adapter_hits_api_v1_chat_completions() {
+    use wiremock::matchers::path;
+
+    let server = MockServer::start().await;
+    // Match ONLY the exact OpenAI-compatible chat path under the gateway's `/api/v1` mount.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-daemon",
+            "object": "chat.completion",
+            "model": "anthropic/claude-sonnet-4-5",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "routed through the gateway"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        })))
+        .mount(&server)
+        .await;
+
+    // The daemon-api base carries a trailing slash (as `NodeConfig::daemon_api_base` guarantees), so
+    // genai's relative `Url::join("chat/completions")` resolves under `/api/v1/`.
+    let base = format!("{}/api/v1/", server.uri());
+    let provider = GenAiProvider::openai("anthropic/claude-sonnet-4-5").with_endpoint(base);
+    let out = provider
+        .chat(req())
+        .await
+        .expect("chat succeeds against the gateway path");
+    assert_eq!(out.text, "routed through the gateway");
+
+    // Assert the exact path the adapter posted to (no dropped/doubled `v1`, OpenAI wire not
+    // Anthropic-native). The mock only matches `/api/v1/chat/completions`, so a hit already proves
+    // it; re-assert on the captured request for an explicit, readable guarantee.
+    let received = server.received_requests().await.expect("captured requests");
+    assert_eq!(received.len(), 1, "exactly one upstream call");
+    assert_eq!(
+        received[0].url.path(),
+        "/api/v1/chat/completions",
+        "DaemonApi must post to the OpenAI-compatible /api/v1/chat/completions path"
+    );
+}

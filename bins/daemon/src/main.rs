@@ -152,10 +152,12 @@ async fn run_matrix_login(args: &[String]) -> anyhow::Result<()> {
     .await
 }
 
-/// Build the provider registry the config selected. `Mock` keeps the deterministic fleet wiring
-/// (a completing default plus the delegating-orchestrator / completing-child demo profiles); a real
-/// provider becomes the registry default for every profile (the engine threads the credential lease
-/// secret onto each request as the bearer).
+/// Build the provider registry for the explicitly-selected `provider_kind` (there is no silent
+/// default — a host launch resolves the kind through [`NodeConfig::validate_for_host`] first).
+/// `Mock`/`Scripted` are opt-in only and keep the deterministic fleet wiring (a completing default
+/// plus the delegating-orchestrator / completing-child demo profiles); a real provider becomes the
+/// registry default for every profile (the engine threads the credential lease secret onto each
+/// request as the bearer).
 /// The price sheet for a cloud `model`, looked up in the built-in catalog (the static fallback that
 /// also backs the GUI model picker). `None` for an unknown / local model — cost is then left
 /// uncomputed (`cost_micros == 0`). Cache read/write rates are derived from the base input rate.
@@ -252,11 +254,12 @@ fn scripted_builder(cfg: &NodeConfig) -> daemon_core::ProviderBuilder {
 
 fn build_providers(
     cfg: &NodeConfig,
+    provider_kind: ProviderKind,
     manager: &Arc<ModelManager>,
     active: &ActiveModels,
 ) -> ProviderRegistry {
     let mut providers = ProviderRegistry::new();
-    match cfg.provider_kind {
+    match provider_kind {
         ProviderKind::Scripted => {
             // Hermetic tool-using turn: the default provider replays the configured script, so a
             // side-effecting tool call parks an approval under the node's Ask policy (the HITL e2e).
@@ -297,8 +300,23 @@ fn build_providers(
                 Arc::new(p) as Arc<dyn Provider>
             }));
         }
+        ProviderKind::DaemonApi => {
+            // The daemon-api OpenRouter clone speaks the OpenAI shape: pin genai's OpenAI adapter at
+            // the daemon base (default `https://api.daemon.ai/api/v1/`, override `DAEMON_BASE_URL`).
+            // NEVER `for_model(...)` here — that would infer the Anthropic-native wire for `claude-*`
+            // ids against an OpenAI-compatible gateway. The bearer flows per-call via the broker.
+            let (base, model) = (cfg.daemon_api_base(), cfg.model.clone());
+            let pricing = pricing_for(&model);
+            providers.set_default(Arc::new(move || {
+                let mut p = GenAiProvider::openai(model.clone()).with_endpoint(base.clone());
+                if let Some(pricing) = pricing {
+                    p = p.with_pricing(pricing);
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            }));
+        }
         ProviderKind::LlamaCpp | ProviderKind::MistralRs => {
-            let engine = match cfg.provider_kind {
+            let engine = match provider_kind {
                 ProviderKind::MistralRs => Engine::MistralRs,
                 _ => Engine::Llama,
             };
@@ -331,13 +349,14 @@ fn build_providers(
 fn provider_builder_for(
     spec: &ProfileSpec,
     cfg: &NodeConfig,
+    provider_kind: ProviderKind,
     manager: &Arc<ModelManager>,
     active: &ActiveModels,
 ) -> daemon_core::ProviderBuilder {
     // Scripted launch overrides the per-profile provider: the wire ProviderSelector stays Mock
     // (no contract change), but every interactive session runs the scripted tool-calling provider
     // so the HITL e2e drives real parked approvals/clarify.
-    if cfg.provider_kind == ProviderKind::Scripted {
+    if provider_kind == ProviderKind::Scripted {
         return scripted_builder(cfg);
     }
     match spec.provider {
@@ -353,6 +372,25 @@ fn provider_builder_for(
                 if let Some(base) = &base {
                     p = p.with_endpoint(base.clone());
                 }
+                if let Some(pricing) = pricing {
+                    p = p.with_pricing(pricing);
+                }
+                Arc::new(p) as Arc<dyn Provider>
+            })
+        }
+        // The daemon-api OpenRouter clone: genai's OpenAI adapter pinned at the profile's base URL
+        // (default `https://api.daemon.ai/api/v1/`). NEVER `for_model(...)` — the gateway is
+        // OpenAI-compatible, so an inferred Anthropic-native wire for `claude-*` ids would be wrong.
+        ProviderSelector::DaemonApi => {
+            let base = NodeConfig::ensure_trailing_slash(
+                spec.base_url
+                    .as_deref()
+                    .unwrap_or(NodeConfig::DAEMON_API_DEFAULT_BASE),
+            );
+            let model = spec.model.clone();
+            let pricing = pricing_for(&model);
+            Arc::new(move || {
+                let mut p = GenAiProvider::openai(model.clone()).with_endpoint(base.clone());
                 if let Some(pricing) = pricing {
                     p = p.with_pricing(pricing);
                 }
@@ -378,12 +416,13 @@ fn provider_builder_for(
 /// Seed the launch [`NodeConfig`] as the node's default [`ProfileSpec`] so existing env/TOML
 /// launches keep working: the active profile mirrors the configured provider/model/base-URL/engine
 /// tunables, and a GUI can then clone/edit/select alternatives over the `ProfileApi`.
-fn default_profile_spec(cfg: &NodeConfig) -> ProfileSpec {
-    let provider = match cfg.provider_kind {
+fn default_profile_spec(cfg: &NodeConfig, provider_kind: ProviderKind) -> ProfileSpec {
+    let provider = match provider_kind {
         // Scripted is binary-internal: the durable profile records Mock so the wire stays unchanged
         // (provider_builder_for swaps in the scripted provider for the live session).
         ProviderKind::Mock | ProviderKind::Scripted => ProviderSelector::Mock,
         ProviderKind::GenAi => ProviderSelector::GenAi,
+        ProviderKind::DaemonApi => ProviderSelector::DaemonApi,
         ProviderKind::LlamaCpp => ProviderSelector::LlamaCpp,
         ProviderKind::MistralRs => ProviderSelector::MistralRs,
     };
@@ -1426,6 +1465,10 @@ fn emit_generated_admin(cfg: &NodeConfig, username: &str, password: &str) {
 /// `ctrl_c` trips a graceful shutdown. The wiring itself lives in [`daemon_node::assemble`]; this
 /// role only builds the policy inputs (store, credentials, provider registry, engine tunables).
 async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
+    // Fail fast: a host launch must explicitly configure a provider (no silent mock default). A
+    // networked provider (`genai`/`daemon_api`) additionally requires a model + credential. The
+    // resolved kind is threaded into provider construction below.
+    let provider_kind = cfg.validate_for_host()?;
     let store = build_store(&cfg.store)?;
 
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.
@@ -1438,9 +1481,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         Arc::new(MemCredentialStore::new())
     };
     // Seed the launch-configured key so existing launches keep authenticating until a GUI sets one.
-    credential_store
-        .set(&cfg.profile, &cfg.credential_key)
-        .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+    // Skip when empty (mock/local need no credential): we no longer mint a placeholder secret.
+    if !cfg.credential_key.is_empty() {
+        credential_store
+            .set(&cfg.profile, &cfg.credential_key)
+            .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+    }
 
     // Credentials: a PER-PROFILE owner broker over the credential store, brokered into *every*
     // engine, uniformly across the durable, interactive, and fleet-child construction paths
@@ -1492,10 +1538,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // Seed the configured model as the active selection for a local provider, so resolve-before-load
     // downloads it into the shared cache on first use.
     if matches!(
-        cfg.provider_kind,
+        provider_kind,
         ProviderKind::LlamaCpp | ProviderKind::MistralRs
     ) {
-        if let Some(model_ref) = parse_model_ref(cfg.provider_kind, &cfg.model) {
+        if let Some(model_ref) = parse_model_ref(provider_kind, &cfg.model) {
             active.set(cfg.profile.clone(), model_ref);
         }
     }
@@ -1504,7 +1550,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // via `set_default(...)` without touching the engine or the construction sites. The API key
     // flows per-call through the credential broker (the lease secret -> `Request.auth`), so a real
     // provider builder needs only the base URL + model.
-    let providers = build_providers(&cfg, &manager, &active);
+    let providers = build_providers(&cfg, provider_kind, &manager, &active);
 
     // The default context engine (§10, LCM) and memory providers (§11, Mnemosyne) wired into every
     // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry. Both
@@ -1641,7 +1687,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         Arc::new(MemProfileStore::new())
     };
     profile_store
-        .seed(default_profile_spec(&cfg))
+        .seed(default_profile_spec(&cfg, provider_kind))
         .map_err(|e| anyhow::anyhow!("seeding default profile: {e}"))?;
     // The per-session provider resolution seam: maps the active profile bundle onto a provider
     // client (so a GUI can switch model/provider live).
@@ -1649,7 +1695,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         let cfg = cfg.clone();
         let manager = manager.clone();
         let active = active.clone();
-        Arc::new(move |spec: &ProfileSpec| provider_builder_for(spec, &cfg, &manager, &active))
+        Arc::new(move |spec: &ProfileSpec| {
+            provider_builder_for(spec, &cfg, provider_kind, &manager, &active)
+        })
     };
 
     let routing = build_routing_registry(&cfg.routing);
@@ -1978,14 +2026,19 @@ fn build_multi_profile_broker(
 /// turn under a seed-derived signer, so its construction matches the host path.
 async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
+    // Fail fast on the transport path too: no silent mock default — a launch must configure a
+    // provider (Mock is reachable only via explicit `DAEMON_MODEL_PROVIDER=mock`).
+    let _provider_kind = cfg.validate_for_host()?;
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
 
     // A transport node owns its store, so it mints its own credentials (the host path's owner
     // broker) rather than brokering from a parent — the engine is therefore not credential-less.
     let cred_store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
-    cred_store
-        .set(&cfg.profile, &cfg.credential_key)
-        .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+    if !cfg.credential_key.is_empty() {
+        cred_store
+            .set(&cfg.profile, &cfg.credential_key)
+            .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+    }
     let (owner, _cred_authority) =
         build_owner_broker(&cfg.profile, &cfg.credential_key, cred_store);
     let credentials: CredentialBuilder = {
@@ -1995,8 +2048,11 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
                 as Arc<dyn CredentialProvider>
         })
     };
+    // The configured provider (genai / daemon_api / local / explicit mock), built through the same
+    // seam as the host + placed-child paths — not a hardcoded `MockProvider`.
+    let provider = build_placed_child_provider(&cfg).await;
     let profile = EngineProfile::new(
-        Arc::new(|| Arc::new(MockProvider::completing("transport done")) as Arc<dyn Provider>),
+        provider,
         Arc::new(ToolRegistry::new()),
         SystemPrompt::new("transport-hosted unit"),
     )
@@ -2037,6 +2093,15 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
     let fallback = || -> daemon_core::ProviderBuilder {
         Arc::new(|| Arc::new(MockProvider::completing("placed child done")) as Arc<dyn Provider>)
     };
+    // The placed child inherits the (already-validated) parent env; resolve the configured kind. On
+    // an unset/invalid provider fall back to a completing mock so placement never dies.
+    let provider_kind = match cfg.validate_for_host() {
+        Ok(kind) => kind,
+        Err(e) => {
+            tracing::warn!(error = %e, "placed child: provider not configured; using mock provider");
+            return fallback();
+        }
+    };
     let manager = match ModelManager::new(ManagerConfig {
         cache_dir: cfg.models.cache_dir.clone(),
         registry_path: cfg.models.registry_path.clone(),
@@ -2053,14 +2118,14 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
     };
     let active = manager.active_handle();
     if matches!(
-        cfg.provider_kind,
+        provider_kind,
         ProviderKind::LlamaCpp | ProviderKind::MistralRs
     ) {
-        if let Some(model_ref) = parse_model_ref(cfg.provider_kind, &cfg.model) {
+        if let Some(model_ref) = parse_model_ref(provider_kind, &cfg.model) {
             active.set(cfg.profile.clone(), model_ref);
         }
     }
-    let providers = build_providers(cfg, &manager, &active);
+    let providers = build_providers(cfg, provider_kind, &manager, &active);
     providers
         .builder_for(&ProfileRef::new(cfg.profile.clone()))
         .unwrap_or_else(fallback)

@@ -465,7 +465,14 @@ impl WireVersion {
     /// `ContactProfile`/`Contacts`/`ActionMenu` responses plus the `action-menu` group def, forwarding
     /// to the `SupportsContacts`/`SupportsDirectory` feature traits (Matrix implements get_profile +
     /// directory search). `SupportsRoster` remains defined-but-unplumbed. Additive (new variants).
-    pub const CURRENT: Self = Self(20);
+    ///
+    /// v21 (daemon-api provider): adds the additive `ProviderSelector::DaemonApi` (`"daemon_api"`)
+    /// wire value — a first-class selector for the daemon-api OpenRouter-clone gateway that binds
+    /// genai's OpenAI adapter at `https://api.daemon.ai/api/v1/` (override `DAEMON_BASE_URL`).
+    /// Additive (a new selector value on `provider-selector`), but bumped because `is_compatible` is
+    /// strict-equal, so an older peer cannot decode the new value (mirrors the v3 `ProviderSelector`
+    /// change and the additive v15–v20 bumps).
+    pub const CURRENT: Self = Self(21);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

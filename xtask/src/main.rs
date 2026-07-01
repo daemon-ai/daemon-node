@@ -363,6 +363,22 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-profile.cbor",
         &ApiResponse::Profile(Some(fixture_spec)),
     )?;
+    // The daemon-api gateway selector (wire `"daemon_api"`): a full profile-spec exercising the new
+    // additive `provider-selector` value so `verify-codec` proves the generated zcbor C decoder
+    // accepts it (OpenRouter-style `author/slug` model id + the pinned OpenAI-compatible base URL).
+    let daemon_api_spec = ProfileSpec {
+        base_url: Some("https://api.daemon.ai/api/v1/".into()),
+        ..ProfileSpec::new(
+            "daemon",
+            ProviderSelector::DaemonApi,
+            "anthropic/claude-sonnet-4-5",
+        )
+    };
+    write_cbor(
+        &out,
+        "response-profile-daemon-api.cbor",
+        &ApiResponse::Profile(Some(daemon_api_spec)),
+    )?;
 
     let fixture_descriptor = ModelDescriptor {
         id: "claude-opus-4-8".into(),
