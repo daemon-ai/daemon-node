@@ -34,6 +34,8 @@ pub mod embed;
 pub mod engine;
 pub mod events;
 pub mod exec;
+#[cfg(feature = "otel")]
+pub mod genai_telemetry;
 pub mod memory;
 pub mod profile;
 pub mod provider;
@@ -69,6 +71,8 @@ pub use engine::{
 };
 pub use events::{EventSink, SessionLog};
 pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+#[cfg(feature = "otel")]
+pub use genai_telemetry::set_genai_capture;
 pub use memory::{
     FileMemory, MemoryProvider, PromptBlock, RecallQuery, RecalledBlock, SwitchReason,
 };
@@ -78,7 +82,8 @@ pub use profile::{
 };
 pub use provider::{
     build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
-    Recovery, Request, RequestMsg, ScriptStep, ScriptedProvider, StreamEvent, ToolCallFormat,
+    Recovery, Request, RequestMsg, RequestParams, ResponseMeta, ScriptStep, ScriptedProvider,
+    StreamEvent, ToolCallFormat,
 };
 pub use recovery::{classify_api_error, drive_model_call, ModelCallPolicy, RecoveryStep};
 pub use repair::{

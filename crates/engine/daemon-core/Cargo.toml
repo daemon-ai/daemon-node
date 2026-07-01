@@ -21,5 +21,12 @@ serde_json = { workspace = true }
 # so they are logged rather than propagated). The only logging dep in the otherwise log-free core.
 tracing = { workspace = true }
 
+[features]
+# OFF by default. Gates recording the OpenTelemetry GenAI attributes (incl. full prompt/completion/
+# tool content) onto the engine's turn/model/tool spans. When off, the spans are unchanged and no
+# session content is ever attached — so the default build's logs and behaviour are identical. The
+# daemon binary turns this on transitively via its own `otel` feature (with `daemon-telemetry/otel`).
+otel = []
+
 [lints]
 workspace = true

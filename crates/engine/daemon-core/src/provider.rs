@@ -126,7 +126,48 @@ pub struct RequestMsg {
     pub cache_breakpoint: bool,
 }
 
+/// The effective sampling/request parameters a provider applied for one model call (observability
+/// only). Each field is `None` when the provider does not surface it: cloud providers report their
+/// output cap but not temperature/top_p (genai applies its own defaults), while the local worker
+/// path reports the full sampling set. Consumed by the telemetry layer to emit `gen_ai.request.*`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RequestParams {
+    /// Sampling temperature.
+    pub temperature: Option<f64>,
+    /// Nucleus (top-p) cutoff.
+    pub top_p: Option<f64>,
+    /// Top-k cutoff.
+    pub top_k: Option<u32>,
+    /// The output-token cap applied to the generation.
+    pub max_tokens: Option<u32>,
+    /// The sampling seed, when the provider uses a deterministic one.
+    pub seed: Option<u64>,
+}
+
+/// Observability-only provider response metadata (finish reason, response id/model, provider vendor,
+/// effective sampling params) the networked/local providers decode. Bundled behind
+/// [`ModelOutput::meta`] (boxed, so it does not bloat the hot `StreamEvent` path); `None` for the
+/// deterministic in-tree providers. Never affects turn control flow.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResponseMeta {
+    /// The model's normalized stop reason (`stop`/`length`/`tool_calls`/…), when the provider
+    /// reports one. Distinct from the turn-level `EndReason`.
+    pub finish_reason: Option<String>,
+    /// The provider-reported completion/response id, when available.
+    pub response_id: Option<String>,
+    /// The provider-reported response model id (may differ from the requested model), when available.
+    pub response_model: Option<String>,
+    /// The GenAI provider vendor (`openai`/`anthropic`/`gcp.gemini`/…), when known.
+    pub provider_name: Option<String>,
+    /// The effective sampling/request parameters the provider applied, when surfaced.
+    pub params: Option<RequestParams>,
+}
+
 /// What a model produced for one turn (§4.4).
+///
+/// Alongside the content channels it carries optional provider [`ResponseMeta`] (finish reason,
+/// response id/model, vendor, sampling params) for observability — populated best-effort at the
+/// decode boundary, `None` for the deterministic in-tree providers.
 #[derive(Clone, Debug, Default)]
 pub struct ModelOutput {
     /// The assistant text.
@@ -137,6 +178,8 @@ pub struct ModelOutput {
     pub tool_calls: Vec<ToolCall>,
     /// Usage accrued by this model call.
     pub usage: UsageDelta,
+    /// Provider response metadata (observability only); boxed to keep [`StreamEvent`] compact.
+    pub meta: Option<Box<ResponseMeta>>,
 }
 
 /// One event in a streamed model response (§7). Real providers emit incremental
@@ -468,6 +511,7 @@ impl Provider for MockProvider {
                     args: "{}".into(),
                 }],
                 usage,
+                ..Default::default()
             })
         } else {
             Ok(ModelOutput {
@@ -475,6 +519,7 @@ impl Provider for MockProvider {
                 reasoning: None,
                 tool_calls: Vec::new(),
                 usage,
+                ..Default::default()
             })
         }
     }
@@ -547,6 +592,7 @@ impl ScriptedProvider {
                     args: args.clone(),
                 }],
                 usage,
+                ..Default::default()
             },
             ScriptStep::Calls(list) => ModelOutput {
                 text: String::new(),
@@ -561,12 +607,14 @@ impl ScriptedProvider {
                     })
                     .collect(),
                 usage,
+                ..Default::default()
             },
             ScriptStep::Final(text) => ModelOutput {
                 text: text.clone(),
                 reasoning: None,
                 tool_calls: Vec::new(),
                 usage,
+                ..Default::default()
             },
         }
     }

@@ -1024,6 +1024,7 @@ mod tests {
                     reasoning: None,
                     tool_calls: Vec::new(),
                     usage: UsageDelta::default(),
+                    ..Default::default()
                 })
             }
         }

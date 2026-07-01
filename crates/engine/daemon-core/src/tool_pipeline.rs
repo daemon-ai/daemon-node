@@ -31,9 +31,18 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
         "engine.tool",
         call_id = %call.call_id,
         tool_name = %call.name,
-        session = %cx.session_id
+        session = %cx.session_id,
+        // OpenTelemetry GenAI attributes (recorded only under `--features otel` + capture on).
+        "gen_ai.operation.name" = tracing::field::Empty,
+        "gen_ai.tool.type" = tracing::field::Empty,
+        "gen_ai.tool.name" = tracing::field::Empty,
+        "gen_ai.tool.call.id" = tracing::field::Empty,
+        "gen_ai.tool.call.arguments" = tracing::field::Empty,
+        "gen_ai.tool.call.result" = tracing::field::Empty,
     );
     async {
+        #[cfg(feature = "otel")]
+        crate::genai_telemetry::record_tool_call(&tracing::Span::current(), call);
         match call.name.as_str() {
             TOOL_SEARCH => return tool_search(call, registry),
             TOOL_DESCRIBE => return tool_describe(call, registry),
@@ -103,6 +112,11 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
             result_bytes = outcome.result.content.len(),
             untrusted = outcome.untrusted,
             "engine.tool.finished"
+        );
+        #[cfg(feature = "otel")]
+        crate::genai_telemetry::record_tool_result(
+            &tracing::Span::current(),
+            &outcome.result.content,
         );
         outcome
     }

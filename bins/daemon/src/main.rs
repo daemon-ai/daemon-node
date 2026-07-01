@@ -89,8 +89,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Stderr-only structured logging (stdout is the cut transport in the child role).
-    daemon_telemetry::init_subscriber();
+    // Stderr-only structured logging (stdout is the cut transport in the child role), plus the
+    // OpenTelemetry OTLP export layer when built with `--features otel` and an endpoint is set. The
+    // guard flushes the exporter on process exit, so it is held for the whole of `main`.
+    let _telemetry = daemon_telemetry::init_telemetry();
+    // With a live exporter, switch on GenAI span content capture in the engine (off otherwise, so a
+    // default build attaches no session content to any span).
+    #[cfg(feature = "otel")]
+    if _telemetry.is_exporting() {
+        daemon_core::set_genai_capture(true);
+    }
 
     if std::env::var_os(PLACED_CHILD_ENV).is_some() {
         run_as_placed_child().await;

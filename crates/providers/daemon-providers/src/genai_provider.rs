@@ -8,14 +8,15 @@ use async_trait::async_trait;
 use daemon_common::{Pricing, UsageDelta};
 use daemon_core::{
     Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestMsg,
-    StreamEvent, ToolCallFormat,
+    RequestParams, ResponseMeta, StreamEvent, ToolCallFormat,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamEvent,
-    ContentPart, MessageContent, StreamEnd, Tool, ToolCall as GenToolCall, ToolResponse,
+    ContentPart, MessageContent, StopReason, StreamEnd, Tool, ToolCall as GenToolCall,
+    ToolResponse,
 };
 use genai::embed::{EmbedOptions, EmbedRequest};
 use genai::resolver::{AuthData, Endpoint};
@@ -457,6 +458,35 @@ fn usage_from(usage: &genai::chat::Usage, pricing: Option<&Pricing>) -> UsageDel
     delta
 }
 
+/// Map a genai [`AdapterKind`] onto the OpenTelemetry `gen_ai.provider.name` well-known value where
+/// one exists, else fall back to genai's lowercase adapter name (a valid custom value per the spec).
+fn provider_name_otel(kind: AdapterKind) -> String {
+    match kind {
+        AdapterKind::OpenAI | AdapterKind::OpenAIResp => "openai",
+        AdapterKind::Anthropic => "anthropic",
+        AdapterKind::Gemini => "gcp.gemini",
+        AdapterKind::Groq => "groq",
+        AdapterKind::DeepSeek => "deepseek",
+        AdapterKind::Xai => "x_ai",
+        AdapterKind::Cohere => "cohere",
+        other => return other.as_lower_str().to_string(),
+    }
+    .to_string()
+}
+
+/// Normalize a genai [`StopReason`] onto the OpenTelemetry `gen_ai.response.finish_reasons` values
+/// (`stop`/`length`/`tool_calls`/`content_filter`), passing through anything provider-specific.
+fn finish_reason_otel(reason: &StopReason) -> String {
+    match reason {
+        StopReason::Completed(_) => "stop".to_string(),
+        StopReason::MaxTokens(_) => "length".to_string(),
+        StopReason::ToolCall(_) => "tool_calls".to_string(),
+        StopReason::ContentFilter(_) => "content_filter".to_string(),
+        StopReason::StopSequence(_) => "stop".to_string(),
+        StopReason::Other(raw) => raw.clone(),
+    }
+}
+
 /// Map `genai` tool calls into the pre-repair [`RawToolCall`]s.
 fn raw_calls(calls: Vec<GenToolCall>) -> Vec<RawToolCall> {
     calls
@@ -473,24 +503,46 @@ fn raw_calls(calls: Vec<GenToolCall>) -> Vec<RawToolCall> {
         .collect()
 }
 
-/// Decode a non-streaming [`ChatResponse`] into the canonical [`ModelOutput`] through §9 repair.
+/// Decode a non-streaming [`ChatResponse`] into the canonical [`ModelOutput`] through §9 repair,
+/// carrying the provider response metadata (finish reason, response id/model, vendor) and the
+/// applied `max_tokens` cap onto the output for telemetry.
 fn decode_response(
     resp: ChatResponse,
     valid_tools: &[String],
     pricing: Option<&Pricing>,
+    max_tokens: u32,
 ) -> ModelOutput {
     let usage = usage_from(&resp.usage, pricing);
     let reasoning = resp.reasoning_content.clone();
+    let provider_name = Some(provider_name_otel(resp.model_iden.adapter_kind));
+    let response_model = Some(resp.provider_model_iden.model_name.to_string());
+    let response_id = resp.response_id.clone();
+    let finish_reason = resp.stop_reason.as_ref().map(finish_reason_otel);
     let text = resp.content.joined_texts().unwrap_or_default();
     let calls = raw_calls(resp.content.into_tool_calls());
-    finalize_output(text, reasoning, calls, usage, valid_tools)
+    let mut out = finalize_output(text, reasoning, calls, usage, valid_tools);
+    out.meta = Some(Box::new(ResponseMeta {
+        finish_reason,
+        response_id,
+        response_model,
+        provider_name,
+        params: Some(RequestParams {
+            max_tokens: Some(max_tokens),
+            ..Default::default()
+        }),
+    }));
+    out
 }
 
-/// Assemble a [`ModelOutput`] from a captured [`StreamEnd`] through §9 repair.
+/// Assemble a [`ModelOutput`] from a captured [`StreamEnd`] through §9 repair, carrying the provider
+/// response metadata (finish reason, response id, vendor + resolved model from the stream's
+/// [`ModelIden`]) and the applied `max_tokens` cap onto the output for telemetry.
 fn decode_stream_end(
     end: StreamEnd,
     valid_tools: &[String],
     pricing: Option<&Pricing>,
+    model_iden: &ModelIden,
+    max_tokens: u32,
 ) -> ModelOutput {
     let usage = end
         .captured_usage
@@ -498,12 +550,27 @@ fn decode_stream_end(
         .map(|u| usage_from(u, pricing))
         .unwrap_or_default();
     let reasoning = end.captured_reasoning_content.clone();
+    let response_id = end.captured_response_id.clone();
+    let finish_reason = end.captured_stop_reason.as_ref().map(finish_reason_otel);
+    let provider_name = Some(provider_name_otel(model_iden.adapter_kind));
+    let response_model = Some(model_iden.model_name.to_string());
     let text = end
         .captured_texts()
         .map(|texts| texts.join(""))
         .unwrap_or_default();
     let calls = raw_calls(end.captured_into_tool_calls().unwrap_or_default());
-    finalize_output(text, reasoning, calls, usage, valid_tools)
+    let mut out = finalize_output(text, reasoning, calls, usage, valid_tools);
+    out.meta = Some(Box::new(ResponseMeta {
+        finish_reason,
+        response_id,
+        response_model,
+        provider_name,
+        params: Some(RequestParams {
+            max_tokens: Some(max_tokens),
+            ..Default::default()
+        }),
+    }));
+    out
 }
 
 #[async_trait]
@@ -536,7 +603,12 @@ impl Provider for GenAiProvider {
             .exec_chat(target, chat, Some(&opts))
             .await
             .map_err(classify_genai_error)?;
-        Ok(decode_response(resp, &valid, self.pricing.as_ref()))
+        Ok(decode_response(
+            resp,
+            &valid,
+            self.pricing.as_ref(),
+            self.max_tokens,
+        ))
     }
 
     fn stream(&self, req: Request) -> BoxStream<'_, Result<StreamEvent, Failure>> {
@@ -549,6 +621,7 @@ impl Provider for GenAiProvider {
         let opts = self.options(&req);
         let valid = req.tool_names();
         let pricing = self.pricing;
+        let max_tokens = self.max_tokens;
         let (tx, rx) = futures::channel::mpsc::unbounded();
 
         tokio::spawn(async move {
@@ -574,6 +647,7 @@ impl Provider for GenAiProvider {
                     return;
                 }
             };
+            let model_iden = resp.model_iden.clone();
             let mut stream = resp.stream;
             while let Some(event) = stream.next().await {
                 match event {
@@ -594,7 +668,13 @@ impl Provider for GenAiProvider {
                         }
                     }
                     Ok(ChatStreamEvent::End(end)) => {
-                        let out = decode_stream_end(end, &valid, pricing.as_ref());
+                        let out = decode_stream_end(
+                            end,
+                            &valid,
+                            pricing.as_ref(),
+                            &model_iden,
+                            max_tokens,
+                        );
                         let _ = tx.unbounded_send(Ok(StreamEvent::Done(out)));
                         return;
                     }

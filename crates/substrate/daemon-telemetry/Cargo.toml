@@ -17,6 +17,23 @@ tracing-subscriber = { workspace = true }
 dcbor = { workspace = true }
 bc-envelope = { workspace = true }
 bc-components = { workspace = true }
+# OpenTelemetry OTLP export — optional, gated behind the `otel` feature (default OFF). None of these
+# are compiled or resolved in the default workspace gate; enabling `otel` layers an OTLP/HTTP span
+# exporter onto the existing fmt subscriber (see `otel.rs`).
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+# OFF by default: pull the OpenTelemetry stack and install the OTLP trace-export layer. The layer is
+# additionally gated at runtime on `OTEL_EXPORTER_OTLP_ENDPOINT` being set (see `init_telemetry`).
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dev-dependencies]
 bc-rand = { workspace = true }

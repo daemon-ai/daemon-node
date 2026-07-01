@@ -226,9 +226,40 @@ pub async fn drive_model_call(
 ) -> Result<ModelOutput, Failure> {
     let span = tracing::debug_span!(
         "engine.model_stream",
-        watchdog_ms = watchdog.as_millis() as u64
+        watchdog_ms = watchdog.as_millis() as u64,
+        // OpenTelemetry GenAI attributes (recorded only under `--features otel` + capture on).
+        "gen_ai.operation.name" = tracing::field::Empty,
+        "gen_ai.request.stream" = tracing::field::Empty,
+        "gen_ai.request.model" = tracing::field::Empty,
+        "gen_ai.request.temperature" = tracing::field::Empty,
+        "gen_ai.request.top_p" = tracing::field::Empty,
+        "gen_ai.request.top_k" = tracing::field::Empty,
+        "gen_ai.request.max_tokens" = tracing::field::Empty,
+        "gen_ai.request.seed" = tracing::field::Empty,
+        "gen_ai.system_instructions" = tracing::field::Empty,
+        "gen_ai.input.messages" = tracing::field::Empty,
+        "gen_ai.output.messages" = tracing::field::Empty,
+        "gen_ai.tool.definitions" = tracing::field::Empty,
+        "gen_ai.provider.name" = tracing::field::Empty,
+        "gen_ai.response.id" = tracing::field::Empty,
+        "gen_ai.response.model" = tracing::field::Empty,
+        "gen_ai.response.finish_reasons" = tracing::field::Empty,
+        "gen_ai.response.time_to_first_chunk" = tracing::field::Empty,
+        "gen_ai.usage.input_tokens" = tracing::field::Empty,
+        "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        "gen_ai.usage.cache_read.input_tokens" = tracing::field::Empty,
+        "gen_ai.usage.cache_creation.input_tokens" = tracing::field::Empty,
+        "gen_ai.usage.reasoning.output_tokens" = tracing::field::Empty,
+        "daemon.usage.cost_micros" = tracing::field::Empty,
+        "daemon.usage.api_calls" = tracing::field::Empty,
     );
     async {
+        #[cfg(feature = "otel")]
+        crate::genai_telemetry::record_model_request(&tracing::Span::current(), &req);
+        #[cfg(feature = "otel")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "otel")]
+        let mut first_chunk_recorded = false;
         let mut stream = provider.stream(req);
         let mut streamed_text = false;
         let mut streamed_reasoning = false;
@@ -272,12 +303,28 @@ pub async fn drive_model_call(
             match event {
                 StreamEvent::TextDelta(text) => {
                     if !text.is_empty() {
+                        #[cfg(feature = "otel")]
+                        if !first_chunk_recorded {
+                            first_chunk_recorded = true;
+                            crate::genai_telemetry::record_time_to_first_chunk(
+                                &tracing::Span::current(),
+                                started.elapsed().as_secs_f64(),
+                            );
+                        }
                         streamed_text = true;
                         events.emit(|seq| AgentEvent::TextDelta { seq, text });
                     }
                 }
                 StreamEvent::ReasoningDelta(text) => {
                     if !text.is_empty() {
+                        #[cfg(feature = "otel")]
+                        if !first_chunk_recorded {
+                            first_chunk_recorded = true;
+                            crate::genai_telemetry::record_time_to_first_chunk(
+                                &tracing::Span::current(),
+                                started.elapsed().as_secs_f64(),
+                            );
+                        }
                         streamed_reasoning = true;
                         events.emit(|seq| AgentEvent::ReasoningDelta { seq, text });
                     }
@@ -320,6 +367,8 @@ pub async fn drive_model_call(
             tool_call_count = out.tool_calls.len(),
             "engine.model.stream.done"
         );
+        #[cfg(feature = "otel")]
+        crate::genai_telemetry::record_model_response(&tracing::Span::current(), &out);
         Ok(out)
     }
     .instrument(span)
@@ -388,6 +437,7 @@ mod tests {
                     api_calls: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             };
             Box::pin(stream::iter(vec![
                 Ok(StreamEvent::TextDelta("Hel".into())),

@@ -213,6 +213,7 @@ impl Provider for PolicyGatedProvider {
                 reasoning: None,
                 tool_calls: Vec::new(),
                 usage: UsageDelta::default(),
+                ..Default::default()
             })
         } else {
             Err(Failure::ContentPolicy("blocked on primary".into()))

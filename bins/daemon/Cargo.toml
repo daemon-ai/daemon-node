@@ -13,6 +13,9 @@ path = "src/main.rs"
 default = []
 # Compile + register the CDP `browser` tool (pulls chromiumoxide via `daemon-tool-browser/cdp`).
 browser = ["dep:daemon-tool-browser", "daemon-tool-browser/cdp"]
+# Compile the OpenTelemetry OTLP trace exporter + GenAI span enrichment. OFF by default; when on,
+# the daemon exports session traces to `OTEL_EXPORTER_OTLP_ENDPOINT` (see `daemon-telemetry`).
+otel = ["daemon-telemetry/otel", "daemon-core/otel"]
 
 [dependencies]
 daemon-common = { workspace = true }
