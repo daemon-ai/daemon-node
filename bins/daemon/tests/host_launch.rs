@@ -11,8 +11,42 @@
 //! assertion.
 
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn configure_base_env(cmd: &mut Command) {
+    cmd.env_clear();
+    if let Ok(p) = std::env::var("PATH") {
+        cmd.env("PATH", p);
+    }
+    forward_tls_trust_store(cmd);
+}
+
+/// Forward system TLS roots into the controlled child environment, but never preserve Nix's
+/// sandbox placeholder (`/no-cert-file.crt`) or any other stale path.
+fn forward_tls_trust_store(cmd: &mut Command) {
+    for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE"] {
+        forward_existing_file_env(cmd, var);
+    }
+    forward_existing_dir_env(cmd, "SSL_CERT_DIR");
+}
+
+fn forward_existing_file_env(cmd: &mut Command, var: &str) {
+    if let Ok(value) = std::env::var(var) {
+        if Path::new(&value).is_file() {
+            cmd.env(var, value);
+        }
+    }
+}
+
+fn forward_existing_dir_env(cmd: &mut Command, var: &str) {
+    if let Ok(value) = std::env::var(var) {
+        if Path::new(&value).is_dir() {
+            cmd.env(var, value);
+        }
+    }
+}
 
 /// Spawn the `daemon` binary in its **host** role (no placed-child / transport-server env, no
 /// subcommand) with a clean, controlled environment plus `extra` overrides. Returns
@@ -23,10 +57,7 @@ fn run_host_launch(extra: &[(&str, &str)], timeout: Duration) -> (bool, String) 
     // A minimal, deterministic environment so a stray `DAEMON_*` from the test host cannot mask the
     // fail-fast. Keep `PATH` for any loader lookups; pin an ephemeral store + throwaway data dir so
     // nothing touches a real home even if validation were (wrongly) skipped.
-    cmd.env_clear();
-    if let Ok(p) = std::env::var("PATH") {
-        cmd.env("PATH", p);
-    }
+    configure_base_env(&mut cmd);
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -78,10 +109,7 @@ fn spawn_host_launch(
     timeout: Duration,
 ) -> (bool, String, std::process::Child, std::path::PathBuf) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_daemon"));
-    cmd.env_clear();
-    if let Ok(p) = std::env::var("PATH") {
-        cmd.env("PATH", p);
-    }
+    configure_base_env(&mut cmd);
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

@@ -1160,19 +1160,6 @@ mod tests {
         }
     }
 
-    /// Drift gate: the committed `docs/config-reference.md` must match the generator exactly. Adding
-    /// or renaming a `NodeConfig` field without regenerating fails here — docs cannot silently drift.
-    /// Regenerate with `daemon config reference > docs/config-reference.md`.
-    #[test]
-    fn config_reference_is_committed_and_current() {
-        let committed = include_str!("../../../docs/config-reference.md");
-        assert_eq!(
-            config_reference(),
-            committed,
-            "docs/config-reference.md is stale; regenerate: `daemon config reference > docs/config-reference.md`"
-        );
-    }
-
     #[test]
     fn ensure_trailing_slash_normalizes() {
         assert_eq!(

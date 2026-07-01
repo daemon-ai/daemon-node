@@ -2053,8 +2053,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
     let local_trust = cfg.api.local_trust.is_some();
 
-    // Bind the api socket (fresh) and serve the unified surface over it.
-    let _ = std::fs::remove_file(&cfg.socket_path);
+    // Bind the api socket (fresh) and serve the unified surface over it. A managed/user launch may
+    // target a nested runtime path (e.g. under $XDG_RUNTIME_DIR) whose parent dir does not exist
+    // yet, so ensure the parent exists (and clear any stale socket) before binding.
+    prepare_api_socket(&cfg.socket_path)?;
     let listener = tokio::net::UnixListener::bind(&cfg.socket_path)?;
     let server = if local_trust {
         tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (local trust: system)");
@@ -2432,11 +2434,49 @@ async fn run_as_placed_child() {
     }
 }
 
+/// Prepare the api socket path for a fresh bind: create its parent directory if missing (a
+/// managed/user launch may target a nested runtime path, e.g. under `$XDG_RUNTIME_DIR`) and clear
+/// any stale socket file left by a previous run. Kept separate from [`run_as_host`] so it is
+/// unit-testable without standing up the full host.
+fn prepare_api_socket(path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("creating socket dir {}: {e}", parent.display()))?;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use daemon_auth::AdminSeed;
     use std::sync::Mutex;
+
+    /// The api socket bind path may point at a nested runtime dir that does not exist yet
+    /// (managed/user launch); `prepare_api_socket` must create the parent so `bind` succeeds.
+    #[test]
+    fn prepare_api_socket_creates_missing_parent_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "daemon-sockprep-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let sock = base.join("nested/run/api.sock");
+        assert!(!sock.parent().unwrap().exists());
+        prepare_api_socket(&sock).expect("prepare_api_socket");
+        assert!(sock.parent().unwrap().is_dir());
+        // The prepared path is now bindable (and re-preparing over a stale socket still works).
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind nested socket");
+        drop(listener);
+        prepare_api_socket(&sock).expect("re-prepare clears stale socket");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("rebind after clear");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Serializes the env-mutating bootstrap tests (they share the process environment).
     static ENV_LOCK: Mutex<()> = Mutex::new(());

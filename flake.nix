@@ -34,6 +34,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
+        caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
 
         # Version: the SemVer base lives in `./VERSION` (mirrored by `[workspace.package].version`
         # in Cargo.toml; the `just check-version` gate asserts they agree). The build-metadata
@@ -172,6 +173,8 @@
           pname = "daemon-workspace";
           version = baseVersion;
           strictDeps = true;
+          SSL_CERT_FILE = caBundle;
+          NIX_SSL_CERT_FILE = caBundle;
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -328,6 +331,8 @@
             LLAMA_PREBUILT_DIR = "${llamaCpp}";
             LLAMA_PREBUILT_SHARED = "1";
             LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
+            SSL_CERT_FILE = caBundle;
+            NIX_SSL_CERT_FILE = caBundle;
             packages =
               [
                 rustToolchain
@@ -354,6 +359,8 @@
           # shell so the everyday build never pulls the nightly toolchain onto PATH.
           nightly = pkgs.mkShell {
             LIBCLANG_PATH = libclangPath;
+            SSL_CERT_FILE = caBundle;
+            NIX_SSL_CERT_FILE = caBundle;
             packages = [
               rustNightly
               pkgs.cargo-fuzz
@@ -375,6 +382,8 @@
             LLAMA_PREBUILT_DIR = "${llamaCpp}";
             LLAMA_PREBUILT_SHARED = "1";
             LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
+            SSL_CERT_FILE = caBundle;
+            NIX_SSL_CERT_FILE = caBundle;
             packages =
               [ rustToolchain pkgs.rust-cbindgen ]
               ++ engineNativeInputs
@@ -390,6 +399,8 @@
             craneLib.devShell {
               LIBCLANG_PATH = libclangPath;
               CUDA_PATH = "${cudaPkgs.cudatoolkit}";
+              SSL_CERT_FILE = caBundle;
+              NIX_SSL_CERT_FILE = caBundle;
               packages =
                 [ rustToolchain pkgs.rust-cbindgen ]
                 ++ engineNativeInputs
