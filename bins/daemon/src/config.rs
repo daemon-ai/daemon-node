@@ -55,7 +55,10 @@ const CONTEXT_ENGINE_ENV: &str = "DAEMON_CONTEXT_ENGINE";
 const MEMORY_PROVIDER_ENV: &str = "DAEMON_MEMORY_PROVIDER";
 /// The snapshot file the `file` memory provider serves as its frozen memory (when selected).
 const MEMORY_FILE_ENV: &str = "DAEMON_MEMORY_FILE";
-/// Selects the model provider implementation: `mock` (default), `scripted`, `openai`, or `anthropic`.
+/// Selects the model provider implementation: `mock`, `scripted`, `genai`, `daemon_api`, `llama`,
+/// or `mistralrs`. There is **no default** — a host launch must set this explicitly (or fail fast
+/// via [`NodeConfig::validate_for_host`]); the legacy per-family names (`openai`/`anthropic`/…) all
+/// map to `genai`.
 const MODEL_PROVIDER_ENV: &str = "DAEMON_MODEL_PROVIDER";
 /// The scripted provider's replay script (a JSON array of `{call,args}`/`{final}` steps). Only read
 /// when `DAEMON_MODEL_PROVIDER=scripted`.
@@ -231,6 +234,11 @@ pub enum ProviderKind {
     /// Any networked provider served by `genai`; the adapter is inferred from the (optionally
     /// namespaced) `DAEMON_MODEL` name. Replaces the former per-family launch kinds.
     GenAi,
+    /// The daemon-api OpenRouter-clone gateway (OpenAI-compatible). Binds genai's **OpenAI** adapter
+    /// pinned at `https://api.daemon.ai/api/v1/` (override via `DAEMON_BASE_URL`); model ids are
+    /// OpenRouter-style `author/slug` (e.g. `anthropic/claude-sonnet-4-5`) and the bearer is a
+    /// daemon-api key. NEVER the Anthropic-native adapter — the gateway speaks the OpenAI shape.
+    DaemonApi,
     /// A local llama.cpp model via the supervised `daemon-infer` worker.
     LlamaCpp,
     /// A local mistral.rs model via the supervised `daemon-infer` worker.
@@ -708,8 +716,10 @@ pub struct NodeConfig {
     pub memory_provider: MemoryProviderKind,
     /// The snapshot file the `file` memory provider serves (when `memory_provider = file`).
     pub memory_file: Option<PathBuf>,
-    /// Which model provider implementation to use (mock|scripted|genai|llama|mistralrs).
-    pub provider_kind: ProviderKind,
+    /// Which model provider implementation to use (mock|scripted|genai|daemon_api|llama|mistralrs).
+    /// `None` = unset: there is no silent default, so a host launch fails fast (see
+    /// [`NodeConfig::validate_for_host`]) rather than silently mocking.
+    pub provider_kind: Option<ProviderKind>,
     /// The [`ProviderKind::Scripted`] replay script (raw `DAEMON_MOCK_SCRIPT` JSON); `None` otherwise.
     pub mock_script: Option<String>,
     /// An optional provider API base-URL override. `None` uses the provider's default endpoint (the
@@ -737,7 +747,10 @@ pub struct NodeConfig {
     pub browser: BrowserConfig,
     /// Skills-subsystem tuning (`enable = true` by default — the index + `skill_*` tools).
     pub skills: SkillsConfig,
-    /// The (stub) credential key the owner authority mints for that profile.
+    /// The credential key the owner authority mints for that profile (the daemon-api / provider
+    /// bearer). **No default** — empty means "no launch credential"; a networked provider then fails
+    /// fast in [`NodeConfig::validate_for_host`] unless a key is set via `DAEMON_CREDENTIAL_KEY` /
+    /// `[credential_key]` (or provisioned later over the API via `CredentialSet`).
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine via the `EngineProfile`.
     pub engine: daemon_core::Config,
@@ -1117,6 +1130,80 @@ impl NodeConfig {
         matches!(self.store, StoreBackend::Sqlite { .. })
     }
 
+    /// The daemon-api gateway default base URL. The trailing slash is load-bearing: genai's OpenAI
+    /// adapter resolves the request URL with a *relative* `Url::join("chat/completions")`, so a base
+    /// ending in `/` yields `…/api/v1/chat/completions` while a base without it drops the last
+    /// segment (`…/api/chat/completions`). Model listing uses `{base}models`, which also needs the
+    /// slash. Mirrors the clone's `POST /api/v1/chat/completions` + `GET /api/v1/models`.
+    pub const DAEMON_API_DEFAULT_BASE: &'static str = "https://api.daemon.ai/api/v1/";
+
+    /// Normalize a base URL so it ends with `/` (genai appends a relative adapter suffix to it).
+    pub(crate) fn ensure_trailing_slash(base: &str) -> String {
+        if base.ends_with('/') {
+            base.to_string()
+        } else {
+            format!("{base}/")
+        }
+    }
+
+    /// The resolved daemon-api base: the `DAEMON_BASE_URL` / `[base_url]` override (slash-normalized)
+    /// when set, else [`NodeConfig::DAEMON_API_DEFAULT_BASE`].
+    pub fn daemon_api_base(&self) -> String {
+        Self::ensure_trailing_slash(
+            self.base_url
+                .as_deref()
+                .unwrap_or(Self::DAEMON_API_DEFAULT_BASE),
+        )
+    }
+
+    /// The pure fail-fast core (unit-tested without touching process env): a provider must be
+    /// selected; a networked provider (`genai`/`daemon_api`) needs a non-empty model and a
+    /// credential; mock/scripted/local providers need neither. Returns the resolved kind on success.
+    fn validate_provider(
+        kind: Option<ProviderKind>,
+        model: &str,
+        has_credential: bool,
+    ) -> anyhow::Result<ProviderKind> {
+        let kind = kind.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model provider configured: set DAEMON_MODEL_PROVIDER \
+                 (mock|scripted|genai|daemon_api|llama|mistralrs)"
+            )
+        })?;
+        match kind {
+            ProviderKind::GenAi | ProviderKind::DaemonApi => {
+                anyhow::ensure!(
+                    !model.trim().is_empty(),
+                    "model provider {kind:?} requires a model: set DAEMON_MODEL"
+                );
+                anyhow::ensure!(
+                    has_credential,
+                    "model provider {kind:?} requires a credential: set DAEMON_CREDENTIAL_KEY \
+                     (or provision the profile key over the API via CredentialSet)"
+                );
+            }
+            // Mock/Scripted are deterministic and keyless; local engines resolve a GGUF path/HF id
+            // (an empty model is a non-fatal warning at build time, not a launch failure).
+            ProviderKind::Mock
+            | ProviderKind::Scripted
+            | ProviderKind::LlamaCpp
+            | ProviderKind::MistralRs => {}
+        }
+        Ok(kind)
+    }
+
+    /// Fail-fast validation for the **host** role: rejects a launch with no provider selected, a
+    /// networked provider with an empty model, or a networked provider with no credential. Returns
+    /// the resolved [`ProviderKind`] so callers thread it into provider construction without
+    /// re-unwrapping the `Option`.
+    pub fn validate_for_host(&self) -> anyhow::Result<ProviderKind> {
+        Self::validate_provider(
+            self.provider_kind,
+            &self.model,
+            !self.credential_key.is_empty(),
+        )
+    }
+
     /// Load the layered config: read the optional TOML file at `$DAEMON_CONFIG`, then overlay env.
     pub fn load() -> anyhow::Result<Self> {
         let file = match std::env::var_os(CONFIG_ENV) {
@@ -1201,25 +1288,28 @@ impl NodeConfig {
             .map(PathBuf::from)
             .or(file.memory_file);
 
-        let provider_kind = match env_string(MODEL_PROVIDER_ENV)
-            .or(file.model_provider)
-            .unwrap_or_else(|| "mock".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "mock" => ProviderKind::Mock,
-            // Binary-internal scripted provider for the hermetic HITL e2e (DAEMON_MOCK_SCRIPT).
-            "scripted" | "script" => ProviderKind::Scripted,
-            // All networked providers are genai-backed; the adapter is inferred from DAEMON_MODEL.
-            // The legacy per-family names remain accepted for launch back-compat and all map here.
-            "genai" | "openai" | "anthropic" | "gemini" | "google" | "groq" | "deepseek"
-            | "deep_seek" | "deep-seek" | "xai" | "grok" | "openrouter" | "open_router"
-            | "open-router" | "cohere" => ProviderKind::GenAi,
-            "llama" | "llamacpp" | "llama-cpp" => ProviderKind::LlamaCpp,
-            "mistralrs" | "mistral-rs" | "mistral.rs" => ProviderKind::MistralRs,
-            other => anyhow::bail!(
-                "unknown model provider {other:?} (expected mock|scripted|genai|llama|mistralrs)"
-            ),
+        // No silent default: an unset provider stays `None` so a host launch fails fast in
+        // `validate_for_host` rather than quietly running the deterministic mock.
+        let provider_kind = match env_string(MODEL_PROVIDER_ENV).or(file.model_provider) {
+            None => None,
+            Some(raw) => Some(match raw.to_ascii_lowercase().as_str() {
+                "mock" => ProviderKind::Mock,
+                // Binary-internal scripted provider for the hermetic HITL e2e (DAEMON_MOCK_SCRIPT).
+                "scripted" | "script" => ProviderKind::Scripted,
+                // All networked providers are genai-backed; the adapter is inferred from DAEMON_MODEL.
+                // The legacy per-family names remain accepted for launch back-compat and all map here.
+                "genai" | "openai" | "anthropic" | "gemini" | "google" | "groq" | "deepseek"
+                | "deep_seek" | "deep-seek" | "xai" | "grok" | "openrouter" | "open_router"
+                | "open-router" | "cohere" => ProviderKind::GenAi,
+                // The daemon-api OpenRouter-clone gateway (OpenAI adapter pinned at the daemon base).
+                "daemon_api" | "daemonapi" | "daemon-api" => ProviderKind::DaemonApi,
+                "llama" | "llamacpp" | "llama-cpp" => ProviderKind::LlamaCpp,
+                "mistralrs" | "mistral-rs" | "mistral.rs" => ProviderKind::MistralRs,
+                other => anyhow::bail!(
+                    "unknown model provider {other:?} \
+                     (expected mock|scripted|genai|daemon_api|llama|mistralrs)"
+                ),
+            }),
         };
         // The scripted provider's replay script (env-only; JSON array of {call,args}/{final} steps).
         let mock_script = env_string(MOCK_SCRIPT_ENV);
@@ -1230,9 +1320,11 @@ impl NodeConfig {
         // model: a networked launch must set DAEMON_MODEL (e.g. `claude-opus-4-8`, `groq::…`).
         let model = env_string(MODEL_ENV).or(file.model).unwrap_or_default();
 
+        // No default credential: empty means "no launch credential" and a networked provider then
+        // fails fast in `validate_for_host` (a real key is set via env/file or later `CredentialSet`).
         let credential_key = env_string(CREDENTIAL_KEY_ENV)
             .or(file.credential_key)
-            .unwrap_or_else(|| "sk-configured".to_string());
+            .unwrap_or_default();
 
         let journal_seed = match env_string(JOURNAL_SEED_ENV).or(file.journal_seed) {
             Some(hex) => Some(parse_seed(&hex)?),
@@ -1874,5 +1966,88 @@ impl NodeConfig {
             }
             other => anyhow::bail!("unknown store backend {other:?} (expected memory|sqlite)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_provider_fails_fast() {
+        let err = NodeConfig::validate_provider(None, "any", true)
+            .expect_err("an unset provider must fail fast");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DAEMON_MODEL_PROVIDER"),
+            "error should name the provider env: {msg}"
+        );
+    }
+
+    #[test]
+    fn networked_provider_requires_a_model() {
+        for kind in [ProviderKind::GenAi, ProviderKind::DaemonApi] {
+            let err = NodeConfig::validate_provider(Some(kind), "   ", true)
+                .expect_err("empty model must fail fast for {kind:?}");
+            assert!(
+                err.to_string().contains("DAEMON_MODEL"),
+                "error should name the model env for {kind:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn networked_provider_requires_a_credential() {
+        for kind in [ProviderKind::GenAi, ProviderKind::DaemonApi] {
+            let err =
+                NodeConfig::validate_provider(Some(kind), "anthropic/claude-sonnet-4-5", false)
+                    .expect_err("missing credential must fail fast for {kind:?}");
+            assert!(
+                err.to_string().contains("DAEMON_CREDENTIAL_KEY"),
+                "error should name the credential env for {kind:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn networked_provider_ok_with_model_and_credential() {
+        assert_eq!(
+            NodeConfig::validate_provider(Some(ProviderKind::DaemonApi), "author/slug", true)
+                .expect("valid daemon_api config"),
+            ProviderKind::DaemonApi
+        );
+        assert_eq!(
+            NodeConfig::validate_provider(Some(ProviderKind::GenAi), "claude-opus-4-8", true)
+                .expect("valid genai config"),
+            ProviderKind::GenAi
+        );
+    }
+
+    #[test]
+    fn mock_scripted_and_local_need_neither_model_nor_key() {
+        for kind in [
+            ProviderKind::Mock,
+            ProviderKind::Scripted,
+            ProviderKind::LlamaCpp,
+            ProviderKind::MistralRs,
+        ] {
+            assert_eq!(
+                NodeConfig::validate_provider(Some(kind), "", false)
+                    .unwrap_or_else(|e| panic!("{kind:?} should validate keyless/modelless: {e}")),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_trailing_slash_normalizes() {
+        assert_eq!(
+            NodeConfig::ensure_trailing_slash("https://api.daemon.ai/api/v1"),
+            "https://api.daemon.ai/api/v1/"
+        );
+        assert_eq!(
+            NodeConfig::ensure_trailing_slash("http://127.0.0.1:8787/api/v1/"),
+            "http://127.0.0.1:8787/api/v1/"
+        );
     }
 }

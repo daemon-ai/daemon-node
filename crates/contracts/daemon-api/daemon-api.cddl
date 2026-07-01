@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 20)
+wire_version = uint                 ; daemon-common WireVersion (current = 21)
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id  = tstr
@@ -781,6 +781,7 @@ profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_a
 credential-info = { "profile": tstr, "present": bool, "hint": tstr }
 provider-selector = "mock"
                   / "genai"
+                  / "daemon_api"
                   / "llama_cpp"
                   / "mistral_rs"
 model-descriptor = { "id": tstr, "provider": provider-selector, "context_length": (uint / null), "input_price_micros_per_mtok": (uint64 / null), "output_price_micros_per_mtok": (uint64 / null), "local": bool }

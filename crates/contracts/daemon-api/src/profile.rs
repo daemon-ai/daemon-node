@@ -44,6 +44,12 @@ pub enum ProviderSelector {
         alias = "cohere"
     )]
     GenAi,
+    /// The daemon-api OpenRouter-clone gateway (OpenAI-compatible). The host binds genai's OpenAI
+    /// adapter pinned at `https://api.daemon.ai/api/v1/` (override via the profile `base_url` /
+    /// `DAEMON_BASE_URL`); model ids are OpenRouter-style `author/slug` (e.g.
+    /// `anthropic/claude-sonnet-4-5`) and the bearer is a daemon-api key. It is networked (not
+    /// local), and never resolves the Anthropic-native adapter for `claude-*` ids.
+    DaemonApi,
     /// A local llama.cpp model via the supervised `daemon-infer` worker (on-disk GGUF, listed from
     /// the `ModelManager` catalog).
     LlamaCpp,
@@ -589,11 +595,45 @@ mod tests {
         assert!(ProviderSelector::MistralRs.is_local());
         assert!(!ProviderSelector::GenAi.is_local());
         assert!(!ProviderSelector::Mock.is_local());
+        // The daemon-api gateway is networked, not local.
+        assert!(!ProviderSelector::DaemonApi.is_local());
         // The networked selector serializes to the stable "genai" wire id.
         assert_eq!(
             serde_json::to_string(&ProviderSelector::GenAi).unwrap(),
             "\"genai\""
         );
+    }
+
+    #[test]
+    fn daemon_api_selector_wire_id_round_trips() {
+        // The daemon-api gateway selector serializes to the stable snake_case "daemon_api" wire id
+        // and deserializes back (serde JSON + CBOR/ciborium — the two on-wire encodings).
+        assert_eq!(
+            serde_json::to_string(&ProviderSelector::DaemonApi).unwrap(),
+            "\"daemon_api\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderSelector>("\"daemon_api\"").unwrap(),
+            ProviderSelector::DaemonApi
+        );
+        let mut buf = Vec::new();
+        ciborium::into_writer(&ProviderSelector::DaemonApi, &mut buf).unwrap();
+        let back: ProviderSelector = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back, ProviderSelector::DaemonApi);
+
+        // And it round-trips inside a full ProfileSpec (the shape a GUI creates/edits).
+        let spec = ProfileSpec {
+            base_url: Some("https://api.daemon.ai/api/v1/".to_string()),
+            ..ProfileSpec::new(
+                "daemon",
+                ProviderSelector::DaemonApi,
+                "anthropic/claude-sonnet-4-5",
+            )
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&spec, &mut buf).unwrap();
+        let back: ProfileSpec = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back, spec);
     }
 
     #[test]
