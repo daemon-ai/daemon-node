@@ -110,6 +110,8 @@ use daemon_api::{
     ProfileApi,
     ProfileInfo,
     ProfileSpec,
+    ProviderDescriptor,
+    ProviderKindWire,
     ProviderSelector,
     RecordMetaArgs,
     RoomInfo,
@@ -220,6 +222,17 @@ pub trait CloudCatalog: Send + Sync {
     /// The networked models a GUI can pick right now: the static catalog unioned with any live
     /// `genai` listing for adapters that have a resolvable key. Ids are namespaced (`groq::…`).
     async fn list(&self) -> Vec<ModelDescriptor>;
+
+    /// The discoverable provider catalog for the setup picker: local engines + every genai cloud
+    /// vendor + Daemon Cloud. Static metadata (no network); independent of the launch default, so an
+    /// unconfigured node still lists providers.
+    async fn providers(&self) -> Vec<ProviderDescriptor>;
+
+    /// One provider's discoverable models, keyed by [`ProviderDescriptor::id`]. Credential-aware for
+    /// genai vendors (the resolved `key` authenticates the LIST call); Daemon Cloud lists keyless.
+    /// Local engines are served by the host from the `ModelManager` catalog, not here.
+    async fn provider_models(&self, provider_id: &str, key: Option<String>)
+        -> Vec<ModelDescriptor>;
 }
 
 /// The ACP-discovery hook (I7). `daemon-host` does not link the ACP runtime (`daemon-acp` depends on

@@ -477,7 +477,19 @@ impl WireVersion {
     /// Additive (a new selector value on `provider-selector`), but bumped because `is_compatible` is
     /// strict-equal, so an older peer cannot decode the new value (mirrors the v3 `ProviderSelector`
     /// change and the additive v15–v20 bumps).
-    pub const CURRENT: Self = Self(21);
+    ///
+    /// v22 (provider + model discovery): adds the node-driven setup surface — the additive
+    /// `ProviderCatalog` and `ProviderModels { provider, credential_ref?, transient_key? }` ops
+    /// (gated on `ModelsRead`) returning `ProviderDescriptor`
+    /// (`id`/`display_name`/`kind`/`wire_selector`/`requires_key`/`supports_model_discovery`/
+    /// `default_base_url`) and `[model-descriptor]`, plus the `ProviderKindWire` enum and an optional
+    /// `display_name` on `ModelDescriptor`. The node enumerates local engines + every genai cloud
+    /// vendor + Daemon Cloud, and discovers each provider's models (genai `all_model_names`
+    /// credential-aware; Daemon Cloud gateway `GET /models` keyless; local from the ModelManager
+    /// catalog). Additive (new request/response variants + new/optional fields), but bumped because
+    /// `is_compatible` is strict-equal, so an older peer cannot decode the new ops (mirrors the
+    /// additive v15–v21 bumps).
+    pub const CURRENT: Self = Self(22);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

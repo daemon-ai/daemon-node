@@ -400,10 +400,15 @@ impl SessionOverlay {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDescriptor {
-    /// The model id sent to the provider (or the local catalog id).
+    /// The model id sent to the provider (or the local catalog id). This is directly usable as
+    /// `ProfileSpec.model` with NO client-side rewriting: Daemon Cloud ids stay `author/slug`; genai
+    /// vendor ids stay whatever genai returns, namespaced only when required for adapter inference.
     pub id: String,
     /// The provider this model is served by.
     pub provider: ProviderSelector,
+    /// An optional nicer label for the picker (genai returns bare ids); `None` => render `id`.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// The context window in tokens, when known (the denominator for a context-fill HUD).
     pub context_length: Option<u32>,
     /// Input price in micro-USD per million tokens, when known (e.g. $3.00 => 3_000_000).
@@ -424,6 +429,7 @@ impl ModelDescriptor {
         Self {
             id: id.into(),
             provider,
+            display_name: None,
             context_length,
             input_price_micros_per_mtok: None,
             output_price_micros_per_mtok: None,
@@ -484,6 +490,47 @@ impl ModelDescriptor {
             .find(|m| m.id == id)
             .and_then(|m| m.context_length)
     }
+}
+
+/// The picker "kind" bucket a [`ProviderDescriptor`] groups by. Distinct from [`ProviderSelector`]
+/// (the wire binding a profile persists): `DaemonCloud` is grouped separately in the UI but maps to
+/// `ProviderSelector::DaemonApi`; every genai cloud vendor maps to `ProviderSelector::GenAi`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKindWire {
+    /// A local inference engine (llama.cpp / mistral.rs).
+    Local,
+    /// A third-party cloud vendor served through genai (Anthropic, OpenAI, Gemini, …).
+    Cloud,
+    /// Daemon Cloud — the OpenRouter-clone gateway (`ProviderSelector::DaemonApi`).
+    DaemonCloud,
+}
+
+/// One discoverable provider row for the GUI/TUI picker (returned by `ProviderCatalog`). Carries
+/// everything the client needs to render the provider list and, on selection, drive `ProviderModels`
+/// and persist a working profile — without hardcoding any endpoint or provider list.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDescriptor {
+    /// Stable provider id (e.g. `"anthropic"`, `"openai"`, `"llama_cpp"`, `"daemon_cloud"`).
+    pub id: String,
+    /// Human label for the picker (genai-sourced where possible; not hand-relabeled beyond case).
+    pub display_name: String,
+    /// The picker grouping bucket.
+    pub kind: ProviderKindWire,
+    /// The wire selector a persisted `ProfileSpec` must use for this provider.
+    pub wire_selector: ProviderSelector,
+    /// Whether LISTING this provider's models needs a key: `false` for Daemon Cloud (keyless list)
+    /// and local engines; `true` for genai cloud vendors. (A turn always uses the stored profile
+    /// credential regardless.)
+    pub requires_key: bool,
+    /// Whether `ProviderModels` can enumerate this provider (local providers still support it — they
+    /// return the installed models; the client appends its own "Discover More").
+    pub supports_model_discovery: bool,
+    /// The gateway/base URL the client should persist for this provider, so it never hardcodes one.
+    /// Daemon Cloud carries `https://api.daemon.ai/api/v1/`; `None` for genai vendors + local.
+    pub default_base_url: Option<String>,
 }
 
 /// A redacted view of a stored credential (the shape a GUI's "API keys" list renders). The secret

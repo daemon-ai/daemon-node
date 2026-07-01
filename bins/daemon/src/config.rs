@@ -987,29 +987,26 @@ impl NodeConfig {
         )
     }
 
-    /// The pure fail-fast core (unit-tested without touching process env): a provider must be
-    /// selected; a networked provider (`genai`/`daemon_api`) needs a non-empty model and a credential.
-    fn validate_provider(
+    /// The pure boot-resolution core (unit-tested without touching process env): a host now boots
+    /// with **no** provider configured (`None` => the node installs [`UnconfiguredProvider`] and
+    /// serves; a turn against an unconfigured profile fails clearly, never a silent mock). An
+    /// *explicitly-set-but-incomplete* networked provider (`genai`/`daemon_api` with no model) is a
+    /// deliberate misconfiguration and still fails fast. A credential is **not** required at boot —
+    /// it arrives per-profile over the API via `CredentialSet`.
+    fn resolve_provider(
         kind: Option<ProviderKind>,
         model: &str,
-        has_credential: bool,
-    ) -> anyhow::Result<ProviderKind> {
-        let kind = kind.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model provider configured: set DAEMON_MODEL_PROVIDER \
-                 (mock|scripted|genai|daemon_api|llama|mistralrs)"
-            )
-        })?;
+    ) -> anyhow::Result<Option<ProviderKind>> {
+        let Some(kind) = kind else {
+            // Unset: boot unconfigured (no default provider).
+            return Ok(None);
+        };
         match kind {
             ProviderKind::GenAi | ProviderKind::DaemonApi => {
                 anyhow::ensure!(
                     !model.trim().is_empty(),
-                    "model provider {kind:?} requires a model: set DAEMON_MODEL"
-                );
-                anyhow::ensure!(
-                    has_credential,
-                    "model provider {kind:?} requires a credential: set DAEMON_CREDENTIAL_KEY \
-                     (or provision the profile key over the API via CredentialSet)"
+                    "model provider {kind:?} is set but has no model: set DAEMON_MODEL \
+                     (or unset DAEMON_MODEL_PROVIDER to boot unconfigured)"
                 );
             }
             ProviderKind::Mock
@@ -1017,16 +1014,14 @@ impl NodeConfig {
             | ProviderKind::LlamaCpp
             | ProviderKind::MistralRs => {}
         }
-        Ok(kind)
+        Ok(Some(kind))
     }
 
-    /// Fail-fast validation for the **host** role, returning the resolved [`ProviderKind`].
-    pub fn validate_for_host(&self) -> anyhow::Result<ProviderKind> {
-        Self::validate_provider(
-            self.provider_kind,
-            &self.model,
-            !self.credential_key.is_empty(),
-        )
+    /// Boot-time provider resolution for the **host** role: `None` when no provider is configured
+    /// (boot unconfigured), `Some(kind)` when one is set and complete, `Err` when one is set but
+    /// incomplete (explicit misconfiguration). Never requires a credential.
+    pub fn resolve_for_host(&self) -> anyhow::Result<Option<ProviderKind>> {
+        Self::resolve_provider(self.provider_kind, &self.model)
     }
 }
 
@@ -1117,30 +1112,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_provider_fails_fast() {
-        let err = NodeConfig::validate_provider(None, "any", true)
-            .expect_err("an unset provider must fail fast");
-        assert!(
-            err.to_string().contains("DAEMON_MODEL_PROVIDER"),
-            "error should name the provider env: {err}"
+    fn unset_provider_boots_unconfigured() {
+        // A bare launch (no DAEMON_MODEL_PROVIDER) now BOOTS with no default provider; the node
+        // installs UnconfiguredProvider and a turn fails clearly (never a silent mock).
+        assert_eq!(
+            NodeConfig::resolve_provider(None, "any")
+                .expect("an unset provider must boot unconfigured, not fail"),
+            None,
         );
     }
 
     #[test]
-    fn networked_provider_requires_a_model() {
+    fn explicit_networked_provider_without_a_model_fails_fast() {
+        // Explicitly selecting a networked provider without a model is a deliberate misconfig.
         for kind in [ProviderKind::GenAi, ProviderKind::DaemonApi] {
-            let err = NodeConfig::validate_provider(Some(kind), "   ", true)
-                .expect_err("empty model must fail fast");
+            let err = NodeConfig::resolve_provider(Some(kind), "   ")
+                .expect_err("explicit networked provider without a model must fail fast");
             assert!(err.to_string().contains("DAEMON_MODEL"), "{err}");
         }
     }
 
     #[test]
-    fn networked_provider_requires_a_credential() {
+    fn networked_provider_boots_without_a_credential() {
+        // Credentials are provisioned per-profile over the API (CredentialSet), not at boot.
         for kind in [ProviderKind::GenAi, ProviderKind::DaemonApi] {
-            let err = NodeConfig::validate_provider(Some(kind), "author/slug", false)
-                .expect_err("missing credential must fail fast");
-            assert!(err.to_string().contains("DAEMON_CREDENTIAL_KEY"), "{err}");
+            assert_eq!(
+                NodeConfig::resolve_provider(Some(kind), "author/slug")
+                    .unwrap_or_else(|e| panic!("{kind:?} should boot keyless: {e}")),
+                Some(kind),
+            );
         }
     }
 
@@ -1153,9 +1153,9 @@ mod tests {
             ProviderKind::MistralRs,
         ] {
             assert_eq!(
-                NodeConfig::validate_provider(Some(kind), "", false)
-                    .unwrap_or_else(|e| panic!("{kind:?} should validate keyless/modelless: {e}")),
-                kind
+                NodeConfig::resolve_provider(Some(kind), "")
+                    .unwrap_or_else(|e| panic!("{kind:?} should resolve keyless/modelless: {e}")),
+                Some(kind),
             );
         }
     }

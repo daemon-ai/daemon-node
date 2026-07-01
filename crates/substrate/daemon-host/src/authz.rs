@@ -104,7 +104,9 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ModelQuantizes
         | ModelInspect { .. }
         | Models
-        | ModelCurrent { .. } => C::ModelsRead,
+        | ModelCurrent { .. }
+        | ProviderCatalog
+        | ProviderModels { .. } => C::ModelsRead,
         ModelDownload { .. }
         | ModelCancel { .. }
         | ModelPause { .. }
@@ -280,6 +282,15 @@ mod tests {
             (ApiRequest::Sessions, Capability::SessionRead),
             (ApiRequest::Fleet, Capability::FleetRead),
             (ApiRequest::Models, Capability::ModelsRead),
+            (ApiRequest::ProviderCatalog, Capability::ModelsRead),
+            (
+                ApiRequest::ProviderModels {
+                    provider: "daemon_cloud".into(),
+                    credential_ref: None,
+                    transient_key: None,
+                },
+                Capability::ModelsRead,
+            ),
             (ApiRequest::ProfileList, Capability::ProfileRead),
             (
                 ApiRequest::CuratorList { profile: None },

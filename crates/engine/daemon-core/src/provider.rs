@@ -525,6 +525,58 @@ impl Provider for MockProvider {
     }
 }
 
+/// A provider that never talks to a model: every turn fails immediately with a clear, actionable
+/// [`Failure::Provider`]. It replaces the historical silent-mock fallbacks so an unconfigured
+/// profile surfaces a real error (`AgentEvent::Error` + `TurnFinished{Failed}`) instead of
+/// fabricating text. Installed as the default when no provider is configured at boot and for a
+/// profile whose networked selector carries no model, and as the aux (LCM / mnemosyne) and
+/// placed-child fallback in place of a completing mock.
+pub struct UnconfiguredProvider {
+    message: String,
+}
+
+impl UnconfiguredProvider {
+    /// The standard operator-facing message pointing at the Settings provider/model picker.
+    pub const DEFAULT_MESSAGE: &'static str =
+        "no model provider configured for this profile — choose a provider and model in Settings";
+
+    /// A provider carrying the default "choose a provider and model" message.
+    pub fn new() -> Self {
+        Self {
+            message: Self::DEFAULT_MESSAGE.to_string(),
+        }
+    }
+
+    /// A provider carrying a custom failure message.
+    pub fn with_message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Default for UnconfiguredProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for UnconfiguredProvider {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_native_tools: false,
+            supports_streaming: false,
+            tool_call_format: ToolCallFormat::Native,
+            max_context: None,
+        }
+    }
+
+    async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+        Err(Failure::Provider(self.message.clone()))
+    }
+}
+
 /// One scripted model round for a [`ScriptedProvider`].
 #[derive(Clone, Debug)]
 pub enum ScriptStep {
@@ -690,5 +742,26 @@ mod cache_tests {
         let req = build_context(&conv, &[]);
         assert!(req.cache_system);
         assert!(req.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_provider_errors_clearly_and_never_completes() {
+        let provider = UnconfiguredProvider::new();
+        let req = Request {
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            auth: None,
+            constraint: None,
+            cache_system: false,
+        };
+        let err = provider.chat(req).await.expect_err("must not complete");
+        match err {
+            Failure::Provider(msg) => assert!(
+                msg.contains("no model provider configured"),
+                "message must guide the operator to Settings; got: {msg}"
+            ),
+            other => panic!("expected Failure::Provider, got {other:?}"),
+        }
     }
 }

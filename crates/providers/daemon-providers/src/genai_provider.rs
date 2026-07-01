@@ -96,6 +96,18 @@ impl GenAiProvider {
         Self::new(AdapterKind::OpenAI, model)
     }
 
+    /// The **Daemon Cloud** provider for `model`: a clone of genai's OpenRouter adapter behaviour
+    /// achieved through genai's PUBLIC API only — an OpenAI-compatible [`AdapterKind::OpenAI`] pinned
+    /// at [`DAEMON_CLOUD_BASE`] via [`with_endpoint`](Self::with_endpoint). genai's `OpenRouterAdapter`
+    /// is itself a pass-through delegating to `OpenAIAdapter` with a fixed endpoint + its own
+    /// `key_env`, so this is byte-identical on the wire while avoiding an OpenRouter env-key fallback;
+    /// OpenRouter remains available as its own genai vendor via [`for_model`](Self::for_model). Model
+    /// ids are OpenRouter-style `author/slug`; the bearer flows per-call via the credential broker.
+    /// Override the base (self-hosted gateway) with [`with_endpoint`](Self::with_endpoint).
+    pub fn daemon_cloud(model: impl Into<String>) -> Self {
+        Self::openai(model).with_endpoint(DAEMON_CLOUD_BASE)
+    }
+
     /// The Anthropic Messages provider for `model` (explicit adapter; for wire tests).
     pub fn anthropic(model: impl Into<String>) -> Self {
         Self::new(AdapterKind::Anthropic, model)
@@ -167,10 +179,16 @@ fn prompt_cache_key(req: &Request) -> String {
     format!("daemon-{:016x}", hasher.finish())
 }
 
-/// The genai adapters the node probes for live model discovery. genai 0.6.5 exposes no public
-/// enumeration of [`AdapterKind`], so this is the curated set the model picker asks; each is queried
-/// only when its API key resolves from the environment, so a no-key node makes no network calls.
-const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
+/// The Daemon Cloud gateway base URL (OpenRouter-clone; OpenAI-compatible). Pinned here (a public
+/// endpoint, not host config) so [`GenAiProvider::daemon_cloud`] stays config-crate-free; the host
+/// profile's `base_url` overrides it for a self-hosted gateway.
+pub const DAEMON_CLOUD_BASE: &str = "https://api.daemon.ai/api/v1/";
+
+/// The genai cloud vendors the node enumerates for provider + model discovery. genai 0.6.5 exposes
+/// no public enumeration of [`AdapterKind`], so this is the curated set the picker offers. Each is
+/// queried for models only when a credential resolves (a transient/stored key, or its env var), so a
+/// no-key node makes no network calls for it.
+pub const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
     AdapterKind::OpenAI,
     AdapterKind::Anthropic,
     AdapterKind::Gemini,
@@ -181,6 +199,33 @@ const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
     AdapterKind::OpenRouter,
 ];
 
+/// Live model ids for a single genai `adapter`, credential-aware: when `key` is `Some`, the LIST
+/// call authenticates with it (a first-run transient key or a stored credential); when `None`, genai
+/// resolves the adapter's `default_key_env_name()` from the environment. Ids are namespaced so
+/// [`AdapterKind::from_model`] round-trips the adapter at chat time. A listing error yields an empty
+/// list (one unreachable/keyless vendor never blanks the picker). This is the genai-native model
+/// discovery the `ProviderModels` op drives per vendor.
+pub async fn genai_models_for(adapter: AdapterKind, key: Option<&str>) -> Vec<String> {
+    let client = Client::default();
+    // `AuthData` converts into a genai `ProviderConfig { endpoint: None, auth: Some(..) }`; `()`
+    // resolves the adapter's default endpoint + env key.
+    let listed = match key {
+        Some(k) => {
+            client
+                .all_model_names(adapter, AuthData::from_single(k.to_string()))
+                .await
+        }
+        None => client.all_model_names(adapter, ()).await,
+    };
+    match listed {
+        Ok(names) => names
+            .iter()
+            .map(|name| namespace_model(adapter, name))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Live model ids from `genai` for every [`DISCOVERY_ADAPTERS`] adapter whose API key is present in
 /// the environment ([`AdapterKind::default_key_env_name`]), each namespaced so
 /// [`AdapterKind::from_model`] round-trips the adapter. Adapters without a key are skipped (their
@@ -188,7 +233,6 @@ const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
 /// unreachable provider does not blank the picker. This is the genai-native replacement for a
 /// daemon-side cloud-model registry.
 pub async fn genai_listed_models() -> Vec<String> {
-    let client = Client::default();
     let mut out = Vec::new();
     for &adapter in DISCOVERY_ADAPTERS {
         let has_key = adapter
@@ -198,12 +242,49 @@ pub async fn genai_listed_models() -> Vec<String> {
         if !has_key {
             continue;
         }
-        // `()` => genai resolves the adapter's default endpoint + env key for the listing call.
-        if let Ok(names) = client.all_model_names(adapter, ()).await {
-            out.extend(names.iter().map(|name| namespace_model(adapter, name)));
-        }
+        // `None` => genai resolves the adapter's default endpoint + env key for the listing call.
+        out.extend(genai_models_for(adapter, None).await);
     }
     out
+}
+
+/// A human label for a genai cloud vendor adapter (the picker's provider row title). Falls back to
+/// genai's lowercase adapter name for any vendor without a curated label.
+fn vendor_display_name(adapter: AdapterKind) -> String {
+    match adapter {
+        AdapterKind::OpenAI => "OpenAI",
+        AdapterKind::Anthropic => "Anthropic",
+        AdapterKind::Gemini => "Google Gemini",
+        AdapterKind::Groq => "Groq",
+        AdapterKind::DeepSeek => "DeepSeek",
+        AdapterKind::Xai => "xAI",
+        AdapterKind::Cohere => "Cohere",
+        AdapterKind::OpenRouter => "OpenRouter",
+        other => return other.as_lower_str().to_string(),
+    }
+    .to_string()
+}
+
+/// The genai cloud vendors the picker offers as `(stable id, display name)` pairs. The id is the
+/// adapter's genai lowercase name (e.g. `"anthropic"`, `"open_router"`) and is the discriminator the
+/// `ProviderModels.provider` field carries (every genai vendor shares `ProviderSelector::GenAi`).
+pub fn discovery_vendor_ids() -> Vec<(String, String)> {
+    DISCOVERY_ADAPTERS
+        .iter()
+        .map(|&a| (a.as_lower_str().to_string(), vendor_display_name(a)))
+        .collect()
+}
+
+/// Live models for a genai vendor identified by its discovery id (see [`discovery_vendor_ids`]),
+/// credential-aware (see [`genai_models_for`]). Empty for an unknown id.
+pub async fn genai_models_for_id(vendor_id: &str, key: Option<&str>) -> Vec<String> {
+    let Some(&adapter) = DISCOVERY_ADAPTERS
+        .iter()
+        .find(|a| a.as_lower_str() == vendor_id)
+    else {
+        return Vec::new();
+    };
+    genai_models_for(adapter, key).await
 }
 
 /// Prefix a model id with its `genai` adapter namespace (`groq::…`) unless the id already

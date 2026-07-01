@@ -242,8 +242,8 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
         ApiRequest, ApiResponse, CommandInvocation, CommandOutput, CredentialInfo, EventsPage,
-        HealthReport, LogPageView, ModelDescriptor, NodeEvent, ProfileSpec, ProviderSelector,
-        ServiceHealth, SessionPage,
+        HealthReport, LogPageView, ModelDescriptor, NodeEvent, ProfileSpec, ProviderDescriptor,
+        ProviderKindWire, ProviderSelector, ServiceHealth, SessionPage,
     };
     use daemon_common::{ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, UserMsg};
@@ -403,6 +403,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     let fixture_descriptor = ModelDescriptor {
         id: "claude-opus-4-8".into(),
         provider: ProviderSelector::GenAi,
+        display_name: None,
         context_length: Some(200_000),
         input_price_micros_per_mtok: Some(15_000_000),
         output_price_micros_per_mtok: Some(75_000_000),
@@ -426,6 +427,49 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &out,
         "response-model-current.cbor",
         &ApiResponse::ModelCurrent(Some(fixture_descriptor)),
+    )?;
+    // Provider + model discovery (v22): the enumeration op, a credential-aware per-provider listing
+    // (with a transient key), and their responses. The response descriptors exercise the additive
+    // `provider-descriptor` shape and a `model-descriptor` carrying the optional `display_name`.
+    write_cbor(
+        &out,
+        "request-provider-catalog.cbor",
+        &ApiRequest::ProviderCatalog,
+    )?;
+    write_cbor(
+        &out,
+        "request-provider-models.cbor",
+        &ApiRequest::ProviderModels {
+            provider: "anthropic".into(),
+            credential_ref: None,
+            transient_key: Some("sk-fixture-transient".into()),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-provider-catalog.cbor",
+        &ApiResponse::ProviderCatalog(vec![ProviderDescriptor {
+            id: "daemon_cloud".into(),
+            display_name: "Daemon Cloud".into(),
+            kind: ProviderKindWire::DaemonCloud,
+            wire_selector: ProviderSelector::DaemonApi,
+            requires_key: false,
+            supports_model_discovery: true,
+            default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
+        }]),
+    )?;
+    write_cbor(
+        &out,
+        "response-provider-models.cbor",
+        &ApiResponse::ProviderModels(vec![ModelDescriptor {
+            id: "anthropic/claude-sonnet-4-5".into(),
+            provider: ProviderSelector::DaemonApi,
+            display_name: Some("Claude Sonnet 4.5".into()),
+            context_length: Some(200_000),
+            input_price_micros_per_mtok: Some(3_000_000),
+            output_price_micros_per_mtok: Some(15_000_000),
+            local: false,
+        }]),
     )?;
     write_cbor(&out, "response-ok.cbor", &ApiResponse::Ok)?;
     write_cbor(

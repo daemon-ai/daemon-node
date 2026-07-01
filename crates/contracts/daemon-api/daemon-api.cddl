@@ -784,7 +784,9 @@ provider-selector = "mock"
                   / "daemon_api"
                   / "llama_cpp"
                   / "mistral_rs"
-model-descriptor = { "id": tstr, "provider": provider-selector, "context_length": (uint / null), "input_price_micros_per_mtok": (uint64 / null), "output_price_micros_per_mtok": (uint64 / null), "local": bool }
+model-descriptor = { "id": tstr, "provider": provider-selector, ? "display_name": (tstr / null), "context_length": (uint / null), "input_price_micros_per_mtok": (uint64 / null), "output_price_micros_per_mtok": (uint64 / null), "local": bool }
+provider-kind-wire = "local" / "cloud" / "daemon_cloud"
+provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-wire, "wire_selector": provider-selector, "requires_key": bool, "supports_model_discovery": bool, "default_base_url": (tstr / null) }
 skill-creator = "agent" / "user" / "bundled"
 skill-state = "active" / "stale" / "archived"
 skill-usage = { "created_by": skill-creator, "state": skill-state, "pinned": bool, "use_count": uint64, "view_count": uint64, "patch_count": uint64, "created_at_ms": uint64, "last_used_ms": (uint64 / null), "last_viewed_ms": (uint64 / null), "last_patched_ms": (uint64 / null) }
@@ -1008,6 +1010,8 @@ request-model-quantizes = "ModelQuantizes"
 request-model-inspect = { "ModelInspect": { "id": model-id } }
 request-models = "Models"
 request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
+request-provider-catalog = "ProviderCatalog"
+request-provider-models = { "ProviderModels": { "provider": tstr, ? "credential_ref": (tstr / null), ? "transient_key": (tstr / null) } }
 request-auth-begin = { "AuthBegin": auth-begin-request }
 request-auth-complete = { "AuthComplete": auth-complete-request }
 request-auth-cancel = { "AuthCancel": { "flow_id": tstr } }
@@ -1179,6 +1183,8 @@ api-request = request-submit
             / request-model-inspect
             / request-models
             / request-model-current
+            / request-provider-catalog
+            / request-provider-models
             / request-auth-begin
             / request-auth-complete
             / request-auth-cancel
@@ -1300,6 +1306,8 @@ response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns n
 response-credentials = { "Credentials": [* credential-info] }
 response-models = { "Models": [* model-descriptor] }
 response-model-current = { "ModelCurrent": (model-descriptor / null) }
+response-provider-catalog = { "ProviderCatalog": [* provider-descriptor] }
+response-provider-models = { "ProviderModels": [* model-descriptor] }
 response-distribution = { "Distribution": distribution }
 response-profile-id = { "ProfileId": tstr }
 response-revisions = { "Revisions": [* revision] }
@@ -1388,6 +1396,8 @@ api-response = response-ok
              / response-credentials
              / response-models
              / response-model-current
+             / response-provider-catalog
+             / response-provider-models
              / response-distribution
              / response-profile-id
              / response-revisions

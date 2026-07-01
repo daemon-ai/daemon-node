@@ -83,7 +83,7 @@ pub use profile::{
 pub use provider::{
     build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
     Recovery, Request, RequestMsg, RequestParams, ResponseMeta, ScriptStep, ScriptedProvider,
-    StreamEvent, ToolCallFormat,
+    StreamEvent, ToolCallFormat, UnconfiguredProvider,
 };
 pub use recovery::{classify_api_error, drive_model_call, ModelCallPolicy, RecoveryStep};
 pub use repair::{

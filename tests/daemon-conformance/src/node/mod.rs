@@ -27,6 +27,7 @@ mod negative_auth;
 mod ownership;
 mod positive_e2e;
 mod profiles_skills;
+mod provider_discovery;
 mod routing_auth;
 mod sessions;
 mod tools_hitl;

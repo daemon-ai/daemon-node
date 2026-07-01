@@ -21,7 +21,10 @@
 mod genai_provider;
 mod local;
 
-pub use genai_provider::{genai_listed_models, GenAiEmbedder, GenAiProvider};
+pub use genai_provider::{
+    discovery_vendor_ids, genai_listed_models, genai_models_for, genai_models_for_id,
+    GenAiEmbedder, GenAiProvider, DAEMON_CLOUD_BASE, DISCOVERY_ADAPTERS,
+};
 pub use local::{LocalEmbedder, LocalProvider, SwitchableLocalProvider, WorkerConfig};
 
 use daemon_common::UsageDelta;

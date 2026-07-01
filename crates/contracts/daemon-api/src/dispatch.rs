@@ -224,6 +224,15 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
         ApiRequest::ModelCurrent { profile } => {
             ok_or_err(api.model_current(profile).await, ApiResponse::ModelCurrent)
         }
+        ApiRequest::ProviderCatalog => ApiResponse::ProviderCatalog(api.provider_catalog().await),
+        ApiRequest::ProviderModels {
+            provider,
+            credential_ref,
+            transient_key,
+        } => ApiResponse::ProviderModels(
+            api.provider_models(provider, credential_ref, transient_key)
+                .await,
+        ),
         _ => return None,
     })
 }

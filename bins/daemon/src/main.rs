@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use daemon_api::{
     BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileSpec,
-    ProviderSelector,
+    ProviderDescriptor, ProviderKindWire, ProviderSelector,
 };
 use daemon_common::{
     CredMode, CredScope, JournalStreamId, ModelEngine, ModelRef, ModelSource, ProfileRef,
@@ -35,6 +35,7 @@ use daemon_core::{
     CredentialProvider, EmbeddingProvider, EngineProfile, FileMemory, MemoryBuilder,
     MemoryProvider, MockProvider, Provider, ProviderRegistry, ScriptStep, ScriptedProvider,
     SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolProvider, ToolRegistry, TurnCx,
+    UnconfiguredProvider,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 use daemon_host::{
@@ -53,8 +54,8 @@ use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly, ProviderResolver};
 use daemon_protocol::{IsolationPolicy, TransportId};
 use daemon_providers::{
-    genai_listed_models, GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider,
-    WorkerConfig,
+    discovery_vendor_ids, genai_listed_models, genai_models_for_id, GenAiEmbedder, GenAiProvider,
+    LocalEmbedder, SwitchableLocalProvider, WorkerConfig, DAEMON_CLOUD_BASE,
 };
 use daemon_provision::CutChannel;
 use daemon_pytool_client::{PyToolConfig, PyToolProvider};
@@ -267,6 +268,75 @@ fn pricing_for(model: &str) -> Option<daemon_common::Pricing> {
 /// live ids so they round-trip through adapter inference.
 struct GenAiCloudCatalog;
 
+/// Overlay a genai-listed cloud model id with the static catalog's pricing/context (genai supplies
+/// neither), tagged as the `GenAi` provider. Shared by `list()` and per-vendor `provider_models`.
+fn genai_model_descriptor(id: String) -> ModelDescriptor {
+    let overlay = ModelDescriptor::builtin_cloud_catalog();
+    let known = overlay.iter().find(|m| m.id == id);
+    ModelDescriptor {
+        context_length: known
+            .and_then(|m| m.context_length)
+            .or_else(|| ModelDescriptor::known_context_length(&id)),
+        input_price_micros_per_mtok: known.and_then(|m| m.input_price_micros_per_mtok),
+        output_price_micros_per_mtok: known.and_then(|m| m.output_price_micros_per_mtok),
+        display_name: None,
+        id,
+        provider: ProviderSelector::GenAi,
+        local: false,
+    }
+}
+
+/// A Daemon Cloud gateway model row (OpenAI-compatible `GET /models`; ids are `author/slug`), best
+/// effort: name/context/pricing when the gateway supplies them, else `None`. Deserialized tolerantly.
+#[derive(serde::Deserialize)]
+struct GatewayModel {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context_length: Option<u32>,
+}
+
+/// Fetch Daemon Cloud gateway models keyless via `GET {base}/models` (unauth MVP). Tolerates both the
+/// OpenAI `{ "data": [..] }` envelope and a bare array; a non-200 (incl. the 500 "Registry not
+/// published") or a transport error yields an empty list (never an error to the picker). Ids stay
+/// `author/slug` so they feed `ProfileSpec.model` verbatim.
+async fn daemon_cloud_gateway_models(base: &str) -> Vec<ModelDescriptor> {
+    let url = format!("{}models", NodeConfig::ensure_trailing_slash(base));
+    let resp = match reqwest::Client::new().get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::debug!(status = %r.status(), "daemon cloud gateway /models non-success");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon cloud gateway /models unreachable");
+            return Vec::new();
+        }
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon cloud gateway /models parse");
+            return Vec::new();
+        }
+    };
+    let raw = body.get("data").cloned().unwrap_or(body);
+    let models: Vec<GatewayModel> = serde_json::from_value(raw).unwrap_or_default();
+    models
+        .into_iter()
+        .map(|m| ModelDescriptor {
+            id: m.id,
+            provider: ProviderSelector::DaemonApi,
+            display_name: m.name,
+            context_length: m.context_length,
+            input_price_micros_per_mtok: None,
+            output_price_micros_per_mtok: None,
+            local: false,
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl CloudCatalog for GenAiCloudCatalog {
     async fn list(&self) -> Vec<ModelDescriptor> {
@@ -274,25 +344,81 @@ impl CloudCatalog for GenAiCloudCatalog {
         let mut out = ModelDescriptor::builtin_cloud_catalog();
         let mut seen: std::collections::HashSet<String> =
             out.iter().map(|m| m.id.clone()).collect();
-        // Overlay pricing/context for any live id that the static table also knows (by id).
-        let overlay = ModelDescriptor::builtin_cloud_catalog();
         for id in genai_listed_models().await {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let known = overlay.iter().find(|m| m.id == id);
-            out.push(ModelDescriptor {
-                context_length: known
-                    .and_then(|m| m.context_length)
-                    .or_else(|| ModelDescriptor::known_context_length(&id)),
-                input_price_micros_per_mtok: known.and_then(|m| m.input_price_micros_per_mtok),
-                output_price_micros_per_mtok: known.and_then(|m| m.output_price_micros_per_mtok),
-                id,
-                provider: ProviderSelector::GenAi,
-                local: false,
-            });
+            out.push(genai_model_descriptor(id));
         }
         out
+    }
+
+    async fn providers(&self) -> Vec<ProviderDescriptor> {
+        let mut out = vec![
+            // Local inference engines (models come from the ModelManager catalog, node-owned).
+            ProviderDescriptor {
+                id: "llama_cpp".into(),
+                display_name: "llama.cpp (local)".into(),
+                kind: ProviderKindWire::Local,
+                wire_selector: ProviderSelector::LlamaCpp,
+                requires_key: false,
+                supports_model_discovery: true,
+                default_base_url: None,
+            },
+            ProviderDescriptor {
+                id: "mistral_rs".into(),
+                display_name: "mistral.rs (local)".into(),
+                kind: ProviderKindWire::Local,
+                wire_selector: ProviderSelector::MistralRs,
+                requires_key: false,
+                supports_model_discovery: true,
+                default_base_url: None,
+            },
+        ];
+        // One row per genai cloud vendor (all bind `ProviderSelector::GenAi`; the vendor dimension is
+        // carried by `id`). Listing their models needs a key.
+        for (id, display_name) in discovery_vendor_ids() {
+            out.push(ProviderDescriptor {
+                id,
+                display_name,
+                kind: ProviderKindWire::Cloud,
+                wire_selector: ProviderSelector::GenAi,
+                requires_key: true,
+                supports_model_discovery: true,
+                default_base_url: None,
+            });
+        }
+        // Daemon Cloud (OpenRouter clone). Lists keyless; carries the gateway base so the app never
+        // hardcodes it.
+        out.push(ProviderDescriptor {
+            id: "daemon_cloud".into(),
+            display_name: "Daemon Cloud".into(),
+            kind: ProviderKindWire::DaemonCloud,
+            wire_selector: ProviderSelector::DaemonApi,
+            requires_key: false,
+            supports_model_discovery: true,
+            default_base_url: Some(DAEMON_CLOUD_BASE.to_string()),
+        });
+        out
+    }
+
+    async fn provider_models(
+        &self,
+        provider_id: &str,
+        key: Option<String>,
+    ) -> Vec<ModelDescriptor> {
+        match provider_id {
+            // Local engines are served by the host from the ModelManager catalog, not here.
+            "llama_cpp" | "mistral_rs" => Vec::new(),
+            // Daemon Cloud: keyless gateway listing (author/slug).
+            "daemon_cloud" => daemon_cloud_gateway_models(DAEMON_CLOUD_BASE).await,
+            // A genai cloud vendor: credential-aware live listing, overlaid with static pricing.
+            vendor => genai_models_for_id(vendor, key.as_deref())
+                .await
+                .into_iter()
+                .map(genai_model_descriptor)
+                .collect(),
+        }
     }
 }
 
@@ -339,11 +465,20 @@ fn scripted_builder(cfg: &NodeConfig) -> daemon_core::ProviderBuilder {
 
 fn build_providers(
     cfg: &NodeConfig,
-    provider_kind: ProviderKind,
+    provider_kind: Option<ProviderKind>,
     manager: &Arc<ModelManager>,
     active: &ActiveModels,
 ) -> ProviderRegistry {
     let mut providers = ProviderRegistry::new();
+    let Some(provider_kind) = provider_kind else {
+        // Unconfigured boot: the default provider fails every turn with a clear, actionable error
+        // (never a silent mock). Discovery + profile creation still work; a configured profile
+        // resolves its own provider via `provider_builder_for`.
+        providers.set_default(Arc::new(|| {
+            Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>
+        }));
+        return providers;
+    };
     match provider_kind {
         ProviderKind::Scripted => {
             // Hermetic tool-using turn: the default provider replays the configured script, so a
@@ -386,14 +521,14 @@ fn build_providers(
             }));
         }
         ProviderKind::DaemonApi => {
-            // The daemon-api OpenRouter clone speaks the OpenAI shape: pin genai's OpenAI adapter at
-            // the daemon base (default `https://api.daemon.ai/api/v1/`, override `DAEMON_BASE_URL`).
-            // NEVER `for_model(...)` here — that would infer the Anthropic-native wire for `claude-*`
-            // ids against an OpenAI-compatible gateway. The bearer flows per-call via the broker.
+            // Daemon Cloud (OpenRouter clone) via `GenAiProvider::daemon_cloud`: genai's OpenAI
+            // adapter pinned at the daemon base (default `https://api.daemon.ai/api/v1/`, override
+            // `DAEMON_BASE_URL`). NEVER `for_model(...)` — that would infer the Anthropic-native wire
+            // for `claude-*` ids against an OpenAI-compatible gateway. The bearer flows per-call.
             let (base, model) = (cfg.daemon_api_base(), cfg.model.clone());
             let pricing = pricing_for(&model);
             providers.set_default(Arc::new(move || {
-                let mut p = GenAiProvider::openai(model.clone()).with_endpoint(base.clone());
+                let mut p = GenAiProvider::daemon_cloud(model.clone()).with_endpoint(base.clone());
                 if let Some(pricing) = pricing {
                     p = p.with_pricing(pricing);
                 }
@@ -434,14 +569,14 @@ fn build_providers(
 fn provider_builder_for(
     spec: &ProfileSpec,
     cfg: &NodeConfig,
-    provider_kind: ProviderKind,
+    provider_kind: Option<ProviderKind>,
     manager: &Arc<ModelManager>,
     active: &ActiveModels,
 ) -> daemon_core::ProviderBuilder {
     // Scripted launch overrides the per-profile provider: the wire ProviderSelector stays Mock
     // (no contract change), but every interactive session runs the scripted tool-calling provider
     // so the HITL e2e drives real parked approvals/clarify.
-    if provider_kind == ProviderKind::Scripted {
+    if provider_kind == Some(ProviderKind::Scripted) {
         return scripted_builder(cfg);
     }
     match spec.provider {
@@ -449,7 +584,12 @@ fn provider_builder_for(
             Arc::new(|| Arc::new(MockProvider::completing("session done")) as Arc<dyn Provider>)
         }
         // The single genai-backed path; the adapter is inferred from the model name (`for_model`).
+        // A networked selector with no model yet is UNCONFIGURED (never a silent mock): the turn
+        // fails clearly until the GUI picks a provider + model.
         ProviderSelector::GenAi => {
+            if spec.model.trim().is_empty() {
+                return Arc::new(|| Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>);
+            }
             let (base, model) = (spec.base_url.clone(), spec.model.clone());
             let pricing = pricing_for(&model);
             Arc::new(move || {
@@ -463,19 +603,23 @@ fn provider_builder_for(
                 Arc::new(p) as Arc<dyn Provider>
             })
         }
-        // The daemon-api OpenRouter clone: genai's OpenAI adapter pinned at the profile's base URL
-        // (default `https://api.daemon.ai/api/v1/`). NEVER `for_model(...)` — the gateway is
-        // OpenAI-compatible, so an inferred Anthropic-native wire for `claude-*` ids would be wrong.
+        // Daemon Cloud: genai's OpenAI adapter pinned at the profile's base URL (default
+        // `https://api.daemon.ai/api/v1/`) via `GenAiProvider::daemon_cloud`. NEVER `for_model(...)`
+        // — the gateway is OpenAI-compatible, so an inferred Anthropic-native wire for `claude-*` ids
+        // would be wrong. An empty model is UNCONFIGURED (clear error, never mock).
         ProviderSelector::DaemonApi => {
-            let base = NodeConfig::ensure_trailing_slash(
-                spec.base_url
-                    .as_deref()
-                    .unwrap_or(NodeConfig::DAEMON_API_DEFAULT_BASE),
-            );
+            if spec.model.trim().is_empty() {
+                return Arc::new(|| Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>);
+            }
+            let base = spec.base_url.clone();
             let model = spec.model.clone();
             let pricing = pricing_for(&model);
             Arc::new(move || {
-                let mut p = GenAiProvider::openai(model.clone()).with_endpoint(base.clone());
+                let mut p = match &base {
+                    Some(base) => GenAiProvider::daemon_cloud(model.clone())
+                        .with_endpoint(NodeConfig::ensure_trailing_slash(base)),
+                    None => GenAiProvider::daemon_cloud(model.clone()),
+                };
                 if let Some(pricing) = pricing {
                     p = p.with_pricing(pricing);
                 }
@@ -501,15 +645,19 @@ fn provider_builder_for(
 /// Seed the launch [`NodeConfig`] as the node's default [`ProfileSpec`] so existing env/TOML
 /// launches keep working: the active profile mirrors the configured provider/model/base-URL/engine
 /// tunables, and a GUI can then clone/edit/select alternatives over the `ProfileApi`.
-fn default_profile_spec(cfg: &NodeConfig, provider_kind: ProviderKind) -> ProfileSpec {
+fn default_profile_spec(cfg: &NodeConfig, provider_kind: Option<ProviderKind>) -> ProfileSpec {
     let provider = match provider_kind {
+        // Unconfigured boot: seed a Daemon Cloud selector with an EMPTY model so the profile does
+        // not silently chat — `provider_builder_for` resolves it to `UnconfiguredProvider` until the
+        // GUI picks a provider + model. New-profile default surface is Daemon Cloud (base prefilled).
+        None => ProviderSelector::DaemonApi,
         // Scripted is binary-internal: the durable profile records Mock so the wire stays unchanged
         // (provider_builder_for swaps in the scripted provider for the live session).
-        ProviderKind::Mock | ProviderKind::Scripted => ProviderSelector::Mock,
-        ProviderKind::GenAi => ProviderSelector::GenAi,
-        ProviderKind::DaemonApi => ProviderSelector::DaemonApi,
-        ProviderKind::LlamaCpp => ProviderSelector::LlamaCpp,
-        ProviderKind::MistralRs => ProviderSelector::MistralRs,
+        Some(ProviderKind::Mock | ProviderKind::Scripted) => ProviderSelector::Mock,
+        Some(ProviderKind::GenAi) => ProviderSelector::GenAi,
+        Some(ProviderKind::DaemonApi) => ProviderSelector::DaemonApi,
+        Some(ProviderKind::LlamaCpp) => ProviderSelector::LlamaCpp,
+        Some(ProviderKind::MistralRs) => ProviderSelector::MistralRs,
     };
     let context_engine = match cfg.context_engine {
         ContextEngineKind::Lcm => ContextEngineSel::Lcm,
@@ -1559,10 +1707,12 @@ fn emit_generated_admin(cfg: &NodeConfig, username: &str, password: &str) {
 /// `ctrl_c` trips a graceful shutdown. The wiring itself lives in [`daemon_node::assemble`]; this
 /// role only builds the policy inputs (store, credentials, provider registry, engine tunables).
 async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
-    // Fail fast: a host launch must explicitly configure a provider (no silent mock default). A
-    // networked provider (`genai`/`daemon_api`) additionally requires a model + credential. The
-    // resolved kind is threaded into provider construction below.
-    let provider_kind = cfg.validate_for_host()?;
+    // Boot resolution (no silent mock default): an unset provider boots UNCONFIGURED (`None` — the
+    // node installs `UnconfiguredProvider` and serves; a turn then fails clearly). An explicitly-set
+    // networked provider (`genai`/`daemon_api`) still requires a model (else a deliberate misconfig
+    // aborts). A credential is NOT required at boot — it arrives per-profile via `CredentialSet`. The
+    // resolved `Option<ProviderKind>` is threaded into provider construction below.
+    let provider_kind = cfg.resolve_for_host()?;
     let store = build_store(&cfg.store_backend())?;
 
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.
@@ -1631,11 +1781,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let active = manager.active_handle();
     // Seed the configured model as the active selection for a local provider, so resolve-before-load
     // downloads it into the shared cache on first use.
-    if matches!(
-        provider_kind,
-        ProviderKind::LlamaCpp | ProviderKind::MistralRs
-    ) {
-        if let Some(model_ref) = parse_model_ref(provider_kind, &cfg.model) {
+    if let Some(kind @ (ProviderKind::LlamaCpp | ProviderKind::MistralRs)) = provider_kind {
+        if let Some(model_ref) = parse_model_ref(kind, &cfg.model) {
             active.set(cfg.profile.clone(), model_ref);
         }
     }
@@ -1651,22 +1798,24 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // are per-session builders (LCM keeps per-session compaction state; Mnemosyne scopes by
     // `session_id`), so concurrent sessions never share mutable provider state.
     // LCM summarizes through the same default provider the agent uses: resolve the profile's builder
-    // (falling back to a mock) and hand the context engine an aux provider instance.
+    // (falling back to the unconfigured provider — never a silent mock; with no provider the context
+    // layer's summarization simply errors and LCM stays on its deterministic baseline).
     let lcm_aux: Arc<dyn Provider> = providers
         .builder_for(&cred_profile)
         .map(|b| b())
-        .unwrap_or_else(|| Arc::new(MockProvider::completing("")) as Arc<dyn Provider>);
+        .unwrap_or_else(|| Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>);
     let context = build_context(&cfg, lcm_aux);
     // The optional embedding backend (Mnemosyne vector recall), reusing the shared `ModelManager`
     // for local-model acquisition. `Off` by default — recall stays keyword-only.
     let embedder = build_embedder(&cfg, &manager).await;
     // Mnemosyne's optional LLM backend for structured extraction + sleep summarization, resolved the
-    // same way as `lcm_aux` (the profile's builder, falling back to a mock). With no provider the
-    // knowledge layer stays on its deterministic regex/AAAK baselines.
+    // same way as `lcm_aux` (the profile's builder, falling back to the unconfigured provider — never
+    // a silent mock). With no provider the knowledge layer stays on its deterministic regex/AAAK
+    // baselines.
     let mnemosyne_llm: Arc<dyn Provider> = providers
         .builder_for(&cred_profile)
         .map(|b| b())
-        .unwrap_or_else(|| Arc::new(MockProvider::completing("")) as Arc<dyn Provider>);
+        .unwrap_or_else(|| Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>);
     let memory = build_memory(&cfg, embedder, Some(mnemosyne_llm));
     // Both context (`lcm_*`) and memory (`mnemosyne_*`) tools register on every role registry.
     let mut extra_tools: Vec<Arc<dyn Tool>> = memory
@@ -2123,7 +2272,7 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
     // Fail fast on the transport path too: no silent mock default — a launch must configure a
     // provider (Mock is reachable only via explicit `DAEMON_MODEL_PROVIDER=mock`).
-    let _provider_kind = cfg.validate_for_host()?;
+    let _provider_kind = cfg.resolve_for_host()?;
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
 
     // A transport node owns its store, so it mints its own credentials (the host path's owner
@@ -2185,16 +2334,18 @@ async fn run_as_transport_server(addr: String) -> anyhow::Result<()> {
 /// completing mock if the model manager cannot be initialized, so the placement path never dies on a
 /// model-subsystem error.
 async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderBuilder {
-    let fallback = || -> daemon_core::ProviderBuilder {
-        Arc::new(|| Arc::new(MockProvider::completing("placed child done")) as Arc<dyn Provider>)
+    let unconfigured = || -> daemon_core::ProviderBuilder {
+        Arc::new(|| Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>)
     };
-    // The placed child inherits the (already-validated) parent env; resolve the configured kind. On
-    // an unset/invalid provider fall back to a completing mock so placement never dies.
-    let provider_kind = match cfg.validate_for_host() {
-        Ok(kind) => kind,
+    // The placed child inherits the parent env; resolve the configured kind. An unset provider, an
+    // explicit misconfig, or a model-subsystem error yields the UNCONFIGURED provider (clear
+    // turn-time error, never a silent mock) so placement never dies but also never fabricates output.
+    let provider_kind = match cfg.resolve_for_host() {
+        Ok(Some(kind)) => kind,
+        Ok(None) => return unconfigured(),
         Err(e) => {
-            tracing::warn!(error = %e, "placed child: provider not configured; using mock provider");
-            return fallback();
+            tracing::warn!(error = %e, "placed child: provider misconfigured; using unconfigured provider");
+            return unconfigured();
         }
     };
     let manager = match ModelManager::new(ManagerConfig {
@@ -2207,8 +2358,8 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
     {
         Ok(manager) => Arc::new(manager),
         Err(e) => {
-            tracing::warn!(error = %e, "placed child: model manager init failed; using mock provider");
-            return fallback();
+            tracing::warn!(error = %e, "placed child: model manager init failed; using unconfigured provider");
+            return unconfigured();
         }
     };
     let active = manager.active_handle();
@@ -2220,10 +2371,10 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
             active.set(cfg.profile.clone(), model_ref);
         }
     }
-    let providers = build_providers(cfg, provider_kind, &manager, &active);
+    let providers = build_providers(cfg, Some(provider_kind), &manager, &active);
     providers
         .builder_for(&ProfileRef::new(cfg.profile.clone()))
-        .unwrap_or_else(fallback)
+        .unwrap_or_else(unconfigured)
 }
 
 /// The tool registry for a placed child (B2): the always-on, dependency-light core chat tools the
@@ -2362,5 +2513,89 @@ mod tests {
         }
         clear_admin_env();
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- provider + model discovery (Track 2) ---------------------------------------------------
+
+    /// `ProviderCatalog` enumerates the local engines + every genai cloud vendor + Daemon Cloud, and
+    /// is independent of the launch config (an unconfigured node still lists providers).
+    #[tokio::test]
+    async fn provider_catalog_lists_local_all_genai_vendors_and_daemon_cloud() {
+        let catalog = GenAiCloudCatalog;
+        let providers = CloudCatalog::providers(&catalog).await;
+        let ids: std::collections::HashSet<&str> =
+            providers.iter().map(|p| p.id.as_str()).collect();
+
+        // Local engines (node-owned model lists).
+        assert!(ids.contains("llama_cpp"), "missing llama_cpp: {ids:?}");
+        assert!(ids.contains("mistral_rs"), "missing mistral_rs: {ids:?}");
+        // Every genai cloud vendor in the discovery set.
+        for (vendor_id, _) in discovery_vendor_ids() {
+            assert!(
+                ids.contains(vendor_id.as_str()),
+                "missing genai vendor {vendor_id}: {ids:?}"
+            );
+        }
+        // Daemon Cloud carries the gateway base so the app never hardcodes it, lists keyless, and
+        // binds the DaemonApi selector.
+        let daemon_cloud = providers
+            .iter()
+            .find(|p| p.id == "daemon_cloud")
+            .expect("daemon_cloud present");
+        assert_eq!(daemon_cloud.kind, ProviderKindWire::DaemonCloud);
+        assert_eq!(daemon_cloud.wire_selector, ProviderSelector::DaemonApi);
+        assert!(!daemon_cloud.requires_key, "Daemon Cloud lists keyless");
+        assert_eq!(
+            daemon_cloud.default_base_url.as_deref(),
+            Some(DAEMON_CLOUD_BASE)
+        );
+
+        // Genai vendors require a key to LIST; local engines do not.
+        let anthropic = providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert!(anthropic.requires_key, "genai vendors need a key to list");
+        assert_eq!(anthropic.wire_selector, ProviderSelector::GenAi);
+    }
+
+    /// `ProviderModels(daemon_cloud)` lists the gateway's `author/slug` models keyless via
+    /// `GET {base}/models`, against a mock upstream (OpenAI `{ "data": [..] }` envelope).
+    #[tokio::test]
+    async fn daemon_cloud_models_listed_keyless_via_mock_gateway() {
+        // A one-shot mock gateway: accept a connection, ignore the request, return the model list.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"data":[{"id":"anthropic/claude-sonnet-4-5","name":"Claude Sonnet 4.5","context_length":200000}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let base = format!("http://{addr}/");
+        let models = daemon_cloud_gateway_models(&base).await;
+        server.await.unwrap();
+
+        assert_eq!(models.len(), 1, "one gateway model: {models:?}");
+        let m = &models[0];
+        assert_eq!(m.id, "anthropic/claude-sonnet-4-5", "id stays author/slug");
+        assert_eq!(m.provider, ProviderSelector::DaemonApi);
+        assert_eq!(m.display_name.as_deref(), Some("Claude Sonnet 4.5"));
+        assert_eq!(m.context_length, Some(200_000));
+    }
+
+    /// A gateway that reports the 500 "Registry not published" (or is unreachable) yields an empty
+    /// list, never an error to the picker.
+    #[tokio::test]
+    async fn daemon_cloud_models_empty_on_gateway_error() {
+        // An unroutable/closed port: the GET fails and the picker sees an empty list.
+        let models = daemon_cloud_gateway_models("http://127.0.0.1:1/").await;
+        assert!(models.is_empty(), "gateway error => empty list: {models:?}");
     }
 }

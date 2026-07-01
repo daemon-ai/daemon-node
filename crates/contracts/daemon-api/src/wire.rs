@@ -387,6 +387,25 @@ pub enum ApiRequest {
         /// The profile to resolve (`None` = the active default).
         profile: Option<String>,
     },
+    /// [`ModelApi::provider_catalog`] — enumerate providers (local engines + every genai cloud
+    /// vendor + Daemon Cloud) for the setup picker. Gated on `Capability::ModelsRead`.
+    ProviderCatalog,
+    /// [`ModelApi::provider_models`] — list one provider's discoverable models, credential-aware for
+    /// genai vendors. Gated on `Capability::ModelsRead`.
+    ProviderModels {
+        /// The provider to enumerate — a [`ProviderDescriptor::id`] from `ProviderCatalog` (e.g.
+        /// `"anthropic"`, `"daemon_cloud"`, `"llama_cpp"`). This carries the vendor dimension that
+        /// `ProviderSelector` alone cannot (every genai cloud vendor shares `ProviderSelector::GenAi`).
+        provider: String,
+        /// A stored credential ref to authenticate the LIST call with (genai vendors).
+        #[serde(default)]
+        credential_ref: Option<String>,
+        /// A first-run transient key to authenticate the LIST call with, before a credential is
+        /// stored. Never persisted; used only for this listing call (turns use the stored profile
+        /// credential).
+        #[serde(default)]
+        transient_key: Option<String>,
+    },
     /// [`SessionApi::set_session_model`].
     SetSessionModel {
         /// The live session to switch.
@@ -941,6 +960,11 @@ pub enum ApiResponse {
     Models(Vec<ModelDescriptor>),
     /// The model a profile currently resolves to (`None` = none resolvable).
     ModelCurrent(Option<ModelDescriptor>),
+    /// The discoverable provider catalog (`provider_catalog`): local engines + genai vendors +
+    /// Daemon Cloud.
+    ProviderCatalog(Vec<ProviderDescriptor>),
+    /// A provider's discoverable models (`provider_models`).
+    ProviderModels(Vec<ModelDescriptor>),
     /// A profile distribution (profile_export).
     Distribution(Distribution),
     /// A created profile id (profile_import).

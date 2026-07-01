@@ -47,7 +47,7 @@ pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
     Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
-    ProviderSelector, SessionOverlay, ToolsOverride,
+    ProviderDescriptor, ProviderKindWire, ProviderSelector, SessionOverlay, ToolsOverride,
 };
 
 /// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live
@@ -1131,6 +1131,25 @@ pub trait ModelApi: Send + Sync {
         _profile: Option<String>,
     ) -> Result<Option<ModelDescriptor>, ApiError> {
         Ok(None)
+    }
+
+    /// The discoverable provider catalog the setup picker renders: local engines + every genai cloud
+    /// vendor + Daemon Cloud. Independent of the launch default, so an unconfigured node still lists
+    /// providers. Default: empty (a transport with no discovery seam wired).
+    async fn provider_catalog(&self) -> Vec<ProviderDescriptor> {
+        Vec::new()
+    }
+
+    /// One provider's discoverable models. Credential-aware for genai vendors (authenticate the LIST
+    /// call with the `transient_key`, else the stored `credential_ref`); Daemon Cloud lists keyless;
+    /// local providers return the installed models. Default: empty.
+    async fn provider_models(
+        &self,
+        _provider: String,
+        _credential_ref: Option<String>,
+        _transient_key: Option<String>,
+    ) -> Vec<ModelDescriptor> {
+        Vec::new()
     }
 }
 
