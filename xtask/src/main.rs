@@ -295,6 +295,21 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             profile: Some(ProfileRef::new("default")),
         },
     )?;
+    write_cbor(
+        &out,
+        "request-session-create.cbor",
+        &ApiRequest::SessionCreate {
+            session: Some(SessionId::new("fixture-session")),
+            profile: Some(ProfileRef::new("default")),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-session-created.cbor",
+        &ApiResponse::SessionCreated {
+            session: SessionId::new("fixture-session"),
+        },
+    )?;
     write_cbor(&out, "request-profile-list.cbor", &ApiRequest::ProfileList)?;
     write_cbor(
         &out,

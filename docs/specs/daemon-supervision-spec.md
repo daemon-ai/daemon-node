@@ -36,6 +36,53 @@ contract that `Snapshot`/`Outcome` ride on).
 
 ---
 
+## 0. Terminology — agent, engine, brain, node, session
+
+These terms recur across this spec, [`daemon-host-spec.md`](daemon-host-spec.md), the profile
+contract, and the GUI/TUI. They are defined **once, here**, because "agent" in particular had drifted
+(read variously as a profile, a session, or a unit). Use them exactly as defined; do not redefine
+locally.
+
+- **Engine** — a `ManagedUnit` of `UnitKind::Engine`: the leaf that runs §17 turns. It is a *seat*,
+  not a brain. Every turn-producer, native or foreign, is presented up the tree as an `Engine`
+  (`fleet/spawner.rs`: an external agent process "is presented up the tree as a `UnitKind::Engine`").
+- **Brain** — the pluggable turn-producer *behind* an `Engine`. Either **daemon-core's native brain**
+  (a `Provider` + model, configured by a `ProfileSpec`) or a **foreign-agent adapter** — an external
+  process such as Claude-Code (`stream-json`), ACP, Amp, or Cursor, configured by a `LaunchProfile`
+  and driven over a foreign codec (`daemon-host-spec.md` §"agent adapter"; `StreamJsonCodec`,
+  `daemon-acp`). The recurring spec phrase *"the brain (or a foreign-agent adapter)"* names exactly
+  this seam. **daemon-core vs claude-code is a *brain* distinction inside one agent shape** — not two
+  different kinds of thing.
+- **Profile** — a brain's configuration bundle and durable identity: `ProfileSpec` (native: provider,
+  model, persona, tools, budget, context/memory, credential) or its foreign counterpart
+  `LaunchProfile` (external process + codec). A profile is *config/identity*, never the runtime.
+- **Agent** — **an `Engine` unit + the config that gives it identity/behavior** (a `ProfileSpec` for a
+  native brain, or a `LaunchProfile` for a foreign one). Two faces of the same thing: *durably* an
+  agent **is its profile** — it persists and appears in the Fleet with **zero** active sessions;
+  *at runtime* it occupies an `Engine` seat to run a session. An agent is **not** a bare session and
+  **not** an orchestrator.
+- **Session** — a conversation / turn-thread an agent runs; bound to the agent's profile
+  (`bound_profile`) on the first `StartTurn`; durable or live. One agent may run many sessions.
+- **Orchestrator** — a `ManagedUnit` of `UnitKind::Orchestrator`: a non-leaf owning child units (a
+  sub-fleet). A unit's `kind` is `Orchestrator` iff it has children, else `Engine`.
+- **Node / Host** — a `daemon-node` process: the **substrate + partition owner** that hosts engines
+  and owns a partition of the durable tree ([`daemon-lifecycle-persistence.md`](daemon-lifecycle-persistence.md):
+  "durable partition/owner", `PartitionId`). A host is a *translator/substrate*, **not** an in-tree
+  `UnitKind` (§2.2). The GUI/TUI surfaces its **connection to a node as the Fleet root** — a
+  *client-side representation of the ffi/socket link*, never a unit in the node's `tree()`.
+  Daisy-chained **remote** nodes are the **deferred cross-node work** (§2.2, `daemon-host-spec.md`
+  §11), which will reintroduce a remote-host aggregate `UnitKind`; until then one node hosts one local
+  root partition.
+
+**The Fleet tree the GUI/TUI presents** is therefore a *membership* view — `node (client-side
+connection root) → agents (the node's profiles/launch-profiles) → each agent's sessions` — layered
+**above** the node's in-partition `tree()` (the durable session parent→children delegation graph of
+§2.2). The two are distinct structures and must not be conflated: the membership view answers *"which
+agents exist on this node and what has each run,"* while `tree()` answers *"who delegated to whom
+within one running session graph."*
+
+---
+
 ## 1. Why one protocol
 
 The recursive three-role architecture (synthesis §3) holds together only because the **upward face
@@ -225,6 +272,13 @@ by the fleet that holds its record (the **authority split** below), so the metho
 > remote host appears to its parent as one opaque unit that fans out to its engines — is **deferred
 > to the cross-node work** ([`daemon-host-spec.md`](daemon-host-spec.md) §11) and will reintroduce a
 > `UnitKind` variant then.
+>
+> The GUI/TUI nonetheless shows a **node root** at the top of its Fleet view — but that is the
+> **client-side representation of its connection** to the node (§0 Terminology), *not* an in-tree
+> `Host` unit: it introduces no `UnitKind`, never appears in `tree()`, and the node stays
+> authoritative for everything beneath it. (The pre-live GUI mock seeded a `UnitKind::Host` row to
+> preview this root; that mock is to be reconciled to the client-side-root model when the Fleet is
+> wired live.)
 
 ---
 

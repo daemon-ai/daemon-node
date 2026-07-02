@@ -10,21 +10,44 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_list(&self) -> Vec<ProfileInfo> {
-        let Ok(store) = self.profile_store() else {
-            return Vec::new();
-        };
-        let active = store.active().ok().flatten();
-        match store.list() {
-            Ok(specs) => {
-                let mut out: Vec<ProfileInfo> = specs
-                    .iter()
-                    .map(|s| ProfileInfo::from_spec(s, active.as_deref() == Some(s.id.as_str())))
-                    .collect();
-                out.sort_by(|a, b| a.id.cmp(&b.id));
-                out
-            }
+        let store_ok = self.profile_store().is_ok();
+        let out = match self.profile_store() {
             Err(_) => Vec::new(),
+            Ok(store) => {
+                let active = store.active().ok().flatten();
+                match store.list() {
+                    Ok(specs) => {
+                        let mut out: Vec<ProfileInfo> = specs
+                            .iter()
+                            .map(|s| {
+                                ProfileInfo::from_spec(s, active.as_deref() == Some(s.id.as_str()))
+                            })
+                            .collect();
+                        out.sort_by(|a, b| a.id.cmp(&b.id));
+                        out
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+        };
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/home/j/experiments/daemon/.cursor/debug-96b7ad.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "{{\"sessionId\":\"96b7ad\",\"hypothesisId\":\"PROFILE-LIST\",\"location\":\"node:profile_list\",\"message\":\"profile_list result\",\"data\":{{\"store_ok\":{},\"count\":{}}},\"timestamp\":0}}",
+                    store_ok,
+                    out.len()
+                );
+            }
         }
+        // #endregion
+        out
     }
 
     async fn profile_get(&self, id: String) -> Result<Option<ProfileSpec>, ApiError> {
@@ -33,7 +56,26 @@ impl ProfileApi for NodeApiImpl {
 
     async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
         let id = spec.id.clone();
-        self.profile_store()?.create(spec).map_err(profile_err)?;
+        let (provider, model) = (format!("{:?}", spec.provider), spec.model.clone());
+        let store = self.profile_store()?;
+        let res = store.create(spec);
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/home/j/experiments/daemon/.cursor/debug-96b7ad.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "{{\"sessionId\":\"96b7ad\",\"hypothesisId\":\"PROFILE-CREATE\",\"location\":\"node:profile_create\",\"message\":\"profile_create result\",\"data\":{{\"id\":\"{}\",\"provider\":\"{}\",\"model\":\"{}\",\"ok\":{}}},\"timestamp\":0}}",
+                    id, provider, model, res.is_ok()
+                );
+            }
+        }
+        // #endregion
+        res.map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "create");
         Ok(())
     }

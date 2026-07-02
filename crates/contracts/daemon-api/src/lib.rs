@@ -204,6 +204,23 @@ pub trait SessionApi: Send + Sync {
         Ok(session)
     }
 
+    /// Node-authoritative session creation: create a **blank, profile-bound, UN-RUN** session (no
+    /// turn, no engine wake), persist it so it appears in the roster + the ByProfile query, emit the
+    /// existing `RosterChanged`, and return the id. The node mints the id when `session` is `None`,
+    /// or accepts a caller-supplied one; `profile` binds `bound_profile` (or the active default when
+    /// `None`). This is the node-authority replacement for a client-minted session id: the client
+    /// **requests**, the node **creates**, the node **events**, the client **updates** from the event.
+    ///
+    /// Default: unsupported (a session-only transport with no roster/profile store), so existing
+    /// implementors keep compiling unchanged.
+    async fn session_create(
+        &self,
+        _session: Option<SessionId>,
+        _profile: Option<ProfileRef>,
+    ) -> Result<SessionId, ApiError> {
+        Err(ApiError::Unsupported("session_create".into()))
+    }
+
     /// Drain up to `max` outbound items (events + raised host requests) for `session`. A
     /// **destructive, single-consumer** convenience (each call consumes what it returns), for the
     /// FFI / MCP lowest-common-denominator only — NOT the multi-surface basis (a drain is inherently

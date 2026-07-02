@@ -61,6 +61,18 @@ pub enum ApiRequest {
         /// Session to assign/wake.
         session: SessionId,
     },
+    /// [`SessionApi::session_create`]: node-authoritative creation of a blank, profile-bound, UN-RUN
+    /// session. The node mints (`session = None`) or accepts the id, binds `profile` (or the active
+    /// default), persists it (so it appears in the roster + ByProfile query), emits `RosterChanged`,
+    /// and replies [`ApiResponse::SessionCreated`] with the id.
+    SessionCreate {
+        /// The id to accept, or `None` to let the node mint one.
+        #[serde(default)]
+        session: Option<SessionId>,
+        /// The profile to bind on creation, or `None` to bind the node's active default.
+        #[serde(default)]
+        profile: Option<ProfileRef>,
+    },
     /// [`ControlApi::cancel`].
     Cancel {
         /// Session to cancel.
@@ -890,6 +902,12 @@ pub enum ApiResponse {
     /// The session a routed submit ([`ApiRequest::SubmitRouted`]) resolved to and opened.
     Routed {
         /// The derived session id (subscribe/poll it for the reply).
+        session: SessionId,
+    },
+    /// The session a [`ApiRequest::SessionCreate`] minted/accepted (subscribe/poll it, or open it in
+    /// the GUI). The node-authoritative counterpart to a client-minted id.
+    SessionCreated {
+        /// The created (blank, profile-bound, UN-RUN) session id.
         session: SessionId,
     },
     /// Drained outbound items (poll).

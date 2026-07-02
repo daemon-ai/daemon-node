@@ -62,6 +62,11 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
                 ApiResponse::Routed { session }
             })
         }
+        ApiRequest::SessionCreate { session, profile } => {
+            ok_or_err(api.session_create(session, profile).await, |session| {
+                ApiResponse::SessionCreated { session }
+            })
+        }
         ApiRequest::Poll { session, max } => {
             ok_or_err(api.poll(session, max).await, ApiResponse::Drained)
         }

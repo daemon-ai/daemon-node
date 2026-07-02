@@ -28,6 +28,81 @@ impl SessionApi for NodeApiImpl {
         self.live.submit_from(session, origin, command).await
     }
 
+    async fn session_create(
+        &self,
+        session: Option<SessionId>,
+        profile: Option<ProfileRef>,
+    ) -> Result<SessionId, ApiError> {
+        // Node-authoritative creation of a blank, profile-bound, UN-RUN session: the create-if-absent
+        // body of `assign` (durable row + fresh snapshot + owner stamp) enriched with `bound_profile`,
+        // MINUS `manager.wake()` — no turn runs and no engine is woken.
+        let session = session.unwrap_or_else(mint_session_id);
+        // Reserve the id for the live lifecycle: the GUI binds its composer to this id and opens it
+        // with a live `StartTurn`, so claiming `Live` keeps that subsequent submit idempotent (a
+        // `Durable` claim would make the first turn conflict with the guard-rail).
+        self.claim(&session, Lifecycle::Live)?;
+        // Auth 4: an `Absent` session passes; the durable-create + meta stamp below fixes ownership.
+        self.require_session_access(&session, true).await?;
+        // Resolve the profile to bind: an explicit ref, else the node's active default — so a blank
+        // session still lands under an agent in the ByProfile roster.
+        let bound = match profile {
+            Some(p) => Some(p),
+            None => self
+                .profile_store()
+                .ok()
+                .and_then(|s| s.active().ok().flatten())
+                .map(ProfileRef::new),
+        };
+        // Create-if-absent durable row with the engine's initial snapshot (the `assign` body).
+        let created = if self.store.status(&session).await.is_none() {
+            let blob = Snapshot::fresh(session.clone())
+                .encode()
+                .map_err(|e| ApiError::Other(format!("encode initial snapshot: {e}")))?;
+            self.store
+                .create_session(session.clone(), self.partition, blob)
+                .await
+                .map_err(|e| ApiError::Other(format!("create session: {e}")))?;
+            true
+        } else {
+            false
+        };
+        // Bind `bound_profile` + stamp the owner on the durable host meta (read-modify-write, so a
+        // pre-existing overlay/title is preserved and a re-create never clobbers an existing binding).
+        let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
+        if meta.bound_profile.is_none() {
+            meta.bound_profile = bound.clone();
+        }
+        if meta.owner.is_none() {
+            meta.owner = current_principal().map(|p| p.user_id);
+        }
+        let _ = self.store.set_session_meta(&session, meta).await;
+        // L3: the roster *set* changed — a client refetches the roster + the ByProfile query. This is
+        // the existing `RosterChanged` the live `ensure()` path also emits.
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(&session);
+            feed.emit(NodeEvent::RosterChanged { rev });
+        }
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/home/j/experiments/daemon/.cursor/debug-96b7ad.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "{{\"sessionId\":\"96b7ad\",\"hypothesisId\":\"SESSION-CREATE\",\"location\":\"node:session_create\",\"message\":\"node created blank session\",\"data\":{{\"session\":\"{}\",\"profile\":\"{}\",\"created_row\":{}}},\"timestamp\":0}}",
+                    session.as_str(),
+                    bound.as_ref().map(|p| p.as_str()).unwrap_or(""),
+                    created
+                );
+            }
+        }
+        // #endregion
+        Ok(session)
+    }
+
     async fn submit_as(&self, args: SubmitAsArgs) -> Result<(), ApiError> {
         let SubmitAsArgs {
             session,
@@ -212,4 +287,24 @@ impl SessionApi for NodeApiImpl {
         }
         Ok(())
     }
+}
+
+/// Mint a fresh node-authoritative session id: the `s-<32 hex>` shape the GUI historically minted
+/// client-side, now produced on the node from 16 random bytes so nothing is client-minted. A
+/// getrandom failure is astronomically unlikely; fall back to a time-seeded id rather than panicking.
+fn mint_session_id() -> SessionId {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes[..16].copy_from_slice(&nanos.to_le_bytes());
+    }
+    let mut hex = String::with_capacity(2 + bytes.len() * 2);
+    hex.push_str("s-");
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    SessionId::new(hex)
 }

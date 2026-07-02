@@ -489,7 +489,15 @@ impl WireVersion {
     /// catalog). Additive (new request/response variants + new/optional fields), but bumped because
     /// `is_compatible` is strict-equal, so an older peer cannot decode the new ops (mirrors the
     /// additive v15–v21 bumps).
-    pub const CURRENT: Self = Self(22);
+    ///
+    /// v23 (node-authoritative session create): adds the additive `SessionCreate { session?,
+    /// profile? }` request -> `SessionCreated { session }` response — node-authoritative creation of a
+    /// blank, profile-bound, UN-RUN session (no turn, no engine wake) that appears in the roster + the
+    /// ByProfile query and emits the existing `RosterChanged`. Replaces client-minted session ids: the
+    /// client REQUESTS, the node CREATES (minting or accepting the id) and EVENTs. Additive (a new
+    /// request/response variant), but bumped because `is_compatible` is strict-equal, so an older peer
+    /// cannot decode the new op (mirrors the additive v15–v22 bumps).
+    pub const CURRENT: Self = Self(23);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

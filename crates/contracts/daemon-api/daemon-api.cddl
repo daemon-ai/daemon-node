@@ -941,6 +941,11 @@ request-stats = "Stats"
 request-telemetry = "Telemetry"
 request-sessions = "Sessions"
 request-assign = { "Assign": { "session": session-id } }
+; SessionCreate: node-authoritative creation of a blank, profile-bound, UN-RUN session (no turn, no
+; engine wake). The node mints (`session` absent/null) or accepts the id, binds `profile` (or the
+; active default), persists it so it appears in the roster + ByProfile query, emits `RosterChanged`,
+; and returns the id via `response-session-created`.
+request-session-create = { "SessionCreate": { ? "session": (session-id / null), ? "profile": (profile-ref / null) } }
 request-cancel = { "Cancel": { "session": session-id } }
 request-fleet = "Fleet"
 request-tree = "Tree"
@@ -1120,6 +1125,7 @@ api-request = request-submit
             / request-telemetry
             / request-sessions
             / request-assign
+            / request-session-create
             / request-cancel
             / request-fleet
             / request-tree
@@ -1275,6 +1281,7 @@ api-request = request-submit
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
+response-session-created = { "SessionCreated": { "session": session-id } }
 response-drained = { "Drained": [* outbound] }
 response-health = { "Health": health-report }
 response-stats = { "Stats": stats-report }
@@ -1366,6 +1373,7 @@ response-access-roles = { "AccessRoles": [* role-info] }
 response-who-am-i     = { "WhoAmI": principal-view }
 api-response = response-ok
              / response-routed
+             / response-session-created
              / response-drained
              / response-health
              / response-stats

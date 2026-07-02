@@ -50,6 +50,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // -- serve_session: own-session interaction --------------------------------------------
         Submit { .. }
         | SubmitRouted { .. }
+        | SessionCreate { .. }
         | Respond { .. }
         | Handover { .. }
         | RecordMeta(_)

@@ -225,7 +225,7 @@ pub enum EmbedKind {
 pub enum StoreKind {
     /// The in-memory backend (non-durable; the default).
     Memory,
-    /// The SQLite backend at `store_path` (default `$TMPDIR/daemon-store.sqlite`).
+    /// The SQLite backend at `store_path` (default `<data_dir>/daemon-store.sqlite`).
     Sqlite,
 }
 
@@ -740,7 +740,7 @@ pub struct NodeConfig {
     pub http_addr: Option<String>,
     /// The durable store backend selector (`memory`|`sqlite`).
     pub store: StoreKind,
-    /// The SQLite database path when `store = sqlite` (`None` => `$TMPDIR/daemon-store.sqlite`).
+    /// The SQLite database path when `store = sqlite` (`None` => `<data_dir>/daemon-store.sqlite`).
     pub store_path: Option<PathBuf>,
     /// The host data directory rooting the profile-scoped subsystem databases (§10/§11).
     pub data_dir: PathBuf,
@@ -917,10 +917,13 @@ impl NodeConfig {
         match self.store {
             StoreKind::Memory => StoreBackend::Memory,
             StoreKind::Sqlite => {
-                let path = self.store_path.clone().unwrap_or_else(|| {
-                    let dir = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
-                    PathBuf::from(dir).join("daemon-store.sqlite")
-                });
+                // Default the durable store under `data_dir` (like auth_db/blob_root/workspace_root),
+                // NOT `$TMPDIR`: a managed run's store must survive a reboot / tmp reaper, otherwise
+                // "durable sqlite" silently loses every session on restart.
+                let path = self
+                    .store_path
+                    .clone()
+                    .unwrap_or_else(|| self.data_dir.join("daemon-store.sqlite"));
                 StoreBackend::Sqlite { path }
             }
         }
