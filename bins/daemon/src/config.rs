@@ -129,7 +129,7 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn default_profile() -> String {
-    "openai".to_string()
+    "default".to_string()
 }
 
 fn default_true() -> bool {
@@ -1180,7 +1180,7 @@ mod tests {
         let cfg =
             NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
                 .expect("defaults must extract");
-        assert_eq!(cfg.profile, "openai");
+        assert_eq!(cfg.profile, "default");
         assert_eq!(cfg.context_engine, ContextEngineKind::Lcm);
         assert_eq!(cfg.memory_provider, MemoryProviderKind::Mnemosyne);
         assert!(cfg.provider_kind.is_none());

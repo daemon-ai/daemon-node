@@ -1925,7 +1925,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 
     // The profile store backing the `ProfileApi` surface + per-session engine resolution. It
     // persists alongside the durable subsystem databases when the node is durable (sqlite), else it
-    // is in-memory (the ephemeral default). The launch config is seeded as the active default.
+    // is in-memory (the ephemeral default). The launch config is seeded as the active default only
+    // on a store with no profiles at all (first boot) — once a GUI/operator replaces and deletes
+    // the seeded placeholder, a reboot never resurrects it.
     let profile_store: Arc<dyn ProfileStore> = if cfg.persist_providers() {
         Arc::new(FileProfileStore::open(cfg.data_dir.join("profiles"))?)
     } else {

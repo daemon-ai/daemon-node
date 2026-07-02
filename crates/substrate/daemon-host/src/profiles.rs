@@ -52,10 +52,13 @@ pub trait ProfileStore: Send + Sync {
     /// Select the active default profile; errors if the id does not exist.
     fn set_active(&self, id: &str) -> Result<(), ProfileError>;
 
-    /// Insert `spec` only if no profile with its id exists yet (idempotent seeding). Returns whether
-    /// it was inserted.
+    /// Seed the store's FIRST profile: insert `spec` only when the store holds no profiles at
+    /// all (a fresh boot), making it the active default when none is set. A store that already
+    /// has any profile — including one whose operator replaced and deleted the seeded
+    /// placeholder — is left untouched, so a deleted placeholder is never resurrected on
+    /// reboot. Returns whether it was inserted.
     fn seed(&self, spec: ProfileSpec) -> Result<bool, ProfileError> {
-        if self.get(&spec.id)?.is_some() {
+        if !self.list()?.is_empty() {
             return Ok(false);
         }
         let id = spec.id.clone();
@@ -310,6 +313,45 @@ mod tests {
             reopened.get("opus").unwrap().unwrap().model,
             "claude-opus-4-8"
         );
+        assert_eq!(reopened.list().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_only_when_store_empty() {
+        let s = MemProfileStore::new();
+        // Empty store: the placeholder seeds and becomes the active default.
+        assert!(s.seed(sample("default")).unwrap());
+        assert_eq!(s.active().unwrap().as_deref(), Some("default"));
+        // Non-empty store with the placeholder DELETED (the wizard replaced it): re-seeding must
+        // not resurrect it, and the operator's profile/active selection stays intact.
+        s.create(sample("anthropic")).unwrap();
+        s.set_active("anthropic").unwrap();
+        s.delete("default").unwrap();
+        assert!(!s.seed(sample("default")).unwrap());
+        assert!(s.get("default").unwrap().is_none());
+        assert_eq!(s.active().unwrap().as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn file_store_seed_does_not_resurrect_deleted_placeholder() {
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-profiles-reseed-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Boot 1: fresh (empty) store seeds the placeholder as active.
+        let s = FileProfileStore::open(&dir).unwrap();
+        assert!(s.seed(sample("default")).unwrap());
+        // The wizard replaces it: named profile created + selected, placeholder deleted.
+        s.create(sample("anthropic")).unwrap();
+        s.set_active("anthropic").unwrap();
+        s.delete("default").unwrap();
+        // Boot 2 (reopen + re-seed): the placeholder must stay gone — no ghost agent.
+        let reopened = FileProfileStore::open(&dir).unwrap();
+        assert!(!reopened.seed(sample("default")).unwrap());
+        assert!(reopened.get("default").unwrap().is_none());
+        assert_eq!(reopened.active().unwrap().as_deref(), Some("anthropic"));
         assert_eq!(reopened.list().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
