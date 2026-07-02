@@ -497,6 +497,14 @@ impl WireVersion {
     /// client REQUESTS, the node CREATES (minting or accepting the id) and EVENTs. Additive (a new
     /// request/response variant), but bumped because `is_compatible` is strict-equal, so an older peer
     /// cannot decode the new op (mirrors the additive v15–v22 bumps).
+    ///
+    /// Also in v23 (same unreleased dev cycle, no extra bump — foreign-engine profiles): adds the
+    /// additive `ProfileSpec::engine` selector (`engine-selector = "Core" / { "Acp": { "agent":
+    /// tstr } }`, serde-default `Core`), binding a profile to the native `daemon-core` engine or to
+    /// a foreign ACP agent referenced from the node's ACP catalog BY NAME ONLY — launch recipes
+    /// never travel in profiles (they stay node-side, operator-managed via `acp_register`), so a
+    /// `ProfileCreate` can never smuggle an arbitrary binary spawn. Pre-engine encodings omit the
+    /// field and decode as `Core`.
     pub const CURRENT: Self = Self(23);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).

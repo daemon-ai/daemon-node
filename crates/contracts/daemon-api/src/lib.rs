@@ -46,8 +46,9 @@ pub mod profile;
 pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
-    Distribution, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
-    ProviderDescriptor, ProviderKindWire, ProviderSelector, SessionOverlay, ToolsOverride,
+    Distribution, EngineSelector, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo,
+    ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector, SessionOverlay,
+    ToolsOverride,
 };
 
 /// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live

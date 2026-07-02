@@ -152,6 +152,30 @@ impl BoundAccount {
     }
 }
 
+/// Which execution engine a profile's sessions run on (wire v23).
+///
+/// `Core` (the default) is the native in-process `daemon-core` engine, materialized from the
+/// profile's provider/model through the usual resolution path. `Acp { agent }` binds the profile
+/// to a foreign ACP agent from the node's ACP catalog, referenced **by name only**: the host
+/// resolves the name to the catalog entry's launch recipe at spawn time and drives it through the
+/// foreign (ACP) spawn seam — the genai provider/model path is bypassed entirely.
+///
+/// SECURITY INVARIANT (deliberate design): launch recipes never travel in profiles. Recipes stay
+/// node-side and operator-managed (`acp_register` under existing authz), so a `ProfileCreate` can
+/// never smuggle an arbitrary binary spawn — it can only *name* an agent the node already knows.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineSelector {
+    /// The native in-process `daemon-core` engine (provider/model resolution applies).
+    #[default]
+    Core,
+    /// A foreign ACP agent, referenced by its catalog name (never by a recipe).
+    Acp {
+        /// The ACP catalog entry name (e.g. `"gemini"`, `"goose"`, or a manual registration).
+        agent: String,
+    },
+}
+
 /// The full agent configuration bundle a GUI creates/edits and a session binds to.
 ///
 /// One profile is the unit a GUI manages: it names a provider + model, the persona system prompt,
@@ -203,6 +227,10 @@ pub struct ProfileSpec {
     /// registry's `instance_profiles` baseline (account → this profile) from these. Empty by default.
     #[serde(default)]
     pub bound_accounts: Vec<BoundAccount>,
+    /// Which execution engine this profile's sessions run on (wire v23): the native `daemon-core`
+    /// engine (default), or a foreign ACP agent referenced from the node's catalog by name only.
+    #[serde(default)]
+    pub engine: EngineSelector,
 }
 
 impl ProfileSpec {
@@ -226,6 +254,7 @@ impl ProfileSpec {
             credential_ref: None,
             fallback_credential_ref: None,
             bound_accounts: Vec::new(),
+            engine: EngineSelector::Core,
         }
     }
 
@@ -731,5 +760,47 @@ mod tests {
         assert_eq!(spec.fallback_credential_profile(), None);
         spec.fallback_credential_ref = Some("backup".into());
         assert_eq!(spec.fallback_credential_profile(), Some("backup"));
+    }
+
+    #[test]
+    fn engine_selector_wire_shapes_round_trip() {
+        // The unit variant serializes as the bare "Core" string; the ACP arm as the nested
+        // {"Acp": {"agent": ...}} map — mirroring the CDDL `engine-selector` union exactly.
+        assert_eq!(
+            serde_json::to_string(&EngineSelector::Core).unwrap(),
+            "\"Core\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EngineSelector::Acp {
+                agent: "gemini".into()
+            })
+            .unwrap(),
+            "{\"Acp\":{\"agent\":\"gemini\"}}"
+        );
+        // And a full ProfileSpec carrying the ACP selector round-trips through CBOR (the on-wire
+        // encoding); the recipe never travels — only the catalog NAME does.
+        let spec = ProfileSpec {
+            engine: EngineSelector::Acp {
+                agent: "goose".into(),
+            },
+            ..ProfileSpec::new("foreign", ProviderSelector::Mock, "")
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&spec, &mut buf).unwrap();
+        let back: ProfileSpec = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn pre_engine_profile_encodings_decode_as_core() {
+        // A profile persisted/sent before the engine selector existed has no "engine" key; it must
+        // decode with the Core default (the additive-compat contract for the optional CDDL field).
+        let legacy = serde_json::json!({
+            "id": "old",
+            "provider": "genai",
+            "model": "claude-opus-4-8"
+        });
+        let spec: ProfileSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(spec.engine, EngineSelector::Core);
     }
 }

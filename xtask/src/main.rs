@@ -414,6 +414,21 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-profile-daemon-api.cbor",
         &ApiResponse::Profile(Some(daemon_api_spec)),
     )?;
+    // The foreign-engine selector (wire v23): a profile-spec whose `engine` is the ACP arm
+    // (`{"Acp": {"agent": tstr}}` — catalog name only, never a recipe), so `verify-codec` proves
+    // the generated zcbor C decoder accepts the additive `engine-selector` union. The other
+    // profile fixtures above exercise the default "Core" arm (always present on new encodings).
+    let acp_engine_spec = ProfileSpec {
+        engine: daemon_api::EngineSelector::Acp {
+            agent: "gemini".into(),
+        },
+        ..ProfileSpec::new("foreign", ProviderSelector::Mock, "")
+    };
+    write_cbor(
+        &out,
+        "response-profile-acp-engine.cbor",
+        &ApiResponse::Profile(Some(acp_engine_spec)),
+    )?;
 
     let fixture_descriptor = ModelDescriptor {
         id: "claude-opus-4-8".into(),
