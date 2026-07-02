@@ -87,7 +87,7 @@ Configuration is layered by [figment](https://docs.rs/figment), later sources wi
 | `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
 | `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
 | `partition` | `DAEMON_PARTITION` | number | `0` |
-| `profile` | `DAEMON_PROFILE` | string | `openai` |
+| `profile` | `DAEMON_PROFILE` | string | `default` |
 | `python.enable` | `DAEMON_PYTHON__ENABLE` | bool | `false` |
 | `python.interpreter` | `DAEMON_PYTHON__INTERPRETER` | string | `python3` |
 | `python.max_restarts` | `DAEMON_PYTHON__MAX_RESTARTS` | number | `3` |
