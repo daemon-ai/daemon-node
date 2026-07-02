@@ -352,8 +352,35 @@ impl NodeEventFeed {
     }
 }
 
+/// A resident live session's backend handle: the native in-process §17 actor, or a foreign engine
+/// session (e.g. an ACP agent) behind the transport-agnostic [`AgentSession`](crate::AgentSession)
+/// seam. Both feed the same pump/log/journal; only command dispatch differs (the actor exposes
+/// typed calls, a foreign session takes raw [`AgentCommand`]s).
+#[derive(Clone)]
+pub(crate) enum LiveHandle {
+    /// The in-process `daemon-core` engine actor.
+    Core(AgentHandle),
+    /// A foreign engine session (constructed by the injected [`ForeignSessionFactory`]).
+    Foreign(Arc<dyn crate::AgentSession>),
+}
+
+impl LiveHandle {
+    /// Subscribe to the backend's lossless-primary §17 event stream (identical for both kinds).
+    fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        match self {
+            LiveHandle::Core(handle) => handle.subscribe(),
+            LiveHandle::Foreign(session) => session.subscribe(),
+        }
+    }
+
+    /// Whether this backend is a foreign engine (no in-process actor, not rewindable).
+    fn is_foreign(&self) -> bool {
+        matches!(self, LiveHandle::Foreign(_))
+    }
+}
+
 pub(crate) struct LiveSession {
-    handle: AgentHandle,
+    handle: LiveHandle,
     drain: Drain,
     pending: Pending,
     /// The non-destructive merged event log (multi-surface observability).
@@ -440,26 +467,48 @@ impl LiveSessions {
         *self.background.lock().unwrap() = Some(background);
     }
 
-    /// The handle for `session` only if it is already resident (does not spawn a new actor).
+    /// The in-process actor handle for `session` only if it is already resident AND runs the
+    /// native engine (does not spawn a new actor). `None` for a foreign-engine session — the
+    /// actor-only surfaces (live provider swap, engine-side policy switch) have no foreign
+    /// counterpart and no-op/fail explicitly at their call sites.
     pub(crate) fn handle_if_live(&self, session: &SessionId) -> Option<AgentHandle> {
-        self.sessions.get(session).map(|s| s.handle.clone())
+        self.sessions.get(session).and_then(|s| match &s.handle {
+            LiveHandle::Core(handle) => Some(handle.clone()),
+            LiveHandle::Foreign(_) => None,
+        })
     }
 
-    /// Spawn (or reuse) the actor for `session`, returning its handle. The `profile` selects which
-    /// profile bundle a *new* session's engine is built from (the routing agent-selection seam); a
-    /// resident session ignores it (the first `ensure` binds the profile — bindings are sticky).
+    /// Whether `session` is resident on the live surface (either backend kind).
+    pub(crate) fn is_resident(&self, session: &SessionId) -> bool {
+        self.sessions.contains_key(session)
+    }
+
+    /// Whether a *resident* session runs a foreign engine (`None` when not resident). Foreign
+    /// sessions have no model provider to swap and are not rewindable.
+    pub(crate) fn resident_is_foreign(&self, session: &SessionId) -> Option<bool> {
+        self.sessions.get(session).map(|s| s.handle.is_foreign())
+    }
+
+    /// Spawn (or reuse) the backend for `session`, returning its handle. The `profile` selects
+    /// which profile bundle a *new* session's engine is built from (the routing agent-selection
+    /// seam); a resident session ignores it (the first `ensure` binds the profile — bindings are
+    /// sticky).
     ///
     /// The session's persisted [`SessionOverlay`] is read from the store and applied on top of the
     /// bound profile at build time, so a live model/tools/approval override is **restored** when the
     /// actor is (re)spawned (e.g. after a host restart). The first `ensure` also records the bound
     /// profile in the store metadata, so the durable path can later re-resolve the same profile.
+    ///
+    /// Fallible: a foreign-engine profile resolves its ACP catalog entry at spawn time (the recipe
+    /// lives node-side, keyed by name), so a vanished or no-longer-installed agent fails the open
+    /// with a clear [`ApiError`] here instead of a dead actor. Native construction cannot fail.
     pub(crate) async fn ensure(
         &self,
         session: &SessionId,
         profile: Option<ProfileRef>,
-    ) -> AgentHandle {
+    ) -> Result<LiveHandle, ApiError> {
         if let Some(s) = self.sessions.get(session) {
-            return s.handle.clone();
+            return Ok(s.handle.clone());
         }
         // Read (and, for a new session, establish) the host-level session metadata: the bound
         // profile + persisted overlay. A read-modify-write keeps the overlay intact when we are only
@@ -468,6 +517,11 @@ impl LiveSessions {
         if meta.bound_profile.is_none() && profile.is_some() {
             meta.bound_profile = profile.clone();
         }
+        // The engine resolves from the STICKY binding (just adopted, or persisted earlier — e.g. a
+        // node-authoritative `session_create` that bound a profile before any submit): bindings are
+        // authoritative over the caller's `profile` hint, and a bare `ensure(None)` on a bound
+        // session must not silently fall back to the node's active default.
+        let effective_profile = meta.bound_profile.clone();
         // L2 resync: stamp this activation's epoch and bump the stored generation, so the next
         // activation (including after a daemon restart - SessionMeta is durable, the live MergedLog
         // is not) yields a strictly greater epoch. The first activation is epoch 0 (matching
@@ -483,7 +537,7 @@ impl LiveSessions {
             feed.emit(NodeEvent::RosterChanged { rev });
         }
         let overlay = decode_overlay(&meta.overlay);
-        let engine = (self.builder)(session.clone(), profile, &overlay);
+        let backend = (self.builder)(session.clone(), effective_profile, &overlay);
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let log: Merged = Arc::new(Mutex::new(MergedLog::new(
@@ -512,7 +566,16 @@ impl LiveSessions {
             modes: self.modes.clone(),
             feed: self.node_feed(),
         });
-        let handle = spawn_agent_session(engine, host);
+        // Materialize the backend: the native engine runs on the in-process §17 actor; a foreign
+        // engine is constructed by the injected factory (which resolves its catalog recipe and can
+        // fail with a clear error — the "re-check at spawn time" half of engine validation). Both
+        // route their blocking host requests through the SAME ParkingHandler, so approvals park
+        // identically, and both feed the same pump below, so the merged log + journal + delivery
+        // are byte-for-byte the native shape.
+        let handle: LiveHandle = match backend {
+            SessionBackend::Core(engine) => LiveHandle::Core(spawn_agent_session(engine, host)),
+            SessionBackend::Foreign(factory) => LiveHandle::Foreign(factory(host).await?),
+        };
 
         // Pump §17 events from the actor broadcast into the destructive drain queue (lossless until
         // polled), record them on the non-destructive merged log (outbound / Context), and feed the
@@ -583,7 +646,7 @@ impl LiveSessions {
                 pump,
             },
         );
-        handle
+        Ok(handle)
     }
 
     pub(crate) async fn submit(
@@ -605,7 +668,7 @@ impl LiveSessions {
             AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
                 // (including the terminal `TurnFinished`) flow to the drain queue for `poll`.
-                let handle = self.ensure(&session, None).await;
+                let handle = self.ensure(&session, None).await?;
                 // Seed the session's Primary reply sink from the opening origin (where replies post by
                 // default), unless one is already in force. Handover re-points it later.
                 self.seed_primary(&session, &origin);
@@ -623,9 +686,20 @@ impl LiveSessions {
                         }),
                     },
                 );
-                tokio::spawn(async move {
-                    let _ = handle.start_turn(input).await;
-                });
+                match handle {
+                    LiveHandle::Core(handle) => {
+                        tokio::spawn(async move {
+                            let _ = handle.start_turn(input).await;
+                        });
+                    }
+                    // A foreign session backgrounds the turn itself (submit must return promptly);
+                    // progress streams out on the same pump.
+                    LiveHandle::Foreign(session) => {
+                        session
+                            .submit(AgentCommand::StartTurn { input, request_id })
+                            .await;
+                    }
+                }
                 Ok(())
             }
             AgentCommand::Interrupt { reason } => {
@@ -640,7 +714,12 @@ impl LiveSessions {
                         }),
                     },
                 );
-                handle.interrupt(reason).await;
+                match handle {
+                    LiveHandle::Core(handle) => handle.interrupt(reason).await,
+                    LiveHandle::Foreign(session) => {
+                        session.submit(AgentCommand::Interrupt { reason }).await;
+                    }
+                }
                 Ok(())
             }
             AgentCommand::Shutdown => {
@@ -653,14 +732,19 @@ impl LiveSessions {
                     },
                 );
                 if let Some((_, s)) = self.sessions.remove(&session) {
-                    s.handle.shutdown().await;
+                    match &s.handle {
+                        LiveHandle::Core(handle) => handle.shutdown().await,
+                        LiveHandle::Foreign(session) => {
+                            session.submit(AgentCommand::Shutdown).await;
+                        }
+                    }
                 }
                 Ok(())
             }
             AgentCommand::Steer { text, request_id } => {
                 // Steer-when-idle opens a fresh turn; mid-turn it is drained at a phase boundary.
                 // Either way the ack + any turn events flow to the drain queue via the pump.
-                let handle = self.ensure(&session, None).await;
+                let handle = self.ensure(&session, None).await?;
                 self.record_inbound(
                     &session,
                     LogEntryParts {
@@ -672,14 +756,21 @@ impl LiveSessions {
                         }),
                     },
                 );
-                handle.steer(request_id, text).await;
+                match handle {
+                    LiveHandle::Core(handle) => handle.steer(request_id, text).await,
+                    LiveHandle::Foreign(session) => {
+                        session
+                            .submit(AgentCommand::Steer { text, request_id })
+                            .await;
+                    }
+                }
                 Ok(())
             }
             AgentCommand::Observe { input, request_id } => {
                 // Context-only append (no turn): spawn-if-absent so the chatter has a conversation to
                 // land in, record it as context, then hand it to the actor — which folds it in when
                 // idle or queues it for the following turn when busy (event-io §5.9). No turn starts.
-                let handle = self.ensure(&session, None).await;
+                let handle = self.ensure(&session, None).await?;
                 self.record_inbound(
                     &session,
                     LogEntryParts {
@@ -691,7 +782,14 @@ impl LiveSessions {
                         }),
                     },
                 );
-                handle.observe(request_id, input).await;
+                match handle {
+                    LiveHandle::Core(handle) => handle.observe(request_id, input).await,
+                    LiveHandle::Foreign(session) => {
+                        session
+                            .submit(AgentCommand::Observe { input, request_id })
+                            .await;
+                    }
+                }
                 Ok(())
             }
             AgentCommand::Snapshot { request_id } => {
@@ -704,14 +802,27 @@ impl LiveSessions {
                         payload: SessionPayload::Command(AgentCommand::Snapshot { request_id }),
                     },
                 );
-                handle.snapshot(request_id).await;
+                match handle {
+                    LiveHandle::Core(handle) => handle.snapshot(request_id).await,
+                    LiveHandle::Foreign(session) => {
+                        session.submit(AgentCommand::Snapshot { request_id }).await;
+                    }
+                }
                 Ok(())
             }
             AgentCommand::RewindTo { anchor, request_id } => {
                 // Conversation rewind (spec §4): the engine interrupts any live turn, truncates +
                 // reconstructs + bumps epoch + emits `Rewound`; the host then seals the durable
                 // journal and rolls the workspace back to the sealed-off range's earliest checkpoint.
-                let handle = self.existing(&session)?;
+                let LiveHandle::Core(handle) = self.existing(&session)? else {
+                    // A foreign (ACP) engine owns its own conversation state and the protocol has
+                    // no truncate-at-anchor primitive — surfaced up front as `rewindable = false`;
+                    // an explicit submit is refused rather than silently dropped.
+                    return Err(ApiError::Unsupported(
+                        "conversation rewind is not supported for a foreign-engine (ACP) session"
+                            .into(),
+                    ));
+                };
                 self.record_inbound(
                     &session,
                     LogEntryParts {
@@ -763,13 +874,19 @@ impl LiveSessions {
 
     /// Rewind a *resident* session's transcript at `anchor` (in-process engine truncate + epoch bump),
     /// then apply the shared durable side-effects honoring `restore_workspace`. The host-spec unified
-    /// rewind seam for the live path; backs [`NodeApiImpl::rewind`] for a live session.
+    /// rewind seam for the live path; backs [`NodeApiImpl::rewind`] for a live session. A resident
+    /// FOREIGN session is refused explicitly (ACP has no truncate-at-anchor primitive).
     pub(crate) async fn rewind_resident(
         &self,
         session: &SessionId,
         anchor: daemon_protocol::RewindAnchor,
         restore_workspace: bool,
     ) -> Result<(), ApiError> {
+        if self.resident_is_foreign(session) == Some(true) {
+            return Err(ApiError::Unsupported(
+                "conversation rewind is not supported for a foreign-engine (ACP) session".into(),
+            ));
+        }
         let handle = self
             .handle_if_live(session)
             .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
@@ -960,7 +1077,7 @@ impl LiveSessions {
         }
     }
 
-    pub(crate) fn existing(&self, session: &SessionId) -> Result<AgentHandle, ApiError> {
+    pub(crate) fn existing(&self, session: &SessionId) -> Result<LiveHandle, ApiError> {
         self.sessions
             .get(session)
             .map(|s| s.handle.clone())
@@ -1013,13 +1130,20 @@ impl LiveSessions {
     }
 
     pub(crate) async fn interrupt(&self, session: &SessionId) -> bool {
-        match self.sessions.get(session) {
-            Some(s) => {
-                s.handle.interrupt(Some("control cancel".into())).await;
-                true
+        let Some(handle) = self.sessions.get(session).map(|s| s.handle.clone()) else {
+            return false;
+        };
+        match handle {
+            LiveHandle::Core(handle) => handle.interrupt(Some("control cancel".into())).await,
+            LiveHandle::Foreign(session) => {
+                session
+                    .submit(AgentCommand::Interrupt {
+                        reason: Some("control cancel".into()),
+                    })
+                    .await;
             }
-            None => false,
         }
+        true
     }
 }
 

@@ -77,8 +77,15 @@ impl NodeApiImpl {
         for (session, status) in self.store.list_sessions().await {
             let meta = self.store.session_meta(&session).await.unwrap_or_default();
             let owner = meta.owner.clone();
+            let rewindable = self.session_rewindable(&session);
             out.push((
-                session_info_from(&session, Some(status), &meta, ApiLifecycle::Durable),
+                session_info_from(
+                    &session,
+                    Some(status),
+                    &meta,
+                    ApiLifecycle::Durable,
+                    rewindable,
+                ),
                 owner,
             ));
             seen.insert(session);
@@ -89,12 +96,21 @@ impl NodeApiImpl {
             }
             let meta = self.store.session_meta(&session).await.unwrap_or_default();
             let owner = meta.owner.clone();
+            let rewindable = self.session_rewindable(&session);
             out.push((
-                session_info_from(&session, None, &meta, ApiLifecycle::Live),
+                session_info_from(&session, None, &meta, ApiLifecycle::Live, rewindable),
                 owner,
             ));
         }
         out
+    }
+
+    /// Whether a session's conversation is rewindable: `daemon-core`-backed engines own their
+    /// conversation state and can truncate it (durable sessions and native live sessions alike);
+    /// a resident FOREIGN (ACP) session cannot — the agent owns the conversation and ACP has no
+    /// truncate-at-anchor primitive. Non-resident sessions default to rewindable (durable = core).
+    pub(crate) fn session_rewindable(&self, session: &SessionId) -> bool {
+        self.live.resident_is_foreign(session) != Some(true)
     }
 
     /// The roster scoped to the **current request principal** (Auth 4): a peer sees only sessions it
@@ -413,18 +429,19 @@ fn seed_title(turn_text: Option<&str>) -> Option<String> {
 /// Build a wire [`SessionInfo`] from a session id + its (optional) durable status + host meta +
 /// lifecycle. The single place the enriched roster line is assembled, so the durable, live, and
 /// detail paths stay consistent. A live session with no durable row reports `Active`.
+/// `rewindable` comes from [`NodeApiImpl::session_rewindable`]: `true` for daemon-core-backed
+/// engines (durable + native live), `false` for a resident foreign (ACP) session.
 pub(crate) fn session_info_from(
     session: &SessionId,
     status: Option<SessionStatus>,
     meta: &SessionMeta,
     lifecycle: ApiLifecycle,
+    rewindable: bool,
 ) -> SessionInfo {
     SessionInfo {
         session: session.clone(),
         state: status.map(map_state).unwrap_or(SessionState::Active),
-        // Daemon-core-backed engines own their conversation state and can truncate it, so durable
-        // and live sessions are both rewindable; foreign ACP units are surfaced via the fleet API.
-        rewindable: true,
+        rewindable,
         bound_profile: meta.bound_profile.clone(),
         title: meta.title.clone(),
         last_activity_ms: meta.last_activity_ms,

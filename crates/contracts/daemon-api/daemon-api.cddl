@@ -761,6 +761,15 @@ distribution = {
 engine-tunables = { "model_retry_attempts": (uint / null), "context_budget_tokens": (uint / null), "max_iterations": (uint / null), "tool_result_budget": (uint / null) }
 context-engine-sel = "lcm" / "budgeted"
 memory-provider-sel = "mnemosyne" / "file" / "none"
+; which execution engine a profile's sessions run on (wire v23): the native in-process daemon-core
+; engine ("Core", the serde default), or a foreign ACP agent referenced from the node's ACP catalog
+; BY NAME ONLY. Launch recipes deliberately never travel in profiles — they stay node-side and
+; operator-managed (acp_register under existing authz), so a ProfileCreate can never smuggle an
+; arbitrary binary spawn. Optional: pre-engine encodings omit it and decode as "Core".
+engine-acp-agent = { "agent": tstr }
+engine-acp = { "Acp": engine-acp-agent }
+engine-selector = "Core"
+                / engine-acp
 profile-spec = {
   "id": tstr,
   "provider": provider-selector,
@@ -775,6 +784,7 @@ profile-spec = {
   "credential_ref": (tstr / null),
   "fallback_credential_ref": (tstr / null),
   "bound_accounts": [* bound-account],
+  ? "engine": engine-selector,
 }
 bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account] }

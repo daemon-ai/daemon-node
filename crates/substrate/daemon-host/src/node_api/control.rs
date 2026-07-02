@@ -165,7 +165,13 @@ impl ControlApi for NodeApiImpl {
         } else {
             ApiLifecycle::Live
         };
-        let info = session_info_from(&session, status, &meta, lifecycle);
+        let info = session_info_from(
+            &session,
+            status,
+            &meta,
+            lifecycle,
+            self.session_rewindable(&session),
+        );
         let overlay = (!meta.overlay.is_empty()).then(|| decode_overlay(&meta.overlay));
         let model = self.session_models.get(&session).map(|m| m.clone());
         let delivery_targets = self.live.delivery_targets(&session);
@@ -1246,8 +1252,9 @@ impl ControlApi for NodeApiImpl {
         // and, when `point.restore_workspace`, roll the workspace back to the matching checkpoint —
         // sealing the journal on the way out. A resident session rewinds its in-process engine
         // directly through the shared seal+rollback seam that the live `RewindTo` command and the
-        // managed/fleet engine path also call (so all three stay consistent).
-        if self.live.handle_if_live(&session).is_some() {
+        // managed/fleet engine path also call (so all three stay consistent). A resident foreign
+        // (ACP) session is refused inside `rewind_resident` (not rewindable).
+        if self.live.is_resident(&session) {
             return self
                 .live
                 .rewind_resident(&session, point.anchor, point.restore_workspace)

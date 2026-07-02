@@ -22,7 +22,7 @@ use daemon_host::{
     BackgroundSpawner, BlobStore, BlueprintSource, CoreEngineFactory, CronFiring, CronOps,
     CronScheduler, DurableProfileResolver, FileBlobStore, FleetControl, Host, JournalConfig,
     ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileStore, RoutingRegistry,
-    SessionEngineBuilder, WorkspaceFs, WorkspaceRoots,
+    SessionBackend, SessionEngineBuilder, WorkspaceFs, WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_supervision::ManageRequestHandler;
@@ -207,7 +207,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &cron.cron_tool,
         &shared.workspace_roots,
     );
-    let session_builder = build_session_builder(&session_ctx, session_profile);
+    let session_builder = build_session_builder(&session_ctx, session_profile, a.store.clone());
 
     let mut node_api = NodeApiImpl::new(NodeApiParts {
         supervisor: handle.observer(),
@@ -452,6 +452,14 @@ fn build_factory(
             Arc::new(move |bound: Option<ProfileRef>, overlay: &SessionOverlay| {
                 let bound = bound?;
                 let spec = store.get(bound.as_str()).ok().flatten()?;
+                // The durable incarnation path is core-only: a FOREIGN-engine (ACP) profile must
+                // never resolve a core `EngineProfile` here (its provider/model fields are inert
+                // and the recipe belongs to the live foreign seam). Decline so the factory keeps
+                // its default profile for whatever durable bookkeeping touches the session; turns
+                // on foreign-engine sessions run through the live surface.
+                if !matches!(spec.engine, daemon_api::EngineSelector::Core) {
+                    return None;
+                }
                 Some(ctx.resolve_effective(&spec, overlay))
             });
         factory = factory.with_session_resolver(resolver);
@@ -508,11 +516,18 @@ fn build_session_profile(
 
 /// The profile-aware interactive session builder: when the node carries a profile store + provider
 /// resolver, each session resolves its bound profile bundle at open, applies the persisted session
-/// overlay, and materializes its engine from the result (the same `resolve_effective` the durable
+/// overlay, and materializes its backend from the result (the same `resolve_effective` the durable
 /// path uses). Otherwise sessions are built from the single fixed `session_profile` (moved in here).
+///
+/// The profile's `engine` selector picks the backend: `Core` runs the native in-process engine
+/// (provider/model resolution as before); `Acp { agent }` returns a deferred foreign factory that
+/// resolves the agent's catalog recipe node-side at spawn (`fleet::acp_live`) — the genai
+/// provider/model path is bypassed entirely for foreign engines. `session_store` supplies the
+/// durable ACP registrations that resolution reads.
 fn build_session_builder(
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     session_profile: EngineProfile,
+    session_store: Arc<dyn daemon_store::SessionStore>,
 ) -> SessionEngineBuilder {
     match session_ctx {
         Some((store, ctx)) => {
@@ -532,8 +547,18 @@ fn build_session_builder(
                             .and_then(|active| store.get(&active).ok().flatten()),
                     };
                     match spec {
-                        Some(spec) => ctx.resolve_effective(&spec, overlay).fresh(id),
-                        None => fallback.fresh(id),
+                        Some(spec) => match &spec.engine {
+                            daemon_api::EngineSelector::Core => SessionBackend::Core(
+                                ctx.resolve_effective(&spec, overlay).fresh(id),
+                            ),
+                            daemon_api::EngineSelector::Acp { agent } => SessionBackend::Foreign(
+                                crate::fleet::acp_live::acp_session_factory(
+                                    agent.clone(),
+                                    session_store.clone(),
+                                ),
+                            ),
+                        },
+                        None => SessionBackend::Core(fallback.fresh(id)),
                     }
                 },
             )
@@ -542,7 +567,7 @@ fn build_session_builder(
             let profile = session_profile;
             Arc::new(
                 move |id: SessionId, _requested: Option<ProfileRef>, _overlay: &SessionOverlay| {
-                    profile.fresh(id)
+                    SessionBackend::Core(profile.fresh(id))
                 },
             )
         }
