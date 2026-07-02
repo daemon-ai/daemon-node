@@ -74,6 +74,15 @@ locally.
   §11), which will reintroduce a remote-host aggregate `UnitKind`; until then one node hosts one local
   root partition.
 
+**The `engine` selector (wire v23) makes the agent = engine-unit + profile-spec seam explicit on the
+wire.** `ProfileSpec` carries an additive `engine` selector: `"Core"` (the default — the native
+daemon-core brain behind the seat) or `{"Acp": {"agent": tstr}}`, where `agent` is an ACP **catalog
+name**, never a launch recipe — recipes stay node-side, operator-managed. The same profile identity
+thus either configures the native brain (provider/model/persona/…) or references a foreign ACP
+engine, which **bypasses the inference/provider path entirely** (no provider, model, or credential
+applies to a foreign spec). This phase, durable/fleet-assigned work **declines foreign specs**
+(foreign engines serve interactive sessions only), and foreign sessions are **non-rewindable**.
+
 **The Fleet tree the GUI/TUI presents** is therefore a *membership* view — `node (client-side
 connection root) → agents (the node's profiles/launch-profiles) → each agent's sessions` — layered
 **above** the node's in-partition `tree()` (the durable session parent→children delegation graph of
