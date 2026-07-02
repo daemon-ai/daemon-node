@@ -232,6 +232,11 @@ hello = { "Hello": { "wire_version": uint, "features": [* tstr] } }   ; e.g. ["m
 - A connection whose first bytes decode as a bare `ApiRequest` (no `Hello`) is served in **legacy
   one-shot mode** — the exact current behavior — so the FFI/CLI/old clients keep working unchanged.
   This makes L0 strictly additive on the wire.
+- The server's `Hello` `features` also carry the daemon-api **contract** version as `"api/<N>"`
+  (N = `daemon_common::WireVersion::CURRENT`, distinct from `wire_version`, the envelope version).
+  A client compares it against its own compiled contract version at connect: a missing `api/`
+  feature or a different N means the peer cannot be decoded reliably — the client must replace an
+  app-managed stale daemon or refuse an attach explicitly, never attach silently.
 
 ### 2.5 Backpressure and lossy re-baseline
 

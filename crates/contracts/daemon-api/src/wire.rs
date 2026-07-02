@@ -1100,6 +1100,17 @@ pub const WIRE_FEATURE_VERSIONING: &str = "versioning";
 /// When advertised, the server `Hello` carries the offered `auth_mechanisms` and the client must
 /// complete an `AuthStart`/`AuthStep` (or `AuthResume`) exchange ending in `AuthOk` first.
 pub const WIRE_FEATURE_AUTH: &str = "auth";
+/// Feature-string prefix carrying the server's daemon-api CONTRACT version in its `Hello`
+/// (`"api/<N>"`, N = [`crate::API_WIRE_VERSION`]). Distinct from [`WIRE_VERSION`] (the envelope
+/// version): the contract version governs whether a peer can decode the wrapped
+/// [`ApiRequest`]/[`ApiResponse`] payloads at all. A server `Hello` without an `api/` feature is a
+/// pre-v23 daemon; clients treat that as incompatible (the stale-managed-daemon connect gate).
+pub const WIRE_FEATURE_API_PREFIX: &str = "api/";
+
+/// The `api/<N>` feature string this build advertises (see [`WIRE_FEATURE_API_PREFIX`]).
+pub fn wire_feature_api() -> String {
+    format!("{WIRE_FEATURE_API_PREFIX}{}", crate::API_WIRE_VERSION.0)
+}
 
 /// The authenticated principal as surfaced to a client on [`WireS2C::AuthOk`] (and the future
 /// `WhoAmI` admin op): the user identity plus its effective role/capability names. This is the wire
@@ -1549,6 +1560,23 @@ mod auth_contract_tests {
     #[test]
     fn wire_version_is_two() {
         assert_eq!(WIRE_VERSION, 2);
+    }
+
+    /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)
+    /// and parses back to it through the public prefix.
+    #[test]
+    fn api_feature_carries_current_contract_version() {
+        let feature = wire_feature_api();
+        assert_eq!(
+            feature,
+            format!("api/{}", daemon_common::WireVersion::CURRENT.0)
+        );
+        let n: u16 = feature
+            .strip_prefix(WIRE_FEATURE_API_PREFIX)
+            .expect("api feature carries the prefix")
+            .parse()
+            .expect("api feature suffix is the numeric contract version");
+        assert_eq!(daemon_common::WireVersion(n), crate::API_WIRE_VERSION);
     }
 
     #[test]

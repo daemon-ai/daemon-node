@@ -2435,9 +2435,10 @@ async fn run_as_placed_child() {
 }
 
 /// Prepare the api socket path for a fresh bind: create its parent directory if missing (a
-/// managed/user launch may target a nested runtime path, e.g. under `$XDG_RUNTIME_DIR`) and clear
-/// any stale socket file left by a previous run. Kept separate from [`run_as_host`] so it is
-/// unit-testable without standing up the full host.
+/// managed/user launch may target a nested runtime path, e.g. under `$XDG_RUNTIME_DIR`), refuse to
+/// displace a LIVE daemon already serving the path, and clear a stale (dead) socket file left by a
+/// previous run. Kept separate from [`run_as_host`] so it is unit-testable without standing up the
+/// full host.
 fn prepare_api_socket(path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2445,7 +2446,21 @@ fn prepare_api_socket(path: &std::path::Path) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("creating socket dir {}: {e}", parent.display()))?;
         }
     }
-    let _ = std::fs::remove_file(path);
+    if !path.exists() {
+        return Ok(());
+    }
+    // Probe before unlink: blindly removing the file would orphan a live daemon (it keeps serving
+    // its already-bound listener while every new connect goes to the usurper — the leaked-daemon
+    // incident). A Unix-socket connect is local and immediate: success proves a live listener;
+    // refused / not-a-socket means the path is stale debris and safe to clear.
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => anyhow::bail!(
+            "api socket already bound by a live daemon: {}",
+            path.display()
+        ),
+        Err(_) => std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("removing stale socket {}: {e}", path.display()))?,
+    }
     Ok(())
 }
 
@@ -2469,11 +2484,37 @@ mod tests {
         assert!(!sock.parent().unwrap().exists());
         prepare_api_socket(&sock).expect("prepare_api_socket");
         assert!(sock.parent().unwrap().is_dir());
-        // The prepared path is now bindable (and re-preparing over a stale socket still works).
+        // The prepared path is now bindable (and re-preparing over a STALE socket — bound once,
+        // listener gone — still clears it and binds fresh).
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind nested socket");
         drop(listener);
         prepare_api_socket(&sock).expect("re-prepare clears stale socket");
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("rebind after clear");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A LIVE listener on the api socket path must fail the prepare (and thus the launch) instead
+    /// of being unlinked out from under its daemon — the orphaned-daemon incident.
+    #[test]
+    fn prepare_api_socket_refuses_live_listener() {
+        let base = std::env::temp_dir().join(format!(
+            "daemon-socklive-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create test dir");
+        let sock = base.join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind live listener");
+
+        let err = prepare_api_socket(&sock).expect_err("a live listener must refuse the prepare");
+        assert!(
+            err.to_string().contains("already bound by a live daemon"),
+            "unexpected error: {err}"
+        );
+        assert!(sock.exists(), "the live socket must be left in place");
+
         drop(listener);
         let _ = std::fs::remove_dir_all(&base);
     }

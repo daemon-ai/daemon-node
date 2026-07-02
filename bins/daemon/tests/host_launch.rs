@@ -48,33 +48,42 @@ fn forward_existing_dir_env(cmd: &mut Command, var: &str) {
     }
 }
 
-/// Spawn the `daemon` binary in its **host** role (no placed-child / transport-server env, no
-/// subcommand) with a clean, controlled environment plus `extra` overrides. Returns
-/// `(exited_successfully, stderr)`. Bounded: kills the child if it does not exit within `timeout`
-/// (validation is the first thing `run_as_host` does, so a real launch exits well under it).
-fn run_host_launch(extra: &[(&str, &str)], timeout: Duration) -> (bool, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_daemon"));
-    // A minimal, deterministic environment so a stray `DAEMON_*` from the test host cannot mask the
-    // fail-fast. Keep `PATH` for any loader lookups; pin an ephemeral store + throwaway data dir so
-    // nothing touches a real home even if validation were (wrongly) skipped.
-    configure_base_env(&mut cmd);
+/// A unique throwaway path under the system temp dir (never a real home).
+fn unique_tmp(prefix: &str) -> std::path::PathBuf {
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp =
-        std::env::temp_dir().join(format!("daemon-host-launch-{}-{uniq}", std::process::id()));
+    std::env::temp_dir().join(format!("{prefix}-{}-{uniq}", std::process::id()))
+}
+
+/// Build the host-role `Command`: a minimal, deterministic environment (so a stray `DAEMON_*` from
+/// the test host cannot mask a fail-fast), an ephemeral store + throwaway data dir, and `socket`
+/// as the api socket path, plus `extra` overrides.
+fn host_command(tmp: &Path, socket: &Path, extra: &[(&str, &str)]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_daemon"));
+    configure_base_env(&mut cmd);
     cmd.env("DAEMON_STORE", "memory");
-    cmd.env("DAEMON_DATA_DIR", &tmp);
-    cmd.env("DAEMON_SOCKET_PATH", tmp.join("api.sock"));
+    cmd.env("DAEMON_DATA_DIR", tmp);
+    cmd.env("DAEMON_SOCKET_PATH", socket);
     for (k, v) in extra {
         cmd.env(k, v);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    cmd
+}
 
-    let mut child = cmd.spawn().expect("spawn daemon binary");
+/// Spawn the `daemon` binary in its **host** role (no placed-child / transport-server env, no
+/// subcommand) with a clean, controlled environment plus `extra` overrides. Returns
+/// `(exited_successfully, stderr)`. Bounded: kills the child if it does not exit within `timeout`
+/// (validation is the first thing `run_as_host` does, so a real launch exits well under it).
+fn run_host_launch(extra: &[(&str, &str)], timeout: Duration) -> (bool, String) {
+    let tmp = unique_tmp("daemon-host-launch");
+    let mut child = host_command(&tmp, &tmp.join("api.sock"), extra)
+        .spawn()
+        .expect("spawn daemon binary");
     let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
@@ -108,26 +117,12 @@ fn spawn_host_launch(
     extra: &[(&str, &str)],
     timeout: Duration,
 ) -> (bool, String, std::process::Child, std::path::PathBuf) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_daemon"));
-    configure_base_env(&mut cmd);
-    let uniq = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!("daemon-host-boot-{}-{uniq}", std::process::id()));
+    let tmp = unique_tmp("daemon-host-boot");
     let _ = std::fs::create_dir_all(&tmp);
     let socket = tmp.join("api.sock");
-    cmd.env("DAEMON_STORE", "memory");
-    cmd.env("DAEMON_DATA_DIR", &tmp);
-    cmd.env("DAEMON_SOCKET_PATH", &socket);
-    for (k, v) in extra {
-        cmd.env(k, v);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().expect("spawn daemon binary");
+    let mut child = host_command(&tmp, &socket, extra)
+        .spawn()
+        .expect("spawn daemon binary");
     let deadline = Instant::now() + timeout;
     let mut booted = false;
     loop {
@@ -205,5 +200,75 @@ fn daemon_api_without_model_host_launch_fails_fast() {
     assert!(
         stderr.contains("DAEMON_MODEL"),
         "the failure must name the model env key; stderr:\n{stderr}"
+    );
+}
+
+/// A LIVE listener already bound on the target socket: the launch must fail fast with the
+/// bind-safety error instead of unlinking the socket out from under the serving daemon (the
+/// orphaned-daemon incident: 7 leaked processes from 4 builds).
+#[test]
+fn live_socket_occupied_host_launch_fails_fast() {
+    let tmp = unique_tmp("daemon-host-occupied");
+    std::fs::create_dir_all(&tmp).expect("create socket dir");
+    let socket = tmp.join("api.sock");
+    let _live = std::os::unix::net::UnixListener::bind(&socket).expect("bind live listener");
+
+    let (ok, stderr) = run_host_launch(
+        &[("DAEMON_SOCKET_PATH", socket.to_str().expect("utf8 path"))],
+        Duration::from_secs(20),
+    );
+    assert!(
+        !ok,
+        "a launch against a live socket must exit non-zero; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("already bound by a live daemon"),
+        "the failure must name the bind-safety error; stderr:\n{stderr}"
+    );
+    assert!(socket.exists(), "the live socket must be left in place");
+}
+
+/// A stale socket FILE with no listener (a previous daemon that died without cleanup) must not
+/// block a fresh launch: the node clears it and boots. Boot signal is a successful connect — the
+/// file exists from the start, so file-existence polling would prove nothing.
+#[test]
+fn stale_socket_file_host_launch_boots_and_serves() {
+    let tmp = unique_tmp("daemon-host-stale");
+    std::fs::create_dir_all(&tmp).expect("create socket dir");
+    let socket = tmp.join("api.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind then abandon"));
+    assert!(socket.exists(), "the stale socket file must pre-exist");
+
+    let mut child = host_command(&tmp, &socket, &[])
+        .spawn()
+        .expect("spawn daemon binary");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut serving = false;
+    let mut exited = false;
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            exited = true;
+            break;
+        }
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            serving = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut stderr = String::new();
+    if exited {
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        serving,
+        "a launch over a stale socket file must clear it and serve; stderr:\n{stderr}"
     );
 }

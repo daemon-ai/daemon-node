@@ -18,9 +18,10 @@ use crate::authn::{AuthExchange, AuthSuccess, Authenticator, BeginOutcome, StepO
 use crate::authz::authorize;
 use crate::request_context::{with_request_context, AuthMethod, RequestContext};
 use daemon_api::{
-    dispatch, from_cbor, is_streaming, to_cbor, ApiError, ApiRequest, ApiResponse, EventsPage,
-    LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C, WIRE_FEATURE_AUTH, WIRE_FEATURE_MUX,
-    WIRE_FEATURE_STREAM, WIRE_FEATURE_VERSIONING, WIRE_VERSION,
+    dispatch, from_cbor, is_streaming, to_cbor, wire_feature_api, ApiError, ApiRequest,
+    ApiResponse, EventsPage, LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C,
+    WIRE_FEATURE_AUTH, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM, WIRE_FEATURE_VERSIONING,
+    WIRE_VERSION,
 };
 use daemon_auth::Principal;
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
@@ -290,6 +291,25 @@ async fn complete_auth(
     principal
 }
 
+/// The capability strings a server `Hello` ack advertises: the always-on envelope features
+/// (`mux`, `stream`) plus the API contract version (`api/<N>`, so a client can refuse or replace
+/// a stale daemon whose contract it cannot decode), then `versioning` / `auth` when the node /
+/// transport supports them. Pure, so the advertisement is unit-testable without a socket.
+fn hello_features(supports_versioning: bool, auth_required: bool) -> Vec<String> {
+    let mut features = vec![
+        WIRE_FEATURE_MUX.to_string(),
+        WIRE_FEATURE_STREAM.to_string(),
+        wire_feature_api(),
+    ];
+    if supports_versioning {
+        features.push(WIRE_FEATURE_VERSIONING.to_string());
+    }
+    if auth_required {
+        features.push(WIRE_FEATURE_AUTH.to_string());
+    }
+    features
+}
+
 /// Multiplexed serve loop, generic over the byte stream halves so it backs both the Unix socket and
 /// the TLS/TCP transport. Decodes each `WireC2S`, runs the SASL handshake (when [`AuthMode::Required`]),
 /// and — only once authenticated (or under local trust) — spawns a task per `Call` that
@@ -351,19 +371,10 @@ where
         };
         match frame {
             WireC2S::Hello { .. } => {
-                let mut features = vec![
-                    WIRE_FEATURE_MUX.to_string(),
-                    WIRE_FEATURE_STREAM.to_string(),
-                ];
-                if api.supports_versioning() {
-                    features.push(WIRE_FEATURE_VERSIONING.to_string());
-                }
+                let features = hello_features(api.supports_versioning(), !mode.is_local_system());
                 // Advertise mechanisms only when an exchange is required; local trust offers none.
                 let auth_mechanisms = match mode.as_ref() {
-                    AuthMode::Required { auth, tls_state } => {
-                        features.push(WIRE_FEATURE_AUTH.to_string());
-                        auth.advertised_mechanisms(tls_state)
-                    }
+                    AuthMode::Required { auth, tls_state } => auth.advertised_mechanisms(tls_state),
                     AuthMode::LocalSystem => Vec::new(),
                 };
                 let _ = tx
@@ -936,4 +947,41 @@ pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     stream.write_all(bytes).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every server `Hello` advertises the envelope features AND the API contract version — the
+    /// `api/<N>` string a client uses to detect a stale daemon (the orphaned-daemon incident).
+    #[test]
+    fn hello_always_advertises_api_contract_version() {
+        for (versioning, auth) in [(false, false), (true, false), (false, true), (true, true)] {
+            let features = hello_features(versioning, auth);
+            assert!(features.contains(&WIRE_FEATURE_MUX.to_string()));
+            assert!(features.contains(&WIRE_FEATURE_STREAM.to_string()));
+            assert!(
+                features.contains(&wire_feature_api()),
+                "hello must advertise {} (got {features:?})",
+                wire_feature_api()
+            );
+        }
+    }
+
+    /// `versioning` / `auth` ride the Hello only when the node / transport actually offers them.
+    #[test]
+    fn hello_gates_versioning_and_auth_features() {
+        let bare = hello_features(false, false);
+        assert!(!bare.contains(&WIRE_FEATURE_VERSIONING.to_string()));
+        assert!(!bare.contains(&WIRE_FEATURE_AUTH.to_string()));
+
+        let versioned = hello_features(true, false);
+        assert!(versioned.contains(&WIRE_FEATURE_VERSIONING.to_string()));
+        assert!(!versioned.contains(&WIRE_FEATURE_AUTH.to_string()));
+
+        let authed = hello_features(false, true);
+        assert!(!authed.contains(&WIRE_FEATURE_VERSIONING.to_string()));
+        assert!(authed.contains(&WIRE_FEATURE_AUTH.to_string()));
+    }
 }
