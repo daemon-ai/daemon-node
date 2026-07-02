@@ -168,14 +168,46 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
-/// Builds a fresh live [`Engine`] for an interactive session id (the session sub-surface's engine
-/// seam — the binary supplies the provider/tools/system). The optional [`ProfileRef`] selects which
-/// profile bundle the engine is materialized from (host routing's agent-selection degree of freedom);
-/// `None` resolves the node's active default. The [`SessionOverlay`] is the session's persisted
-/// per-session override (model/provider/tools/approval), applied on top of the bound profile at
-/// build time, so a live override is **restored** when the actor is (re)spawned.
+/// Builds a fresh live session backend for an interactive session id (the session sub-surface's
+/// engine seam — the binary supplies the provider/tools/system). The optional [`ProfileRef`] selects
+/// which profile bundle the backend is materialized from (host routing's agent-selection degree of
+/// freedom); `None` resolves the node's active default. The [`SessionOverlay`] is the session's
+/// persisted per-session override (model/provider/tools/approval), applied on top of the bound
+/// profile at build time, so a live override is **restored** when the actor is (re)spawned.
 pub type SessionEngineBuilder =
-    Arc<dyn Fn(SessionId, Option<ProfileRef>, &SessionOverlay) -> Engine + Send + Sync>;
+    Arc<dyn Fn(SessionId, Option<ProfileRef>, &SessionOverlay) -> SessionBackend + Send + Sync>;
+
+/// Constructs a foreign live session (e.g. an ACP agent) once the host hands it the session's
+/// [`HostRequestHandler`] (the parking handler that answers the agent's blocking §17 requests —
+/// permission prompts park exactly like a native engine's). Deferred + async because resolving the
+/// profile's catalog NAME to a launch recipe reads the durable ACP registrations, and fallible so
+/// a vanished/uninstalled agent fails the spawn with a clear [`ApiError`] instead of a dead actor.
+/// Injected by the assembling binary — `daemon-host` never links the foreign runtime (`daemon-acp`
+/// depends on *it*), mirroring the [`AcpDiscovery`] injection.
+pub type ForeignSessionFactory = Box<
+    dyn FnOnce(
+            Arc<dyn HostRequestHandler>,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Arc<dyn crate::AgentSession>, ApiError>,
+        > + Send,
+>;
+
+/// How a live interactive session's backend is constructed by the [`SessionEngineBuilder`]: the
+/// in-process `daemon-core` [`Engine`] (the native default), or a foreign engine supplied as a
+/// deferred [`ForeignSessionFactory`] (a profile whose `engine = Acp{agent}` resolved through the
+/// node's ACP catalog). Both present identically on the live surface — one merged log, one drain,
+/// one journal feeder — only the backend construction differs.
+// Built once per session open and consumed immediately by `ensure` — the variant size delta is
+// irrelevant, and boxing the Engine would leak into the builder closures for no benefit (mirrors
+// the fleet spawner's AgentBackend).
+#[allow(clippy::large_enum_variant)]
+pub enum SessionBackend {
+    /// The native in-process `daemon-core` engine (run on the §17 actor).
+    Core(Engine),
+    /// A foreign engine, materialized by the injected factory at `ensure` time.
+    Foreign(ForeignSessionFactory),
+}
 
 /// Resolve a session's effective [`EngineProfile`] from its bound profile ref + persisted overlay —
 /// the durable-path counterpart of [`SessionEngineBuilder`], injected into [`CoreEngineFactory`] by
@@ -247,6 +279,14 @@ pub trait AcpDiscovery: Send + Sync {
     /// Verify/enrich a single (manual) recipe by attempting the `initialize` handshake — fills in
     /// `installed` / `version` / `capabilities`. Returns the entry unchanged on a failed probe.
     async fn probe(&self, entry: daemon_api::AcpAgentEntry) -> daemon_api::AcpAgentEntry;
+    /// Resolve a curated builtin recipe by `name` WITHOUT the `initialize` probe: the recipe plus a
+    /// cheap PATH-presence `installed` check only. Backs the fast-path lookups that must not spawn
+    /// candidate processes (profile-engine validation, foreign-engine spawn resolution) when the
+    /// name is not among the durable manual registrations. `None` when the name is not curated.
+    fn builtin(&self, name: &str) -> Option<daemon_api::AcpAgentEntry> {
+        let _ = name;
+        None
+    }
 }
 
 /// The node interface implemented over a running [`crate::Host`].

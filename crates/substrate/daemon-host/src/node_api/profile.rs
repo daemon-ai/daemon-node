@@ -55,6 +55,7 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
+        self.validate_engine(&spec).await?;
         let id = spec.id.clone();
         let (provider, model) = (format!("{:?}", spec.provider), spec.model.clone());
         let store = self.profile_store()?;
@@ -81,6 +82,7 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_update(&self, spec: ProfileSpec) -> Result<(), ApiError> {
+        self.validate_engine(&spec).await?;
         let id = spec.id.clone();
         self.profile_store()?.update(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "update");
@@ -164,6 +166,9 @@ impl ProfileApi for NodeApiImpl {
         if let Some(id) = new_id {
             spec.id = id;
         }
+        // An imported distribution's engine binding is validated against THIS node's catalog: the
+        // exporting node's ACP agents do not necessarily exist here.
+        self.validate_engine(&spec).await?;
         let id = spec.id.clone();
         store.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "import");
@@ -369,6 +374,47 @@ impl NodeApiImpl {
         self.profiles
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("profile management not available".into()))
+    }
+
+    /// Resolve an ACP catalog entry by `name`: the merged catalog (durable manual registrations +
+    /// the last discovery scan) first, then the curated builtin recipe table via the injected
+    /// [`AcpDiscovery`](crate::AcpDiscovery) hook (a cheap PATH check, never an `initialize`
+    /// probe — validation must not spawn candidate processes). `None` when the node knows no such
+    /// agent. Profiles reference agents BY NAME ONLY, so this lookup is the sole recipe source.
+    pub(crate) async fn resolve_acp_entry(&self, name: &str) -> Option<daemon_api::AcpAgentEntry> {
+        if let Some(entry) = self
+            .acp_catalog()
+            .await
+            .into_iter()
+            .find(|e| e.name == name)
+        {
+            return Some(entry);
+        }
+        self.acp.as_ref().and_then(|acp| acp.builtin(name))
+    }
+
+    /// Validate a profile spec's engine selector before it is persisted (create/update/import):
+    /// an `Acp { agent }` binding must name an agent the node's ACP catalog knows AND that is
+    /// currently installed — otherwise the mutation fails fast with a clear error instead of
+    /// minting a profile whose sessions can never spawn. (Spawn re-checks installed-ness too,
+    /// since it can change after validation.) `Core` always passes.
+    pub(crate) async fn validate_engine(&self, spec: &ProfileSpec) -> Result<(), ApiError> {
+        let daemon_api::EngineSelector::Acp { agent } = &spec.engine else {
+            return Ok(());
+        };
+        let entry = self.resolve_acp_entry(agent).await.ok_or_else(|| {
+            ApiError::Other(format!(
+                "profile engine references unknown ACP agent `{agent}` — register it via \
+                 acp_register or run AcpDiscover first"
+            ))
+        })?;
+        if !entry.installed {
+            return Err(ApiError::Other(format!(
+                "ACP agent `{agent}` is not installed (catalog entry present, binary/endpoint \
+                 missing)"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve the spec for an explicit id, or the active default when `profile` is `None`.

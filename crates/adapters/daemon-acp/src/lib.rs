@@ -243,14 +243,27 @@ impl AcpDiscoverer {
 }
 
 /// Build an [`AcpLaunch`] from a wire [`daemon_api::AcpRecipe`]'s program + args + env (stdio agents
-/// only; an endpoint recipe has no local binary to spawn).
-fn launch_from_recipe(recipe: &daemon_api::AcpRecipe) -> Option<AcpLaunch> {
+/// only; an endpoint recipe has no local binary to spawn). Public so the node's foreign-engine
+/// resolution (profile `engine = Acp{agent}` -> catalog recipe -> spawn) reuses the exact mapping
+/// discovery uses.
+pub fn launch_from_recipe(recipe: &daemon_api::AcpRecipe) -> Option<AcpLaunch> {
     let program = recipe.program.as_ref()?;
     Some(
         AcpLaunch::new(program.clone())
             .args(recipe.args.clone())
             .env(recipe.env.clone()),
     )
+}
+
+/// Whether a recipe's stdio program currently resolves on `$PATH` (or as a direct path) — the
+/// cheap "is it installed *right now*?" re-check the foreign-engine spawn path runs, since
+/// installed-ness can change between profile validation and spawn. `false` for endpoint-only
+/// recipes (no local binary).
+pub fn recipe_installed(recipe: &daemon_api::AcpRecipe) -> bool {
+    recipe
+        .program
+        .as_deref()
+        .is_some_and(|program| which(program).is_some())
 }
 
 #[async_trait]
@@ -296,6 +309,26 @@ impl daemon_host::AcpDiscovery for AcpDiscoverer {
             }
         }
         entry
+    }
+
+    fn builtin(&self, name: &str) -> Option<daemon_api::AcpAgentEntry> {
+        // Recipe + PATH check only — deliberately NO initialize probe, so the validation /
+        // spawn-resolution fast path never spawns candidate processes.
+        let (agent, program, args) = CURATED.iter().find(|(agent, _, _)| *agent == name)?;
+        let recipe = daemon_api::AcpRecipe {
+            program: Some((*program).to_string()),
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            env: Vec::new(),
+            endpoint: None,
+        };
+        Some(daemon_api::AcpAgentEntry {
+            name: (*agent).to_string(),
+            installed: recipe_installed(&recipe),
+            recipe,
+            source: daemon_api::AcpSource::Builtin,
+            version: None,
+            capabilities: Vec::new(),
+        })
     }
 }
 

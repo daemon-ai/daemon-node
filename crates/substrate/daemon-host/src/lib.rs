@@ -112,8 +112,8 @@ pub use journal::{
 };
 pub use node_api::{
     decode_overlay, encode_overlay, AccountProvisioning, AcpDiscovery, CloudCatalog, DeliveryHost,
-    DurableProfileResolver, ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed,
-    ProvisionedAccount, SessionEngineBuilder,
+    DurableProfileResolver, ForeignSessionFactory, ModelProviderFactory, NodeApiImpl, NodeApiParts,
+    NodeEventFeed, ProvisionedAccount, SessionBackend, SessionEngineBuilder,
 };
 pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};

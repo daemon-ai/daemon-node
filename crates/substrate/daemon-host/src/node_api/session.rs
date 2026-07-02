@@ -115,7 +115,7 @@ impl SessionApi for NodeApiImpl {
         // Bind the explicit profile sticky-on-first-open (the same `ensure` seam `submit_routed`
         // uses), so a GUI can "open this chat as agent X" before the first turn submits.
         if profile.is_some() {
-            self.live.ensure(&session, profile).await;
+            self.live.ensure(&session, profile).await?;
         }
         self.note_activity(&session, &command).await;
         match origin {
@@ -148,7 +148,7 @@ impl SessionApi for NodeApiImpl {
         ) {
             self.live
                 .ensure(&resolved.session, resolved.profile.clone())
-                .await;
+                .await?;
             self.live
                 .seed_primary_target(&resolved.session, resolved.delivery.clone());
         }

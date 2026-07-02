@@ -72,11 +72,31 @@ impl NodeApiImpl {
     /// non-resident (durable) session is a no-op here — it picks the overlay up at its next
     /// (re)hydration. Tool-allowlist overrides are *not* hot-applied (the live registry is fixed for
     /// the actor's lifetime); they take effect on the next (re)hydration.
+    ///
+    /// A resident FOREIGN (ACP) session has no model provider to swap — a model/provider override
+    /// is refused explicitly (the profile's engine owns its own model). Its approval-mode override
+    /// IS honored: the shared `session_modes` map is what the ParkingHandler consults, for both
+    /// backend kinds.
     pub(crate) async fn apply_overlay_live(
         &self,
         session: &SessionId,
         overlay: &SessionOverlay,
     ) -> Result<(), ApiError> {
+        let foreign = self.live.resident_is_foreign(session) == Some(true);
+        if foreign && (overlay.model.is_some() || overlay.provider.is_some()) {
+            return Err(ApiError::Unsupported(
+                "a foreign-engine (ACP) session has no model provider to override".into(),
+            ));
+        }
+        if let Some(mode) = overlay.approval_mode {
+            let policy = approval_mode_to_policy(mode);
+            if let Some(handle) = self.live.handle_if_live(session) {
+                handle.set_approval_policy(policy).await;
+            }
+            if self.live.is_resident(session) {
+                self.session_modes.insert(session.clone(), policy);
+            }
+        }
         let Some(handle) = self.live.handle_if_live(session) else {
             return Ok(());
         };
@@ -89,11 +109,6 @@ impl NodeApiImpl {
             })?;
             overlay.apply_to(&mut spec);
             handle.set_provider((factory)(&spec)).await;
-        }
-        if let Some(mode) = overlay.approval_mode {
-            let policy = approval_mode_to_policy(mode);
-            handle.set_approval_policy(policy).await;
-            self.session_modes.insert(session.clone(), policy);
         }
         Ok(())
     }
