@@ -134,6 +134,10 @@ serde_yaml = "0.9"
 # merged session event log. Isolated to the `daemon-http` adapter crate so axum never leaks into the
 # host/core; toggled on like MCP at launch.
 axum = { version = "0.8", features = ["ws"] }
+# WebSocket carrier for the CBOR wire mux (`daemon-host` ws.rs, the browser/WASM client path).
+# Already resolved in the tree via axum's ws feature (same 0.29), so this adds no new crates. No
+# TLS features on purpose: `wss://` terminates at a reverse proxy for now.
+tokio-tungstenite = "0.29"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
