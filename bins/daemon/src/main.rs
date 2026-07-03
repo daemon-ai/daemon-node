@@ -1812,6 +1812,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let manager = Arc::new(
         ModelManager::new(ManagerConfig {
             cache_dir: cfg.models.cache_dir.clone(),
+            // HOME-less environments (containers/microvms): when neither `[models].cache_dir` nor
+            // the `HF_*`/XDG/`HOME` precedence resolves, cache under the daemon's own data dir
+            // (standard hub layout) instead of depending on a home directory existing.
+            fallback_cache_dir: Some(cfg.data_dir.join("huggingface").join("hub")),
             registry_path: cfg.models.registry_path.clone(),
             endpoint: cfg.models.endpoint.clone(),
             // Offline quantization runs out-of-process via the llama-enabled inference worker; reuse
@@ -2460,6 +2464,8 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
     };
     let manager = match ModelManager::new(ManagerConfig {
         cache_dir: cfg.models.cache_dir.clone(),
+        // Same HOME-less data-dir fallback as the host role (the child inherits the parent env).
+        fallback_cache_dir: Some(cfg.data_dir.join("huggingface").join("hub")),
         registry_path: cfg.models.registry_path.clone(),
         endpoint: cfg.models.endpoint.clone(),
         quantize_worker_bin: Some(cfg.infer.worker_bin.clone()),

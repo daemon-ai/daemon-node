@@ -125,6 +125,7 @@ async fn live_quantize_small_gguf() {
         registry_path: Some(cache_dir.join("catalog.json")),
         endpoint: None,
         quantize_worker_bin: Some(worker_bin.into()),
+        ..Default::default()
     })
     .await
     .expect("manager");

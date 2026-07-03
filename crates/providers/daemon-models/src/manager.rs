@@ -30,6 +30,10 @@ use crate::{gguf, recommend, resolve};
 pub struct ManagerConfig {
     /// The hub cache directory; `None` follows the `HF_*` / XDG precedence.
     pub cache_dir: Option<PathBuf>,
+    /// The last-resort hub cache directory when `cache_dir` is unset AND the `HF_*`/XDG/`HOME`
+    /// precedence resolves nothing (HOME-less containers/microvms). The daemon passes a directory
+    /// under its own data dir so boot never depends on a home directory existing.
+    pub fallback_cache_dir: Option<PathBuf>,
     /// The catalog manifest path; `None` places it next to the cache (`<hub>/daemon-catalog.json`).
     pub registry_path: Option<PathBuf>,
     /// The Hub endpoint; `None` uses the default (`https://huggingface.co`).
@@ -91,7 +95,7 @@ impl ModelManager {
 
     /// Build a manager over the shared cache + catalog.
     pub async fn new(config: ManagerConfig) -> Result<Self> {
-        let cache = CacheConfig::resolve(config.cache_dir);
+        let cache = CacheConfig::resolve_with_fallback(config.cache_dir, config.fallback_cache_dir);
         let client = match config.endpoint {
             Some(ep) => HfClient::with_endpoint(ep, cache.token.clone()),
             None => HfClient::new(cache.token.clone()),

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use daemon_common::{DownloadId, DownloadState, DownloadStatus, ModelRef, ModelSource};
 use hf_hub::api::tokio::{Api, ApiBuilder, Progress};
-use hf_hub::{Repo, RepoType};
+use hf_hub::{Cache, Repo, RepoType};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -113,9 +113,13 @@ pub struct Downloader {
 
 impl Downloader {
     /// Build a downloader over the shared cache (`cache.hub_dir`, `cache.token`).
+    ///
+    /// Built via `ApiBuilder::from_cache` on OUR resolved hub dir, never `ApiBuilder::new()`:
+    /// the latter eagerly probes the process home directory (`Cache::default()` →
+    /// `dirs::home_dir().expect(..)`) and PANICS in HOME-less environments (containers/microvms),
+    /// even though the probed value would be overridden by `with_cache_dir` right after.
     pub fn new(cache: &CacheConfig) -> Result<Self> {
-        let api = ApiBuilder::new()
-            .with_cache_dir(cache.hub_dir.clone())
+        let api = ApiBuilder::from_cache(Cache::new(cache.hub_dir.clone()))
             .with_token(cache.token.clone())
             // We render progress ourselves via the custom sink; suppress hf-hub's progress bar.
             .with_progress(false)

@@ -11,7 +11,7 @@
 //! assertion.
 //!
 //! It also gates the container/microvm launch contract: SIGTERM and SIGINT both trip the graceful
-//! shutdown (exit 0, shutdown log line, socket removed).
+//! shutdown (exit 0, shutdown log line, socket removed), and a HOME-less environment still boots.
 
 use std::io::Read;
 use std::path::Path;
@@ -232,6 +232,51 @@ fn sigterm_host_launch_shuts_down_gracefully() {
 #[test]
 fn sigint_host_launch_shuts_down_gracefully() {
     assert_graceful_shutdown_on(nix::sys::signal::Signal::SIGINT, "SIGINT");
+}
+
+/// A HOME-less environment (a container/microvm: no `HOME`, no `HF_*`/XDG variables) must still
+/// boot to ready — the model subsystem used to panic here inside hf-hub's eager home-directory
+/// probe (`ApiBuilder::new` → `Cache::default`), even with local inference unconfigured. The
+/// controlled base env (`env_clear`) already omits `HOME`; the explicit `env_remove` locks that in
+/// if the base env ever grows. (On dev machines the panic also needed a uid without a passwd
+/// entry — hf-hub falls back to getpwuid_r — so this gate guards the env-probe path; the fix
+/// removes the probe from the boot path entirely.)
+#[test]
+fn homeless_env_host_launch_boots_and_serves() {
+    let tmp = unique_tmp("daemon-host-homeless");
+    let _ = std::fs::create_dir_all(&tmp);
+    let socket = tmp.join("api.sock");
+    let mut cmd = host_command(&tmp, &socket, &[]);
+    cmd.env_remove("HOME");
+    let mut child = cmd.spawn().expect("spawn daemon binary");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut booted = false;
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break; // exited before serving — a fail-fast (or the old panic), not a boot
+        }
+        if socket.exists() {
+            booted = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut stderr = String::new();
+    if !booted {
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        booted,
+        "a HOME-less host launch must boot and serve; stderr:\n{stderr}"
+    );
 }
 
 /// A networked provider (`daemon_api`) with a model but no credential also BOOTS now — credentials
