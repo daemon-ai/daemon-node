@@ -33,4 +33,6 @@ mod routing_auth;
 mod sessions;
 mod tools_hitl;
 mod tree_roster;
+mod web_serve;
 mod wire_client;
+mod ws_transport;

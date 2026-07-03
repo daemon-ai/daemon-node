@@ -91,6 +91,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 # `figment::Jail` (hermetic, race-free env + temp-file fixtures) for the config-loading tests.
 figment = { workspace = true, features = ["test"] }
+# Raw SIGTERM/SIGINT delivery in the host-launch graceful-shutdown gate (`tests/host_launch.rs`).
+nix = { workspace = true }
 
 [lints]
 workspace = true

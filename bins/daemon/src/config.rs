@@ -452,7 +452,8 @@ pub struct McpConfig {
     pub servers: Vec<McpServerEntry>,
 }
 
-/// Tuning for the web tools (`daemon-tool-web`). `[web]` / `DAEMON_WEB__*`.
+/// The `[web]` table / `DAEMON_WEB__*`: the web *tools* tuning (`daemon-tool-web`) and — an
+/// independent knob sharing the table name — the single-origin browser web front (`addr`/`root`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
@@ -466,6 +467,14 @@ pub struct WebConfig {
     pub tavily_key_id: String,
     /// The credential-profile id the Firecrawl scraper key is read from.
     pub firecrawl_key_id: String,
+    /// Bind address of the single-origin browser listener: serves the Qt WASM app bundle
+    /// (`root`) as static files AND the same authenticated mux-over-WebSocket carrier on `/ws`,
+    /// so the GUI loads from — and connects back to — one origin with no CORS configuration.
+    /// `None` (the default) keeps it off. Independent of `enable` (the web tools).
+    pub addr: Option<String>,
+    /// The app bundle directory served as static files (required when `addr` is set; must exist
+    /// at startup — its contents are scanned once at boot).
+    pub root: Option<PathBuf>,
 }
 
 impl Default for WebConfig {
@@ -475,6 +484,8 @@ impl Default for WebConfig {
             local_fallback: true,
             tavily_key_id: "tavily".to_string(),
             firecrawl_key_id: "firecrawl".to_string(),
+            addr: None,
+            root: None,
         }
     }
 }
@@ -595,6 +606,17 @@ pub struct ApiConfig {
     pub require_client_cert: bool,
     /// PEM CA bundle trusted to sign client certs (required with `require_client_cert`).
     pub tls_client_ca: Option<PathBuf>,
+    /// Plain-WebSocket bind address for the browser (Qt WASM) mux carrier; `None` (the default)
+    /// keeps it off. The listener always requires SASL authentication (never local-trusted);
+    /// `wss://` is expected to terminate at a reverse proxy for now.
+    pub ws_addr: Option<String>,
+    /// Origins allowed to upgrade on the WebSocket listener, matched against the HTTP `Origin`
+    /// header when a browser sends one. Empty (the default) rejects every browser origin;
+    /// non-browser clients send no `Origin` and are deliberately unaffected — the origin gate is
+    /// a browser CSRF defense (browsers stamp the header; page script cannot forge it), while a
+    /// non-browser client could stamp any allow-listed value anyway, so it is gated by the
+    /// listener's mandatory SASL authentication instead.
+    pub ws_allowed_origins: Vec<String>,
     /// SQLite identity store path (`None` => `<data_dir>/auth.sqlite`; see [`NodeConfig::auth_db`]).
     pub auth_db: Option<PathBuf>,
     /// The local-trust principal for the Unix socket / FFI / in-process HTTP. `Some(name)` (default
@@ -611,6 +633,8 @@ impl Default for ApiConfig {
             tls_key: None,
             require_client_cert: false,
             tls_client_ca: None,
+            ws_addr: None,
+            ws_allowed_origins: Vec::new(),
             auth_db: None,
             local_trust: Some("system".to_string()),
         }
@@ -1069,6 +1093,28 @@ pub fn config_reference() -> String {
          uppercased with `__` between table levels (e.g. `python.op_timeout_ms` \u{2190} \
          `DAEMON_PYTHON__OP_TIMEOUT_MS`).\n\n",
     );
+    out.push_str(
+        "The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` \
+         only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse \
+         proxy in front of it for now. Browser connections must additionally match \
+         `api.ws_allowed_origins` (empty = every browser origin is refused). An upgrade without \
+         an `Origin` header (a non-browser client) is accepted by design: the origin allow-list \
+         is a browser CSRF defense — browsers stamp the header and page script cannot forge it — \
+         while a non-browser client controls its own headers and could present any allow-listed \
+         origin anyway, so it is gated by the mandatory authentication instead.\n\n",
+    );
+    out.push_str(
+        "Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves \
+         the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle \
+         directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — \
+         the browser loads the GUI from the daemon and connects back to the same origin, so \
+         same-origin upgrades need no origin configuration (an `Origin` matching the request's \
+         own `Host` is accepted automatically; `api.ws_allowed_origins` grants extra cross-origin \
+         allowance). Static files are public; the api still requires SASL. The bundle directory \
+         is scanned once at startup (restart to pick up new files), and `https://`/`wss://` \
+         terminate at a reverse proxy for now — behind one, add the public origin to \
+         `api.ws_allowed_origins` (the derived self-origin is `http://`).\n\n",
+    );
     out.push_str("| TOML path | Environment variable | Type | Default |\n");
     out.push_str("|-----------|----------------------|------|---------|\n");
     for (path, env, ty, default) in &rows {
@@ -1207,6 +1253,31 @@ mod tests {
             assert_eq!(cfg.python.op_timeout, Duration::from_millis(5000));
             assert_eq!(cfg.engine.model_retry_attempts, 4);
             assert!(matches!(cfg.store_backend(), StoreBackend::Sqlite { .. }));
+            Ok(())
+        });
+    }
+
+    // The web-front listener knobs ride the standard env mapping (off by default).
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    #[test]
+    fn web_front_env_overrides_extract() {
+        let defaults =
+            NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
+                .expect("defaults must extract");
+        assert_eq!(defaults.web.addr, None, "the web front defaults to off");
+        assert_eq!(defaults.web.root, None);
+
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DAEMON_WEB__ADDR", "127.0.0.1:8787");
+            jail.set_env("DAEMON_WEB__ROOT", "/srv/daemon-app");
+            let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
+                .unwrap_or_else(|e| panic!("env layer must extract: {e:#}"));
+            assert_eq!(cfg.web.addr.as_deref(), Some("127.0.0.1:8787"));
+            assert_eq!(cfg.web.root, Some(PathBuf::from("/srv/daemon-app")));
+            assert!(
+                !cfg.web.enable,
+                "the listener is independent of the web tools"
+            );
             Ok(())
         });
     }

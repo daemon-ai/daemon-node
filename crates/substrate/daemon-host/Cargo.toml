@@ -46,6 +46,10 @@ rsasl = { workspace = true }
 # TLS for the TCP api transport (tls.rs). PEM cert/key loading uses the maintained `PemObject`
 # reader re-exported by rustls' pki-types (no separate rustls-pemfile dep).
 tokio-rustls = { workspace = true }
+# The plain-WebSocket carrier for the same mux (ws.rs): one binary WS message per CBOR frame, for
+# browser (Qt WASM) clients that cannot open Unix sockets or raw TLS TCP. Already in the tree via
+# axum's ws feature; wss termination is a reverse proxy's job, so no TLS features here.
+tokio-tungstenite = { workspace = true }
 # content hashing for the append-only profile/skill revision log (content-addressed snapshot blobs).
 sha2 = { workspace = true }
 # HMAC-SHA256 for deterministic decoy SCRAM material (anti-oracle) + OS entropy for the decoy secret.

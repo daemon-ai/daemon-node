@@ -4,6 +4,10 @@ This file is generated from `NodeConfig` (the single source of truth) by `daemon
 
 Configuration is layered by [figment](https://docs.rs/figment), later sources winning: built-in defaults, then an optional TOML file (`$DAEMON_CONFIG`), then environment variables, then CLI flags. Every environment variable is `DAEMON_` + the TOML path uppercased with `__` between table levels (e.g. `python.op_timeout_ms` ← `DAEMON_PYTHON__OP_TIMEOUT_MS`).
 
+The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse proxy in front of it for now. Browser connections must additionally match `api.ws_allowed_origins` (empty = every browser origin is refused). An upgrade without an `Origin` header (a non-browser client) is accepted by design: the origin allow-list is a browser CSRF defense — browsers stamp the header and page script cannot forge it — while a non-browser client controls its own headers and could present any allow-listed origin anyway, so it is gated by the mandatory authentication instead.
+
+Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — the browser loads the GUI from the daemon and connects back to the same origin, so same-origin upgrades need no origin configuration (an `Origin` matching the request's own `Host` is accepted automatically; `api.ws_allowed_origins` grants extra cross-origin allowance). Static files are public; the api still requires SASL. The bundle directory is scanned once at startup (restart to pick up new files), and `https://`/`wss://` terminate at a reverse proxy for now — behind one, add the public origin to `api.ws_allowed_origins` (the derived self-origin is `http://`).
+
 | TOML path | Environment variable | Type | Default |
 |-----------|----------------------|------|---------|
 | `api.auth_db` | `DAEMON_API__AUTH_DB` | optional | _(unset)_ |
@@ -13,6 +17,8 @@ Configuration is layered by [figment](https://docs.rs/figment), later sources wi
 | `api.tls_cert` | `DAEMON_API__TLS_CERT` | optional | _(unset)_ |
 | `api.tls_client_ca` | `DAEMON_API__TLS_CLIENT_CA` | optional | _(unset)_ |
 | `api.tls_key` | `DAEMON_API__TLS_KEY` | optional | _(unset)_ |
+| `api.ws_addr` | `DAEMON_API__WS_ADDR` | optional | _(unset)_ |
+| `api.ws_allowed_origins` | `DAEMON_API__WS_ALLOWED_ORIGINS` | array | `[]` |
 | `base_url` | `DAEMON_BASE_URL` | optional | _(unset)_ |
 | `blob_root` | `DAEMON_BLOB_ROOT` | optional | _(unset)_ |
 | `browser.approve_navigation` | `DAEMON_BROWSER__APPROVE_NAVIGATION` | bool | `false` |
@@ -109,8 +115,10 @@ Configuration is layered by [figment](https://docs.rs/figment), later sources wi
 | `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
 | `store` | `DAEMON_STORE` | string | `memory` |
 | `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |
+| `web.addr` | `DAEMON_WEB__ADDR` | optional | _(unset)_ |
 | `web.enable` | `DAEMON_WEB__ENABLE` | bool | `false` |
 | `web.firecrawl_key_id` | `DAEMON_WEB__FIRECRAWL_KEY_ID` | string | `firecrawl` |
 | `web.local_fallback` | `DAEMON_WEB__LOCAL_FALLBACK` | bool | `true` |
+| `web.root` | `DAEMON_WEB__ROOT` | optional | _(unset)_ |
 | `web.tavily_key_id` | `DAEMON_WEB__TAVILY_KEY_ID` | string | `tavily` |
 | `workspace_root` | `DAEMON_WORKSPACE_ROOT` | optional | _(unset)_ |

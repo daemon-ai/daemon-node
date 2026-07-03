@@ -94,6 +94,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 async fn manager_over(dir: &std::path::Path, endpoint: String) -> ModelManager {
     ModelManager::new(ManagerConfig {
         cache_dir: Some(dir.join("hub")),
+        fallback_cache_dir: None,
         registry_path: Some(dir.join("catalog.json")),
         endpoint: Some(endpoint),
         quantize_worker_bin: None,

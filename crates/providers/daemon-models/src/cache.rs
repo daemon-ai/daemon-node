@@ -13,8 +13,11 @@
 //! 2. `HF_HUB_CACHE`,
 //! 3. `HF_HOME`/`hub`,
 //! 4. `XDG_CACHE_HOME`/`huggingface`/`hub`,
-//! 5. `~/.cache/huggingface/hub`.
+//! 5. `~/.cache/huggingface/hub`,
+//! 6. a caller-supplied last resort for HOME-less environments (containers/microvms) — the daemon
+//!    passes a directory under its own data dir, so a missing `HOME` never breaks boot.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The resolved Hugging Face cache + token the daemon shares with the engine sidecars.
@@ -30,7 +33,19 @@ impl CacheConfig {
     /// Resolve the cache config, honoring an explicit `configured` hub directory then the standard
     /// `HF_*` environment precedence.
     pub fn resolve(configured: Option<PathBuf>) -> Self {
-        let hub_dir = configured.unwrap_or_else(default_hub_dir);
+        Self::resolve_with_fallback(configured, None)
+    }
+
+    /// [`CacheConfig::resolve`] with an explicit **last-resort** hub directory for HOME-less
+    /// environments (containers/microvms): it is used only when no directory is configured, none
+    /// of the `HF_*`/XDG variables is set, and `HOME` is missing — every populated environment
+    /// resolves exactly as before. `None` keeps the prior last resort (a cwd-relative
+    /// `./.cache/huggingface/hub`).
+    pub fn resolve_with_fallback(
+        configured: Option<PathBuf>,
+        last_resort: Option<PathBuf>,
+    ) -> Self {
+        let hub_dir = configured.unwrap_or_else(|| default_hub_dir(last_resort));
         Self {
             hub_dir,
             token: resolve_token(),
@@ -51,21 +66,38 @@ impl CacheConfig {
 }
 
 /// The default hub cache directory following the `HF_*` / XDG precedence.
-fn default_hub_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE") {
+fn default_hub_dir(last_resort: Option<PathBuf>) -> PathBuf {
+    default_hub_dir_from(|key| std::env::var_os(key), last_resort)
+}
+
+/// [`default_hub_dir`] over an injected environment lookup, so the precedence — including the
+/// HOME-less container case — is unit-testable without mutating the process environment.
+fn default_hub_dir_from(
+    env: impl Fn(&str) -> Option<OsString>,
+    last_resort: Option<PathBuf>,
+) -> PathBuf {
+    let set = |key: &str| env(key).filter(|v| !v.is_empty());
+    if let Some(dir) = set("HF_HUB_CACHE") {
         return PathBuf::from(dir);
     }
-    if let Some(home) = std::env::var_os("HF_HOME") {
+    if let Some(home) = set("HF_HOME") {
         return PathBuf::from(home).join("hub");
     }
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+    if let Some(xdg) = set("XDG_CACHE_HOME") {
         return PathBuf::from(xdg).join("huggingface").join("hub");
     }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache")
-        .join("huggingface")
-        .join("hub")
+    if let Some(home) = set("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub");
+    }
+    last_resort.unwrap_or_else(|| {
+        PathBuf::from(".")
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
+    })
 }
 
 /// The Hugging Face token: `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN` env, else the token file under the
@@ -89,9 +121,13 @@ fn resolve_token() -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-/// The user's home directory (`$HOME`), if known.
+/// The user's home directory (`$HOME`), if known. Empty counts as unset (containers often clear
+/// rather than unset it); never consults the passwd database, so the answer matches what the
+/// hub-dir precedence saw.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -107,5 +143,66 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "HF_HUB_CACHE" && v == "/tmp/some-cache"));
         assert!(env.iter().any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1"));
+    }
+
+    /// A synthetic environment for the injected-lookup precedence tests (no process-env mutation,
+    /// so the tests are hermetic and parallel-safe).
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn hub_dir_precedence_follows_hf_then_xdg_then_home() {
+        let all = [
+            ("HF_HUB_CACHE", "/hf-hub-cache"),
+            ("HF_HOME", "/hf-home"),
+            ("XDG_CACHE_HOME", "/xdg"),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(
+            default_hub_dir_from(env_of(&all), None),
+            PathBuf::from("/hf-hub-cache")
+        );
+        assert_eq!(
+            default_hub_dir_from(env_of(&all[1..]), None),
+            PathBuf::from("/hf-home/hub")
+        );
+        assert_eq!(
+            default_hub_dir_from(env_of(&all[2..]), None),
+            PathBuf::from("/xdg/huggingface/hub")
+        );
+        assert_eq!(
+            default_hub_dir_from(env_of(&all[3..]), None),
+            PathBuf::from("/home/u/.cache/huggingface/hub")
+        );
+    }
+
+    /// The container case: nothing set at all. The caller-supplied last resort (the daemon's
+    /// data-dir fallback) is used; without one the prior cwd-relative default remains.
+    #[test]
+    fn homeless_environment_uses_the_last_resort() {
+        assert_eq!(
+            default_hub_dir_from(env_of(&[]), Some(PathBuf::from("/data/huggingface/hub"))),
+            PathBuf::from("/data/huggingface/hub")
+        );
+        assert_eq!(
+            default_hub_dir_from(env_of(&[]), None),
+            PathBuf::from("./.cache/huggingface/hub")
+        );
+    }
+
+    /// Empty values count as unset (containers often clear rather than unset variables).
+    #[test]
+    fn empty_environment_values_count_as_unset() {
+        let empties = [("HF_HUB_CACHE", ""), ("HF_HOME", ""), ("HOME", "")];
+        assert_eq!(
+            default_hub_dir_from(env_of(&empties), Some(PathBuf::from("/data/hub"))),
+            PathBuf::from("/data/hub")
+        );
     }
 }

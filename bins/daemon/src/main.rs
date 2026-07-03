@@ -223,9 +223,9 @@ async fn main() -> anyhow::Result<()> {
 /// given credential-ref. Writes to the durable `FileCredentialStore` the host reads at startup.
 async fn run_matrix_login(homeserver: &str, credential_ref: &str) -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
-    // Login implies persistence: write to the same on-disk credential store the host reads.
-    std::fs::create_dir_all(&cfg.data_dir)
-        .map_err(|e| anyhow::anyhow!("creating data dir {}: {e}", cfg.data_dir.display()))?;
+    // Login implies persistence: write to the same on-disk credential store the host reads,
+    // through the same single creation helper the host boot uses (private on create).
+    ensure_data_dir(&cfg.data_dir)?;
     let credential_store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::open(
         cfg.data_dir.join("credentials.json"),
     )?);
@@ -1712,16 +1712,76 @@ fn emit_generated_admin(cfg: &NodeConfig, username: &str, password: &str) {
     );
 }
 
+/// Register the shutdown-signal listeners and return the future that resolves (to the signal
+/// name, for the shutdown log line) when one arrives: SIGINT (`ctrl_c`) everywhere, plus SIGTERM
+/// on unix — container runtimes (`docker stop`, Fly Machines, systemd) send SIGTERM first, so it
+/// must trip the same graceful shutdown instead of running into the stop timeout + SIGKILL.
+/// SIGTERM registration happens at the *call* (the top of `run_as_host`), not at the await: a
+/// stop that lands while the node is still assembling is queued on the signal stream instead of
+/// hitting the default disposition (killed, unclean exit).
+#[cfg(unix)]
+fn shutdown_signal(
+) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<&'static str>>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                Ok("SIGINT")
+            }
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    })
+}
+
+/// Non-unix fallback: only `ctrl_c` is portable (registered lazily on first poll, as before).
+#[cfg(not(unix))]
+fn shutdown_signal(
+) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<&'static str>>> {
+    Ok(async {
+        tokio::signal::ctrl_c().await?;
+        Ok("ctrl_c")
+    })
+}
+
+/// Ensure the data directory exists before anything under it is opened — the sqlite store,
+/// credentials.json, the auth db, blobs, workspaces, revisions, profiles, and checkpoints all
+/// hang off it, and none of their opens creates parent directories. Creation is recursive, and
+/// on unix every directory *created here* is private (0700 — the tree holds `auth.sqlite` and
+/// journal seeds); a directory that already exists is left completely untouched (recursive
+/// create skips existing components and never chmods), so operator-managed setups keep their
+/// permissions. A failure is an early, path-naming boot error.
+fn ensure_data_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .map_err(|e| anyhow::anyhow!("creating data dir {}: {e}", dir.display()))
+}
+
 /// Assemble and run the default host node, serving the unified surface over a Unix socket until
-/// `ctrl_c` trips a graceful shutdown. The wiring itself lives in [`daemon_node::assemble`]; this
-/// role only builds the policy inputs (store, credentials, provider registry, engine tunables).
+/// a shutdown signal (SIGINT/`ctrl_c`, or SIGTERM on unix) trips a graceful shutdown. The wiring
+/// itself lives in [`daemon_node::assemble`]; this role only builds the policy inputs (store,
+/// credentials, provider registry, engine tunables).
 async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
+    // Listen for shutdown signals from the very start (see `shutdown_signal` on why this is
+    // registered before any listener is bound rather than where it is awaited below).
+    let shutdown = shutdown_signal()?;
     // Boot resolution (no silent mock default): an unset provider boots UNCONFIGURED (`None` — the
     // node installs `UnconfiguredProvider` and serves; a turn then fails clearly). An explicitly-set
     // networked provider (`genai`/`daemon_api`) still requires a model (else a deliberate misconfig
     // aborts). A credential is NOT required at boot — it arrives per-profile via `CredentialSet`. The
     // resolved `Option<ProviderKind>` is threaded into provider construction below.
     let provider_kind = cfg.resolve_for_host()?;
+    // The ONE data-dir creation point for the host role: everything below (store, credential
+    // store, auth db, blobs, workspaces, ...) opens paths under it and assumes it exists.
+    ensure_data_dir(&cfg.data_dir)?;
     let store = build_store(&cfg.store_backend())?;
 
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.
@@ -1779,6 +1839,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let manager = Arc::new(
         ModelManager::new(ManagerConfig {
             cache_dir: cfg.models.cache_dir.clone(),
+            // HOME-less environments (containers/microvms): when neither `[models].cache_dir` nor
+            // the `HF_*`/XDG/`HOME` precedence resolves, cache under the daemon's own data dir
+            // (standard hub layout) instead of depending on a home directory existing.
+            fallback_cache_dir: Some(cfg.data_dir.join("huggingface").join("hub")),
             registry_path: cfg.models.registry_path.clone(),
             endpoint: cfg.models.endpoint.clone(),
             // Offline quantization runs out-of-process via the llama-enabled inference worker; reuse
@@ -2108,13 +2172,71 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 tls_listener,
                 server_config,
                 node.clone(),
-                authenticator,
+                authenticator.clone(),
             )))
         }
         (Some(_), _, _) => {
             anyhow::bail!("[api].tls_addr is set but [api].tls_cert / [api].tls_key are missing")
         }
         _ => None,
+    };
+
+    // The plain-WebSocket mux carrier (opt-in via `[api].ws_addr`) for browser (Qt WASM) clients:
+    // the same CBOR mux, one binary message per frame, subprotocol `daemon-mux`, authentication
+    // ALWAYS required (never local-trusted). Browser origins are gated by
+    // `[api].ws_allowed_origins`; wss:// terminates at a reverse proxy for now.
+    let ws_server = match &cfg.api.ws_addr {
+        Some(addr) => {
+            let ws_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                %addr,
+                allowed_origins = ?cfg.api.ws_allowed_origins,
+                "serving daemon-api over WebSocket (subprotocol daemon-mux, authentication required)"
+            );
+            Some(tokio::spawn(daemon_host::serve_mux_ws(
+                ws_listener,
+                node.clone(),
+                authenticator.clone(),
+                cfg.api.ws_allowed_origins.clone(),
+            )))
+        }
+        None => None,
+    };
+
+    // The single-origin web front (opt-in via `[web].addr`): ONE listener serving the Qt WASM app
+    // bundle (`[web].root`, scanned once at startup) as static files AND the same mux-over-
+    // WebSocket carrier on `/ws` — the browser loads the GUI from the daemon and connects back to
+    // the same origin, so same-origin upgrades need zero origin config (`[api].ws_allowed_origins`
+    // adds extra cross-origin allowance). Static files are public; `/ws` still requires SASL.
+    let web_server = match &cfg.web.addr {
+        Some(addr) => {
+            let root = cfg.web.root.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[web].addr is set but [web].root is missing (set it to the wasm app bundle directory)"
+                )
+            })?;
+            let site = daemon_host::WebRoot::scan(root).map_err(|e| {
+                anyhow::anyhow!(
+                    "[web].root {} is not a servable directory: {e}",
+                    root.display()
+                )
+            })?;
+            let web_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                %addr,
+                root = %root.display(),
+                files = site.len(),
+                "serving web app bundle + daemon-api WebSocket at /ws (single origin, authentication required)"
+            );
+            Some(tokio::spawn(daemon_host::serve_web(
+                web_listener,
+                site,
+                node.clone(),
+                authenticator.clone(),
+                cfg.api.ws_allowed_origins.clone(),
+            )))
+        }
+        None => None,
     };
 
     // Optionally bind the in-process HTTP/WS surface (the `daemon-http` adapter), toggled on by a
@@ -2164,11 +2286,17 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         None => None,
     };
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("ctrl_c received; shutting down");
+    let signal = shutdown.await?;
+    tracing::info!(signal, "shutdown signal received; shutting down");
     server.abort();
     if let Some(tls_server) = tls_server {
         tls_server.abort();
+    }
+    if let Some(ws_server) = ws_server {
+        ws_server.abort();
+    }
+    if let Some(web_server) = web_server {
+        web_server.abort();
     }
     if let Some(http_server) = http_server {
         http_server.abort();
@@ -2370,6 +2498,8 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
     };
     let manager = match ModelManager::new(ManagerConfig {
         cache_dir: cfg.models.cache_dir.clone(),
+        // Same HOME-less data-dir fallback as the host role (the child inherits the parent env).
+        fallback_cache_dir: Some(cfg.data_dir.join("huggingface").join("hub")),
         registry_path: cfg.models.registry_path.clone(),
         endpoint: cfg.models.endpoint.clone(),
         quantize_worker_bin: Some(cfg.infer.worker_bin.clone()),

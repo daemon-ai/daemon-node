@@ -247,6 +247,7 @@ async fn projector_records_are_excluded_and_activate_rejects() {
     }
     let manager = daemon_models::ModelManager::new(daemon_models::ManagerConfig {
         cache_dir: Some(dir.join("hub")),
+        fallback_cache_dir: None,
         registry_path: Some(registry_path),
         endpoint: None,
         quantize_worker_bin: None,

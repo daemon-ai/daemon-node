@@ -103,6 +103,10 @@ encoding_rs = "0.8"
 mistralrs = { version = "0.8", default-features = false }
 # in-process mock HTTP server for provider wire tests (no live network in the suite).
 wiremock = "0.6"
+# (dev) raw signal delivery for the graceful-shutdown launch gate: SIGTERM/SIGINT sent to the real
+# spawned binary exactly the way a container runtime stops it. Already resolved in the tree
+# (transitively); test-only, never compiled into a shipped artifact.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 # Hugging Face Hub client for model acquisition into the shared cache (async tokio API + rustls).
 # Same crate (and cache layout) mistral.rs uses, so a warmed cache is read by the mistralrs engine.
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
@@ -137,6 +141,10 @@ serde_yaml = "0.9"
 # merged session event log. Isolated to the `daemon-http` adapter crate so axum never leaks into the
 # host/core; toggled on like MCP at launch.
 axum = { version = "0.8", features = ["ws"] }
+# WebSocket carrier for the CBOR wire mux (`daemon-host` ws.rs, the browser/WASM client path).
+# Already resolved in the tree via axum's ws feature (same 0.29), so this adds no new crates. No
+# TLS features on purpose: `wss://` terminates at a reverse proxy for now.
+tokio-tungstenite = "0.29"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
