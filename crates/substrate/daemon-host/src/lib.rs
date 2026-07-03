@@ -63,6 +63,7 @@ pub mod supervisor;
 pub mod tls;
 pub mod transcript;
 pub mod unit;
+pub mod web;
 pub mod workspace_fs;
 pub mod ws;
 
@@ -136,6 +137,7 @@ pub use supervisor::{
 pub use tls::{build_server_config, serve_api_tls_tcp, ApiTlsConfig, TlsConfigError};
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use unit::{EngineUnit, RewindHooks};
+pub use web::{serve_web, WebRoot};
 pub use workspace_fs::{WorkspaceFs, WorkspaceRoots};
 pub use ws::{serve_mux_ws, WS_SUBPROTOCOL};
 

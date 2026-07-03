@@ -70,13 +70,7 @@ pub async fn serve_mux_ws(
                 tokio::spawn(async move {
                     match accept_mux_upgrade(stream, &allowed).await {
                         Ok(ws) => {
-                            let mode = Arc::new(AuthMode::Required {
-                                auth,
-                                tls_state: TlsState::plaintext(),
-                            });
-                            let (wr, rd) = split_frames(ws);
-                            if let Err(e) = serve_mux(rd, wr, api, mode, None, next_conn_id()).await
-                            {
+                            if let Err(e) = serve_mux_over_ws(ws, api, auth).await {
                                 tracing::debug!("ws api connection ended: {e}");
                             }
                         }
@@ -92,6 +86,26 @@ pub async fn serve_mux_ws(
             }
         }
     }
+}
+
+/// Serve the unchanged mux loop over one *accepted* (post-upgrade) WebSocket, in the carrier's
+/// fixed security posture: [`AuthMode::Required`] (never local-trusted) with a plaintext
+/// [`TlsState`] (SCRAM only). Shared by the standalone `[api].ws_addr` listener above and the
+/// single-origin web front ([`crate::web`]), so both `/ws` paths are byte-identical on the wire.
+pub(crate) async fn serve_mux_over_ws<S>(
+    ws: WebSocketStream<S>,
+    api: Arc<dyn NodeApi>,
+    auth: Arc<Authenticator>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mode = Arc::new(AuthMode::Required {
+        auth,
+        tls_state: TlsState::plaintext(),
+    });
+    let (wr, rd) = split_frames(ws);
+    serve_mux(rd, wr, api, mode, None, next_conn_id()).await
 }
 
 /// Run the WebSocket server handshake with the mux upgrade gate applied: the policy callback
@@ -110,10 +124,12 @@ async fn accept_mux_upgrade(
 
 /// The handshake callback: extract `Origin` + the requested subprotocols from the upgrade request,
 /// run the pure [`negotiate_upgrade`] policy, and either echo the negotiated subprotocol on the
-/// 101 response or refuse with the policy's HTTP status.
+/// 101 response or refuse with the policy's HTTP status. `pub(crate)` so the single-origin web
+/// front ([`crate::web`]) applies the *same* gate, with its derived self-origin appended to the
+/// allow-list.
 // tungstenite's `Callback` trait dictates the `Result<Response, ErrorResponse>` shape; not ours to shrink.
 #[allow(clippy::result_large_err)]
-fn apply_upgrade_policy(
+pub(crate) fn apply_upgrade_policy(
     req: &Request,
     mut resp: Response,
     allowed_origins: &[String],
