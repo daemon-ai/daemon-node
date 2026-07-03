@@ -367,6 +367,8 @@ mod tests {
     async fn vector_recall_surfaces_semantic_match_through_provider() {
         // Pin the stored memory and the query to the same vector, and a distractor orthogonal — all
         // with content that shares NO tokens with the query, so only the vector path can match.
+        // Working-memory candidates are lexically gated (`beam.py` L5313), so the pure semantic
+        // match must come from the episodic tier: consolidate before recalling.
         let stored = "[USER] the deployment uses a blue-green rollout";
         let distractor = "[USER] lunch yesterday was margherita pizza";
         let query = "shipping strategy";
@@ -379,7 +381,7 @@ mod tests {
             ],
         ));
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
-        let provider = MnemosyneProvider::with_embedder(engine, embedder);
+        let provider = MnemosyneProvider::with_embedder(engine.clone(), embedder);
         let conv = Conversation::new(SystemPrompt::new(""));
 
         provider
@@ -394,6 +396,7 @@ mod tests {
                 &conv,
             )
             .await;
+        engine.consolidate().unwrap();
 
         let block = provider
             .recall(&RecallQuery {

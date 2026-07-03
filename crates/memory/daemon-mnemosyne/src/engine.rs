@@ -12,8 +12,9 @@
 //! [`Engine::consolidate`] is a minimal WM->episodic promotion (no LLM summarization/degradation).
 //! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain port-spec P1 work.
 
-use crate::config::{MnemosyneConfig, RecallScope};
+use crate::config::{MnemosyneConfig, RecallFilters, RecallScope};
 use crate::error::Result;
+use crate::recall::diagnostics::RecallDiagnostics;
 use crate::recall::query_cache::QueryCache;
 use crate::store::Store;
 use std::sync::OnceLock;
@@ -124,21 +125,29 @@ pub struct SleepReport {
     pub tier2_to_tier3: usize,
 }
 
-/// Which BEAM tier a row lives in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Which BEAM tier a recall row came from (`beam.py` result `tier` labels).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// Hot, recent, auto-injected context.
+    #[default]
     Working,
     /// Long-term consolidated memory.
     Episodic,
+    /// The MEMORIA structured-fact supplement row (`beam.py` L6023).
+    Memoria,
+    /// A working row surfaced as a MEMORIA fact source (`beam.py` L6049).
+    MemoriaSource,
+    /// A structured `fact_recall` row merged into recall output (`beam.py` L6167).
+    Fact,
 }
 
-/// A recalled / stored memory row (the `recall` result shape, `beam.py` L5996+).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// A recalled / stored memory row (the `recall` result dict shape, `beam.py` L5344-L5366).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MemoryRow {
     /// Memory id.
     pub id: String,
-    /// Content text.
+    /// Content text (recall truncates to 500 chars, `beam.py` L5346).
     pub content: String,
     /// Ingestion source.
     pub source: String,
@@ -152,10 +161,49 @@ pub struct MemoryRow {
     pub trust_tier: String,
     /// Which tier the row came from.
     pub tier: Tier,
-    /// The episodic tier level (`1`/`2`/`3`); working rows are always `1` (`beam.py` L5931).
+    /// The episodic degradation tier (`1`/`2`/`3`); working rows are always `1` (`beam.py` L5960).
     pub tier_level: i64,
-    /// The recall score (0 for direct fetches).
+    /// The recall score (0 for direct fetches), rounded to 4 places.
     pub score: f64,
+    /// The lexical relevance signal that fed the score (`keyword_score`).
+    #[serde(default)]
+    pub keyword_score: f64,
+    /// The dense/vector similarity signal (`dense_score`).
+    #[serde(default)]
+    pub dense_score: f64,
+    /// The FTS5 signal (`fts_score`).
+    #[serde(default)]
+    pub fts_score: f64,
+    /// The recency decay factor applied (`recency_decay`).
+    #[serde(default)]
+    pub recency_decay: f64,
+    /// Times this row has been recalled (`recall_count`).
+    #[serde(default)]
+    pub recall_count: i64,
+    /// When this row was last recalled (`last_recalled`).
+    #[serde(default)]
+    pub last_recalled: Option<String>,
+    /// Row scope (`session`/`global`).
+    #[serde(default)]
+    pub scope: String,
+    /// Multi-agent author id, when stamped.
+    #[serde(default)]
+    pub author_id: Option<String>,
+    /// Multi-agent author type, when stamped.
+    #[serde(default)]
+    pub author_type: Option<String>,
+    /// Multi-agent channel id, when stamped.
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// Row expiry; recall admits rows with `valid_until > now` (`beam.py` L5177).
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// Whether the entity-aware pass matched/boosted this row (`entity_match`).
+    #[serde(default)]
+    pub entity_match: bool,
+    /// Whether the fact-aware pass matched/boosted this row (`fact_match`).
+    #[serde(default)]
+    pub fact_match: bool,
 }
 
 /// An unresolved `(subject, predicate)` contradiction awaiting LLM validation in sleep.
@@ -231,26 +279,8 @@ pub struct RecallReq<'a> {
     pub query_vector: Option<&'a [f32]>,
     /// The multi-agent recall scope.
     pub scope: &'a RecallScope,
-}
-
-/// Per-tier candidate-gathering context for [`Engine::gather_working`] / [`Engine::gather_episodic`]:
-/// the tokenized/entity-extracted query, the candidate caps, the lexical floor, the query vector,
-/// the `(vec, fts, importance)` blend weights, and the recall scope.
-pub(crate) struct GatherCtx<'a> {
-    pub q_tokens: &'a [String],
-    pub q_entities: &'a [String],
-    pub top_k: usize,
-    pub floor: f64,
-    pub query_vector: Option<&'a [f32]>,
-    pub weights: (f64, f64, f64),
-    pub scope: &'a RecallScope,
-}
-
-/// Entity-seeded candidate-injection context for [`Engine::inject_entity_candidates`].
-pub(crate) struct EntityInjectCtx<'a> {
-    pub q_entities: &'a [String],
-    pub present: &'a std::collections::HashSet<String>,
-    pub scope: &'a RecallScope,
+    /// Row filters + temporal scoring knobs (`beam.py` `recall` kwargs).
+    pub filters: RecallFilters,
 }
 
 /// Arguments for [`Engine::triple_add`] — a temporal-triple upsert.
@@ -352,6 +382,9 @@ pub struct Engine {
     device_id: OnceLock<String>,
     /// Monotonic per-process disambiguator for event ids minted within the same instant.
     event_seq: std::sync::atomic::AtomicU64,
+    /// Recall path provenance counters (`recall_diagnostics.py`; Python's process-global
+    /// singleton, owned per engine here).
+    recall_diag: RecallDiagnostics,
 }
 
 impl Engine {
@@ -365,6 +398,7 @@ impl Engine {
             query_cache: OnceLock::new(),
             device_id: OnceLock::new(),
             event_seq: std::sync::atomic::AtomicU64::new(0),
+            recall_diag: RecallDiagnostics::default(),
         })
     }
 
@@ -378,7 +412,13 @@ impl Engine {
             query_cache: OnceLock::new(),
             device_id: OnceLock::new(),
             event_seq: std::sync::atomic::AtomicU64::new(0),
+            recall_diag: RecallDiagnostics::default(),
         })
+    }
+
+    /// The recall path provenance counters (`recall_diagnostics.py` `get_diagnostics`).
+    pub fn recall_diagnostics(&self) -> &RecallDiagnostics {
+        &self.recall_diag
     }
 
     /// The lazily-opened query cache (`query_cache.db` next to the bank when persistent, else
@@ -421,6 +461,4 @@ mod tests;
 #[cfg(all(feature = "vec-ext", test))]
 pub(crate) use query::native_cosine_sim_map;
 pub(crate) use query::{cosine_sim_map, load_embeddings};
-pub(crate) use recall::age_hours;
-#[cfg(test)]
-pub(crate) use recall::lexical_relevance;
+pub use recall::FactHit;

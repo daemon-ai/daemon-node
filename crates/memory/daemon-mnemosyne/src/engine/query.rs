@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! SQL row-access layer for the BEAM [`Engine`]: scoped scan/fetch over the working and episodic
-//! tiers, FTS5 match execution, binary-vector loading, recall-stat bumps, the result-row mappers,
-//! and the embedding cosine maps. Split out of `engine.rs` (W-MNEMO).
+//! SQL row-access layer for the BEAM [`Engine`]: scoped single-row fetches over the working and
+//! episodic tiers, the per-row recall-stat bump used by the polyphonic pipeline, and the embedding
+//! cosine maps. Split out of `engine.rs` (W-MNEMO). The linear recall pipeline owns its own
+//! candidate SQL in `engine/recall.rs` (the faithful `beam.py` port).
 
 use super::*;
 use crate::config::RecallScope;
@@ -12,7 +13,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection};
 use std::collections::HashMap;
 
-/// The working-tier result projection shared by the scan/fetch paths (`id, content, source,
+/// The working-tier result projection shared by the fetch paths (`id, content, source,
 /// timestamp, importance, veracity, trust_tier`).
 const WORKING_SELECT: &str =
     "SELECT id, content, source, timestamp, importance, veracity, trust_tier FROM working_memory";
@@ -21,101 +22,26 @@ const WORKING_SELECT: &str =
 const EPISODIC_SELECT: &str = "SELECT id, content, source, timestamp, importance, veracity, \
      trust_tier, tier FROM episodic_memory";
 
-/// A tier's scoped-query recipe: its `SELECT ... FROM <table>` projection, the recall scope to
-/// filter by, and the row mapper. Bundles the stable params shared by [`Engine::scoped_scan`] /
-/// [`Engine::scoped_fetch`] so neither helper carries an excess argument count.
-struct TierQuery<'a> {
-    select_from: &'static str,
-    scope: &'a RecallScope,
-    map: fn(&rusqlite::Row<'_>) -> MemoryRow,
-}
-
-impl<'a> TierQuery<'a> {
-    fn working(scope: &'a RecallScope) -> Self {
-        Self {
-            select_from: WORKING_SELECT,
-            scope,
-            map: working_row,
-        }
-    }
-
-    fn episodic(scope: &'a RecallScope) -> Self {
-        Self {
-            select_from: EPISODIC_SELECT,
-            scope,
-            map: episodic_row,
-        }
-    }
-}
-
 impl Engine {
-    /// Run an FTS5 `MATCH` query (`sql` selecting `(id, bm25)`), returning `id -> normalized BM25`
-    /// for the hits. An empty token list (or a query with no usable terms) yields no hits.
-    pub(crate) fn fts_search(
-        &self,
-        conn: &Connection,
-        sql: &str,
-        q_tokens: &[String],
-        limit: usize,
-    ) -> Result<HashMap<String, f64>> {
-        let Some(match_str) = fts_match_string(q_tokens) else {
-            return Ok(HashMap::new());
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let mut map = HashMap::new();
-        let rows = stmt.query_map(params![match_str, limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-        })?;
-        for row in rows {
-            let (id, bm25) = row?;
-            map.insert(id, normalize_bm25(bm25));
-        }
-        Ok(map)
-    }
-
-    /// Recency/importance fallback scan over a tier (the candidate floor), filtered by the
-    /// multi-agent recall scope. Shared by the working/episodic scans.
-    fn scoped_scan(
-        &self,
-        conn: &Connection,
-        spec: &TierQuery,
-        limit: usize,
-    ) -> Result<Vec<MemoryRow>> {
-        let (scope_sql, scope_params) = self.scope_clause(spec.scope);
-        let sql = format!(
-            "{} \
-             WHERE (valid_until IS NULL) AND superseded_by IS NULL{scope_sql} \
-             ORDER BY importance DESC, timestamp DESC LIMIT ?",
-            spec.select_from,
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut bind = scope_params;
-        bind.push(Value::Integer(limit as i64));
-        let map = spec.map;
-        let rows = stmt
-            .query_map(params_from_iter(bind), |r| Ok(map(r)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Fetch a single row by id (for FTS hits beyond the fallback window), scope-filtered. Shared by
-    /// the working/episodic single-row fetches.
+    /// Fetch a single row by id from a tier, scope-filtered. Shared by the working/episodic
+    /// single-row fetches.
     fn scoped_fetch(
         &self,
         conn: &Connection,
-        spec: &TierQuery,
+        select_from: &str,
+        map: fn(&rusqlite::Row<'_>) -> MemoryRow,
+        scope: &RecallScope,
         id: &str,
     ) -> Result<Option<MemoryRow>> {
-        let (scope_sql, scope_params) = self.scope_clause(spec.scope);
+        let (scope_sql, scope_params) = self.scope_clause(scope);
         let sql = format!(
-            "{} \
-             WHERE id = ? AND (valid_until IS NULL) AND superseded_by IS NULL{scope_sql}",
-            spec.select_from,
+            "{select_from} \
+             WHERE id = ? AND (valid_until IS NULL OR valid_until > ?) \
+             AND superseded_by IS NULL{scope_sql}",
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut bind = vec![Value::Text(id.to_string())];
+        let mut bind = vec![Value::Text(id.to_string()), Value::Text(util::now_iso())];
         bind.extend(scope_params);
-        let map = spec.map;
         let mut rows = stmt.query_map(params_from_iter(bind), |r| Ok(map(r)))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -123,73 +49,35 @@ impl Engine {
         }
     }
 
-    /// Recency/importance fallback scan over working memory (the candidate floor), scope-filtered.
-    pub(crate) fn scan_working(
-        &self,
-        conn: &Connection,
-        limit: usize,
-        scope: &RecallScope,
-    ) -> Result<Vec<MemoryRow>> {
-        self.scoped_scan(conn, &TierQuery::working(scope), limit)
-    }
-
-    /// Fetch a single working row by id (for FTS hits beyond the fallback window), scope-filtered.
+    /// Fetch a single live working row by id, scope-filtered.
     pub(crate) fn fetch_working(
         &self,
         conn: &Connection,
         id: &str,
         scope: &RecallScope,
     ) -> Result<Option<MemoryRow>> {
-        self.scoped_fetch(conn, &TierQuery::working(scope), id)
+        self.scoped_fetch(conn, WORKING_SELECT, working_row, scope, id)
     }
 
-    /// Recency/importance fallback scan over episodic memory, scope-filtered.
-    pub(crate) fn scan_episodic(
-        &self,
-        conn: &Connection,
-        limit: usize,
-        scope: &RecallScope,
-    ) -> Result<Vec<MemoryRow>> {
-        self.scoped_scan(conn, &TierQuery::episodic(scope), limit)
-    }
-
-    /// Fetch a single episodic row by id (for FTS hits beyond the fallback window), scope-filtered.
+    /// Fetch a single live episodic row by id, scope-filtered.
     pub(crate) fn fetch_episodic(
         &self,
         conn: &Connection,
         id: &str,
         scope: &RecallScope,
     ) -> Result<Option<MemoryRow>> {
-        self.scoped_fetch(conn, &TierQuery::episodic(scope), id)
-    }
-
-    /// Load the packed MIB `binary_vector` blobs for episodic rows, keyed by memory id.
-    pub(crate) fn load_binary_vectors(
-        &self,
-        conn: &Connection,
-    ) -> Result<HashMap<String, Vec<u8>>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, binary_vector FROM episodic_memory WHERE binary_vector IS NOT NULL",
-        )?;
-        let mut map = HashMap::new();
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        for row in rows {
-            let (id, blob) = row?;
-            map.insert(id, blob);
-        }
-        Ok(map)
+        self.scoped_fetch(conn, EPISODIC_SELECT, episodic_row, scope, id)
     }
 
     /// Bump `recall_count` / `last_recalled` for the returned rows in their source tier (`beam.py`
-    /// L6084-L6119).
+    /// L6084-L6119). Used by the polyphonic pipeline; the linear path batches its own scoped bump.
     pub(crate) fn bump_recall(&self, conn: &Connection, rows: &[MemoryRow]) -> Result<()> {
         let now = util::now_iso();
         for row in rows {
             let table = match row.tier {
                 Tier::Working => "working_memory",
                 Tier::Episodic => "episodic_memory",
+                Tier::Memoria | Tier::MemoriaSource | Tier::Fact => continue,
             };
             conn.execute(
                 &format!(
@@ -303,7 +191,7 @@ fn working_row(r: &rusqlite::Row<'_>) -> MemoryRow {
         trust_tier,
         tier: Tier::Working,
         tier_level: 1,
-        score: 0.0,
+        ..Default::default()
     }
 }
 
@@ -321,26 +209,6 @@ fn episodic_row(r: &rusqlite::Row<'_>) -> MemoryRow {
         trust_tier,
         tier: Tier::Episodic,
         tier_level: r.get::<_, Option<i64>>(7).ok().flatten().unwrap_or(1),
-        score: 0.0,
+        ..Default::default()
     }
-}
-
-/// Build an FTS5 `MATCH` expression from query tokens (`"a" OR "b" OR ...`), quoting each term so
-/// punctuation/operators can never break the query. `None` when there are no usable terms.
-fn fts_match_string(q_tokens: &[String]) -> Option<String> {
-    if q_tokens.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = q_tokens
-        .iter()
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
-        .collect();
-    Some(parts.join(" OR "))
-}
-
-/// Map SQLite FTS5 `bm25()` (more-negative = better) onto `[0, 1)` (`raw / (1 + raw)`), so a missed
-/// row contributes `0` and a strong match approaches `1`.
-fn normalize_bm25(bm25: f64) -> f64 {
-    let raw = (-bm25).max(0.0);
-    raw / (1.0 + raw)
 }

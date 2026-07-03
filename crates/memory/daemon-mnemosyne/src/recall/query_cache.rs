@@ -325,13 +325,13 @@ mod tests {
             id: id.to_string(),
             content: format!("content {id}"),
             source: "test".to_string(),
-            timestamp: String::new(),
             importance: 0.5,
             veracity: "stated".to_string(),
             trust_tier: "STATED".to_string(),
             tier: Tier::Working,
             tier_level: 1,
             score: 1.0,
+            ..Default::default()
         }
     }
 

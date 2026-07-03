@@ -260,11 +260,28 @@ pub async fn dispatch(
             if let Some(v) = s(&args, "channel_id") {
                 scope.channel_id = Some(v.to_string());
             }
+            // Row filters + temporal knobs (`beam.py` `recall` kwargs; full tool-schema parity is
+            // Phase 7, but the engine seam accepts them today).
+            let filters = crate::config::RecallFilters {
+                from_date: s(&args, "from_date").map(String::from),
+                to_date: s(&args, "to_date").map(String::from),
+                source: s(&args, "source").map(String::from),
+                topic: s(&args, "topic").map(String::from),
+                veracity: s(&args, "veracity").map(String::from),
+                memory_type: s(&args, "memory_type").map(String::from),
+                temporal_weight: args
+                    .get("temporal_weight")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                query_time: s(&args, "query_time").map(String::from),
+                temporal_halflife: args.get("temporal_halflife").and_then(|v| v.as_f64()),
+            };
             match engine.recall_with_scope(&RecallReq {
                 query,
                 top_k,
                 query_vector: query_vec.as_deref(),
                 scope: &scope,
+                filters,
             }) {
                 Ok(rows) => {
                     let results: Vec<Value> = rows

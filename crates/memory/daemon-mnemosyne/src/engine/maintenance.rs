@@ -6,7 +6,6 @@
 //! `engine.rs` (W-MNEMO).
 
 use super::*;
-use crate::config::RecallScope;
 use crate::util;
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -14,14 +13,46 @@ use serde_json::json;
 impl Engine {
     // ── Tool-surface backing methods (`beam.py` get/update/forget/invalidate/validate/stats/...) ──
 
-    /// Fetch a single live memory by id, working tier first then episodic (`beam.py` `get`).
+    /// Fetch a single memory by id — a pure read with no recall bump and no validity filter
+    /// (`beam.py` `get` L3855-L3911): the session-scoped working row first, then the
+    /// session-or-global episodic row.
     pub fn get(&self, id: &str) -> Result<Option<MemoryRow>> {
         let conn = self.store.conn.lock().unwrap();
-        let scope = RecallScope::default();
-        if let Some(row) = self.fetch_working(&conn, id, &scope)? {
-            return Ok(Some(row));
+        let map = |tier: Tier| {
+            move |r: &rusqlite::Row<'_>| -> rusqlite::Result<MemoryRow> {
+                Ok(MemoryRow {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    source: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    timestamp: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    importance: r.get::<_, Option<f64>>(4)?.unwrap_or(0.5),
+                    veracity: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    scope: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    tier,
+                    tier_level: 1,
+                    ..Default::default()
+                })
+            }
+        };
+        let working = conn
+            .query_row(
+                "SELECT id, content, source, timestamp, importance, veracity, scope \
+                 FROM working_memory WHERE id = ?1 AND session_id = ?2",
+                params![id, self.config.session_id],
+                map(Tier::Working),
+            )
+            .ok();
+        if working.is_some() {
+            return Ok(working);
         }
-        self.fetch_episodic(&conn, id, &scope)
+        Ok(conn
+            .query_row(
+                "SELECT id, content, source, timestamp, importance, veracity, scope \
+                 FROM episodic_memory WHERE id = ?1 AND (session_id = ?2 OR scope = 'global')",
+                params![id, self.config.session_id],
+                map(Tier::Episodic),
+            )
+            .ok())
     }
 
     /// Update a memory's `content` and/or `importance` in whichever tier holds it (`beam.py`
@@ -66,60 +97,86 @@ impl Engine {
         }
     }
 
+    /// Update a session-scoped working-memory row's `content` and/or `importance` (`beam.py`
+    /// `update_working` L3809-L3853). FTS stays in sync via the `wm_au` trigger; on a content
+    /// change the stale dense embedding is dropped so vector recall can't serve outdated state
+    /// (Python re-embeds inline; the sync engine defers that to the async provider/tool layer).
+    /// Returns whether a row changed.
     pub fn update(&self, id: &str, content: Option<&str>, importance: Option<f64>) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
-        let mut changed = false;
-        for table in ["working_memory", "episodic_memory"] {
-            if let Some(c) = content {
-                changed |= conn.execute(
-                    &format!("UPDATE {table} SET content = ?2 WHERE id = ?1"),
-                    params![id, c],
-                )? > 0;
-            }
-            if let Some(imp) = importance {
-                changed |= conn.execute(
-                    &format!("UPDATE {table} SET importance = ?2 WHERE id = ?1"),
-                    params![id, imp],
-                )? > 0;
-            }
+        let mut sets: Vec<&str> = Vec::new();
+        let mut bind: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(c) = content {
+            sets.push("content = ?");
+            bind.push(rusqlite::types::Value::Text(c.to_string()));
         }
-        if changed {
+        if let Some(imp) = importance {
+            sets.push("importance = ?");
+            bind.push(rusqlite::types::Value::Real(imp));
+        }
+        if sets.is_empty() {
+            return Ok(false);
+        }
+        bind.push(rusqlite::types::Value::Text(id.to_string()));
+        bind.push(rusqlite::types::Value::Text(self.config.session_id.clone()));
+        let affected = conn.execute(
+            &format!(
+                "UPDATE working_memory SET {} WHERE id = ? AND session_id = ?",
+                sets.join(", ")
+            ),
+            rusqlite::params_from_iter(bind),
+        )?;
+        if content.is_some() && affected > 0 {
+            conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+            )?;
+        }
+        if affected > 0 {
             self.audit(&conn, "update", Some(id), None);
         }
-        Ok(changed)
+        Ok(affected > 0)
     }
 
-    /// Hard-delete a memory from both tiers plus its stored embedding (`beam.py` `forget`). FTS rows
-    /// are removed by the delete triggers. Returns whether anything was deleted.
+    /// Hard-delete a working-memory row plus its derived state (`beam.py` `forget_working`
+    /// L3913-L3958): the session-or-global-scoped delete is the authorization boundary for the
+    /// annotation/embedding cascade (E6.a). FTS rows are removed by the delete trigger. Returns
+    /// whether anything was deleted.
     pub fn forget(&self, id: &str) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
-        let mut deleted = conn.execute("DELETE FROM working_memory WHERE id = ?1", params![id])?;
-        deleted += conn.execute("DELETE FROM episodic_memory WHERE id = ?1", params![id])?;
-        conn.execute(
-            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
-            params![id],
+        let deleted = conn.execute(
+            "DELETE FROM working_memory WHERE id = ?1 AND (session_id = ?2 OR scope = 'global')",
+            params![id, self.config.session_id],
         )?;
         if deleted > 0 {
+            conn.execute("DELETE FROM annotations WHERE memory_id = ?1", params![id])?;
+            conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+            )?;
             self.audit(&conn, "forget", Some(id), None);
         }
         Ok(deleted > 0)
     }
 
     /// Soft-invalidate a memory: stamp `valid_until` now and point `superseded_by` at an optional
-    /// replacement (`beam.py` `invalidate` L7725). The row drops out of recall (which filters
-    /// `valid_until IS NULL AND superseded_by IS NULL`). Returns whether a row changed.
+    /// replacement (`beam.py` `invalidate` L3610-L3632), session-or-global scoped, working tier
+    /// first. The row drops out of recall (which filters validity). Returns whether a row changed.
     pub fn invalidate(&self, id: &str, replacement_id: Option<&str>) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
         let now = util::now_iso();
         let mut changed = false;
         for table in ["working_memory", "episodic_memory"] {
-            changed |= conn.execute(
+            changed = conn.execute(
                 &format!(
                     "UPDATE {table} SET valid_until = ?2, superseded_by = ?3 \
-                     WHERE id = ?1 AND valid_until IS NULL"
+                     WHERE id = ?1 AND (session_id = ?4 OR scope = 'global')"
                 ),
-                params![id, now, replacement_id],
+                params![id, now, replacement_id, self.config.session_id],
             )? > 0;
+            if changed {
+                break;
+            }
         }
         if changed {
             let reason = replacement_id.map(|r| format!("superseded_by={r}"));

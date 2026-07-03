@@ -5,6 +5,7 @@
 //! default; enhanced/polyphonic/SHMR are opt-in).
 
 pub mod diagnostics;
+pub mod lexical;
 pub mod mmr;
 pub mod polyphonic;
 pub mod query_cache;

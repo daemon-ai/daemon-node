@@ -132,7 +132,7 @@ impl Engine {
                  (id, content, source, timestamp, session_id, importance, metadata_json, veracity, \
                   memory_type, tier, binary_vector, scope, trust_tier, summary_of, \
                   event_date, event_date_precision, temporal_tags) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, '', ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, ?15, ?12, ?13, ?14)",
                 params![
                     ep_id,
                     seed.content,
@@ -148,7 +148,19 @@ impl Engine {
                     seed.event_date,
                     seed.event_date_precision,
                     seed.temporal_tags,
+                    // summary_of: the source wm id (comma format) so recall's cross-tier dedup can
+                    // link the promoted copy back to its still-live working row.
+                    seed.wm_id,
                 ],
+            )?;
+            // Carry the dense embedding over to the episodic id (Python embeds consolidation
+            // output, `beam.py` L4030): episodic vector recall joins `memory_embeddings` on the
+            // episodic id, so without this copy the promoted row would be invisible to the vec
+            // voice.
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_embeddings (memory_id, embedding_json, model) \
+                 SELECT ?2, embedding_json, model FROM memory_embeddings WHERE memory_id = ?1",
+                params![seed.wm_id, ep_id],
             )?;
             conn.execute(
                 "UPDATE working_memory SET consolidated_at = ?2 WHERE id = ?1",
@@ -331,7 +343,9 @@ impl Engine {
                 };
                 let ep_id =
                     util::memory_id(&format!("episodic:{}:{}", self.config.session_id, summary));
-                let summary_of = serde_json::to_string(&group.ids)?;
+                // Comma-joined source ids (`beam.py` `consolidate_to_episodic` L4001); recall's
+                // cross-tier dedup splits on ",".
+                let summary_of = group.ids.join(",");
                 conn.execute(
                     "INSERT OR IGNORE INTO episodic_memory \
                      (id, content, source, timestamp, session_id, importance, metadata_json, \

@@ -571,6 +571,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &empty,
+            filters: Default::default(),
         })
         .unwrap()
         .iter()
@@ -589,6 +590,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &author_scope,
+            filters: Default::default(),
         })
         .unwrap();
     assert!(
@@ -608,6 +610,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &other_author,
+            filters: Default::default(),
         })
         .unwrap()
         .is_empty(),
@@ -625,6 +628,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &channel_scope,
+            filters: Default::default(),
         })
         .unwrap();
     assert!(
@@ -636,29 +640,96 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
 }
 
 #[test]
-fn vector_recall_surfaces_semantic_match_lexical_misses() {
+fn wm_vector_signal_blends_but_lexical_gates() {
     let e = engine();
-    // A query vector, one near-parallel memory vector (cos ~0.96) and one orthogonal — with
-    // content that shares NO tokens with the query, so lexical recall finds nothing.
     let q = [1.0f32, 0.0, 0.0];
     let near = [0.96f32, 0.28, 0.0];
     let far = [0.0f32, 0.0, 1.0];
-    e.remember_with_vector("alpha apple", &RememberArgs::default(), Some(&near), "mock")
-        .unwrap();
-    e.remember_with_vector("beta banana", &RememberArgs::default(), Some(&far), "mock")
-        .unwrap();
+    // Two rows with identical lexical relevance for the query; only the vectors differ.
+    e.remember_with_vector(
+        "apple pie recipe",
+        &RememberArgs::default(),
+        Some(&near),
+        "mock",
+    )
+    .unwrap();
+    e.remember_with_vector(
+        "apple tart recipe",
+        &RememberArgs::default(),
+        Some(&far),
+        "mock",
+    )
+    .unwrap();
 
-    // Lexical-only recall for a disjoint query returns nothing.
-    assert!(e.recall("zzz", 5).unwrap().is_empty());
+    // Working-memory candidates are lexically gated (`beam.py` L5313): a vector-only match with
+    // zero lexical relevance is dropped — pure semantic matches surface via the episodic tier.
+    assert!(e.recall_with_vector("zzz", 5, Some(&q)).unwrap().is_empty());
 
-    // Vector recall surfaces the semantically-close memory and ranks it first.
-    let hits = e.recall_with_vector("zzz", 5, Some(&q)).unwrap();
-    assert!(!hits.is_empty(), "vector recall should surface a match");
-    assert_eq!(hits[0].content, "alpha apple");
+    // With lexical parity, the dense blend (`base*0.8 + sim*0.2`, `beam.py` L5321-L5323) breaks
+    // the tie toward the semantically-close row.
+    let hits = e.recall_with_vector("apple recipe", 5, Some(&q)).unwrap();
+    assert_eq!(hits.len(), 2, "both rows pass the lexical gate");
+    assert_eq!(hits[0].content, "apple pie recipe");
+    assert!(hits[0].dense_score > hits[1].dense_score);
+}
+
+#[test]
+fn wm_score_matches_python_reference_formula() {
+    // Golden check against the live Python engine (BeamMemory.recall on a fresh bank):
+    //   remember("the database password rotation policy runs monthly"); recall("database password")
+    //   -> score 0.53232, keyword_score 1.0, fts_score 1.0, dense_score 0.0.
+    // Composition: base = 1.0*0.48 + 0.5*0.2 + 1.0^2*0.08 = 0.66; score = base * (0.32 + 0.68*decay)
+    // * veracity(unknown)=0.8. With decay ~= 1.0 for a fresh row -> ~0.5282 (Python's 0.53232
+    // reflects its local-vs-utc timestamp skew inflating decay slightly above 1.0).
+    let e = engine();
+    e.remember(
+        "the database password rotation policy runs monthly",
+        &RememberArgs::default(),
+    )
+    .unwrap();
+    let hits = e.recall("database password", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    let h = &hits[0];
+    assert_eq!(h.keyword_score, 1.0);
+    assert_eq!(h.fts_score, 1.0);
+    assert_eq!(h.dense_score, 0.0);
     assert!(
-        hits.iter().all(|h| h.content != "beta banana"),
-        "orthogonal memory must not pass the vector gate"
+        (h.score - 0.5282).abs() < 0.005,
+        "score {} should match the Python formula chain",
+        h.score
     );
+}
+
+#[test]
+fn recall_diagnostics_record_paths_and_fallbacks() {
+    let e = engine();
+    // Miss on an EMPTY bank: both fallbacks fire with zero scanned rows -> truly empty.
+    assert!(e.recall("zzz qqq", 5).unwrap().is_empty());
+    e.remember("kubernetes deploy pipeline", &RememberArgs::default())
+        .unwrap();
+    // Hit: the FTS path contributes the kept WM row.
+    assert!(!e.recall("kubernetes pipeline", 5).unwrap().is_empty());
+    // Miss over a non-empty bank: the fallback scan credits its scanned candidates even though
+    // the relevance gate kept none (`beam.py` L5366-L5370), so this is NOT truly empty.
+    assert!(e.recall("zzz qqq", 5).unwrap().is_empty());
+
+    let snap = e.recall_diagnostics().snapshot();
+    assert_eq!(snap.totals.calls, 3);
+    assert_eq!(snap.totals.calls_truly_empty, 1);
+    let wm_fts = &snap.by_tier[0];
+    assert_eq!(wm_fts.0, "wm_fts");
+    assert_eq!(wm_fts.1.calls_with_hits, 1);
+    let wm_fallback = &snap.by_tier[2];
+    assert_eq!(wm_fallback.0, "wm_fallback");
+    assert_eq!(
+        wm_fallback.1.total_hits, 1,
+        "the non-empty miss scanned one fallback candidate"
+    );
+    assert_eq!(snap.totals.calls_using_wm_fallback, 2);
+    assert!((snap.totals.wm_fallback_rate - 2.0 / 3.0).abs() < 1e-9);
+
+    e.recall_diagnostics().reset();
+    assert_eq!(e.recall_diagnostics().snapshot().totals.calls, 0);
 }
 
 #[test]
@@ -686,18 +757,24 @@ fn get_context_orders_by_importance() {
 
 #[test]
 fn lexical_relevance_scores() {
+    use crate::recall::lexical::lexical_relevance;
     let q = vec!["auth".to_string(), "flow".to_string()];
     // Both tokens present as whole words + full-query substring -> clamped to 1.0.
-    assert!((lexical_relevance(&q, "the auth flow uses jwt") - 1.0).abs() < 1e-9);
+    assert!((lexical_relevance(&q, "the auth flow uses jwt", "auth flow") - 1.0).abs() < 1e-9);
     // One exact token of two -> 0.5.
-    assert!((lexical_relevance(&q, "the auth subsystem") - 0.5).abs() < 1e-9);
+    assert!((lexical_relevance(&q, "the auth subsystem", "auth flow") - 0.5).abs() < 1e-9);
     // A >=4-char substring (no whole-word match, and the full query is not a substring)
     // contributes the 0.4 partial: one of two tokens at 0.4 -> 0.2.
     let q2 = vec!["serialize".to_string(), "absent".to_string()];
-    assert!((lexical_relevance(&q2, "the deserializer ran") - 0.2).abs() < 1e-9);
+    assert!(
+        (lexical_relevance(&q2, "the deserializer ran", "serialize absent") - 0.2).abs() < 1e-9
+    );
     // Disjoint query -> 0.0; empty query -> 0.0.
-    assert_eq!(lexical_relevance(&q, "completely unrelated"), 0.0);
-    assert_eq!(lexical_relevance(&[], "anything"), 0.0);
+    assert_eq!(
+        lexical_relevance(&q, "completely unrelated", "auth flow"),
+        0.0
+    );
+    assert_eq!(lexical_relevance(&[], "anything", ""), 0.0);
 }
 
 #[test]
@@ -1129,9 +1206,11 @@ fn tool_backing_methods_round_trip() {
     assert_eq!(status, crate::knowledge::canonical::Status::Created);
     assert_eq!(e.canonical_recall("ada", None, None).unwrap().len(), 1);
 
-    // Invalidate drops it from recall surface.
+    // Invalidate drops it from the recall surface, but `get` stays a pure read that still returns
+    // the row (`beam.py` `get` L3855-L3911 applies no validity filter).
     assert!(e.invalidate(&id, None).unwrap());
-    assert!(e.get(&id).unwrap().is_none());
+    assert!(e.get(&id).unwrap().is_some());
+    assert!(e.recall("updated fact", 5).unwrap().is_empty());
 
     // Forget hard-deletes.
     let id2 = e.remember("ephemeral", &RememberArgs::default()).unwrap();

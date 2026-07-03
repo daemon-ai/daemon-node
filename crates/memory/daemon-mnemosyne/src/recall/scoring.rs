@@ -12,9 +12,6 @@ pub const DEFAULT_WEIGHTS: (f64, f64, f64) = (0.5, 0.3, 0.2);
 /// Recency half-life in hours (`RECENCY_HALFLIFE_HOURS`, `beam.py` L1202).
 pub const RECENCY_HALFLIFE_HOURS: f64 = 168.0;
 
-/// Episodic tier weights `T1/T2/T3` (`beam.py` L5931).
-pub const TIER_WEIGHTS: [f64; 3] = [1.0, 0.5, 0.25];
-
 /// Normalize `(vec, fts, importance)` to sum 1.0, clamping negatives (`beam.py` L1157-L1183).
 pub fn normalize_weights(vw: f64, fw: f64, iw: f64) -> (f64, f64, f64) {
     let vw = vw.max(0.0);
@@ -29,8 +26,14 @@ pub fn normalize_weights(vw: f64, fw: f64, iw: f64) -> (f64, f64, f64) {
 
 /// Exponential recency decay `exp(-age_hours / halflife)`; unknown age -> 0.5 (`beam.py` L1202-L1214).
 pub fn recency_decay(age_hours: Option<f64>) -> f64 {
+    recency_decay_hl(age_hours, RECENCY_HALFLIFE_HOURS)
+}
+
+/// [`recency_decay`] with an explicit half-life (the engine passes the configured
+/// `recency_halflife_hours`; Python reads the env once at import).
+pub fn recency_decay_hl(age_hours: Option<f64>, halflife_hours: f64) -> f64 {
     match age_hours {
-        Some(age) => (-age / RECENCY_HALFLIFE_HOURS).exp(),
+        Some(age) => (-age / halflife_hours).exp(),
         None => 0.5,
     }
 }
@@ -93,25 +96,6 @@ pub fn working_memory_score(
     base * (rc_share + (1.0 - rc_share) * decay)
 }
 
-/// Blend the FTS5 signal into lexical relevance (`beam.py` L5314): once a row clears the lexical
-/// floor, take `max(lexical, 0.75*lexical + 0.25*normalized_fts)` so a strong BM25 match can lift a
-/// thin token overlap. Below the floor the raw `lexical` is returned unchanged (the row only
-/// survives via the vector / FTS candidate gate, where `vec_sim` drives the score).
-pub fn blend_fts(lexical: f64, normalized_fts: f64, floor: f64) -> f64 {
-    if lexical >= floor {
-        lexical.max(0.75 * lexical + 0.25 * normalized_fts)
-    } else {
-        lexical
-    }
-}
-
-/// The episodic tier multiplier for a 1-based tier level (`T1=1.0, T2=0.5, T3=0.25`, `beam.py`
-/// L5931). Out-of-range levels clamp to the nearest defined tier.
-pub fn tier_weight(tier: i64) -> f64 {
-    let idx = (tier.max(1) as usize - 1).min(TIER_WEIGHTS.len() - 1);
-    TIER_WEIGHTS[idx]
-}
-
 /// Graph bonus `min(edge_count * 0.02, 0.08)` (`beam.py` L5779).
 pub fn graph_bonus(edge_count: usize) -> f64 {
     (edge_count as f64 * 0.02).min(0.08)
@@ -155,23 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn fts_lifts_thin_lexical_above_floor() {
-        // Above the floor, a strong BM25 signal raises the blended relevance over raw lexical...
-        let blended = blend_fts(0.5, 1.0, 0.3);
-        assert!((blended - (0.75 * 0.5 + 0.25 * 1.0)).abs() < 1e-9);
-        assert!(blended > 0.5);
-        // ...but a row below the floor keeps its raw lexical (it only survives via vec/FTS gate).
-        assert_eq!(blend_fts(0.1, 1.0, 0.3), 0.1);
-        // A weak FTS signal never drags relevance below the raw lexical (max() guard).
-        assert_eq!(blend_fts(0.8, 0.0, 0.3), 0.8);
-    }
-
-    #[test]
-    fn tier_weight_clamps_to_table() {
-        assert_eq!(tier_weight(1), 1.0);
-        assert_eq!(tier_weight(2), 0.5);
-        assert_eq!(tier_weight(3), 0.25);
-        assert_eq!(tier_weight(0), 1.0); // clamp low
-        assert_eq!(tier_weight(9), 0.25); // clamp high
+    fn decay_halflife_is_parameterizable() {
+        // The configured half-life changes the curve; the default matches the const path.
+        assert!(recency_decay_hl(Some(24.0), 24.0) < recency_decay_hl(Some(24.0), 168.0));
+        assert_eq!(
+            recency_decay(Some(42.0)),
+            recency_decay_hl(Some(42.0), 168.0)
+        );
     }
 }

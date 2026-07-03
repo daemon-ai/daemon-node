@@ -36,7 +36,7 @@ fn seeded(mode: RecallMode) -> Engine {
 }
 
 #[test]
-fn base_recall_is_ranked_but_does_not_expand_synonyms() {
+fn base_recall_is_ranked_and_gates_short_tokens() {
     let e = seeded(RecallMode::Base);
 
     // A directly-lexical query returns ranked results.
@@ -51,35 +51,78 @@ fn base_recall_is_ranked_but_does_not_expand_synonyms() {
         hits[0].content
     );
 
-    // "db" only matches via the `database` synonym group, which base mode must NOT apply.
+    // "db" alone yields NO results: `_recall_tokens` drops <3-char tokens, so the query carries
+    // zero lexical signal (verified against the Python reference: `recall("db")` -> []).
     assert!(
         e.recall("db", 5).unwrap().is_empty(),
-        "base recall must not expand synonyms (opt-in only)"
+        "two-char queries carry no recall tokens"
+    );
+
+    // One exact token of two ("rotation", lexical 0.5) clears the 0.15 short-query gate even
+    // though "pwd" itself matches nothing (verified against Python: base `pwd rotation` surfaces).
+    let hits = e.recall("pwd rotation", 5).unwrap();
+    assert!(
+        !hits.is_empty() && hits[0].content.contains("password"),
+        "partial token overlap should surface the password row, got {hits:?}"
     );
 }
 
 #[test]
-fn enhanced_recall_expands_synonyms_and_is_stable() {
+fn enhanced_recall_matches_python_gating_and_is_stable() {
     let e = seeded(RecallMode::Enhanced);
 
-    // Same "db" query now resolves through synonym expansion -> the database row.
-    let hits = e.recall("db", 5).unwrap();
+    // Parity with the Python reference (`recall_enhanced("db")` -> []): expansion rewrites "db"
+    // to "(database|db|datastore|data_store)", whose 3 surviving tokens raise the lexical gate to
+    // 0.5 while the seeded row matches only 1/3 of them — enhanced mode must NOT loosen the gate.
     assert!(
-        !hits.is_empty(),
-        "enhanced recall should expand `db` -> database"
-    );
-    assert!(
-        hits[0].content.contains("password"),
-        "top hit: {}",
-        hits[0].content
+        e.recall("db", 5).unwrap().is_empty(),
+        "enhanced recall keeps the Python lexical gate"
     );
 
-    // Repeating the query (served from the semantic cache) stays consistent.
-    let again = e.recall("db", 5).unwrap();
+    // A query with real lexical signal resolves, and repeating it (now served from the semantic
+    // query cache) stays consistent.
+    let hits = e.recall("db password", 5).unwrap();
+    assert!(
+        !hits.is_empty() && hits[0].content.contains("password"),
+        "top hit: {hits:?}"
+    );
+    let again = e.recall("db password", 5).unwrap();
     assert_eq!(
         again[0].content, hits[0].content,
         "cached recall must be stable"
     );
+}
+
+#[test]
+fn base_recall_matches_python_reference_matrix() {
+    // Golden matrix captured from the live Python engine (BeamMemory over the same 5-row bank):
+    //   recall(q, top_k=5) -> top-1 content, or [] when the lexical gate rejects everything.
+    let e = seeded(RecallMode::Base);
+    let expect_password = "the database password rotation policy runs monthly";
+    let expect_dark = "I prefer dark mode in the editor";
+    let cases: &[(&str, Option<&str>)] = &[
+        ("db", None),
+        ("theme", None),
+        ("db password", Some(expect_password)),
+        ("db rotation", Some(expect_password)),
+        ("datastore rotation", Some(expect_password)),
+        ("pwd rotation", Some(expect_password)),
+        ("password rotation", Some(expect_password)),
+        ("dark theme", Some(expect_dark)),
+    ];
+    for (query, want) in cases {
+        let hits = e.recall(query, 5).unwrap();
+        match want {
+            None => assert!(hits.is_empty(), "{query:?} should return nothing: {hits:?}"),
+            Some(content) => {
+                assert_eq!(
+                    hits.first().map(|h| h.content.as_str()),
+                    Some(*content),
+                    "{query:?} top hit diverged from the Python reference"
+                );
+            }
+        }
+    }
 }
 
 #[test]

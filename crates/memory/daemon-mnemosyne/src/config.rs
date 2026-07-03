@@ -113,6 +113,14 @@ pub struct MnemosyneConfig {
     pub binary_bonus: bool,
     /// Cross-tier summary dedup in recall finalize (`MNEMOSYNE_CROSS_TIER_DEDUP=0` disables).
     pub cross_tier_dedup: bool,
+    /// Merge structured `fact_recall` hits into recall output (`MNEMOSYNE_FACT_RECALL_ENABLED=1`
+    /// enables; default off, `beam.py` L6152).
+    pub fact_recall_enabled: bool,
+    /// Lenient fact-aware recall matching (`MNEMOSYNE_LENIENT_FACT_MATCH=1`; default strict,
+    /// `beam.py` L1703).
+    pub lenient_fact_match: bool,
+    /// Default temporal-boost half-life in hours (`MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS`, default 24).
+    pub temporal_halflife_hours: f64,
     /// Proactive graph linking at ingest (`MNEMOSYNE_PROACTIVE_LINKING=1` enables; default off,
     /// `beam.py` `_proactively_link` L3358).
     pub proactive_linking: bool,
@@ -150,6 +158,32 @@ impl RecallScope {
     }
 }
 
+/// Per-call recall filters and temporal scoring knobs (`beam.py` `recall` kwargs L5027-L5040):
+/// date-range / source / topic / veracity / memory-type row filters plus the Phase-3 soft
+/// temporal boost. [`Default`] disables everything (the plain recall behavior).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecallFilters {
+    /// Lower timestamp bound, `YYYY-MM-DD` (expanded to `T00:00:00`).
+    pub from_date: Option<String>,
+    /// Upper timestamp bound, `YYYY-MM-DD` (expanded to `T23:59:59`).
+    pub to_date: Option<String>,
+    /// Exact `source` column match.
+    pub source: Option<String>,
+    /// Topic tag; stored in `source` pending a dedicated column (`beam.py` L5202).
+    pub topic: Option<String>,
+    /// Exact `veracity` label match.
+    pub veracity: Option<String>,
+    /// Exact `memory_type` match.
+    pub memory_type: Option<String>,
+    /// Soft boost weight `[0, 1]` for memories near `query_time`; `0.0` disables (default).
+    pub temporal_weight: f64,
+    /// Temporal-boost target instant (ISO-8601); `None` = now.
+    pub query_time: Option<String>,
+    /// Temporal decay half-life in hours; `None` = the configured
+    /// [`MnemosyneConfig::temporal_halflife_hours`].
+    pub temporal_halflife: Option<f64>,
+}
+
 impl Default for MnemosyneConfig {
     fn default() -> Self {
         Self {
@@ -173,6 +207,9 @@ impl Default for MnemosyneConfig {
             fact_bonus: true,
             binary_bonus: true,
             cross_tier_dedup: true,
+            fact_recall_enabled: false,
+            lenient_fact_match: false,
+            temporal_halflife_hours: 24.0,
             proactive_linking: false,
             recall_mode: RecallMode::Base,
             llm_conflict_detection: false,
