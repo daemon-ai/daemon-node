@@ -48,6 +48,9 @@ serde_json = { workspace = true }
 # Test-only; never compiled into a shipped artifact.
 rsasl = { workspace = true }
 tokio-rustls = { workspace = true }
+# The WebSocket-carrier gate: a real client handshake (subprotocol + Origin headers) against the
+# `serve_mux_ws` listener, speaking the pinned one-binary-message-per-frame contract. Test-only.
+tokio-tungstenite = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
 # Track D live-agent e2e: an in-process mock upstream standing in for the daemon-api gateway, so a

@@ -34,3 +34,4 @@ mod sessions;
 mod tools_hitl;
 mod tree_roster;
 mod wire_client;
+mod ws_transport;

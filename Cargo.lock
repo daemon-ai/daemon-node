@@ -2218,6 +2218,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "wiremock",
 ]
