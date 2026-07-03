@@ -57,8 +57,9 @@ async fn serve_ws(
 
 /// A minimal client of the **pinned WS contract** (what the Qt WASM client implements): one binary
 /// message per CBOR mux frame, no length prefix, subprotocol `daemon-mux`. Not a byte-stream
-/// client on purpose — it proves the message-per-frame shape on the wire.
-struct WsMuxClient {
+/// client on purpose — it proves the message-per-frame shape on the wire. `pub(crate)` so the
+/// single-origin web gate (`web_serve.rs`) drives the identical client against its `/ws` path.
+pub(crate) struct WsMuxClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     /// The mechanisms the server advertised on its `Hello`.
@@ -72,9 +73,13 @@ impl WsMuxClient {
         addr: std::net::SocketAddr,
         origin: Option<&str>,
     ) -> Result<Self, Box<WsError>> {
-        let mut request = format!("ws://{addr}/")
-            .into_client_request()
-            .expect("client request");
+        Self::connect_url(&format!("ws://{addr}/"), origin).await
+    }
+
+    /// As [`WsMuxClient::connect`], against an explicit `ws://` URL (the single-origin listener
+    /// serves the mux on `/ws`, not at the root).
+    pub(crate) async fn connect_url(url: &str, origin: Option<&str>) -> Result<Self, Box<WsError>> {
+        let mut request = url.into_client_request().expect("client request");
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static(WS_SUBPROTOCOL),
@@ -143,7 +148,7 @@ impl WsMuxClient {
     }
 
     /// Send a one-shot `Call` and await its correlated `Reply`.
-    async fn call(&mut self, req: ApiRequest) -> Result<ApiResponse, ApiError> {
+    pub(crate) async fn call(&mut self, req: ApiRequest) -> Result<ApiResponse, ApiError> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(WireC2S::Call { id, req }).await?;
@@ -162,7 +167,7 @@ impl WsMuxClient {
 
     /// Drive a full `SCRAM-SHA-256` exchange with a real `rsasl` client (the same client shape the
     /// GUI uses), returning the authenticated principal from `AuthOk`.
-    async fn authenticate_scram(
+    pub(crate) async fn authenticate_scram(
         &mut self,
         username: &str,
         password: &str,
