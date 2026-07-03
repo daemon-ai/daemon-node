@@ -235,6 +235,7 @@ pub async fn dispatch(
                     importance,
                     scope,
                     veracity,
+                    ..Default::default()
                 },
                 vector.as_deref(),
                 model,

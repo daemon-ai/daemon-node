@@ -339,3 +339,16 @@ CREATE TABLE IF NOT EXISTS conflicts (
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 "#;
+
+/// Parity migration (M2): the schema surface the Python engine grew outside `init_beam` — the sync
+/// metadata table (`sync.py` `_init_events_table` L661-L666), the validation ring-buffer trigger
+/// (`beam.py` L953-L965), the `facts` FTS sync triggers (`beam.py` L993-L1004), the SHMR belief
+/// tables (`shmr.py` L40-L66), the MEMORIA fact-versioning columns (`beam.py` L754-L785), and the
+/// full index set from `init_beam`.
+pub const SCHEMA_V2: &str = r#"
+-- Device identity + sync state, persisted across restarts (`sync.py` L661-L666).
+CREATE TABLE IF NOT EXISTS sync_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"#;

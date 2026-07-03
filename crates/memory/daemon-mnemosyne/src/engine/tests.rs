@@ -110,6 +110,241 @@ fn native_vec_cosine_matches_f32_fallback() {
 }
 
 #[test]
+fn remember_dedups_exact_content_and_refreshes_row() {
+    let e = engine();
+    let id1 = e
+        .remember(
+            "the deploy target is us-east-1",
+            &RememberArgs {
+                importance: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Simulate a consolidated row: dedup must clear the stamp so sleep re-runs.
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE working_memory SET consolidated_at = 'x', veracity = 'unknown' WHERE id = ?1",
+            params![id1],
+        )
+        .unwrap();
+    let id2 = e
+        .remember(
+            "the deploy target is us-east-1",
+            &RememberArgs {
+                importance: 0.2,
+                veracity: "stated".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        id1, id2,
+        "exact-content re-remember returns the existing id"
+    );
+
+    let conn = e.store.conn.lock().unwrap();
+    let (count, importance, veracity, consolidated_at): (i64, f64, String, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(importance), MAX(veracity), MAX(consolidated_at) \
+             FROM working_memory WHERE content = 'the deploy target is us-east-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "no duplicate row");
+    assert!((importance - 0.9).abs() < 1e-9, "importance keeps the max");
+    assert_eq!(veracity, "stated", "non-unknown veracity upgrades the row");
+    assert!(
+        consolidated_at.is_none(),
+        "dedup clears consolidated_at so the row is sleep-eligible again"
+    );
+}
+
+#[test]
+fn remember_derives_and_clamps_trust_tier() {
+    let e = engine();
+    for (source, expected) in [
+        ("conversation", "STATED"),
+        ("mcp", "EXTERNAL_WRITE"),
+        ("bulk_import", "IMPORTED"),
+        ("sleep_consolidation", "DERIVED"),
+        ("somewhere_else", "STATED"),
+    ] {
+        let id = e
+            .remember(
+                &format!("trust tier probe via {source}"),
+                &RememberArgs {
+                    source: source.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let tier: String = e
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT trust_tier FROM working_memory WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tier, expected, "source {source}");
+    }
+    // Explicit-but-bogus tiers clamp to STATED; bogus veracity labels clamp to unknown.
+    let id = e
+        .remember(
+            "explicit tier probe",
+            &RememberArgs {
+                trust_tier: Some("ROOT".to_string()),
+                veracity: "Gospel Truth".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (tier, veracity): (String, String) = e
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT trust_tier, veracity FROM working_memory WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(tier, "STATED");
+    assert_eq!(veracity, "unknown");
+}
+
+#[test]
+fn remember_emits_memory_events_with_stable_device_id() {
+    let e = engine();
+    let id = e
+        .remember("an event-logged memory", &RememberArgs::default())
+        .unwrap();
+    // Exact-content re-remember logs an UPDATE against the same memory id.
+    e.remember("an event-logged memory", &RememberArgs::default())
+        .unwrap();
+    let conn = e.store.conn.lock().unwrap();
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT operation, memory_id, device_id FROM memory_events ORDER BY timestamp ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        rows
+    };
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "CREATE");
+    assert_eq!(rows[1].0, "UPDATE");
+    assert!(rows.iter().all(|r| r.1 == id));
+    assert!(rows[0].2.starts_with("device-"));
+    assert_eq!(rows[0].2, rows[1].2, "device id is stable per bank");
+    // The persisted identity matches sync_meta.
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM sync_meta WHERE key = 'device_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, rows[0].2);
+    // Events carry a dedup hash.
+    let no_hash: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE event_hash IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_hash, 0);
+}
+
+#[test]
+fn trim_caps_unconsolidated_working_rows() {
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        working_memory_max_items: 3,
+        ..Default::default()
+    })
+    .unwrap();
+    // A consolidated row is exempt from the cap ("originals stay").
+    let kept = e
+        .remember("consolidated original zero", &RememberArgs::default())
+        .unwrap();
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE working_memory SET consolidated_at = 'x', timestamp = '2000-01-01T00:00:00' \
+             WHERE id = ?1",
+            params![kept],
+        )
+        .unwrap();
+    for i in 0..5 {
+        e.remember(&format!("fresh row number {i}"), &RememberArgs::default())
+            .unwrap();
+    }
+    let conn = e.store.conn.lock().unwrap();
+    let unconsolidated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM working_memory WHERE consolidated_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unconsolidated, 3, "trim caps not-yet-consolidated rows");
+    let exempt: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM working_memory WHERE id = ?1",
+            params![kept],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(exempt, 1, "consolidated rows survive the trim");
+}
+
+#[test]
+fn remember_writes_occurred_on_and_has_source_annotations() {
+    let e = engine();
+    let id = e
+        .remember(
+            "annotated for provenance",
+            &RememberArgs {
+                source: "toolbelt".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let conn = e.store.conn.lock().unwrap();
+    let occurred = annotations::query_by_memory(&conn, &id, Some("occurred_on")).unwrap();
+    assert_eq!(occurred.len(), 1);
+    assert_eq!(occurred[0].value.len(), 10, "YYYY-MM-DD grain");
+    let has_source = annotations::query_by_memory(&conn, &id, Some("has_source")).unwrap();
+    assert_eq!(has_source.len(), 1);
+    assert_eq!(has_source[0].value, "toolbelt");
+    // Conversational sources skip has_source (`beam.py` L3487).
+    drop(conn);
+    let id2 = e
+        .remember("plain conversational note", &RememberArgs::default())
+        .unwrap();
+    let conn = e.store.conn.lock().unwrap();
+    let none = annotations::query_by_memory(&conn, &id2, Some("has_source")).unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
 fn mutations_write_audit_log_rows() {
     let e = engine();
     let id = e
@@ -583,10 +818,15 @@ fn episodic_vector_recall_uses_binary_and_cosine() {
 #[test]
 fn remember_extracts_entities_and_facts() {
     let e = engine();
+    // `mentions` annotations are opt-in (`beam.py` `extract_entities=False` default); the SPO
+    // fact/graph pipeline is always on.
     let id = e
         .remember(
             "Maya works at Acme and uses Postgres",
-            &RememberArgs::default(),
+            &RememberArgs {
+                extract_entities: true,
+                ..Default::default()
+            },
         )
         .unwrap();
     let c = e.store.conn.lock().unwrap();
@@ -646,19 +886,28 @@ fn entity_and_fact_match_reorders_recall() {
 
 #[test]
 fn cooccurrence_links_memories_sharing_an_entity() {
-    let e = engine();
-    let a = e
-        .remember("Maya leads the Phoenix team", &RememberArgs::default())
-        .unwrap();
+    // Proactive linking is env-gated in Python (`MNEMOSYNE_PROACTIVE_LINKING=1`) and config-gated
+    // here; entity-overlap linking additionally requires the `mentions` annotations.
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        proactive_linking: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let args = RememberArgs {
+        extract_entities: true,
+        ..Default::default()
+    };
+    let a = e.remember("Maya leads the Phoenix team", &args).unwrap();
     let b = e
-        .remember("Maya approved the Phoenix budget", &RememberArgs::default())
+        .remember("Maya approved the Phoenix budget", &args)
         .unwrap();
     let c = e.store.conn.lock().unwrap();
-    // The two memories share the "Maya"/"Phoenix" entities -> a `references` edge was drawn.
-    assert!(episodic_graph::edge_count(&c, &a).unwrap() >= 1);
-    let related = episodic_graph::find_related_memories(&c, &a, 2, "", 0.0).unwrap();
+    // The second memory shares the "Maya"/"Phoenix" entities -> a `references` edge was drawn
+    // from the newer memory to the older one.
+    assert!(episodic_graph::edge_count(&c, &b).unwrap() >= 1);
+    let related = episodic_graph::find_related_memories(&c, &b, 2, "", 0.0).unwrap();
     assert!(
-        related.iter().any(|r| r.memory_id == b),
+        related.iter().any(|r| r.memory_id == a),
         "graph should relate the two Maya/Phoenix memories"
     );
 }

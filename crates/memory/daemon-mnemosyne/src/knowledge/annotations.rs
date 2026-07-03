@@ -37,7 +37,8 @@ fn is_mentions_noise(value: &str) -> bool {
 }
 
 /// Append an annotation (`annotations.py` `add` L208-L230). `INSERT OR IGNORE` against the
-/// `(memory_id, kind, value)` unique index dedups repeats. Returns the new row id (0 if ignored).
+/// `(memory_id, kind, value)` unique index dedups repeats. An empty `source` is stored as NULL
+/// (Python's `source=None` default). Returns the new row id (0 if ignored).
 pub fn add(
     conn: &Connection,
     memory_id: &str,
@@ -46,6 +47,11 @@ pub fn add(
     source: &str,
     confidence: f64,
 ) -> Result<i64> {
+    let source = if source.is_empty() {
+        None
+    } else {
+        Some(source)
+    };
     conn.execute(
         "INSERT OR IGNORE INTO annotations (memory_id, kind, value, source, confidence) \
          VALUES (?1, ?2, ?3, ?4, ?5)",

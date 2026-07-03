@@ -153,11 +153,20 @@ impl MemoryProvider for MnemosyneProvider {
     }
 
     async fn after_turn(&self, turn: &Turn, _conv: &Conversation) {
-        // sync_turn gates (`__init__.py` L1668-L1692): persist the user text (>5 chars) and the
-        // assistant text (>10 chars) with their respective importances.
+        // sync_turn gates (`__init__.py` L1668-L1692): persist the user text (>5 chars, capped at
+        // 500) and the assistant text (>10 chars, capped at 800) with their respective importances.
         let (content, importance) = match turn {
-            Turn::User(u) if u.text.len() > 5 => (format!("[USER] {}", u.text), 0.5),
-            Turn::Assistant(a) if a.text.len() > 10 => (format!("[ASSISTANT] {}", a.text), 0.15),
+            Turn::User(u) if u.text.len() > 5 => (
+                format!("[USER] {}", u.text.chars().take(500).collect::<String>()),
+                0.5,
+            ),
+            Turn::Assistant(a) if a.text.len() > 10 => (
+                format!(
+                    "[ASSISTANT] {}",
+                    a.text.chars().take(800).collect::<String>()
+                ),
+                0.15,
+            ),
             _ => return,
         };
         // Embed once at this async seam; the precomputed vector is persisted with the row.
@@ -167,6 +176,7 @@ impl MemoryProvider for MnemosyneProvider {
             &content,
             &RememberArgs {
                 importance,
+                extract_entities: true,
                 ..Default::default()
             },
             vector.as_deref(),

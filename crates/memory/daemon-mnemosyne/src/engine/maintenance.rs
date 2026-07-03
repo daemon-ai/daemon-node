@@ -330,6 +330,7 @@ impl Engine {
                         importance,
                         scope,
                         veracity,
+                        ..Default::default()
                     },
                     None,
                     "",

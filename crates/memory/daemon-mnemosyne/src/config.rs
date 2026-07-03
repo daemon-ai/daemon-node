@@ -24,6 +24,47 @@ pub enum RecallMode {
     Polyphonic,
 }
 
+/// Per-label veracity score multipliers (`veracity_consolidation.py` `VERACITY_WEIGHTS` L122-L128,
+/// env-overridable per label in `beam.py` L340-L345).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VeracityWeights {
+    /// `stated` (default 1.0, `MNEMOSYNE_STATED_WEIGHT`).
+    pub stated: f64,
+    /// `inferred` (default 0.7, `MNEMOSYNE_INFERRED_WEIGHT`).
+    pub inferred: f64,
+    /// `tool` (default 0.5, `MNEMOSYNE_TOOL_WEIGHT`).
+    pub tool: f64,
+    /// `imported` (default 0.6, `MNEMOSYNE_IMPORTED_WEIGHT`).
+    pub imported: f64,
+    /// `unknown` (default 0.8, `MNEMOSYNE_UNKNOWN_WEIGHT`).
+    pub unknown: f64,
+}
+
+impl Default for VeracityWeights {
+    fn default() -> Self {
+        Self {
+            stated: 1.0,
+            inferred: 0.7,
+            tool: 0.5,
+            imported: 0.6,
+            unknown: 0.8,
+        }
+    }
+}
+
+impl VeracityWeights {
+    /// The multiplier for a (clamped) veracity label; unrecognized labels weigh as `unknown`.
+    pub fn weight(&self, veracity: &str) -> f64 {
+        match veracity {
+            "stated" => self.stated,
+            "inferred" => self.inferred,
+            "tool" => self.tool,
+            "imported" => self.imported,
+            _ => self.unknown,
+        }
+    }
+}
+
 /// Engine configuration.
 #[derive(Clone, Debug)]
 pub struct MnemosyneConfig {
@@ -35,8 +76,46 @@ pub struct MnemosyneConfig {
     pub session_id: String,
     /// Recency decay half-life in hours (`RECENCY_HALFLIFE_HOURS`, default 168).
     pub recency_halflife_hours: f64,
-    /// Working-memory TTL in hours (`WORKING_MEMORY_TTL_HOURS`, default 168).
+    /// Working-memory TTL in hours (`WORKING_MEMORY_TTL_HOURS`, default 168). Bounds the
+    /// not-yet-consolidated trim window; sleep's consolidation age cutoff is half this.
     pub working_memory_ttl_hours: f64,
+    /// Working-memory row cap per session before trim (`WORKING_MEMORY_MAX_ITEMS`,
+    /// `MNEMOSYNE_WM_MAX_ITEMS`, default 10000).
+    pub working_memory_max_items: usize,
+    /// Cap on how often recall bumps `last_recalled` (`WM_BUMP_CAP_HOURS`, default 24).
+    pub wm_bump_cap_hours: f64,
+    /// Episodic fallback-scan limit (`EPISODIC_RECALL_LIMIT`, `MNEMOSYNE_EP_LIMIT`, default 50000).
+    pub episodic_recall_limit: usize,
+    /// Scratchpad row cap per session (`SCRATCHPAD_MAX_ITEMS`, `MNEMOSYNE_SP_MAX`, default 1000).
+    pub scratchpad_max_items: usize,
+    /// Max working rows claimed per sleep pass (`SLEEP_BATCH_SIZE`, default 5000).
+    pub sleep_batch_size: usize,
+    /// Tier 1->2 degradation age in days (`TIER2_DAYS`, default 30).
+    pub tier2_days: i64,
+    /// Tier 2->3 degradation age in days (`TIER3_DAYS`, default 180).
+    pub tier3_days: i64,
+    /// Episodic tier score weights `[T1, T2, T3]` (`MNEMOSYNE_TIER{1,2,3}_WEIGHT`,
+    /// default `[1.0, 0.5, 0.25]`).
+    pub tier_weights: [f64; 3],
+    /// Hybrid recall weights `(vec, fts, importance)` before normalization
+    /// (`MNEMOSYNE_{VEC,FTS,IMPORTANCE}_WEIGHT`, defaults 0.5/0.3/0.2, `beam.py` L1157-L1183).
+    pub recall_weights: (f64, f64, f64),
+    /// Apply the veracity score multiplier (A/B toggle `MNEMOSYNE_VERACITY_MULTIPLIER=0` disables;
+    /// default on, `beam.py` L5950-L5972).
+    pub veracity_multiplier: bool,
+    /// Per-label veracity multipliers (env-overridable in Python; injected here).
+    pub veracity_weights: VeracityWeights,
+    /// Apply the episodic graph-edge bonus (`MNEMOSYNE_GRAPH_BONUS=0` disables).
+    pub graph_bonus: bool,
+    /// Apply the episodic fact-match bonus (`MNEMOSYNE_FACT_BONUS=0` disables).
+    pub fact_bonus: bool,
+    /// Apply the MIB binary-vector bonus (`MNEMOSYNE_BINARY_BONUS=0` disables).
+    pub binary_bonus: bool,
+    /// Cross-tier summary dedup in recall finalize (`MNEMOSYNE_CROSS_TIER_DEDUP=0` disables).
+    pub cross_tier_dedup: bool,
+    /// Proactive graph linking at ingest (`MNEMOSYNE_PROACTIVE_LINKING=1` enables; default off,
+    /// `beam.py` `_proactively_link` L3358).
+    pub proactive_linking: bool,
     /// Which recall pipeline to use (default [`RecallMode::Base`]).
     pub recall_mode: RecallMode,
     /// Enable the opt-in tier-2 LLM conflict detector in sleep (`MNEMOSYNE_LLM_CONFLICT_DETECTION`).
@@ -79,6 +158,22 @@ impl Default for MnemosyneConfig {
             session_id: "default".to_string(),
             recency_halflife_hours: 168.0,
             working_memory_ttl_hours: 168.0,
+            working_memory_max_items: 10_000,
+            wm_bump_cap_hours: 24.0,
+            episodic_recall_limit: 50_000,
+            scratchpad_max_items: 1000,
+            sleep_batch_size: 5000,
+            tier2_days: 30,
+            tier3_days: 180,
+            tier_weights: [1.0, 0.5, 0.25],
+            recall_weights: (0.5, 0.3, 0.2),
+            veracity_multiplier: true,
+            veracity_weights: VeracityWeights::default(),
+            graph_bonus: true,
+            fact_bonus: true,
+            binary_bonus: true,
+            cross_tier_dedup: true,
+            proactive_linking: false,
             recall_mode: RecallMode::Base,
             llm_conflict_detection: false,
             author_id: None,

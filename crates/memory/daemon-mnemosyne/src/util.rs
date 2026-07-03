@@ -23,3 +23,10 @@ pub fn memory_id(content: &str) -> String {
     let hex = format!("{:x}", h.finalize());
     hex[..16].to_string()
 }
+
+/// The time-salted memory id used for fresh `working_memory` rows (`beam.py` `_generate_id` L1122:
+/// `sha256(content + now.isoformat())[:16]`). Non-deterministic on purpose — exact-content
+/// idempotency is provided by the dedup lookup, not the id.
+pub fn generate_id(content: &str) -> String {
+    memory_id(&format!("{content}{}", now_iso()))
+}

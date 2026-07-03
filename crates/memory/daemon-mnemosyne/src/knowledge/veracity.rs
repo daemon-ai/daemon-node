@@ -28,6 +28,31 @@ pub fn veracity_weight(veracity: &str) -> f64 {
 /// The canonical veracity labels (`veracity_consolidation.py` `VERACITY_ALLOWED`).
 const VERACITY_ALLOWED: &[&str] = &["stated", "inferred", "tool", "imported", "unknown"];
 
+/// Cap on the raw value included in the clamp warning (`veracity_consolidation.py`
+/// `_VERACITY_WARN_VALUE_CAP` L145): bounds log volume and content leakage from bad labels.
+const VERACITY_WARN_VALUE_CAP: usize = 80;
+
+/// Normalize and clamp a veracity label to the canonical allowlist (`veracity_consolidation.py`
+/// `clamp_veracity` L148-L180): empty/whitespace clamps silently, non-canonical labels clamp to
+/// `unknown` with a warning naming the calling `context`.
+pub fn clamp_veracity(raw: &str, context: &str) -> String {
+    let norm = raw.trim().to_lowercase();
+    if norm.is_empty() {
+        return "unknown".to_string();
+    }
+    if VERACITY_ALLOWED.contains(&norm.as_str()) {
+        return norm;
+    }
+    let truncated: String = if raw.len() > VERACITY_WARN_VALUE_CAP {
+        let cut: String = raw.chars().take(VERACITY_WARN_VALUE_CAP).collect();
+        format!("{cut}...[truncated]")
+    } else {
+        raw.to_string()
+    };
+    tracing::warn!(context, raw = %truncated, "unknown veracity label; clamping to 'unknown'");
+    "unknown".to_string()
+}
+
 /// Aggregate per-source veracity labels into one summary label (`veracity_consolidation.py`
 /// `aggregate_veracity` L183-L244): drop non-canonical labels; treat `unknown` as low-priority (only
 /// counted when no canonical non-`unknown` label is present); then take the mode, breaking multi-way

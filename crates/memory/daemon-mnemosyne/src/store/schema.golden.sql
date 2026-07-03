@@ -250,6 +250,10 @@ CREATE TABLE scratchpad (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE sqlite_sequence(name,seq);
+CREATE TABLE sync_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE triples (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     subject     TEXT NOT NULL,

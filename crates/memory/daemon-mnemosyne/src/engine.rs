@@ -18,10 +18,6 @@ use crate::recall::query_cache::QueryCache;
 use crate::store::Store;
 use std::sync::OnceLock;
 
-/// Max co-occurrence edges drawn per shared entity at ingest, bounding the proactive-link fan-out
-/// (`beam.py` `_proactively_link` is similarly capped).
-const MAX_COOCCURRENCE_EDGES_PER_ENTITY: usize = 10;
-
 /// The vector-similarity floor that lets a vector-only hit survive the lexical gate (mirrors the
 /// episodic candidate-drop rule `lexical < floor && sim < 0.65 -> drop`, `beam.py` L5720+).
 const VEC_SIM_FLOOR: f64 = 0.65;
@@ -187,8 +183,23 @@ pub struct RememberArgs {
     /// Scope: `session` (default) or `global`. Note: the column default is `global` but
     /// `remember()` defaults to `session` (`beam.py` L2838).
     pub scope: String,
-    /// Trust label (default `unknown`).
+    /// Trust label (default `unknown`; clamped to the canonical set on write).
     pub veracity: String,
+    /// Caller-supplied metadata object persisted to `metadata_json` (`beam.py` `metadata`).
+    pub metadata: Option<serde_json::Value>,
+    /// Expiry timestamp; the row drops out of recall past it (`beam.py` `valid_until`).
+    pub valid_until: Option<String>,
+    /// Pre-generated memory id; a fresh time-salted id is derived when absent
+    /// (`beam.py` `memory_id` passthrough, L2843).
+    pub memory_id: Option<String>,
+    /// Extract regex entity `mentions` annotations (`beam.py` `extract_entities`, default off).
+    pub extract_entities: bool,
+    /// Request LLM fact extraction (`beam.py` `extract`, default off). The synchronous engine
+    /// records the request; the async provider/tool layer honors it via
+    /// [`Engine::ingest_extracted`] after the LLM round-trip.
+    pub extract: bool,
+    /// Explicit trust tier; derived from `source` when absent (`beam.py` `trust_tier` L152-L188).
+    pub trust_tier: Option<String>,
 }
 
 impl Default for RememberArgs {
@@ -198,6 +209,12 @@ impl Default for RememberArgs {
             importance: 0.5,
             scope: "session".to_string(),
             veracity: "unknown".to_string(),
+            metadata: None,
+            valid_until: None,
+            memory_id: None,
+            extract_entities: false,
+            extract: false,
+            trust_tier: None,
         }
     }
 }
@@ -227,13 +244,6 @@ pub(crate) struct GatherCtx<'a> {
     pub query_vector: Option<&'a [f32]>,
     pub weights: (f64, f64, f64),
     pub scope: &'a RecallScope,
-}
-
-/// A freshly-stored memory to run deterministic knowledge ingestion over ([`Engine::ingest_knowledge`]).
-pub(crate) struct IngestItem<'a> {
-    pub memory_id: &'a str,
-    pub content: &'a str,
-    pub veracity: &'a str,
 }
 
 /// Entity-seeded candidate-injection context for [`Engine::inject_entity_candidates`].
@@ -337,6 +347,11 @@ pub struct Engine {
     persistent: bool,
     /// Lazily-opened 5-tier semantic query cache (enhanced recall only).
     query_cache: OnceLock<QueryCache>,
+    /// Stable per-bank device identity for the event log (`sync.py` L628-L640), lazily read from /
+    /// persisted to `sync_meta`.
+    device_id: OnceLock<String>,
+    /// Monotonic per-process disambiguator for event ids minted within the same instant.
+    event_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -348,6 +363,8 @@ impl Engine {
             config,
             persistent: true,
             query_cache: OnceLock::new(),
+            device_id: OnceLock::new(),
+            event_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -359,6 +376,8 @@ impl Engine {
             config,
             persistent: false,
             query_cache: OnceLock::new(),
+            device_id: OnceLock::new(),
+            event_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

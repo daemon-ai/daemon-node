@@ -156,14 +156,15 @@ impl Engine {
             )?;
             // Mirror the deterministic knowledge layer onto the episodic id so the episodic recall
             // tier carries its own entity/fact/graph signals.
-            self.ingest_knowledge(
+            self.ingest_graph_and_veracity(&conn, &ep_id, &seed.content, &seed.veracity);
+            self.emit_event(
                 &conn,
-                &IngestItem {
-                    memory_id: &ep_id,
-                    content: &seed.content,
-                    veracity: &seed.veracity,
-                },
-            )?;
+                "CONSOLIDATE",
+                &ep_id,
+                Some(&seed.content),
+                "consolidation",
+                seed.importance,
+            );
             count += 1;
         }
         let preview: String = pending
@@ -348,14 +349,15 @@ impl Engine {
                         group.valid_until,
                     ],
                 )?;
-                self.ingest_knowledge(
+                self.ingest_graph_and_veracity(&conn, &ep_id, &summary, &group.veracity);
+                self.emit_event(
                     &conn,
-                    &IngestItem {
-                        memory_id: &ep_id,
-                        content: &summary,
-                        veracity: &group.veracity,
-                    },
-                )?;
+                    "CONSOLIDATE",
+                    &ep_id,
+                    Some(&summary),
+                    "sleep_consolidation",
+                    0.6,
+                );
                 let placeholders = group.ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
                     "UPDATE working_memory SET consolidation_claimed_at = NULL WHERE id IN ({placeholders})"
