@@ -223,9 +223,9 @@ async fn main() -> anyhow::Result<()> {
 /// given credential-ref. Writes to the durable `FileCredentialStore` the host reads at startup.
 async fn run_matrix_login(homeserver: &str, credential_ref: &str) -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
-    // Login implies persistence: write to the same on-disk credential store the host reads.
-    std::fs::create_dir_all(&cfg.data_dir)
-        .map_err(|e| anyhow::anyhow!("creating data dir {}: {e}", cfg.data_dir.display()))?;
+    // Login implies persistence: write to the same on-disk credential store the host reads,
+    // through the same single creation helper the host boot uses (private on create).
+    ensure_data_dir(&cfg.data_dir)?;
     let credential_store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::open(
         cfg.data_dir.join("credentials.json"),
     )?);
@@ -1741,6 +1741,26 @@ fn shutdown_signal(
     })
 }
 
+/// Ensure the data directory exists before anything under it is opened — the sqlite store,
+/// credentials.json, the auth db, blobs, workspaces, revisions, profiles, and checkpoints all
+/// hang off it, and none of their opens creates parent directories. Creation is recursive, and
+/// on unix every directory *created here* is private (0700 — the tree holds `auth.sqlite` and
+/// journal seeds); a directory that already exists is left completely untouched (recursive
+/// create skips existing components and never chmods), so operator-managed setups keep their
+/// permissions. A failure is an early, path-naming boot error.
+fn ensure_data_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .map_err(|e| anyhow::anyhow!("creating data dir {}: {e}", dir.display()))
+}
+
 /// Assemble and run the default host node, serving the unified surface over a Unix socket until
 /// a shutdown signal (SIGINT/`ctrl_c`, or SIGTERM on unix) trips a graceful shutdown. The wiring
 /// itself lives in [`daemon_node::assemble`]; this role only builds the policy inputs (store,
@@ -1755,6 +1775,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // aborts). A credential is NOT required at boot — it arrives per-profile via `CredentialSet`. The
     // resolved `Option<ProviderKind>` is threaded into provider construction below.
     let provider_kind = cfg.resolve_for_host()?;
+    // The ONE data-dir creation point for the host role: everything below (store, credential
+    // store, auth db, blobs, workspaces, ...) opens paths under it and assumes it exists.
+    ensure_data_dir(&cfg.data_dir)?;
     let store = build_store(&cfg.store_backend())?;
 
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.

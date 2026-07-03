@@ -11,7 +11,8 @@
 //! assertion.
 //!
 //! It also gates the container/microvm launch contract: SIGTERM and SIGINT both trip the graceful
-//! shutdown (exit 0, shutdown log line, socket removed), and a HOME-less environment still boots.
+//! shutdown (exit 0, shutdown log line, socket removed), a HOME-less environment still boots, and
+//! a nonexistent `DAEMON_DATA_DIR` is created (private) rather than aborting the sqlite store open.
 
 use std::io::Read;
 use std::path::Path;
@@ -169,6 +170,32 @@ fn unconfigured_provider_host_launch_boots_and_serves() {
     );
 }
 
+/// Poll until `child` serves `socket` (true) or it exits / `timeout` elapses first (false).
+fn wait_until_serving(child: &mut std::process::Child, socket: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            return false; // exited before serving — a fail-fast, not a boot
+        }
+        if socket.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Drain whatever the (exited or killed) child wrote to its piped stderr.
+fn drain_stderr(child: &mut std::process::Child) -> String {
+    let mut s = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut s);
+    }
+    s
+}
+
 /// Wait (bounded) for `child` to exit; panics — after killing it — if `timeout` elapses first.
 fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
@@ -276,6 +303,75 @@ fn homeless_env_host_launch_boots_and_serves() {
     assert!(
         booted,
         "a HOME-less host launch must boot and serve; stderr:\n{stderr}"
+    );
+}
+
+/// `DAEMON_DATA_DIR` pointing at a nonexistent nested path must boot: the host role creates the
+/// data directory (recursively) before anything under it is opened. `DAEMON_STORE=sqlite`
+/// (overriding the harness memory default) reproduces the reported failure shape — the store file
+/// is the data dir's first boot-time consumer ("opening sqlite store …: unable to open database
+/// file"). On unix the created leaf is private (0700): auth.sqlite + journal seeds live inside.
+#[test]
+fn nonexistent_data_dir_host_launch_creates_it_and_boots() {
+    let root = unique_tmp("daemon-host-datadir");
+    let data_dir = root.join("a").join("b").join("data");
+    assert!(!data_dir.exists(), "the data dir must start nonexistent");
+    let socket = root.join("api.sock");
+    let mut child = host_command(&data_dir, &socket, &[("DAEMON_STORE", "sqlite")])
+        .spawn()
+        .expect("spawn daemon binary");
+    let booted = wait_until_serving(&mut child, &socket, Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = drain_stderr(&mut child);
+    assert!(
+        booted,
+        "a nonexistent data dir must be created at boot, not abort it; stderr:\n{stderr}"
+    );
+    assert!(data_dir.is_dir(), "the data dir must exist after boot");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&data_dir)
+            .expect("stat the created data dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "a daemon-created data dir must be private");
+    }
+}
+
+/// A data dir that ALREADY exists is left completely untouched: the creation path never chmods an
+/// existing directory, so operator-managed permissions (here: a deliberately non-default 0755)
+/// survive a boot. (Every other test in this file already boots over a pre-created data dir and
+/// would catch an existing-dir regression; this one pins the permission bits explicitly.)
+#[cfg(unix)]
+#[test]
+fn preexisting_data_dir_permissions_survive_boot() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = unique_tmp("daemon-host-datadir-keep");
+    std::fs::create_dir_all(&tmp).expect("pre-create the data dir");
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).expect("set 0755");
+    let socket = tmp.join("api.sock");
+    let mut child = host_command(&tmp, &socket, &[("DAEMON_STORE", "sqlite")])
+        .spawn()
+        .expect("spawn daemon binary");
+    let booted = wait_until_serving(&mut child, &socket, Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = drain_stderr(&mut child);
+    assert!(
+        booted,
+        "an existing data dir must keep booting; stderr:\n{stderr}"
+    );
+    let mode = std::fs::metadata(&tmp)
+        .expect("stat the pre-existing data dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "boot must not clobber an existing data dir's permissions"
     );
 }
 
