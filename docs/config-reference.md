@@ -4,6 +4,8 @@ This file is generated from `NodeConfig` (the single source of truth) by `daemon
 
 Configuration is layered by [figment](https://docs.rs/figment), later sources winning: built-in defaults, then an optional TOML file (`$DAEMON_CONFIG`), then environment variables, then CLI flags. Every environment variable is `DAEMON_` + the TOML path uppercased with `__` between table levels (e.g. `python.op_timeout_ms` ← `DAEMON_PYTHON__OP_TIMEOUT_MS`).
 
+The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse proxy in front of it for now. Browser connections must additionally match `api.ws_allowed_origins` (empty = every browser origin is refused).
+
 | TOML path | Environment variable | Type | Default |
 |-----------|----------------------|------|---------|
 | `api.auth_db` | `DAEMON_API__AUTH_DB` | optional | _(unset)_ |
@@ -13,6 +15,8 @@ Configuration is layered by [figment](https://docs.rs/figment), later sources wi
 | `api.tls_cert` | `DAEMON_API__TLS_CERT` | optional | _(unset)_ |
 | `api.tls_client_ca` | `DAEMON_API__TLS_CLIENT_CA` | optional | _(unset)_ |
 | `api.tls_key` | `DAEMON_API__TLS_KEY` | optional | _(unset)_ |
+| `api.ws_addr` | `DAEMON_API__WS_ADDR` | optional | _(unset)_ |
+| `api.ws_allowed_origins` | `DAEMON_API__WS_ALLOWED_ORIGINS` | array | `[]` |
 | `base_url` | `DAEMON_BASE_URL` | optional | _(unset)_ |
 | `blob_root` | `DAEMON_BLOB_ROOT` | optional | _(unset)_ |
 | `browser.approve_navigation` | `DAEMON_BROWSER__APPROVE_NAVIGATION` | bool | `false` |

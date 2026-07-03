@@ -595,6 +595,14 @@ pub struct ApiConfig {
     pub require_client_cert: bool,
     /// PEM CA bundle trusted to sign client certs (required with `require_client_cert`).
     pub tls_client_ca: Option<PathBuf>,
+    /// Plain-WebSocket bind address for the browser (Qt WASM) mux carrier; `None` (the default)
+    /// keeps it off. The listener always requires SASL authentication (never local-trusted);
+    /// `wss://` is expected to terminate at a reverse proxy for now.
+    pub ws_addr: Option<String>,
+    /// Origins allowed to upgrade on the WebSocket listener, matched against the HTTP `Origin`
+    /// header when a browser sends one. Empty (the default) rejects every browser origin;
+    /// non-browser clients send no `Origin` and are unaffected.
+    pub ws_allowed_origins: Vec<String>,
     /// SQLite identity store path (`None` => `<data_dir>/auth.sqlite`; see [`NodeConfig::auth_db`]).
     pub auth_db: Option<PathBuf>,
     /// The local-trust principal for the Unix socket / FFI / in-process HTTP. `Some(name)` (default
@@ -611,6 +619,8 @@ impl Default for ApiConfig {
             tls_key: None,
             require_client_cert: false,
             tls_client_ca: None,
+            ws_addr: None,
+            ws_allowed_origins: Vec::new(),
             auth_db: None,
             local_trust: Some("system".to_string()),
         }
@@ -1068,6 +1078,12 @@ pub fn config_reference() -> String {
          variables, then CLI flags. Every environment variable is `DAEMON_` + the TOML path \
          uppercased with `__` between table levels (e.g. `python.op_timeout_ms` \u{2190} \
          `DAEMON_PYTHON__OP_TIMEOUT_MS`).\n\n",
+    );
+    out.push_str(
+        "The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` \
+         only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse \
+         proxy in front of it for now. Browser connections must additionally match \
+         `api.ws_allowed_origins` (empty = every browser origin is refused).\n\n",
     );
     out.push_str("| TOML path | Environment variable | Type | Default |\n");
     out.push_str("|-----------|----------------------|------|---------|\n");

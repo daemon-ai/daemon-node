@@ -2097,13 +2097,35 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 tls_listener,
                 server_config,
                 node.clone(),
-                authenticator,
+                authenticator.clone(),
             )))
         }
         (Some(_), _, _) => {
             anyhow::bail!("[api].tls_addr is set but [api].tls_cert / [api].tls_key are missing")
         }
         _ => None,
+    };
+
+    // The plain-WebSocket mux carrier (opt-in via `[api].ws_addr`) for browser (Qt WASM) clients:
+    // the same CBOR mux, one binary message per frame, subprotocol `daemon-mux`, authentication
+    // ALWAYS required (never local-trusted). Browser origins are gated by
+    // `[api].ws_allowed_origins`; wss:// terminates at a reverse proxy for now.
+    let ws_server = match &cfg.api.ws_addr {
+        Some(addr) => {
+            let ws_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                %addr,
+                allowed_origins = ?cfg.api.ws_allowed_origins,
+                "serving daemon-api over WebSocket (subprotocol daemon-mux, authentication required)"
+            );
+            Some(tokio::spawn(daemon_host::serve_mux_ws(
+                ws_listener,
+                node.clone(),
+                authenticator,
+                cfg.api.ws_allowed_origins.clone(),
+            )))
+        }
+        None => None,
     };
 
     // Optionally bind the in-process HTTP/WS surface (the `daemon-http` adapter), toggled on by a
@@ -2158,6 +2180,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     server.abort();
     if let Some(tls_server) = tls_server {
         tls_server.abort();
+    }
+    if let Some(ws_server) = ws_server {
+        ws_server.abort();
     }
     if let Some(http_server) = http_server {
         http_server.abort();
