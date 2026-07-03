@@ -9,6 +9,9 @@
 //! bare launch — the node comes up and serves its socket. An *explicitly-set* networked provider
 //! with no model is still a deliberate misconfiguration and fails fast. A bounded wait guards every
 //! assertion.
+//!
+//! It also gates the container/microvm launch contract: SIGTERM and SIGINT both trip the graceful
+//! shutdown (exit 0, shutdown log line, socket removed).
 
 use std::io::Read;
 use std::path::Path;
@@ -164,6 +167,71 @@ fn unconfigured_provider_host_launch_boots_and_serves() {
         booted,
         "a bare (unconfigured) host launch must boot and serve; stderr:\n{stderr}"
     );
+}
+
+/// Wait (bounded) for `child` to exit; panics — after killing it — if `timeout` elapses first.
+fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon did not exit within {timeout:?} after the shutdown signal");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Boot the host role, deliver `signal` (raw kill(2), exactly like a container runtime or an
+/// interactive ^C), and assert the graceful-shutdown contract: a prompt exit 0, the shutdown log
+/// line naming the signal, and the api socket removed on the way out.
+fn assert_graceful_shutdown_on(signal: nix::sys::signal::Signal, name: &str) {
+    let (booted, stderr, mut child, socket) = spawn_host_launch(&[], Duration::from_secs(20));
+    assert!(
+        booted,
+        "the host launch must boot before the signal; stderr:\n{stderr}"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().try_into().expect("pid fits i32")),
+        signal,
+    )
+    .expect("deliver the shutdown signal");
+    let status = wait_bounded(&mut child, Duration::from_secs(20));
+
+    // The child has exited, so draining the (small, far under the pipe buffer) stderr is safe.
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    assert!(
+        status.success(),
+        "{name} must trip a graceful (exit 0) shutdown, got {status:?}; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("shutdown signal received") && stderr.contains(name),
+        "the shutdown log line must name {name}; stderr:\n{stderr}"
+    );
+    assert!(
+        !socket.exists(),
+        "a graceful shutdown must remove the api socket"
+    );
+}
+
+/// SIGTERM — what container runtimes (`docker stop`, Fly Machines, systemd) send first — must trip
+/// the same graceful shutdown as SIGINT instead of running into the stop timeout + SIGKILL.
+#[test]
+fn sigterm_host_launch_shuts_down_gracefully() {
+    assert_graceful_shutdown_on(nix::sys::signal::Signal::SIGTERM, "SIGTERM");
+}
+
+/// SIGINT (`ctrl_c`) — the other arm of the shutdown select — keeps the prior behavior.
+#[test]
+fn sigint_host_launch_shuts_down_gracefully() {
+    assert_graceful_shutdown_on(nix::sys::signal::Signal::SIGINT, "SIGINT");
 }
 
 /// A networked provider (`daemon_api`) with a model but no credential also BOOTS now — credentials

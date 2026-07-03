@@ -1708,10 +1708,47 @@ fn emit_generated_admin(cfg: &NodeConfig, username: &str, password: &str) {
     );
 }
 
+/// Register the shutdown-signal listeners and return the future that resolves (to the signal
+/// name, for the shutdown log line) when one arrives: SIGINT (`ctrl_c`) everywhere, plus SIGTERM
+/// on unix — container runtimes (`docker stop`, Fly Machines, systemd) send SIGTERM first, so it
+/// must trip the same graceful shutdown instead of running into the stop timeout + SIGKILL.
+/// SIGTERM registration happens at the *call* (the top of `run_as_host`), not at the await: a
+/// stop that lands while the node is still assembling is queued on the signal stream instead of
+/// hitting the default disposition (killed, unclean exit).
+#[cfg(unix)]
+fn shutdown_signal(
+) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<&'static str>>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                Ok("SIGINT")
+            }
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    })
+}
+
+/// Non-unix fallback: only `ctrl_c` is portable (registered lazily on first poll, as before).
+#[cfg(not(unix))]
+fn shutdown_signal(
+) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<&'static str>>> {
+    Ok(async {
+        tokio::signal::ctrl_c().await?;
+        Ok("ctrl_c")
+    })
+}
+
 /// Assemble and run the default host node, serving the unified surface over a Unix socket until
-/// `ctrl_c` trips a graceful shutdown. The wiring itself lives in [`daemon_node::assemble`]; this
-/// role only builds the policy inputs (store, credentials, provider registry, engine tunables).
+/// a shutdown signal (SIGINT/`ctrl_c`, or SIGTERM on unix) trips a graceful shutdown. The wiring
+/// itself lives in [`daemon_node::assemble`]; this role only builds the policy inputs (store,
+/// credentials, provider registry, engine tunables).
 async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
+    // Listen for shutdown signals from the very start (see `shutdown_signal` on why this is
+    // registered before any listener is bound rather than where it is awaited below).
+    let shutdown = shutdown_signal()?;
     // Boot resolution (no silent mock default): an unset provider boots UNCONFIGURED (`None` — the
     // node installs `UnconfiguredProvider` and serves; a turn then fails clearly). An explicitly-set
     // networked provider (`genai`/`daemon_api`) still requires a model (else a deliberate misconfig
@@ -2211,8 +2248,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         None => None,
     };
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("ctrl_c received; shutting down");
+    let signal = shutdown.await?;
+    tracing::info!(signal, "shutdown signal received; shutting down");
     server.abort();
     if let Some(tls_server) = tls_server {
         tls_server.abort();

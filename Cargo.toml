@@ -100,6 +100,10 @@ encoding_rs = "0.8"
 mistralrs = { version = "0.8", default-features = false }
 # in-process mock HTTP server for provider wire tests (no live network in the suite).
 wiremock = "0.6"
+# (dev) raw signal delivery for the graceful-shutdown launch gate: SIGTERM/SIGINT sent to the real
+# spawned binary exactly the way a container runtime stops it. Already resolved in the tree
+# (transitively); test-only, never compiled into a shipped artifact.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 # Hugging Face Hub client for model acquisition into the shared cache (async tokio API + rustls).
 # Same crate (and cache layout) mistral.rs uses, so a warmed cache is read by the mistralrs engine.
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
