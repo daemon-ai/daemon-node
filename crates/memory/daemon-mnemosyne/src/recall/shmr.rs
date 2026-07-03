@@ -1,24 +1,1083 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! SHMR (Self-Harmonizing Memory Reasoning) — port of `shmr.py` (P3, opt-in background pass).
+//! SHMR (Self-Harmonizing Memory Reasoning) — full port of `shmr.py` (opt-in background pass).
 //!
-//! Greedy cosine clustering (>= 0.70) + belief convergence (<= 3 iters to harmony >= 0.60) writing
-//! `harmonic_beliefs` / `memory_resonance_log`. NOTE: Python never wires this into `sleep()` despite
-//! its docstring (`shmr.py` L356); the port keeps it an explicit opt-in pass. Runtime clustering is
-//! not wired yet.
+//! One harmonic cycle ([`harmonize`]): pull echo candidates (recent `facts` + recent episodic
+//! rows), greedily cluster them by cosine (`>= 0.70` connected components), then per cluster run
+//! an LLM harmonization loop (<= 3 iterations) until the harmony score (belief-vs-centroid cosine
+//! x confidence, with a pairwise-consistency bonus) reaches `>= 0.60`, applying the accepted
+//! beliefs to `harmonic_beliefs` (and dampening/updating contradicted `facts` rows) and logging
+//! the run to `memory_resonance_log`. Both tables are created lazily by the pass — absent unless
+//! SHMR runs (spec §3).
+//!
+//! NOTE: Python never wires this into `sleep()` despite its docstring (`shmr.py` L356-L361 —
+//! `beam.sleep` has no `harmonize` call). The port keeps it an explicit opt-in pass off the hot
+//! path, exposed via [`crate::engine::Engine::harmonize`]. The engine owns no LLM/embedding
+//! runtime, so both are injected as callbacks (the same seam `extract.rs` uses).
 
-/// Cluster similarity threshold (`shmr.py` L30).
+use crate::error::Result;
+use crate::recall::lexical::round4;
+use crate::util;
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
+
+/// Echo-candidate batch size (`MNEMOSYNE_SHMR_BATCH_SIZE`, `shmr.py` L28).
+pub const BATCH_SIZE: usize = 50;
+/// Refinement iterations per cluster (`MNEMOSYNE_SHMR_MAX_ITERATIONS`, L29).
+pub const MAX_ITERATIONS: usize = 3;
+/// Cluster similarity threshold (`MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD`, L30).
 pub const SIMILARITY_THRESHOLD: f64 = 0.70;
-/// Harmony acceptance threshold (`shmr.py` L31).
+/// Harmony acceptance threshold (`MNEMOSYNE_SHMR_HARMONY_THRESHOLD`, L31).
 pub const HARMONY_THRESHOLD: f64 = 0.60;
+/// Minimum cluster size worth harmonizing (`MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE`, L33).
+pub const MIN_CLUSTER_SIZE: usize = 2;
 
-/// Whether a cosine similarity score belongs in an SHMR candidate cluster.
-pub fn is_cluster_candidate(similarity: f64) -> bool {
-    similarity >= SIMILARITY_THRESHOLD
+/// Embedding callback: `text -> vector` (`shmr.py` `_embed`). `None` = backend failure.
+pub type EmbedFn<'a> = &'a dyn Fn(&str) -> Option<Vec<f32>>;
+/// LLM callback: `prompt -> completion` (`shmr.py` `_call_llm`). `None`/empty = no output.
+pub type LlmFn<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Tunables for one [`harmonize`] cycle (Python's env knobs, as explicit options).
+#[derive(Clone, Copy, Debug)]
+pub struct ShmrOptions {
+    /// Max fact candidates pulled (episodic candidates pull `batch_size / 2`).
+    pub batch_size: usize,
+    /// Max refinement iterations per cluster.
+    pub max_iterations: usize,
+    /// Cosine threshold for the greedy clustering.
+    pub similarity_threshold: f64,
+    /// Harmony score needed to accept a cluster's beliefs.
+    pub harmony_threshold: f64,
+    /// Clusters smaller than this are skipped.
+    pub min_cluster_size: usize,
 }
 
-/// Whether a convergence score is high enough to accept as harmonic.
-pub fn accepts_harmony(harmony: f64) -> bool {
-    harmony >= HARMONY_THRESHOLD
+impl Default for ShmrOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: BATCH_SIZE,
+            max_iterations: MAX_ITERATIONS,
+            similarity_threshold: SIMILARITY_THRESHOLD,
+            harmony_threshold: HARMONY_THRESHOLD,
+            min_cluster_size: MIN_CLUSTER_SIZE,
+        }
+    }
+}
+
+/// Stats of one harmonic cycle (`shmr.py` `harmonize` return dict).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HarmonizeStats {
+    /// Semantic clusters found (post size filter).
+    pub clusters_found: usize,
+    /// `create`/`update` beliefs accepted.
+    pub beliefs_generated: usize,
+    /// `dampen` beliefs accepted (contradictions resolved).
+    pub contradictions_resolved: usize,
+    /// Mean harmony score across scored iterations, rounded to 4.
+    pub harmony_score_avg: f64,
+    /// Wall-clock duration.
+    pub duration_ms: u64,
+    /// `insufficient_candidates` | `harmonized` | `no_convergence`.
+    pub status: &'static str,
+}
+
+/// A harmonic-belief hit from [`recall_beliefs`].
+#[derive(Clone, Debug)]
+pub struct BeliefHit {
+    /// The belief object text.
+    pub content: String,
+    /// `cosine(query, object) * confidence`, rounded to 4.
+    pub score: f64,
+    /// The deterministic belief id.
+    pub belief_id: String,
+    /// Belief subject.
+    pub subject: String,
+    /// Belief predicate.
+    pub predicate: String,
+    /// JSON array of source fact ids.
+    pub provenance: Option<String>,
+    /// Always `harmonic_belief`.
+    pub source: &'static str,
+}
+
+/// One `memory_resonance_log` row ([`get_resonance_log`]).
+#[derive(Clone, Debug)]
+pub struct ResonanceEntry {
+    /// Autoincrement row id.
+    pub id: i64,
+    /// The harmonizing session.
+    pub session_id: Option<String>,
+    /// Clusters found by the run.
+    pub cluster_count: i64,
+    /// Beliefs generated by the run.
+    pub beliefs_generated: i64,
+    /// Contradictions dampened by the run.
+    pub contradictions_resolved: i64,
+    /// Mean harmony score.
+    pub harmony_score_avg: f64,
+    /// Run duration.
+    pub duration_ms: i64,
+    /// Row creation time.
+    pub created_at: String,
+}
+
+/// The SHMR DDL (`shmr.py` `FACTS_SCHEMA_SQL` L39-L67), applied lazily by every entry point.
+const SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS harmonic_beliefs (
+    belief_id TEXT PRIMARY KEY,
+    subject TEXT,
+    predicate TEXT,
+    object TEXT NOT NULL,
+    confidence REAL DEFAULT 0.5,
+    provenance TEXT,
+    cluster_id TEXT,
+    iteration INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS memory_resonance_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    cluster_count INTEGER,
+    beliefs_generated INTEGER,
+    contradictions_resolved INTEGER,
+    harmony_score_avg REAL,
+    duration_ms INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_beliefs_subject ON harmonic_beliefs(subject);
+CREATE INDEX IF NOT EXISTS idx_beliefs_predicate ON harmonic_beliefs(predicate);
+CREATE INDEX IF NOT EXISTS idx_beliefs_confidence ON harmonic_beliefs(confidence);
+";
+
+/// Ensure the SHMR tables exist (`shmr.py` `_init_schema`).
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_SQL)?;
+    Ok(())
+}
+
+/// The harmonizer prompt (`shmr.py` `HARMONY_PROMPT` L149-L174, verbatim).
+pub const HARMONY_PROMPT: &str = r#"You are the Self-Harmonizing Memory Reasoner for Mnemosyne.
+These memories belong to the same semantic cluster -- they all relate to the
+same entities, topics, or events. Your job is to harmonize them:
+
+1. **Resolve contradictions**: If two memories conflict, determine which is more
+   likely true based on recency, specificity, and internal consistency. Flag the
+   weaker one as dampened, not deleted.
+2. **Extract higher-order beliefs**: Find patterns that span multiple memories.
+   What does this cluster as a whole tell us? What's the stable truth?
+3. **Dampen noise, amplify signal**: Low-confidence or stale memories get lower
+   weight. Corroborated facts get reinforced.
+4. **Output only stable beliefs**: Return NEW or UPDATED facts with confidence
+   scores. Don't regurgitate every input fact -- synthesize.
+
+Output as JSON array of belief objects:
+[{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.0-1.0,
+  "action": "create"|"update"|"dampen", "target_fact_id": null|"fact_id",
+  "rationale": "one sentence explaining why"}]
+
+RULES:
+- Confidence 0.9+ = highly corroborated (multiple sources agree)
+- Confidence 0.5-0.8 = reasonable inference from the cluster
+- Confidence <0.4 = speculative, mark as such
+- Use "dampen" to reduce confidence of contradicted facts (never delete)
+- Use "update" to modify an existing fact with new information
+- Output 1-5 beliefs per cluster (don't over-generate)"#;
+
+/// The Phase-3A reflective synthesis prompt (`shmr.py` `REFLECTION_PROMPT` L580-L594, verbatim;
+/// `{question}` / `{fact_context}` substituted).
+pub const REFLECTION_PROMPT: &str = r#"You are a memory reasoning assistant. You have retrieved facts
+from a conversation database and need to synthesize a coherent answer.
+
+QUESTION: {question}
+
+RETRIEVED FACTS:
+{fact_context}
+
+Based on these facts, provide a concise synthesis (2-4 sentences) that:
+1. Answers the question directly if the facts are sufficient
+2. Identifies any contradictions or gaps in the facts
+3. Notes temporal context (dates, order of events) if present
+4. If facts are insufficient, states what's missing clearly
+
+SYNTHESIS:"#;
+
+/// An echo candidate (`shmr.py` candidate dicts): a fact / truncated episodic row / iteration
+/// belief-candidate, with its embedding.
+struct Candidate {
+    /// `facts.fact_id`, `ep_<id>`, or `None` for iteration belief-candidates (whose empty
+    /// `fact_id` Python filters out of provenance).
+    fact_id: Option<String>,
+    subject: String,
+    predicate: String,
+    object: String,
+    confidence: f64,
+    source: &'static str,
+    embedding: Vec<f32>,
+}
+
+/// A parsed harmonizer belief (Python reads the dict with `.get` defaults; non-object array
+/// entries are dropped).
+#[derive(Clone, Debug)]
+struct Belief {
+    subject: String,
+    predicate: String,
+    object: String,
+    confidence: f64,
+    action: String,
+    target_fact_id: Option<String>,
+}
+
+impl Belief {
+    fn from_value(v: &serde_json::Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let s = |k: &str, d: &str| -> String {
+            obj.get(k).and_then(|x| x.as_str()).unwrap_or(d).to_string()
+        };
+        Some(Self {
+            subject: s("subject", "entity"),
+            predicate: s("predicate", "related_to"),
+            object: s("object", ""),
+            confidence: obj
+                .get("confidence")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.5),
+            action: s("action", "create"),
+            target_fact_id: obj
+                .get("target_fact_id")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+        })
+    }
+}
+
+/// Cosine over Python's epsilon-normalized vectors (`shmr.py` `_cosine_similarity` L84-L88:
+/// `dot(a/(|a|+1e-8), b/(|b|+1e-8))` — zero vectors score ~0 instead of erroring).
+fn cosine_eps(a: &[f32], b: &[f32]) -> f64 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    dot / ((na.sqrt() + 1e-8) * (nb.sqrt() + 1e-8))
+}
+
+/// Greedy connected-components clustering by cosine `>= threshold` (`shmr.py`
+/// `_cluster_by_similarity` L91-L130). Returns index clusters in first-seen order.
+fn cluster_by_similarity(embeddings: &[Vec<f32>], threshold: f64) -> Vec<Vec<usize>> {
+    let n = embeddings.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if cosine_eps(&embeddings[i], &embeddings[j]) >= threshold {
+                adj[i].push(j);
+                adj[j].push(i);
+            }
+        }
+    }
+    let mut visited = vec![false; n];
+    let mut clusters = Vec::new();
+    for i in 0..n {
+        if visited[i] {
+            continue;
+        }
+        let mut cluster = Vec::new();
+        let mut stack = vec![i];
+        while let Some(node) = stack.pop() {
+            if visited[node] {
+                continue;
+            }
+            visited[node] = true;
+            cluster.push(node);
+            stack.extend(adj[node].iter().copied().filter(|&m| !visited[m]));
+        }
+        clusters.push(cluster);
+    }
+    clusters
+}
+
+/// Format a cluster as the harmonizer's context block (`shmr.py` `_format_cluster_for_llm`
+/// L133-L146).
+fn format_cluster(cluster: &[Candidate]) -> String {
+    let mut lines = vec!["=== MEMORY CLUSTER ===".to_string()];
+    for (i, item) in cluster.iter().enumerate() {
+        lines.push(format!(
+            "[{i}] ({source}, conf={confidence:.2}) {subject} | {predicate} | {obj}",
+            source = item.source,
+            confidence = item.confidence,
+            subject = item.subject,
+            predicate = item.predicate,
+            obj = item.object,
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Robust JSON-array extraction from LLM output (`shmr.py` `_extract_json_from_llm_output`
+/// L264-L302): direct parse (array or `{"beliefs": [...]}`), fenced ```json block, bare array,
+/// then per-object fallback.
+fn extract_json_beliefs(text: &str) -> Vec<serde_json::Value> {
+    use std::sync::OnceLock;
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(arr) = parsed.as_array() {
+            return arr.clone();
+        }
+        if let Some(arr) = parsed.get("beliefs").and_then(|b| b.as_array()) {
+            return arr.clone();
+        }
+    }
+    static FENCE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let fence =
+        FENCE_RE.get_or_init(|| regex::Regex::new(r"(?s)```(?:json)?\s*(\[.*?\])\s*```").unwrap());
+    if let Some(cap) = fence.captures(text) {
+        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&cap[1]) {
+            return arr;
+        }
+    }
+    static ARRAY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let array = ARRAY_RE.get_or_init(|| regex::Regex::new(r"(?s)\[\s*\{.*?\}\s*\]").unwrap());
+    if let Some(m) = array.find(text) {
+        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(m.as_str()) {
+            return arr;
+        }
+    }
+    static OBJECT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let object = OBJECT_RE.get_or_init(|| regex::Regex::new(r"\{[^{}]*\}").unwrap());
+    object
+        .find_iter(text)
+        .filter_map(|m| serde_json::from_str(m.as_str()).ok())
+        .collect()
+}
+
+/// Score how well the beliefs represent the cluster (`shmr.py` `_compute_harmony_score`
+/// L210-L261): mean of `cosine(belief, centroid) * confidence` (embed failure -> `0.3`), times a
+/// consistency bonus `min(1.0, avg_pairwise_belief_sim + 0.3)` when there are multiple beliefs
+/// (embed failure -> a zero vector).
+fn compute_harmony_score(beliefs: &[Belief], cluster: &[Candidate], embed: EmbedFn) -> f64 {
+    if beliefs.is_empty() || cluster.is_empty() {
+        return 0.0;
+    }
+    let dim = cluster.iter().map(|c| c.embedding.len()).max().unwrap_or(0);
+    let mut centroid = vec![0f32; dim];
+    for item in cluster {
+        for (i, v) in item.embedding.iter().enumerate() {
+            centroid[i] += v;
+        }
+    }
+    for v in centroid.iter_mut() {
+        *v /= cluster.len() as f32;
+    }
+
+    let belief_text = |b: &Belief| format!("{} {}", b.predicate, b.object);
+    let belief_scores: Vec<f64> = beliefs
+        .iter()
+        .map(|b| match embed(&belief_text(b)) {
+            Some(emb) => cosine_eps(&emb, &centroid) * b.confidence,
+            None => 0.3,
+        })
+        .collect();
+
+    let mut consistency_bonus = 1.0;
+    if beliefs.len() > 1 {
+        let embs: Vec<Vec<f32>> = beliefs
+            .iter()
+            .map(|b| embed(&belief_text(b)).unwrap_or_else(|| vec![0f32; dim]))
+            .collect();
+        let mut pairwise = Vec::new();
+        for i in 0..embs.len() {
+            for j in (i + 1)..embs.len() {
+                pairwise.push(cosine_eps(&embs[i], &embs[j]));
+            }
+        }
+        if !pairwise.is_empty() {
+            let avg = pairwise.iter().sum::<f64>() / pairwise.len() as f64;
+            consistency_bonus = (avg + 0.3).min(1.0);
+        }
+    }
+    let avg_belief = belief_scores.iter().sum::<f64>() / belief_scores.len() as f64;
+    avg_belief * consistency_bonus
+}
+
+/// Write accepted beliefs and update contradicted source facts (`shmr.py` `_apply_beliefs`
+/// L305-L353): `dampen` decrements the target fact's confidence (`-0.15`, floor `0.1`), `update`
+/// rewrites its object/confidence, and every belief upserts into `harmonic_beliefs` with the
+/// cluster's fact ids as provenance.
+fn apply_beliefs(
+    conn: &Connection,
+    beliefs: &[Belief],
+    cluster: &[Candidate],
+    cluster_id: &str,
+) -> Result<()> {
+    let now = util::now_iso();
+    let provenance = serde_json::to_string(
+        &cluster
+            .iter()
+            .filter_map(|c| c.fact_id.as_deref())
+            .collect::<Vec<_>>(),
+    )?;
+    for belief in beliefs {
+        let confidence = belief.confidence.clamp(0.1, 1.0);
+        let obj_head: String = belief.object.chars().take(50).collect();
+        let digest = Sha256::digest(
+            format!(
+                "{cluster_id}:{}:{}:{obj_head}",
+                belief.subject, belief.predicate
+            )
+            .as_bytes(),
+        );
+        let belief_id = format!("{digest:x}")[..24].to_string();
+
+        if belief.action == "dampen" {
+            if let Some(target) = &belief.target_fact_id {
+                conn.execute(
+                    "UPDATE facts SET confidence = MAX(0.1, confidence - 0.15) WHERE fact_id = ?1",
+                    params![target],
+                )?;
+            }
+        } else if belief.action == "update" {
+            if let Some(target) = &belief.target_fact_id {
+                conn.execute(
+                    "UPDATE facts SET object = ?1, confidence = ?2 WHERE fact_id = ?3",
+                    params![belief.object, confidence, target],
+                )?;
+            }
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO harmonic_beliefs \
+             (belief_id, subject, predicate, object, confidence, provenance, cluster_id, \
+              iteration, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                belief_id,
+                belief.subject,
+                belief.predicate,
+                belief.object,
+                confidence,
+                provenance,
+                cluster_id,
+                0,
+                now
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Run one harmonic cycle over recent memories (`shmr.py` `harmonize` L356-L523).
+///
+/// Candidate pull note: Python filters facts with `WHERE status = 'active' OR status IS NULL`,
+/// but no `facts` table (Python or Rust) ever has a `status` column, so that query raises on any
+/// real bank — the port drops the phantom predicate (equivalent to its `status IS NULL` intent).
+pub fn harmonize(
+    conn: &Connection,
+    session_id: &str,
+    opts: &ShmrOptions,
+    embed: EmbedFn,
+    llm: LlmFn,
+) -> Result<HarmonizeStats> {
+    let t0 = std::time::Instant::now();
+    ensure_schema(conn)?;
+
+    // --- Step 1: echo candidates (recent facts + recent episodic rows) ---
+    let mut candidates: Vec<Candidate> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT fact_id, subject, predicate, object, confidence FROM facts \
+             ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![opts.batch_size as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    r.get::<_, Option<f64>>(4)?.unwrap_or(0.5),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (fact_id, subject, predicate, object, confidence) in rows {
+            let embedding = embed(&object)
+                .ok_or_else(|| crate::Error::Embedding("shmr fact candidate".into()))?;
+            candidates.push(Candidate {
+                fact_id: Some(fact_id),
+                subject,
+                predicate,
+                object,
+                confidence,
+                source: "fact",
+                embedding,
+            });
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, content, importance FROM episodic_memory \
+             ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![(opts.batch_size / 2) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, Option<f64>>(2)?.unwrap_or(0.5),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, content, importance) in rows {
+            if content.chars().count() <= 10 {
+                continue;
+            }
+            let object: String = content.chars().take(300).collect();
+            let embedding = embed(&object)
+                .ok_or_else(|| crate::Error::Embedding("shmr episodic candidate".into()))?;
+            candidates.push(Candidate {
+                fact_id: Some(format!("ep_{id}")),
+                subject: "memory".into(),
+                predicate: "contains".into(),
+                object,
+                confidence: importance,
+                source: "episodic",
+                embedding,
+            });
+        }
+    }
+
+    if candidates.len() < opts.min_cluster_size {
+        return Ok(HarmonizeStats {
+            duration_ms: t0.elapsed().as_millis() as u64,
+            status: "insufficient_candidates",
+            ..Default::default()
+        });
+    }
+
+    // --- Step 2: cluster by semantic similarity, drop the singletons ---
+    let embeddings: Vec<Vec<f32>> = candidates.iter().map(|c| c.embedding.clone()).collect();
+    let mut index_clusters = cluster_by_similarity(&embeddings, opts.similarity_threshold);
+    index_clusters.retain(|c| c.len() >= opts.min_cluster_size);
+
+    // Move candidates into their clusters (each index appears in exactly one component).
+    let mut slots: Vec<Option<Candidate>> = candidates.into_iter().map(Some).collect();
+    let mut clusters: Vec<Vec<Candidate>> = index_clusters
+        .iter()
+        .map(|ixs| ixs.iter().map(|&i| slots[i].take().unwrap()).collect())
+        .collect();
+
+    let mut total_beliefs = 0usize;
+    let mut total_contradictions = 0usize;
+    let mut harmony_scores: Vec<f64> = Vec::new();
+
+    // --- Step 3: harmonize each cluster (<= max_iterations to convergence) ---
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (cluster_idx, cluster) in clusters.iter_mut().enumerate() {
+        let cluster_id = format!("shmr_{epoch_secs}_{cluster_idx}");
+        for _iteration in 0..opts.max_iterations {
+            let full_prompt = format!("{}\n\n{HARMONY_PROMPT}", format_cluster(cluster));
+            let Some(llm_output) = llm(&full_prompt).filter(|o| !o.is_empty()) else {
+                continue;
+            };
+            let beliefs: Vec<Belief> = extract_json_beliefs(&llm_output)
+                .iter()
+                .filter_map(Belief::from_value)
+                .collect();
+            if beliefs.is_empty() {
+                continue;
+            }
+
+            let score = compute_harmony_score(&beliefs, cluster, embed);
+            harmony_scores.push(score);
+
+            if score >= opts.harmony_threshold {
+                apply_beliefs(conn, &beliefs, cluster, &cluster_id)?;
+                total_beliefs += beliefs
+                    .iter()
+                    .filter(|b| b.action == "create" || b.action == "update")
+                    .count();
+                total_contradictions += beliefs.iter().filter(|b| b.action == "dampen").count();
+                break; // converged for this cluster
+            }
+            // Repopulate the cluster with the belief candidates for the next iteration
+            // (`shmr.py` L479-L488; an embed failure there aborts the iteration's feedback).
+            for b in &beliefs {
+                let Some(embedding) = embed(&b.object) else {
+                    break;
+                };
+                cluster.push(Candidate {
+                    fact_id: None,
+                    subject: b.subject.clone(),
+                    predicate: b.predicate.clone(),
+                    object: b.object.clone(),
+                    confidence: b.confidence,
+                    source: "belief_candidate",
+                    embedding,
+                });
+            }
+        }
+    }
+
+    let duration_ms = t0.elapsed().as_millis() as u64;
+    let avg_score = if harmony_scores.is_empty() {
+        0.0
+    } else {
+        harmony_scores.iter().sum::<f64>() / harmony_scores.len() as f64
+    };
+
+    // --- Step 4: log the resonance ---
+    conn.execute(
+        "INSERT INTO memory_resonance_log \
+         (session_id, cluster_count, beliefs_generated, contradictions_resolved, \
+          harmony_score_avg, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            session_id,
+            clusters.len() as i64,
+            total_beliefs as i64,
+            total_contradictions as i64,
+            round4(avg_score),
+            duration_ms as i64
+        ],
+    )?;
+
+    Ok(HarmonizeStats {
+        clusters_found: clusters.len(),
+        beliefs_generated: total_beliefs,
+        contradictions_resolved: total_contradictions,
+        harmony_score_avg: round4(avg_score),
+        duration_ms,
+        status: if total_beliefs > 0 {
+            "harmonized"
+        } else {
+            "no_convergence"
+        },
+    })
+}
+
+/// Search `harmonic_beliefs` for a query (`shmr.py` `recall_beliefs` L526-L573): the top
+/// `top_k*2` by stored confidence, re-scored by `cosine(query, object) * confidence` (belief
+/// embed failure -> `confidence * 0.3`), top `top_k`. An unembeddable query returns empty.
+pub fn recall_beliefs(
+    conn: &Connection,
+    query: &str,
+    top_k: usize,
+    embed: EmbedFn,
+) -> Result<Vec<BeliefHit>> {
+    ensure_schema(conn)?;
+    let Some(query_emb) = embed(query) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT belief_id, subject, predicate, object, confidence, provenance \
+         FROM harmonic_beliefs ORDER BY confidence DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![(top_k * 2) as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<f64>>(4)?.unwrap_or(0.5),
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut scored: Vec<(f64, BeliefHit)> = rows
+        .into_iter()
+        .map(
+            |(belief_id, subject, predicate, object, confidence, provenance)| {
+                let score = match embed(&object) {
+                    Some(emb) => cosine_eps(&query_emb, &emb) * confidence,
+                    None => confidence * 0.3,
+                };
+                (
+                    score,
+                    BeliefHit {
+                        content: object,
+                        score: round4(score),
+                        belief_id,
+                        subject,
+                        predicate,
+                        provenance,
+                        source: "harmonic_belief",
+                    },
+                )
+            },
+        )
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(scored.into_iter().take(top_k).map(|(_, h)| h).collect())
+}
+
+/// Phase-3A single-pass reflective synthesis over retrieved facts (`shmr.py` `reflect`
+/// L597-L642): format the top facts, prompt the LLM, return the synthesis when it is more than
+/// 10 chars.
+pub fn reflect(
+    question: &str,
+    facts: &[crate::engine::FactHit],
+    top_k: usize,
+    llm: LlmFn,
+) -> Option<String> {
+    if facts.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&crate::engine::FactHit> = facts.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted.truncate(top_k);
+    let fact_context = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("[{i}] (fact, conf={:.2}) {}", f.score, f.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = REFLECTION_PROMPT
+        .replace("{question}", question)
+        .replace("{fact_context}", &fact_context);
+    let synthesis = llm(&prompt)?;
+    let trimmed = synthesis.trim();
+    if trimmed.chars().count() > 10 {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Recent harmonization run logs (`shmr.py` `get_resonance_log` L645-L656).
+pub fn get_resonance_log(conn: &Connection, limit: usize) -> Result<Vec<ResonanceEntry>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, cluster_count, beliefs_generated, contradictions_resolved, \
+                harmony_score_avg, duration_ms, created_at \
+         FROM memory_resonance_log ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(ResonanceEntry {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                cluster_count: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                beliefs_generated: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                contradictions_resolved: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                harmony_score_avg: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                duration_ms: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                created_at: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic bag-of-words hash embedder (same trick as `daemon_core`'s mock): shared
+    /// tokens -> similar vectors, disjoint texts -> near-orthogonal.
+    fn hash_embed(text: &str) -> Option<Vec<f32>> {
+        let mut v = vec![0f32; 64];
+        for token in text.to_lowercase().split_whitespace() {
+            let mut h = 5381u64;
+            for b in token.bytes() {
+                h = h.wrapping_mul(33) ^ b as u64;
+            }
+            let bucket = (h % 64) as usize;
+            let sign = if (h >> 7).is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
+            v[bucket] += sign;
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+        Some(v)
+    }
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE facts (fact_id TEXT PRIMARY KEY, session_id TEXT, subject TEXT, \
+             predicate TEXT, object TEXT, timestamp TEXT, source_msg_id TEXT, confidence REAL, \
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); \
+             CREATE TABLE episodic_memory (rowid INTEGER PRIMARY KEY AUTOINCREMENT, \
+             id TEXT UNIQUE NOT NULL, content TEXT NOT NULL, importance REAL DEFAULT 0.5, \
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_fact(conn: &Connection, id: &str, s: &str, p: &str, o: &str, conf: f64) {
+        conn.execute(
+            "INSERT INTO facts (fact_id, subject, predicate, object, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, s, p, o, conf],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clustering_groups_by_cosine_components() {
+        let e = |t: &str| hash_embed(t).unwrap();
+        let embs = vec![
+            e("rust memory engine daemon"),
+            e("rust memory engine core"),
+            e("completely unrelated pizza topping"),
+        ];
+        let clusters = cluster_by_similarity(&embs, 0.5);
+        assert_eq!(clusters.len(), 2);
+        let big = clusters.iter().find(|c| c.len() == 2).unwrap();
+        assert!(big.contains(&0) && big.contains(&1));
+    }
+
+    #[test]
+    fn json_extraction_handles_fenced_bare_and_object_soup() {
+        let arr = r#"[{"subject": "A", "object": "x"}]"#;
+        assert_eq!(extract_json_beliefs(arr).len(), 1);
+        let wrapped = r#"{"beliefs": [{"subject": "A"}, {"subject": "B"}]}"#;
+        assert_eq!(extract_json_beliefs(wrapped).len(), 2);
+        let fenced = "Here you go:\n```json\n[{\"subject\": \"A\"}]\n```\nDone.";
+        assert_eq!(extract_json_beliefs(fenced).len(), 1);
+        let bare = "I think [ {\"subject\": \"A\"} ] fits";
+        assert_eq!(extract_json_beliefs(bare).len(), 1);
+        let soup = "belief one {\"subject\": \"A\"} and {\"subject\": \"B\"}";
+        assert_eq!(extract_json_beliefs(soup).len(), 2);
+        assert!(extract_json_beliefs("no json at all").is_empty());
+    }
+
+    #[test]
+    fn harmonize_accepts_convergent_beliefs_and_logs_resonance() {
+        let conn = test_conn();
+        seed_fact(
+            &conn,
+            "f1",
+            "Alice",
+            "prefers",
+            "dark roast coffee beans",
+            0.8,
+        );
+        seed_fact(
+            &conn,
+            "f2",
+            "Alice",
+            "likes",
+            "dark roast coffee drinks",
+            0.7,
+        );
+
+        // The scripted harmonizer emits one high-confidence belief whose text matches the
+        // cluster, so cosine(belief, centroid) is high and harmony passes on iteration 1.
+        let llm = |_prompt: &str| {
+            Some(
+                r#"[{"subject": "Alice", "predicate": "prefers", "object": "dark roast coffee",
+                     "confidence": 0.9, "action": "create", "rationale": "corroborated"}]"#
+                    .to_string(),
+            )
+        };
+        let stats = harmonize(
+            &conn,
+            "session-1",
+            &ShmrOptions::default(),
+            &hash_embed,
+            &llm,
+        )
+        .unwrap();
+
+        assert_eq!(stats.status, "harmonized");
+        assert_eq!(stats.clusters_found, 1);
+        assert_eq!(stats.beliefs_generated, 1);
+        assert_eq!(stats.contradictions_resolved, 0);
+        assert!(stats.harmony_score_avg >= HARMONY_THRESHOLD);
+
+        let (object, confidence, provenance): (String, f64, String) = conn
+            .query_row(
+                "SELECT object, confidence, provenance FROM harmonic_beliefs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(object, "dark roast coffee");
+        assert!((confidence - 0.9).abs() < 1e-9);
+        let prov: Vec<String> = serde_json::from_str(&provenance).unwrap();
+        assert_eq!(prov, vec!["f1", "f2"]);
+
+        let log = get_resonance_log(&conn, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(log[0].cluster_count, 1);
+        assert_eq!(log[0].beliefs_generated, 1);
+    }
+
+    #[test]
+    fn dampen_reduces_fact_confidence_with_floor() {
+        let conn = test_conn();
+        seed_fact(
+            &conn,
+            "f1",
+            "Server",
+            "runs",
+            "ubuntu linux server host alpha",
+            0.8,
+        );
+        seed_fact(
+            &conn,
+            "f2",
+            "Server",
+            "runs",
+            "ubuntu linux server host beta",
+            0.2,
+        );
+
+        let llm = |_prompt: &str| {
+            Some(
+                r#"[{"subject": "Server", "predicate": "runs",
+                     "object": "ubuntu linux server host alpha",
+                     "confidence": 0.9, "action": "dampen", "target_fact_id": "f2"}]"#
+                    .to_string(),
+            )
+        };
+        let stats = harmonize(&conn, "s", &ShmrOptions::default(), &hash_embed, &llm).unwrap();
+        assert_eq!(stats.contradictions_resolved, 1);
+        assert_eq!(stats.beliefs_generated, 0);
+        assert_eq!(stats.status, "no_convergence"); // only dampen actions -> no create/update
+
+        let conf: f64 = conn
+            .query_row(
+                "SELECT confidence FROM facts WHERE fact_id = 'f2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (conf - 0.1).abs() < 1e-9,
+            "0.2 - 0.15 floors at 0.1, got {conf}"
+        );
+    }
+
+    #[test]
+    fn low_harmony_iterates_and_gives_up() {
+        let conn = test_conn();
+        seed_fact(&conn, "f1", "Topic", "is", "alpha beta gamma one two", 0.9);
+        seed_fact(
+            &conn,
+            "f2",
+            "Topic",
+            "is",
+            "alpha beta gamma one three",
+            0.9,
+        );
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        // Beliefs never resemble the cluster -> harmony stays low -> 3 iterations, no writes.
+        let llm = |_prompt: &str| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Some(
+                r#"[{"subject": "X", "predicate": "unrelated", "object": "zzz qqq www",
+                     "confidence": 0.2, "action": "create"}]"#
+                    .to_string(),
+            )
+        };
+        let stats = harmonize(&conn, "s", &ShmrOptions::default(), &hash_embed, &llm).unwrap();
+        assert_eq!(stats.status, "no_convergence");
+        assert_eq!(stats.beliefs_generated, 0);
+        assert_eq!(CALLS.load(Ordering::SeqCst), MAX_ITERATIONS);
+        let beliefs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM harmonic_beliefs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(beliefs, 0);
+        // Every scored-but-rejected iteration feeds its beliefs back into the cluster.
+        assert!(stats.harmony_score_avg < HARMONY_THRESHOLD);
+    }
+
+    #[test]
+    fn insufficient_candidates_short_circuits() {
+        let conn = test_conn();
+        seed_fact(&conn, "f1", "Solo", "is", "alone here", 0.9);
+        let llm = |_: &str| -> Option<String> { panic!("LLM must not be called") };
+        let stats = harmonize(&conn, "s", &ShmrOptions::default(), &hash_embed, &llm).unwrap();
+        assert_eq!(stats.status, "insufficient_candidates");
+        assert_eq!(stats.clusters_found, 0);
+    }
+
+    #[test]
+    fn recall_beliefs_ranks_by_similarity_times_confidence() {
+        let conn = test_conn();
+        ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO harmonic_beliefs (belief_id, subject, predicate, object, confidence) \
+             VALUES ('b1', 'A', 'is', 'rust daemon memory engine', 0.9), \
+                    ('b2', 'B', 'is', 'pizza with extra cheese', 0.95)",
+            [],
+        )
+        .unwrap();
+        let hits = recall_beliefs(&conn, "rust memory engine", 10, &hash_embed).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].belief_id, "b1",
+            "semantic match beats raw confidence"
+        );
+        assert_eq!(hits[0].source, "harmonic_belief");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn reflect_formats_facts_and_returns_synthesis() {
+        use crate::engine::FactHit;
+        let facts = vec![
+            FactHit {
+                content: "Alice prefers dark roast".into(),
+                score: 0.9,
+                fact_id: "f1".into(),
+                subject: "Alice".into(),
+                predicate: "prefers".into(),
+            },
+            FactHit {
+                content: "Alice works at Acme".into(),
+                score: 0.5,
+                fact_id: "f2".into(),
+                subject: "Alice".into(),
+                predicate: "works_at".into(),
+            },
+        ];
+        let seen = std::sync::Mutex::new(String::new());
+        let llm = |prompt: &str| {
+            *seen.lock().unwrap() = prompt.to_string();
+            Some("Alice prefers dark roast and works at Acme.".to_string())
+        };
+        let out = reflect("what does Alice like?", &facts, 10, &llm).unwrap();
+        assert_eq!(out, "Alice prefers dark roast and works at Acme.");
+        let prompt = seen.lock().unwrap();
+        assert!(prompt.contains("QUESTION: what does Alice like?"));
+        assert!(prompt.contains("[0] (fact, conf=0.90) Alice prefers dark roast"));
+        assert!(prompt.contains("[1] (fact, conf=0.50) Alice works at Acme"));
+
+        // Short/empty synthesis is rejected like Python's `len(...) > 10` gate.
+        let llm_short = |_: &str| Some("ok".to_string());
+        assert!(reflect("q", &facts, 10, &llm_short).is_none());
+        assert!(reflect("q", &[], 10, &llm).is_none());
+    }
 }

@@ -204,6 +204,11 @@ pub struct MemoryRow {
     /// Whether the fact-aware pass matched/boosted this row (`fact_match`).
     #[serde(default)]
     pub fact_match: bool,
+    /// Per-signal provenance (`voice_scores`): the linear path collapses its scoring signals into
+    /// `vec/fts/keyword/importance/recency_decay` (`beam.py` L5987-L5994, Gap G); the polyphonic
+    /// path carries per-voice RRF contributions (`beam.py` L6649).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_scores: Option<std::collections::HashMap<String, f64>>,
 }
 
 /// An unresolved `(subject, predicate)` contradiction awaiting LLM validation in sleep.
@@ -447,6 +452,49 @@ impl Engine {
     pub fn llm_conflict_detection(&self) -> bool {
         self.config.llm_conflict_detection
     }
+
+    // ── SHMR (opt-in background pass; `shmr.py`) ────────────────────────────────────────────────
+
+    /// Run one SHMR harmonic cycle over recent memories (`shmr.py` `harmonize`). Off the hot path
+    /// — Python never wires it into `sleep()` — and the engine owns no LLM/embedding runtime, so
+    /// both are injected ([`crate::recall::shmr`]).
+    pub fn harmonize(
+        &self,
+        opts: &crate::recall::shmr::ShmrOptions,
+        embed: crate::recall::shmr::EmbedFn,
+        llm: crate::recall::shmr::LlmFn,
+    ) -> Result<crate::recall::shmr::HarmonizeStats> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::recall::shmr::harmonize(&conn, &self.config.session_id, opts, embed, llm)
+    }
+
+    /// Search `harmonic_beliefs` for a query (`shmr.py` `recall_beliefs`).
+    pub fn recall_beliefs(
+        &self,
+        query: &str,
+        top_k: usize,
+        embed: crate::recall::shmr::EmbedFn,
+    ) -> Result<Vec<crate::recall::shmr::BeliefHit>> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::recall::shmr::recall_beliefs(&conn, query, top_k, embed)
+    }
+
+    /// Phase-3A reflective synthesis over [`Engine::fact_recall`] hits (`shmr.py` `reflect`).
+    pub fn reflect(
+        &self,
+        question: &str,
+        top_k: usize,
+        llm: crate::recall::shmr::LlmFn,
+    ) -> Result<Option<String>> {
+        let facts = self.fact_recall(question, top_k)?;
+        Ok(crate::recall::shmr::reflect(question, &facts, top_k, llm))
+    }
+
+    /// Recent harmonization run logs (`shmr.py` `get_resonance_log`).
+    pub fn resonance_log(&self, limit: usize) -> Result<Vec<crate::recall::shmr::ResonanceEntry>> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::recall::shmr::get_resonance_log(&conn, limit)
+    }
 }
 
 mod consolidation;
@@ -458,7 +506,7 @@ mod recall;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use query::load_embeddings;
 #[cfg(all(feature = "vec-ext", test))]
 pub(crate) use query::native_cosine_sim_map;
-pub(crate) use query::{cosine_sim_map, load_embeddings};
 pub use recall::FactHit;

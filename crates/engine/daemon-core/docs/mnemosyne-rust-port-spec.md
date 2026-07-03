@@ -579,16 +579,22 @@ rank starts at 1, missing -> 999):
 keyed on `MnemosyneConfig::recall_mode` (`Base`/`Enhanced`/`Polyphonic`, §13 config). `recall_enhanced`
 runs `classify_intent` → `adjust_weights` → `normalize_query`/`expand_query` → `query_cache().get` →
 `recall_base` (with the intent-biased weights threaded through `gather_working`/`gather_episodic`) →
-`weibull_rescore` (fetches each row's `memory_type` from the bank, `score*0.7 + wb*0.3`) →
-`mmr_rerank` → `episodic_graph::find_related_memories` expansion → `query_cache().put`. The cache
+`weibull_rescore` (only when no explicit `temporal_weight` filter is set; fetches each row's
+`memory_type` from the bank, supplement tiers default to `general`, `score*0.7 + wb*0.3`) →
+`mmr_rerank` over `top_k*2` → final sort/truncate to `top_k` →
+`episodic_graph::find_related_memories` expansion → `query_cache().put`, matching Python's stage
+order exactly. The cache
 ([`recall/query_cache.rs`](../../../memory/daemon-mnemosyne/src/recall/query_cache.rs)) is a
 `OnceLock<QueryCache>` on the engine, persistent (`query_cache.db`) when the bank is on disk and
 in-memory otherwise, and is invalidated on `remember` only once initialized. `recall_polyphonic`
-gathers the four `VoiceHit` lists, fuses them with the pure-RRF
-[`polyphonic::fuse`](../../../memory/daemon-mnemosyne/src/recall/polyphonic.rs) (`RRF_K=60`), applies
-`diversity_rerank` (0.8 Jaccard), then resolves ids back to `MemoryRow`s. The fact voice queries the
-`facts` table directly by subject word (returning `source_msg_id` + confidence) rather than Python's
-non-memory `consolidated_fact` ids, so every fused hit maps to a real memory.
+gathers the four `VoiceHit` lists (`engine/recall.rs` `poly_*_voice`), fuses them with the pure-RRF
+[`polyphonic::combine_voices`](../../../memory/daemon-mnemosyne/src/recall/polyphonic.rs)
+(`RRF_K=60`, missing rank 999), applies `diversity_rerank` (0.8 Jaccard on voice-key sets) and the
+`budget*4`-char `assemble_context` cut, then materializes ids to `MemoryRow`s with per-voice RRF
+provenance in `MemoryRow::voice_scores` and post-RRF veracity + tier-degradation multipliers. The
+fact voice reads `consolidated_facts` faithfully: its synthetic `cf_<id>` hits become Fact-tier rows
+(`[FACT] subject predicate object`) rather than being dropped, and a low-signal
+`memoria_retrieve` supplement is prepended exactly as in Python.
 
 ### 8.3 SHMR (`shmr.py`) — opt-in background
 
@@ -597,6 +603,16 @@ Self-Harmonizing Memory Reasoning: greedy connected-component clustering on cosi
 persists to `harmonic_beliefs` + `memory_resonance_log`. **Not wired into `sleep()` in Python** (the
 docstring claims it is, but `beam.sleep` never calls `harmonize` — `shmr.py` L356). The Rust port
 ships it as an explicit opt-in background pass, not on the hot path.
+
+**As-built ([`recall/shmr.rs`](../../../memory/daemon-mnemosyne/src/recall/shmr.rs)):**
+`Engine::{harmonize, recall_beliefs, reflect, resonance_log}` wrap the module; `harmonize` takes
+injected `EmbedFn`/`LlmFn` callbacks (the engine is sync and LLM-free by design) plus
+`ShmrOptions` mirroring the env knobs (batch 50, <=3 iterations, sim 0.70, harmony 0.60, min
+cluster 2). The `harmonic_beliefs`/`memory_resonance_log` tables are created lazily on first use,
+exactly like Python. Belief application ports `_apply_beliefs` verbatim: `reinforce`/`generalize`
+insert working-memory rows tagged `[HARMONIC]`/`[PATTERN]`, `dampen` floors fact confidence at 0.1.
+One deliberate deviation: Python's `harmonize` filters facts on a nonexistent `facts.status`
+column (an OperationalError on any standard bank); the Rust query drops that predicate.
 
 ---
 

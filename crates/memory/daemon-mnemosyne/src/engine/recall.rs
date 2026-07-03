@@ -21,7 +21,7 @@ use crate::recall::lexical::{
 use crate::recall::{mmr, polyphonic, query_intent, scoring, synonyms};
 use crate::{memoria, util};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 /// The shared candidate projection for the WM / entity / fact SELECTs (`beam.py` L5259).
@@ -259,27 +259,6 @@ impl Engine {
                 vec![Value::Text(self.config.session_id.clone())],
             )
         }
-    }
-
-    /// Build the recall scope SQL fragment (a leading ` AND ...`) plus its bound params for the
-    /// given [`RecallScope`] — the branch plus the exact author/channel filters. Used by the
-    /// polyphonic voices and the scoped single-row fetches.
-    pub(crate) fn scope_clause(&self, scope: &RecallScope) -> (String, Vec<Value>) {
-        let (branch, mut p) = self.scope_branch(scope);
-        let mut clause = format!(" AND {branch}");
-        if let Some(author) = &scope.author_id {
-            clause.push_str(" AND author_id = ?");
-            p.push(Value::Text(author.clone()));
-        }
-        if let Some(author_type) = &scope.author_type {
-            clause.push_str(" AND author_type = ?");
-            p.push(Value::Text(author_type.clone()));
-        }
-        if let Some(channel) = &scope.channel_id {
-            clause.push_str(" AND channel_id = ?");
-            p.push(Value::Text(channel.clone()));
-        }
-        (clause, p)
     }
 
     /// The full per-tier recall WHERE body: validity + scope branch + the per-call row filters +
@@ -1187,38 +1166,46 @@ impl Engine {
             weights,
         )?;
 
-        // 5. Weibull re-scoring by memory type.
-        self.weibull_rescore(&mut results)?;
+        // 5. Weibull re-scoring by memory type — skipped when the caller supplied a temporal
+        // boost (`beam.py` L6243-L6245).
+        if req.filters.temporal_weight == 0.0 {
+            self.weibull_rescore(&mut results)?;
+        }
 
-        // 6-7. Sort, then MMR-diversify down to `top_k`.
+        // 6. MMR diversity rerank at the over-fetch width (`mmr_rerank(..., top_k=top_k*2)`,
+        // L6281-L6282) — only drops candidates beyond `top_k*2`; the score sort below decides
+        // the final order.
+        if results.len() > 1 {
+            let items: Vec<(String, f64)> = results
+                .iter()
+                .map(|r| (r.content.clone(), r.score))
+                .collect();
+            results = mmr::mmr_rerank(&items, mmr::DEFAULT_LAMBDA, req.top_k * 2)
+                .into_iter()
+                .map(|i| results[i].clone())
+                .collect();
+        }
+
+        // 7. Sort by score and take the top results (L6285-L6286). Step 8 (associative graph
+        // expansion) is `use_associative=False` by default in Python and not ported.
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let final_results: Vec<MemoryRow> = if results.len() > 1 {
-            let items: Vec<(String, f64)> = results
-                .iter()
-                .map(|r| (r.content.clone(), r.score))
-                .collect();
-            mmr::mmr_rerank(&items, mmr::DEFAULT_LAMBDA, req.top_k)
-                .into_iter()
-                .map(|i| results[i].clone())
-                .collect()
-        } else {
-            results.truncate(req.top_k);
-            results
-        };
+        results.truncate(req.top_k);
 
-        // 8. Cache the result for next time.
+        // 9. Cache the result for next time.
         self.query_cache()
-            .put(req.query, &final_results, req.query_vector);
-        Ok(final_results)
+            .put(req.query, &results, req.query_vector);
+        Ok(results)
     }
 
-    /// Blend the per-type Weibull temporal boost into each row's score (`beam.py` L6266-L6278):
-    /// `score = score*0.7 + weibull_boost*0.3`. The memory type is read from the row's tier table;
-    /// missing/`unknown` types fall back to `general`.
+    /// Blend the per-type Weibull temporal boost into each row's score (`beam.py` L6243-L6278):
+    /// `score = round4(score*0.7 + weibull_boost*0.3)`. Working/episodic rows read their
+    /// `memory_type` from the tier table; supplement rows (memoria/fact) fall back to `general`
+    /// like Python's dict-shaped rows, so they get rescored too (a memoria row's empty timestamp
+    /// yields `wb = 0.0` -> `score*0.7`).
     fn weibull_rescore(&self, rows: &mut [MemoryRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1226,179 +1213,521 @@ impl Engine {
         let conn = self.store.conn.lock().unwrap();
         for row in rows.iter_mut() {
             let table = match row.tier {
-                Tier::Working => "working_memory",
-                Tier::Episodic => "episodic_memory",
-                // Synthetic supplement rows have no backing table row.
-                Tier::Memoria | Tier::MemoriaSource | Tier::Fact => continue,
+                Tier::Working => Some("working_memory"),
+                Tier::Episodic => Some("episodic_memory"),
+                Tier::Memoria | Tier::MemoriaSource | Tier::Fact => None,
             };
-            let mt: Option<String> = conn
-                .query_row(
+            let mt: Option<String> = table.and_then(|table| {
+                conn.query_row(
                     &format!("SELECT memory_type FROM {table} WHERE id = ?1"),
                     params![row.id],
                     |r| r.get(0),
                 )
-                .ok();
+                .ok()
+            });
             let mut memory_type = mt.unwrap_or_default();
             if memory_type.is_empty() || memory_type == "unknown" {
                 memory_type = "general".to_string();
             }
             let wb = weibull::weibull_boost(age_hours(&row.timestamp), &memory_type);
-            row.score = row.score * 0.7 + wb * 0.3;
+            row.score = round4(row.score * 0.7 + wb * 0.3);
         }
         Ok(())
     }
 
-    /// Four-voice polyphonic recall (`polyphonic_recall.py`, `MNEMOSYNE_POLYPHONIC_RECALL=1`):
-    /// gathers a **vector** voice (cosine normalized `(cos+1)/2`, top 20), a **graph** voice (query
-    /// entities seed `facts` subjects at `0.6`, then `ctx`-edge traversal at `0.4/depth`), a **fact**
-    /// voice (consolidated `facts` whose subject is a query word, `confidence >= 0.5`), and a
-    /// **temporal** voice (last-7-day working rows, `exp(-age_days/7)*importance`, only on temporal
-    /// keywords), then fuses them with RRF ([`polyphonic::fuse`]), diversity-reranks, and resolves
-    /// the surviving ids to rows. Voice weights stay metadata-only (fusion is pure RRF).
+    /// Four-voice polyphonic recall (`PolyphonicRecallEngine.recall` + `beam.py`
+    /// `_recall_polyphonic` L6547-L6737): gathers the vector / graph / fact / temporal voices,
+    /// fuses via RRF (voice weights stay metadata-only), diversity-reranks, assembles within the
+    /// context budget, then materializes rows with the linear path's isolation/validity filters,
+    /// composes the veracity + tier-degradation multipliers on top of the RRF score, cross-tier
+    /// dedups, bumps recall stats scoped, and prepends the MEMORIA supplement.
     fn recall_polyphonic(&self, req: &RecallReq) -> Result<Vec<MemoryRow>> {
-        use polyphonic::VoiceHit;
         let conn = self.store.conn.lock().unwrap();
+        let now = util::now_iso();
 
-        // Voice 1: vector (cosine over stored embeddings, normalized to [0, 1], top 20).
-        let mut vector_hits: Vec<VoiceHit> = Vec::new();
-        if let Some(q) = req.query_vector {
-            let mut sims: Vec<(String, f64)> = cosine_sim_map(&conn, q)?
-                .into_iter()
-                .map(|(id, cos)| (id, (cos + 1.0) / 2.0))
-                .collect();
-            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            sims.truncate(20);
-            vector_hits = sims
-                .into_iter()
-                .map(|(id, s)| VoiceHit {
-                    memory_id: id,
-                    score: s,
-                })
-                .collect();
-        }
+        // ---- The four voices (over-fetch top_k*2, `beam.py` L6599) ----
+        let voices = [
+            poly_vector_voice(&conn, req.query_vector, &now),
+            poly_graph_voice(&conn, req.query)?,
+            poly_fact_voice(&conn, req.query)?,
+            poly_temporal_voice(&conn, req.query)?,
+        ];
+        let fused = polyphonic::combine_voices(&voices);
+        let reranked = polyphonic::diversity_rerank(fused, req.top_k * 2);
+        let assembled = polyphonic::assemble_context(reranked, 4000);
 
-        // Voice 2: graph (entity-seeded gists @0.6 + fact subjects @conf*0.5, then ctx-edge
-        // traversal @0.4/depth from all seeds).
-        let q_entities = entities::extract_entities_regex(req.query);
-        let mut graph_hits: Vec<VoiceHit> = Vec::new();
-        let mut seen_graph: HashSet<String> = HashSet::new();
-        let mut seed_ids: HashSet<String> = HashSet::new();
-        for ent in &q_entities {
-            for (mid, _text) in episodic_graph::find_gists_by_participant(&conn, ent)? {
-                if seen_graph.insert(mid.clone()) {
-                    graph_hits.push(VoiceHit {
-                        memory_id: mid.clone(),
-                        score: 0.6,
-                    });
-                }
-                seed_ids.insert(mid);
+        // ---- Materialize with filters + multipliers (`_recall_polyphonic` L6605-L6659) ----
+        let mut ep_summary_of: HashMap<String, String> = HashMap::new();
+        let mut finals: Vec<MemoryRow> = Vec::new();
+        for r in assembled {
+            // Synthetic consolidated-fact ids can't map back to source rows; they contribute
+            // ranking signal only (`beam.py` L6577-L6582, L6617).
+            if r.memory_id.starts_with("cf_") {
+                continue;
             }
-            for (mid, conf) in self.facts_for_subject(&conn, ent, 0.0)? {
-                if seen_graph.insert(mid.clone()) {
-                    graph_hits.push(VoiceHit {
-                        memory_id: mid.clone(),
-                        score: conf * 0.5,
-                    });
-                }
-                seed_ids.insert(mid);
+            let Some(poly) = fetch_polyphonic_row(&conn, &r.memory_id)? else {
+                continue;
+            };
+            if !self.polyphonic_row_passes_filters(&poly, req, &now) {
+                continue;
             }
-        }
-        for seed in &seed_ids {
-            for rel in episodic_graph::find_related_memories(&conn, seed, 2, "ctx", 0.3)? {
-                if !seed_ids.contains(&rel.memory_id) && seen_graph.insert(rel.memory_id.clone()) {
-                    graph_hits.push(VoiceHit {
-                        memory_id: rel.memory_id,
-                        score: 0.4 / rel.depth as f64,
-                    });
+            let mut row = poly.row;
+            // Compose RRF with the post-E4 veracity multiplier and the episodic tier-degradation
+            // multiplier so flag=ON callers keep the linear path's rank signals (L6640-L6646).
+            let mut score = r.combined_score;
+            if self.config.veracity_multiplier {
+                score *= self.config.veracity_weights.weight(&row.veracity);
+            }
+            if row.tier == Tier::Episodic {
+                let [w1, w2, w3] = self.config.tier_weights;
+                score *= match row.tier_level {
+                    1 => w1,
+                    2 => w2,
+                    3 => w3,
+                    _ => 1.0,
+                };
+                if let Some(s) = poly.summary_of {
+                    ep_summary_of.insert(row.id.clone(), s);
                 }
             }
+            row.score = score;
+            row.voice_scores = Some(r.voice_scores);
+            finals.push(row);
         }
 
-        // Voice 3: fact (query words matched against consolidated `facts` subjects).
-        let mut fact_hits: Vec<VoiceHit> = Vec::new();
-        let mut seen_fact: HashSet<String> = HashSet::new();
-        for word in recall_tokens(req.query) {
-            for (mid, conf) in self.facts_for_subject(&conn, &word, 0.5)? {
-                if seen_fact.insert(mid.clone()) {
-                    fact_hits.push(VoiceHit {
-                        memory_id: mid,
-                        score: conf,
-                    });
-                }
+        // Re-sort post-multiplier, dedup summary<->source pairs like the linear path, truncate
+        // (`beam.py` L6657-L6665).
+        finals.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut finals = dedup_cross_tier_summary_links(finals, &ep_summary_of);
+        finals.truncate(req.top_k);
+
+        // Scoped recall-stat attribution from the deduped final set (`beam.py` L6666-L6714).
+        self.bump_recall_scoped(&conn, &finals, req.scope)?;
+
+        // MEMORIA structured fact supplement — prepended, no lexical gate on this path
+        // (`beam.py` L6716-L6736).
+        if let Some(result) =
+            memoria::memoria_retrieve(&conn, &self.config.session_id, req.query, 3)
+        {
+            if result.source != "fallback" && !result.context.is_empty() {
+                finals.insert(
+                    0,
+                    MemoryRow {
+                        id: format!("memoria_{}", result.source),
+                        content: format!("[MEMORIA {}]\n{}", result.source, result.context),
+                        source: format!("memoria_{}", result.source),
+                        score: 0.95,
+                        tier: Tier::Memoria,
+                        tier_level: 1,
+                        importance: 0.9,
+                        timestamp: String::new(),
+                        ..Default::default()
+                    },
+                );
             }
         }
+        Ok(finals)
+    }
 
-        // Voice 4: temporal (recent working rows, only when the query has a temporal cue).
-        let mut temporal_hits: Vec<VoiceHit> = Vec::new();
-        if has_temporal_keyword(req.query) {
-            let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
-            let (scope_sql, scope_params) = self.scope_clause(req.scope);
-            let sql = format!(
-                "SELECT id, timestamp, importance FROM working_memory \
-                 WHERE timestamp > ? AND superseded_by IS NULL{scope_sql} \
-                 ORDER BY timestamp DESC LIMIT 20",
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut bind: Vec<Value> = vec![Value::Text(week_ago)];
-            bind.extend(scope_params);
-            let rows = stmt.query_map(params_from_iter(bind), |r| {
+    /// The linear path's filter set applied to a polyphonic row post-fetch (`beam.py`
+    /// `_polyphonic_row_passes_filters` L6760-L6814): always-on session/scope isolation and
+    /// validity, then the caller-supplied filters.
+    fn polyphonic_row_passes_filters(&self, poly: &PolyRow, req: &RecallReq, now: &str) -> bool {
+        let row = &poly.row;
+        let f = &req.filters;
+        // Session/scope isolation: non-global rows from another session are invisible (L6779-L6785).
+        if row.scope != "global"
+            && poly.session_id.is_some()
+            && poly.session_id.as_deref() != Some(self.config.session_id.as_str())
+        {
+            return false;
+        }
+        // Validity (L6787-L6792).
+        if let Some(vu) = &row.valid_until {
+            if !vu.is_empty() && vu.as_str() <= now {
+                return false;
+            }
+        }
+        if poly.superseded_by.is_some() {
+            return false;
+        }
+        // Caller-supplied filters (L6794-L6812). Dates compare against the raw kwarg strings.
+        if let Some(from) = &f.from_date {
+            if row.timestamp.as_str() < from.as_str() {
+                return false;
+            }
+        }
+        if let Some(to) = &f.to_date {
+            if row.timestamp.as_str() > to.as_str() {
+                return false;
+            }
+        }
+        if let Some(source) = &f.source {
+            if &row.source != source {
+                return false;
+            }
+        }
+        if let Some(topic) = &f.topic {
+            if !row.source.contains(topic.as_str()) {
+                return false;
+            }
+        }
+        if let Some(author) = &req.scope.author_id {
+            if row.author_id.as_deref() != Some(author.as_str()) {
+                return false;
+            }
+        }
+        if let Some(author_type) = &req.scope.author_type {
+            if row.author_type.as_deref() != Some(author_type.as_str()) {
+                return false;
+            }
+        }
+        if let Some(channel) = &req.scope.channel_id {
+            if row.channel_id.as_deref() != Some(channel.as_str()) {
+                return false;
+            }
+        }
+        if let Some(veracity) = &f.veracity {
+            if &row.veracity != veracity {
+                return false;
+            }
+        }
+        if let Some(memory_type) = &f.memory_type {
+            if &poly.memory_type != memory_type {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A materialized polyphonic candidate: the recall row plus the isolation fields the filter pass
+/// needs but [`MemoryRow`] doesn't carry (`beam.py` `_polyphonic_row_to_dict` L6847-L6872).
+struct PolyRow {
+    row: MemoryRow,
+    session_id: Option<String>,
+    superseded_by: Option<String>,
+    memory_type: String,
+    summary_of: Option<String>,
+}
+
+/// Resolve a polyphonic memory id to its row — episodic first, then working, unscoped; the filter
+/// pass enforces isolation afterwards (`beam.py` `_fetch_polyphonic_row` L6816-L6845).
+fn fetch_polyphonic_row(conn: &Connection, memory_id: &str) -> Result<Option<PolyRow>> {
+    let map = |tier: Tier| {
+        move |r: &rusqlite::Row<'_>| -> rusqlite::Result<PolyRow> {
+            Ok(PolyRow {
+                row: MemoryRow {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    source: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    timestamp: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    importance: r.get::<_, Option<f64>>(5)?.unwrap_or(0.5),
+                    recall_count: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    last_recalled: r.get(7)?,
+                    valid_until: r.get(8)?,
+                    scope: r
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_else(|| "session".into()),
+                    author_id: r.get(11)?,
+                    author_type: r.get(12)?,
+                    channel_id: r.get(13)?,
+                    veracity: r
+                        .get::<_, Option<String>>(14)?
+                        .unwrap_or_else(|| "unknown".into()),
+                    tier,
+                    tier_level: if tier == Tier::Episodic {
+                        r.get::<_, Option<i64>>(16)?.unwrap_or(1)
+                    } else {
+                        1
+                    },
+                    ..Default::default()
+                },
+                session_id: r.get(4)?,
+                superseded_by: r.get(9)?,
+                memory_type: r
+                    .get::<_, Option<String>>(15)?
+                    .unwrap_or_else(|| "unknown".into()),
+                summary_of: if tier == Tier::Episodic {
+                    r.get::<_, Option<String>>(17)?
+                } else {
+                    None
+                },
+            })
+        }
+    };
+    let episodic = conn
+        .query_row(
+            "SELECT id, content, source, timestamp, session_id, importance, recall_count, \
+                    last_recalled, valid_until, superseded_by, scope, author_id, author_type, \
+                    channel_id, veracity, memory_type, tier, summary_of \
+             FROM episodic_memory WHERE id = ?1",
+            params![memory_id],
+            map(Tier::Episodic),
+        )
+        .optional()?;
+    if episodic.is_some() {
+        return Ok(episodic);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT id, content, source, timestamp, session_id, importance, recall_count, \
+                    last_recalled, valid_until, superseded_by, scope, author_id, author_type, \
+                    channel_id, veracity, memory_type \
+             FROM working_memory WHERE id = ?1",
+            params![memory_id],
+            map(Tier::Working),
+        )
+        .optional()?)
+}
+
+/// Voice 1 — vector (`polyphonic_recall.py` `_vector_voice` L168-L493): cosine over
+/// `memory_embeddings` joined to each live tier (EM then WM), normalized `(cos+1)/2`, deduped by
+/// id keeping the higher-similarity occurrence, top 20. This port always takes the
+/// numpy-equivalent fallback path (no sqlite-vec ANN index is populated by the Rust engine).
+fn poly_vector_voice(
+    conn: &Connection,
+    query_vector: Option<&[f32]>,
+    now: &str,
+) -> Vec<polyphonic::VoiceHit> {
+    let Some(q) = query_vector else {
+        return Vec::new();
+    };
+    let norm = (q.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
+    if q.is_empty() || norm == 0.0 {
+        return Vec::new();
+    }
+    let mut by_id: HashMap<String, polyphonic::VoiceHit> = HashMap::new();
+    for (table, tier_label) in [
+        ("episodic_memory", "episodic"),
+        ("working_memory", "working"),
+    ] {
+        let sql = format!(
+            "SELECT t.id, me.embedding_json FROM memory_embeddings me \
+             JOIN {table} t ON me.memory_id = t.id \
+             WHERE t.superseded_by IS NULL AND (t.valid_until IS NULL OR t.valid_until > ?1) \
+             LIMIT 50000"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let rows = stmt
+            .query_map(params![now], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (memory_id, embedding_json) in rows {
+            let Ok(vec) = serde_json::from_str::<Vec<f32>>(&embedding_json) else {
+                continue;
+            };
+            // Python skips zero-norm and dimension-mismatched rows (np.dot raises, the except
+            // continues); `daemon_core::cosine` would silently return 0.0 -> sim 0.5 instead.
+            if vec.len() != q.len() || vec.iter().all(|v| *v == 0.0) {
+                continue;
+            }
+            let cos = daemon_core::cosine(q, &vec) as f64;
+            let sim = (cos + 1.0) / 2.0;
+            let better = by_id.get(&memory_id).map(|h| sim > h.score).unwrap_or(true);
+            if better {
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("similarity".into(), sim.into());
+                metadata.insert("cosine_similarity".into(), cos.into());
+                metadata.insert("embedding_tier".into(), tier_label.into());
+                metadata.insert("backend".into(), "memory_embeddings".into());
+                by_id.insert(
+                    memory_id.clone(),
+                    polyphonic::VoiceHit {
+                        memory_id,
+                        score: sim,
+                        voice: "vector",
+                        metadata,
+                    },
+                );
+            }
+        }
+    }
+    let mut hits: Vec<polyphonic::VoiceHit> = by_id.into_values().collect();
+    // Python sorts by score over dict values (insertion-ordered); a HashMap has no such order, so
+    // tie-break on id for determinism.
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory_id.cmp(&b.memory_id))
+    });
+    hits.truncate(20);
+    hits
+}
+
+/// Voice 2 — graph (`polyphonic_recall.py` `_graph_voice` L495-L565): capitalized-phrase entities
+/// seed gists (`0.6`) and `facts`-table subject rows (`confidence*0.5`, resolved to the fact id's
+/// trailing `_` segment), then a `ctx`-edge BFS from every seed adds traversal rows at
+/// `0.4/depth` under the separate `graph_traversal` voice label. No intra-voice dedup of the
+/// entity-seeded rows, faithful to Python.
+fn poly_graph_voice(conn: &Connection, query: &str) -> Result<Vec<polyphonic::VoiceHit>> {
+    let entities = poly_extract_entities(query);
+    let mut hits: Vec<polyphonic::VoiceHit> = Vec::new();
+    let mut seed_ids: HashSet<String> = HashSet::new();
+    for entity in &entities {
+        for (mid, gist_text) in episodic_graph::find_gists_by_participant(conn, entity)? {
+            seed_ids.insert(mid.clone());
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("entity".into(), entity.as_str().into());
+            metadata.insert("gist".into(), gist_text.into());
+            hits.push(polyphonic::VoiceHit {
+                memory_id: mid,
+                score: 0.6,
+                voice: "graph",
+                metadata,
+            });
+        }
+        let mut stmt = conn.prepare(
+            "SELECT fact_id, subject, predicate, object, confidence FROM facts \
+             WHERE subject = ?1 ORDER BY confidence DESC, timestamp DESC",
+        )?;
+        let facts = stmt
+            .query_map(params![entity], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
                 ))
-            })?;
-            for row in rows.flatten() {
-                let (id, ts, imp) = row;
-                let age_days = age_hours(&ts).unwrap_or(0.0) / 24.0;
-                let tscore = (-age_days / 7.0).exp() * imp;
-                temporal_hits.push(VoiceHit {
-                    memory_id: id,
-                    score: tscore,
-                });
-            }
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (fact_id, subject, predicate, object, confidence) in facts {
+            // `fact.id.split("_")[-1]` (L532): beam fact ids are plain hashes, so this is
+            // usually the id itself — a synthetic id that won't materialize, contributing
+            // ranking signal only.
+            let fact_mid = fact_id.rsplit('_').next().unwrap_or(&fact_id).to_string();
+            seed_ids.insert(fact_mid.clone());
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("entity".into(), entity.as_str().into());
+            metadata.insert(
+                "fact".into(),
+                format!("{subject} {predicate} {object}").into(),
+            );
+            hits.push(polyphonic::VoiceHit {
+                memory_id: fact_mid,
+                score: confidence * 0.5,
+                voice: "graph",
+                metadata,
+            });
         }
-
-        let fused = polyphonic::fuse(&[
-            ("vector", vector_hits),
-            ("graph", graph_hits),
-            ("fact", fact_hits),
-            ("temporal", temporal_hits),
-        ]);
-        let diversified = polyphonic::diversity_rerank(fused, req.top_k);
-
-        let mut out: Vec<MemoryRow> = Vec::new();
-        for f in diversified {
-            let row = match self.fetch_working(&conn, &f.memory_id, req.scope)? {
-                Some(r) => Some(r),
-                None => self.fetch_episodic(&conn, &f.memory_id, req.scope)?,
-            };
-            if let Some(mut r) = row {
-                r.score = f.combined_score;
-                out.push(r);
+    }
+    // Traversal from the seeds (depth 2, ctx edges, min weight 0.3), depth-decayed.
+    let mut traversed: HashSet<String> = HashSet::new();
+    let mut seeds: Vec<&String> = seed_ids.iter().collect();
+    seeds.sort(); // deterministic order (Python iterates a set)
+    for seed in seeds {
+        for rel in episodic_graph::find_related_memories(conn, seed, 2, "ctx", 0.3)? {
+            if traversed.contains(&rel.memory_id) || seed_ids.contains(&rel.memory_id) {
+                continue;
             }
+            traversed.insert(rel.memory_id.clone());
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("seed".into(), seed.as_str().into());
+            metadata.insert("edge_type".into(), rel.edge_type.into());
+            metadata.insert("depth".into(), rel.depth.into());
+            metadata.insert("weight".into(), rel.weight.into());
+            hits.push(polyphonic::VoiceHit {
+                memory_id: rel.memory_id,
+                score: 0.4 / rel.depth as f64,
+                voice: "graph_traversal",
+                metadata,
+            });
         }
-        self.bump_recall(&conn, &out)?;
-        Ok(out)
     }
+    Ok(hits)
+}
 
-    /// `(memory_id, confidence)` for `facts` whose subject matches `subject` at or above
-    /// `min_confidence` (the polyphonic fact voice).
-    fn facts_for_subject(
-        &self,
-        conn: &Connection,
-        subject: &str,
-        min_confidence: f64,
-    ) -> Result<Vec<(String, f64)>> {
-        let mut stmt = conn.prepare(
-            "SELECT source_msg_id, confidence FROM facts \
-             WHERE subject = ?1 COLLATE NOCASE AND confidence >= ?2 AND source_msg_id IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(params![subject, min_confidence], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-        })?;
-        Ok(rows.flatten().collect())
+/// Voice 3 — fact (`polyphonic_recall.py` `_fact_voice` L567-L614): whitespace-split query words
+/// (>=3 chars), each capitalized and matched against consolidated fact subjects at confidence
+/// `>= 0.5`. Hit ids are the consolidated `cf_...` ids — ranking signal that never materializes.
+fn poly_fact_voice(conn: &Connection, query: &str) -> Result<Vec<polyphonic::VoiceHit>> {
+    let mut hits: Vec<polyphonic::VoiceHit> = Vec::new();
+    for word in query.to_lowercase().split_whitespace() {
+        if word.chars().count() < 3 {
+            continue;
+        }
+        let subject = capitalize(word);
+        for fact in crate::knowledge::veracity::get_consolidated_facts(conn, Some(&subject), 0.5)? {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("subject".into(), fact.subject.into());
+            metadata.insert("predicate".into(), fact.predicate.into());
+            metadata.insert("object".into(), fact.object.into());
+            metadata.insert("mentions".into(), fact.mention_count.into());
+            hits.push(polyphonic::VoiceHit {
+                memory_id: fact.id,
+                score: fact.confidence,
+                voice: "fact",
+                metadata,
+            });
+        }
     }
+    Ok(hits)
+}
+
+/// Voice 4 — temporal (`polyphonic_recall.py` `_temporal_voice` L616-L685): only on temporal
+/// keywords; the 20 most recent working rows of the last 7 days (unscoped, matching Python),
+/// scored `exp(-age_days/7) * importance`.
+fn poly_temporal_voice(conn: &Connection, query: &str) -> Result<Vec<polyphonic::VoiceHit>> {
+    if !has_temporal_keyword(query) {
+        return Ok(Vec::new());
+    }
+    // Python: `(datetime.now() - timedelta(days=7)).isoformat()` — same clock the write path
+    // stamps rows with. This port stamps rows with `util::now_iso()` (UTC RFC3339), so the cutoff
+    // uses the same format for a well-ordered string comparison.
+    let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, importance FROM working_memory \
+         WHERE timestamp > ?1 ORDER BY timestamp DESC LIMIT 20",
+    )?;
+    let rows = stmt
+        .query_map(params![week_ago], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?.unwrap_or(0.5),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut hits = Vec::new();
+    for (id, ts, importance) in rows {
+        let Some(hours) = age_hours(&ts) else {
+            continue;
+        };
+        let age_days = hours / 24.0;
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("age_days".into(), age_days.into());
+        metadata.insert("importance".into(), importance.into());
+        hits.push(polyphonic::VoiceHit {
+            memory_id: id,
+            score: (-age_days / 7.0).exp() * importance,
+            voice: "temporal",
+            metadata,
+        });
+    }
+    Ok(hits)
+}
+
+/// Query entity extraction for the graph voice (`polyphonic_recall.py` `_extract_entities`
+/// L687-L692): capitalized word runs, deduped (first-seen order here; Python's `list(set(...))`
+/// order is unspecified).
+fn poly_extract_entities(text: &str) -> Vec<String> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b").unwrap());
+    let mut seen = HashSet::new();
+    re.find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .filter(|e| seen.insert(e.clone()))
+        .collect()
 }
 
 /// A structured `fact_recall` hit (`beam.py` L6874: content/score/fact_id/subject/predicate).

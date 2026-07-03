@@ -250,6 +250,47 @@ pub fn consolidate_fact(
     })
 }
 
+/// Read consolidated facts, optionally filtered by exact subject, above a confidence floor,
+/// excluding superseded rows (`veracity_consolidation.py` `get_consolidated_facts` L706-L752).
+/// Ordered by confidence then mention count, both descending.
+pub fn get_consolidated_facts(
+    conn: &Connection,
+    subject: Option<&str>,
+    min_confidence: f64,
+) -> Result<Vec<ConsolidatedFact>> {
+    let base = "SELECT id, subject, predicate, object, confidence, mention_count \
+                FROM consolidated_facts";
+    let order = "ORDER BY confidence DESC, mention_count DESC";
+    let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ConsolidatedFact> {
+        Ok(ConsolidatedFact {
+            id: r.get(0)?,
+            subject: r.get(1)?,
+            predicate: r.get(2)?,
+            object: r.get(3)?,
+            confidence: r.get(4)?,
+            mention_count: r.get(5)?,
+        })
+    };
+    let rows = if let Some(subject) = subject {
+        let mut stmt = conn.prepare(&format!(
+            "{base} WHERE subject = ?1 AND confidence >= ?2 AND superseded_by IS NULL {order}"
+        ))?;
+        let rows = stmt
+            .query_map(params![subject, min_confidence], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        let mut stmt = conn.prepare(&format!(
+            "{base} WHERE confidence >= ?1 AND superseded_by IS NULL {order}"
+        ))?;
+        let rows = stmt
+            .query_map(params![min_confidence], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    Ok(rows)
+}
+
 /// Record a conflict between two facts (`veracity_consolidation.py` `_record_conflict`).
 pub fn record_conflict(
     conn: &Connection,

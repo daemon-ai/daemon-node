@@ -134,9 +134,42 @@ fn polyphonic_recall_fuses_voices_over_seeded_bank() {
     let hits = e
         .recall_with_vector("Acme", 5, Some(&[0.0, 1.0, 0.0]))
         .unwrap();
+    let acme = hits
+        .iter()
+        .find(|h| h.content.contains("Acme"))
+        .unwrap_or_else(|| {
+            panic!(
+                "polyphonic fusion should surface the Acme row, got: {:?}",
+                hits.iter().map(|h| h.content.as_str()).collect::<Vec<_>>()
+            )
+        });
+    // Every materialized row carries its per-voice RRF provenance (`voice_scores`).
+    let voices = acme.voice_scores.as_ref().expect("voice_scores present");
     assert!(
-        hits.iter().any(|h| h.content.contains("Acme")),
-        "polyphonic fusion should surface the Acme row, got: {:?}",
-        hits.iter().map(|h| h.content.as_str()).collect::<Vec<_>>()
+        voices.contains_key("vector"),
+        "the aligned query vector must register the vector voice: {voices:?}"
+    );
+
+    // A temporal cue without a query vector exercises the temporal voice alone: recent working
+    // rows surface, each attributed to the `temporal` voice.
+    let temporal = e.recall("standup notes from last week", 5).unwrap();
+    assert!(
+        !temporal.is_empty(),
+        "temporal keywords must surface recent working rows"
+    );
+    assert!(
+        temporal.iter().all(|h| h
+            .voice_scores
+            .as_ref()
+            .is_some_and(|v| v.contains_key("temporal"))),
+        "all hits must be attributed to the temporal voice: {temporal:?}"
+    );
+
+    // No temporal cue, no vector, no matching entities/facts -> all four voices are silent.
+    assert!(
+        e.recall("nothing matches this query", 5)
+            .unwrap()
+            .is_empty(),
+        "silent voices must yield no results"
     );
 }
