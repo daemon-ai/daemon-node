@@ -10,9 +10,13 @@
 //! * **Same-origin upgrades work with zero config** — the upgrade gate derives the listener's own
 //!   origin from the request's `Host` header (`http://<host>`, since this listener is plain HTTP)
 //!   and accepts an `Origin` matching it automatically; `[api].ws_allowed_origins` additionally
-//!   applies for deliberate cross-origin allowance; everything else is refused with 403. Behind a
-//!   TLS-terminating reverse proxy the browser's `Origin` is `https://…` and no longer matches the
-//!   derived `http://…` self-origin — add the public origin to `[api].ws_allowed_origins` there.
+//!   applies for deliberate cross-origin allowance; every other *browser* origin is refused with
+//!   403. An upgrade with **no** `Origin` header (a non-browser client) is accepted, same as on
+//!   the standalone listener: the origin gate is a browser CSRF defense, and non-browser clients
+//!   are gated by the mandatory authentication on `/ws` instead (see [`crate::ws`] for the full
+//!   rationale). Behind a TLS-terminating reverse proxy the browser's `Origin` is `https://…` and
+//!   no longer matches the derived `http://…` self-origin — add the public origin to
+//!   `[api].ws_allowed_origins` there.
 //! * **Static files are public, the api is not** — `/ws` runs the identical
 //!   [`serve_mux_over_ws`] posture as the standalone `[api].ws_addr` listener: authentication
 //!   ALWAYS required, plaintext transport, SCRAM only.

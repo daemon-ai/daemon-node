@@ -16,8 +16,12 @@
 //!   requesting none is accepted (tolerant bring-up).
 //! * **Origin policy** — a browser stamps the upgrade request with an `Origin` header the page
 //!   cannot forge: when present it MUST be on the configured allow-list or the upgrade is refused
-//!   with 403 *before any mux traffic*. Absent `Origin` (non-browser clients) is allowed — those
-//!   clients still authenticate like everyone else.
+//!   with 403 *before any mux traffic*. Absent `Origin` (non-browser clients) is allowed — **by
+//!   design, not omission**: the origin check is a browser CSRF defense (it stops a hostile page
+//!   from riding an in-browser user's network position), while a non-browser client controls its
+//!   own headers and could stamp any allow-listed origin anyway, so refusing header-less upgrades
+//!   would add no security. Every client, browser or not, still faces the mandatory SCRAM
+//!   authentication below before any api call is served.
 //! * **Authentication** — ALWAYS [`AuthMode::Required`], regardless of `[api].local_trust`: a
 //!   browser-reachable listener is never local-trusted. Plain WS is a plaintext transport, so
 //!   [`TlsState::plaintext`] gates PLAIN/EXTERNAL off (SCRAM-SHA-256 only) exactly like the
@@ -178,7 +182,12 @@ fn refusal(status: StatusCode, reason: &str) -> ErrorResponse {
 ///
 /// * An `Origin` header, when present, must match the allow-list or the upgrade is refused with
 ///   403 — with the default empty list every browser origin is refused. Absent `Origin`
-///   (non-browser clients) passes.
+///   (non-browser clients) passes — intentionally: `Origin` is only trustworthy as a *browser*
+///   CSRF signal (browsers stamp it and page script cannot forge it), whereas a non-browser
+///   client sets arbitrary headers and could present an allow-listed origin at will, so refusing
+///   the missing header would only break CLI/native clients without stopping an attacker. Those
+///   clients are gated by the mandatory SCRAM authentication instead (see [`serve_mux_over_ws`];
+///   this listener is never local-trusted).
 /// * A client requesting subprotocols must include [`WS_SUBPROTOCOL`] (echoed back); requesting
 ///   only foreign subprotocols is refused. Requesting none is tolerated (bring-up clients).
 fn negotiate_upgrade(

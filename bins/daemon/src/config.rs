@@ -612,7 +612,10 @@ pub struct ApiConfig {
     pub ws_addr: Option<String>,
     /// Origins allowed to upgrade on the WebSocket listener, matched against the HTTP `Origin`
     /// header when a browser sends one. Empty (the default) rejects every browser origin;
-    /// non-browser clients send no `Origin` and are unaffected.
+    /// non-browser clients send no `Origin` and are deliberately unaffected — the origin gate is
+    /// a browser CSRF defense (browsers stamp the header; page script cannot forge it), while a
+    /// non-browser client could stamp any allow-listed value anyway, so it is gated by the
+    /// listener's mandatory SASL authentication instead.
     pub ws_allowed_origins: Vec<String>,
     /// SQLite identity store path (`None` => `<data_dir>/auth.sqlite`; see [`NodeConfig::auth_db`]).
     pub auth_db: Option<PathBuf>,
@@ -1094,7 +1097,11 @@ pub fn config_reference() -> String {
         "The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` \
          only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse \
          proxy in front of it for now. Browser connections must additionally match \
-         `api.ws_allowed_origins` (empty = every browser origin is refused).\n\n",
+         `api.ws_allowed_origins` (empty = every browser origin is refused). An upgrade without \
+         an `Origin` header (a non-browser client) is accepted by design: the origin allow-list \
+         is a browser CSRF defense — browsers stamp the header and page script cannot forge it — \
+         while a non-browser client controls its own headers and could present any allow-listed \
+         origin anyway, so it is gated by the mandatory authentication instead.\n\n",
     );
     out.push_str(
         "Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves \
