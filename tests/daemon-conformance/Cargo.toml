@@ -29,6 +29,9 @@ daemon-node = { workspace = true }
 # `assemble_daemon_api_gateway` harness helper points at a mock upstream. Used from `src/` (the
 # harness), so it is a normal dependency, not dev-only.
 daemon-providers = { workspace = true }
+# Projector (mmproj) guard conformance: a real ModelManager over a seeded registry proves the
+# ProviderModels exclusion + the ModelActivate rejection end to end.
+daemon-models = { workspace = true }
 daemon-acp = { workspace = true }
 daemon-rooms = { workspace = true }
 daemon-matrix = { workspace = true }

@@ -83,10 +83,13 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                 println!("  - {} {} {:?}", t.transport.0, t.route.0, t.kind);
             }
         }
-        ApiResponse::DeliverySessions(sessions) => {
-            println!("delivery_sessions: {}", sessions.len());
-            for s in sessions {
+        ApiResponse::DeliverySessions(page) => {
+            println!("delivery_sessions: {}", page.items.len());
+            for s in page.items {
                 println!("  - {s}");
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::VerifyingKey(key) => match key {

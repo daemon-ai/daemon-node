@@ -240,6 +240,16 @@ async fn authorize_and_dispatch(
     audit: Option<Arc<AuthAudit>>,
 ) -> ApiResponse {
     let conn_id = ctx.conn_id;
+    // Request-level dispatch log (both the mux per-`Call` tasks and the legacy path funnel
+    // through here): the payload-free op tag only, never the body (it may carry a credential).
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            op = %op_tag(&req),
+            conn_id,
+            event = fields::event::API_REQUEST,
+            "api request dispatched"
+        );
+    }
     with_request_context(ctx, async {
         match authorize(&req) {
             Ok(()) => dispatch(api, req).await,

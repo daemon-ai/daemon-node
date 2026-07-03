@@ -376,6 +376,12 @@ pub(crate) fn session_in_scope(
 
 /// Apply cursor pagination in place: skip through the `after` id (exclusive), cap to the effective
 /// limit, and return the next cursor (the last retained id) when the page was truncated.
+///
+/// Deliberately NOT `daemon_api::paginate` (the shared slicer for the uniform `WirePage` ops):
+/// the roster sorts by (pinned, recency, id) while its cursor is the bare session id, and the
+/// generic helper's deleted-cursor fallback assumes the listing is sorted BY the cursor key. Here
+/// a vanished cursor restarts from the top instead (the roster is a live view; re-serving beats
+/// skipping). `SessionPage` also carries extra fields (`rev`/`removed`) outside the envelope.
 pub(crate) fn paginate_roster(
     roster: &mut Vec<SessionInfo>,
     after: Option<&SessionId>,
@@ -386,11 +392,14 @@ pub(crate) fn paginate_roster(
             roster.drain(..=pos);
         }
     }
+    // An explicit limit is additionally clamped to the wire page bound: the zcbor client codec
+    // decodes `sessions` into a fixed WIRE_PAGE_MAX buffer, so a larger page can never be served.
     let limit = if limit == 0 {
         DEFAULT_ROSTER_PAGE
     } else {
         limit as usize
-    };
+    }
+    .min(daemon_api::WIRE_PAGE_MAX);
     if roster.len() > limit {
         roster.truncate(limit);
         roster.last().map(|i| i.session.clone())

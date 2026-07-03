@@ -319,6 +319,70 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         },
     )?;
     write_cbor(&out, "request-fs-roots.cbor", &ApiRequest::FsRoots)?;
+    // Paged fs_list (wire v24/v25, the uniform WirePage shape): a resume request (after = the
+    // previous page's `next`) and a page response carrying items + a set `next` cursor, so
+    // `verify-codec` proves the generated zcbor C decoder accepts the fs-list-page shape.
+    write_cbor(
+        &out,
+        "request-fs-list.cbor",
+        &ApiRequest::FsList {
+            root: daemon_api::FsRootId::Workspace,
+            dir: "src".into(),
+            show_ignored: false,
+            after: Some("src/main.rs".into()),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-fs-list.cbor",
+        &ApiResponse::FsList(daemon_api::FsListPage {
+            items: vec![
+                daemon_api::FsEntry {
+                    name: "vendor".into(),
+                    path: "src/vendor".into(),
+                    kind: daemon_api::FsEntryKind::Dir,
+                    size: 0,
+                    mtime_ms: 1_700_000_000_000,
+                    ignored: false,
+                },
+                daemon_api::FsEntry {
+                    name: "lib.rs".into(),
+                    path: "src/lib.rs".into(),
+                    kind: daemon_api::FsEntryKind::File,
+                    size: 4096,
+                    mtime_ms: 1_700_000_000_001,
+                    ignored: false,
+                },
+            ],
+            next: Some("src/lib.rs".into()),
+        }),
+    )?;
+    // Paged conv_list (wire v25): a resume request + a page with a set `next` cursor, proving the
+    // generated zcbor C decoder accepts the conv-page shape.
+    write_cbor(
+        &out,
+        "request-conv-list.cbor",
+        &ApiRequest::ConvList {
+            transport: daemon_protocol::TransportId::new("rooms"),
+            after: Some("conv-063".into()),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-conv-list.cbor",
+        &ApiResponse::Conversations(daemon_api::WirePage {
+            items: vec![daemon_api::ConversationInfo {
+                transport: daemon_protocol::TransportId::new("rooms"),
+                id: "conv-064".into(),
+                kind: daemon_api::ConversationType::Channel,
+                title: Some("General".into()),
+                topic: None,
+                description: None,
+                members: Vec::new(),
+            }],
+            next: Some("conv-064".into()),
+        }),
+    )?;
     write_cbor(&out, "request-command-list.cbor", &ApiRequest::CommandList)?;
     write_cbor(
         &out,
@@ -351,7 +415,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             profile: "default".into(),
         },
     )?;
-    write_cbor(&out, "request-models.cbor", &ApiRequest::Models)?;
+    write_cbor(
+        &out,
+        "request-models.cbor",
+        &ApiRequest::Models { after: None },
+    )?;
     write_cbor(
         &out,
         "request-set-session-model.cbor",
@@ -451,7 +519,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-models.cbor",
-        &ApiResponse::Models(vec![fixture_descriptor.clone()]),
+        &ApiResponse::Models(daemon_api::WirePage {
+            items: vec![fixture_descriptor.clone()],
+            next: Some(fixture_descriptor.id.clone()),
+        }),
     )?;
     write_cbor(
         &out,
@@ -473,6 +544,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             provider: "anthropic".into(),
             credential_ref: None,
             transient_key: Some("sk-fixture-transient".into()),
+            after: None,
         },
     )?;
     write_cbor(
@@ -492,15 +564,18 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-provider-models.cbor",
-        &ApiResponse::ProviderModels(vec![ModelDescriptor {
-            id: "anthropic/claude-sonnet-4-5".into(),
-            provider: ProviderSelector::DaemonApi,
-            display_name: Some("Claude Sonnet 4.5".into()),
-            context_length: Some(200_000),
-            input_price_micros_per_mtok: Some(3_000_000),
-            output_price_micros_per_mtok: Some(15_000_000),
-            local: false,
-        }]),
+        &ApiResponse::ProviderModels(daemon_api::WirePage {
+            items: vec![ModelDescriptor {
+                id: "anthropic/claude-sonnet-4-5".into(),
+                provider: ProviderSelector::DaemonApi,
+                display_name: Some("Claude Sonnet 4.5".into()),
+                context_length: Some(200_000),
+                input_price_micros_per_mtok: Some(3_000_000),
+                output_price_micros_per_mtok: Some(15_000_000),
+                local: false,
+            }],
+            next: None,
+        }),
     )?;
     write_cbor(&out, "response-ok.cbor", &ApiResponse::Ok)?;
     write_cbor(
@@ -533,6 +608,16 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     session: SessionId::new("fixture-session"),
                     request_id: "req-1".into(),
                 },
+                // v26: byte counters on the throttled download-progress event + the payload-free
+                // catalog-changed pointer, so verify-codec proves the generated decoder takes both.
+                NodeEvent::DownloadProgress {
+                    id: daemon_common::DownloadId(1),
+                    pct: 50,
+                    state: "Downloading".into(),
+                    downloaded_bytes: 46_000_000,
+                    total_bytes: 92_000_000,
+                },
+                NodeEvent::CatalogChanged,
             ],
             next_cursor: 12,
             head_cursor: 12,
@@ -607,6 +692,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 repo: repo.into(),
                 revision: None,
                 engine: ModelEngine::Llama,
+                after: None,
             },
         )?;
         write_cbor(
@@ -658,22 +744,37 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         write_cbor(
             &out,
             "response-model-files.cbor",
-            &ApiResponse::ModelFiles(vec![
-                ModelFile {
-                    path: gguf.into(),
-                    size_bytes: 92_000_000,
-                    quant: Some("Q4_K_M".into()),
-                    is_split: false,
-                    is_first_shard: false,
-                },
-                ModelFile {
-                    path: "SmolLM2-135M-Instruct-Q8_0.gguf".into(),
-                    size_bytes: 145_000_000,
-                    quant: Some("Q8_0".into()),
-                    is_split: false,
-                    is_first_shard: false,
-                },
-            ]),
+            &ApiResponse::ModelFiles(daemon_api::WirePage {
+                items: vec![
+                    ModelFile {
+                        path: gguf.into(),
+                        size_bytes: 92_000_000,
+                        quant: Some("Q4_K_M".into()),
+                        is_split: false,
+                        is_first_shard: false,
+                        is_mmproj: false,
+                    },
+                    ModelFile {
+                        path: "SmolLM2-135M-Instruct-Q8_0.gguf".into(),
+                        size_bytes: 145_000_000,
+                        quant: Some("Q8_0".into()),
+                        is_split: false,
+                        is_first_shard: false,
+                        is_mmproj: false,
+                    },
+                    // A vision-projector companion row (wire v27): listed + downloadable, badged
+                    // by the client, never a chat model.
+                    ModelFile {
+                        path: "mmproj-SmolLM2-135M-Instruct-Q8_0.gguf".into(),
+                        size_bytes: 6_000_000,
+                        quant: Some("Q8_0".into()),
+                        is_split: false,
+                        is_first_shard: false,
+                        is_mmproj: true,
+                    },
+                ],
+                next: None,
+            }),
         )?;
         write_cbor(
             &out,
@@ -703,6 +804,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 arch: Some("llama".into()),
                 context_length: Some(8192),
                 file_type: Some("Q4_K_M".into()),
+                // The paired vision-projector companion (wire v27); null for text-only models.
+                mmproj_path: Some("/cache/models/mmproj-SmolLM2-135M-Instruct-Q8_0.gguf".into()),
             }]),
         )?;
         write_cbor(

@@ -203,22 +203,34 @@
         # C/C++ via cmake, which needs `/bin/sh` + a full stdenv — provided by the nix build sandbox
         # (a raw `cargo` build in the dev shell can't satisfy make's hardcoded `/bin/sh` on NixOS).
         # They are deliberately separate outputs, NOT part of the default workspace gate.
+        #
+        # The statically-compiled llama.cpp links OpenMP, whose runtime (libgomp) the Rust link
+        # step does not record on the RUNPATH — patch it in so the packaged worker runs stand-alone
+        # (the superproject bundle ships it next to the daemon; without this it dies on load with
+        # "libgomp.so.1: cannot open shared object file").
         buildEngineWorker =
-          features:
+          name: features:
           craneLib.buildPackage (
             commonArgs
             // {
-              pname = "daemon-infer-${features}";
+              pname = "daemon-infer-${name}";
               inherit cargoArtifacts;
               cargoExtraArgs = "-p daemon-infer --features ${features}";
-              nativeBuildInputs = engineNativeInputs;
+              nativeBuildInputs = engineNativeInputs ++ [ pkgs.patchelf ];
               LIBCLANG_PATH = libclangPath;
               doCheck = false;
+              postInstall = ''
+                patchelf --add-rpath ${pkgs.gcc.cc.lib}/lib "$out/bin/daemon-infer"
+              '';
             }
           );
 
-        daemon-infer-llama = buildEngineWorker "llama";
-        daemon-infer-mistralrs = buildEngineWorker "mistralrs";
+        # The llama lane ships with multimodal projector loading (`mtmd`): this is a from-source
+        # cmake build inside the sandbox, so tools/mtmd compiles in (unlike the dev-shell prebuilt,
+        # which stays LLAMA_BUILD_TOOLS=OFF and has no libmtmd — keep `mtmd` out of dev-shell
+        # `dynamic-link` builds).
+        daemon-infer-llama = buildEngineWorker "llama" "llama,mtmd";
+        daemon-infer-mistralrs = buildEngineWorker "mistralrs" "mistralrs";
 
         # The authoritative "llama-cpp-4 compiles with the Vulkan backend" gate: build the worker
         # `--features vulkan`, which forwards to `llama-cpp-4/vulkan` -> `llama-cpp-sys-4/vulkan` ->

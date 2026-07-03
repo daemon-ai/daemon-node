@@ -187,6 +187,38 @@ fn worker_thread(
         }
     };
 
+    // Load the paired vision projector (mmproj) alongside the text weights when one was
+    // cataloged. The context is held for the worker's lifetime so the projector is validated at
+    // load (media *inference* is a later phase). A build without the `mtmd` feature ignores the
+    // path with a log line rather than failing the load.
+    #[cfg(feature = "mtmd")]
+    let _mtmd_ctx = match &params.mmproj {
+        Some(mmproj_path) => {
+            use llama_cpp_4::mtmd::{MtmdContext, MtmdContextParams};
+            let mtmd_params = MtmdContextParams::default().use_gpu(params.n_gpu_layers > 0);
+            match MtmdContext::init_from_file(mmproj_path, &model, mtmd_params) {
+                Ok(ctx) => {
+                    tracing::info!(mmproj = %mmproj_path, "loaded multimodal projector");
+                    Some(ctx)
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(BackendError::fatal(format!(
+                        "load mmproj {mmproj_path}: {e}"
+                    ))));
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "mtmd"))]
+    if let Some(mmproj_path) = &params.mmproj {
+        tracing::info!(
+            mmproj = %mmproj_path,
+            "mmproj present but multimodal load not enabled in this build"
+        );
+    }
+
     let capabilities = Capabilities {
         supports_native_tools: false,
         supports_streaming: true,

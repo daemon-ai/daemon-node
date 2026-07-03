@@ -23,7 +23,7 @@ use crate::hardware::HardwareProbe;
 use crate::hf::{files, search, HfClient};
 use crate::quantize::Quantizer;
 use crate::registry::{model_id, Registry};
-use crate::{gguf, recommend, resolve};
+use crate::{gguf, mmproj, recommend, resolve};
 
 /// Construction inputs for a [`ModelManager`].
 #[derive(Clone, Debug, Default)]
@@ -71,6 +71,15 @@ impl ActiveModels {
     }
 }
 
+/// A callback the host wires to announce installed-model registry changes (the L3
+/// `CatalogChanged` node event): invoked after a completed download is cataloged and after a
+/// model is deleted, so clients refetch `ModelCatalog` instead of polling.
+pub type CatalogChangedCb = Arc<dyn Fn() + Send + Sync>;
+
+/// The shared, late-wireable slot a [`CatalogChangedCb`] lives in (set after assembly, read by
+/// the background catalog watchers spawned per download).
+type CatalogChangedSlot = Arc<std::sync::Mutex<Option<CatalogChangedCb>>>;
+
 /// The model-management facade.
 #[derive(Clone)]
 pub struct ModelManager {
@@ -80,6 +89,7 @@ pub struct ModelManager {
     cache: CacheConfig,
     active: ActiveModels,
     quantizer: Quantizer,
+    catalog_changed: CatalogChangedSlot,
 }
 
 impl ModelManager {
@@ -89,14 +99,20 @@ impl ModelManager {
         self.downloader.set_progress(cb);
     }
 
+    /// Wire the node-wide catalog-changed callback (L3 `CatalogChanged`): the host sets this after
+    /// assembly so registry changes (a cataloged download / a delete) fan onto the event feed.
+    pub fn set_catalog_changed(&self, cb: CatalogChangedCb) {
+        *self.catalog_changed.lock().unwrap() = Some(cb);
+    }
+
     /// Build a manager over the shared cache + catalog.
     pub async fn new(config: ManagerConfig) -> Result<Self> {
         let cache = CacheConfig::resolve(config.cache_dir);
-        let client = match config.endpoint {
-            Some(ep) => HfClient::with_endpoint(ep, cache.token.clone()),
+        let client = match &config.endpoint {
+            Some(ep) => HfClient::with_endpoint(ep.clone(), cache.token.clone()),
             None => HfClient::new(cache.token.clone()),
         };
-        let downloader = Downloader::new(&cache)?;
+        let downloader = Downloader::new(&cache, config.endpoint.as_deref())?;
         let registry_path = config
             .registry_path
             .unwrap_or_else(|| cache.hub_dir.join("daemon-catalog.json"));
@@ -114,6 +130,7 @@ impl ModelManager {
             cache,
             active: ActiveModels::default(),
             quantizer,
+            catalog_changed: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -278,39 +295,70 @@ impl ModelManager {
         let removed = self.registry.remove(id).await?;
         if let Some(record) = removed {
             best_effort_delete(&record.local_path);
+            notify_catalog_changed(&self.catalog_changed);
         }
         Ok(())
     }
 
     /// Activate a cataloged model for `profile`: mark it the active selection (new worker spawns
-    /// load it) and ensure it is resolvable on disk.
+    /// load it) and ensure it is resolvable on disk. Vision-projector (mmproj) artifacts are
+    /// rejected with an actionable error — activating one would hand the llama worker a CLIP
+    /// projector as the chat model (`unsupported model architecture: 'clip'`).
     pub async fn activate(&self, id: &ModelId, profile: &str) -> Result<InstalledModel> {
         let record = self
             .registry
             .get(id)
             .await
             .ok_or_else(|| ModelError::Unknown(id.to_string()))?;
+        if mmproj::is_projector_record(&record) {
+            return Err(projector_rejection(&record.display_name));
+        }
         self.active.set(profile, record.model.clone());
         Ok(record)
     }
 
     /// Resolve a model to a ready on-disk artifact, downloading + cataloging it if necessary. This
     /// is the "resolve-before-load" entry the local provider calls before spawning a worker.
+    ///
+    /// Guards: a reference naming a vision-projector (mmproj) artifact — or resolving to a record
+    /// classified as one (`arch == "clip"`) — is rejected with an actionable error instead of
+    /// letting the worker die on `unsupported model architecture: 'clip'`. A cataloged artifact is
+    /// re-verified (exists + size matches the record + GGUF magic) before it is trusted; a failed
+    /// check falls through to a fresh acquisition instead of loading a corrupt file.
     pub async fn resolve(&self, model: &ModelRef) -> Result<ResolvedArtifact> {
         // Already-present local models resolve directly.
         if let ModelSource::Local { path } = &model.source {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            if name.as_deref().is_some_and(mmproj::is_mmproj_path) {
+                return Err(projector_rejection(&path.to_string_lossy()));
+            }
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             return Ok(ResolvedArtifact {
                 local_path: path.clone(),
                 size_bytes: size,
+                mmproj_path: None,
             });
         }
-        // A cataloged model whose artifact still exists resolves without any network.
+        if let ModelSource::Hf { file: Some(f), .. } = &model.source {
+            if mmproj::is_mmproj_path(f) {
+                return Err(projector_rejection(f));
+            }
+        }
+        // A cataloged model whose artifact is still intact resolves without any network.
         if let Some(record) = self.registry.find(model).await {
-            if record.local_path.exists() {
+            if mmproj::is_projector_record(&record) {
+                return Err(projector_rejection(&record.display_name));
+            }
+            if artifact_intact(&record) {
+                let mmproj_path = record
+                    .mmproj_path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists());
                 return Ok(ResolvedArtifact {
                     local_path: record.local_path,
                     size_bytes: record.size_bytes,
+                    mmproj_path,
                 });
             }
         }
@@ -322,6 +370,7 @@ impl ModelManager {
         Ok(ResolvedArtifact {
             local_path: record.local_path,
             size_bytes: record.size_bytes,
+            mmproj_path: record.mmproj_path.as_deref().map(PathBuf::from),
         })
     }
 
@@ -362,15 +411,14 @@ impl ModelManager {
             .artifact(id)
             .await
             .ok_or_else(|| ModelError::Download("completed job has no artifact".into()))?;
-        let record = build_record(model, artifact.local_path, artifact.size_bytes);
-        self.registry.upsert(record.clone()).await?;
-        Ok(record)
+        catalog_artifact(&self.registry, &self.catalog_changed, model, artifact).await
     }
 
     /// Spawn a background watcher that catalogs job `id` once it completes.
     fn spawn_catalog_watcher(&self, id: DownloadId, model: ModelRef) {
         let downloader = self.downloader.clone();
         let registry = self.registry.clone();
+        let catalog_changed = self.catalog_changed.clone();
         tokio::spawn(async move {
             loop {
                 let Some(status) = downloader.status(id).await else {
@@ -379,12 +427,9 @@ impl ModelManager {
                 match status.state {
                     DownloadState::Completed => {
                         if let Some(artifact) = downloader.artifact(id).await {
-                            let record = build_record(
-                                model.clone(),
-                                artifact.local_path,
-                                artifact.size_bytes,
-                            );
-                            if let Err(e) = registry.upsert(record).await {
+                            if let Err(e) =
+                                catalog_artifact(&registry, &catalog_changed, model, artifact).await
+                            {
                                 tracing::warn!(error = %e, "failed to catalog completed download");
                             }
                         }
@@ -395,6 +440,112 @@ impl ModelManager {
                 }
             }
         });
+    }
+}
+
+/// Catalog a completed download's artifact (registry upsert) and announce the catalog change.
+/// Shared by the background watcher and the blocking resolve path so every install emits exactly
+/// one `CatalogChanged`. After the upsert, a best-effort pairing scan links vision-projector
+/// companions across the whole catalog (a new text model picks up a pre-existing projector; a
+/// new projector attaches to existing text records), so the returned record carries any
+/// `mmproj_path` the scan assigned.
+async fn catalog_artifact(
+    registry: &Registry,
+    catalog_changed: &CatalogChangedSlot,
+    model: ModelRef,
+    artifact: ResolvedArtifact,
+) -> Result<InstalledModel> {
+    let mut record = build_record(model, artifact.local_path, artifact.size_bytes);
+    record.mmproj_path = artifact
+        .mmproj_path
+        .map(|p| p.to_string_lossy().into_owned());
+    registry.upsert(record.clone()).await?;
+    pair_projector_companions(registry).await;
+    notify_catalog_changed(catalog_changed);
+    Ok(registry.get(&record.id).await.unwrap_or(record))
+}
+
+/// Best-effort catalog-wide projector pairing (the local-scan rule: hard quant-compatibility
+/// gate + recall ≥ 0.8): every text record whose `mmproj_path` is unset — or points at a file
+/// that no longer exists — gets the best-matching cataloged projector. Failures are logged, never
+/// fatal (pairing is an enrichment, not a correctness gate).
+async fn pair_projector_companions(registry: &Registry) {
+    let all = registry.list().await;
+    let candidates: Vec<mmproj::LocalCandidate> = all
+        .iter()
+        .filter(|r| mmproj::is_projector_record(r))
+        .map(|r| mmproj::LocalCandidate {
+            path: r.local_path.to_string_lossy().into_owned(),
+            file_type: r.file_type.clone(),
+            quant: r.quant.clone(),
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    for record in all {
+        if mmproj::is_projector_record(&record) {
+            continue;
+        }
+        let stale = record
+            .mmproj_path
+            .as_deref()
+            .is_some_and(|p| !std::path::Path::new(p).exists());
+        if record.mmproj_path.is_some() && !stale {
+            continue; // an intact pairing is never overridden
+        }
+        let stem = record
+            .local_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(best) =
+            mmproj::best_registry_companion(&stem, record.file_type.as_deref(), &candidates)
+        else {
+            continue;
+        };
+        let mut updated = record;
+        updated.mmproj_path = Some(best);
+        if let Err(e) = registry.upsert(updated).await {
+            tracing::warn!(error = %e, "projector pairing upsert failed");
+        }
+    }
+}
+
+/// The actionable rejection for a vision-projector artifact selected as a chat model.
+fn projector_rejection(name: &str) -> ModelError {
+    ModelError::Invalid(format!(
+        "{name} is a vision projector (mmproj), not a chat model — select the model's text \
+         weights instead"
+    ))
+}
+
+/// Whether a cataloged artifact is still trustworthy on disk: it exists, and — for single-file
+/// (GGUF) artifacts — the size matches the record and the GGUF magic is intact. Directory
+/// artifacts (mistral.rs snapshots) are checked for existence only.
+fn artifact_intact(record: &InstalledModel) -> bool {
+    let path = &record.local_path;
+    if !path.exists() {
+        return false;
+    }
+    if path.is_dir() {
+        return true;
+    }
+    let size_ok = std::fs::metadata(path).is_ok_and(|m| m.len() == record.size_bytes);
+    if !size_ok {
+        return false;
+    }
+    if gguf::is_gguf(&path.to_string_lossy()) {
+        return gguf::verify_gguf_magic(path).unwrap_or(false);
+    }
+    true
+}
+
+/// Invoke the wired catalog-changed callback, if any (the lock is held only to clone the `Arc`).
+fn notify_catalog_changed(slot: &CatalogChangedSlot) {
+    let cb = slot.lock().unwrap().clone();
+    if let Some(cb) = cb {
+        cb();
     }
 }
 
@@ -411,6 +562,7 @@ fn build_record(model: ModelRef, local_path: PathBuf, size_bytes: u64) -> Instal
         arch: None,
         context_length: None,
         file_type: None,
+        mmproj_path: None,
         model,
     };
     crate::inspect::enrich_installed(&mut record);
@@ -490,5 +642,104 @@ mod tests {
             reader.await.unwrap();
         }
         assert_eq!(active.get("default"), Some(model("org/new")));
+    }
+
+    /// Cataloging a completed artifact upserts the registry AND fires the wired catalog-changed
+    /// callback (the L3 `CatalogChanged` hook) — exactly once per install.
+    #[tokio::test]
+    async fn catalog_artifact_upserts_and_notifies() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = std::env::temp_dir().join(format!(
+            "daemon-models-catalog-notify-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let registry = Registry::open(&path).await.unwrap();
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let slot: CatalogChangedSlot = Arc::new(std::sync::Mutex::new(None));
+        {
+            let fired = fired.clone();
+            *slot.lock().unwrap() = Some(Arc::new(move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+            }) as CatalogChangedCb);
+        }
+
+        let m = model("org/notify");
+        let artifact = ResolvedArtifact {
+            local_path: PathBuf::from("/tmp/notify.gguf"),
+            size_bytes: 42,
+            mmproj_path: None,
+        };
+        let record = catalog_artifact(&registry, &slot, m.clone(), artifact)
+            .await
+            .expect("catalog");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "one notify per install");
+        assert!(registry.get(&record.id).await.is_some(), "record upserted");
+
+        // An unwired slot is a no-op (the host may not have assembled the feed yet).
+        let empty: CatalogChangedSlot = Arc::new(std::sync::Mutex::new(None));
+        notify_catalog_changed(&empty);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Deleting a cataloged model fires the callback; deleting an unknown id does not.
+    #[tokio::test]
+    async fn delete_notifies_catalog_changed_only_when_a_record_was_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-models-delete-notify-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry_path = dir.join("catalog.json");
+        // Pre-seed the registry file, then open the manager over it.
+        {
+            let registry = Registry::open(&registry_path).await.unwrap();
+            let m = model("org/delete-me");
+            let record = InstalledModel {
+                id: crate::registry::model_id(&m),
+                model: m,
+                display_name: "org/delete-me".into(),
+                local_path: dir.join("delete-me.gguf"),
+                size_bytes: 1,
+                quant: None,
+                installed_at_ms: 1,
+                arch: None,
+                context_length: None,
+                file_type: None,
+                mmproj_path: None,
+            };
+            registry.upsert(record).await.unwrap();
+        }
+        let manager = ModelManager::new(ManagerConfig {
+            cache_dir: Some(dir.clone()),
+            registry_path: Some(registry_path),
+            endpoint: None,
+            quantize_worker_bin: None,
+        })
+        .await
+        .expect("manager");
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        {
+            let fired = fired.clone();
+            manager.set_catalog_changed(Arc::new(move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        let id = crate::registry::model_id(&model("org/delete-me"));
+        manager.delete(&id).await.expect("delete");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "delete announces");
+
+        // A second delete removes nothing — no spurious event.
+        manager.delete(&id).await.expect("idempotent delete");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "no-op delete stays quiet");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

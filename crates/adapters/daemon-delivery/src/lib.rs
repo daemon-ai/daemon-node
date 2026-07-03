@@ -101,7 +101,18 @@ pub async fn serve_delivery(
     transport: TransportId,
     projector: Arc<dyn Projector>,
 ) -> DeliverySubscription {
-    let sessions = api.delivery_sessions(transport.clone()).await;
+    // Collect the FULL owned set by walking the wire pages (the op is paginated at the wire
+    // bound; delivery must resume every owned session, not just the first page).
+    let mut sessions = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = api.delivery_sessions(transport.clone(), after.take()).await;
+        sessions.extend(page.items);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
     let mut tasks = Vec::with_capacity(sessions.len());
     for session in sessions {
         let api = api.clone();

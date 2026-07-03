@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Session-surface responses: rosters, pages, detail, grouping, search, approvals,
-//! checkpoints, and drained inbox items.
+//! Session-surface responses: rosters, pages, detail, search, approvals, checkpoints, and
+//! drained inbox items.
 
 use daemon_api::ApiResponse;
 
@@ -14,23 +14,29 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                 println!("  - {} {:?}", info.session, info.state);
             }
         }
-        ApiResponse::Approvals(list) => {
-            println!("pending approvals: {}", list.len());
-            for info in list {
+        ApiResponse::Approvals(page) => {
+            println!("pending approvals: {}", page.items.len());
+            for info in page.items {
                 let path = info.path.map(|p| format!(" path={p}")).unwrap_or_default();
                 println!(
                     "  - {} req={}{} :: {}",
                     info.session, info.request_id, path, info.prompt
                 );
             }
+            if let Some(next) = page.next {
+                println!("  next={next}");
+            }
         }
-        ApiResponse::Checkpoints(list) => {
-            println!("checkpoints: {}", list.len());
-            for info in list {
+        ApiResponse::Checkpoints(page) => {
+            println!("checkpoints: {}", page.items.len());
+            for info in page.items {
                 println!(
                     "  - {} session={} tool={} created={}",
                     info.id, info.session, info.tool, info.created_unix
                 );
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::Drained(items) => {
@@ -68,18 +74,6 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
             ),
             None => println!("session: not found"),
         },
-        ApiResponse::SessionsByProfile(groups) => {
-            for (profile, sessions) in groups {
-                println!(
-                    "profile {}: {} session(s)",
-                    profile.as_str(),
-                    sessions.len()
-                );
-                for s in sessions {
-                    println!("  - {}", s.session);
-                }
-            }
-        }
         ApiResponse::SessionSearch(hits) => {
             println!("hits: {}", hits.len());
             for h in hits {

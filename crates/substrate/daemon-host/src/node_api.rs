@@ -76,6 +76,7 @@ use daemon_api::{
     FleetReport,
     FsContent,
     FsEntry,
+    FsListPage,
     FsRevision,
     FsRoot,
     FsRootId,

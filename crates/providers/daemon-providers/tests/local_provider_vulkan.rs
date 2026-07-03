@@ -46,6 +46,7 @@ fn llama_worker(bin: PathBuf, model: &str, embeddings: bool) -> WorkerConfig {
         flash_attn: false,
         isq: None,
         embeddings,
+        mmproj: None,
     };
     wc.sampling = Sampling {
         temperature: 0.7,

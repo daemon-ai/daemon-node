@@ -107,6 +107,7 @@ impl ControlApi for NodeApiImpl {
         // scope (e.g. an archive leaving `TopLevel`, or a hard-removed id) must be pruned client-side,
         // so it rides the `removed` list rather than silently vanishing from the delta.
         let mut removed: Vec<SessionId> = Vec::new();
+        let mut delta_served = false;
         if let Some((changed, removed_hard, _)) = &delta {
             let changed_set: std::collections::HashSet<&SessionId> = changed.iter().collect();
             removed.extend(removed_hard.iter().cloned());
@@ -123,9 +124,19 @@ impl ControlApi for NodeApiImpl {
             for id in changed.iter().filter(|id| !present.contains(id)) {
                 removed.push((*id).clone());
             }
-            // The page body is the changed + still-in-scope sessions.
-            roster.retain(|i| changed_set.contains(&i.session) && in_scope(i));
-        } else {
+            if removed.len() <= daemon_api::WIRE_PAGE_MAX {
+                // The page body is the changed + still-in-scope sessions.
+                roster.retain(|i| changed_set.contains(&i.session) && in_scope(i));
+                delta_served = true;
+            } else {
+                // Delta guard: `removed` rides unpaginated next to the page body, so a tombstone
+                // list past the wire page bound would be un-decodable by the fixed-buffer client
+                // codec. Serve a full page instead (the same fallback an unservable `since_rev`
+                // takes below); the client applies it as a replace + prune, needing no removals.
+                removed.clear();
+            }
+        }
+        if !delta_served {
             roster.retain(|i| in_scope(i));
         }
         // Stable order: pinned conversations first, then most-recently-active, then id as the final
@@ -190,23 +201,6 @@ impl ControlApi for NodeApiImpl {
         })
     }
 
-    async fn sessions_by_profile(&self) -> Vec<(ProfileRef, Vec<SessionInfo>)> {
-        // Auth 4: owner-scoped to the request principal (see `sessions_query`).
-        let mut roster = self.roster_scoped().await;
-        roster.retain(|i| i.role == SessionRole::Primary && i.bound_profile.is_some());
-        let mut grouped: std::collections::BTreeMap<String, (ProfileRef, Vec<SessionInfo>)> =
-            std::collections::BTreeMap::new();
-        for info in roster {
-            let profile = info.bound_profile.clone().expect("retained Some above");
-            grouped
-                .entry(profile.as_str().to_string())
-                .or_insert_with(|| (profile, Vec::new()))
-                .1
-                .push(info);
-        }
-        grouped.into_values().collect()
-    }
-
     async fn session_search(&self, query: String, limit: u32) -> Vec<SessionSearchHit> {
         // Auth 4 (read-of-one): drop hits the caller may not see (own sessions only, unless the
         // caller holds `SessionSeeAll`). Owner is read per hit; the result set is small/capped.
@@ -264,8 +258,13 @@ impl ControlApi for NodeApiImpl {
         Ok(())
     }
 
-    async fn approvals_pending(&self, session: Option<SessionId>) -> Vec<ApprovalInfo> {
-        self.store
+    async fn approvals_pending(
+        &self,
+        session: Option<SessionId>,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<ApprovalInfo> {
+        let mut approvals: Vec<ApprovalInfo> = self
+            .store
             .pending_approvals_of(session.as_ref())
             .await
             .into_iter()
@@ -275,7 +274,17 @@ impl ControlApi for NodeApiImpl {
                 prompt: p.prompt,
                 path: p.path,
             })
-            .collect()
+            .collect();
+        // The store lists in rowseq (arrival) order; the cursor is the request_id, so sort by it
+        // before slicing — the pending set is small and a deterministic id order keeps the cursor
+        // stable across pages even as decisions land in between.
+        approvals.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        daemon_api::paginate(
+            approvals,
+            after.as_deref(),
+            daemon_api::WIRE_PAGE_MAX,
+            |a| a.request_id.clone(),
+        )
     }
 
     async fn approval_decide(
@@ -358,10 +367,24 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
-    async fn tree(&self) -> TreeReport {
+    async fn tree(&self, after: Option<String>) -> TreeReport {
         // Auth 4: the orchestration tree is scoped to the request principal (children inherit the
         // parent owner, so an owned subtree is kept whole and a foreign one dropped whole).
-        self.tree_owned(&current_principal()).await
+        let mut report = self.tree_owned(&current_principal()).await;
+        // Page `nodes` in unit-id order (the fleet projection has no stable order of its own);
+        // `root` rides every page and the id-linked structure reassembles client-side.
+        report
+            .nodes
+            .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        let page = daemon_api::paginate(
+            report.nodes,
+            after.as_deref(),
+            daemon_api::WIRE_PAGE_MAX,
+            |n| n.id.as_str().to_string(),
+        );
+        report.nodes = page.items;
+        report.next = page.next;
+        report
     }
 
     async fn unit(&self, id: UnitId) -> Option<UnitNode> {
@@ -456,13 +479,19 @@ impl ControlApi for NodeApiImpl {
         Ok(stream.boxed())
     }
 
-    async fn routing_list_chats(&self) -> Vec<ChatRoute> {
-        self.store
+    async fn routing_list_chats(&self, after: Option<String>) -> daemon_api::WirePage<ChatRoute> {
+        // The store lists `ORDER BY key` (key = origin_pin_key), so the listing is already in
+        // cursor order; the cursor is recomputed from each route's origin.
+        let routes: Vec<ChatRoute> = self
+            .store
             .routing_list()
             .await
             .iter()
             .filter_map(wire_route_from_store)
-            .collect()
+            .collect();
+        daemon_api::paginate(routes, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |r| {
+            crate::routing::origin_pin_key(&r.origin)
+        })
     }
 
     async fn routing_get(&self, origin: Origin) -> Option<ChatRoute> {
@@ -512,11 +541,16 @@ impl ControlApi for NodeApiImpl {
         Ok(())
     }
 
-    async fn transport_rooms(&self, transport: TransportId) -> Vec<RoomInfo> {
+    async fn transport_rooms(
+        &self,
+        transport: TransportId,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<RoomInfo> {
         // Read-only enumeration backed by the durable routing pins: the rooms this transport instance
         // (or family) has a pin for, each carrying its pinned session. A live adapter-backed room
         // listing (e.g. Matrix joined rooms) can layer on later behind the same shape.
-        self.store
+        let mut rooms: Vec<RoomInfo> = self
+            .store
             .routing_list()
             .await
             .iter()
@@ -528,7 +562,12 @@ impl ControlApi for NodeApiImpl {
                 name: None,
                 session: Some(r.session.clone()),
             })
-            .collect()
+            .collect();
+        // The cursor is the room label, so re-sort by it (the pins arrive in pin-key order).
+        rooms.sort_by(|a, b| a.room.cmp(&b.room));
+        daemon_api::paginate(rooms, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |r| {
+            r.room.clone()
+        })
     }
 
     async fn transport_adapters(&self) -> Vec<AdapterInfo> {
@@ -548,11 +587,22 @@ impl ControlApi for NodeApiImpl {
     // through the registry to the addressed transport's `MessagingProtocol` feature traits; mutating
     // ops are sealed onto the verifiable `node-management` stream. -----
 
-    async fn conv_list(&self, transport: TransportId) -> Vec<ConversationInfo> {
-        match self.conversations_for(&transport) {
+    async fn conv_list(
+        &self,
+        transport: TransportId,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<ConversationInfo> {
+        // The adapters return unbounded, adapter-ordered listings; sort + page here (once) rather
+        // than teaching every `SupportsConversations` impl the cursor. The cursor is the
+        // conversation id.
+        let mut convs = match self.conversations_for(&transport) {
             Ok(c) => c.list(transport).await,
             Err(_) => Vec::new(),
-        }
+        };
+        convs.sort_by(|a, b| a.id.cmp(&b.id));
+        daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
+            c.id.clone()
+        })
     }
 
     async fn conv_get(&self, transport: TransportId, conv: String) -> Option<ConversationInfo> {
@@ -1012,12 +1062,16 @@ impl ControlApi for NodeApiImpl {
         self.verifier.as_ref().map(|s| s.verifying_key().to_hex())
     }
 
-    async fn checkpoints(&self, session: Option<SessionId>) -> Vec<daemon_api::CheckpointInfo> {
+    async fn checkpoints(
+        &self,
+        session: Option<SessionId>,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<daemon_api::CheckpointInfo> {
         let Some(store) = &self.checkpoints else {
-            return Vec::new();
+            return daemon_api::WirePage::default();
         };
         let filter = session.as_ref().map(|s| s.to_string());
-        store
+        let mut checkpoints: Vec<daemon_api::CheckpointInfo> = store
             .list(filter.as_deref())
             .await
             .into_iter()
@@ -1031,7 +1085,17 @@ impl ControlApi for NodeApiImpl {
                 turn_ordinal: None,
                 cursor: None,
             })
-            .collect()
+            .collect();
+        // The uniform ascending-by-key page order (the cursor is the checkpoint id). The store's
+        // newest-first order was an internal convenience with no wire consumers; a client wanting
+        // newest-first re-sorts by `created_unix` after collecting its pages.
+        checkpoints.sort_by(|a, b| a.id.cmp(&b.id));
+        daemon_api::paginate(
+            checkpoints,
+            after.as_deref(),
+            daemon_api::WIRE_PAGE_MAX,
+            |c| c.id.clone(),
+        )
     }
 
     async fn checkpoint_rewind(
@@ -1101,12 +1165,13 @@ impl ControlApi for NodeApiImpl {
         root: FsRootId,
         dir: String,
         show_ignored: bool,
-    ) -> Result<Vec<FsEntry>, ApiError> {
+        after: Option<String>,
+    ) -> Result<FsListPage, ApiError> {
         let ws = self
             .workspace
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("fs_list".into()))?;
-        ws.list(&root, &dir, show_ignored).await
+        ws.list(&root, &dir, show_ignored, after.as_deref()).await
     }
 
     async fn fs_stat(&self, root: FsRootId, path: String) -> Result<FsEntry, ApiError> {

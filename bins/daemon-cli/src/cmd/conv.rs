@@ -18,6 +18,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
     let req = match cmd {
         ConvCmd::List { transport } => ApiRequest::ConvList {
             transport: TransportId::new(transport),
+            after: None,
         },
         ConvCmd::Get { transport, conv } => ApiRequest::ConvGet {
             transport: TransportId::new(transport),

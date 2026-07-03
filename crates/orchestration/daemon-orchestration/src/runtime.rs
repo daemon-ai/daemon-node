@@ -420,9 +420,16 @@ impl FleetRuntime {
                 TreeReport {
                     root: Some(root.clone()),
                     nodes: all,
+                    // The full (unpaged) projection: the wire `ControlApi::tree` handler slices it
+                    // into cursor pages; in-process consumers (the fleet bus) take it whole.
+                    next: None,
                 }
             }
-            None => TreeReport { root: None, nodes },
+            None => TreeReport {
+                root: None,
+                nodes,
+                next: None,
+            },
         }
     }
 

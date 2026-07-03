@@ -112,7 +112,13 @@ impl FleetControl for FleetViewImpl {
             [only] => Some(UnitId::new(only.as_str())),
             _ => None,
         };
-        daemon_api::TreeReport { root, nodes }
+        daemon_api::TreeReport {
+            root,
+            nodes,
+            // The full (unpaged) projection: the wire `ControlApi::tree` handler slices it into
+            // cursor pages; in-process consumers (the fleet bus) take it whole.
+            next: None,
+        }
     }
 
     async fn unit(&self, id: &UnitId) -> Option<daemon_api::UnitNode> {

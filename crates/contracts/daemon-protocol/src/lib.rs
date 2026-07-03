@@ -1348,14 +1348,20 @@ pub struct UnitNode {
     pub role: Option<SessionRole>,
 }
 
-/// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`.
+/// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`. `nodes` is
+/// served in wire-bounded pages (unit-id order); `next` is the resume cursor to pass back as the
+/// tree request's `after` (`None` => last page). `root` rides every page; the id-linked structure
+/// reassembles client-side regardless of page boundaries.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeReport {
     /// The root unit id (the node itself), when there is one.
     pub root: Option<UnitId>,
-    /// Every node in the tree.
+    /// The nodes in this page (at most the wire page bound).
     pub nodes: Vec<UnitNode>,
+    /// The resume cursor when more nodes remain (`None` => last page).
+    #[serde(default)]
+    pub next: Option<String>,
 }
 
 /// A transport-stable projection of a unit's management event, for GUI drill-down (decoupled from

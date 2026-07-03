@@ -59,6 +59,11 @@ impl NodeApiImpl {
         after_cursor: u64,
         max: u32,
     ) -> JournalPageView {
+        // Clamp the page size at this (shared SessionHistory/UnitHistory/ConvHistory handler)
+        // seam: `max == 0` previously returned the ENTIRE journal, which the fixed-buffer client
+        // codec cannot decode past WIRE_PAGE_MAX entries. The store's `if max > 0 { truncate }`
+        // contract stays generic; `next_cursor`/`head_cursor` let the client loop to completion.
+        let max = daemon_api::clamp_page_max(max);
         let page = self.store.load_journal(&stream, after_cursor, max).await;
         let key = self.verifier.as_ref().map(|s| s.verifying_key());
 

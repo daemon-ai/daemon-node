@@ -283,11 +283,12 @@ async fn daemon_cloud_discovery_configure_and_chat() {
             provider: "daemon_cloud".into(),
             credential_ref: None,
             transient_key: None,
+            after: None,
         })
         .await
         .expect("provider models")
     {
-        ApiResponse::ProviderModels(m) => m,
+        ApiResponse::ProviderModels(page) => page.items,
         other => panic!("expected ProviderModels, got {other:?}"),
     };
     let model_id = "anthropic/claude-sonnet-4-5";

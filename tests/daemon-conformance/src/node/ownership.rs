@@ -272,7 +272,7 @@ async fn delegation_child_inherits_owner_and_tree_is_scoped() {
 
     // The tree is owner-scoped: Alice sees her subtree; Bob sees none of it; the operator sees all.
     let alice_tree =
-        with_request_context(ctx("alice", Role::User), async { node.tree().await }).await;
+        with_request_context(ctx("alice", Role::User), async { node.tree(None).await }).await;
     assert!(
         alice_tree
             .nodes
@@ -280,7 +280,8 @@ async fn delegation_child_inherits_owner_and_tree_is_scoped() {
             .any(|n| n.session.as_ref() == Some(&parent)),
         "the owner sees her own subtree"
     );
-    let bob_tree = with_request_context(ctx("bob", Role::User), async { node.tree().await }).await;
+    let bob_tree =
+        with_request_context(ctx("bob", Role::User), async { node.tree(None).await }).await;
     assert!(
         !bob_tree
             .nodes
@@ -289,7 +290,7 @@ async fn delegation_child_inherits_owner_and_tree_is_scoped() {
         "a peer sees none of another user's subtree, got {bob_tree:?}"
     );
     let op_tree =
-        with_request_context(ctx("op", Role::Operator), async { node.tree().await }).await;
+        with_request_context(ctx("op", Role::Operator), async { node.tree(None).await }).await;
     assert!(op_tree
         .nodes
         .iter()

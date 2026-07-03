@@ -199,10 +199,21 @@ pub async fn serve(
     ));
     let delivery = Arc::new(DeliveryManager::new(api.clone(), projector));
 
-    // Resume delivery for any sessions this transport already owns (reconnect / restart).
+    // Resume delivery for any sessions this transport already owns (reconnect / restart),
+    // walking the wire pages so every owned session resumes (not just the first page).
     for acct in &brought_up {
-        for session in api.delivery_sessions(acct.transport.clone()).await {
-            delivery.ensure(session, acct.transport.clone());
+        let mut after: Option<String> = None;
+        loop {
+            let page = api
+                .delivery_sessions(acct.transport.clone(), after.take())
+                .await;
+            for session in page.items {
+                delivery.ensure(session, acct.transport.clone());
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
         }
     }
 

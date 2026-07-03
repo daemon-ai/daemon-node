@@ -333,17 +333,35 @@ async fn phase0_gui_readiness_demo_gate() {
         other => panic!("expected Profiles, got {other:?}"),
     }
 
-    // 3. The model picker can discover claude-opus-4-8 (the static cloud catalog).
-    match client.call(ApiRequest::Models).await.unwrap() {
-        ApiResponse::Models(models) => {
-            let opus = models
-                .iter()
-                .find(|m| m.id == "claude-opus-4-8")
-                .expect("claude-opus-4-8 in the catalog");
-            assert_eq!(opus.provider, ProviderSelector::GenAi);
-            assert_eq!(opus.context_length, Some(200_000));
+    // 3. The model picker can discover claude-opus-4-8 (the static cloud catalog), walking the
+    // wire pages (v25: Models is cursor-paged in descriptor-id order).
+    {
+        let mut all = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            match client
+                .call(ApiRequest::Models {
+                    after: after.take(),
+                })
+                .await
+                .unwrap()
+            {
+                ApiResponse::Models(page) => {
+                    all.extend(page.items);
+                    match page.next {
+                        Some(next) => after = Some(next),
+                        None => break,
+                    }
+                }
+                other => panic!("expected Models, got {other:?}"),
+            }
         }
-        other => panic!("expected Models, got {other:?}"),
+        let opus = all
+            .iter()
+            .find(|m| m.id == "claude-opus-4-8")
+            .expect("claude-opus-4-8 in the catalog");
+        assert_eq!(opus.provider, ProviderSelector::GenAi);
+        assert_eq!(opus.context_length, Some(200_000));
     }
 
     // 4. The current model resolves to the active profile's opus.

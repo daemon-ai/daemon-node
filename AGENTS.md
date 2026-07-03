@@ -13,6 +13,20 @@ Nix-managed workspace. There are NO host tools — run cargo inside the devShell
 
 Never bypass the pre-commit hook (no `git commit --no-verify`).
 
+## daemon-node is authoritative — clients stay thin
+
+This daemon is the single authority for domain state, business logic, validation, persistence,
+and orchestration. Every client (`daemon-app` GUI / TUI / WASM, `daemon-cli`) is a thin renderer
+of node state that sends intents back — so design the API accordingly:
+
+- New behavior lands HERE first, behind `ApiRequest` / `ApiResponse`, then clients consume it.
+  Never plan a feature that needs a client to compute domain results locally.
+- Responses carry decisions, not raw material for clients to re-derive: expose computed/derived
+  state (statuses, aggregates, eligibility, ordering) instead of expecting clients to recompute
+  it. If two clients would each re-implement the same rule, that rule belongs in the node.
+- Requests are intents ("do X"), and the node validates them fully server-side; client-side
+  checks are UX sugar, never the enforcement point.
+
 ## Wire contract (CDDL) — keep it in lockstep with the Rust types
 
 [`crates/contracts/daemon-api/daemon-api.cddl`](crates/contracts/daemon-api/daemon-api.cddl) is the

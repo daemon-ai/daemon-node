@@ -291,10 +291,15 @@ pub trait SessionApi: Send + Sync {
     /// `Primary` [`DeliveryTarget`] names `transport` (daemon-event-io-spec §5.9.3). This is the
     /// owned-session discovery primitive a transport calls on (re)connect to find which sessions it
     /// must resume posting for, without having tracked their ids itself (the reconnect-safe seam the
-    /// `submit_routed`-returns-an-id path alone cannot cover after a restart). Default: empty (a
-    /// transport with no live delivery state).
-    async fn delivery_sessions(&self, _transport: TransportId) -> Vec<SessionId> {
-        Vec::new()
+    /// `submit_routed`-returns-an-id path alone cannot cover after a restart). Paged at
+    /// [`WIRE_PAGE_MAX`] in session-id order; `after` resumes past the previous page's `next`.
+    /// Default: empty (a transport with no live delivery state).
+    async fn delivery_sessions(
+        &self,
+        _transport: TransportId,
+        _after: Option<String>,
+    ) -> WirePage<SessionId> {
+        WirePage::default()
     }
 
     /// Re-point a session's `Primary` reply sink to `target` (the single explicit "handover" op): the
@@ -406,12 +411,6 @@ pub trait ControlApi: Send + Sync {
         None
     }
 
-    /// The roster grouped by owning profile (the "agent owns N conversations" view). Scoped to
-    /// top-level conversations like the inbox. Default: empty.
-    async fn sessions_by_profile(&self) -> Vec<(ProfileRef, Vec<SessionInfo>)> {
-        Vec::new()
-    }
-
     /// Full-text search over indexed session text (title + coalesced body), most-relevant first,
     /// capped at `limit` (`0` => a server default). Default: empty (no text index).
     async fn session_search(&self, _query: String, _limit: u32) -> Vec<SessionSearchHit> {
@@ -440,9 +439,12 @@ pub trait ControlApi: Send + Sync {
     async fn fleet(&self) -> FleetReport;
 
     /// The orchestration tree as the GUI/TUI drives it: every unit (single agent through
-    /// fleets-of-fleets) with its parent/child structure, state, work, and folded usage. The default
-    /// is an empty tree (a transport with no fleet projection, e.g. the session-only FFI).
-    async fn tree(&self) -> TreeReport {
+    /// fleets-of-fleets) with its parent/child structure, state, work, and folded usage. `nodes`
+    /// is paged at [`WIRE_PAGE_MAX`] in unit-id order (`after` resumes past the report's `next`;
+    /// `root` rides every page); the id-linked structure reassembles client-side regardless of
+    /// page boundaries. The default is an empty tree (a transport with no fleet projection, e.g.
+    /// the session-only FFI).
+    async fn tree(&self, _after: Option<String>) -> TreeReport {
         TreeReport::default()
     }
 
@@ -498,10 +500,14 @@ pub trait ControlApi: Send + Sync {
     }
 
     /// List parked §12 edit-approval requests awaiting an operator decision — for one `session` when
-    /// given, else across all sessions (the operator HITL inbox). Default: empty (a transport with no
-    /// durable approval store).
-    async fn approvals_pending(&self, _session: Option<SessionId>) -> Vec<ApprovalInfo> {
-        Vec::new()
+    /// given, else across all sessions (the operator HITL inbox). Paged at [`WIRE_PAGE_MAX`] in
+    /// `request_id` order. Default: empty (a transport with no durable approval store).
+    async fn approvals_pending(
+        &self,
+        _session: Option<SessionId>,
+        _after: Option<String>,
+    ) -> WirePage<ApprovalInfo> {
+        WirePage::default()
     }
 
     /// Answer a parked §12 edit-approval request: record the operator's decision and wake the dormant
@@ -524,11 +530,16 @@ pub trait ControlApi: Send + Sync {
         None
     }
 
-    /// List recorded §12 tool checkpoints (workspace snapshots taken before a mutating tool ran),
-    /// newest first — for one `session` when given, else node-wide. Default: empty (a node with no
-    /// checkpoint store). The GUI renders these as rewind points.
-    async fn checkpoints(&self, _session: Option<SessionId>) -> Vec<CheckpointInfo> {
-        Vec::new()
+    /// List recorded §12 tool checkpoints (workspace snapshots taken before a mutating tool ran) —
+    /// for one `session` when given, else node-wide. Paged at [`WIRE_PAGE_MAX`] in checkpoint-id
+    /// order (the uniform ascending-by-key cursor; consumers re-sort for a newest-first render).
+    /// Default: empty (a node with no checkpoint store). The GUI renders these as rewind points.
+    async fn checkpoints(
+        &self,
+        _session: Option<SessionId>,
+        _after: Option<String>,
+    ) -> WirePage<CheckpointInfo> {
+        WirePage::default()
     }
 
     /// Rewind the workspace to a recorded checkpoint (`checkpoint_id` from [`Self::checkpoints`]).
@@ -576,9 +587,10 @@ pub trait ControlApi: Send + Sync {
     // pin an inbound origin (chat/room) to a specific session (+ profile). Pins are durable and hot-
     // reloaded into the live registry. Defaults: empty / unsupported (a node without durable routing).
 
-    /// List all chat→session routing pins. Default: empty.
-    async fn routing_list_chats(&self) -> Vec<ChatRoute> {
-        Vec::new()
+    /// List all chat→session routing pins, paged at [`WIRE_PAGE_MAX`] in origin-pin-key order (the
+    /// store's `ORDER BY key`; the cursor is recomputed from each route's origin). Default: empty.
+    async fn routing_list_chats(&self, _after: Option<String>) -> WirePage<ChatRoute> {
+        WirePage::default()
     }
 
     /// Read the routing pin for an origin, if one is set. Default: `None`.
@@ -609,9 +621,14 @@ pub trait ControlApi: Send + Sync {
     }
 
     /// Enumerate the rooms/chats a transport instance knows about (read-only), with the pinned
-    /// session for each when one exists. Default: empty (a transport with no room enumeration).
-    async fn transport_rooms(&self, _transport: TransportId) -> Vec<RoomInfo> {
-        Vec::new()
+    /// session for each when one exists. Paged at [`WIRE_PAGE_MAX`] in `room` order. Default:
+    /// empty (a transport with no room enumeration).
+    async fn transport_rooms(
+        &self,
+        _transport: TransportId,
+        _after: Option<String>,
+    ) -> WirePage<RoomInfo> {
+        WirePage::default()
     }
 
     // -- Transport adapters: the events-IO adapter framework (daemon-transport-adapter-spec.md) ---
@@ -646,9 +663,14 @@ pub trait ControlApi: Send + Sync {
     //    by the host to the owning adapter's `MessagingProtocol` feature interfaces. Defaults are
     //    empty / `Unsupported` (a node with no messaging adapter registered). --
 
-    /// List the conversations a transport owns (`SupportsConversations::list`). Default: empty.
-    async fn conv_list(&self, _transport: TransportId) -> Vec<ConversationInfo> {
-        Vec::new()
+    /// List the conversations a transport owns (`SupportsConversations::list`), paged at
+    /// [`WIRE_PAGE_MAX`] in conversation-id order. Default: empty.
+    async fn conv_list(
+        &self,
+        _transport: TransportId,
+        _after: Option<String>,
+    ) -> WirePage<ConversationInfo> {
+        WirePage::default()
     }
 
     /// Read one conversation by id (`SupportsConversations::get`). Default: `None`.
@@ -950,15 +972,17 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
-    /// One directory's children (root-relative `dir`, "" = the root). Ignored entries are *marked*
-    /// (`FsEntry.ignored`), not hidden, when `show_ignored` is false the caller may still hide them.
-    /// Default: unsupported.
+    /// One directory's children (root-relative `dir`, "" = the root), paged at [`WIRE_PAGE_MAX`]
+    /// entries per response: `after` resumes past the previous page's `next` cursor. Ignored
+    /// entries are *marked* (`FsEntry.ignored`), not hidden, when `show_ignored` is false the
+    /// caller may still hide them. Default: unsupported.
     async fn fs_list(
         &self,
         _root: FsRootId,
         _dir: String,
         _show_ignored: bool,
-    ) -> Result<Vec<FsEntry>, ApiError> {
+        _after: Option<String>,
+    ) -> Result<FsListPage, ApiError> {
         Err(ApiError::Unsupported("fs_list".into()))
     }
 
@@ -1059,13 +1083,15 @@ pub trait ModelApi: Send + Sync {
         Err(ApiError::Unsupported("model_search".into()))
     }
 
-    /// Step 2 — list a repo's loadable files for `engine` (the set a client selects to download).
+    /// Step 2 — list a repo's loadable files for `engine` (the set a client selects to download),
+    /// paged at [`WIRE_PAGE_MAX`] in `path` order.
     async fn model_files(
         &self,
         _repo: String,
         _revision: Option<String>,
         _engine: ModelEngine,
-    ) -> Result<Vec<ModelFile>, ApiError> {
+        _after: Option<String>,
+    ) -> Result<WirePage<ModelFile>, ApiError> {
         Err(ApiError::Unsupported("model_files".into()))
     }
 
@@ -1137,9 +1163,12 @@ pub trait ModelApi: Send + Sync {
     }
 
     /// The discoverable model catalog a GUI's model picker renders: well-known cloud models (incl.
-    /// `claude-opus-4-8`) merged with locally-installed models. Default: the built-in cloud catalog.
-    async fn models(&self) -> Vec<ModelDescriptor> {
-        ModelDescriptor::builtin_cloud_catalog()
+    /// `claude-opus-4-8`) merged with locally-installed models. Paged at [`WIRE_PAGE_MAX`] in
+    /// descriptor-id order. Default: the built-in cloud catalog.
+    async fn models(&self, after: Option<String>) -> WirePage<ModelDescriptor> {
+        let mut catalog = ModelDescriptor::builtin_cloud_catalog();
+        catalog.sort_by(|a, b| a.id.cmp(&b.id));
+        paginate(catalog, after.as_deref(), WIRE_PAGE_MAX, |m| m.id.clone())
     }
 
     /// The model a profile currently resolves to (`None` profile = the active default). `None` when
@@ -1160,14 +1189,16 @@ pub trait ModelApi: Send + Sync {
 
     /// One provider's discoverable models. Credential-aware for genai vendors (authenticate the LIST
     /// call with the `transient_key`, else the stored `credential_ref`); Daemon Cloud lists keyless;
-    /// local providers return the installed models. Default: empty.
+    /// local providers return the installed models. Paged at [`WIRE_PAGE_MAX`] in descriptor-id
+    /// order. Default: empty.
     async fn provider_models(
         &self,
         _provider: String,
         _credential_ref: Option<String>,
         _transient_key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
-        Vec::new()
+        _after: Option<String>,
+    ) -> WirePage<ModelDescriptor> {
+        WirePage::default()
     }
 }
 
@@ -1238,8 +1269,13 @@ pub trait ProfileApi: Send + Sync {
         Err(ApiError::Unsupported("profile_import".into()))
     }
 
-    /// The revision history of a profile (oldest first).
-    async fn profile_history(&self, _id: String) -> Result<Vec<Revision>, ApiError> {
+    /// The revision history of a profile (oldest first), paged at [`WIRE_PAGE_MAX`]; the cursor is
+    /// the stringified revision `seq`.
+    async fn profile_history(
+        &self,
+        _id: String,
+        _after: Option<String>,
+    ) -> Result<WirePage<Revision>, ApiError> {
         Err(ApiError::Unsupported("profile_history".into()))
     }
 
@@ -1254,8 +1290,13 @@ pub trait ProfileApi: Send + Sync {
         Err(ApiError::Unsupported("profile_revert".into()))
     }
 
-    /// The revision history of a skill (oldest first).
-    async fn skill_history(&self, _name: String) -> Result<Vec<Revision>, ApiError> {
+    /// The revision history of a skill (oldest first), paged at [`WIRE_PAGE_MAX`]; the cursor is
+    /// the stringified revision `seq`.
+    async fn skill_history(
+        &self,
+        _name: String,
+        _after: Option<String>,
+    ) -> Result<WirePage<Revision>, ApiError> {
         Err(ApiError::Unsupported("skill_history".into()))
     }
 
@@ -3323,7 +3364,9 @@ pub enum NodeEvent {
         /// The approval's request id.
         request_id: String,
     },
-    /// A model download advanced (replaces the client's poll).
+    /// A model download advanced (replaces the client's poll). Emitted from the byte-level
+    /// transfer sink, throttled node-side (>= 1 percent-point advance or >= 500 ms since the last
+    /// emit), plus on every state transition and per-file completion.
     DownloadProgress {
         /// The download job id.
         id: DownloadId,
@@ -3331,7 +3374,15 @@ pub enum NodeEvent {
         pct: u32,
         /// The job state string.
         state: String,
+        /// Bytes transferred so far (across the job's files) — the client renders these directly.
+        downloaded_bytes: u64,
+        /// Total bytes to transfer, when known (0 when the Hub reported no sizes).
+        total_bytes: u64,
     },
+    /// The installed-model registry changed (a finished download was cataloged / a model was
+    /// deleted): the client refetches `ModelCatalog`. Payload-free and globally coalesced in the
+    /// backlog (a refetch always reads the whole catalog).
+    CatalogChanged,
     /// The feed could not serve from the client's cursor (aged out / lagged); the client must
     /// re-baseline the named scope ("roster" / "all" / ...).
     ResyncNeeded {
@@ -3432,6 +3483,7 @@ mod tests {
         let reqs = vec![
             ApiRequest::ConvList {
                 transport: transport.clone(),
+                after: Some("conv-cursor".into()),
             },
             ApiRequest::ConvGet {
                 transport: transport.clone(),
@@ -3567,7 +3619,10 @@ mod tests {
             }],
         };
         let resps = vec![
-            ApiResponse::Conversations(vec![info.clone()]),
+            ApiResponse::Conversations(WirePage {
+                items: vec![info.clone()],
+                next: Some(info.id.clone()),
+            }),
             ApiResponse::Conversation(Some(info.clone())),
             ApiResponse::ConvCreateDetails(CreateConversationDetails::default()),
             ApiResponse::ConvJoinDetails(ChannelJoinDetails::default()),
@@ -3743,6 +3798,7 @@ mod tests {
                 root: FsRootId::Host("home".into()),
                 dir: "projects".into(),
                 show_ignored: true,
+                after: Some("projects/zzz".into()),
             },
             ApiRequest::FsStat {
                 root: FsRootId::Workspace,
@@ -3793,14 +3849,17 @@ mod tests {
                 kind: FsRootKind::Workspace,
                 session: None,
             }]),
-            ApiResponse::FsList(vec![FsEntry {
-                name: "src".into(),
-                path: "src".into(),
-                kind: FsEntryKind::Dir,
-                size: 0,
-                mtime_ms: 1,
-                ignored: false,
-            }]),
+            ApiResponse::FsList(FsListPage {
+                items: vec![FsEntry {
+                    name: "src".into(),
+                    path: "src".into(),
+                    kind: FsEntryKind::Dir,
+                    size: 0,
+                    mtime_ms: 1,
+                    ignored: false,
+                }],
+                next: Some("src".into()),
+            }),
             ApiResponse::FsRead(FsContent {
                 bytes: vec![9, 9],
                 revision: FsRevision {
@@ -3953,7 +4012,6 @@ mod tests {
             ApiRequest::SessionGet {
                 session: SessionId::new("s1"),
             },
-            ApiRequest::SessionsByProfile,
             ApiRequest::SessionSearch {
                 query: "build".into(),
                 limit: 10,
@@ -4001,7 +4059,6 @@ mod tests {
                 children: vec![SessionId::new("c1")],
                 checkpoints: 2,
             })),
-            ApiResponse::SessionsByProfile(vec![(ProfileRef::new("agent-x"), vec![sample_info()])]),
             ApiResponse::SessionSearch(vec![SessionSearchHit {
                 session: SessionId::new("s1"),
                 title: "hello".into(),
@@ -4050,6 +4107,7 @@ mod tests {
                 title: None,
                 role: None,
             }],
+            next: Some("root".into()),
         });
         assert_eq!(ev, from_cbor::<TreeEvent>(&to_cbor(&ev)).unwrap());
     }

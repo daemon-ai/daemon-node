@@ -143,9 +143,10 @@ async fn provider_models_prefers_the_transient_key() {
             "anthropic".into(),
             Some("cred-1".into()),
             Some("transient-xyz".into()),
+            None,
         )
         .await;
-    assert_eq!(models.len(), 1);
+    assert_eq!(models.items.len(), 1);
     assert_eq!(
         *last_key.lock().unwrap(),
         Some(Some("transient-xyz".into())),
@@ -165,7 +166,7 @@ async fn provider_models_resolves_the_credential_ref() {
 
     // No transient key: the stored credential the ref points at is resolved and passed through.
     let _ = node
-        .provider_models("anthropic".into(), Some("cred-1".into()), None)
+        .provider_models("anthropic".into(), Some("cred-1".into()), None, None)
         .await;
     assert_eq!(
         *last_key.lock().unwrap(),
@@ -184,13 +185,143 @@ async fn provider_models_daemon_cloud_is_keyless() {
     let node = assemble_with_catalog(catalog, creds);
 
     let _ = node
-        .provider_models("daemon_cloud".into(), None, None)
+        .provider_models("daemon_cloud".into(), None, None, None)
         .await;
     assert_eq!(
         *last_key.lock().unwrap(),
         Some(None),
         "Daemon Cloud lists keyless (no LIST credential)"
     );
+}
+
+/// Vision-projector (mmproj) records never surface as chat models: `ProviderModels` for the local
+/// engine and the merged `models` page both exclude them, and `ModelActivate` rejects them with
+/// the actionable error — while the text record stays offered and activatable.
+#[tokio::test]
+async fn projector_records_are_excluded_and_activate_rejects() {
+    use daemon_common::{InstalledModel, ModelEngine, ModelRef, ModelSource};
+
+    // Seed a registry with one text model and one projector (arch=clip + mmproj name), then open
+    // a real ModelManager over it (no network is touched by catalog/activate paths).
+    let dir = std::env::temp_dir().join(format!("daemon-conf-projector-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let registry_path = dir.join("catalog.json");
+    let text_ref = ModelRef::new(
+        ModelEngine::Llama,
+        ModelSource::hf_file("org/smolvlm", "SmolVLM-256M-Instruct-f16.gguf"),
+    );
+    let proj_ref = ModelRef::new(
+        ModelEngine::Llama,
+        ModelSource::hf_file("org/smolvlm", "mmproj-SmolVLM-256M-Instruct-Q8_0.gguf"),
+    );
+    let record = |model: &ModelRef, name: &str, arch: &str| InstalledModel {
+        id: daemon_models::model_id(model),
+        model: model.clone(),
+        display_name: name.into(),
+        local_path: dir.join(name),
+        size_bytes: 1,
+        quant: None,
+        installed_at_ms: 1,
+        arch: Some(arch.into()),
+        context_length: None,
+        file_type: None,
+        mmproj_path: None,
+    };
+    let text_id = daemon_models::model_id(&text_ref);
+    let proj_id = daemon_models::model_id(&proj_ref);
+    {
+        let registry = daemon_models::Registry::open(&registry_path).await.unwrap();
+        registry
+            .upsert(record(&text_ref, "SmolVLM-256M-Instruct-f16.gguf", "llama"))
+            .await
+            .unwrap();
+        registry
+            .upsert(record(
+                &proj_ref,
+                "mmproj-SmolVLM-256M-Instruct-Q8_0.gguf",
+                "clip",
+            ))
+            .await
+            .unwrap();
+    }
+    let manager = daemon_models::ModelManager::new(daemon_models::ManagerConfig {
+        cache_dir: Some(dir.join("hub")),
+        registry_path: Some(registry_path),
+        endpoint: None,
+        quantize_worker_bin: None,
+    })
+    .await
+    .expect("manager");
+
+    let AssembledNode { node, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: daemon_common::ProfileRef::new("openai"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x68; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: Some(Arc::new(manager)),
+        profiles: Some(Arc::new(MemProfileStore::new())),
+        provider_resolver: None,
+        credential_store: None,
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![],
+        workspace_root: None,
+        blob_root: None,
+    });
+
+    // The local chat offer carries the text model but never the projector.
+    let offered = node
+        .provider_models("llama_cpp".into(), None, None, None)
+        .await;
+    let ids: Vec<&str> = offered.items.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&text_id.as_str()),
+        "text model offered: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&proj_id.as_str()),
+        "projector must not be offered: {ids:?}"
+    );
+
+    // The merged models page excludes it too.
+    let page = node.models(None).await;
+    assert!(page.items.iter().all(|m| m.id != proj_id.as_str()));
+
+    // Activating the projector fails with the actionable error; the text model activates.
+    let err = node
+        .model_activate(proj_id.clone(), None)
+        .await
+        .expect_err("projector activation must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("vision projector") && msg.contains("text weights"),
+        "actionable message expected, got: {msg}"
+    );
+    node.model_activate(text_id, None)
+        .await
+        .expect("text model activates");
+
+    // The projector stays in the raw catalog (inventory / uninstall surface).
+    let catalog = node.model_catalog().await;
+    assert!(catalog.iter().any(|m| m.id == proj_id));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An unconfigured node with no discovery hook wired still lists providers (the static fallback:

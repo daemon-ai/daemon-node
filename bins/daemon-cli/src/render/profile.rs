@@ -99,9 +99,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
             }
         }
         ApiResponse::ProfileId(id) => println!("imported profile: {id}"),
-        ApiResponse::Revisions(revs) => {
-            println!("revisions: {}", revs.len());
-            for r in revs {
+        ApiResponse::Revisions(page) => {
+            println!("revisions: {}", page.items.len());
+            for r in page.items {
                 let author = match &r.author {
                     daemon_api::Author::Operator => "operator".to_string(),
                     daemon_api::Author::Agent(label) => format!("agent:{label}"),
@@ -110,6 +110,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                     "  - #{} [{}] {} (parent {:?})",
                     r.seq, author, r.reason, r.parent
                 );
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::SkillBundle(b) => {

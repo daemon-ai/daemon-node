@@ -276,6 +276,11 @@ impl NodeEventFeed {
             g.ring
                 .coalesce(|e| matches!(e, NodeEvent::FleetChanged { .. }));
         }
+        // CatalogChanged coalesces globally too (a refetch reads the whole installed-model
+        // catalog), so a burst of installs/deletes is one client refetch.
+        if matches!(&event, NodeEvent::CatalogChanged) {
+            g.ring.coalesce(|e| matches!(e, NodeEvent::CatalogChanged));
+        }
         // push assigns the cursor + raises the floor on a capacity eviction.
         let cursor = g.ring.push(event.clone());
         drop(g);

@@ -93,6 +93,9 @@ chromiumoxide = { version = "0.9", default-features = false }
 # local inference engines (feature-gated, isolated to the `daemon-infer` worker crate; never built
 # in the default workspace gate). llama-cpp-4 tracks upstream llama.cpp closely (a llama-cpp-2 fork);
 # default-features off drops its `mtmd`/`dynamic-link` defaults — we add `openmp` + a backend.
+# Multimodal projector loading is opt-in again via daemon-infer's `mtmd` feature (forwards to
+# `llama-cpp-4/mtmd`), enabled in the shipped `daemon-infer-llama` nix lane (from-source cmake
+# builds tools/mtmd) but NOT in dev-shell `dynamic-link` builds (the prebuilt has no libmtmd).
 llama-cpp-4 = { version = "0.3", default-features = false, features = ["openmp"] }
 encoding_rs = "0.8"
 # mistral.rs: the async, high-level local engine (Phase-1 seam; depth in Phase 2). default-features

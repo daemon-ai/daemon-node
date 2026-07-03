@@ -89,6 +89,66 @@ async fn reconnect_reads_back_verified_session_history() {
     handle.shutdown().await;
 }
 
+/// Wire page bound (v24): a session journal holding more than WIRE_PAGE_MAX records is served in
+/// <= 64-entry pages through `SessionHistory` — `max == 0` no longer returns the entire journal —
+/// and the `after_cursor` loop (via `next_cursor`/`head_cursor`) reads it to completion with no
+/// truncation and no duplicates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_history_pages_past_the_wire_bound() {
+    use daemon_api::{SessionApi, WIRE_PAGE_MAX};
+    use daemon_common::JournalStreamId;
+    use daemon_host::JournalSink;
+
+    let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+    let AssembledNode {
+        node,
+        handle,
+        signer,
+        ..
+    } = assemble_over(store.clone(), 0, [0x66; 32], fast_host_config());
+    let session = SessionId::new("history-paged");
+
+    // Write 70 sealed records straight into the session's journal stream (the same sink the host
+    // writes through), so the durable history holds more than one wire page.
+    let sink = JournalSink::new(
+        store.clone(),
+        signer.clone(),
+        JournalStreamId::session(&session),
+    );
+    for n in 0..70 {
+        sink.record_management("test.rec", format!("record {n}"))
+            .await
+            .expect("record");
+    }
+    sink.seal().await.expect("seal");
+
+    let mut cursor = 0u64;
+    let mut seen = 0usize;
+    let mut pages = 0usize;
+    loop {
+        let page = node.session_history(session.clone(), cursor, 0).await;
+        assert!(
+            page.entries.len() <= WIRE_PAGE_MAX,
+            "a history page must never exceed the wire bound, got {}",
+            page.entries.len()
+        );
+        if page.entries.is_empty() {
+            break;
+        }
+        seen += page.entries.len();
+        cursor = page.next_cursor;
+        pages += 1;
+        assert!(pages <= 4, "runaway pagination");
+        if cursor >= page.head_cursor {
+            break;
+        }
+    }
+    assert_eq!(seen, 70, "the cursor loop must read the whole journal");
+    assert!(pages >= 2, "70 records must span more than one page");
+
+    handle.shutdown().await;
+}
+
 /// Conversation rewind (conversation-rewind spec) end-to-end over the node surface: a
 /// `daemon-core` session is rewindable, `RewindTo` emits `Rewound`, the durable journal records
 /// the seal (`JournalPageView::sealed_after`), and a follow-up `StartTurn` re-runs from the anchor.

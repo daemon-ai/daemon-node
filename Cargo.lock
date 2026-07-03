@@ -2197,6 +2197,7 @@ dependencies = [
  "daemon-host",
  "daemon-ingest",
  "daemon-matrix",
+ "daemon-models",
  "daemon-node",
  "daemon-orchestration",
  "daemon-protocol",

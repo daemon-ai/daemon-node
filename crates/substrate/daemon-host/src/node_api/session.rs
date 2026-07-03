@@ -54,7 +54,7 @@ impl SessionApi for NodeApiImpl {
                 .map(ProfileRef::new),
         };
         // Create-if-absent durable row with the engine's initial snapshot (the `assign` body).
-        let created = if self.store.status(&session).await.is_none() {
+        if self.store.status(&session).await.is_none() {
             let blob = Snapshot::fresh(session.clone())
                 .encode()
                 .map_err(|e| ApiError::Other(format!("encode initial snapshot: {e}")))?;
@@ -62,10 +62,7 @@ impl SessionApi for NodeApiImpl {
                 .create_session(session.clone(), self.partition, blob)
                 .await
                 .map_err(|e| ApiError::Other(format!("create session: {e}")))?;
-            true
-        } else {
-            false
-        };
+        }
         // Bind `bound_profile` + stamp the owner on the durable host meta (read-modify-write, so a
         // pre-existing overlay/title is preserved and a re-create never clobbers an existing binding).
         let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
@@ -82,24 +79,6 @@ impl SessionApi for NodeApiImpl {
             let rev = feed.note_roster_change(&session);
             feed.emit(NodeEvent::RosterChanged { rev });
         }
-        // #region agent log
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/j/experiments/daemon/.cursor/debug-96b7ad.log")
-            {
-                let _ = writeln!(
-                    f,
-                    "{{\"sessionId\":\"96b7ad\",\"hypothesisId\":\"SESSION-CREATE\",\"location\":\"node:session_create\",\"message\":\"node created blank session\",\"data\":{{\"session\":\"{}\",\"profile\":\"{}\",\"created_row\":{}}},\"timestamp\":0}}",
-                    session.as_str(),
-                    bound.as_ref().map(|p| p.as_str()).unwrap_or(""),
-                    created
-                );
-            }
-        }
-        // #endregion
         Ok(session)
     }
 
@@ -208,8 +187,18 @@ impl SessionApi for NodeApiImpl {
         self.live.delivery_targets(&session)
     }
 
-    async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
-        self.live.delivery_sessions(&transport)
+    async fn delivery_sessions(
+        &self,
+        transport: TransportId,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<SessionId> {
+        // The live registry is a DashMap scan with no stable order; sort by session id (the
+        // cursor key) before slicing.
+        let mut sessions = self.live.delivery_sessions(&transport);
+        sessions.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        daemon_api::paginate(sessions, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |s| {
+            s.as_str().to_string()
+        })
     }
 
     async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {

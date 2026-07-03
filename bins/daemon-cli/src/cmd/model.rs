@@ -79,6 +79,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ModelCmd) -> anyhow::Result<()>
             repo,
             revision,
             engine: parse_engine(&engine)?,
+            after: None,
         },
         ModelCmd::Pull {
             repo,

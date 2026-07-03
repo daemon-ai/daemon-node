@@ -66,6 +66,120 @@ fn assemble_versioning(
     (node, handle, skills)
 }
 
+/// Wire page bound (v25): a revision history past `WIRE_PAGE_MAX` entries is served in cursor
+/// pages (the stringified-`seq` cursor, resumed numerically) — 71 revisions page as 64 + 7,
+/// oldest-first, chaining to completion with no dup or gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_history_pages_beyond_the_wire_bound() {
+    use daemon_api::{ProfileApi, ProfileSpec, ProviderSelector, WIRE_PAGE_MAX};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-history-page-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (node, handle, _skills) = assemble_versioning(&dir);
+
+    // 1 create + 70 updates = 71 revisions.
+    let mut spec = ProfileSpec::new("pg", ProviderSelector::GenAi, "model-0");
+    node.profile_create(spec.clone()).await.expect("create pg");
+    for i in 1..=70 {
+        spec.model = format!("model-{i}");
+        node.profile_update(spec.clone()).await.expect("update pg");
+    }
+
+    let mut sizes = Vec::new();
+    let mut seqs = Vec::new();
+    let mut after: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let page = node
+            .profile_history("pg".into(), after.take())
+            .await
+            .expect("history");
+        assert!(
+            page.items.len() <= WIRE_PAGE_MAX,
+            "a wire page must never exceed WIRE_PAGE_MAX, got {}",
+            page.items.len()
+        );
+        sizes.push(page.items.len());
+        seqs.extend(page.items.iter().map(|r| r.seq));
+        pages += 1;
+        assert!(pages <= 4, "pagination must terminate");
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(sizes, vec![WIRE_PAGE_MAX, 7], "71 revisions page as 64 + 7");
+    let expected: Vec<u64> = (1..=71).collect();
+    assert_eq!(
+        seqs, expected,
+        "pages chain oldest-first with no dup or gap"
+    );
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fail-fast inference validation (wire v26 cycle): a LOCAL-provider profile (llama.cpp /
+/// mistral.rs) with an empty model is rejected at create AND update with a clear, actionable
+/// error — it could never load an artifact and would otherwise only fail at first turn. Cloud
+/// selectors keep the empty-model latitude (the unconfigured boot placeholder relies on it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_provider_profile_requires_a_model() {
+    use daemon_api::{ProfileApi, ProfileSpec, ProviderSelector};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-local-model-validate-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (node, handle, _skills) = assemble_versioning(&dir);
+
+    // Create: a llama.cpp profile with no model fails fast with an actionable message.
+    let err = node
+        .profile_create(ProfileSpec::new("local", ProviderSelector::LlamaCpp, ""))
+        .await
+        .expect_err("empty-model llama profile must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("names no model"),
+        "the rejection must say what is missing: {msg}"
+    );
+
+    // A cloud selector keeps the empty-model latitude (the seeded placeholder shape).
+    node.profile_create(ProfileSpec::new("cloudy", ProviderSelector::DaemonApi, ""))
+        .await
+        .expect("cloud profiles may stay unconfigured");
+
+    // A configured local profile passes; blanking its model via update is rejected.
+    let mut spec = ProfileSpec::new("local", ProviderSelector::LlamaCpp, "abc123");
+    node.profile_create(spec.clone())
+        .await
+        .expect("local profile with a model");
+    spec.model = String::new();
+    node.profile_update(spec)
+        .await
+        .expect_err("blanking a local profile's model must be rejected");
+    assert_eq!(
+        node.profile_get("local".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .model,
+        "abc123",
+        "the rejected update must not have been applied"
+    );
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// THE VERSIONING + DISTRIBUTION GATE: a profile's edits are versioned in a native append-only
 /// history with non-destructive revert (and roll-forward), skills (incl. agent-authored ones)
 /// share the same mechanism, binary-bundled skills are read-only, and a profile exports/imports
@@ -95,15 +209,22 @@ async fn profile_and_skill_versioning_and_distribution() {
     let mut spec = ProfileSpec::new("p1", ProviderSelector::GenAi, "claude-opus-4-8");
     spec.credential_ref = Some("team-key".into());
     node.profile_create(spec).await.expect("create p1");
-    assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 1);
+    assert_eq!(
+        node.profile_history("p1".into(), None)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
 
     // Edit the profile in full via `profile_update` (the only durable editor; Config removed).
     let mut edited = node.profile_get("p1".into()).await.unwrap().unwrap();
     edited.model = "claude-3-5-sonnet-latest".into();
     node.profile_update(edited).await.expect("update model");
-    let hist = node.profile_history("p1".into()).await.unwrap();
-    assert_eq!(hist.len(), 2, "create + update = 2 revisions");
-    assert_eq!(hist[0].author, daemon_common::Author::Operator);
+    let hist = node.profile_history("p1".into(), None).await.unwrap();
+    assert_eq!(hist.items.len(), 2, "create + update = 2 revisions");
+    assert_eq!(hist.items[0].author, daemon_common::Author::Operator);
     assert_eq!(
         node.profile_get("p1".into()).await.unwrap().unwrap().model,
         "claude-3-5-sonnet-latest"
@@ -115,7 +236,14 @@ async fn profile_and_skill_versioning_and_distribution() {
         node.profile_get("p1".into()).await.unwrap().unwrap().model,
         "claude-opus-4-8"
     );
-    assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 3);
+    assert_eq!(
+        node.profile_history("p1".into(), None)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        3
+    );
     // Roll-forward = revert to the later seq 2 (the sonnet model).
     node.profile_revert("p1".into(), 2)
         .await
@@ -124,7 +252,14 @@ async fn profile_and_skill_versioning_and_distribution() {
         node.profile_get("p1".into()).await.unwrap().unwrap().model,
         "claude-3-5-sonnet-latest"
     );
-    assert_eq!(node.profile_history("p1".into()).await.unwrap().len(), 4);
+    assert_eq!(
+        node.profile_history("p1".into(), None)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        4
+    );
     // `profile_at` returns the recorded spec without mutating the live profile.
     assert_eq!(
         node.profile_at("p1".into(), 1).await.unwrap().model,
@@ -135,7 +270,14 @@ async fn profile_and_skill_versioning_and_distribution() {
     node.profile_clone("p1".into(), "p2".into())
         .await
         .expect("clone");
-    assert_eq!(node.profile_history("p2".into()).await.unwrap().len(), 1);
+    assert_eq!(
+        node.profile_history("p2".into(), None)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
     let p2 = node.profile_get("p2".into()).await.unwrap().unwrap();
     assert_eq!(p2.model, "claude-3-5-sonnet-latest");
     assert_eq!(p2.credential_ref.as_deref(), Some("team-key"));
@@ -151,10 +293,10 @@ async fn profile_and_skill_versioning_and_distribution() {
     p1_skills
         .edit("mine", &sample_skill_md("v2"))
         .expect("edit skill");
-    let sk_hist = node.skill_history("mine".into()).await.unwrap();
-    assert_eq!(sk_hist.len(), 2, "create + edit = 2 skill revisions");
+    let sk_hist = node.skill_history("mine".into(), None).await.unwrap();
+    assert_eq!(sk_hist.items.len(), 2, "create + edit = 2 skill revisions");
     assert_eq!(
-        sk_hist[0].author,
+        sk_hist.items[0].author,
         daemon_common::Author::Agent("skill_manage".into()),
         "tool writes are attributed to the agent"
     );
@@ -218,9 +360,10 @@ async fn profile_and_skill_versioning_and_distribution() {
     );
     assert_eq!(
         node2
-            .profile_history("imported".into())
+            .profile_history("imported".into(), None)
             .await
             .unwrap()
+            .items
             .len(),
         1,
         "an imported profile seeds a fresh history"
@@ -230,12 +373,22 @@ async fn profile_and_skill_versioning_and_distribution() {
     // --- restart survival: reopen the original data root; history is intact ---
     let (node3, handle3, _skills3) = assemble_versioning(&dir);
     assert_eq!(
-        node3.profile_history("p1".into()).await.unwrap().len(),
+        node3
+            .profile_history("p1".into(), None)
+            .await
+            .unwrap()
+            .items
+            .len(),
         4,
         "profile history survives a node restart (durable revision log)"
     );
     assert_eq!(
-        node3.skill_history("mine".into()).await.unwrap().len(),
+        node3
+            .skill_history("mine".into(), None)
+            .await
+            .unwrap()
+            .items
+            .len(),
         3,
         "skill history (create + edit + revert) survives a restart"
     );

@@ -81,7 +81,12 @@ pub enum ApiRequest {
     /// [`ControlApi::fleet`].
     Fleet,
     /// [`ControlApi::tree`].
-    Tree,
+    Tree {
+        /// Resume cursor: the `next` of the previous [`TreeReport`] (the last node's unit id).
+        /// `None` starts at the first node.
+        #[serde(default)]
+        after: Option<String>,
+    },
     /// [`ControlApi::unit`].
     Unit {
         /// The unit to view.
@@ -139,6 +144,9 @@ pub enum ApiRequest {
     DeliverySessions {
         /// The transport instance whose owned sessions to enumerate.
         transport: TransportId,
+        /// Resume cursor: the previous page's `next` (the last served session id).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`SessionApi::handover`].
     Handover {
@@ -190,6 +198,9 @@ pub enum ApiRequest {
         revision: Option<String>,
         /// The engine the listed files must be loadable by.
         engine: ModelEngine,
+        /// Resume cursor: the previous page's `next` (the last served file `path`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ModelApi::model_download`].
     ModelDownload {
@@ -289,6 +300,9 @@ pub enum ApiRequest {
     ProfileHistory {
         /// The profile id whose history to list.
         id: String,
+        /// Resume cursor: the previous page's `next` (the last served revision's stringified `seq`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ProfileApi::profile_at`].
     ProfileAt {
@@ -308,6 +322,9 @@ pub enum ApiRequest {
     SkillHistory {
         /// The skill (bundle) name whose history to list.
         name: String,
+        /// Resume cursor: the previous page's `next` (the last served revision's stringified `seq`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ProfileApi::skill_at`].
     SkillAt {
@@ -393,7 +410,11 @@ pub enum ApiRequest {
     /// [`AuthApi::auth_providers`].
     AuthProviders,
     /// [`ModelApi::models`].
-    Models,
+    Models {
+        /// Resume cursor: the previous page's `next` (the last served descriptor `id`).
+        #[serde(default)]
+        after: Option<String>,
+    },
     /// [`ModelApi::model_current`].
     ModelCurrent {
         /// The profile to resolve (`None` = the active default).
@@ -417,6 +438,9 @@ pub enum ApiRequest {
         /// credential).
         #[serde(default)]
         transient_key: Option<String>,
+        /// Resume cursor: the previous page's `next` (the last served descriptor `id`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`SessionApi::set_session_model`].
     SetSessionModel {
@@ -447,6 +471,9 @@ pub enum ApiRequest {
         /// Filter to one session, or `None` for the node-wide HITL inbox.
         #[serde(default)]
         session: Option<SessionId>,
+        /// Resume cursor: the previous page's `next` (the last served `request_id`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ControlApi::approval_decide`].
     ApprovalDecide {
@@ -462,6 +489,9 @@ pub enum ApiRequest {
         /// Filter to one session, or `None` for the node-wide checkpoint list.
         #[serde(default)]
         session: Option<SessionId>,
+        /// Resume cursor: the previous page's `next` (the last served checkpoint `id`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ControlApi::checkpoint_rewind`].
     CheckpointRewind {
@@ -480,8 +510,6 @@ pub enum ApiRequest {
         /// The session to detail.
         session: SessionId,
     },
-    /// [`ControlApi::sessions_by_profile`] — the roster grouped by owning profile.
-    SessionsByProfile,
     /// [`ControlApi::session_search`] — full-text session search.
     SessionSearch {
         /// The search query.
@@ -604,7 +632,11 @@ pub enum ApiRequest {
         id: String,
     },
     /// [`ControlApi::routing_list_chats`] — all chat→session routing pins.
-    RoutingListChats,
+    RoutingListChats {
+        /// Resume cursor: the previous page's `next` (the last served route's origin pin key).
+        #[serde(default)]
+        after: Option<String>,
+    },
     /// [`ControlApi::routing_get`] — the pin for an origin.
     RoutingGet {
         /// The origin to look up.
@@ -634,6 +666,9 @@ pub enum ApiRequest {
     TransportRooms {
         /// The transport instance.
         transport: TransportId,
+        /// Resume cursor: the previous page's `next` (the last served `room`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ControlApi::transport_adapters`] — the available adapter families + capabilities + schema.
     TransportAdapters,
@@ -643,6 +678,9 @@ pub enum ApiRequest {
     ConvList {
         /// The owning transport.
         transport: TransportId,
+        /// Resume cursor: the previous page's `next` (the last served conversation `id`).
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ControlApi::conv_get`] — one conversation by id.
     ConvGet {
@@ -774,6 +812,10 @@ pub enum ApiRequest {
         /// Include ignored entries (they are marked either way).
         #[serde(default)]
         show_ignored: bool,
+        /// Resume cursor: the `next` of the previous [`FsListPage`] (the last entry's `path`).
+        /// `None` starts at the first entry.
+        #[serde(default)]
+        after: Option<String>,
     },
     /// [`ControlApi::fs_stat`].
     FsStat {
@@ -920,10 +962,10 @@ pub enum ApiResponse {
     Telemetry(TelemetryDump),
     /// A session list.
     Sessions(Vec<SessionInfo>),
-    /// A list of parked §12 edit-approval requests awaiting an operator decision.
-    Approvals(Vec<ApprovalInfo>),
-    /// A list of recorded §12 tool checkpoints (rewind points), newest first.
-    Checkpoints(Vec<CheckpointInfo>),
+    /// A page of parked §12 edit-approval requests awaiting an operator decision (request_id order).
+    Approvals(WirePage<ApprovalInfo>),
+    /// A page of recorded §12 tool checkpoints (rewind points), checkpoint-id order.
+    Checkpoints(WirePage<CheckpointInfo>),
     /// A fleet report.
     Fleet(FleetReport),
     /// A tree report.
@@ -940,14 +982,15 @@ pub enum ApiResponse {
     EventsPage(EventsPage),
     /// A session's outbound delivery targets (the reply sinks of `delivery_targets`).
     DeliveryTargets(Vec<DeliveryTarget>),
-    /// The live sessions a transport instance owns for delivery (`delivery_sessions`).
-    DeliverySessions(Vec<SessionId>),
+    /// A page of the live sessions a transport instance owns for delivery (`delivery_sessions`),
+    /// session-id order.
+    DeliverySessions(WirePage<SessionId>),
     /// The node's journal verifying key (hex dCBOR), or `None` if it exposes no signer.
     VerifyingKey(Option<String>),
     /// A page of model search results.
     ModelSearch(SearchPage),
-    /// A repo's loadable files.
-    ModelFiles(Vec<ModelFile>),
+    /// A page of a repo's loadable files, path order.
+    ModelFiles(WirePage<ModelFile>),
     /// A started download's job handle.
     ModelDownloadStarted(DownloadId),
     /// Download job statuses.
@@ -974,21 +1017,22 @@ pub enum ApiResponse {
     AuthCompleted(AuthCompleteResponse),
     /// The registered interactive-auth providers (`auth_providers`).
     AuthProviders(Vec<AuthProviderInfo>),
-    /// A discoverable model catalog (cloud + local).
-    Models(Vec<ModelDescriptor>),
+    /// A page of the discoverable model catalog (cloud + local), descriptor-id order.
+    Models(WirePage<ModelDescriptor>),
     /// The model a profile currently resolves to (`None` = none resolvable).
     ModelCurrent(Option<ModelDescriptor>),
     /// The discoverable provider catalog (`provider_catalog`): local engines + genai vendors +
     /// Daemon Cloud.
     ProviderCatalog(Vec<ProviderDescriptor>),
-    /// A provider's discoverable models (`provider_models`).
-    ProviderModels(Vec<ModelDescriptor>),
+    /// A page of a provider's discoverable models (`provider_models`), descriptor-id order.
+    ProviderModels(WirePage<ModelDescriptor>),
     /// A profile distribution (profile_export).
     Distribution(Distribution),
     /// A created profile id (profile_import).
     ProfileId(String),
-    /// A revision history (profile_history / skill_history), oldest first.
-    Revisions(Vec<Revision>),
+    /// A page of a revision history (profile_history / skill_history), oldest first (`seq` order;
+    /// the cursor is the stringified `seq`).
+    Revisions(WirePage<Revision>),
     /// A skill bundle as recorded at a revision (skill_at).
     SkillBundle(SkillBundle),
     /// A profile's curator listing (curator_list): discovered + archived skills with usage.
@@ -999,8 +1043,6 @@ pub enum ApiResponse {
     SessionPage(SessionPage),
     /// One session's full detail, or `None` if unknown (session_get).
     SessionDetail(Option<SessionDetail>),
-    /// The roster grouped by owning profile (sessions_by_profile).
-    SessionsByProfile(Vec<(ProfileRef, Vec<SessionInfo>)>),
     /// Full-text session-search hits (session_search).
     SessionSearch(Vec<SessionSearchHit>),
     /// The ACP agent catalog (acp_discover / acp_catalog).
@@ -1023,14 +1065,14 @@ pub enum ApiResponse {
     CronRuns(Vec<CronRun>),
     /// Pending cron-job suggestions (cron_suggestions).
     CronSuggestions(Vec<CronSuggestion>),
-    /// The chat→session routing pins (routing_list_chats).
-    ChatRoutes(Vec<ChatRoute>),
+    /// A page of the chat→session routing pins (routing_list_chats), origin-pin-key order.
+    ChatRoutes(WirePage<ChatRoute>),
     /// One origin's routing pin, if set (routing_get).
     ChatRoute(Option<ChatRoute>),
-    /// A transport instance's rooms (transport_rooms).
-    Rooms(Vec<RoomInfo>),
-    /// A transport's conversations (conv_list).
-    Conversations(Vec<ConversationInfo>),
+    /// A page of a transport instance's rooms (transport_rooms), room order.
+    Rooms(WirePage<RoomInfo>),
+    /// A page of a transport's conversations (conv_list), conversation-id order.
+    Conversations(WirePage<ConversationInfo>),
     /// One conversation, if present (conv_get / conv_create / conv_join).
     Conversation(Option<ConversationInfo>),
     /// A remote contact's profile text (contact_get_profile).
@@ -1051,8 +1093,8 @@ pub enum ApiResponse {
     Error(ApiError),
     /// The browsable filesystem roots (fs_roots).
     FsRoots(Vec<FsRoot>),
-    /// A directory listing (fs_list).
-    FsList(Vec<FsEntry>),
+    /// A directory listing page (fs_list).
+    FsList(FsListPage),
     /// One entry's metadata (fs_stat).
     FsStat(FsEntry),
     /// A file's bytes + etag (fs_read).
@@ -1110,6 +1152,76 @@ pub const WIRE_FEATURE_API_PREFIX: &str = "api/";
 /// The `api/<N>` feature string this build advertises (see [`WIRE_FEATURE_API_PREFIX`]).
 pub fn wire_feature_api() -> String {
     format!("{WIRE_FEATURE_API_PREFIX}{}", crate::API_WIRE_VERSION.0)
+}
+
+// The wire page bound + clamp live in `daemon-common` (so producers below this crate — e.g.
+// `daemon-core`'s `ConvView` projection — can honor them); re-exported here so every existing
+// `daemon_api::{WIRE_PAGE_MAX, clamp_page_max}` call site keeps working.
+pub use daemon_common::{clamp_page_max, WIRE_PAGE_MAX};
+
+/// One page of a paginated list op, bounded at [`WIRE_PAGE_MAX`] items. The uniform envelope for
+/// every list that can exceed the wire bound: the CDDL side is a per-payload rule of the shape
+/// `x-page = { "items": [0*64 x], ? "next": (tstr / null) }`, and the request carries a matching
+/// optional `after` resume cursor (`? "after": (tstr / null)`).
+///
+/// `next` is the cursor key of the last served item when more remain (`None` => last page); pass
+/// it back as the request's `after` to resume. Produced by [`paginate`] (or by a bespoke slicer
+/// with equivalent semantics, e.g. `WorkspaceFs::list`, whose composite sort order needs a
+/// comparator-aware resume).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WirePage<T> {
+    /// The items in this page (at most [`WIRE_PAGE_MAX`]).
+    pub items: Vec<T>,
+    /// The resume cursor when more items remain (`None` => last page).
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+// Manual impl: `derive(Default)` would demand `T: Default`, which the empty page does not need.
+impl<T> Default for WirePage<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            next: None,
+        }
+    }
+}
+
+/// Slice one page out of a full, **key-ascending-sorted** listing — the shared pagination the
+/// converted list ops run on. `key` must be the cursor key AND the sort key (handlers sort by it
+/// before calling); `limit` is clamped to [`WIRE_PAGE_MAX`] (`0` => `WIRE_PAGE_MAX`).
+///
+/// Resume semantics (the ones proven in `WorkspaceFs::list` / `paginate_roster`): start PAST the
+/// exact-match `after` item (the normal case); a cursor whose item vanished between pages falls
+/// back to the first item whose key sorts strictly greater under the same ascending order, so
+/// nothing already served is re-served. `next` is the last served item's key iff items remain.
+pub fn paginate<T>(
+    mut items: Vec<T>,
+    after: Option<&str>,
+    limit: usize,
+    key: impl Fn(&T) -> String,
+) -> WirePage<T> {
+    let limit = if limit == 0 {
+        WIRE_PAGE_MAX
+    } else {
+        limit.min(WIRE_PAGE_MAX)
+    };
+    let start = match after {
+        None => 0,
+        Some(after) => match items.iter().position(|item| key(item) == after) {
+            Some(idx) => idx + 1,
+            None => items.partition_point(|item| key(item).as_str() <= after),
+        },
+    };
+    let mut page: Vec<T> = items.split_off(start.min(items.len()));
+    let next = if page.len() > limit {
+        page.truncate(limit);
+        page.last().map(&key)
+    } else {
+        None
+    };
+    WirePage { items: page, next }
 }
 
 /// The authenticated principal as surfaced to a client on [`WireS2C::AuthOk`] (and the future
@@ -1378,6 +1490,13 @@ pub struct FsEntry {
     pub ignored: bool,
 }
 
+/// One page of a directory listing (fs_list) — the uniform [`WirePage`] envelope over
+/// [`FsEntry`]. The listing's stable order (dirs first, then case-insensitive name) defines the
+/// cursor: `next` is the last entry's `path`; pass it back as [`ApiRequest::FsList::after`] to
+/// resume. (The slicing stays bespoke in `WorkspaceFs::list`: the composite sort key is NOT the
+/// `path` cursor key, so the generic [`paginate`] key-resume would mis-place a deleted cursor.)
+pub type FsListPage = WirePage<FsEntry>;
+
 /// A cheap opaque content etag for optimistic-concurrency writes. NOT [`Revision`] (which is
 /// profile/skill versioning); this avoids re-reading a file to validate a write base.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -1537,6 +1656,124 @@ pub enum ApiError {
     /// Any other failure.
     #[error("{0}")]
     Other(String),
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    /// A key-sorted item list `["k000", "k001", ...)`.
+    fn items(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("k{i:03}")).collect()
+    }
+
+    fn page(items: Vec<String>, after: Option<&str>, limit: usize) -> WirePage<String> {
+        paginate(items, after, limit, |s| s.clone())
+    }
+
+    #[test]
+    fn empty_listing_yields_empty_last_page() {
+        let p = page(Vec::new(), None, 10);
+        assert!(p.items.is_empty());
+        assert_eq!(p.next, None);
+    }
+
+    #[test]
+    fn exactly_limit_is_one_final_page() {
+        let p = page(items(10), None, 10);
+        assert_eq!(p.items.len(), 10);
+        assert_eq!(p.next, None, "a full-but-final page carries no cursor");
+    }
+
+    #[test]
+    fn limit_plus_one_truncates_and_sets_cursor() {
+        let p = page(items(11), None, 10);
+        assert_eq!(p.items.len(), 10);
+        assert_eq!(p.next.as_deref(), Some("k009"));
+    }
+
+    #[test]
+    fn consecutive_pages_never_overlap_and_cover_everything() {
+        let all = items(25);
+        let mut served = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let p = page(all.clone(), after.as_deref(), 10);
+            served.extend(p.items);
+            match p.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(served, all, "pages chain without dedup or gaps");
+    }
+
+    #[test]
+    fn deleted_cursor_resumes_at_first_strictly_greater_key() {
+        // The cursor "k004x" no longer exists; resume must serve k005.. (never re-serve <= cursor).
+        let p = page(items(10), Some("k004x"), 4);
+        assert_eq!(p.items, vec!["k005", "k006", "k007", "k008"]);
+        assert_eq!(p.next.as_deref(), Some("k008"));
+    }
+
+    #[test]
+    fn cursor_past_the_end_yields_empty_last_page() {
+        let p = page(items(3), Some("zzz"), 10);
+        assert!(p.items.is_empty());
+        assert_eq!(p.next, None);
+    }
+
+    /// The client page loops re-issue while `next` is non-empty, so a `next` that echoes the
+    /// request's own `after` would spin a well-behaved client forever (the same page served over
+    /// and over). With unique keys — every converted handler's cursor is a unique id/path — the
+    /// resume always advances past the cursor, whether it still exists or has vanished.
+    #[test]
+    fn next_never_echoes_the_requests_after() {
+        let all = items(2 * WIRE_PAGE_MAX + 7);
+        for limit in [1, 2, WIRE_PAGE_MAX] {
+            // Every live key as the cursor, plus vanished cursors (before/between/past the keys).
+            let cursors =
+                all.iter()
+                    .cloned()
+                    .chain(["".into(), "k".into(), "k010x".into(), "zzz".into()]);
+            for after in cursors {
+                let p = page(all.clone(), Some(&after), limit);
+                assert_ne!(
+                    p.next.as_deref(),
+                    Some(after.as_str()),
+                    "next must advance past after={after:?} (limit {limit})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn limit_is_clamped_to_wire_page_max() {
+        let p = page(items(WIRE_PAGE_MAX + 10), None, WIRE_PAGE_MAX + 10);
+        assert_eq!(p.items.len(), WIRE_PAGE_MAX);
+        assert!(p.next.is_some());
+    }
+
+    #[test]
+    fn zero_limit_means_wire_page_max() {
+        let p = page(items(WIRE_PAGE_MAX + 1), None, 0);
+        assert_eq!(p.items.len(), WIRE_PAGE_MAX);
+        assert_eq!(p.next.as_deref(), Some("k063"));
+    }
+
+    #[test]
+    fn wire_page_round_trips_and_defaults() {
+        let p = WirePage {
+            items: vec!["a".to_string()],
+            next: Some("a".into()),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&p, &mut bytes).unwrap();
+        let back: WirePage<String> = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(WirePage::<String>::default().items, Vec::<String>::new());
+        assert_eq!(WirePage::<String>::default().next, None);
+    }
 }
 
 #[cfg(test)]

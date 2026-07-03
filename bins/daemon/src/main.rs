@@ -1461,6 +1461,9 @@ fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
         flash_attn: local.flash_attn,
         isq: local.isq.clone(),
         embeddings: false,
+        // The paired vision projector is per-model: the switchable provider fills it from the
+        // resolved catalog record at load, never from static config.
+        mmproj: None,
     };
     wc.max_tokens = local.max_tokens;
     wc.load_timeout = local.load_timeout;
@@ -1581,6 +1584,7 @@ async fn build_embedder(
                 flash_attn: cfg.infer.flash_attn,
                 isq: None,
                 embeddings: true,
+                mmproj: None,
             };
             // Load from the warmed cache offline (the daemon owns acquisition).
             wc.env.extend(manager.cache().sidecar_env());
@@ -1970,6 +1974,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     } else {
         vec![]
     };
+
+    // Materialize the workspace root eagerly (the way FileBlobStore::open creates its own dir):
+    // nothing else creates it, so after a state wipe every `fs_list` on the advertised `workspace`
+    // root would fail with read_dir ENOENT. Per-session sandboxes stay lazy.
+    let ws_root = cfg.workspace_root();
+    std::fs::create_dir_all(&ws_root)
+        .map_err(|e| anyhow::anyhow!("creating workspace root {}: {e}", ws_root.display()))?;
 
     let AssembledNode {
         node,

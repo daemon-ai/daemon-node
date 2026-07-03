@@ -75,12 +75,19 @@ impl SessionApi for MockApi {
             .map(daemon_api::LogStreamItem::Entry)
             .boxed())
     }
-    async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
-        if transport == self.transport {
+    async fn delivery_sessions(
+        &self,
+        transport: TransportId,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<SessionId> {
+        let sessions = if transport == self.transport {
             self.sessions.clone()
         } else {
             Vec::new()
-        }
+        };
+        daemon_api::paginate(sessions, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |s| {
+            s.as_str().to_string()
+        })
     }
     async fn delivery_targets(&self, _: SessionId) -> Vec<DeliveryTarget> {
         let n = self.targets_calls.fetch_add(1, Ordering::SeqCst);

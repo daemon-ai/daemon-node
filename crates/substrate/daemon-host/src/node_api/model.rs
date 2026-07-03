@@ -15,11 +15,20 @@ impl ModelApi for NodeApiImpl {
         repo: String,
         revision: Option<String>,
         engine: ModelEngine,
-    ) -> Result<Vec<ModelFile>, ApiError> {
+        after: Option<String>,
+    ) -> Result<daemon_api::WirePage<ModelFile>, ApiError> {
         let m = self.require_models()?;
-        m.model_files(&repo, revision.as_deref(), engine)
+        // The manager returns the full listing already sorted by `path` (the cursor key).
+        let files = m
+            .model_files(&repo, revision.as_deref(), engine)
             .await
-            .map_err(map_model_err)
+            .map_err(map_model_err)?;
+        Ok(daemon_api::paginate(
+            files,
+            after.as_deref(),
+            daemon_api::WIRE_PAGE_MAX,
+            |f| f.path.clone(),
+        ))
     }
 
     async fn model_download(&self, model: ModelRef) -> Result<DownloadId, ApiError> {
@@ -111,32 +120,14 @@ impl ModelApi for NodeApiImpl {
         m.inspect(&id).await.map_err(map_model_err)
     }
 
-    async fn models(&self) -> Vec<ModelDescriptor> {
-        // Networked models: a live `genai` listing (per adapter with a resolvable key, namespaced,
-        // pricing/context overlaid) when the discovery hook is wired, else the static catalog
-        // (incl. claude-opus-4-8). Then merge any locally-installed (GGUF) models.
-        let mut out = match &self.cloud_catalog {
-            Some(catalog) => catalog.list().await,
-            None => ModelDescriptor::builtin_cloud_catalog(),
-        };
-        if let Some(m) = &self.models {
-            for im in m.catalog().await {
-                let provider = match im.model.engine {
-                    ModelEngine::MistralRs => ProviderSelector::MistralRs,
-                    ModelEngine::Llama => ProviderSelector::LlamaCpp,
-                };
-                out.push(ModelDescriptor {
-                    id: im.id.as_str().to_string(),
-                    provider,
-                    display_name: None,
-                    context_length: im.context_length,
-                    input_price_micros_per_mtok: None,
-                    output_price_micros_per_mtok: None,
-                    local: true,
-                });
-            }
-        }
-        out
+    async fn models(&self, after: Option<String>) -> daemon_api::WirePage<ModelDescriptor> {
+        // Cursor order: descriptor id ascending (the merged cloud+local catalog has no stable
+        // order of its own). Internal full-catalog consumers use `models_all` instead.
+        let mut catalog = self.models_all().await;
+        catalog.sort_by(|a, b| a.id.cmp(&b.id));
+        daemon_api::paginate(catalog, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |m| {
+            m.id.clone()
+        })
     }
 
     async fn model_current(
@@ -150,7 +141,13 @@ impl ModelApi for NodeApiImpl {
         };
         let Some(spec) = spec else { return Ok(None) };
         // Prefer a catalog entry (carries context/pricing); else synthesize from the profile spec.
-        if let Some(found) = self.models().await.into_iter().find(|m| m.id == spec.model) {
+        // The FULL catalog (not one wire page): the lookup is by id across everything discoverable.
+        if let Some(found) = self
+            .models_all()
+            .await
+            .into_iter()
+            .find(|m| m.id == spec.model)
+        {
             return Ok(Some(found));
         }
         Ok(Some(ModelDescriptor {
@@ -183,23 +180,31 @@ impl ModelApi for NodeApiImpl {
         provider: String,
         credential_ref: Option<String>,
         transient_key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
+        after: Option<String>,
+    ) -> daemon_api::WirePage<ModelDescriptor> {
         // Local engines: the node is the single source of truth — return the installed models from
         // the ModelManager catalog (the client appends its own "Discover More" affordance).
-        if provider == "llama_cpp" || provider == "mistral_rs" {
-            return self.installed_models_for(&provider).await;
-        }
-        // Resolve the LIST credential: a first-run transient key wins, else the stored credential the
-        // `credential_ref` points at. A turn always uses the stored profile credential regardless.
-        let key = transient_key.or_else(|| {
-            credential_ref
-                .as_deref()
-                .and_then(|r| self.credentials.as_ref().and_then(|c| c.get(r)))
-        });
-        match &self.cloud_catalog {
-            Some(catalog) => catalog.provider_models(&provider, key).await,
-            None => Vec::new(),
-        }
+        let mut models = if provider == "llama_cpp" || provider == "mistral_rs" {
+            self.installed_models_for(&provider).await
+        } else {
+            // Resolve the LIST credential: a first-run transient key wins, else the stored
+            // credential the `credential_ref` points at. A turn always uses the stored profile
+            // credential regardless.
+            let key = transient_key.or_else(|| {
+                credential_ref
+                    .as_deref()
+                    .and_then(|r| self.credentials.as_ref().and_then(|c| c.get(r)))
+            });
+            match &self.cloud_catalog {
+                Some(catalog) => catalog.provider_models(&provider, key).await,
+                None => Vec::new(),
+            }
+        };
+        // Cursor order: descriptor id ascending (vendor listings arrive in vendor order).
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        daemon_api::paginate(models, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |m| {
+            m.id.clone()
+        })
     }
 }
 
@@ -209,6 +214,40 @@ impl NodeApiImpl {
         self.models
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("model management is not enabled".into()))
+    }
+
+    /// The FULL discoverable catalog (cloud + local), unpaged — the internal backing of the wire
+    /// `models` page and of by-id lookups (`model_current`) that must search everything.
+    /// Networked models: a live `genai` listing (per adapter with a resolvable key, namespaced,
+    /// pricing/context overlaid) when the discovery hook is wired, else the static catalog
+    /// (incl. claude-opus-4-8). Then merge any locally-installed (GGUF) models.
+    pub(crate) async fn models_all(&self) -> Vec<ModelDescriptor> {
+        let mut out = match &self.cloud_catalog {
+            Some(catalog) => catalog.list().await,
+            None => ModelDescriptor::builtin_cloud_catalog(),
+        };
+        if let Some(m) = &self.models {
+            for im in m.catalog().await {
+                // Vision-projector (mmproj) companions are inventory, never chat models.
+                if daemon_models::mmproj::is_projector_record(&im) {
+                    continue;
+                }
+                let provider = match im.model.engine {
+                    ModelEngine::MistralRs => ProviderSelector::MistralRs,
+                    ModelEngine::Llama => ProviderSelector::LlamaCpp,
+                };
+                out.push(ModelDescriptor {
+                    id: im.id.as_str().to_string(),
+                    provider,
+                    display_name: None,
+                    context_length: im.context_length,
+                    input_price_micros_per_mtok: None,
+                    output_price_micros_per_mtok: None,
+                    local: true,
+                });
+            }
+        }
+        out
     }
 
     /// The catalog-less fallback provider list: local engines + Daemon Cloud (the genai cloud vendors
@@ -248,7 +287,8 @@ impl NodeApiImpl {
     }
 
     /// The installed local models for one engine id (`"llama_cpp"` / `"mistral_rs"`), read from the
-    /// ModelManager catalog. Empty when model management is not enabled.
+    /// ModelManager catalog. Empty when model management is not enabled. Vision-projector (mmproj)
+    /// records are excluded — offering one as a chat model is exactly the `arch == 'clip'` fatal.
     async fn installed_models_for(&self, engine_id: &str) -> Vec<ModelDescriptor> {
         let Some(m) = &self.models else {
             return Vec::new();
@@ -261,6 +301,7 @@ impl NodeApiImpl {
         m.catalog()
             .await
             .into_iter()
+            .filter(|im| !daemon_models::mmproj::is_projector_record(im))
             .filter_map(|im| {
                 let provider = match im.model.engine {
                     ModelEngine::MistralRs => ProviderSelector::MistralRs,

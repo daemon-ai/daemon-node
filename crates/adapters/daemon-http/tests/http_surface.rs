@@ -64,13 +64,18 @@ impl SessionApi for MockApi {
             .map(daemon_api::LogStreamItem::Entry)
             .boxed())
     }
-    async fn delivery_sessions(&self, transport: TransportId) -> Vec<SessionId> {
+    async fn delivery_sessions(
+        &self,
+        transport: TransportId,
+        _after: Option<String>,
+    ) -> daemon_api::WirePage<SessionId> {
         // The `http/t1` tenant owns exactly one session (the discovery the delivery endpoint runs).
-        if transport == TransportId::new("http/t1") {
+        let items = if transport == TransportId::new("http/t1") {
             vec![SessionId::new("s-http-t1")]
         } else {
             Vec::new()
-        }
+        };
+        daemon_api::WirePage { items, next: None }
     }
     async fn delivery_targets(&self, _: SessionId) -> Vec<DeliveryTarget> {
         // The owned session's reply sink is the `http/t1` Primary, so the pull helper keeps delivering.

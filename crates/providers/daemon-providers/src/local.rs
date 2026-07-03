@@ -677,6 +677,12 @@ impl SwitchInner {
                     .map_err(|e| Failure::Fatal(format!("resolve model: {e}")))?;
                 let mut wc = self.template.clone();
                 wc.model = artifact.local_path.to_string_lossy().into_owned();
+                // The paired vision projector (when cataloged) rides along; a worker without
+                // multimodal support ignores it with a log line.
+                wc.params.mmproj = artifact
+                    .mmproj_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned());
                 // The engine loads from the warmed cache offline (the daemon owns acquisition).
                 wc.env.extend(self.manager.cache().sidecar_env());
                 // mistral.rs quantizes in-engine (ISQ); when no level was configured, pick one that

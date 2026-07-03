@@ -73,12 +73,17 @@ struct LlamaCandidate {
 
 /// Aggregate a repo's GGUF files into per-quant candidates: split shards of the same quant are
 /// summed and represented by their first shard (the file a client names to pull the whole set).
+/// Vision-projector (mmproj) companions are skipped — they are small (so they always "fit") but
+/// are never chat models; recommending one is exactly the `arch == 'clip'` fatal.
 fn aggregate_llama(files: &[ModelFile]) -> Vec<LlamaCandidate> {
     use std::collections::BTreeMap;
     // quant -> (named file, total size). The named file prefers a first shard / single file.
     let mut by_quant: BTreeMap<String, (Option<String>, u64)> = BTreeMap::new();
     for f in files {
         if !gguf::is_gguf(&f.path) {
+            continue;
+        }
+        if f.is_mmproj || crate::mmproj::is_mmproj_path(&f.path) {
             continue;
         }
         let Some(quant) = f.quant.clone().or_else(|| gguf::quant_label(&f.path)) else {
@@ -262,6 +267,7 @@ pub fn highest_precision_gguf(files: &[ModelFile]) -> Option<&ModelFile> {
     files
         .iter()
         .filter(|f| gguf::is_gguf(&f.path))
+        .filter(|f| !f.is_mmproj && !crate::mmproj::is_mmproj_path(&f.path))
         .filter(|f| !f.is_split || f.is_first_shard)
         .filter(|f| f.quant.is_some() || gguf::quant_label(&f.path).is_some())
         .min_by(|a, b| {
@@ -314,6 +320,7 @@ mod tests {
             quant: gguf::quant_label(path),
             is_first_shard: gguf::is_first_shard(path),
             is_split: gguf::shard_spec(path).is_some(),
+            is_mmproj: crate::mmproj::is_mmproj_path(path),
             path: path.to_string(),
             size_bytes,
         }
@@ -392,6 +399,36 @@ mod tests {
         let rec = recommend_llama("org/m", &[], 8 * 1024 * 1024 * 1024);
         assert!(!rec.fits);
         assert!(rec.file.is_none());
+    }
+
+    /// The recommender never returns a vision-projector (mmproj) file — the small companion would
+    /// otherwise always "fit best" and become the exact `arch == 'clip'` load fatal.
+    #[test]
+    fn llama_never_recommends_mmproj() {
+        let gib = 1024 * 1024 * 1024;
+        let files = vec![
+            gguf_file("mmproj-SmolVLM-256M-Instruct-Q8_0.gguf", gib / 10),
+            gguf_file("SmolVLM-256M-Instruct-Q8_0.gguf", gib / 2),
+        ];
+        let rec = recommend_llama("org/m", &files, 8 * gib);
+        assert_eq!(rec.file.as_deref(), Some("SmolVLM-256M-Instruct-Q8_0.gguf"));
+        assert!(
+            rec.candidates
+                .iter()
+                .all(|c| c.file.as_deref() != Some("mmproj-SmolVLM-256M-Instruct-Q8_0.gguf")),
+            "no candidate may name the projector"
+        );
+        // A projector-only listing yields no recommendation at all.
+        let only_proj = vec![gguf_file(
+            "mmproj-SmolVLM-256M-Instruct-Q8_0.gguf",
+            gib / 10,
+        )];
+        let rec = recommend_llama("org/m", &only_proj, 8 * gib);
+        assert!(rec.file.is_none());
+
+        // The quantize source picker skips projectors too.
+        let src = highest_precision_gguf(&files).expect("text file");
+        assert_eq!(src.path, "SmolVLM-256M-Instruct-Q8_0.gguf");
     }
 
     #[test]

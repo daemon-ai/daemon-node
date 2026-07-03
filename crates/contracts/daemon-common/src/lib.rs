@@ -505,7 +505,37 @@ impl WireVersion {
     /// never travel in profiles (they stay node-side, operator-managed via `acp_register`), so a
     /// `ProfileCreate` can never smuggle an arbitrary binary spawn. Pre-engine encodings omit the
     /// field and decode as `Core`.
-    pub const CURRENT: Self = Self(23);
+    ///
+    /// v24–v25 (pagination overhaul, one unreleased dev cycle — neither shipped): every unbounded
+    /// list op is paginated or bounded at [`WIRE_PAGE_MAX`] (= 64, the zcbor client codec's fixed
+    /// array-buffer size). v24 introduced the paged fs_list (a page struct + an optional `after`
+    /// resume cursor on the request) and clamped the journal / log / events / roster page reads
+    /// whose `max == 0` previously meant "everything". v25 generalizes the mechanism: the generic
+    /// `WirePage { items, next? }` envelope (fs_list's page renamed `entries` -> `items`) plus a
+    /// uniform optional `after` cursor across ConvList / Tree / Models / ProviderModels /
+    /// ModelFiles / CheckpointList / ApprovalsPending / ProfileHistory / SkillHistory /
+    /// RoutingListChats / DeliverySessions / TransportRooms (their list responses become
+    /// `WirePage`s; `TreeReport` gains an inline `next`), truncates `ConvView::turns` to the last
+    /// `WIRE_PAGE_MAX` turns, and removes the redundant `SessionsByProfile` op (clients compose
+    /// the grouping from paged scoped `SessionsQuery` reads). Breaking (list response shapes).
+    ///
+    /// v26 (live model-acquisition feedback): `NodeEvent::DownloadProgress` gains
+    /// `downloaded_bytes`/`total_bytes` (the client renders real byte counters instead of
+    /// deriving them from `pct`) and is now emitted from the byte-level transfer sink (throttled
+    /// to >= 1 percent-point advance or >= 500 ms) rather than only on state transitions; adds
+    /// the payload-free `NodeEvent::CatalogChanged`, emitted when the installed-model registry
+    /// changes (a finished download is cataloged / a model is deleted), so clients refetch
+    /// `ModelCatalog` instead of polling. Breaking (the `DownloadProgress` event shape).
+    ///
+    /// v27 (vision-projector companions): `model-file` gains the required `is_mmproj` flag (the
+    /// client badges projector rows and never targets them with "Download recommended") and
+    /// `installed-model` gains the optional `mmproj_path` (the paired CLIP projector fetched with
+    /// the download or matched from the local catalog; `null`/absent for text-only models).
+    /// Projector artifacts are classified node-side (mmproj/projector filename hint or
+    /// `arch == "clip"`): excluded from quant recommendations and local chat-model offers, and
+    /// rejected by `ModelActivate`/resolve with an actionable error instead of the llama worker's
+    /// `unsupported model architecture: 'clip'` fatal. Breaking (the `model-file` shape).
+    pub const CURRENT: Self = Self(27);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -521,6 +551,24 @@ impl WireVersion {
 impl Default for WireVersion {
     fn default() -> Self {
         Self::CURRENT
+    }
+}
+
+/// Per-response array cap: the zcbor client codec decodes arrays into fixed 64-element buffers
+/// (`zcbor-codegen.sh --default-max-qty`). No handler may emit a longer list; ops that can exceed
+/// it paginate (page structs with a resume cursor — `daemon-api`'s `WirePage`). Hoisted here (the
+/// lowest contract layer) so producers below `daemon-api` — e.g. `daemon-core`'s `ConvView`
+/// projection — can honor the bound; `daemon-api` re-exports it.
+pub const WIRE_PAGE_MAX: usize = 64;
+
+/// Clamp a client-supplied page size to the wire bound: `0` (the "server default" / historical
+/// "all" sentinel) becomes [`WIRE_PAGE_MAX`], and anything larger is capped to it — a longer page
+/// would be un-decodable by the fixed-buffer client codec.
+pub fn clamp_page_max(max: u32) -> u32 {
+    if max == 0 {
+        WIRE_PAGE_MAX as u32
+    } else {
+        max.min(WIRE_PAGE_MAX as u32)
     }
 }
 
@@ -1123,6 +1171,10 @@ pub struct ModelFile {
     pub is_split: bool,
     /// Whether this is the *first* shard of a split set (the file to name when downloading the set).
     pub is_first_shard: bool,
+    /// Whether this file is a vision-projector (mmproj) companion — downloadable, but never a
+    /// chat model (wire v27; the client badges these and excludes them from recommendation).
+    #[serde(default)]
+    pub is_mmproj: bool,
 }
 
 /// A handle to one in-flight or completed download job.
@@ -1203,6 +1255,11 @@ pub struct InstalledModel {
     /// The authoritative GGUF file-type label (from metadata), more reliable than the filename guess.
     #[serde(default)]
     pub file_type: Option<String>,
+    /// The on-disk path of this model's paired vision-projector (mmproj) companion, when one was
+    /// fetched with the download or matched from the local catalog (wire v27). `None` for
+    /// text-only models and for projector records themselves.
+    #[serde(default)]
+    pub mmproj_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

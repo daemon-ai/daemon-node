@@ -25,7 +25,7 @@ pub(super) async fn run(client: &ApiClient, command: Command) -> anyhow::Result<
         Command::Stats => render(client.call(ApiRequest::Stats).await?),
         Command::Telemetry => render(client.call(ApiRequest::Telemetry).await?),
         Command::Fleet => render(client.call(ApiRequest::Fleet).await?),
-        Command::Tree => render(client.call(ApiRequest::Tree).await?),
+        Command::Tree => render(client.call(ApiRequest::Tree { after: None }).await?),
         Command::Unit { id } => render(
             client
                 .call(ApiRequest::Unit {

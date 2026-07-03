@@ -89,8 +89,12 @@ impl SessionApi for Recorder {
             Ok(futures::stream::empty().boxed())
         }
     }
-    async fn delivery_sessions(&self, _: TransportId) -> Vec<SessionId> {
-        Vec::new()
+    async fn delivery_sessions(
+        &self,
+        _: TransportId,
+        _: Option<String>,
+    ) -> daemon_api::WirePage<SessionId> {
+        daemon_api::WirePage::default()
     }
     async fn delivery_targets(&self, _: SessionId) -> Vec<DeliveryTarget> {
         vec![DeliveryTarget::new(

@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use daemon_api::{
-    ApiError, FsChange, FsChangeKind, FsContent, FsEntry, FsEntryKind, FsRevision, FsRootId,
-    FsSearchHit, FsSearchPage, FsSearchQuery, FsWatchPageView,
+    clamp_page_max, ApiError, FsChange, FsChangeKind, FsContent, FsEntry, FsEntryKind, FsListPage,
+    FsRevision, FsRootId, FsSearchHit, FsSearchPage, FsSearchQuery, FsWatchPageView, WIRE_PAGE_MAX,
 };
 use daemon_core::exec::contain;
 
@@ -246,14 +246,18 @@ impl WorkspaceFs {
         contain(base, Path::new(rel)).map_err(|e| ApiError::Other(format!("path not allowed: {e}")))
     }
 
-    /// List one directory's children (root-relative `dir`, "" = the root). Entries matching the
-    /// ignore set are marked `ignored`; when `show_ignored` is false they are dropped.
+    /// List one directory's children (root-relative `dir`, "" = the root), paged at
+    /// [`WIRE_PAGE_MAX`] entries per call. Entries matching the ignore set are marked `ignored`;
+    /// when `show_ignored` is false they are dropped BEFORE pagination (the cursor walks the
+    /// filtered + sorted listing). `after` is the previous page's `next` cursor (the last served
+    /// entry's `path`); the returned `next` is `Some` iff more entries remain.
     pub async fn list(
         &self,
         root: &FsRootId,
         dir: &str,
         show_ignored: bool,
-    ) -> Result<Vec<FsEntry>, ApiError> {
+        after: Option<&str>,
+    ) -> Result<FsListPage, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, dir)?;
         let mut rd = tokio::fs::read_dir(&abs)
@@ -283,14 +287,39 @@ impl WorkspaceFs {
                 ignored,
             });
         }
-        // Directories first, then case-insensitive name (a stable, IDE-like ordering).
+        // Directories first, then case-insensitive name (a stable, IDE-like ordering). This order
+        // DEFINES the cursor: `next`/`after` is the last served entry's `path`.
         entries.sort_by(|a, b| {
             let ad = matches!(a.kind, FsEntryKind::Dir);
             let bd = matches!(b.kind, FsEntryKind::Dir);
             bd.cmp(&ad)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        Ok(entries)
+        // Resume PAST the cursor entry: exact path match first (the normal case). A cursor whose
+        // entry vanished between pages falls back to the first entry sorting after it under the
+        // same order, treating the lost entry as a file (files sort last, so this never re-serves
+        // entries; a deleted *dir* cursor can skip until the next re-list, and the deletion itself
+        // fires the watch that triggers one).
+        let start = match after {
+            None => 0,
+            Some(after) => match entries.iter().position(|e| e.path == after) {
+                Some(idx) => idx + 1,
+                None => {
+                    let cursor_name = after.rsplit('/').next().unwrap_or(after).to_lowercase();
+                    entries.partition_point(|e| {
+                        matches!(e.kind, FsEntryKind::Dir) || e.name.to_lowercase() <= cursor_name
+                    })
+                }
+            },
+        };
+        let mut page: Vec<FsEntry> = entries.split_off(start.min(entries.len()));
+        let next = if page.len() > WIRE_PAGE_MAX {
+            page.truncate(WIRE_PAGE_MAX);
+            page.last().map(|e| e.path.clone())
+        } else {
+            None
+        };
+        Ok(FsListPage { items: page, next })
     }
 
     /// One entry's metadata.
@@ -444,11 +473,10 @@ impl WorkspaceFs {
         } else {
             None
         };
-        let limit = if query.max_results == 0 {
-            200
-        } else {
-            query.max_results as usize
-        };
+        // Default AND clamp the page size to the wire bound: a >64-hit page is un-decodable by the
+        // fixed-buffer client codec, so `0` ("server default", previously 200) and any larger
+        // request both resolve to WIRE_PAGE_MAX per page; `page` serves the rest.
+        let limit = clamp_page_max(query.max_results) as usize;
         let skip = (query.page as usize).saturating_mul(limit);
         let case_sensitive = query.case_sensitive;
         // Synchronous walk in a blocking task (small workspaces; bounded by SEARCH_FILE_BUDGET).
@@ -679,8 +707,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ApiError::Conflict(_)));
 
-        let entries = fs.list(&root, "a", false).await.unwrap();
-        assert!(entries.iter().any(|e| e.name == "b.txt"));
+        let page = fs.list(&root, "a", false, None).await.unwrap();
+        assert!(page.items.iter().any(|e| e.name == "b.txt"));
+        assert!(page.next.is_none(), "a small dir fits one page");
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -741,6 +770,74 @@ mod tests {
             .events
             .iter()
             .any(|c| c.path == "new.txt" && matches!(c.kind, FsChangeKind::Created)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Wire pagination (v24): a 150-entry directory lists to completion across 3 pages (64/64/22)
+    // in the stable dirs-first order with no duplicates or misses, and only the last page carries
+    // next = None. Mixed kinds prove the cursor respects the dirs-before-files ordering.
+    #[tokio::test]
+    async fn list_pages_large_dir_to_completion() {
+        let base = temp_base("paginate");
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let root = FsRootId::Workspace;
+        for n in 0..10 {
+            std::fs::create_dir(base.join(format!("d{n:02}"))).unwrap();
+        }
+        for n in 0..140 {
+            std::fs::write(base.join(format!("f{n:03}.txt")), b"x").unwrap();
+        }
+
+        let mut sizes = Vec::new();
+        let mut all: Vec<String> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = fs.list(&root, "", false, after.as_deref()).await.unwrap();
+            assert!(page.items.len() <= WIRE_PAGE_MAX, "page exceeds the bound");
+            sizes.push(page.items.len());
+            all.extend(page.items.iter().map(|e| e.path.clone()));
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+            assert!(sizes.len() <= 10, "runaway pagination");
+        }
+
+        assert_eq!(sizes, vec![64, 64, 22]);
+        let expected: Vec<String> = (0..10)
+            .map(|n| format!("d{n:02}"))
+            .chain((0..140).map(|n| format!("f{n:03}.txt")))
+            .collect();
+        assert_eq!(all, expected, "stable order, no duplicates, no misses");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A cursor whose entry was deleted between pages still resumes at the right position (the
+    // first entry sorting after it), with no duplicates.
+    #[tokio::test]
+    async fn list_cursor_survives_deleted_entry() {
+        let base = temp_base("cursor-del");
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let root = FsRootId::Workspace;
+        for n in 0..100 {
+            std::fs::write(base.join(format!("f{n:03}.txt")), b"x").unwrap();
+        }
+
+        let first = fs.list(&root, "", false, None).await.unwrap();
+        assert_eq!(first.items.len(), WIRE_PAGE_MAX);
+        let cursor = first.next.clone().expect("more pages remain");
+        assert_eq!(cursor, "f063.txt", "the cursor is the last served path");
+
+        // The cursor entry vanishes between pages; the resume continues at the next entry.
+        std::fs::remove_file(base.join("f063.txt")).unwrap();
+        let second = fs.list(&root, "", false, Some(&cursor)).await.unwrap();
+        assert_eq!(
+            second.items.first().map(|e| e.name.as_str()),
+            Some("f064.txt"),
+            "resume lands on the entry after the deleted cursor"
+        );
+        assert_eq!(second.items.len(), 36, "the remaining tail in one page");
+        assert!(second.next.is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 

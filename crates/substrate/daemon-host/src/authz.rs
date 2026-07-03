@@ -74,11 +74,9 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // Durable control-plane lifecycle is operator-level (Assign wakes a durable session).
         Assign { .. } => C::ControlWrite,
         // The roster reads are "one's own sessions"; SeeAll (Track C) widens them cross-owner.
-        Sessions
-        | SessionsQuery { .. }
-        | SessionGet { .. }
-        | SessionsByProfile
-        | SessionSearch { .. } => C::SessionRead,
+        Sessions | SessionsQuery { .. } | SessionGet { .. } | SessionSearch { .. } => {
+            C::SessionRead
+        }
         // A user may drive their OWN session's lifecycle (cancel/rewind/checkpoint-rewind/approve +
         // roster metadata); Track C scopes it to ownership, operators cross via SessionControlAny.
         Cancel { .. }
@@ -89,7 +87,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
 
         // -- serve_fleet: orchestration tree ----------------------------------------------------
         Fleet
-        | Tree
+        | Tree { .. }
         | Unit { .. }
         | UnitEvents { .. }
         | UnitOutbound { .. }
@@ -104,7 +102,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ModelRecommend(_)
         | ModelQuantizes
         | ModelInspect { .. }
-        | Models
+        | Models { .. }
         | ModelCurrent { .. }
         | ProviderCatalog
         | ProviderModels { .. } => C::ModelsRead,
@@ -162,7 +160,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | CronDismissSuggestion { .. } => C::CronWrite,
 
         // -- serve_routing: chat routing + transport registry -----------------------------------
-        RoutingListChats
+        RoutingListChats { .. }
         | RoutingGet { .. }
         | TransportRooms { .. }
         | TransportAdapters
@@ -282,13 +280,14 @@ mod tests {
             (ApiRequest::Health, Capability::ControlRead),
             (ApiRequest::Sessions, Capability::SessionRead),
             (ApiRequest::Fleet, Capability::FleetRead),
-            (ApiRequest::Models, Capability::ModelsRead),
+            (ApiRequest::Models { after: None }, Capability::ModelsRead),
             (ApiRequest::ProviderCatalog, Capability::ModelsRead),
             (
                 ApiRequest::ProviderModels {
                     provider: "daemon_cloud".into(),
                     credential_ref: None,
                     transient_key: None,
+                    after: None,
                 },
                 Capability::ModelsRead,
             ),
@@ -299,10 +298,14 @@ mod tests {
             ),
             (ApiRequest::CredentialList, Capability::CredentialRead),
             (ApiRequest::CronList, Capability::CronRead),
-            (ApiRequest::RoutingListChats, Capability::RoutingRead),
+            (
+                ApiRequest::RoutingListChats { after: None },
+                Capability::RoutingRead,
+            ),
             (
                 ApiRequest::ConvList {
                     transport: TransportId::new("t"),
+                    after: None,
                 },
                 Capability::MessagingRead,
             ),

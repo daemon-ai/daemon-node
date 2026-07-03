@@ -12,8 +12,8 @@ use daemon_common::{ModelEngine, ModelFile};
 use serde::Deserialize;
 
 use crate::error::{ModelError, Result};
-use crate::gguf;
 use crate::hf::client::HfClient;
+use crate::{gguf, mmproj};
 
 /// One node of the repo tree.
 #[derive(Debug, Deserialize)]
@@ -145,10 +145,14 @@ fn to_model_file(item: RawTreeItem, _engine: ModelEngine) -> ModelFile {
         item.lfs.map(|l| l.size).unwrap_or(0)
     };
     let is_split = gguf::shard_spec(&item.path).is_some();
+    // Projector companions stay LISTED (visible + downloadable) but are tagged so clients badge
+    // them and the recommender / chat offers skip them.
+    let is_mmproj = gguf::is_gguf(&item.path) && mmproj::is_mmproj_path(&item.path);
     ModelFile {
         quant: gguf::quant_label(&item.path),
         is_first_shard: gguf::is_first_shard(&item.path),
         is_split,
+        is_mmproj,
         path: item.path,
         size_bytes: size,
     }

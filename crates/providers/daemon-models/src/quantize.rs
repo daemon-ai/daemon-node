@@ -198,6 +198,7 @@ async fn run_job(
         arch: None,
         context_length: None,
         file_type: None,
+        mmproj_path: None,
         model,
     };
     inspect::enrich_installed(&mut record);

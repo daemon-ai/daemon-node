@@ -10,8 +10,7 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_list(&self) -> Vec<ProfileInfo> {
-        let store_ok = self.profile_store().is_ok();
-        let out = match self.profile_store() {
+        match self.profile_store() {
             Err(_) => Vec::new(),
             Ok(store) => {
                 let active = store.active().ok().flatten();
@@ -29,25 +28,7 @@ impl ProfileApi for NodeApiImpl {
                     Err(_) => Vec::new(),
                 }
             }
-        };
-        // #region agent log
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/j/experiments/daemon/.cursor/debug-96b7ad.log")
-            {
-                let _ = writeln!(
-                    f,
-                    "{{\"sessionId\":\"96b7ad\",\"hypothesisId\":\"PROFILE-LIST\",\"location\":\"node:profile_list\",\"message\":\"profile_list result\",\"data\":{{\"store_ok\":{},\"count\":{}}},\"timestamp\":0}}",
-                    store_ok,
-                    out.len()
-                );
-            }
         }
-        // #endregion
-        out
     }
 
     async fn profile_get(&self, id: String) -> Result<Option<ProfileSpec>, ApiError> {
@@ -56,33 +37,16 @@ impl ProfileApi for NodeApiImpl {
 
     async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
         self.validate_engine(&spec).await?;
+        validate_inference(&spec)?;
         let id = spec.id.clone();
-        let (provider, model) = (format!("{:?}", spec.provider), spec.model.clone());
-        let store = self.profile_store()?;
-        let res = store.create(spec);
-        // #region agent log
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/j/experiments/daemon/.cursor/debug-96b7ad.log")
-            {
-                let _ = writeln!(
-                    f,
-                    "{{\"sessionId\":\"96b7ad\",\"hypothesisId\":\"PROFILE-CREATE\",\"location\":\"node:profile_create\",\"message\":\"profile_create result\",\"data\":{{\"id\":\"{}\",\"provider\":\"{}\",\"model\":\"{}\",\"ok\":{}}},\"timestamp\":0}}",
-                    id, provider, model, res.is_ok()
-                );
-            }
-        }
-        // #endregion
-        res.map_err(profile_err)?;
+        self.profile_store()?.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "create");
         Ok(())
     }
 
     async fn profile_update(&self, spec: ProfileSpec) -> Result<(), ApiError> {
         self.validate_engine(&spec).await?;
+        validate_inference(&spec)?;
         let id = spec.id.clone();
         self.profile_store()?.update(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "update");
@@ -169,6 +133,7 @@ impl ProfileApi for NodeApiImpl {
         // An imported distribution's engine binding is validated against THIS node's catalog: the
         // exporting node's ACP agents do not necessarily exist here.
         self.validate_engine(&spec).await?;
+        validate_inference(&spec)?;
         let id = spec.id.clone();
         store.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "import");
@@ -193,10 +158,16 @@ impl ProfileApi for NodeApiImpl {
         Ok(id)
     }
 
-    async fn profile_history(&self, id: String) -> Result<Vec<daemon_common::Revision>, ApiError> {
-        self.revision_log()?
+    async fn profile_history(
+        &self,
+        id: String,
+        after: Option<String>,
+    ) -> Result<daemon_api::WirePage<daemon_common::Revision>, ApiError> {
+        let history = self
+            .revision_log()?
             .history(daemon_common::RevisionKind::Profile, &id)
-            .map_err(revision_err)
+            .map_err(revision_err)?;
+        Ok(paginate_revisions(history, after))
     }
 
     async fn profile_at(&self, id: String, seq: u64) -> Result<ProfileSpec, ApiError> {
@@ -219,10 +190,16 @@ impl ProfileApi for NodeApiImpl {
         Ok(())
     }
 
-    async fn skill_history(&self, name: String) -> Result<Vec<daemon_common::Revision>, ApiError> {
-        self.revision_log()?
+    async fn skill_history(
+        &self,
+        name: String,
+        after: Option<String>,
+    ) -> Result<daemon_api::WirePage<daemon_common::Revision>, ApiError> {
+        let history = self
+            .revision_log()?
             .history(daemon_common::RevisionKind::Skill, &name)
-            .map_err(revision_err)
+            .map_err(revision_err)?;
+        Ok(paginate_revisions(history, after))
     }
 
     async fn skill_at(
@@ -511,6 +488,25 @@ impl NodeApiImpl {
     }
 }
 
+/// Fail fast on a LOCAL-provider profile with an empty model (create/update/import): a
+/// llama.cpp / mistral.rs session cannot resolve any artifact to load, so it would only fail
+/// later — at first turn, far from the mistake. Cloud selectors keep the empty-model latitude
+/// (the unconfigured boot placeholder is exactly that, and it is seeded, not created here).
+fn validate_inference(spec: &ProfileSpec) -> Result<(), ApiError> {
+    let local = matches!(
+        spec.provider,
+        ProviderSelector::LlamaCpp | ProviderSelector::MistralRs
+    );
+    if local && spec.model.trim().is_empty() {
+        return Err(ApiError::Unsupported(format!(
+            "profile `{}` selects a local provider but names no model — download one \
+             (ModelSearch/ModelDownload) and set `model` to its installed catalog id",
+            spec.id
+        )));
+    }
+    Ok(())
+}
+
 /// Map a profile-store error onto the wire [`ApiError`].
 pub(crate) fn profile_err(e: crate::profiles::ProfileError) -> ApiError {
     use crate::profiles::ProfileError;
@@ -519,6 +515,29 @@ pub(crate) fn profile_err(e: crate::profiles::ProfileError) -> ApiError {
         ProfileError::Exists(id) => ApiError::Conflict(format!("profile exists: {id}")),
         other => ApiError::Other(other.to_string()),
     }
+}
+
+/// Page an oldest-first (seq-ascending) revision history under the uniform wire envelope. The
+/// cursor is the stringified `seq`, resumed NUMERICALLY rather than through the generic
+/// string-keyed [`daemon_api::paginate`]: a lexicographic compare would mis-order multi-digit
+/// seqs ("10" < "9"), and the append-only log makes seq-resume exact anyway. An unparseable
+/// cursor restarts from the first revision.
+fn paginate_revisions(
+    history: Vec<daemon_common::Revision>,
+    after: Option<String>,
+) -> daemon_api::WirePage<daemon_common::Revision> {
+    let start = match after.as_deref().and_then(|s| s.parse::<u64>().ok()) {
+        None => 0,
+        Some(seq) => history.partition_point(|r| r.seq <= seq),
+    };
+    let mut items: Vec<daemon_common::Revision> = history.into_iter().skip(start).collect();
+    let next = if items.len() > daemon_api::WIRE_PAGE_MAX {
+        items.truncate(daemon_api::WIRE_PAGE_MAX);
+        items.last().map(|r| r.seq.to_string())
+    } else {
+        None
+    };
+    daemon_api::WirePage { items, next }
 }
 
 /// Map a revision-log error onto the wire [`ApiError`].

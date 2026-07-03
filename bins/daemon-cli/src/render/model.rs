@@ -27,12 +27,15 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                 );
             }
         }
-        ApiResponse::ModelFiles(files) => {
-            println!("files: {}", files.len());
-            for f in files {
+        ApiResponse::ModelFiles(page) => {
+            println!("files: {}", page.items.len());
+            for f in page.items {
                 let quant = f.quant.map(|q| format!(" quant={q}")).unwrap_or_default();
                 let split = if f.is_split { " split" } else { "" };
                 println!("  - {} ({} bytes){}{}", f.path, f.size_bytes, quant, split);
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::ModelDownloadStarted(id) => println!("download started: {id}"),
@@ -143,15 +146,18 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
             );
             println!("  size_bytes: {}", info.size_bytes);
         }
-        ApiResponse::Models(models) => {
-            println!("models: {}", models.len());
-            for m in models {
+        ApiResponse::Models(page) => {
+            println!("models: {}", page.items.len());
+            for m in page.items {
                 let ctx = m
                     .context_length
                     .map(|c| format!(" ctx={c}"))
                     .unwrap_or_default();
                 let kind = if m.local { " [local]" } else { "" };
                 println!("  - {} [{:?}]{}{}", m.id, m.provider, ctx, kind);
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::ModelCurrent(model) => match model {

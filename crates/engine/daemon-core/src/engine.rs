@@ -260,12 +260,18 @@ impl Engine {
 
     /// Build a read-only [`ConvView`] projection of the current conversation (the §17 snapshot
     /// reply body). Never exposes live resources — only the durable conversation + epoch.
+    ///
+    /// The view is wire-bounded: only the **last** [`WIRE_PAGE_MAX`](daemon_common::WIRE_PAGE_MAX)
+    /// turns ride the snapshot (the client codec decodes into fixed 64-element buffers, and the
+    /// snapshot travels inside a single `AgentEvent`). Scroll-back past the window is the durable
+    /// journal's job (`session_history`), not the live view's. `waiting_for` is capped defensively
+    /// under the same bound.
     pub fn conv_view(&self) -> ConvView {
-        let turns = self
-            .snapshot
-            .conversation
-            .turns
+        let all = &self.snapshot.conversation.turns;
+        let skip = all.len().saturating_sub(daemon_common::WIRE_PAGE_MAX);
+        let turns = all
             .iter()
+            .skip(skip)
             .map(|turn| match turn {
                 Turn::User(u) => ConvTurnView {
                     role: "user".into(),
@@ -291,6 +297,7 @@ impl Engine {
                 .snapshot
                 .waiting_for
                 .iter()
+                .take(daemon_common::WIRE_PAGE_MAX)
                 .map(|j| j.to_string())
                 .collect(),
         }

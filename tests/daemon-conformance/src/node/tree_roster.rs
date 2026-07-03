@@ -45,8 +45,8 @@ async fn tree_surface_is_transport_agnostic() {
     }
 
     // tree() parity + the fleet child presents as an Engine leaf.
-    let inproc_tree = node.tree().await;
-    let socket_tree = match client.call(ApiRequest::Tree).await.unwrap() {
+    let inproc_tree = node.tree(None).await;
+    let socket_tree = match client.call(ApiRequest::Tree { after: None }).await.unwrap() {
         ApiResponse::Tree(t) => t,
         other => panic!("expected Tree, got {other:?}"),
     };
@@ -204,7 +204,7 @@ async fn roster_top_level_excludes_managed_children_across_transports() {
     }
 
     // The managed child id, sourced from the tree projection (the GUI's drill-down).
-    let tree = node.tree().await;
+    let tree = node.tree(None).await;
     let child = tree
         .nodes
         .iter()
@@ -350,12 +350,124 @@ async fn roster_pagination_cursor_is_total() {
     handle.shutdown().await;
 }
 
-/// `sessions_by_profile` groups the `Primary` roster by bound profile (the per-agent view). A
-/// session opened "as agent X" (sticky profile bind on first open) lands under that profile's
-/// group; a managed child never appears (it is not `Primary`).
+/// Wire page bound (v25): a tree holding more than `WIRE_PAGE_MAX` units is served in unit-id
+/// cursor pages through real dispatch/CBOR — 70 units page as 64 + 6, `root` rides every page
+/// unchanged, and the id-linked structure reassembles from the page union with no dup or gap
+/// (every parent->child edge resolves inside the union).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn roster_sessions_by_profile_groups_primary_sessions() {
-    use daemon_api::SessionApi;
+async fn tree_pages_beyond_the_wire_bound() {
+    use daemon_api::WIRE_PAGE_MAX;
+
+    let (node, handle) = assemble();
+    let path = temp_socket();
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind api socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+    let client = ApiClient::new(path.clone());
+
+    // 35 assigned parents, each delegating exactly one child => 70 durable units in the tree.
+    let parents: Vec<SessionId> = (0..35)
+        .map(|n| SessionId::new(format!("tree-pg-{n:02}")))
+        .collect();
+    for session in &parents {
+        assert!(matches!(
+            client
+                .call(ApiRequest::Assign {
+                    session: session.clone()
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+    }
+    // Every parent completing implies its delegation child exists and the graph is stable.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let ApiResponse::Sessions(list) = client.call(ApiRequest::Sessions).await.unwrap() {
+            let done = parents
+                .iter()
+                .filter(|p| {
+                    list.iter()
+                        .any(|i| i.session == **p && i.state == SessionState::Completed)
+                })
+                .count();
+            if done == parents.len() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the assigned parents never all completed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Walk the pages through real dispatch/CBOR: sizes 64 then 6, cursor-chained, root constant.
+    let mut sizes = Vec::new();
+    let mut ids: Vec<daemon_common::UnitId> = Vec::new();
+    let mut nodes = Vec::new();
+    let mut roots = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = match client
+            .call(ApiRequest::Tree {
+                after: after.take(),
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::Tree(t) => t,
+            other => panic!("expected Tree, got {other:?}"),
+        };
+        assert!(
+            page.nodes.len() <= WIRE_PAGE_MAX,
+            "a wire page must never exceed WIRE_PAGE_MAX, got {}",
+            page.nodes.len()
+        );
+        sizes.push(page.nodes.len());
+        roots.push(page.root.clone());
+        for n in &page.nodes {
+            assert!(!ids.contains(&n.id), "unit {} served twice", n.id);
+            ids.push(n.id.clone());
+        }
+        nodes.extend(page.nodes);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(sizes, vec![WIRE_PAGE_MAX, 6], "70 units page as 64 + 6");
+    assert!(
+        roots.windows(2).all(|w| w[0] == w[1]),
+        "root rides every page unchanged"
+    );
+    // Full reassembly: every parent's child edge resolves inside the page union.
+    for n in &nodes {
+        for child in &n.children {
+            assert!(
+                ids.contains(child),
+                "child {child} of {} must be present in the reassembled union",
+                n.id
+            );
+        }
+    }
+    // Unit-id order is the cursor order, so the union is sorted ascending.
+    let mut sorted = ids.clone();
+    sorted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(ids, sorted, "pages arrive in unit-id (cursor) order");
+
+    server.abort();
+    handle.shutdown().await;
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The per-agent ("agent owns N conversations") view composes from the scoped, paged roster: a
+/// session opened "as agent X" (sticky profile bind on first open) lands in that profile's
+/// `SessionScope::ByProfile` query. This is the client-side recipe that replaced the removed
+/// `SessionsByProfile` wire op (v25): loop the scoped pages per profile and group locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn roster_by_profile_scope_composes_the_per_agent_grouping() {
+    use daemon_api::{ControlApi, SessionApi, SessionQuery, SessionScope};
     use daemon_common::ProfileRef;
     use daemon_protocol::{AgentCommand, UserMsg};
 
@@ -379,18 +491,36 @@ async fn roster_sessions_by_profile_groups_primary_sessions() {
         .expect("submit_as binds the profile and opens the session");
     }
 
-    let grouped = node.sessions_by_profile().await;
-    let group = grouped
-        .iter()
-        .find(|(p, _)| p == &profile)
-        .map(|(_, s)| s)
-        .expect("a group for the bound profile");
+    // Compose the group by looping the scoped roster pages (the replacement recipe).
+    let mut group: Vec<daemon_api::SessionInfo> = Vec::new();
+    let mut after: Option<SessionId> = None;
+    loop {
+        let page = node
+            .sessions_query(SessionQuery {
+                scope: SessionScope::ByProfile(profile.clone()),
+                after: after.take(),
+                limit: 1, // force multi-page traversal through the cursor
+                since_rev: None,
+            })
+            .await;
+        group.extend(page.sessions);
+        match page.next_cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
     for id in &ids {
         assert!(
             group.iter().any(|i| &i.session == id),
-            "session {id} must appear under its bound profile"
+            "session {id} must appear under its bound profile's scope"
         );
     }
+    assert!(
+        group
+            .iter()
+            .all(|i| i.bound_profile.as_ref() == Some(&profile)),
+        "the ByProfile scope returns only that profile's sessions"
+    );
 
     handle.shutdown().await;
 }
@@ -644,8 +774,8 @@ async fn nested_tree_projection_is_recursive_and_transport_agnostic() {
 
     // (a) tree() projects root + 2+ levels with correct per-node children ids, identically on
     // both transports.
-    let inproc_tree = node.tree().await;
-    let socket_tree = match client.call(ApiRequest::Tree).await.unwrap() {
+    let inproc_tree = node.tree(None).await;
+    let socket_tree = match client.call(ApiRequest::Tree { after: None }).await.unwrap() {
         ApiResponse::Tree(t) => t,
         other => panic!("expected Tree, got {other:?}"),
     };
@@ -886,7 +1016,7 @@ async fn nested_delegation_recovers_after_restart(store: Arc<dyn SessionStore>) 
 
     // The recovered tree shows the full depth: a depth-2 grandchild (two `/` path segments) is
     // present and addressable, proving the *nested* delegation — not just the top — recovered.
-    let tree = node_b.tree().await;
+    let tree = node_b.tree(None).await;
     assert!(
         tree.nodes
             .iter()

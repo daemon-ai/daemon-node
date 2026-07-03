@@ -52,7 +52,10 @@ async fn routing_pin_resolves_to_bound_session() {
     );
 
     // The pin surfaces as a room of its transport family.
-    let rooms = node.transport_rooms(TransportId::new("telegram")).await;
+    let rooms = node
+        .transport_rooms(TransportId::new("telegram"), None)
+        .await
+        .items;
     assert!(
         rooms.iter().any(|r| r.session.as_ref() == Some(&pinned)),
         "the pinned chat must enumerate as a transport room, got {rooms:?}"

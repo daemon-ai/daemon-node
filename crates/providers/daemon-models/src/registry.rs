@@ -164,6 +164,7 @@ mod tests {
             arch: None,
             context_length: None,
             file_type: None,
+            mmproj_path: None,
         }
     }
 

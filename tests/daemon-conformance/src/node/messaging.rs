@@ -99,11 +99,12 @@ async fn messaging_adapter_rooms_manage_over_socket() {
     let convs = match client
         .call(ApiRequest::ConvList {
             transport: room.clone(),
+            after: None,
         })
         .await
         .unwrap()
     {
-        ApiResponse::Conversations(c) => c,
+        ApiResponse::Conversations(page) => page.items,
         other => panic!("expected Conversations, got {other:?}"),
     };
     assert!(convs.iter().any(|c| c.id == "r1"), "created room is listed");
@@ -358,6 +359,108 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         ),
         "deleted room is gone from get"
     );
+
+    server.abort();
+    for task in &adapter_tasks {
+        task.abort();
+    }
+    handle.shutdown().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wire page bound (v25): `ConvList` over a transport holding more than `WIRE_PAGE_MAX`
+/// conversations is served in cursor pages through real dispatch/CBOR — 70 rooms page as 64 + 6,
+/// the `next` cursor chains the pages, and the union is exactly the full set with no dup or gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conv_list_pages_beyond_the_wire_bound() {
+    use daemon_api::WIRE_PAGE_MAX;
+    use daemon_protocol::TransportId;
+
+    let dir = std::env::temp_dir().join(format!("daemon-rooms-page-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store: Arc<dyn SessionStore> =
+        Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
+    let AssembledNode {
+        node,
+        handle,
+        signer,
+        ..
+    } = assemble_over(store.clone(), 0, [0x5e; 32], fast_host_config());
+
+    let rooms_cfg = daemon_rooms::RoomsConfig {
+        enabled: true,
+        max_turns: 8,
+    };
+    let registry = daemon_host::AdapterRegistry::new().with_adapter(
+        daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+    );
+    node.set_adapters(registry);
+    let adapter_tasks = node.spawn_adapters();
+
+    let path = temp_socket();
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind api socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+    let client = ApiClient::new(path.clone());
+    let room = TransportId::new("room");
+
+    // 70 conversations, ids chosen so the id (cursor) order is deterministic.
+    let total = WIRE_PAGE_MAX + 6;
+    for i in 0..total {
+        let mut details = daemon_api::CreateConversationDetails::default();
+        details
+            .extras
+            .values
+            .insert("id".into(), format!("pg-{i:03}"));
+        details
+            .extras
+            .values
+            .insert("name".into(), format!("Page Room {i}"));
+        assert!(matches!(
+            client
+                .call(ApiRequest::ConvCreate {
+                    transport: room.clone(),
+                    details,
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Conversation(Some(_))
+        ));
+    }
+
+    // Walk the pages through real dispatch/CBOR: sizes 64 then 6, cursor-chained.
+    let mut sizes = Vec::new();
+    let mut all = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = match client
+            .call(ApiRequest::ConvList {
+                transport: room.clone(),
+                after: after.take(),
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::Conversations(page) => page,
+            other => panic!("expected Conversations, got {other:?}"),
+        };
+        assert!(
+            page.items.len() <= WIRE_PAGE_MAX,
+            "a wire page must never exceed WIRE_PAGE_MAX, got {}",
+            page.items.len()
+        );
+        sizes.push(page.items.len());
+        all.extend(page.items.into_iter().map(|c| c.id));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(sizes, vec![WIRE_PAGE_MAX, 6], "70 rooms page as 64 + 6");
+    let expected: Vec<String> = (0..total).map(|i| format!("pg-{i:03}")).collect();
+    assert_eq!(all, expected, "pages chain without dup or gap, in id order");
 
     server.abort();
     for task in &adapter_tasks {

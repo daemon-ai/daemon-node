@@ -19,7 +19,21 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 21)
+wire_version = uint                 ; daemon-common WireVersion (current = 27)
+
+; ----- uniform wire pagination (wire v25) -----
+; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
+; with ONE mechanism: the response is a page rule of the shape
+;   x-page = { "items": [0*64 x], ? "next": (tstr / null) }
+; (the Rust generic `WirePage<T>`), and the request carries a matching optional resume cursor
+; `? "after": (tstr / null)` — pass the previous page's `next` back to resume; absent/null `next`
+; means the last page. The per-payload page rules live next to their response rules below
+; (fs-list-page, conv-page, model-page, model-file-page, checkpoint-page, approval-page,
+; revision-page, chat-route-page, delivery-session-page, room-page); tree-report carries its
+; page cursor inline (`root` rides every page). The remaining list ops (profiles, credentials,
+; commands, cron, adapters, roles, health, ...) are BOUND-ONLY: small, operator-scale sets that
+; stay under the 64-element decode cap without a cursor — they adopt the same page recipe if one
+; ever outgrows it.
 
 ; ----- identifiers (daemon-common newtypes; encoded as text) -----
 session-id  = tstr
@@ -71,10 +85,12 @@ conv-turn-view = {
   "tools": [* tstr],
 }
 
+; Wire-bounded (v25): the engine projects only the LAST 64 turns (scroll-back is the durable
+; journal's job); waiting_for is capped under the same bound.
 conv-view = {
   "epoch": uint64,
-  "turns": [* conv-turn-view],
-  "waiting_for": [* tstr],
+  "turns": [0*64 conv-turn-view],
+  "waiting_for": [0*64 tstr],
 }
 
 ; An opaque structured payload a brain (or foreign-agent adapter) attaches for a rich consumer (a
@@ -238,10 +254,10 @@ session-query = {
 }
 
 session-page = {
-  "sessions": [* session-info],
+  "sessions": [0*64 session-info],
   ? "next_cursor": (session-id / null), ; null => last page
   "rev": uint64,                          ; L4: the roster revision this page reflects
-  ? "removed": [* session-id],          ; L4: ids removed since since_rev (delta reads only)
+  ? "removed": [0*64 session-id],       ; L4: ids removed since since_rev (delta reads only)
 }
 
 ; One session's full detail (the detail-pane round-trip).
@@ -336,9 +352,12 @@ unit-node = {
   ? "role": (session-role / null),      ; null => Primary
 }
 
+; Paged (wire v25): `nodes` is served 64 per page in unit-id order; `next` is the resume cursor
+; for the tree request's `after` (absent/null => last page). `root` rides every page.
 tree-report = {
   "root": (unit-id / null),
-  "nodes": [* unit-node],
+  "nodes": [0*64 unit-node],
+  ? "next": (tstr / null),
 }
 
 ; A delegation/subagent lifecycle phase (the Subagent manage-event discriminator).
@@ -398,7 +417,7 @@ journal-record = {
 }
 
 journal-page-view = {
-  "entries": [* journal-record],
+  "entries": [0*64 journal-record],
   "next_cursor": uint64,
   "head_cursor": uint64,
   "sealed_after": (uint64 / null),
@@ -448,7 +467,7 @@ session-log-entry = {
 }
 
 log-page-view = {
-  "entries": [* session-log-entry],
+  "entries": [0*64 session-log-entry],
   "next_seq": uint64,
   "head_seq": uint64,
   "epoch": uint64,                      ; session-activation generation (L2 resync; 0 = first activation)
@@ -461,16 +480,20 @@ node-event = node-event-session-advanced
            / node-event-fleet-changed
            / node-event-approval-pending
            / node-event-download-progress
+           / node-event-catalog-changed
            / node-event-resync-needed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
 node-event-fleet-changed        = { "FleetChanged":       { "rev": uint64 } }
 node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
-node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr } }
+; v26: byte counters ride the event (throttled byte-level emission node-side).
+node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64 } }
+; v26: the installed-model registry changed (download cataloged / model deleted) -> refetch ModelCatalog.
+node-event-catalog-changed      = "CatalogChanged"
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 events-page = {
-  "events": [* node-event],
+  "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
   "head_cursor": uint64,                ; highest cursor the feed has assigned
 }
@@ -536,12 +559,15 @@ search-hit = {
 
 search-page = { "page": uint, "results": [* search-hit], "has_more": bool }
 
+; is_mmproj (wire v27): a vision-projector (mmproj) companion — listed and downloadable, but
+; never a chat model (the client badges it; recommendation skips it).
 model-file = {
   "path": tstr,
   "size_bytes": uint64,
   "quant": (tstr / null),
   "is_split": bool,
   "is_first_shard": bool,
+  "is_mmproj": bool,
 }
 
 download-state = "Queued"
@@ -562,6 +588,9 @@ download-status = {
   "error": (tstr / null),
 }
 
+; mmproj_path (wire v27): the paired vision-projector companion on a *text* record (fetched with
+; the download or matched from the local catalog); null/absent for text-only models and for
+; projector records themselves.
 installed-model = {
   "id": model-id,
   "model": model-ref,
@@ -573,6 +602,7 @@ installed-model = {
   ? "arch": (tstr / null),
   ? "context_length": (uint / null),
   ? "file_type": (tstr / null),
+  ? "mmproj_path": (tstr / null),
 }
 
 ; ----- recommend / quantize / inspect DTOs -----
@@ -958,7 +988,7 @@ request-assign = { "Assign": { "session": session-id } }
 request-session-create = { "SessionCreate": { ? "session": (session-id / null), ? "profile": (profile-ref / null) } }
 request-cancel = { "Cancel": { "session": session-id } }
 request-fleet = "Fleet"
-request-tree = "Tree"
+request-tree = { "Tree": { ? "after": (tstr / null) } }
 request-unit = { "Unit": { "unit": unit-id } }
 ; UnitEvents: a NON-destructive bounded snapshot of a unit's recent management-event views (a read
 ; over a retained ring), despite the legacy "drain"-style naming. UnitOutbound: a DESTRUCTIVE
@@ -969,7 +999,7 @@ request-session-history = { "SessionHistory": { "session": session-id, "after_cu
 request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint64, "max": uint } }
 request-events-since = { "EventsSince": { "cursor": uint64, ? "wait_ms": (uint / null) } }
 request-delivery-targets = { "DeliveryTargets": { "session": session-id } }
-request-delivery-sessions = { "DeliverySessions": { "transport": transport-id } }
+request-delivery-sessions = { "DeliverySessions": { "transport": transport-id, ? "after": (tstr / null) } }
 request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
 record-meta-args = { "session": session-id, "origin": origin, "kind": tstr, "body": byte-array }
 request-record-meta = { "RecordMeta": record-meta-args }
@@ -981,7 +1011,7 @@ request-verifying-key = "VerifyingKey"
 request-set-session-model = { "SetSessionModel": { "session": session-id, "model": tstr, ? "provider": (provider-selector / null) } }
 request-set-session-mode = { "SetSessionMode": { "session": session-id, "mode": approval-mode } }
 request-set-session-overlay = { "SetSessionOverlay": { "session": session-id, "overlay": session-overlay } }
-request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null) } }
+request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null), ? "after": (tstr / null) } }
 request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool } }
 request-profile-list = "ProfileList"
 request-profile-get = { "ProfileGet": { "id": tstr } }
@@ -992,10 +1022,10 @@ request-profile-select = { "ProfileSelect": { "id": tstr } }
 request-profile-clone = { "ProfileClone": { "source": tstr, "new_id": tstr } }
 request-profile-export = { "ProfileExport": { "id": tstr } }
 request-profile-import = { "ProfileImport": { "dist": distribution, ? "new_id": (tstr / null) } }
-request-profile-history = { "ProfileHistory": { "id": tstr } }
+request-profile-history = { "ProfileHistory": { "id": tstr, ? "after": (tstr / null) } }
 request-profile-at = { "ProfileAt": { "id": tstr, "seq": uint64 } }
 request-profile-revert = { "ProfileRevert": { "id": tstr, "seq": uint64 } }
-request-skill-history = { "SkillHistory": { "name": tstr } }
+request-skill-history = { "SkillHistory": { "name": tstr, ? "after": (tstr / null) } }
 request-skill-at = { "SkillAt": { "name": tstr, "seq": uint64 } }
 request-skill-revert = { "SkillRevert": { "name": tstr, "seq": uint64 } }
 request-curator-list = { "CuratorList": { ? "profile": (tstr / null) } }
@@ -1008,7 +1038,7 @@ request-credential-set = { "CredentialSet": { "profile": tstr, "secret": tstr } 
 request-credential-list = "CredentialList"
 request-credential-remove = { "CredentialRemove": { "profile": tstr } }
 request-model-search = { "ModelSearch": { "query": search-query } }
-request-model-files = { "ModelFiles": { "repo": tstr, "revision": (tstr / null), "engine": model-engine } }
+request-model-files = { "ModelFiles": { "repo": tstr, "revision": (tstr / null), "engine": model-engine, ? "after": (tstr / null) } }
 request-model-download = { "ModelDownload": { "model": model-ref } }
 request-model-downloads = "ModelDownloads"
 request-model-cancel = { "ModelCancel": { "id": download-id } }
@@ -1023,19 +1053,18 @@ model-quantize-args = { "repo": tstr, "revision": (tstr / null), "target_quant":
 request-model-quantize = { "ModelQuantize": model-quantize-args }
 request-model-quantizes = "ModelQuantizes"
 request-model-inspect = { "ModelInspect": { "id": model-id } }
-request-models = "Models"
+request-models = { "Models": { ? "after": (tstr / null) } }
 request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-provider-catalog = "ProviderCatalog"
-request-provider-models = { "ProviderModels": { "provider": tstr, ? "credential_ref": (tstr / null), ? "transient_key": (tstr / null) } }
+request-provider-models = { "ProviderModels": { "provider": tstr, ? "credential_ref": (tstr / null), ? "transient_key": (tstr / null), ? "after": (tstr / null) } }
 request-auth-begin = { "AuthBegin": auth-begin-request }
 request-auth-complete = { "AuthComplete": auth-complete-request }
 request-auth-cancel = { "AuthCancel": { "flow_id": tstr } }
 request-auth-providers = "AuthProviders"
-request-checkpoint-list = { "CheckpointList": { ? "session": (session-id / null) } }
+request-checkpoint-list = { "CheckpointList": { ? "session": (session-id / null), ? "after": (tstr / null) } }
 request-checkpoint-rewind = { "CheckpointRewind": { "session": session-id, "checkpoint_id": tstr } }
 request-sessions-query = { "SessionsQuery": { "query": session-query } }
 request-session-get = { "SessionGet": { "session": session-id } }
-request-sessions-by-profile = "SessionsByProfile"
 request-session-search = { "SessionSearch": { "query": tstr, "limit": uint } }
 request-session-update-meta = { "SessionUpdateMeta": { "session": session-id, "patch": session-meta-patch } }
 request-rewind = { "Rewind": { "session": session-id, "point": rewind-point } }
@@ -1063,15 +1092,15 @@ request-cron-pause = { "CronPause": { "id": tstr, "paused": bool } }
 request-cron-suggestions = "CronSuggestions"
 request-cron-accept-suggestion = { "CronAcceptSuggestion": { "id": tstr } }
 request-cron-dismiss-suggestion = { "CronDismissSuggestion": { "id": tstr } }
-request-routing-list-chats = "RoutingListChats"
+request-routing-list-chats = { "RoutingListChats": { ? "after": (tstr / null) } }
 request-routing-get = { "RoutingGet": { "origin": origin } }
 request-routing-set = { "RoutingSet": { "route": chat-route } }
 request-routing-bind-chat = { "RoutingBindChat": { "origin": origin, "session": session-id, ? "profile": (profile-ref / null) } }
 request-routing-unbind-chat = { "RoutingUnbindChat": { "origin": origin } }
-request-transport-rooms = { "TransportRooms": { "transport": transport-id } }
+request-transport-rooms = { "TransportRooms": { "transport": transport-id, ? "after": (tstr / null) } }
 request-transport-adapters = "TransportAdapters"
 request-transport-instances = "TransportInstances"
-request-conv-list = { "ConvList": { "transport": transport-id } }
+request-conv-list = { "ConvList": { "transport": transport-id, ? "after": (tstr / null) } }
 request-conv-get = { "ConvGet": { "transport": transport-id, "conv": tstr } }
 request-conv-create-details = { "ConvCreateDetails": { "transport": transport-id } }
 request-conv-create = { "ConvCreate": { "transport": transport-id, "details": create-conversation-details } }
@@ -1099,7 +1128,7 @@ request-contact-set-alias = { "ContactSetAlias": { "transport": transport-id, "c
 request-contact-action-menu = { "ContactActionMenu": { "transport": transport-id, "contact": contact-info } }
 request-directory-search = { "DirectorySearch": { "transport": transport-id, ? "query": (tstr / null) } }
 request-fs-roots = "FsRoots"
-request-fs-list = { "FsList": { "root": fs-root-id-t, "dir": tstr, ? "show_ignored": bool } }
+request-fs-list = { "FsList": { "root": fs-root-id-t, "dir": tstr, ? "show_ignored": bool, ? "after": (tstr / null) } }
 request-fs-stat = { "FsStat": { "root": fs-root-id-t, "path": tstr } }
 request-fs-read = { "FsRead": { "root": fs-root-id-t, "path": tstr, ? "max_bytes": uint64 } }
 fs-write-args = { "root": fs-root-id-t, "path": tstr, "bytes": byte-array, ? "base_revision": (fs-revision / null), ? "force": bool }
@@ -1209,7 +1238,6 @@ api-request = request-submit
             / request-checkpoint-rewind
             / request-sessions-query
             / request-session-get
-            / request-sessions-by-profile
             / request-session-search
             / request-session-update-meta
             / request-rewind
@@ -1298,7 +1326,17 @@ response-stats = { "Stats": stats-report }
 telemetry-dump = { "usage": usage-delta, "events": uint64, "healthy": bool, "pending_jobs": uint64, "pending_wakes": uint64, "sessions": uint64, "active": uint64 }
 response-telemetry = { "Telemetry": telemetry-dump }
 response-sessions = { "Sessions": [* session-info] }
-response-approvals = { "Approvals": [* approval-info] }
+; ----- the uniform WirePage rules (wire v25; see the pagination note in the header) -----
+approval-page = { "items": [0*64 approval-info], ? "next": (tstr / null) }
+checkpoint-page = { "items": [0*64 checkpoint-info], ? "next": (tstr / null) }
+delivery-session-page = { "items": [0*64 session-id], ? "next": (tstr / null) }
+model-file-page = { "items": [0*64 model-file], ? "next": (tstr / null) }
+model-page = { "items": [0*64 model-descriptor], ? "next": (tstr / null) }   ; Models + ProviderModels
+revision-page = { "items": [0*64 revision], ? "next": (tstr / null) }
+chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
+room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
+conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null) }
+response-approvals = { "Approvals": approval-page }
 response-fleet = { "Fleet": fleet-report }
 response-tree = { "Tree": tree-report }
 response-unit = { "Unit": (unit-node / null) }
@@ -1307,10 +1345,10 @@ response-journal = { "Journal": journal-page-view }
 response-log-page = { "LogPage": log-page-view }
 response-events-page = { "EventsPage": events-page }
 response-delivery-targets = { "DeliveryTargets": [* delivery-target] }
-response-delivery-sessions = { "DeliverySessions": [* session-id] }
+response-delivery-sessions = { "DeliverySessions": delivery-session-page }
 response-verifying-key = { "VerifyingKey": (tstr / null) }
 response-model-search = { "ModelSearch": search-page }
-response-model-files = { "ModelFiles": [* model-file] }
+response-model-files = { "ModelFiles": model-file-page }
 response-model-download-started = { "ModelDownloadStarted": download-id }
 response-model-downloads = { "ModelDownloads": [* download-status] }
 response-model-catalog = { "ModelCatalog": [* installed-model] }
@@ -1321,23 +1359,22 @@ response-model-inspect = { "ModelInspect": gguf-info }
 response-profiles = { "Profiles": [* profile-info] }
 response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns null on a missing id
 response-credentials = { "Credentials": [* credential-info] }
-response-models = { "Models": [* model-descriptor] }
+response-models = { "Models": model-page }
 response-model-current = { "ModelCurrent": (model-descriptor / null) }
 response-provider-catalog = { "ProviderCatalog": [* provider-descriptor] }
-response-provider-models = { "ProviderModels": [* model-descriptor] }
+response-provider-models = { "ProviderModels": model-page }
 response-distribution = { "Distribution": distribution }
 response-profile-id = { "ProfileId": tstr }
-response-revisions = { "Revisions": [* revision] }
+response-revisions = { "Revisions": revision-page }
 response-skill-bundle = { "SkillBundle": skill-bundle }
 response-curator-skills = { "CuratorSkills": [* curator-entry] }
 response-curator-run = { "CuratorRun": [* curator-change] }
 response-auth-begun = { "AuthBegun": auth-begin-response }
 response-auth-completed = { "AuthCompleted": auth-complete-response }
 response-auth-providers = { "AuthProviders": [* auth-provider-info] }
-response-checkpoints = { "Checkpoints": [* checkpoint-info] }
+response-checkpoints = { "Checkpoints": checkpoint-page }
 response-session-page = { "SessionPage": session-page }
 response-session-detail = { "SessionDetail": (session-detail / null) }
-response-sessions-by-profile = { "SessionsByProfile": [* [profile: profile-ref, sessions: [* session-info]]] }
 response-session-search = { "SessionSearch": [* session-search-hit] }
 response-acp-catalog = { "AcpCatalog": [* acp-agent-entry] }
 response-providers = { "Providers": [* provider-info] }
@@ -1349,12 +1386,12 @@ response-cron-jobs = { "CronJobs": [* cron-job] }
 response-cron-id = { "CronId": tstr }
 response-cron-runs = { "CronRuns": [* cron-run] }
 response-cron-suggestions = { "CronSuggestions": [* cron-suggestion] }
-response-chat-routes = { "ChatRoutes": [* chat-route] }
+response-chat-routes = { "ChatRoutes": chat-route-page }
 response-chat-route = { "ChatRoute": (chat-route / null) }
-response-rooms = { "Rooms": [* room-info] }
+response-rooms = { "Rooms": room-page }
 response-adapters = { "Adapters": [* adapter-info] }
 response-transport-instances = { "TransportInstances": [* transport-instance-info] }
-response-conversations = { "Conversations": [* conversation-info] }
+response-conversations = { "Conversations": conv-page }
 response-conversation = { "Conversation": (conversation-info / null) }
 response-conv-create-details = { "ConvCreateDetails": create-conversation-details }
 response-conv-join-details = { "ConvJoinDetails": channel-join-details }
@@ -1363,7 +1400,7 @@ response-contacts = { "Contacts": [* contact-info] }
 response-action-menu = { "ActionMenu": (action-menu / null) }
 response-error = { "Error": api-error }
 response-fs-roots = { "FsRoots": [* fs-root] }
-response-fs-list = { "FsList": [* fs-entry] }
+response-fs-list = { "FsList": fs-list-page }
 response-fs-stat = { "FsStat": fs-entry }
 response-fs-read = { "FsRead": fs-content }
 response-fs-write = { "FsWrite": fs-revision }
@@ -1428,7 +1465,6 @@ api-response = response-ok
              / response-checkpoints
              / response-session-page
              / response-session-detail
-             / response-sessions-by-profile
              / response-session-search
              / response-acp-catalog
              / response-providers
@@ -1531,11 +1567,15 @@ fs-entry-kind-t = "file"
 ; real mtime). Wire-compatible: ciborium already encodes the Rust u64 as a CBOR uint.
 uint64 = 0..18446744073709551615
 fs-entry = { "name": tstr, "path": tstr, "kind": fs-entry-kind-t, "size": uint64, "mtime_ms": uint64, ? "ignored": bool }
+; One fs_list page (the uniform WirePage over fs-entry, wire v24/v25): bounded at 64 items per
+; response; `next` is the last entry's `path`, passed back as the request's `after` to resume
+; (absent/null => last page).
+fs-list-page = { "items": [0*64 fs-entry], ? "next": (tstr / null) }
 fs-revision = { "mtime_ms": uint64, "size": uint64 }
 fs-content = { "bytes": byte-array, "revision": fs-revision, ? "truncated": bool, ? "blob_ref": (blob-ref / null) }
 fs-search-query = { "query": tstr, ? "regex": bool, ? "case_sensitive": bool, ? "max_results": uint, ? "page": uint }
 fs-search-hit = { "path": tstr, "line": uint, "col": uint, "preview": tstr }
-fs-search-page = { "hits": [* fs-search-hit], ? "has_more": bool }
+fs-search-page = { "hits": [0*64 fs-search-hit], ? "has_more": bool }
 fs-change-kind-t = "created"
                  / "modified"
                  / "removed"

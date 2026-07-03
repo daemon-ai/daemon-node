@@ -345,20 +345,21 @@ async fn delivery_sessions_discovery_and_pull_subscriber() {
     let session_a = drive_turn(&node, origin_a.clone(), 1).await;
     let session_b = drive_turn(&node, origin_b.clone(), 2).await;
 
-    // 1. Owned-session discovery is scoped to the instance's Primary.
+    // 1. Owned-session discovery is scoped to the instance's Primary (a single wire page here).
     let owned_a = node
-        .delivery_sessions(TransportId::new("matrix/@a:hs"))
+        .delivery_sessions(TransportId::new("matrix/@a:hs"), None)
         .await;
     assert_eq!(
-        owned_a,
+        owned_a.items,
         vec![session_a.clone()],
         "@a:hs owns exactly session_a"
     );
+    assert_eq!(owned_a.next, None, "one owned session fits one page");
     let owned_b = node
-        .delivery_sessions(TransportId::new("matrix/@b:hs"))
+        .delivery_sessions(TransportId::new("matrix/@b:hs"), None)
         .await;
     assert_eq!(
-        owned_b,
+        owned_b.items,
         vec![session_b.clone()],
         "@b:hs owns exactly session_b"
     );
@@ -395,8 +396,9 @@ async fn delivery_sessions_discovery_and_pull_subscriber() {
         .await
         .expect("handover");
     assert!(
-        node.delivery_sessions(TransportId::new("matrix/@a:hs"))
+        node.delivery_sessions(TransportId::new("matrix/@a:hs"), None)
             .await
+            .items
             .is_empty(),
         "after handover @a:hs owns no sessions"
     );

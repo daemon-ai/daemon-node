@@ -8,9 +8,9 @@ use daemon_api::ApiResponse;
 
 pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
     match resp {
-        ApiResponse::ChatRoutes(routes) => {
-            println!("chat routes: {}", routes.len());
-            for r in routes {
+        ApiResponse::ChatRoutes(page) => {
+            println!("chat routes: {}", page.items.len());
+            for r in page.items {
                 let profile = r
                     .profile
                     .map(|p| p.as_str().to_string())
@@ -23,6 +23,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                     profile
                 );
             }
+            if let Some(next) = page.next {
+                println!("  next={next}");
+            }
         }
         ApiResponse::ChatRoute(route) => match route {
             Some(r) => println!(
@@ -33,9 +36,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
             ),
             None => println!("pin: (none)"),
         },
-        ApiResponse::Rooms(rooms) => {
-            println!("rooms: {}", rooms.len());
-            for r in rooms {
+        ApiResponse::Rooms(page) => {
+            println!("rooms: {}", page.items.len());
+            for r in page.items {
                 let session = r
                     .session
                     .map(|s| s.as_str().to_string())
@@ -46,6 +49,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                     r.room,
                     session
                 );
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::TransportInstances(instances) => {
@@ -60,9 +66,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                 );
             }
         }
-        ApiResponse::Conversations(convs) => {
-            println!("conversations: {}", convs.len());
-            for c in convs {
+        ApiResponse::Conversations(page) => {
+            println!("conversations: {}", page.items.len());
+            for c in page.items {
                 let title = c.title.unwrap_or_else(|| "(untitled)".to_string());
                 println!(
                     "  - {}/{} [{:?}] \"{}\" members={}",
@@ -72,6 +78,9 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                     title,
                     c.members.len()
                 );
+            }
+            if let Some(next) = page.next {
+                println!("  next={next}");
             }
         }
         ApiResponse::Conversation(conv) => match conv {

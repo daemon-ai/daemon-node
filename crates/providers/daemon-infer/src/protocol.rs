@@ -87,6 +87,12 @@ pub struct ModelParams {
     /// Load the model in **embedding mode** (a pooled-embedding context) rather than for generation.
     /// A worker loaded this way answers [`Command::Embed`] and refuses [`Command::Generate`].
     pub embeddings: bool,
+    /// llama.cpp: the on-disk path of the model's vision-projector (mmproj) companion, loaded
+    /// alongside the text weights when the build carries multimodal (mtmd) support; ignored (with
+    /// a log line) otherwise. `None` = text-only. Defaulted for wire back-compat with older
+    /// parents/workers.
+    #[serde(default)]
+    pub mmproj: Option<String>,
 }
 
 /// Token-sampling parameters for one [`Command::Generate`].
@@ -367,6 +373,7 @@ mod tests {
                 flash_attn: true,
                 isq: None,
                 embeddings: false,
+                mmproj: Some("/models/mmproj-llama-3.2-vision.gguf".into()),
             },
         });
         round_trip_command(Command::Generate {

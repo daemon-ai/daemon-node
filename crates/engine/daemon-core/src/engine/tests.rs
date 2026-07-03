@@ -356,6 +356,22 @@ async fn snapshot_request_served_with_conv_view() {
         .any(|t| t.role == "user" && t.text == "question"));
 }
 
+/// The snapshot view is wire-bounded: a conversation past `WIRE_PAGE_MAX` turns projects only the
+/// LAST `WIRE_PAGE_MAX` turns, in order (the fixed-buffer client codec cannot decode more; the
+/// durable journal serves scroll-back).
+#[tokio::test]
+async fn conv_view_truncates_to_the_last_wire_page_of_turns() {
+    let mut engine = completing_engine("snap-cap");
+    for i in 0..70 {
+        engine.push_observe(UserMsg::new(format!("turn-{i}")));
+    }
+    let view = engine.conv_view();
+    assert_eq!(view.turns.len(), daemon_common::WIRE_PAGE_MAX);
+    // The window keeps the TAIL: turns 6..=69, oldest-first.
+    assert_eq!(view.turns.first().unwrap().text, "turn-6");
+    assert_eq!(view.turns.last().unwrap().text, "turn-69");
+}
+
 /// A queued steer is drained at a boundary: the marker lands in the conversation and a
 /// `Steered` ack is emitted.
 #[tokio::test]

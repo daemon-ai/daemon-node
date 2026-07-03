@@ -67,9 +67,13 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
                 ApiResponse::SessionCreated { session }
             })
         }
-        ApiRequest::Poll { session, max } => {
-            ok_or_err(api.poll(session, max).await, ApiResponse::Drained)
-        }
+        ApiRequest::Poll { session, max } => ok_or_err(
+            // Clamp to the wire page bound (0 previously meant "everything"): the client codec
+            // decodes into fixed WIRE_PAGE_MAX buffers. The drain leaves un-returned items queued,
+            // so the next poll picks them up.
+            api.poll(session, clamp_page_max(max)).await,
+            ApiResponse::Drained,
+        ),
         ApiRequest::Respond { session, response } => {
             unit_or_err(api.respond(session, response).await)
         }
@@ -83,14 +87,17 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
             after_seq,
             max,
         } => ok_or_err(
-            api.log_after(session, after_seq, max).await,
+            // Clamp to the wire page bound: max == 0 previously flowed to the merged log ring
+            // uncapped (CursoredRing::page treats 0 as "no cap"), which can exceed the client
+            // codec's fixed array buffers. The page is cursored, so the client loops.
+            api.log_after(session, after_seq, clamp_page_max(max)).await,
             ApiResponse::LogPage,
         ),
         ApiRequest::DeliveryTargets { session } => {
             ApiResponse::DeliveryTargets(api.delivery_targets(session).await)
         }
-        ApiRequest::DeliverySessions { transport } => {
-            ApiResponse::DeliverySessions(api.delivery_sessions(transport).await)
+        ApiRequest::DeliverySessions { transport, after } => {
+            ApiResponse::DeliverySessions(api.delivery_sessions(transport, after).await)
         }
         ApiRequest::Handover { session, target } => {
             unit_or_err(api.handover(session, target).await)
@@ -119,21 +126,22 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::Stats => ApiResponse::Stats(api.stats().await),
         ApiRequest::Telemetry => ApiResponse::Telemetry(api.telemetry().await),
         ApiRequest::Sessions => ApiResponse::Sessions(api.sessions().await),
-        ApiRequest::ApprovalsPending { session } => {
-            ApiResponse::Approvals(api.approvals_pending(session).await)
+        ApiRequest::ApprovalsPending { session, after } => {
+            ApiResponse::Approvals(api.approvals_pending(session, after).await)
         }
         ApiRequest::ApprovalDecide {
             session,
             request_id,
             allow,
         } => unit_or_err(api.approval_decide(session, request_id, allow).await),
-        ApiRequest::CheckpointList { session } => {
-            ApiResponse::Checkpoints(api.checkpoints(session).await)
+        ApiRequest::CheckpointList { session, after } => {
+            ApiResponse::Checkpoints(api.checkpoints(session, after).await)
         }
         // L3 node-wide event feed: the one-shot/long-poll page (the push form rides `Open` ->
-        // `events_subscribe` in the socket pump, not `dispatch`).
+        // `events_subscribe` in the socket pump, not `dispatch`). Bounded at the wire page max
+        // (previously 0 = up to the whole ring); the page is cursored, so the client loops.
         ApiRequest::EventsSince { cursor, .. } => {
-            ApiResponse::EventsPage(api.events_page(cursor, 0).await)
+            ApiResponse::EventsPage(api.events_page(cursor, clamp_page_max(0)).await)
         }
         ApiRequest::CheckpointRewind {
             session,
@@ -147,9 +155,6 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         }
         ApiRequest::SessionGet { session } => {
             ApiResponse::SessionDetail(api.session_get(session).await)
-        }
-        ApiRequest::SessionsByProfile => {
-            ApiResponse::SessionsByProfile(api.sessions_by_profile().await)
         }
         ApiRequest::SessionSearch { query, limit } => {
             ApiResponse::SessionSearch(api.session_search(query, limit).await)
@@ -166,14 +171,16 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
 async fn serve_fleet(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
         ApiRequest::Fleet => ApiResponse::Fleet(api.fleet().await),
-        ApiRequest::Tree => ApiResponse::Tree(api.tree().await),
+        ApiRequest::Tree { after } => ApiResponse::Tree(api.tree(after).await),
         ApiRequest::Unit { unit } => ApiResponse::Unit(api.unit(unit).await),
         ApiRequest::UnitEvents { unit, max } => {
-            ApiResponse::UnitEvents(api.unit_events(unit, max).await)
+            // Clamp to the wire page bound (0 previously meant the store's whole snapshot).
+            ApiResponse::UnitEvents(api.unit_events(unit, clamp_page_max(max)).await)
         }
         ApiRequest::UnitOutbound { unit, max } => {
-            // Reuses the `Drained(Vec<Outbound>)` response — the same rich §17 drain shape as `poll`.
-            ApiResponse::Drained(api.unit_outbound(unit, max).await)
+            // Reuses the `Drained(Vec<Outbound>)` response — the same rich §17 drain shape as
+            // `poll`, with the same wire-bound clamp (leftovers stay queued for the next drain).
+            ApiResponse::Drained(api.unit_outbound(unit, clamp_page_max(max)).await)
         }
         ApiRequest::UnitHistory {
             unit,
@@ -197,8 +204,9 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
             repo,
             revision,
             engine,
+            after,
         } => ok_or_err(
-            api.model_files(repo, revision, engine).await,
+            api.model_files(repo, revision, engine, after).await,
             ApiResponse::ModelFiles,
         ),
         ApiRequest::ModelDownload { model } => ok_or_err(
@@ -225,7 +233,7 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
         ApiRequest::ModelInspect { id } => {
             ok_or_err(api.model_inspect(id).await, ApiResponse::ModelInspect)
         }
-        ApiRequest::Models => ApiResponse::Models(api.models().await),
+        ApiRequest::Models { after } => ApiResponse::Models(api.models(after).await),
         ApiRequest::ModelCurrent { profile } => {
             ok_or_err(api.model_current(profile).await, ApiResponse::ModelCurrent)
         }
@@ -234,8 +242,9 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
             provider,
             credential_ref,
             transient_key,
+            after,
         } => ApiResponse::ProviderModels(
-            api.provider_models(provider, credential_ref, transient_key)
+            api.provider_models(provider, credential_ref, transient_key, after)
                 .await,
         ),
         _ => return None,
@@ -261,15 +270,15 @@ async fn serve_profile(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             api.profile_import(dist, new_id).await,
             ApiResponse::ProfileId,
         ),
-        ApiRequest::ProfileHistory { id } => {
-            ok_or_err(api.profile_history(id).await, ApiResponse::Revisions)
+        ApiRequest::ProfileHistory { id, after } => {
+            ok_or_err(api.profile_history(id, after).await, ApiResponse::Revisions)
         }
         ApiRequest::ProfileAt { id, seq } => ok_or_err(api.profile_at(id, seq).await, |spec| {
             ApiResponse::Profile(Some(spec))
         }),
         ApiRequest::ProfileRevert { id, seq } => unit_or_err(api.profile_revert(id, seq).await),
-        ApiRequest::SkillHistory { name } => {
-            ok_or_err(api.skill_history(name).await, ApiResponse::Revisions)
+        ApiRequest::SkillHistory { name, after } => {
+            ok_or_err(api.skill_history(name, after).await, ApiResponse::Revisions)
         }
         ApiRequest::SkillAt { name, seq } => {
             ok_or_err(api.skill_at(name, seq).await, ApiResponse::SkillBundle)
@@ -354,7 +363,9 @@ async fn serve_cron(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
 /// Chat routing + transport adapter/instance registry.
 async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
-        ApiRequest::RoutingListChats => ApiResponse::ChatRoutes(api.routing_list_chats().await),
+        ApiRequest::RoutingListChats { after } => {
+            ApiResponse::ChatRoutes(api.routing_list_chats(after).await)
+        }
         ApiRequest::RoutingGet { origin } => ApiResponse::ChatRoute(api.routing_get(origin).await),
         ApiRequest::RoutingSet { route } => unit_or_err(api.routing_set(route).await),
         ApiRequest::RoutingBindChat {
@@ -365,8 +376,8 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::RoutingUnbindChat { origin } => {
             unit_or_err(api.routing_unbind_chat(origin).await)
         }
-        ApiRequest::TransportRooms { transport } => {
-            ApiResponse::Rooms(api.transport_rooms(transport).await)
+        ApiRequest::TransportRooms { transport, after } => {
+            ApiResponse::Rooms(api.transport_rooms(transport, after).await)
         }
         ApiRequest::TransportAdapters => ApiResponse::Adapters(api.transport_adapters().await),
         ApiRequest::TransportInstances => {
@@ -379,8 +390,8 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
 /// Messaging surface: conversations, membership, contacts, directory.
 async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
-        ApiRequest::ConvList { transport } => {
-            ApiResponse::Conversations(api.conv_list(transport).await)
+        ApiRequest::ConvList { transport, after } => {
+            ApiResponse::Conversations(api.conv_list(transport, after).await)
         }
         ApiRequest::ConvGet { transport, conv } => {
             ApiResponse::Conversation(api.conv_get(transport, conv).await)
@@ -480,8 +491,9 @@ async fn serve_fs(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
             root,
             dir,
             show_ignored,
+            after,
         } => ok_or_err(
-            api.fs_list(root, dir, show_ignored).await,
+            api.fs_list(root, dir, show_ignored, after).await,
             ApiResponse::FsList,
         ),
         ApiRequest::FsStat { root, path } => {

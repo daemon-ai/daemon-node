@@ -75,10 +75,11 @@ async fn filesystem_surface_round_trips_and_gates() {
     assert_eq!(std::fs::read(ws.join("notes/hello.txt")).unwrap(), b"hi");
 
     let listing = node
-        .fs_list(FsRootId::Workspace, "notes".into(), false)
+        .fs_list(FsRootId::Workspace, "notes".into(), false, None)
         .await
         .expect("list");
-    assert!(listing.iter().any(|e| e.name == "hello.txt"));
+    assert!(listing.items.iter().any(|e| e.name == "hello.txt"));
+    assert!(listing.next.is_none(), "one small dir fits one page");
 
     // The sensitive-path gate blocks a dotenv write unless forced.
     let blocked = node
@@ -109,6 +110,101 @@ async fn filesystem_surface_round_trips_and_gates() {
         .is_err());
 
     handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// Wire pagination (v24) end to end over the mux socket: `fs_list` on a >64-entry directory pages
+/// at the WIRE_PAGE_MAX bound, the `next` cursor chains the pages through real dispatch/CBOR, and
+/// the reassembled listing is complete, ordered, and duplicate-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_list_pages_over_the_wire() {
+    use daemon_api::{FsRootId, WIRE_PAGE_MAX};
+    use daemon_host::{serve_api_unix, MuxApiClient};
+    use tokio::net::UnixListener;
+
+    let ws = std::env::temp_dir().join(format!("daemon-fs-page-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(ws.join("big")).unwrap();
+    for n in 0..70 {
+        std::fs::write(ws.join("big").join(format!("f{n:03}.txt")), b"x").unwrap();
+    }
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("openai"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x48; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: None,
+        provider_resolver: None,
+        credential_store: None,
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![],
+        workspace_root: Some(ws.clone()),
+        blob_root: None,
+    });
+    let path = temp_socket();
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind api socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+
+    let mut mux = MuxApiClient::connect(path.clone())
+        .await
+        .expect("mux connect + hello");
+    let mut all: Vec<String> = Vec::new();
+    let mut sizes = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = match mux
+            .call(ApiRequest::FsList {
+                root: FsRootId::Workspace,
+                dir: "big".into(),
+                show_ignored: false,
+                after: after.clone(),
+            })
+            .await
+            .expect("fs_list call")
+        {
+            ApiResponse::FsList(page) => page,
+            other => panic!("expected FsList, got {other:?}"),
+        };
+        assert!(
+            page.items.len() <= WIRE_PAGE_MAX,
+            "a wire page must never exceed WIRE_PAGE_MAX, got {}",
+            page.items.len()
+        );
+        sizes.push(page.items.len());
+        all.extend(page.items.iter().map(|e| e.name.clone()));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+        assert!(sizes.len() <= 4, "runaway pagination");
+    }
+
+    assert_eq!(sizes, vec![64, 6]);
+    let expected: Vec<String> = (0..70).map(|n| format!("f{n:03}.txt")).collect();
+    assert_eq!(all, expected, "complete, ordered, duplicate-free listing");
+
+    handle.shutdown().await;
+    server.abort();
+    let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&ws);
 }
 

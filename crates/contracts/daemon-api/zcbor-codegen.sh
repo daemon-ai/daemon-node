@@ -23,10 +23,12 @@ exec zcbor code \
   --cddl "$cddl" \
   --entry-types api-request api-response \
   --decode --encode \
-  `# Per-array element cap for the generated C structs (the CDDL arrays stay unbounded for the` \
-  `# Rust/cddl-cat conformance side). 64 covers a repo's GGUF/quant file list + a search page +` \
-  `# the installed catalog + more log entries per Subscribe page; bump here if a real response` \
-  `# is ever truncated. Heap-allocated, so the larger union is fine.` \
+  `# Per-array element cap for the generated C structs, in lockstep with daemon-api's` \
+  `# WIRE_PAGE_MAX (= 64). The paginated response arrays (fs-list-page / fs-search-page /` \
+  `# log-page-view / journal-page-view / events-page / session-page) carry an explicit 0*64` \
+  `# bound in the CDDL since wire v24 and the node clamps every page to WIRE_PAGE_MAX; this` \
+  `# default caps the remaining (small, enumeration-shaped) arrays. Heap-allocated, so the` \
+  `# larger union is fine.` \
   --default-max-qty 64 \
   --output-c "$out/${base}.c" \
   --output-h "$out/${base}.h" \

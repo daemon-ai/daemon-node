@@ -312,6 +312,82 @@ async fn events_since_feed_streams_node_events_and_resyncs() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Wire page bound (v24): the one-shot `EventsSince` — through the shared `dispatch` every socket
+/// transport runs — returns at most WIRE_PAGE_MAX events per page (previously it served up to the
+/// whole retained ring in one response), and the `next_cursor` loop reads the rest to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_since_one_shot_is_bounded_at_the_wire_page_max() {
+    use daemon_api::{dispatch, SessionApi, WIRE_PAGE_MAX};
+
+    let (node, handle) = assemble();
+    // 70 node-authoritative session creations: each emits an un-coalesced `RosterChanged` onto the
+    // retained feed, so the ring holds more than one wire page.
+    for n in 0..70 {
+        node.session_create(Some(SessionId::new(format!("evt-{n:03}"))), None)
+            .await
+            .expect("session_create");
+    }
+
+    let page = match dispatch(
+        node.as_ref(),
+        ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::EventsPage(page) => page,
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+    assert_eq!(
+        page.events.len(),
+        WIRE_PAGE_MAX,
+        "the first page of an over-full ring must be exactly the wire bound"
+    );
+    assert!(
+        page.next_cursor < page.head_cursor,
+        "more events remain past the first page"
+    );
+
+    // The cursor loop drains the rest, each page within the bound.
+    let mut cursor = page.next_cursor;
+    let mut total = page.events.len();
+    let mut pages = 1usize;
+    loop {
+        let page = match dispatch(
+            node.as_ref(),
+            ApiRequest::EventsSince {
+                cursor,
+                wait_ms: None,
+            },
+        )
+        .await
+        {
+            ApiResponse::EventsPage(page) => page,
+            other => panic!("expected EventsPage, got {other:?}"),
+        };
+        assert!(
+            page.events.len() <= WIRE_PAGE_MAX,
+            "every page must respect the wire bound, got {}",
+            page.events.len()
+        );
+        total += page.events.len();
+        cursor = page.next_cursor;
+        pages += 1;
+        assert!(pages <= 4, "runaway pagination");
+        if cursor >= page.head_cursor {
+            break;
+        }
+    }
+    assert!(
+        total >= 70,
+        "the cursor loop must deliver every retained event, got {total}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// Live fleet push: a durable delegation (the default node delegates once on `Assign`) changes the
 /// subagent tree, and the `assemble()` bridge forwards the fleet bus onto the node-wide feed as a
 /// `FleetChanged` so an `EventsSince` client re-fetches `Tree` live (not just on focus/reconnect).

@@ -17,6 +17,12 @@ path = "src/bin/daemon-infer.rs"
 default = []
 # Engine selectors (the worker compiles a backend in when one of these is on).
 llama = ["dep:llama-cpp-4", "dep:encoding_rs"]
+# Multimodal projector loading (llama.cpp mtmd): the worker loads a paired mmproj GGUF alongside
+# the text weights at `Command::Load` (media *inference* is a later phase — this validates and
+# holds the projector). Separate from `llama` because the dev-shell prebuilt
+# (`LLAMA_PREBUILT_DIR`, built with LLAMA_BUILD_TOOLS=OFF) carries no libmtmd — the sandboxed
+# from-source lanes (`nix build .#daemon-infer-llama`) enable it.
+mtmd = ["llama", "llama-cpp-4/mtmd"]
 # Link a prebuilt *shared* llama.cpp (via `LLAMA_PREBUILT_DIR`) instead of static-compiling it from
 # source. Used in the Nix dev shell to skip cmake on hosts without `/bin/sh`.
 dynamic-link = ["llama-cpp-4/dynamic-link"]

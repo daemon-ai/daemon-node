@@ -633,10 +633,12 @@ fn bind_storage_surfaces(
 }
 
 /// Bind the model-management sub-surface (when this node hosts local-inference model management),
-/// fanning download progress onto the node-wide feed so the client renders it without polling.
+/// fanning download progress + catalog changes onto the node-wide feed so the client renders both
+/// without polling.
 fn bind_model_surface(mut node_api: NodeApiImpl, a: &NodeAssembly, shared: &Shared) -> NodeApiImpl {
     if let Some(models) = a.models.clone() {
-        // L3: pct is derived from the byte counters; state mirrors the wire string.
+        // L3: pct is derived from the byte counters; state mirrors the wire string; the raw byte
+        // counters ride the event so the client renders real progress (wire v26).
         let feed = shared.node_events.clone();
         models.set_download_progress(Arc::new(move |status: daemon_common::DownloadStatus| {
             let pct = status
@@ -657,7 +659,15 @@ fn bind_model_surface(mut node_api: NodeApiImpl, a: &NodeAssembly, shared: &Shar
                 id: status.id,
                 pct,
                 state: state.to_string(),
+                downloaded_bytes: status.downloaded_bytes,
+                total_bytes: status.total_bytes,
             });
+        }));
+        // L3 (wire v26): the installed-model registry changed (a completed download was cataloged
+        // / a model was deleted) — clients refetch ModelCatalog instead of polling.
+        let feed = shared.node_events.clone();
+        models.set_catalog_changed(Arc::new(move || {
+            feed.emit(daemon_api::NodeEvent::CatalogChanged);
         }));
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
     }
