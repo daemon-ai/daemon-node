@@ -2121,7 +2121,43 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             Some(tokio::spawn(daemon_host::serve_mux_ws(
                 ws_listener,
                 node.clone(),
-                authenticator,
+                authenticator.clone(),
+                cfg.api.ws_allowed_origins.clone(),
+            )))
+        }
+        None => None,
+    };
+
+    // The single-origin web front (opt-in via `[web].addr`): ONE listener serving the Qt WASM app
+    // bundle (`[web].root`, scanned once at startup) as static files AND the same mux-over-
+    // WebSocket carrier on `/ws` — the browser loads the GUI from the daemon and connects back to
+    // the same origin, so same-origin upgrades need zero origin config (`[api].ws_allowed_origins`
+    // adds extra cross-origin allowance). Static files are public; `/ws` still requires SASL.
+    let web_server = match &cfg.web.addr {
+        Some(addr) => {
+            let root = cfg.web.root.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[web].addr is set but [web].root is missing (set it to the wasm app bundle directory)"
+                )
+            })?;
+            let site = daemon_host::WebRoot::scan(root).map_err(|e| {
+                anyhow::anyhow!(
+                    "[web].root {} is not a servable directory: {e}",
+                    root.display()
+                )
+            })?;
+            let web_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                %addr,
+                root = %root.display(),
+                files = site.len(),
+                "serving web app bundle + daemon-api WebSocket at /ws (single origin, authentication required)"
+            );
+            Some(tokio::spawn(daemon_host::serve_web(
+                web_listener,
+                site,
+                node.clone(),
+                authenticator.clone(),
                 cfg.api.ws_allowed_origins.clone(),
             )))
         }
@@ -2183,6 +2219,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     }
     if let Some(ws_server) = ws_server {
         ws_server.abort();
+    }
+    if let Some(web_server) = web_server {
+        web_server.abort();
     }
     if let Some(http_server) = http_server {
         http_server.abort();

@@ -452,7 +452,8 @@ pub struct McpConfig {
     pub servers: Vec<McpServerEntry>,
 }
 
-/// Tuning for the web tools (`daemon-tool-web`). `[web]` / `DAEMON_WEB__*`.
+/// The `[web]` table / `DAEMON_WEB__*`: the web *tools* tuning (`daemon-tool-web`) and — an
+/// independent knob sharing the table name — the single-origin browser web front (`addr`/`root`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
@@ -466,6 +467,14 @@ pub struct WebConfig {
     pub tavily_key_id: String,
     /// The credential-profile id the Firecrawl scraper key is read from.
     pub firecrawl_key_id: String,
+    /// Bind address of the single-origin browser listener: serves the Qt WASM app bundle
+    /// (`root`) as static files AND the same authenticated mux-over-WebSocket carrier on `/ws`,
+    /// so the GUI loads from — and connects back to — one origin with no CORS configuration.
+    /// `None` (the default) keeps it off. Independent of `enable` (the web tools).
+    pub addr: Option<String>,
+    /// The app bundle directory served as static files (required when `addr` is set; must exist
+    /// at startup — its contents are scanned once at boot).
+    pub root: Option<PathBuf>,
 }
 
 impl Default for WebConfig {
@@ -475,6 +484,8 @@ impl Default for WebConfig {
             local_fallback: true,
             tavily_key_id: "tavily".to_string(),
             firecrawl_key_id: "firecrawl".to_string(),
+            addr: None,
+            root: None,
         }
     }
 }
@@ -1085,6 +1096,18 @@ pub fn config_reference() -> String {
          proxy in front of it for now. Browser connections must additionally match \
          `api.ws_allowed_origins` (empty = every browser origin is refused).\n\n",
     );
+    out.push_str(
+        "Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves \
+         the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle \
+         directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — \
+         the browser loads the GUI from the daemon and connects back to the same origin, so \
+         same-origin upgrades need no origin configuration (an `Origin` matching the request's \
+         own `Host` is accepted automatically; `api.ws_allowed_origins` grants extra cross-origin \
+         allowance). Static files are public; the api still requires SASL. The bundle directory \
+         is scanned once at startup (restart to pick up new files), and `https://`/`wss://` \
+         terminate at a reverse proxy for now — behind one, add the public origin to \
+         `api.ws_allowed_origins` (the derived self-origin is `http://`).\n\n",
+    );
     out.push_str("| TOML path | Environment variable | Type | Default |\n");
     out.push_str("|-----------|----------------------|------|---------|\n");
     for (path, env, ty, default) in &rows {
@@ -1223,6 +1246,31 @@ mod tests {
             assert_eq!(cfg.python.op_timeout, Duration::from_millis(5000));
             assert_eq!(cfg.engine.model_retry_attempts, 4);
             assert!(matches!(cfg.store_backend(), StoreBackend::Sqlite { .. }));
+            Ok(())
+        });
+    }
+
+    // The web-front listener knobs ride the standard env mapping (off by default).
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    #[test]
+    fn web_front_env_overrides_extract() {
+        let defaults =
+            NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
+                .expect("defaults must extract");
+        assert_eq!(defaults.web.addr, None, "the web front defaults to off");
+        assert_eq!(defaults.web.root, None);
+
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DAEMON_WEB__ADDR", "127.0.0.1:8787");
+            jail.set_env("DAEMON_WEB__ROOT", "/srv/daemon-app");
+            let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
+                .unwrap_or_else(|e| panic!("env layer must extract: {e:#}"));
+            assert_eq!(cfg.web.addr.as_deref(), Some("127.0.0.1:8787"));
+            assert_eq!(cfg.web.root, Some(PathBuf::from("/srv/daemon-app")));
+            assert!(
+                !cfg.web.enable,
+                "the listener is independent of the web tools"
+            );
             Ok(())
         });
     }

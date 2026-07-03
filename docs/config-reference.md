@@ -6,6 +6,8 @@ Configuration is layered by [figment](https://docs.rs/figment), later sources wi
 
 The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse proxy in front of it for now. Browser connections must additionally match `api.ws_allowed_origins` (empty = every browser origin is refused).
 
+Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — the browser loads the GUI from the daemon and connects back to the same origin, so same-origin upgrades need no origin configuration (an `Origin` matching the request's own `Host` is accepted automatically; `api.ws_allowed_origins` grants extra cross-origin allowance). Static files are public; the api still requires SASL. The bundle directory is scanned once at startup (restart to pick up new files), and `https://`/`wss://` terminate at a reverse proxy for now — behind one, add the public origin to `api.ws_allowed_origins` (the derived self-origin is `http://`).
+
 | TOML path | Environment variable | Type | Default |
 |-----------|----------------------|------|---------|
 | `api.auth_db` | `DAEMON_API__AUTH_DB` | optional | _(unset)_ |
@@ -113,8 +115,10 @@ The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain
 | `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
 | `store` | `DAEMON_STORE` | string | `memory` |
 | `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |
+| `web.addr` | `DAEMON_WEB__ADDR` | optional | _(unset)_ |
 | `web.enable` | `DAEMON_WEB__ENABLE` | bool | `false` |
 | `web.firecrawl_key_id` | `DAEMON_WEB__FIRECRAWL_KEY_ID` | string | `firecrawl` |
 | `web.local_fallback` | `DAEMON_WEB__LOCAL_FALLBACK` | bool | `true` |
+| `web.root` | `DAEMON_WEB__ROOT` | optional | _(unset)_ |
 | `web.tavily_key_id` | `DAEMON_WEB__TAVILY_KEY_ID` | string | `tavily` |
 | `workspace_root` | `DAEMON_WORKSPACE_ROOT` | optional | _(unset)_ |
