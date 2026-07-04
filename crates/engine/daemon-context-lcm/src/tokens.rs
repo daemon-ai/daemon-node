@@ -4,16 +4,17 @@
 //! Token counting (`daemon-context-lcm-port-spec.md` §6.1, §12.2).
 //!
 //! LCM sizes its compaction threshold and leaf/condense budgets in tokens, so it counts with the
-//! model's real BPE when it can (`tiktoken-rs`, selected by model family) and falls back to a
-//! `chars/4` heuristic for unknown encodings. Per-message overhead mirrors the OpenAI chat-format
-//! accounting (`4` tokens/message + `3` reply-priming tokens — kept exact for parity).
+//! model's real BPE when it can (`tiktoken-rs`, selected by model family) and falls back to the
+//! Python `len/4 + 1` heuristic for unknown encodings (`count_tokens`, `LCM:tokens.py:32-42`).
+//! Per-message overhead mirrors the OpenAI chat-format accounting (`4` tokens/message + `3`
+//! reply-priming tokens — kept exact for parity).
 
 use daemon_core::{Conversation, Turn};
 use std::sync::Arc;
 use tiktoken_rs::CoreBPE;
 
 /// Per-message structural overhead (role/framing), OpenAI chat-format accounting.
-const PER_MESSAGE_OVERHEAD: usize = 4;
+pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;
 /// Per-request reply-priming overhead.
 const REPLY_PRIMING: usize = 3;
 
@@ -30,7 +31,7 @@ impl Default for Tokenizer {
 }
 
 impl Tokenizer {
-    /// The always-available `chars/4` heuristic (no BPE).
+    /// The always-available `len/4 + 1` heuristic (no BPE).
     pub fn heuristic() -> Self {
         Self { bpe: None }
     }
@@ -48,11 +49,15 @@ impl Tokenizer {
         self.bpe.is_some()
     }
 
-    /// Count the tokens in a bare string (no message overhead).
+    /// Count the tokens in a bare string (no message overhead). Empty text is `0`; the heuristic
+    /// fallback is Python's `len(text) // 4 + 1` (`count_tokens`, `LCM:tokens.py:32-42`).
     pub fn count_text(&self, text: &str) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
         match &self.bpe {
             Some(bpe) => bpe.encode_ordinary(text).len(),
-            None => text.len() / 4,
+            None => text.len() / 4 + 1,
         }
     }
 
@@ -122,10 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_is_chars_over_four() {
+    fn heuristic_is_chars_over_four_plus_one() {
         let tok = Tokenizer::heuristic();
         assert!(!tok.is_exact());
-        assert_eq!(tok.count_text("abcdefgh"), 2);
+        // Python: `len(text) // 4 + 1` for non-empty text, `0` for empty.
+        assert_eq!(tok.count_text("abcdefgh"), 3);
+        assert_eq!(tok.count_text("abc"), 1);
+        assert_eq!(tok.count_text(""), 0);
     }
 
     #[test]
@@ -133,8 +141,8 @@ mod tests {
         let tok = Tokenizer::heuristic();
         let mut c = Conversation::new(SystemPrompt::new(""));
         c.push_user(UserMsg::new("hello there"));
-        // priming(3) + user(len/4 + 4)
-        let expected = REPLY_PRIMING + ("hello there".len() / 4 + PER_MESSAGE_OVERHEAD);
+        // priming(3) + user(len/4 + 1 + 4)
+        let expected = REPLY_PRIMING + ("hello there".len() / 4 + 1 + PER_MESSAGE_OVERHEAD);
         assert_eq!(tok.count_conversation(&c), expected);
     }
 }
