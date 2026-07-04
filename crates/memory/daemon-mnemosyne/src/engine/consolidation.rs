@@ -215,6 +215,17 @@ impl Engine {
     /// provider) summarizes each group and hands the summaries to [`Engine::finish_sleep`]. Returns
     /// an empty vec when nothing is eligible.
     pub fn sleep_plan(&self, force: bool) -> Result<Vec<SleepGroup>> {
+        self.sleep_plan_inner(force, true)
+    }
+
+    /// A non-mutating sleep plan: the same candidate selection and grouping as
+    /// [`Engine::sleep_plan`] but WITHOUT the atomic claim, so nothing changes state
+    /// (`beam.py` sleep L7639-L7641: "The dry_run branch skips the claim entirely").
+    pub fn sleep_plan_dry_run(&self, force: bool) -> Result<Vec<SleepGroup>> {
+        self.sleep_plan_inner(force, false)
+    }
+
+    fn sleep_plan_inner(&self, force: bool, claim: bool) -> Result<Vec<SleepGroup>> {
         let conn = self.store.conn.lock().unwrap();
         let cutoff = if force {
             "9999-12-31T23:59:59+00:00".to_string()
@@ -268,19 +279,24 @@ impl Engine {
         }
 
         // Atomic claim: mark consolidated_at gated on it still being NULL, then keep only the rows we
-        // actually won (a concurrent sleep may have claimed some).
+        // actually won (a concurrent sleep may have claimed some). Dry-run keeps all candidates.
         let now = util::now_iso();
-        let mut claimed: Vec<Claimable> = Vec::new();
-        for c in candidates {
-            let n = conn.execute(
-                "UPDATE working_memory SET consolidated_at = ?2, consolidation_claimed_at = ?2 \
-                 WHERE id = ?1 AND consolidated_at IS NULL",
-                params![c.id, now],
-            )?;
-            if n == 1 {
-                claimed.push(c);
+        let claimed: Vec<Claimable> = if claim {
+            let mut won: Vec<Claimable> = Vec::new();
+            for c in candidates {
+                let n = conn.execute(
+                    "UPDATE working_memory SET consolidated_at = ?2, consolidation_claimed_at = ?2 \
+                     WHERE id = ?1 AND consolidated_at IS NULL",
+                    params![c.id, now],
+                )?;
+                if n == 1 {
+                    won.push(c);
+                }
             }
-        }
+            won
+        } else {
+            candidates
+        };
         if claimed.is_empty() {
             return Ok(Vec::new());
         }
@@ -430,6 +446,12 @@ impl Engine {
                     Some(&ep_id),
                     Some(&format!("{} items from {}", group.ids.len(), group.source)),
                 );
+                if let Some(pm) = self.plugins_if_active() {
+                    pm.notify_consolidate(&serde_json::json!({
+                        "summary": summary,
+                        "source_wm_ids": group.ids,
+                    }));
+                }
 
                 report.items_consolidated += group.ids.len();
                 report.summaries_created += 1;

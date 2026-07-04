@@ -97,6 +97,59 @@ impl Engine {
         }
     }
 
+    /// Tool-level audit event with explicit `bank`/`source_tool`/`metadata` stamps
+    /// (`hermes_memory_provider/__init__.py` `_audit_event`). Like [`Engine::audit`] the row
+    /// lands in THIS engine's bank-co-located `audit_log` — shared-surface tool events audit
+    /// into the private provider DB with `bank="surface"`, matching Python's provider-side log.
+    /// Fire-and-forget: locks the connection itself and swallows errors.
+    pub(crate) fn audit_tool(
+        &self,
+        action: &str,
+        memory_id: Option<&str>,
+        bank: &str,
+        source_tool: &str,
+        metadata: Option<&serde_json::Value>,
+    ) {
+        let conn = self.store.conn.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let none = Option::<String>::None;
+        let res = conn.execute(
+            "INSERT INTO audit_log \
+             (timestamp, action, memory_id, bank, scope, profile, session_id, source_tool, \
+              tokens_used, reason, metadata_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                ts,
+                action,
+                memory_id,
+                bank,
+                none,
+                none,
+                self.config.session_id,
+                source_tool,
+                Option::<i64>::None,
+                none,
+                metadata.map(|m| m.to_string()),
+            ],
+        );
+        if let Err(e) = res {
+            tracing::debug!(error = %e, action, "tool audit log insert failed (non-fatal)");
+        }
+    }
+
+    /// Test-only: the audit_log actions recorded against a bank label, insertion-ordered.
+    #[cfg(test)]
+    pub(crate) fn audit_rows_for_test(&self, bank: &str) -> Result<Vec<String>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT action FROM audit_log WHERE bank = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![bank], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Update a session-scoped working-memory row's `content` and/or `importance` (`beam.py`
     /// `update_working` L3809-L3853). FTS stays in sync via the `wm_au` trigger; on a content
     /// change the stale dense embedding is dropped so vector recall can't serve outdated state
@@ -181,6 +234,9 @@ impl Engine {
         if changed {
             let reason = replacement_id.map(|r| format!("superseded_by={r}"));
             self.audit(&conn, "invalidate", Some(id), reason.as_deref());
+            if let Some(pm) = self.plugins_if_active() {
+                pm.notify_invalidate(id);
+            }
         }
         Ok(changed)
     }
@@ -257,6 +313,46 @@ impl Engine {
             triples: count("SELECT COUNT(*) FROM triples WHERE valid_until IS NULL")?,
             conflicts: count("SELECT COUNT(*) FROM conflicts")?,
         })
+    }
+
+    /// All identity memories for the active session, importance-then-recency ordered — the
+    /// always-inject prefetch rows (`__init__.py` `_identity_fichas` L1547-L1582). Query-independent
+    /// and strictly session-scoped so there is zero cross-session leakage.
+    pub fn identity_rows(&self) -> Result<Vec<crate::prefetch::IdentityRow>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT content, importance, timestamp FROM working_memory \
+             WHERE source = 'identity' AND session_id = ?1 \
+             ORDER BY importance DESC, timestamp DESC",
+        )?;
+        let rows = stmt.query_map(params![self.config.session_id], |r| {
+            Ok(crate::prefetch::IdentityRow {
+                content: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                importance: r.get::<_, Option<f64>>(1)?.unwrap_or(0.95),
+                timestamp: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.flatten().filter(|r| !r.content.is_empty()).collect())
+    }
+
+    /// Count working rows a non-forced sleep pass would claim right now (`beam.py`
+    /// `_count_unconsolidated_before`; the auto-sleep eligibility gate, `__init__.py` L1735-L1738).
+    /// Matches [`Engine::sleep_plan`]'s candidate WHERE exactly.
+    pub fn eligible_for_sleep(&self) -> Result<i64> {
+        let half_ttl_minutes = (self.config.working_memory_ttl_hours * 30.0) as i64;
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::minutes(half_ttl_minutes)).to_rfc3339();
+        let conn = self.store.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM working_memory \
+             WHERE COALESCE(session_id, 'default') = ?1 \
+               AND timestamp < ?2 \
+               AND consolidated_at IS NULL \
+               AND (pinned IS NULL OR pinned = 0) \
+               AND superseded_by IS NULL",
+            params![self.config.session_id, cutoff],
+            |r| r.get(0),
+        )?)
     }
 
     /// A lightweight diagnostics summary (`beam.py` `health`).

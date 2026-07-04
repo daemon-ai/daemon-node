@@ -24,7 +24,10 @@ pub(crate) fn load_embeddings(conn: &Connection) -> Result<HashMap<String, Vec<f
 }
 
 /// Native sqlite-vec cosine path: `1 - vec_distance_cosine(query, embedding)` computed in SQLite.
+/// Consumed only by the vec0-vs-scalar parity test today (§7 spec: f32-BLOB + scalar cosine is
+/// the ratified default; this stays as the measured alternative for a future opt-in).
 #[cfg(feature = "vec-ext")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn native_cosine_sim_map(
     conn: &Connection,
     query: &[f32],

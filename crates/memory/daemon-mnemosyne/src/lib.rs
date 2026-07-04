@@ -32,6 +32,8 @@ pub mod error;
 pub mod extract;
 pub mod knowledge;
 pub mod memoria;
+pub mod plugins;
+pub mod prefetch;
 pub mod provider;
 pub mod recall;
 pub mod sanitize;

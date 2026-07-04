@@ -4,15 +4,16 @@
 //! The `MemoryProvider` implementation — port of `hermes_memory_provider/__init__.py`.
 //!
 //! Maps Mnemosyne onto the daemon-core seam: `prompt_block` = memory-override instructions
-//! (`system_prompt_block` L1437), `recall` = formatted BEAM recall block (`prefetch` L1474 / block
-//! format L1645-L1659), `after_turn` = the `sync_turn` persist gates (L1668), and `tools`/`call_tool`
-//! = the JSON tool dispatch (L1750). Current slice: the core hooks are wired; the full 26-tool table
-//! and identity-signal capture remain port-spec follow-ups.
+//! (`system_prompt_block` L1437), `recall` = the hardened prefetch pipeline
+//! ([`crate::prefetch`], `prefetch` L1474 / `_prefetch_bank` L1584 / `_prefetch_identity` L1514),
+//! `after_turn` = the `sync_turn` persist gates + identity-signal capture + gated auto-sleep
+//! (L1668-L1748), and `tools`/`call_tool` = the JSON tool dispatch (L1750) including the
+//! shared-surface bank (`_handle_shared_*` L1973-L2054).
 
 use crate::embeddings::Embedder;
-use crate::engine::{Engine, MemoryRow, RememberArgs};
+use crate::engine::{Engine, RememberArgs};
 use crate::extract::Extractor;
-use crate::MnemosyneConfig;
+use crate::{prefetch, MnemosyneConfig};
 use daemon_core::command::{
     CommandCx, CommandError, CommandInvocation, CommandOutput, CommandProvider,
     CommandProviderHandle, CommandSpec,
@@ -23,11 +24,27 @@ use daemon_core::tools::ToolDef;
 use daemon_core::{EmbeddingProvider, Provider};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-/// Auto-sleep cadence: run a consolidation pass every N persisted turns (`__init__.py` auto-sleep
-/// every 10 turns, L1690).
+/// Auto-sleep cadence: check the consolidation gate every N persisted turns (`__init__.py`
+/// `sync_turn` L1689: `turn_count % 10 == 0`).
 const AUTO_SLEEP_EVERY_TURNS: u64 = 10;
+
+/// Identity-significant expressions the user may voice about themselves or their relationship to
+/// their work (`__init__.py` `_IDENTITY_SIGNALS` L1698-L1709). A match persists the turn again as
+/// a high-importance global `[IDENTITY]` memory.
+const IDENTITY_SIGNALS: &[&str] = &[
+    "feeling like",
+    "imposter",
+    "impostor",
+    "barely know",
+    "don't know my own",
+    "don't even know how",
+    "want them to feel",
+    "i'm proud",
+    "i feel like a",
+    "i don't know how to",
+];
 
 /// The Mnemosyne memory provider over a single bank engine, with optional embedding + LLM backends.
 pub struct MnemosyneProvider {
@@ -35,6 +52,10 @@ pub struct MnemosyneProvider {
     embedder: Embedder,
     extractor: Extractor,
     turns: AtomicU64,
+    /// The lazily-opened shared-surface bank (`__init__.py` `_ensure_surface_beam` L1954): a
+    /// separate cross-profile DB at `<shared_surface_dir>/mnemosyne.db`, session
+    /// `hermes_shared_surface`. `Some(None)` = init failed (reported per tool call).
+    surface: OnceLock<Option<Arc<Engine>>>,
 }
 
 impl MnemosyneProvider {
@@ -45,6 +66,7 @@ impl MnemosyneProvider {
             embedder: Embedder::new(),
             extractor: Extractor::new(),
             turns: AtomicU64::new(0),
+            surface: OnceLock::new(),
         }
     }
 
@@ -55,6 +77,7 @@ impl MnemosyneProvider {
             embedder: Embedder::with_provider(embedder),
             extractor: Extractor::new(),
             turns: AtomicU64::new(0),
+            surface: OnceLock::new(),
         }
     }
 
@@ -69,6 +92,7 @@ impl MnemosyneProvider {
             embedder: embedder.map(Embedder::with_provider).unwrap_or_default(),
             extractor: llm.map(Extractor::with_provider).unwrap_or_default(),
             turns: AtomicU64::new(0),
+            surface: OnceLock::new(),
         }
     }
 
@@ -101,24 +125,75 @@ impl MnemosyneProvider {
         ))
     }
 
-    /// Format recall rows into a prompt block (`__init__.py` L1645-L1659):
-    /// `  [ts] (importance X.XX[, source S])[ TRUST] content`.
-    fn format_block(rows: &[MemoryRow]) -> String {
-        let mut out = String::from("## Mnemosyne Context\n");
-        for row in rows {
-            let ts = row.timestamp.chars().take(16).collect::<String>();
-            let mut meta = format!("importance {:.2}", row.importance);
-            if row.source != "conversation" && !row.source.is_empty() {
-                meta.push_str(&format!(", source {}", row.source));
-            }
-            let trust = if row.trust_tier != "STATED" && !row.trust_tier.is_empty() {
-                format!(" [{}]", row.trust_tier)
-            } else {
-                String::new()
-            };
-            out.push_str(&format!("  [{}] ({}){} {}\n", ts, meta, trust, row.content));
+    /// The lazily-opened shared-surface engine (`__init__.py` `_ensure_surface_beam` L1954-L1962).
+    /// `None` when opening failed (each shared tool call reports it, never panics). An in-memory
+    /// private bank gets an in-memory surface so the ephemeral default node touches no disk.
+    pub(crate) fn surface_engine(&self) -> Option<&Arc<Engine>> {
+        self.surface
+            .get_or_init(|| {
+                let cfg = self.engine.config();
+                let surface_config = MnemosyneConfig {
+                    data_dir: cfg.shared_surface_dir(),
+                    bank: "default".to_string(),
+                    session_id: "hermes_shared_surface".to_string(),
+                    ..cfg.clone()
+                };
+                let opened = if self.engine.is_persistent() {
+                    std::fs::create_dir_all(&surface_config.data_dir)
+                        .map_err(crate::Error::from)
+                        .and_then(|()| Engine::open(surface_config))
+                } else {
+                    Engine::open_in_memory(surface_config)
+                };
+                match opened {
+                    Ok(e) => Some(Arc::new(e)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mnemosyne shared surface init failed");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Should this turn role be persisted (`sync_roles` config, `__init__.py` L1673/L1681)?
+    fn syncs_role(&self, role: &str) -> bool {
+        self.engine
+            .config()
+            .sync_roles
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(role))
+    }
+
+    /// Whether content matches an ignore pattern (`__init__.py` `_should_filter` L1215-L1226).
+    /// Case-insensitive regex search; invalid patterns are skipped.
+    fn should_filter(&self, content: &str) -> bool {
+        self.engine.config().ignore_patterns.iter().any(|p| {
+            regex::Regex::new(&format!("(?i){p}"))
+                .map(|re| re.is_match(content))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Persist a user turn that voices an identity-significant feeling as a durable global
+    /// `[IDENTITY]` memory (`__init__.py` `_capture_identity_signals` L1711-L1723). One per turn.
+    fn capture_identity_signals(&self, user_content: &str) {
+        let lower = user_content.to_lowercase();
+        if IDENTITY_SIGNALS.iter().any(|sig| lower.contains(sig)) {
+            let _ = self.engine.remember(
+                &format!(
+                    "[IDENTITY] {}",
+                    user_content.chars().take(400).collect::<String>()
+                ),
+                &RememberArgs {
+                    source: "identity".to_string(),
+                    importance: 0.85,
+                    scope: "global".to_string(),
+                    veracity: "stated".to_string(),
+                    ..Default::default()
+                },
+            );
         }
-        out
     }
 }
 
@@ -129,44 +204,101 @@ impl MemoryProvider for MnemosyneProvider {
     }
 
     fn prompt_block(&self) -> Option<PromptBlock> {
+        // The active-memory branch of `system_prompt_block` (`__init__.py` L1444-L1450); the
+        // init-failed/skip-context branches are host concerns (the daemon simply doesn't register
+        // the provider), and the hermes legacy-tool deprecation sentence has no daemon equivalent.
         Some(PromptBlock {
-            text: "You have a persistent memory (Mnemosyne). Recalled context is injected below; \
-                   use the mnemosyne_* tools to remember, recall, and manage long-term memory."
+            text: "# Mnemosyne Memory\n\
+                   Active (native local memory). Use mnemosyne_remember to store ANY durable \
+                   fact, preference, identity, or insight. Use mnemosyne_recall to search. \
+                   Use mnemosyne_shared_* tools for manual shared surface CRUD."
                 .to_string(),
         })
     }
 
     async fn recall(&self, q: &RecallQuery) -> Option<RecalledBlock> {
-        // Embed the query at this async seam (keyword-only -> None) and pass the vector into the
-        // synchronous hybrid recall so the engine never blocks on a model call.
+        // The hardened prefetch pipeline (`__init__.py` `prefetch` L1474 / `_prefetch_bank`
+        // L1584): over-fetch, filter junk/raw transcript, rank by adjusted score, semantic-dedup,
+        // cap to the profile's top_k — then always-inject the session's identity rows up front.
+        let cfg = self.engine.config();
+        let profile = prefetch::resolve_profile(&cfg.prefetch_profile);
+        let content_limit = if cfg.prefetch_content_chars > 0 {
+            cfg.prefetch_content_chars
+        } else {
+            profile.content_char_limit
+        };
+
         let query_vec = self.embedder.embed_query(&q.text).await;
-        let rows = self
+        let overfetch = (profile.top_k * 2).max(prefetch::PREFETCH_OVERFETCH);
+        let filters = crate::config::RecallFilters {
+            temporal_weight: profile.temporal_weight,
+            temporal_halflife: Some(profile.temporal_halflife),
+            vec_weight: profile.vec_weight,
+            fts_weight: profile.fts_weight,
+            importance_weight: profile.importance_weight,
+            ..Default::default()
+        };
+        let bank_block = self
             .engine
-            .recall_with_vector(&q.text, q.top_k, query_vec.as_deref())
-            .ok()?;
-        if rows.is_empty() {
+            .recall_with_scope(&crate::engine::RecallReq {
+                query: &q.text,
+                top_k: overfetch,
+                query_vector: query_vec.as_deref(),
+                scope: &self.engine.config_scope(),
+                filters,
+            })
+            .ok()
+            .map(|rows| prefetch::filter_and_rank(rows, &profile))
+            .map(|rows| prefetch::render_bank_block(&rows, content_limit))
+            .unwrap_or_default();
+
+        // Per-contact identity memories surface on EVERY turn, independent of the recall query
+        // (`_prefetch_identity` L1499-L1545), deduplicated against what recall already produced.
+        let identity_block = self
+            .engine
+            .identity_rows()
+            .map(|rows| prefetch::render_identity_block(&rows, &bank_block, content_limit))
+            .unwrap_or_default();
+
+        let text = [identity_block, bank_block]
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if text.is_empty() {
             return None;
         }
-        Some(RecalledBlock {
-            text: Self::format_block(&rows),
-        })
+        Some(RecalledBlock { text })
     }
 
     async fn after_turn(&self, turn: &Turn, _conv: &Conversation) {
         // sync_turn gates (`__init__.py` L1668-L1692): persist the user text (>5 chars, capped at
-        // 500) and the assistant text (>10 chars, capped at 800) with their respective importances.
-        let (content, importance) = match turn {
-            Turn::User(u) if u.text.len() > 5 => (
-                format!("[USER] {}", u.text.chars().take(500).collect::<String>()),
-                0.5,
-            ),
-            Turn::Assistant(a) if a.text.len() > 10 => (
-                format!(
-                    "[ASSISTANT] {}",
-                    a.text.chars().take(800).collect::<String>()
-                ),
-                0.15,
-            ),
+        // 500) and the assistant text (>10 chars, capped at 800) with their respective
+        // importances, honoring the `sync_roles` and `ignore_patterns` config.
+        let (content, importance, is_user) = match turn {
+            Turn::User(u)
+                if u.text.len() > 5 && self.syncs_role("user") && !self.should_filter(&u.text) =>
+            {
+                (
+                    format!("[USER] {}", u.text.chars().take(500).collect::<String>()),
+                    0.5,
+                    true,
+                )
+            }
+            Turn::Assistant(a)
+                if a.text.len() > 10
+                    && self.syncs_role("assistant")
+                    && !self.should_filter(&a.text) =>
+            {
+                (
+                    format!(
+                        "[ASSISTANT] {}",
+                        a.text.chars().take(800).collect::<String>()
+                    ),
+                    0.15,
+                    false,
+                )
+            }
             _ => return,
         };
         // Embed once at this async seam; the precomputed vector is persisted with the row.
@@ -186,6 +318,13 @@ impl MemoryProvider for MnemosyneProvider {
             Err(_) => return,
         };
 
+        // Identity-signal capture is gated by user sync (`__init__.py` L1680).
+        if is_user {
+            if let Turn::User(u) = turn {
+                self.capture_identity_signals(&u.text);
+            }
+        }
+
         // LLM extraction layered on top of the always-on regex baseline (`extraction.py`): extract
         // at this async seam, then merge into the knowledge layer synchronously.
         if self.extractor.available() {
@@ -194,16 +333,24 @@ impl MemoryProvider for MnemosyneProvider {
             }
         }
 
-        // Turn-counter auto-sleep (`__init__.py` L1690): every N persisted turns, run a
-        // consolidation pass (summarizing through the LLM when present).
+        // Gated auto-sleep (`__init__.py` `sync_turn` L1688-L1690 + `_maybe_auto_sleep`
+        // L1725-L1748): every 10 persisted turns, when enabled, working memory exceeds the
+        // threshold, AND a non-forced pass would actually claim rows (the cheap eligibility check
+        // that avoids spinning up a full pass just to find nothing).
         let turns = self.turns.fetch_add(1, Ordering::Relaxed) + 1;
-        if turns.is_multiple_of(AUTO_SLEEP_EVERY_TURNS) {
-            self.run_sleep(false).await;
+        let cfg = self.engine.config();
+        if cfg.auto_sleep_enabled && turns.is_multiple_of(AUTO_SLEEP_EVERY_TURNS) {
+            let working = self.engine.stats().map(|s| s.working).unwrap_or(0);
+            let eligible = self.engine.eligible_for_sleep().unwrap_or(0);
+            if working > cfg.auto_sleep_threshold as i64 && eligible > 0 {
+                self.run_sleep(false).await;
+            }
         }
     }
 
     async fn before_compact(&self, _conv: &Conversation) {
-        // Port follow-up: persist salient facts before the body is compacted (`on_pre_compress`).
+        // Deliberate no-op: every turn is already persisted at `after_turn` time, so compaction
+        // loses nothing this provider hasn't stored. (Python has no compact hook at all.)
     }
 
     async fn on_session_switch(&self, reason: SwitchReason) {
@@ -349,8 +496,18 @@ impl MnemosyneProvider {
     }
 
     /// Dispatch one of [`Self::tools`] by name, returning a JSON string result.
+    ///
+    /// The shared-surface engine is materialized lazily on the first `shared_*` call (or
+    /// `mnemosyne_recall` with surface read enabled); when init fails, `shared_*` tools report
+    /// the error instead of silently writing to the private bank.
     pub async fn call_tool(&self, name: &str, args: Value) -> String {
-        crate::tools::dispatch(&self.engine, &self.embedder, &self.extractor, name, args).await
+        let cx = crate::tools::ToolCx {
+            engine: &self.engine,
+            embedder: &self.embedder,
+            extractor: &self.extractor,
+            surface: self.surface_engine().map(|e| &**e),
+        };
+        crate::tools::dispatch(&cx, name, args).await
     }
 }
 
@@ -483,19 +640,105 @@ mod tests {
             )
             .await;
         assert!(
-            remembered.contains("\"status\":\"ok\""),
+            remembered.contains("\"status\":\"stored\""),
             "got: {remembered}"
         );
+        // Tool writes default to source "user" (`_handle_remember` L1838).
+        let parsed: Value = serde_json::from_str(&remembered).unwrap();
+        let row = provider
+            .engine
+            .get(parsed["memory_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.source, "user");
 
         let recalled = provider
             .call_tool("mnemosyne_recall", json!({"query": "eviction policy"}))
             .await;
         assert!(recalled.contains("LRU"), "recall via tool: {recalled}");
+        assert!(
+            recalled.contains("\"bank\":\"private\""),
+            "private rows are bank-tagged: {recalled}"
+        );
 
         let stats = provider.call_tool("mnemosyne_stats", json!({})).await;
         assert!(stats.contains("\"working\":1"), "stats: {stats}");
 
         let unknown = provider.call_tool("mnemosyne_nope", json!({})).await;
         assert!(unknown.contains("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn shared_tools_write_to_separate_surface_bank() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+
+        // Kind validation (`_handle_shared_remember` L1984).
+        let bad = provider
+            .call_tool(
+                "mnemosyne_shared_remember",
+                json!({"content": "x", "kind": "gossip"}),
+            )
+            .await;
+        assert!(bad.contains("kind must be one of"), "got: {bad}");
+
+        // Raw conversation content is rejected (L1979).
+        let raw = provider
+            .call_tool(
+                "mnemosyne_shared_remember",
+                json!({"content": "[USER] hi there"}),
+            )
+            .await;
+        assert!(raw.contains("raw conversation content"), "got: {raw}");
+
+        let stored = provider
+            .call_tool(
+                "mnemosyne_shared_remember",
+                json!({"content": "the user prefers dark mode", "kind": "preference"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed["status"], "stored_shared", "got: {stored}");
+        let sid = parsed["memory_id"].as_str().unwrap();
+        assert!(sid.starts_with("sf_"), "stable surface id, got {sid}");
+
+        // Exact repeat hits the dedup path (`_find_duplicate`) -> reported as existing.
+        let again = provider
+            .call_tool(
+                "mnemosyne_shared_remember",
+                json!({"content": "the user prefers dark mode", "kind": "preference"}),
+            )
+            .await;
+        assert!(again.contains("existing_shared"), "got: {again}");
+
+        // The private bank saw none of it.
+        assert_eq!(provider.engine.stats().unwrap().working, 0);
+
+        // Surface recall finds it, tagged with its bank.
+        let recalled = provider
+            .call_tool("mnemosyne_shared_recall", json!({"query": "dark mode"}))
+            .await;
+        assert!(recalled.contains("Surface preference"), "got: {recalled}");
+        assert!(recalled.contains("\"bank\":\"surface\""), "got: {recalled}");
+
+        // Forget via the Python arg name (`memory_id`).
+        let forgotten = provider
+            .call_tool("mnemosyne_shared_forget", json!({"memory_id": sid}))
+            .await;
+        assert!(
+            forgotten.contains("\"status\":\"deleted\""),
+            "got: {forgotten}"
+        );
+
+        // Tool-level audit rows landed in the PRIVATE bank's audit_log with bank="surface".
+        let audits = provider
+            .engine
+            .audit_rows_for_test("surface")
+            .expect("audit query");
+        assert!(
+            audits.iter().any(|a| a == "shared_remember")
+                && audits.iter().any(|a| a == "shared_forget"),
+            "audit actions: {audits:?}"
+        );
     }
 }

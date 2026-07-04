@@ -136,6 +136,30 @@ pub struct MnemosyneConfig {
     /// Multi-agent identity: channel/group id (`MNEMOSYNE_CHANNEL_ID`, `beam.py` ctor L2618). Writes
     /// default it to `session_id`; recall only filters on it when explicitly set.
     pub channel_id: Option<String>,
+    /// Named prefetch profile for the provider's per-turn recall injection
+    /// (`MNEMOSYNE_PREFETCH_PROFILE`; `general` or `social-chat`, unknown -> `general`).
+    pub prefetch_profile: String,
+    /// Per-memory prefetch content char cap; `0` = untruncated
+    /// (`MNEMOSYNE_PREFETCH_CONTENT_CHARS`, default 0).
+    pub prefetch_content_chars: usize,
+    /// Auto-run a sleep pass from `after_turn` every 10 persisted turns when working memory
+    /// exceeds [`Self::auto_sleep_threshold`] (`MNEMOSYNE_AUTO_SLEEP_ENABLED`, default off).
+    pub auto_sleep_enabled: bool,
+    /// Working-memory row count that arms auto-sleep (`sleep_threshold`, default 50).
+    pub auto_sleep_threshold: usize,
+    /// Conversation roles persisted by `after_turn` (`MNEMOSYNE_SYNC_ROLES` / `sync_roles`,
+    /// default `["user", "assistant"]`; empty disables autosave; identity capture is gated by
+    /// `user`).
+    pub sync_roles: Vec<String>,
+    /// Regex patterns filtered from turn autosave (`ignore_patterns`, case-insensitive search;
+    /// invalid patterns are skipped).
+    pub ignore_patterns: Vec<String>,
+    /// Directory holding the shared-surface bank (`shared_surface_path`; the DB file is
+    /// `<dir>/mnemosyne.db`). `None` -> `<data_dir>/shared`.
+    pub shared_surface_dir: Option<PathBuf>,
+    /// Merge shared-surface hits into `mnemosyne_recall`, tagging each result's `bank`
+    /// (`shared_surface_read`, default off).
+    pub shared_surface_read: bool,
 }
 
 /// The multi-agent identity scope applied to a recall (`beam.py` `recall` author/channel params
@@ -182,6 +206,13 @@ pub struct RecallFilters {
     /// Temporal decay half-life in hours; `None` = the configured
     /// [`MnemosyneConfig::temporal_halflife_hours`].
     pub temporal_halflife: Option<f64>,
+    /// Per-call vec-weight override before normalization (`beam.py` `recall(vec_weight=...)`);
+    /// `None` = the configured [`MnemosyneConfig::recall_weights`]. Base pipeline only.
+    pub vec_weight: Option<f64>,
+    /// Per-call FTS-weight override (`fts_weight=...`).
+    pub fts_weight: Option<f64>,
+    /// Per-call importance-weight override (`importance_weight=...`).
+    pub importance_weight: Option<f64>,
 }
 
 impl Default for MnemosyneConfig {
@@ -216,6 +247,14 @@ impl Default for MnemosyneConfig {
             author_id: None,
             author_type: None,
             channel_id: None,
+            prefetch_profile: "general".to_string(),
+            prefetch_content_chars: 0,
+            auto_sleep_enabled: false,
+            auto_sleep_threshold: 50,
+            sync_roles: vec!["user".to_string(), "assistant".to_string()],
+            ignore_patterns: Vec::new(),
+            shared_surface_dir: None,
+            shared_surface_read: false,
         }
     }
 }
@@ -238,5 +277,14 @@ impl MnemosyneConfig {
                 .join(&self.bank)
                 .join("mnemosyne.db")
         }
+    }
+
+    /// The shared-surface bank directory (`shared_surface_path` config key; Python default
+    /// `<mnemosyne>/data/shared/mnemosyne.db`). Divergence: Rust configures the *directory*, the
+    /// DB file inside is always `mnemosyne.db`.
+    pub fn shared_surface_dir(&self) -> PathBuf {
+        self.shared_surface_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("shared"))
     }
 }

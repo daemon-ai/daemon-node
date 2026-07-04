@@ -188,6 +188,9 @@ impl Engine {
             if let Some(cache) = self.query_cache.get() {
                 cache.invalidate();
             }
+            if let Some(pm) = self.plugins_if_active() {
+                pm.notify_remember(&serde_json::json!({"id": existing_id, "content": content}));
+            }
             return Ok(existing_id);
         }
 
@@ -265,7 +268,17 @@ impl Engine {
         if let Some(cache) = self.query_cache.get() {
             cache.invalidate();
         }
+        if let Some(pm) = self.plugins_if_active() {
+            pm.notify_remember(&serde_json::json!({"id": id, "content": content}));
+        }
         Ok(id)
+    }
+
+    /// Public exact-dedup probe for the tool layer (`__init__.py` `_handle_shared_remember` L1995
+    /// checks for an existing row to report `existing_shared` vs `stored_shared`).
+    pub fn find_existing(&self, content: &str) -> Result<Option<String>> {
+        let conn = self.store.conn.lock().unwrap();
+        self.find_duplicate(&conn, content)
     }
 
     /// Exact same-session content dedup lookup (`beam.py` `_find_duplicate` L2801-L2811).

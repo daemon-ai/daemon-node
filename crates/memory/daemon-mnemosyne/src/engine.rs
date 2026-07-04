@@ -413,6 +413,9 @@ pub struct Engine {
     /// Recall path provenance counters (`recall_diagnostics.py`; Python's process-global
     /// singleton, owned per engine here).
     recall_diag: RecallDiagnostics,
+    /// Lazily-materialized plugin manager (`memory.py` "Phase 8: Plugins" lazy property
+    /// L286-L292). Never touched by a host = never built = zero overhead per event.
+    plugins: OnceLock<crate::plugins::PluginManager>,
 }
 
 impl Engine {
@@ -427,6 +430,7 @@ impl Engine {
             device_id: OnceLock::new(),
             event_seq: std::sync::atomic::AtomicU64::new(0),
             recall_diag: RecallDiagnostics::default(),
+            plugins: OnceLock::new(),
         })
     }
 
@@ -441,12 +445,26 @@ impl Engine {
             device_id: OnceLock::new(),
             event_seq: std::sync::atomic::AtomicU64::new(0),
             recall_diag: RecallDiagnostics::default(),
+            plugins: OnceLock::new(),
         })
     }
 
     /// The recall path provenance counters (`recall_diagnostics.py` `get_diagnostics`).
     pub fn recall_diagnostics(&self) -> &RecallDiagnostics {
         &self.recall_diag
+    }
+
+    /// The plugin manager, materialized on first access (`memory.py` lazy `plugins` property
+    /// L286-L292). Built-ins are registered but unloaded; call
+    /// [`crate::plugins::PluginManager::load_all`] or load individually to activate them.
+    pub fn plugins(&self) -> &crate::plugins::PluginManager {
+        self.plugins.get_or_init(crate::plugins::PluginManager::new)
+    }
+
+    /// The plugin manager only if a host has materialized it — the lifecycle notification
+    /// call sites use this so an untouched manager costs one atomic load per event.
+    pub(crate) fn plugins_if_active(&self) -> Option<&crate::plugins::PluginManager> {
+        self.plugins.get()
     }
 
     /// The lazily-opened query cache (`query_cache.db` next to the bank when persistent, else
@@ -469,6 +487,16 @@ impl Engine {
     /// The active session id.
     pub fn session_id(&self) -> &str {
         &self.config.session_id
+    }
+
+    /// The engine configuration (read-only; the provider/tool layer reads its knobs).
+    pub fn config(&self) -> &MnemosyneConfig {
+        &self.config
+    }
+
+    /// Whether this engine is backed by a disk file (false for the ephemeral in-memory banks).
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
     }
 
     /// Whether the opt-in tier-2 LLM conflict detector is enabled (`MNEMOSYNE_LLM_CONFLICT_DETECTION`).

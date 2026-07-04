@@ -233,11 +233,27 @@ impl Engine {
     /// As [`Engine::recall_with_vector`], but with an explicit [`RecallReq`] carrying the
     /// multi-agent [`RecallScope`] and the per-call [`RecallFilters`].
     pub fn recall_with_scope(&self, req: &RecallReq) -> Result<Vec<MemoryRow>> {
-        match self.config.recall_mode {
-            RecallMode::Base => self.recall_base(req, self.config.recall_weights),
+        let rows = match self.config.recall_mode {
+            RecallMode::Base => {
+                // Per-call weight overrides (`beam.py` `recall(vec_weight=..., ...)` kwargs);
+                // unset components fall back to the configured defaults.
+                let (dv, df, di) = self.config.recall_weights;
+                let weights = (
+                    req.filters.vec_weight.unwrap_or(dv),
+                    req.filters.fts_weight.unwrap_or(df),
+                    req.filters.importance_weight.unwrap_or(di),
+                );
+                self.recall_base(req, weights)
+            }
             RecallMode::Enhanced => self.recall_enhanced(req),
             RecallMode::Polyphonic => self.recall_polyphonic(req),
+        }?;
+        if let Some(pm) = self.plugins_if_active() {
+            for row in &rows {
+                pm.notify_recall(&serde_json::json!({"id": row.id, "content": row.content}));
+            }
         }
+        Ok(rows)
     }
 
     /// The recall scope *branch* predicate + params (`beam.py` L5182-L5192): channel-widened,

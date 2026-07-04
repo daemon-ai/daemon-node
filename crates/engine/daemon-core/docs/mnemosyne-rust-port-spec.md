@@ -992,10 +992,26 @@ Arc<Engine>, config }`.
 - `after_turn(turn, conv)` <- `sync_turn` (L1668-L1692): from the `Turn`, persist the user text
   (`len > 5`, importance 0.5, `extract_entities=true`) and assistant text (`len > 10`, importance
   0.15); identity-signal capture (substring match -> `[IDENTITY]` row, importance 0.85, scope
-  global); increment turn counter; auto-sleep every 10 turns when enabled. No LLM extraction on the
-  hot path (tool-driven only).
-- `before_compact(conv)` -> persist salient facts; `on_session_switch(reason)` /
-  session end -> `engine.sleep()` on a background task.
+  global); increment turn counter; auto-sleep every 10 turns when enabled.
+
+  **As-built:** both writes are gated by `sync_roles` (default `["user"]`, `MEMORY_SYNC_ROLES`)
+  and the case-insensitive `ignore_patterns` regex list (`_should_filter` L1215); identity capture
+  runs on user turns (`IDENTITY_SIGNALS` substring set); LLM fact extraction *does* run at this
+  async seam when a `Provider` is injected (the seam is Rust's equivalent of Python's
+  tool/CLI-driven extraction path); auto-sleep checks every 10th persisted turn but only fires when
+  `auto_sleep_enabled` (default **off**, `MNEMOSYNE_AUTO_SLEEP`) and `eligible_for_sleep() >=
+  auto_sleep_threshold` (default 50).
+- `recall(q)` **prefetch hardening as-built ([`prefetch.rs`](../../../memory/daemon-mnemosyne/src/prefetch.rs)
+  <- `_prefetch_*`, `__init__.py` L1230-L1546):** 3x over-fetch, then profile-driven filter/rank —
+  low-quality fragment drop (len<40 after `[RAW]`-prefix strip, mid-sentence starts, filler/stopword
+  openers), distilled-source-only + topic-signal gates (`social-chat` profile), adjusted score
+  (`score*(0.5+0.5*source_quality) - raw_penalty`), token-set semantic dedup (0.82 Jaccard), content
+  render truncation (300/220 chars), and the always-injected session-scoped identity block
+  (`_identity_fichas` L1547: importance-then-recency, deduped against recall output). Profiles:
+  `general` (default) and `social-chat` (`MEMORY_PREFETCH_PROFILE`).
+- `before_compact(conv)` -> deliberate no-op (Python provider defines no compaction hook; sleep
+  covers durability at session boundaries); `on_session_switch(reason)` /
+  session end -> forced `run_sleep` on a background task.
 - `tools()` / `call_tool()` <- the **26-tool** dispatch (`__init__.py` L920-L929, L1771-L1824), each
   returning a JSON string: `mnemosyne_remember/recall/get/update/forget/invalidate/validate`,
   `mnemosyne_sleep/stats/diagnose`, `mnemosyne_triple_{add,end,query}`,
@@ -1004,15 +1020,49 @@ Arc<Engine>, config }`.
   `mnemosyne_sync_*` tools are added under the `sync` feature (parity with `mnemosyne_hermes`).
 
 **As-built ([`tools.rs`](../../../memory/daemon-mnemosyne/src/tools.rs)):** the dispatch is factored
-into `crate::tools::{defs, dispatch}` (one table + one match, not a giant method); `tools()`/
-`call_tool()` delegate to it. The full surface is implemented over the §13 backing `Engine` methods
+into `crate::tools::{defs, dispatch}` (one table + one match, not a giant method) over a `ToolCx`
+carrying the private engine, the embedder/extractor seams, and the lazily-opened shared-surface
+engine; `tools()`/`call_tool()` delegate to it. The full surface is implemented over the §13 backing
+`Engine` methods
 (`get`/`update`/`forget`/`invalidate`/`validate`/`stats`/`diagnose`/`scratchpad_{write,read,clear}`/
 `export`/`import`/`graph_{query,link}`/`triple_{add,end,query}`/`canonical_{remember,recall,forget}`):
 `remember/recall/get/update/forget/invalidate/validate`, `sleep/stats/diagnose`, `triple_{add,end,query}`,
 `{remember,recall}_canonical`, `scratchpad_{write,read,clear}`, `graph_{query,link}`, `export/import`,
-and the `shared_{remember,recall,forget,stats}` surface (`shared_remember` = global scope). Under the
+and the `shared_{remember,recall,forget,stats}` surface. Under the
 `sync` feature, `sync_{status,export,import}` land as wrappers over the export-bundle / local surface;
-the full event-log replication subsystem stays P3.
+the full event-log replication subsystem stays P3. Arg/response parity notes:
+
+- `mnemosyne_remember` takes the full `_handle_remember` arg set (`source` default **user**, `scope`,
+  `valid_until`, `extract_entities`, `extract`, `metadata`, clamped `veracity`) and returns the
+  `{"status":"stored", "memory_id", "content_preview", ...}` shape; `extract=true` runs LLM
+  extraction at the async dispatch seam.
+- `mnemosyne_recall` accepts `limit` (Python's arg name; `top_k` kept as an alias), the temporal
+  knobs, the row filters, and per-call `vec_weight`/`fts_weight`/`importance_weight` overrides
+  forwarded **only when supplied** (issue #45); results are full row dicts tagged `bank:"private"`,
+  and when `shared_surface_read` is on, surface results (tagged `bank:"surface"`,
+  `shared_surface:true`) are merged by score and truncated to `limit` (`_handle_recall` L1906).
+- `mnemosyne_sleep` supports `dry_run` (non-claiming `sleep_plan_dry_run`, `beam.py` L7639) and
+  `force`.
+
+**Shared surface (`_ensure_surface_beam` L1954 -> `MnemosyneProvider::surface_engine`):** a second
+`Engine` on its own cross-profile DB (`shared_surface_dir()/mnemosyne.db`, default
+`<data_dir>/shared/`, override `HERMES_SHARED_MEMORY_DIR`; in-memory when the private bank is
+in-memory), session id `hermes_shared_surface`, lazily opened via `OnceLock` — init failure makes
+`shared_*` tools report `{"error": "shared surface DB is not initialized"}` rather than fall back to
+the private bank. `shared_remember` ports the whole L1973-L2017 pipeline: `[USER]`/`[ASSISTANT]`
+raw-content rejection, `kind` whitelist (meta/preference/correction/identity), kind labeling
+(`Surface preference: ...`), the stable content-hash id (`sf_` + sha256(`surface:v1:` +
+lowercased/whitespace-collapsed content)[..24]), importance clamp (default 0.8), metadata stamps
+(`shared_memory`/`surface_kind`/`write_path`/`source_profile_session`), and
+`existing_shared`/`stored_shared` status via the exact-dedup probe. `shared_forget` takes
+`memory_id` (Python arg name).
+
+**Audit (`audit.py` + `_audit_event`):** every engine-level mutation writes a fire-and-forget row
+into the bank-co-located `audit_log` (remember/update/forget/invalidate/validate/consolidate, §12.4);
+tool-level events with no engine counterpart go through `Engine::audit_tool` with explicit
+`bank`/`source_tool`/`metadata_json` stamps — `shared_remember`/`shared_forget` audit into the
+**private** provider DB with `bank="surface"` (matching Python's provider-side log placement), and
+`mnemosyne_sleep` audits `action="sleep"`.
 
 `on_pre_compress` and `on_session_switch` are **not implemented** in the Python provider; in Rust
 they are real (no-op-safe) hooks that map to `before_compact` and a session-end sleep respectively.
@@ -1024,8 +1074,21 @@ The `mnemosyne_diagnose` tool dispatches to the diagnostics subsystem documented
 L449) fans out four lifecycle hooks to registered plugins, swallowing per-plugin errors (L620-L649):
 `on_remember` (L61), `on_recall` (L66), `on_consolidate` (L71), `on_invalidate` (L76). Four built-ins
 ship: `LoggingPlugin` (L91), `MetricsPlugin` (L167), `FilterPlugin` (L245, content/PII filtering),
-and `CompressionPlugin` (L322). In Rust this is a `trait MnemosynePlugin` with a `Vec<Arc<dyn …>>`
-fan-out invoked from `Engine` at the corresponding seams; errors are logged, never propagated.
+and `CompressionPlugin` (L322).
+
+**As-built ([`plugins.rs`](../../../memory/daemon-mnemosyne/src/plugins.rs)):** `trait
+MnemosynePlugin` (no-op default hooks; `&self` + interior mutability) with the four built-ins ported;
+`PluginManager` registers instances (`Arc<dyn MnemosynePlugin>`; no runtime source-file discovery —
+hosts link plugins in and register explicitly), lazily loads on `get_plugin`, and fans out
+`notify_{remember,recall,consolidate,invalidate}` to loaded+enabled plugins. The manager is a lazy
+`OnceLock` on `Engine` (`memory.py`'s lazy `plugins` property): the engine emits the four lifecycle
+events from `remember`/`recall_with_scope`/`invalidate`/`finish_sleep` and consults the concrete
+`CompressionPlugin` before sleep summarization (`beam.py` L7736-L7743) — all gated on the manager
+having been materialized, so an untouched engine pays one atomic load per event. Note the Rust
+wiring is a deliberate superset: Python defines `notify_*` but never calls them from `beam.py`
+(only the compression consult is wired); Rust makes Logging/Metrics actually observe engine events.
+`CompressionPlugin` is permanently in Python's backend-unavailable state (`compress_lines` =
+identity) since no `rust_cave_001` equivalent is linked.
 
 ---
 
@@ -1085,8 +1148,9 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
   (`validate_conflict_pair` via the injected `daemon_core::Provider`, `[mnemosyne].llm_conflict_detection`,
   layered atop the `(S,P)` veracity path in `run_sleep`); and threshold-0.8 fuzzy entity matching
   (`entities::find_similar_entities`) wired into `inject_entity_candidates`. MIB binary bonus shipped
-  in P0; plugins remain P3.
-- **P3 — ecosystem:** sync/streaming, SHMR, patterns, plugins, local-GGUF fallback.
+  in P0.
+- **P3 — ecosystem:** SHMR, patterns, and plugins have since landed (§9.4, §13); sync/streaming and
+  the local-GGUF fallback remain.
 
 ---
 

@@ -36,11 +36,11 @@ pub fn defs() -> Vec<ToolDef> {
     let mut defs = vec![
         def(
             "mnemosyne_remember",
-            r#"{"type":"object","properties":{"content":{"type":"string"},"importance":{"type":"number"},"scope":{"type":"string"},"veracity":{"type":"string"}},"required":["content"]}"#,
+            r#"{"type":"object","properties":{"content":{"type":"string"},"importance":{"type":"number"},"source":{"type":"string"},"scope":{"type":"string"},"valid_until":{"type":"string"},"extract_entities":{"type":"boolean"},"extract":{"type":"boolean"},"metadata":{"type":"object"},"veracity":{"type":"string"}},"required":["content"]}"#,
         ),
         def(
             "mnemosyne_recall",
-            r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"},"author_id":{"type":"string"},"author_type":{"type":"string"},"channel_id":{"type":"string"}},"required":["query"]}"#,
+            r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"temporal_weight":{"type":"number"},"query_time":{"type":"string"},"temporal_halflife":{"type":"number"},"vec_weight":{"type":"number"},"fts_weight":{"type":"number"},"importance_weight":{"type":"number"},"from_date":{"type":"string"},"to_date":{"type":"string"},"source":{"type":"string"},"topic":{"type":"string"},"veracity":{"type":"string"},"memory_type":{"type":"string"},"author_id":{"type":"string"},"author_type":{"type":"string"},"channel_id":{"type":"string"}},"required":["query"]}"#,
         ),
         def(
             "mnemosyne_get",
@@ -64,7 +64,7 @@ pub fn defs() -> Vec<ToolDef> {
         ),
         def(
             "mnemosyne_sleep",
-            r#"{"type":"object","properties":{"force":{"type":"boolean"}}}"#,
+            r#"{"type":"object","properties":{"force":{"type":"boolean"},"dry_run":{"type":"boolean"}}}"#,
         ),
         def("mnemosyne_stats", r#"{"type":"object","properties":{}}"#),
         def("mnemosyne_diagnose", r#"{"type":"object","properties":{}}"#),
@@ -115,15 +115,15 @@ pub fn defs() -> Vec<ToolDef> {
         ),
         def(
             "mnemosyne_shared_remember",
-            r#"{"type":"object","properties":{"content":{"type":"string"},"importance":{"type":"number"}},"required":["content"]}"#,
+            r#"{"type":"object","properties":{"content":{"type":"string"},"kind":{"type":"string","enum":["meta","preference","correction","identity"]},"importance":{"type":"number"},"metadata":{"type":"object"},"veracity":{"type":"string"}},"required":["content"]}"#,
         ),
         def(
             "mnemosyne_shared_recall",
-            r#"{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer"},"author_id":{"type":"string"},"author_type":{"type":"string"},"channel_id":{"type":"string"}},"required":["query"]}"#,
+            r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}"#,
         ),
         def(
             "mnemosyne_shared_forget",
-            r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
+            r#"{"type":"object","properties":{"memory_id":{"type":"string"}},"required":["memory_id"]}"#,
         ),
         def(
             "mnemosyne_shared_stats",
@@ -159,6 +159,84 @@ fn s<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({"status": "error", "error": e.to_string()}).to_string()
+}
+
+/// Everything a tool call can touch: the private bank plus the optional shared-surface bank
+/// (`__init__.py` `_surface_beam`). Built per call by [`crate::MnemosyneProvider::call_tool`].
+pub struct ToolCx<'a> {
+    /// The private (per-profile) bank engine.
+    pub engine: &'a Engine,
+    /// The embedding seam (empty in keyword-only mode).
+    pub embedder: &'a Embedder,
+    /// The LLM seam (empty when no provider is injected).
+    pub extractor: &'a Extractor,
+    /// The shared-surface engine; `None` = init failed/unavailable.
+    pub surface: Option<&'a Engine>,
+}
+
+impl ToolCx<'_> {
+    fn surface(&self) -> std::result::Result<&Engine, String> {
+        self.surface
+            .ok_or_else(|| json!({"error": "shared surface DB is not initialized"}).to_string())
+    }
+}
+
+/// The valid shared-surface kinds (`_handle_shared_remember` L1984).
+const SURFACE_KINDS: &[&str] = &["meta", "preference", "correction", "identity"];
+
+/// Stable shared-surface id: `sf_` + sha256 of the normalized content (`_surface_hash` L1936).
+fn surface_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = content
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let digest = Sha256::digest(format!("surface:v1:{normalized}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sf_{}", &hex[..24])
+}
+
+/// Prefix surface content with its kind label unless already labeled (`_surface_label` L1942).
+fn surface_label(content: &str, kind: &str) -> String {
+    let lower = content.to_lowercase();
+    for prefix in [
+        "surface meta:",
+        "surface preference:",
+        "surface correction:",
+        "surface identity:",
+        "surface fact:",
+    ] {
+        if lower.starts_with(prefix) {
+            return content.to_string();
+        }
+    }
+    let label = match kind {
+        "preference" => "Surface preference",
+        "correction" => "Surface correction",
+        "identity" => "Surface identity",
+        _ => "Surface meta",
+    };
+    format!("{label}: {content}")
+}
+
+/// One recall row as the tool JSON shape (Python `dict(row)` result rows), tagged with its bank.
+fn row_json(r: &crate::engine::MemoryRow, bank: &str) -> Value {
+    let mut v = json!({
+        "id": r.id,
+        "content": r.content,
+        "score": r.score,
+        "importance": r.importance,
+        "source": r.source,
+        "timestamp": r.timestamp,
+        "veracity": r.veracity,
+        "trust_tier": r.trust_tier,
+        "bank": bank,
+    });
+    if bank == "surface" {
+        v["shared_surface"] = json!(true);
+    }
+    v
 }
 
 /// Run a sleep pass, summarizing via the LLM when present (AAAK fallback otherwise) and embedding
@@ -201,9 +279,17 @@ pub async fn run_sleep(
     let mut summaries: HashMap<String, GroupSummary> = HashMap::new();
     for group in &groups {
         let llm_text = if extractor.available() {
-            extractor
-                .summarize(Engine::summary_prompt(&group.contents))
-                .await
+            // Optional pre-compression of the summarization input (`beam.py` L7736-L7743):
+            // consulted only when a host has materialized the plugin manager AND enabled the
+            // compression plugin (identity transform while no backend is linked).
+            use crate::plugins::MnemosynePlugin as _;
+            let lines = match engine.plugins_if_active() {
+                Some(pm) if pm.compression().enabled() => {
+                    pm.compression().compress_lines(group.contents.clone())
+                }
+                _ => group.contents.clone(),
+            };
+            extractor.summarize(Engine::summary_prompt(&lines)).await
         } else {
             None
         };
@@ -227,44 +313,81 @@ pub async fn run_sleep(
 }
 
 /// Dispatch one `mnemosyne_*` tool by name, returning a JSON string result.
-pub async fn dispatch(
-    engine: &Engine,
-    embedder: &Embedder,
-    extractor: &Extractor,
-    name: &str,
-    args: Value,
-) -> String {
+pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
+    let engine = cx.engine;
+    let embedder = cx.embedder;
+    let extractor = cx.extractor;
     match name {
-        "mnemosyne_remember" | "mnemosyne_shared_remember" => {
+        "mnemosyne_remember" => {
             let content = s(&args, "content").unwrap_or("");
+            if content.is_empty() {
+                return json!({"error": "content is required"}).to_string();
+            }
             let importance = args.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
-            let scope = if name == "mnemosyne_shared_remember" {
-                "global".to_string()
-            } else {
-                s(&args, "scope").unwrap_or("session").to_string()
-            };
-            let veracity = s(&args, "veracity").unwrap_or("unknown").to_string();
+            // Tool writes default to source "user" (`_handle_remember` L1838), not the
+            // engine's "conversation" default.
+            let source = s(&args, "source").unwrap_or("user").to_string();
+            let scope = s(&args, "scope").unwrap_or("session").to_string();
+            let veracity = crate::knowledge::veracity::clamp_veracity(
+                s(&args, "veracity").unwrap_or(""),
+                "mnemosyne_remember",
+            );
+            let extract_entities = args
+                .get("extract_entities")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let extract = args.get("extract").and_then(|v| v.as_bool()).unwrap_or(false);
+            let metadata = args.get("metadata").filter(|m| m.is_object()).cloned();
             let vector = embedder.embed_query(content).await;
             let model = embedder.model().unwrap_or("");
-            match engine.remember_with_vector(
+            let id = match engine.remember_with_vector(
                 content,
                 &RememberArgs {
-                    source: "conversation".to_string(),
+                    source,
                     importance,
                     scope,
-                    veracity,
+                    veracity: veracity.clone(),
+                    metadata: metadata.clone(),
+                    valid_until: s(&args, "valid_until").map(String::from),
+                    extract_entities,
+                    extract,
                     ..Default::default()
                 },
                 vector.as_deref(),
                 model,
             ) {
-                Ok(id) => json!({"status": "ok", "memory_id": id}).to_string(),
-                Err(e) => err(e),
+                Ok(id) => id,
+                Err(e) => return err(e),
+            };
+            // `extract=true` LLM fact extraction happens at this async seam (`beam.py` runs it
+            // inline in `remember`; the sync engine records the request).
+            if extract && extractor.available() {
+                if let Some(extracted) = extractor.extract(content).await {
+                    let _ = engine.ingest_extracted(&id, &extracted);
+                }
             }
+            json!({
+                "status": "stored",
+                "memory_id": id,
+                "content_preview": content.chars().take(100).collect::<String>(),
+                "extract_entities": extract_entities,
+                "extract": extract,
+                "metadata": metadata,
+                "veracity": veracity,
+            })
+            .to_string()
         }
-        "mnemosyne_recall" | "mnemosyne_shared_recall" => {
+        "mnemosyne_recall" => {
             let query = s(&args, "query").unwrap_or("");
-            let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            if query.is_empty() {
+                return json!({"error": "query is required"}).to_string();
+            }
+            // Python's tool arg is `limit` (`_handle_recall` L1878); accept `top_k` too.
+            let top_k = args
+                .get("limit")
+                .or_else(|| args.get("top_k"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize;
             let query_vec = embedder.embed_query(query).await;
             // Multi-agent identity overrides default to the engine's configured scope (`beam.py`
             // `recall` author/channel params L5030-L5032 default to the instance attrs).
@@ -278,8 +401,12 @@ pub async fn dispatch(
             if let Some(v) = s(&args, "channel_id") {
                 scope.channel_id = Some(v.to_string());
             }
-            // Row filters + temporal knobs (`beam.py` `recall` kwargs; full tool-schema parity is
-            // Phase 7, but the engine seam accepts them today).
+            let temporal_weight = args
+                .get("temporal_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            // Row filters + temporal knobs + per-call weight overrides (forwarded only when the
+            // caller actually supplied them — issue #45).
             let filters = crate::config::RecallFilters {
                 from_date: s(&args, "from_date").map(String::from),
                 to_date: s(&args, "to_date").map(String::from),
@@ -287,27 +414,197 @@ pub async fn dispatch(
                 topic: s(&args, "topic").map(String::from),
                 veracity: s(&args, "veracity").map(String::from),
                 memory_type: s(&args, "memory_type").map(String::from),
-                temporal_weight: args
-                    .get("temporal_weight")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
+                temporal_weight,
                 query_time: s(&args, "query_time").map(String::from),
                 temporal_halflife: args.get("temporal_halflife").and_then(|v| v.as_f64()),
+                vec_weight: args.get("vec_weight").and_then(|v| v.as_f64()),
+                fts_weight: args.get("fts_weight").and_then(|v| v.as_f64()),
+                importance_weight: args.get("importance_weight").and_then(|v| v.as_f64()),
             };
-            match engine.recall_with_scope(&RecallReq {
+            let rows = match engine.recall_with_scope(&RecallReq {
                 query,
                 top_k,
                 query_vector: query_vec.as_deref(),
                 scope: &scope,
                 filters,
             }) {
-                Ok(rows) => {
-                    let results: Vec<Value> = rows
-                        .iter()
-                        .map(|r| json!({"id": r.id, "content": r.content, "score": r.score}))
-                        .collect();
-                    json!({"query": query, "count": results.len(), "results": results}).to_string()
+                Ok(rows) => rows,
+                Err(e) => return err(e),
+            };
+            let mut results: Vec<Value> = rows.iter().map(|r| row_json(r, "private")).collect();
+            // Optionally merge shared-surface results by score (`_handle_recall` L1906-L1925).
+            let surface_read = engine.config().shared_surface_read;
+            if surface_read {
+                if let Some(surface) = cx.surface {
+                    if let Ok(srows) = surface.recall_with_vector(query, top_k, query_vec.as_deref())
+                    {
+                        results.extend(srows.iter().map(|r| row_json(r, "surface")));
+                        results.sort_by(|a, b| {
+                            let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            sb.total_cmp(&sa)
+                        });
+                        results.truncate(top_k);
+                    }
                 }
+            }
+            json!({
+                "query": query,
+                "count": results.len(),
+                "temporal_weight": temporal_weight,
+                "shared_surface_read": surface_read,
+                "results": results,
+            })
+            .to_string()
+        }
+        "mnemosyne_shared_remember" => {
+            let surface = match cx.surface() {
+                Ok(sf) => sf,
+                Err(e) => return e,
+            };
+            let content = s(&args, "content").unwrap_or("").trim().to_string();
+            if content.is_empty() {
+                return json!({"error": "content is required"}).to_string();
+            }
+            if content.starts_with("[USER]") || content.starts_with("[ASSISTANT]") {
+                return json!({"error": "raw conversation content is not allowed in shared memory"})
+                    .to_string();
+            }
+            let kind = s(&args, "kind").unwrap_or("meta").trim().to_lowercase();
+            if !SURFACE_KINDS.contains(&kind.as_str()) {
+                return json!({"error": "kind must be one of: meta, preference, correction, identity"})
+                    .to_string();
+            }
+            let importance = args
+                .get("importance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.8)
+                .clamp(0.0, 1.0);
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            if !metadata.is_object() {
+                return json!({"error": "metadata must be an object"}).to_string();
+            }
+            let veracity = crate::knowledge::veracity::clamp_veracity(
+                s(&args, "veracity").unwrap_or(""),
+                "mnemosyne_shared_remember",
+            );
+            let surface_content = surface_label(&content, &kind);
+            let stable_id = surface_hash(&surface_content);
+            let mut meta = metadata;
+            meta["shared_memory"] = json!(true);
+            meta["surface_kind"] = json!(kind);
+            meta["write_path"] = json!("manual_tool");
+            meta["source_profile_session"] = json!(engine.session_id());
+            let existing = surface.find_existing(&surface_content).ok().flatten();
+            let vector = embedder.embed_query(&surface_content).await;
+            let model = embedder.model().unwrap_or("");
+            let memory_id = match surface.remember_with_vector(
+                &surface_content,
+                &RememberArgs {
+                    source: "surface_manual".to_string(),
+                    importance,
+                    scope: "global".to_string(),
+                    veracity: veracity.clone(),
+                    metadata: Some(meta),
+                    memory_id: Some(stable_id),
+                    ..Default::default()
+                },
+                vector.as_deref(),
+                model,
+            ) {
+                Ok(id) => id,
+                Err(e) => return err(e),
+            };
+            // The tool-level audit event lands in the PRIVATE bank's audit_log with bank="surface"
+            // (`_audit_event` calls, `audit.py` — the log is co-located with the provider DB).
+            engine.audit_tool(
+                "shared_remember",
+                Some(&memory_id),
+                "surface",
+                "mnemosyne_shared_remember",
+                Some(&json!({"kind": kind, "existing": existing.is_some()})),
+            );
+            json!({
+                "status": if existing.is_some() { "existing_shared" } else { "stored_shared" },
+                "memory_id": memory_id,
+                "content_preview": surface_content.chars().take(120).collect::<String>(),
+                "shared_db": surface.config().bank_db_path().display().to_string(),
+                "kind": kind,
+                "veracity": veracity,
+            })
+            .to_string()
+        }
+        "mnemosyne_shared_recall" => {
+            let surface = match cx.surface() {
+                Ok(sf) => sf,
+                Err(e) => return e,
+            };
+            let query = s(&args, "query").unwrap_or("");
+            if query.is_empty() {
+                return json!({"error": "query is required"}).to_string();
+            }
+            let top_k = args
+                .get("limit")
+                .or_else(|| args.get("top_k"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize;
+            let query_vec = embedder.embed_query(query).await;
+            match surface.recall_with_vector(query, top_k, query_vec.as_deref()) {
+                Ok(rows) => {
+                    let results: Vec<Value> = rows.iter().map(|r| row_json(r, "surface")).collect();
+                    json!({
+                        "query": query,
+                        "count": results.len(),
+                        "shared_db": surface.config().bank_db_path().display().to_string(),
+                        "results": results,
+                    })
+                    .to_string()
+                }
+                Err(e) => err(e),
+            }
+        }
+        "mnemosyne_shared_forget" => {
+            let surface = match cx.surface() {
+                Ok(sf) => sf,
+                Err(e) => return e,
+            };
+            let memory_id = s(&args, "memory_id").or_else(|| s(&args, "id")).unwrap_or("");
+            if memory_id.is_empty() {
+                return json!({"error": "memory_id is required"}).to_string();
+            }
+            match surface.forget(memory_id) {
+                Ok(deleted) => {
+                    if deleted {
+                        engine.audit_tool(
+                            "shared_forget",
+                            Some(memory_id),
+                            "surface",
+                            "mnemosyne_shared_forget",
+                            None,
+                        );
+                    }
+                    json!({
+                        "status": if deleted { "deleted" } else { "not_found" },
+                        "memory_id": memory_id,
+                        "shared_db": surface.config().bank_db_path().display().to_string(),
+                    })
+                    .to_string()
+                }
+                Err(e) => err(e),
+            }
+        }
+        "mnemosyne_shared_stats" => {
+            let surface = match cx.surface() {
+                Ok(sf) => sf,
+                Err(e) => return e,
+            };
+            match surface.stats() {
+                Ok(stats) => json!({
+                    "provider": "mnemosyne_shared",
+                    "shared_db": surface.config().bank_db_path().display().to_string(),
+                    "stats": stats,
+                })
+                .to_string(),
                 Err(e) => err(e),
             }
         }
@@ -327,12 +624,10 @@ pub async fn dispatch(
                 Err(e) => err(e),
             }
         }
-        "mnemosyne_forget" | "mnemosyne_shared_forget" => {
-            match engine.forget(s(&args, "id").unwrap_or("")) {
-                Ok(deleted) => json!({"status": "ok", "deleted": deleted}).to_string(),
-                Err(e) => err(e),
-            }
-        }
+        "mnemosyne_forget" => match engine.forget(s(&args, "id").unwrap_or("")) {
+            Ok(deleted) => json!({"status": "ok", "deleted": deleted}).to_string(),
+            Err(e) => err(e),
+        },
         "mnemosyne_invalidate" => {
             match engine.invalidate(s(&args, "id").unwrap_or(""), s(&args, "replacement_id")) {
                 Ok(changed) => json!({"status": "ok", "invalidated": changed}).to_string(),
@@ -353,12 +648,41 @@ pub async fn dispatch(
         }
         "mnemosyne_sleep" => {
             let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+            if dry_run {
+                // Report the would-be plan without claiming rows (`beam.py` sleep L7639).
+                return match engine.sleep_plan_dry_run(force) {
+                    Ok(groups) => {
+                        let items: usize = groups.iter().map(|g| g.ids.len()).sum();
+                        let group_summaries: Vec<Value> = groups
+                            .iter()
+                            .map(|g| json!({"source": g.source, "items": g.ids.len()}))
+                            .collect();
+                        json!({
+                            "status": "dry_run",
+                            "would_consolidate": items,
+                            "groups": group_summaries,
+                        })
+                        .to_string()
+                    }
+                    Err(e) => err(e),
+                };
+            }
             match run_sleep(engine, embedder, extractor, force).await {
-                Ok(report) => json!({"status": "ok", "report": report}).to_string(),
+                Ok(report) => {
+                    engine.audit_tool(
+                        "sleep",
+                        None,
+                        "private",
+                        "mnemosyne_sleep",
+                        Some(&json!({"status": "consolidated"})),
+                    );
+                    json!({"status": "ok", "report": report}).to_string()
+                }
                 Err(e) => err(e),
             }
         }
-        "mnemosyne_stats" | "mnemosyne_shared_stats" => match engine.stats() {
+        "mnemosyne_stats" => match engine.stats() {
             Ok(stats) => json!({"status": "ok", "stats": stats}).to_string(),
             Err(e) => err(e),
         },
