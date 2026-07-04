@@ -56,13 +56,27 @@ pub fn weibull_decay_factor(age_hours: f64, memory_type: &str) -> f64 {
 /// Temporal boost from a memory's age (`weibull.py` `weibull_boost` L66-L154). Unlike
 /// [`weibull_decay_factor`], an **unknown** age (unparseable / missing timestamp) returns `0.0`
 /// (the row gets no temporal credit); a `Some(age)` defers to the survival function (future ages
-/// clamp to `1.0`). This is the form the enhanced-recall blend `score*0.7 + wb*0.3` uses
-/// (`beam.py` L6272).
-pub fn weibull_boost(age_hours: Option<f64>, memory_type: &str) -> f64 {
-    match age_hours {
-        Some(age) => weibull_decay_factor(age, memory_type),
-        None => 0.0,
+/// clamp to `1.0`). A `halflife_hours` override forces simple exponential decay `exp(-age/h)`
+/// instead of the per-type Weibull params (`weibull.py` L136-L140; `h <= 0` -> `0.0`). This is the
+/// form the enhanced-recall blend `score*0.7 + wb*0.3` uses (`beam.py` L6272, no override).
+pub fn weibull_boost(
+    age_hours: Option<f64>,
+    memory_type: &str,
+    halflife_hours: Option<f64>,
+) -> f64 {
+    let Some(age) = age_hours else {
+        return 0.0;
+    };
+    if age <= 0.0 {
+        return 1.0; // future / now -> full boost (`weibull.py` L128)
     }
+    if let Some(halflife) = halflife_hours {
+        if halflife <= 0.0 {
+            return 0.0;
+        }
+        return (-age / halflife).exp();
+    }
+    weibull_decay_factor(age, memory_type)
 }
 
 #[cfg(test)]
@@ -91,12 +105,22 @@ mod tests {
 
     #[test]
     fn boost_none_age_is_zero() {
-        assert_eq!(weibull_boost(None, "fact"), 0.0);
+        assert_eq!(weibull_boost(None, "fact", None), 0.0);
         // A known age defers to the survival function.
-        assert_eq!(weibull_boost(Some(0.0), "event"), 1.0);
+        assert_eq!(weibull_boost(Some(0.0), "event", None), 1.0);
         assert!(
-            (weibull_boost(Some(720.0), "fact") - weibull_decay_factor(720.0, "fact")).abs()
+            (weibull_boost(Some(720.0), "fact", None) - weibull_decay_factor(720.0, "fact")).abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn halflife_override_forces_exponential() {
+        // exp(-age/h), ignoring the per-type Weibull params (`weibull.py` L136-L140).
+        let got = weibull_boost(Some(24.0), "profile", Some(24.0));
+        assert!((got - (-1.0f64).exp()).abs() < 1e-12);
+        // Non-positive halflife -> 0.0; future still clamps to 1.0 first (`weibull.py` L128).
+        assert_eq!(weibull_boost(Some(10.0), "fact", Some(0.0)), 0.0);
+        assert_eq!(weibull_boost(Some(-1.0), "fact", Some(0.0)), 1.0);
     }
 }

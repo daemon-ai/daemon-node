@@ -938,26 +938,35 @@ fn remember_extracts_entities_and_facts() {
 #[test]
 fn entity_and_fact_match_reorders_recall() {
     let e = engine();
-    // The entity-/fact-bearing memory (capitalized "Acme" -> entity + `works_at` fact)...
+    // The entity-bearing memory: `extract_entities` stores `mentions` annotations (Maya, Acme),
+    // which is what the entity-aware recall pass matches on (`beam.py` `_find_memories_by_entity`
+    // reads mention annotations — without them the 1.3x boost never fires and the two rows tie).
     e.remember(
         "Maya works at Acme on infrastructure",
-        &RememberArgs::default(),
+        &RememberArgs {
+            extract_entities: true,
+            ..Default::default()
+        },
     )
     .unwrap();
     // ...and a lexical-only distractor that mentions "acme" lowercase (no entity extracted).
     e.remember("the acme deadline is approaching", &RememberArgs::default())
         .unwrap();
 
-    // A capitalized-entity query: both rows match lexically, but the entity/fact multipliers
-    // must lift the structured memory to the top.
+    // A capitalized-entity query: both rows match lexically, but the 1.3x entity multiplier must
+    // lift the annotated memory to the top.
     let hits = e.recall("Acme", 5).unwrap();
     assert!(!hits.is_empty());
     assert!(
         hits[0].content.contains("Maya"),
-        "entity+fact match should rank first, got {:?}",
+        "entity match should rank first, got {:?}",
         hits.iter()
             .map(|h| (&h.content, h.score))
             .collect::<Vec<_>>()
+    );
+    assert!(
+        hits[0].entity_match,
+        "the winning row must be marked entity_match"
     );
 }
 
@@ -1085,6 +1094,77 @@ fn sleep_groups_and_summarizes_with_aaak() {
         )
         .unwrap();
     assert_eq!(pending, 0, "all working rows claimed");
+}
+
+#[test]
+fn finish_sleep_embeds_and_binarizes_llm_summary() {
+    let e = engine();
+    e.remember("User decided to migrate the service to Rust", &{
+        RememberArgs {
+            source: "conversation".to_string(),
+            ..Default::default()
+        }
+    })
+    .unwrap();
+    e.remember("User decided the migration ships next quarter", &{
+        RememberArgs {
+            source: "conversation".to_string(),
+            ..Default::default()
+        }
+    })
+    .unwrap();
+    let groups = e.sleep_plan(true).expect("plan");
+    assert_eq!(groups.len(), 1);
+
+    // The async seam supplies an LLM summary (with a <think> block to strip) and its embedding.
+    let vec: Vec<f32> = vec![0.9, -0.4, 0.2, -0.1];
+    let mut summaries = std::collections::HashMap::new();
+    summaries.insert(
+        groups[0].source.clone(),
+        GroupSummary {
+            text: "<think>reasoning</think>We decided to migrate the service to Rust next quarter"
+                .to_string(),
+            llm: true,
+            embedding: Some(vec.clone()),
+            model: "mock-embed".to_string(),
+        },
+    );
+    let report = e.finish_sleep(&groups, &summaries).expect("finish");
+    assert_eq!(report.summaries_created, 1);
+    assert_eq!(report.llm_used, 1);
+
+    let c = e.store.conn.lock().unwrap();
+    let (id, content, memory_type, binary): (String, String, String, Option<Vec<u8>>) = c
+        .query_row(
+            "SELECT id, content, memory_type, binary_vector FROM episodic_memory \
+             WHERE source = 'sleep_consolidation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(
+        !content.contains("<think>"),
+        "think block must be stripped: {content}"
+    );
+    assert_eq!(
+        memory_type, "decision",
+        "summary must be typed-memory classified"
+    );
+    // The embedding row and MIB binary vector make the summary visible to vector recall.
+    let (emb_json, model): (String, String) = c
+        .query_row(
+            "SELECT embedding_json, model FROM memory_embeddings WHERE memory_id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("summary embedding row");
+    assert_eq!(serde_json::from_str::<Vec<f32>>(&emb_json).unwrap(), vec);
+    assert_eq!(model, "mock-embed");
+    assert_eq!(
+        binary.as_deref(),
+        Some(crate::binary_vectors::maximally_informative_binarization(&vec).as_slice()),
+        "episodic row must carry the MIB binary vector"
+    );
 }
 
 #[test]

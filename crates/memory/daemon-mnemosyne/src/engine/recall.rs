@@ -1229,7 +1229,7 @@ impl Engine {
             if memory_type.is_empty() || memory_type == "unknown" {
                 memory_type = "general".to_string();
             }
-            let wb = weibull::weibull_boost(age_hours(&row.timestamp), &memory_type);
+            let wb = weibull::weibull_boost(age_hours(&row.timestamp), &memory_type, None);
             row.score = round4(row.score * 0.7 + wb * 0.3);
         }
         Ok(())

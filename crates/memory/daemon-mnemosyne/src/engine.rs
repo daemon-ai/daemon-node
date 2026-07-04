@@ -9,8 +9,9 @@
 //! embeddings (cosine), and a recency/importance fallback scan, then scores them
 //! ([`crate::recall::scoring`]) with the FTS-blended lexical relevance, vector similarity, the MIB
 //! `binary_bonus`, and the tier/veracity multipliers — merged, content-deduped, and MMR-diversified.
-//! [`Engine::consolidate`] is a minimal WM->episodic promotion (no LLM summarization/degradation).
-//! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain port-spec P1 work.
+//! Recall dispatches on [`crate::config::RecallMode`] (base / enhanced / polyphonic), the knowledge
+//! layer (graph/fact bonuses) is wired into ingest, and `sleep` is the full plan/claim/summarize/
+//! degrade pipeline ([`Engine::sleep_plan`] / [`Engine::finish_sleep`]).
 
 use crate::config::{MnemosyneConfig, RecallFilters, RecallScope};
 use crate::error::Result;
@@ -22,19 +23,6 @@ use std::sync::OnceLock;
 /// The vector-similarity floor that lets a vector-only hit survive the lexical gate (mirrors the
 /// episodic candidate-drop rule `lexical < floor && sim < 0.65 -> drop`, `beam.py` L5720+).
 const VEC_SIM_FLOOR: f64 = 0.65;
-
-/// Working-memory TTL in hours (`beam.py` `WORKING_MEMORY_TTL_HOURS` L269). Sleep's age cutoff is
-/// half this (rows older than `TTL/2` are eligible for consolidation).
-const WORKING_MEMORY_TTL_HOURS: i64 = 168;
-
-/// Max working rows claimed per sleep pass (`beam.py` `SLEEP_BATCH_SIZE` L276).
-const SLEEP_BATCH_SIZE: usize = 5000;
-
-/// Tier 1->2 degradation age in days (`beam.py` `TIER2_DAYS` L281).
-const TIER2_DAYS: i64 = 30;
-
-/// Tier 2->3 degradation age in days (`beam.py` `TIER3_DAYS` L282).
-const TIER3_DAYS: i64 = 180;
 
 /// Max rows degraded per tier per pass (`beam.py` `DEGRADE_BATCH_SIZE` L286).
 const DEGRADE_BATCH_SIZE: usize = 100;
@@ -58,6 +46,36 @@ pub struct SleepGroup {
     pub veracity: String,
     /// Aggregated `valid_until` (earliest member expiry, if any).
     pub valid_until: Option<String>,
+}
+
+impl SleepGroup {
+    /// The deterministic no-LLM summary for this group: `[source] <aaak_encode>` (`beam.py` sleep
+    /// AAAK fallback L7784). Shared by [`Engine::finish_sleep`]'s fallback and the async seam (which
+    /// must know the final text up front to embed it).
+    pub fn aaak_summary(&self) -> String {
+        format!(
+            "[{}] {}",
+            self.source,
+            crate::aaak::summarize_group(&self.contents)
+        )
+    }
+}
+
+/// One sleep group's summarization outcome, produced at the async seam (`tools::run_sleep`) and
+/// keyed by group `source` in [`Engine::finish_sleep`]. Python's `consolidate_to_episodic`
+/// (`beam.py` L3956-L4032) embeds the summary inline; the synchronous Rust engine instead receives
+/// the precomputed embedding of the **final** summary text alongside it.
+#[derive(Clone, Debug, Default)]
+pub struct GroupSummary {
+    /// The final summary text (LLM output or the AAAK fallback), `<think>`-stripped.
+    pub text: String,
+    /// Whether an LLM produced `text` (drives [`SleepReport::llm_used`]).
+    pub llm: bool,
+    /// A dense embedding of `text`, persisted to `memory_embeddings` and binarized into
+    /// `episodic_memory.binary_vector` (`beam.py` L4005-L4032). `None` in keyword-only mode.
+    pub embedding: Option<Vec<f32>>,
+    /// The embedding model tag for `memory_embeddings.model`.
+    pub model: String,
 }
 
 /// A heuristic sleep-time conflict: an older memory that a newer, near-identical one supersedes
@@ -123,6 +141,11 @@ pub struct SleepReport {
     pub tier1_to_tier2: usize,
     /// Tier 2->3 degradations.
     pub tier2_to_tier3: usize,
+    /// Well-attested `(subject, predicate)` fact conflicts auto-resolved by
+    /// [`crate::knowledge::veracity::run_consolidation_pass`] at the end of the pass. (Python
+    /// defines the pass but never calls it — `veracity_consolidation.py` L777; the port wires it
+    /// into sleep so consolidation actually converges contested facts.)
+    pub facts_auto_resolved: usize,
 }
 
 /// Which BEAM tier a recall row came from (`beam.py` result `tier` labels).

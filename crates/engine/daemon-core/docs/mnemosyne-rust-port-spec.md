@@ -644,10 +644,12 @@ table (L28-L59), to port verbatim:
 **As-built ([`dynamics/`](../../../memory/daemon-mnemosyne/src/dynamics/)):** `typed_memory::classify`
 ports the full 69-pattern `TYPE_PATTERNS` table + `CONFIDENCE_BOOSTERS` (regexes compiled once via
 `OnceLock`, case-insensitive), the booster/length confidence math, the `confidence*(1 + 0.1*type_index)`
-tie-break, and the no-match default; it is called from `remember_with_vector` and persisted as
-`memory_type`. A `labeled_corpus_matches_python` test pins the classifications. `weibull::weibull_boost`
-wraps `weibull_decay_factor` (returns `0.0` for a `None` age) and is consumed by `weibull_rescore` on
-the **enhanced** finalize only — base recall is left untouched to preserve P0 parity.
+tie-break, and the no-match default; it is called from `remember_with_vector` (and on the sleep
+summary at `finish_sleep`) and persisted as `memory_type`. A `labeled_corpus_matches_python` test
+pins the classifications. `weibull::weibull_boost` wraps `weibull_decay_factor` (returns `0.0` for a
+`None` age) and honors the `halflife` override (`exp(-age/halflife)`, L129-L134); it is consumed by
+`weibull_rescore` on the **enhanced** finalize only — base recall is left untouched to preserve P0
+parity.
 
 ### 9.3 Sleep / consolidation — `beam.py` L7576-L7844
 
@@ -660,27 +662,48 @@ L7773); `consolidate_to_episodic` (L3956) inserts episodic + embeds + graph; cle
 `consolidation_log`; run `degrade_episodic` (tier T1->T2 at 30d, T2->T3 at 180d). `pinned=1` rows
 skip sleep. Consolidation is **additive**: WM rows are marked, not deleted.
 
-**As-built ([`engine.rs`](../../../memory/daemon-mnemosyne/src/engine.rs), [`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs)):**
-the full `sleep` is live. `Engine::sleep_plan(force)` applies the 84h cutoff (`WORKING_MEMORY_TTL_HOURS/2`,
-skipped on `force`), skips pinned rows, batches at `SLEEP_BATCH_SIZE`, **atomically claims** rows
+**As-built ([`engine/consolidation.rs`](../../../memory/daemon-mnemosyne/src/engine/consolidation.rs), [`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs)):**
+the full `sleep` is live. `Engine::sleep_plan(force)` applies the TTL/2 cutoff
+(`MnemosyneConfig::working_memory_ttl_hours`, 84h default; skipped on `force`), skips pinned rows,
+batches at `MnemosyneConfig::sleep_batch_size`, **atomically claims** rows
 (`consolidated_at`/`consolidation_claimed_at` gated on `consolidated_at IS NULL`), and groups them by
 source with aggregated scope (any-global), `valid_until` (earliest), and `veracity::aggregate_veracity`
-(mode, conservative tie-break). The async provider summarizes each group through the injected
-[`Extractor`] LLM (`Engine::summary_prompt`); `Engine::finish_sleep` writes one episodic summary per
-group (`summary_of` = the source WM id list, importance 0.6), falling back to the deterministic
-**AAAK** summary `[source] <aaak_encode>` when no LLM is present, then logs to `consolidation_log` and
-runs `degrade_episodic`. `Engine::sleep(force)` is the standalone no-LLM entrypoint (plan + finish with
-AAAK). `degrade_episodic` promotes tier 1->2 at `TIER2_DAYS=30` (AAAK-compressed) and tier 2->3 at
-`TIER3_DAYS=180` (signal-compressed to `TIER3_MAX_CHARS=300`), invalidating the stale dense embedding
-(+ binary vector) when content changes so recall falls back to lexical/FTS. The provider runs a forced
-sleep at session End/Handoff and an unforced auto-sleep every `AUTO_SLEEP_EVERY_TURNS=10` turns. Still
-open: the embedding-cosine>0.88 conflict heuristic (the `(S,P)` veracity contradiction path is reused
-instead) and the Weibull recall blend (§9.2).
+(mode, conservative tie-break). `Engine::heuristic_sleep_conflicts` ports `_detect_conflicts` (L3634):
+per in-group pair, timestamps >=1h apart AND stored-embedding cosine >0.88 AND >=2 shared significant
+tokens AND edit-distance ratio >0.3 flags the older row; the no-LLM path invalidates every pair
+(`resolve_sleep_conflicts`), while `tools::run_sleep` validates each through the §10.7 LLM gate first.
+The async provider summarizes each group through the injected [`Extractor`] LLM
+(`Engine::summary_prompt`) and embeds the final text through the injected [`Embedder`], passing both
+down as a `GroupSummary`; `Engine::finish_sleep` `<think>`-strips the text (AAAK fallback when it
+strips to nothing), typed-memory-classifies it, writes one episodic summary per group (`summary_of` =
+the source WM id list, importance 0.6, author/channel stamps from config), embeds + MIB-binarizes it
+into `memory_embeddings`/`binary_vector` (beam L4005-L4032), then logs to `consolidation_log`, runs
+`degrade_episodic`, and finishes with `veracity::run_consolidation_pass` (§10.6; counted as
+`SleepReport::facts_auto_resolved`). `Engine::sleep(force)` is the standalone no-LLM entrypoint
+(plan + heuristic-conflict resolve + finish with AAAK). `degrade_episodic` promotes tier 1->2 at
+`MnemosyneConfig::tier2_days` (30d default, AAAK-compressed) and tier 2->3 at `tier3_days` (180d,
+signal-compressed to `TIER3_MAX_CHARS=300`), invalidating the stale dense embedding (+ binary vector)
+when content changes so recall falls back to lexical/FTS. The provider runs a forced sleep at session
+End/Handoff and an unforced auto-sleep every `AUTO_SLEEP_EVERY_TURNS=10` turns.
 
 ### 9.4 Patterns — `patterns.py`
 
 `MemoryCompressor` (dict/RLE/semantic/auto) and `PatternDetector` (temporal/content/sequence). Pure
 logic; P3 priority.
+
+**As-built ([`dynamics/patterns.rs`](../../../memory/daemon-mnemosyne/src/dynamics/patterns.rs)):**
+full port. `MemoryCompressor` reproduces dict (sequential ordered phrase replacement), RLE (runs
+> 3 -> `[c*count]`, capped 255), semantic (>500 bytes -> first 250 + `[...]` + last 100 chars),
+`auto` (dict first, RLE fallback when savings < 5%), `compress_batch`, and `decompress` (dict
+reverse map is last-duplicate-wins like Python's `{v: k}` — minus Python's empty-token
+`str.replace("", ...)` bug — and RLE is exact), all reporting `CompressionStats`.
+`PatternDetector` ports temporal (top-3 hour / top-2 weekday concentrations over >= 3 parseable
+timestamps), content (top-5 stopword-filtered keywords + top-3 co-occurring pairs, `most_common`
+first-seen tie-order via `BTreeSet` where Python's set iteration is nondeterministic), and
+sequence (adjacent source bigrams in timestamp order); `detect_all` sorts by confidence and
+`summarize_patterns` emits the JSON summary. Pure logic, no tables; like Python's
+`MemoryCore._compressor`/`._pattern_detector`, it is a leaf library not yet called on the hot
+path.
 
 ---
 

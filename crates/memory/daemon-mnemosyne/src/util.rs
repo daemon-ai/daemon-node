@@ -30,3 +30,24 @@ pub fn memory_id(content: &str) -> String {
 pub fn generate_id(content: &str) -> String {
     memory_id(&format!("{content}{}", now_iso()))
 }
+
+/// Strip closed `<think>...</think>` blocks some LLMs emit, then trim (`beam.py`
+/// `consolidate_to_episodic` L3991-L3993, `re.DOTALL`).
+pub fn strip_think(text: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?s)<think>.*?</think>").unwrap());
+    re.replace_all(text, "").trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn strip_think_removes_closed_blocks_only() {
+        assert_eq!(
+            super::strip_think("<think>a\nb</think> summary <think>x</think>"),
+            "summary"
+        );
+        // An unclosed block is left alone (Python's regex only matches closed pairs).
+        assert_eq!(super::strip_think("<think>dangling"), "<think>dangling");
+    }
+}

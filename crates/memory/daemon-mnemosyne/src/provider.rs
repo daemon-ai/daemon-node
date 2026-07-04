@@ -303,7 +303,7 @@ impl MnemosyneProvider {
     /// claimed source group is summarized at this async seam before the synchronous engine writes
     /// the episodic summary; otherwise the engine falls back to the deterministic AAAK summary.
     async fn run_sleep(&self, force: bool) {
-        let _ = crate::tools::run_sleep(&self.engine, &self.extractor, force).await;
+        let _ = crate::tools::run_sleep(&self.engine, &self.embedder, &self.extractor, force).await;
         self.validate_conflicts().await;
     }
 

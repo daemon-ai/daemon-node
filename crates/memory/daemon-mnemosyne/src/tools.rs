@@ -14,8 +14,8 @@
 
 use crate::embeddings::Embedder;
 use crate::engine::{
-    CanonicalRemember, Engine, GraphLink, RecallReq, RememberArgs, SleepGroup, TripleAdd,
-    TripleEnd, TripleQuery, ValidateArgs,
+    CanonicalRemember, Engine, GraphLink, GroupSummary, RecallReq, RememberArgs, SleepGroup,
+    TripleAdd, TripleEnd, TripleQuery, ValidateArgs,
 };
 use crate::extract::Extractor;
 use daemon_core::tools::ToolDef;
@@ -161,16 +161,16 @@ fn err(e: impl std::fmt::Display) -> String {
     json!({"status": "error", "error": e.to_string()}).to_string()
 }
 
-/// Run a sleep pass, summarizing via the LLM when present, else the engine's AAAK fallback.
-/// Shared by the `mnemosyne_sleep` tool and the provider's session-boundary/auto-sleep hooks.
+/// Run a sleep pass, summarizing via the LLM when present (AAAK fallback otherwise) and embedding
+/// each final summary at this async seam so [`Engine::finish_sleep`] can persist the consolidation
+/// output's vector + MIB binary (`beam.py` `consolidate_to_episodic` L4005-L4032). Shared by the
+/// `mnemosyne_sleep` tool and the provider's session-boundary/auto-sleep hooks.
 pub async fn run_sleep(
     engine: &Engine,
+    embedder: &Embedder,
     extractor: &Extractor,
     force: bool,
 ) -> crate::Result<crate::engine::SleepReport> {
-    if !extractor.available() {
-        return engine.sleep(force);
-    }
     let groups: Vec<SleepGroup> = engine.sleep_plan(force)?;
     if groups.is_empty() {
         return engine.finish_sleep(&groups, &HashMap::new());
@@ -198,12 +198,30 @@ pub async fn run_sleep(
             }
         }
     }
-    let mut summaries = HashMap::new();
+    let mut summaries: HashMap<String, GroupSummary> = HashMap::new();
     for group in &groups {
-        let prompt = Engine::summary_prompt(&group.contents);
-        if let Some(text) = extractor.summarize(prompt).await {
-            summaries.insert(group.source.clone(), text);
-        }
+        let llm_text = if extractor.available() {
+            extractor
+                .summarize(Engine::summary_prompt(&group.contents))
+                .await
+        } else {
+            None
+        };
+        let (text, llm) = match llm_text.map(|t| crate::util::strip_think(&t)) {
+            Some(t) if !t.is_empty() => (t, true),
+            _ => (group.aaak_summary(), false),
+        };
+        // Embed the *final* summary text (LLM or AAAK); `None` in keyword-only mode.
+        let embedding = embedder.embed_query(&text).await;
+        summaries.insert(
+            group.source.clone(),
+            GroupSummary {
+                text,
+                llm,
+                embedding,
+                model: embedder.model().unwrap_or("").to_string(),
+            },
+        );
     }
     engine.finish_sleep(&groups, &summaries)
 }
@@ -335,7 +353,7 @@ pub async fn dispatch(
         }
         "mnemosyne_sleep" => {
             let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-            match run_sleep(engine, extractor, force).await {
+            match run_sleep(engine, embedder, extractor, force).await {
                 Ok(report) => json!({"status": "ok", "report": report}).to_string(),
                 Err(e) => err(e),
             }

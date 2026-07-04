@@ -6,9 +6,12 @@
 //! Opt-in tier-2 validator (`MNEMOSYNE_LLM_CONFLICT_DETECTION`) layered atop the deterministic
 //! `(subject, predicate)` veracity-contradiction path that records `conflicts` rows during
 //! consolidation. In the Rust port the LLM call routes through the daemon-core `Provider` (the same
-//! seam used by [`crate::extract::Extractor`]); there is no bespoke HTTP client, retry ladder, or
-//! cost catalog (`_call_conflict_llm_with_retry` L56-L132 / `MODEL_PRICING` L35-L40 are host
-//! concerns). The prompt + JSON contract are ported verbatim from `validate_conflict_pair` L135-L214.
+//! seam used by [`crate::extract::Extractor`]); Python's exponential-backoff retry ladder
+//! (`_call_conflict_llm_with_retry` L86-L128: 2 retries, 1s/2s delays) is ported, while the bespoke
+//! HTTP client, sampling params (temperature 0.0), and cost catalog (`MODEL_PRICING` L35-L40) stay
+//! host concerns — the daemon-core `Request` carries no sampling knobs and cost accounting lives in
+//! the host's usage telemetry. The prompt + JSON contract are ported verbatim from
+//! `validate_conflict_pair` L135-L214.
 
 use crate::extract::Extractor;
 use serde::Deserialize;
@@ -73,9 +76,17 @@ pub fn parse_verdict(raw: &str) -> Option<ConflictVerdict> {
     serde_json::from_str::<ConflictVerdict>(strip_json(raw)).ok()
 }
 
+/// Max retries after the first failed attempt (`_call_conflict_llm_with_retry` L86).
+const MAX_RETRIES: u32 = 2;
+
+/// Initial backoff delay in seconds, doubled per attempt (`_call_conflict_llm_with_retry` L87-L88).
+const INITIAL_DELAY_SECS: f64 = 1.0;
+
 /// Ask the injected LLM whether `newer_content` contradicts/supersedes `older_content`
-/// (`validate_conflict_pair` L135-L214). `None` in regex-only mode, on timeout/backend error, or
-/// when the completion isn't parseable JSON (the Python `(False, 0.0, None)` failure shape).
+/// (`validate_conflict_pair` L135-L214), retrying failed calls with exponential backoff (1s, 2s —
+/// `_call_conflict_llm_with_retry` L90-L128). `None` in regex-only mode, when every attempt
+/// times out / errors, or when the completion isn't parseable JSON (the Python
+/// `(False, 0.0, None)` failure shape; a parse failure is a model answer, not retried).
 pub async fn validate_conflict_pair(
     extractor: &Extractor,
     older_content: &str,
@@ -84,10 +95,19 @@ pub async fn validate_conflict_pair(
     if !extractor.available() {
         return None;
     }
-    let raw = extractor
-        .summarize(build_prompt(older_content, newer_content))
-        .await?;
-    parse_verdict(&raw)
+    for attempt in 0..=MAX_RETRIES {
+        if let Some(raw) = extractor
+            .summarize(build_prompt(older_content, newer_content))
+            .await
+        {
+            return parse_verdict(&raw);
+        }
+        if attempt < MAX_RETRIES {
+            let delay = INITIAL_DELAY_SECS * 2f64.powi(attempt as i32);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await;
+        }
+    }
+    None
 }
 
 #[cfg(test)]

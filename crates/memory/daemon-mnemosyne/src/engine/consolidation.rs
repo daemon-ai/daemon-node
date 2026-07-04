@@ -73,7 +73,8 @@ impl Engine {
     /// `beam.py` `sleep`/consolidation L7576: no LLM summarization or tier degradation yet). Each
     /// promoted row is copied into `episodic_memory` at tier 1 — computing its MIB `binary_vector`
     /// from any stored embedding — its source working row is marked `consolidated_at`, and a
-    /// `consolidation_log` entry is written. Returns the number of rows promoted.
+    /// `consolidation_log` entry is written. Pinned rows are exempt, exactly as in sleep
+    /// (`beam.py` L7614). Returns the number of rows promoted.
     pub fn consolidate(&self) -> Result<usize> {
         let conn = self.store.conn.lock().unwrap();
         let embeddings = load_embeddings(&conn)?;
@@ -83,7 +84,8 @@ impl Engine {
                 "SELECT id, content, source, timestamp, importance, veracity, trust_tier, scope, \
                         memory_type, event_date, event_date_precision, temporal_tags \
                  FROM working_memory \
-                 WHERE consolidated_at IS NULL AND session_id = ?1 AND superseded_by IS NULL",
+                 WHERE consolidated_at IS NULL AND session_id = ?1 AND superseded_by IS NULL \
+                   AND (pinned IS NULL OR pinned = 0)",
             )?;
             let rows = stmt.query_map(params![self.config.session_id], |r| {
                 Ok(EpisodicSeed {
@@ -205,19 +207,21 @@ impl Engine {
         )
     }
 
-    /// Plan a sleep pass (`beam.py` sleep L7597-L7676): select eligible working rows (older than the
-    /// `TTL/2` cutoff unless `force`, skipping pinned/consolidated rows, oldest-first, capped at
-    /// [`SLEEP_BATCH_SIZE`]), **atomically claim** them (set `consolidated_at`/`consolidation_claimed_at`
-    /// gated on `consolidated_at IS NULL` for crash-/concurrency-safety), and group the claimed rows
-    /// by source. The caller (the async provider) summarizes each group and hands the summaries to
-    /// [`Engine::finish_sleep`]. Returns an empty vec when nothing is eligible.
+    /// Plan a sleep pass (`beam.py` sleep L7597-L7676): select eligible working rows (older than
+    /// the `TTL/2` cutoff unless `force`, skipping pinned/consolidated rows, oldest-first, capped
+    /// at [`MnemosyneConfig::sleep_batch_size`]), **atomically claim** them (set
+    /// `consolidated_at`/`consolidation_claimed_at` gated on `consolidated_at IS NULL` for
+    /// crash-/concurrency-safety), and group the claimed rows by source. The caller (the async
+    /// provider) summarizes each group and hands the summaries to [`Engine::finish_sleep`]. Returns
+    /// an empty vec when nothing is eligible.
     pub fn sleep_plan(&self, force: bool) -> Result<Vec<SleepGroup>> {
         let conn = self.store.conn.lock().unwrap();
         let cutoff = if force {
             "9999-12-31T23:59:59+00:00".to_string()
         } else {
-            (chrono::Utc::now() - chrono::Duration::hours(WORKING_MEMORY_TTL_HOURS / 2))
-                .to_rfc3339()
+            // TTL/2 hours, expressed in minutes so fractional configured TTLs survive.
+            let half_ttl_minutes = (self.config.working_memory_ttl_hours * 30.0) as i64;
+            (chrono::Utc::now() - chrono::Duration::minutes(half_ttl_minutes)).to_rfc3339()
         };
 
         struct Claimable {
@@ -241,7 +245,11 @@ impl Engine {
                  ORDER BY timestamp ASC LIMIT ?3",
             )?;
             let rows = stmt.query_map(
-                params![self.config.session_id, cutoff, SLEEP_BATCH_SIZE as i64],
+                params![
+                    self.config.session_id,
+                    cutoff,
+                    self.config.sleep_batch_size as i64
+                ],
                 |r| {
                     Ok(Claimable {
                         id: r.get(0)?,
@@ -317,41 +325,54 @@ impl Engine {
             .collect())
     }
 
-    /// Write the episodic summaries for the claimed [`SleepGroup`]s (`beam.py` sleep L7784-L7824),
-    /// then run tiered degradation. `summaries` maps a group's `source` to an LLM summary; a group
-    /// with no entry falls back to the deterministic AAAK summary `[source] <aaak>`. Clears each
-    /// group's `consolidation_claimed_at`, writes a `consolidation_log` row, and returns the report.
+    /// Write the episodic summaries for the claimed [`SleepGroup`]s (`beam.py` sleep L7784-L7824,
+    /// via `consolidate_to_episodic` L3956-L4049), then run tiered degradation and the veracity
+    /// auto-resolution pass. `summaries` maps a group's `source` to its [`GroupSummary`]; a group
+    /// with no entry falls back to the deterministic AAAK summary `[source] <aaak>`. Each summary
+    /// is `<think>`-stripped and typed-memory classified; its embedding (when the async seam
+    /// supplied one) lands in `memory_embeddings` with an MIB `binary_vector` on the episodic row
+    /// (`beam.py` L4005-L4032). Clears each group's `consolidation_claimed_at`, writes a
+    /// `consolidation_log` row, and returns the report.
     pub fn finish_sleep(
         &self,
         groups: &[SleepGroup],
-        summaries: &HashMap<String, String>,
+        summaries: &HashMap<String, GroupSummary>,
     ) -> Result<SleepReport> {
         let mut report = SleepReport::default();
         if !groups.is_empty() {
             let conn = self.store.conn.lock().unwrap();
             for group in groups {
-                let (summary, llm) = match summaries.get(&group.source) {
-                    Some(s) if !s.trim().is_empty() => (s.trim().to_string(), true),
-                    _ => (
-                        format!(
-                            "[{}] {}",
-                            group.source,
-                            crate::aaak::summarize_group(&group.contents)
-                        ),
-                        false,
+                // Strip closed <think>...</think> blocks (`beam.py` L3991-L3993); an LLM summary
+                // that strips to nothing falls back to AAAK.
+                let (summary, llm, embedding, model) = match summaries.get(&group.source) {
+                    Some(gs) if !util::strip_think(&gs.text).is_empty() => (
+                        util::strip_think(&gs.text),
+                        gs.llm,
+                        gs.embedding.clone(),
+                        gs.model.clone(),
                     ),
+                    _ => (group.aaak_summary(), false, None, String::new()),
                 };
                 let ep_id =
                     util::memory_id(&format!("episodic:{}:{}", self.config.session_id, summary));
+                // Typed-memory classification of the summary (`beam.py` L3976-L3982).
+                let memory_type = crate::dynamics::typed_memory::classify(&summary).as_str();
                 // Comma-joined source ids (`beam.py` `consolidate_to_episodic` L4001); recall's
                 // cross-tier dedup splits on ",".
                 let summary_of = group.ids.join(",");
+                // Multi-agent identity stamps, as on the write path (`beam.py` L3998-L4002).
+                let channel_id = self
+                    .config
+                    .channel_id
+                    .clone()
+                    .unwrap_or_else(|| self.config.session_id.clone());
                 conn.execute(
                     "INSERT OR IGNORE INTO episodic_memory \
                      (id, content, source, timestamp, session_id, importance, metadata_json, \
-                      veracity, memory_type, tier, scope, summary_of, valid_until) \
-                     VALUES (?1, ?2, 'sleep_consolidation', ?3, ?4, 0.6, '{}', ?5, 'unknown', 1, \
-                             ?6, ?7, ?8)",
+                      veracity, memory_type, tier, scope, summary_of, valid_until, \
+                      author_id, author_type, channel_id) \
+                     VALUES (?1, ?2, 'sleep_consolidation', ?3, ?4, 0.6, '{}', ?5, ?9, 1, \
+                             ?6, ?7, ?8, ?10, ?11, ?12)",
                     params![
                         ep_id,
                         summary,
@@ -361,8 +382,28 @@ impl Engine {
                         group.scope,
                         summary_of,
                         group.valid_until,
+                        memory_type,
+                        self.config.author_id,
+                        self.config.author_type,
+                        channel_id,
                     ],
                 )?;
+                // Embed + binarize the consolidation output (`beam.py` L4005-L4032): without this
+                // the summary row would be invisible to vector recall and the MIB binary bonus.
+                if let Some(vec) = &embedding {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO memory_embeddings \
+                         (memory_id, embedding_json, model) VALUES (?1, ?2, ?3)",
+                        params![ep_id, serde_json::to_string(vec)?, model],
+                    )?;
+                    conn.execute(
+                        "UPDATE episodic_memory SET binary_vector = ?2 WHERE id = ?1",
+                        params![
+                            ep_id,
+                            binary_vectors::maximally_informative_binarization(vec)
+                        ],
+                    )?;
+                }
                 self.ingest_graph_and_veracity(&conn, &ep_id, &summary, &group.veracity);
                 self.emit_event(
                     &conn,
@@ -420,6 +461,13 @@ impl Engine {
         let (t1, t2) = self.degrade_episodic()?;
         report.tier1_to_tier2 = t1;
         report.tier2_to_tier3 = t2;
+        // Auto-resolve well-attested (subject, predicate) conflicts by confidence
+        // (`veracity_consolidation.py` `run_consolidation_pass` L777 — defined but never called in
+        // Python; wired into sleep here so contested facts actually converge).
+        {
+            let conn = self.store.conn.lock().unwrap();
+            report.facts_auto_resolved = veracity::run_consolidation_pass(&conn)?;
+        }
         Ok(report)
     }
 
@@ -568,9 +616,10 @@ impl Engine {
         Ok(conflicts)
     }
 
-    /// Tiered episodic degradation (`beam.py` `degrade_episodic` L7241-L7366): tier 1 rows older than
-    /// [`TIER2_DAYS`] are AAAK-compressed and promoted to tier 2; tier 2 rows older than
-    /// [`TIER3_DAYS`] are signal-compressed to <=[`TIER3_MAX_CHARS`] and promoted to tier 3. When a
+    /// Tiered episodic degradation (`beam.py` `degrade_episodic` L7241-L7366): tier 1 rows older
+    /// than [`MnemosyneConfig::tier2_days`] are AAAK-compressed and promoted to tier 2; tier 2 rows
+    /// older than [`MnemosyneConfig::tier3_days`] are signal-compressed to <=[`TIER3_MAX_CHARS`]
+    /// and promoted to tier 3. When a
     /// row's content changes its stale dense embedding is invalidated (dropped + binary vector
     /// cleared) so recall doesn't score against text that no longer exists. Recall already applies a
     /// tier weight, so degraded rows score down automatically. Returns `(tier1->2, tier2->3)` counts.
@@ -586,7 +635,10 @@ impl Engine {
                  ORDER BY created_at ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(
-                params![format!("-{TIER2_DAYS} days"), DEGRADE_BATCH_SIZE as i64],
+                params![
+                    format!("-{} days", self.config.tier2_days),
+                    DEGRADE_BATCH_SIZE as i64
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -614,7 +666,7 @@ impl Engine {
             )?;
             let rows = stmt.query_map(
                 params![
-                    format!("-{TIER3_DAYS} days"),
+                    format!("-{} days", self.config.tier3_days),
                     (DEGRADE_BATCH_SIZE / 2) as i64
                 ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
