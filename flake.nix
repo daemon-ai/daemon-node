@@ -1,6 +1,14 @@
 {
   description = "daemon Rust workspace";
 
+  # Pull built closures from the daemon-ai Cachix cache (public pull). CI feeds the cache via
+  # cachix-action; humans/other machines opt in with --accept-flake-config (or as a trusted-user).
+  # Public pull key only — no secret lives here.
+  nixConfig = {
+    extra-substituters = [ "https://daemon-ai.cachix.org" ];
+    extra-trusted-public-keys = [ "daemon-ai.cachix.org-1:jzeLmFDfgE5dzGT0RXF70IEU/tKsWdDV9LQ5zPGAnQs=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:logos-co/nixpkgs/mingw-integration";
     flake-utils.url = "github:numtide/flake-utils";
