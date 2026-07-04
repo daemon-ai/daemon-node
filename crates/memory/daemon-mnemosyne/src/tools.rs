@@ -142,18 +142,19 @@ pub fn defs() -> Vec<ToolDef> {
 
 #[cfg(feature = "sync")]
 fn sync_defs() -> Vec<ToolDef> {
+    // The three replication tools (`sync_adapter.py` ALL_SYNC_TOOL_SCHEMAS): all arg-less.
     vec![
+        def(
+            "mnemosyne_sync_push",
+            r#"{"type":"object","properties":{}}"#,
+        ),
+        def(
+            "mnemosyne_sync_pull",
+            r#"{"type":"object","properties":{}}"#,
+        ),
         def(
             "mnemosyne_sync_status",
             r#"{"type":"object","properties":{}}"#,
-        ),
-        def(
-            "mnemosyne_sync_export",
-            r#"{"type":"object","properties":{}}"#,
-        ),
-        def(
-            "mnemosyne_sync_import",
-            r#"{"type":"object","properties":{"bundle":{"type":"object"}},"required":["bundle"]}"#,
         ),
     ]
 }
@@ -854,23 +855,145 @@ pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
             None => err("missing 'bundle'"),
         },
         #[cfg(feature = "sync")]
-        "mnemosyne_sync_status" => match engine.diagnose() {
-            Ok(d) => json!({"status": "ok", "replication": "local-only", "diagnostics": d}).to_string(),
-            Err(e) => err(e),
-        },
-        #[cfg(feature = "sync")]
-        "mnemosyne_sync_export" => match engine.export() {
-            Ok(bundle) => json!({"status": "ok", "bundle": bundle}).to_string(),
-            Err(e) => err(e),
-        },
-        #[cfg(feature = "sync")]
-        "mnemosyne_sync_import" => match args.get("bundle") {
-            Some(bundle) => match engine.import(bundle) {
-                Ok(n) => json!({"status": "ok", "imported": n}).to_string(),
-                Err(e) => err(e),
-            },
-            None => err("missing 'bundle'"),
-        },
+        "mnemosyne_sync_push" | "mnemosyne_sync_pull" | "mnemosyne_sync_status" => {
+            sync_tool(engine, name).await
+        }
         _ => json!({"status": "unknown_tool", "tool": name}).to_string(),
+    }
+}
+
+/// The three replication tools (`sync_adapter.py` `handle_tool_call`), on [`crate::sync`] +
+/// [`MnemosyneConfig`](crate::MnemosyneConfig) knobs instead of env vars.
+///
+/// Divergences from the Python adapter (spec §12.1): cursors persist per remote under the same
+/// `sync_meta` keys [`crate::sync::SyncEngine::sync_with`] uses (Python's tools share one global
+/// `last_sync_cursor` between push and pull, which cross-contaminates the two directions and any
+/// second remote), and the pull request sends `since` — the parameter the server actually reads —
+/// where Python sent `since_token` and silently full-pulled every time.
+#[cfg(feature = "sync")]
+async fn sync_tool(engine: &Engine, name: &str) -> String {
+    use crate::sync::{SyncEncryption, SyncEngine};
+
+    // Python truncates cursors for display: `cursor[:30] + "..."`.
+    fn trunc(cursor: &str) -> String {
+        if cursor.chars().count() > 30 {
+            format!("{}...", cursor.chars().take(30).collect::<String>())
+        } else {
+            cursor.to_string()
+        }
+    }
+
+    let cfg = engine.config();
+    let encryption = match cfg.sync_key.as_deref() {
+        Some(source) => match SyncEncryption::from_key_source(source) {
+            Ok(enc) => enc,
+            Err(e) => return err(format!("Sync adapter not available: {e}")),
+        },
+        None => None,
+    };
+    let encrypt_enabled = encryption.is_some();
+    let se = match SyncEngine::new(engine, None, encryption) {
+        Ok(se) => se,
+        Err(e) => return err(format!("Sync adapter not available: {e}")),
+    };
+    let remote = cfg.sync_remote.clone().unwrap_or_default();
+    let token = cfg.sync_token.as_deref();
+    let no_remote = || err("No remote configured. Set sync_remote in the Mnemosyne config.");
+
+    match name {
+        // `_handle_push`: send everything past the per-remote push cursor.
+        "mnemosyne_sync_push" => {
+            if remote.is_empty() {
+                return no_remote();
+            }
+            let cursor_key = format!("last_push_cursor_{remote}");
+            let cursor = se.meta_get(&cursor_key).ok().flatten();
+            let changes = match se.pull_changes(cursor.as_deref(), 500) {
+                Ok(c) => c,
+                Err(e) => return err(e),
+            };
+            let events = changes["events"].as_array().cloned().unwrap_or_default();
+            if events.is_empty() {
+                return json!({"status": "ok", "pushed": 0, "message": "No local changes to push."})
+                    .to_string();
+            }
+            let resp =
+                SyncEngine::http_post(&remote, "/sync/push", &json!({"events": events}), token)
+                    .await;
+            if resp["status"] != "ok" {
+                return resp.to_string();
+            }
+            // Advance to the last *local* timestamp actually sent (the server's `next_cursor`
+            // is its wall clock — meaningless against this bank's log).
+            let next = changes["next_cursor"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !next.is_empty() {
+                let _ = se.meta_set(&cursor_key, &next);
+            }
+            json!({
+                "status": "ok",
+                "pushed": resp["accepted"],
+                "duplicates": resp.get("duplicates").cloned().unwrap_or(json!(0)),
+                "conflicts": resp.get("conflicts").cloned().unwrap_or(json!(0)),
+                "next_cursor": trunc(&next),
+            })
+            .to_string()
+        }
+        // `_handle_pull`: fetch since the per-remote pull cursor and apply locally.
+        "mnemosyne_sync_pull" => {
+            if remote.is_empty() {
+                return no_remote();
+            }
+            let cursor_key = format!("last_sync_cursor_{remote}");
+            let cursor = se.meta_get(&cursor_key).ok().flatten();
+            let resp =
+                SyncEngine::http_post(&remote, "/sync/pull", &json!({"since": cursor}), token)
+                    .await;
+            if resp["status"] != "ok" {
+                return resp.to_string();
+            }
+            let incoming = resp["events"].as_array().cloned().unwrap_or_default();
+            if incoming.is_empty() {
+                return json!({"status": "ok", "pulled": 0, "message": "No remote changes to pull."})
+                    .to_string();
+            }
+            let applied = match se.push_changes(&incoming) {
+                Ok(stats) => stats,
+                Err(e) => return err(e),
+            };
+            let next = resp["next_cursor"].as_str().unwrap_or_default().to_string();
+            if !next.is_empty() {
+                let _ = se.meta_set(&cursor_key, &next);
+            }
+            json!({
+                "status": "ok",
+                "pulled": applied["accepted"],
+                "duplicates": applied["duplicates"],
+                "conflicts": applied["conflicts"],
+                "next_cursor": trunc(&next),
+            })
+            .to_string()
+        }
+        // `_handle_status`: local identity/counters + the configured transport knobs.
+        _ => {
+            let cursor_key = format!("last_sync_cursor_{remote}");
+            let cursor = se.meta_get(&cursor_key).ok().flatten().unwrap_or_default();
+            let local_events = match se.get_status(None) {
+                Ok(status) => status["total_events"].clone(),
+                Err(e) => return err(e),
+            };
+            json!({
+                "status": "ok",
+                "device_id": se.device_id,
+                "remote": if remote.is_empty() { "(unconfigured)".to_string() } else { remote },
+                "encryption": if encrypt_enabled { "enabled" } else { "disabled" },
+                "mode": cfg.sync_mode,
+                "local_events": local_events,
+                "last_cursor": if cursor.is_empty() { "none".to_string() } else { trunc(&cursor) },
+            })
+            .to_string()
+        }
     }
 }

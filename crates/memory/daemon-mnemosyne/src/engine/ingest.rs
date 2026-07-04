@@ -8,6 +8,7 @@
 use super::*;
 use crate::dynamics::typed_memory;
 use crate::knowledge::{annotations, entities, episodic_graph, temporal, veracity};
+use crate::util::py_float;
 use crate::{memoria, sanitize, util};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -51,12 +52,34 @@ pub(crate) fn source_to_trust_tier(source: &str) -> &'static str {
     "STATED"
 }
 
-/// Python `str(float)` formatting for the event-hash preimage (`0.5` -> `"0.5"`, `1.0` -> `"1.0"`).
-fn py_float(v: f64) -> String {
-    if v.fract() == 0.0 && v.is_finite() {
-        format!("{v:.1}")
-    } else {
-        format!("{v}")
+thread_local! {
+    /// Set while sync-apply routes a peer mutation through the write pipeline (`sync.rs`
+    /// `push_changes`). Python's `remember` never writes `memory_events` (only
+    /// `SyncEngine.log_event` does); Rust's write path does — without suppression, applying a
+    /// peer's CREATE would mint a second local event for the same row and every sync cycle
+    /// would ping-pong-grow both peers' logs. Thread-local so concurrent writers on other
+    /// threads keep logging normally.
+    static SUPPRESS_EVENT_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard suppressing `memory_events` inserts on the current thread (the sync-apply path).
+/// The in-process [`crate::streaming::MemoryStream`] still fires — parity with Python, where
+/// sync-applied remembers emit stream events but never self-log.
+#[cfg_attr(not(feature = "sync"), allow(dead_code))]
+pub(crate) struct EventLogSuppressGuard {
+    prev: bool,
+}
+
+#[cfg_attr(not(feature = "sync"), allow(dead_code))]
+pub(crate) fn suppress_event_log() -> EventLogSuppressGuard {
+    let prev = SUPPRESS_EVENT_LOG.with(|c| c.replace(true));
+    EventLogSuppressGuard { prev }
+}
+
+impl Drop for EventLogSuppressGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        SUPPRESS_EVENT_LOG.with(|c| c.set(prev));
     }
 }
 
@@ -585,7 +608,6 @@ impl Engine {
         source: &str,
         importance: f64,
     ) {
-        let device_id = self.device_id(conn);
         let timestamp = util::now_iso();
         let payload = content.map(|c| {
             serde_json::json!({
@@ -596,37 +618,65 @@ impl Engine {
             })
             .to_string()
         });
-        let seq = self
-            .event_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let event_id = util::memory_id(&format!(
-            "{device_id}|{memory_id}|{operation}|{timestamp}|{seq}"
-        ));
-        // Deterministic dedup hash (`sync.py` `_compute_event_hash` L692-L699).
-        let parent_ids = "[]";
-        let preimage = format!(
-            "{memory_id}|{operation}|{timestamp}|{device_id}|{}|{parent_ids}|{}",
-            payload.as_deref().unwrap_or(""),
-            py_float(importance),
-        );
-        let event_hash = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(preimage.as_bytes());
-            format!("{:x}", h.finalize())
-        };
-        let res = conn.execute(
-            "INSERT INTO memory_events \
-             (event_id, memory_id, operation, timestamp, device_id, payload, parent_event_ids, \
-              importance, expiry, event_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
-            params![
-                event_id, memory_id, operation, timestamp, device_id, payload, parent_ids,
-                importance, event_hash,
-            ],
-        );
-        if let Err(e) = res {
-            tracing::debug!(error = %e, operation, "memory_events insert failed (non-fatal)");
+        if !SUPPRESS_EVENT_LOG.with(|c| c.get()) {
+            let device_id = self.device_id(conn);
+            let seq = self
+                .event_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let event_id = util::memory_id(&format!(
+                "{device_id}|{memory_id}|{operation}|{timestamp}|{seq}"
+            ));
+            // Deterministic dedup hash (`sync.py` `_compute_event_hash` L692-L699).
+            let parent_ids = "[]";
+            let preimage = format!(
+                "{memory_id}|{operation}|{timestamp}|{device_id}|{}|{parent_ids}|{}",
+                payload.as_deref().unwrap_or(""),
+                py_float(importance),
+            );
+            let event_hash = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(preimage.as_bytes());
+                format!("{:x}", h.finalize())
+            };
+            let res = conn.execute(
+                "INSERT INTO memory_events \
+                 (event_id, memory_id, operation, timestamp, device_id, payload, parent_event_ids, \
+                  importance, expiry, event_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                params![
+                    event_id, memory_id, operation, timestamp, device_id, payload, parent_ids,
+                    importance, event_hash,
+                ],
+            );
+            if let Err(e) = res {
+                tracing::debug!(error = %e, operation, "memory_events insert failed (non-fatal)");
+            }
+        }
+        // In-process stream fanout when a host enabled it (`beam.py` `_emit_event` L2813-L2835):
+        // CREATE/UPDATE/CONSOLIDATE map to the three Python emission sites; DELETE has no
+        // Python-side stream event. Failures are contained inside `MemoryStream::emit`.
+        if let Some(stream) = self.stream_if_active() {
+            use crate::streaming::EventType;
+            let event_type = match operation {
+                "CREATE" => Some(EventType::MemoryAdded),
+                "UPDATE" => Some(EventType::MemoryUpdated),
+                "CONSOLIDATE" => Some(EventType::MemoryConsolidated),
+                _ => None,
+            };
+            if let Some(event_type) = event_type {
+                stream.emit(crate::streaming::MemoryEvent {
+                    event_type,
+                    memory_id: memory_id.to_string(),
+                    timestamp,
+                    session_id: Some(self.config.session_id.clone()),
+                    content: content.map(str::to_string),
+                    source: Some(source.to_string()),
+                    importance: Some(importance),
+                    metadata: None,
+                    delta: None,
+                });
+            }
         }
     }
 

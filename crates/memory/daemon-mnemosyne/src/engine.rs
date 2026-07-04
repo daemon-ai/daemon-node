@@ -416,6 +416,9 @@ pub struct Engine {
     /// Lazily-materialized plugin manager (`memory.py` "Phase 8: Plugins" lazy property
     /// L286-L292). Never touched by a host = never built = zero overhead per event.
     plugins: OnceLock<crate::plugins::PluginManager>,
+    /// Lazily-enabled in-process event stream (`memory.py` "Phase 8: Streaming" lazy `stream`
+    /// property + `enable_streaming` L166-L189). Never enabled = one atomic load per write.
+    stream: OnceLock<std::sync::Arc<crate::streaming::MemoryStream>>,
 }
 
 impl Engine {
@@ -431,6 +434,7 @@ impl Engine {
             event_seq: std::sync::atomic::AtomicU64::new(0),
             recall_diag: RecallDiagnostics::default(),
             plugins: OnceLock::new(),
+            stream: OnceLock::new(),
         })
     }
 
@@ -446,6 +450,7 @@ impl Engine {
             event_seq: std::sync::atomic::AtomicU64::new(0),
             recall_diag: RecallDiagnostics::default(),
             plugins: OnceLock::new(),
+            stream: OnceLock::new(),
         })
     }
 
@@ -465,6 +470,32 @@ impl Engine {
     /// call sites use this so an untouched manager costs one atomic load per event.
     pub(crate) fn plugins_if_active(&self) -> Option<&crate::plugins::PluginManager> {
         self.plugins.get()
+    }
+
+    /// Enable event streaming for this engine (`memory.py` `enable_streaming` L174-L184): wires
+    /// a [`crate::streaming::MemoryStream`] into the write path so mutations emit
+    /// `MEMORY_ADDED`/`MEMORY_UPDATED`/`MEMORY_CONSOLIDATED` events. Idempotent — repeat calls
+    /// return the same stream. Streaming failures never block memory operations.
+    pub fn enable_streaming(&self) -> std::sync::Arc<crate::streaming::MemoryStream> {
+        self.stream
+            .get_or_init(|| std::sync::Arc::new(crate::streaming::MemoryStream::default()))
+            .clone()
+    }
+
+    /// The stream only if a host has enabled it (`beam.py` `_event_emitter is None` gate L2817).
+    pub(crate) fn stream_if_active(&self) -> Option<&crate::streaming::MemoryStream> {
+        self.stream.get().map(std::sync::Arc::as_ref)
+    }
+
+    /// Run `f` against the bank connection. The seam for the sibling sync/streaming modules
+    /// ([`crate::streaming::DeltaSync`], `sync::SyncEngine`) which own their SQL but not the
+    /// connection (Python hands them `self.conn` directly).
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.store.conn.lock().unwrap();
+        f(&conn)
     }
 
     /// The lazily-opened query cache (`query_cache.db` next to the bank when persistent, else
@@ -557,6 +588,8 @@ mod recall;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "sync")]
+pub(crate) use ingest::suppress_event_log;
 pub(crate) use query::load_embeddings;
 #[cfg(all(feature = "vec-ext", test))]
 pub(crate) use query::native_cosine_sim_map;

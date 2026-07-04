@@ -160,6 +160,17 @@ pub struct MnemosyneConfig {
     /// Merge shared-surface hits into `mnemosyne_recall`, tagging each result's `bank`
     /// (`shared_surface_read`, default off).
     pub shared_surface_read: bool,
+    /// Remote sync server URL for the `mnemosyne_sync_*` tools (`MNEMOSYNE_SYNC_REMOTE` /
+    /// `MNEMOSYNE_SYNC_HOST`+`PORT`; `sync` feature). `None` = replication unconfigured.
+    pub sync_remote: Option<String>,
+    /// Bearer token sent to the remote sync server (`MNEMOSYNE_SYNC_TOKEN`).
+    pub sync_token: Option<String>,
+    /// Sync payload encryption key source: a raw urlsafe-base64 32-byte key or a key-file path
+    /// (`MNEMOSYNE_SYNC_KEY` / `MNEMOSYNE_SYNC_KEY_SOURCE=file:<path>`). `None` = plaintext.
+    pub sync_key: Option<String>,
+    /// Sync direction for the replication cycle (`MNEMOSYNE_SYNC_MODE`): `bidirectional`
+    /// (default), `push`, or `pull`.
+    pub sync_mode: String,
 }
 
 /// The multi-agent identity scope applied to a recall (`beam.py` `recall` author/channel params
@@ -255,6 +266,10 @@ impl Default for MnemosyneConfig {
             ignore_patterns: Vec::new(),
             shared_surface_dir: None,
             shared_surface_read: false,
+            sync_remote: None,
+            sync_token: None,
+            sync_key: None,
+            sync_mode: "bidirectional".to_string(),
         }
     }
 }

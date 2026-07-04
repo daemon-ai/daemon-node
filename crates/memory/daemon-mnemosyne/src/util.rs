@@ -31,6 +31,15 @@ pub fn generate_id(content: &str) -> String {
     memory_id(&format!("{content}{}", now_iso()))
 }
 
+/// Python `str(float)` formatting for event-hash preimages (`0.5` -> `"0.5"`, `1.0` -> `"1.0"`).
+pub(crate) fn py_float(v: f64) -> String {
+    if v.fract() == 0.0 && v.is_finite() {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
 /// Strip closed `<think>...</think>` blocks some LLMs emit, then trim (`beam.py`
 /// `consolidate_to_episodic` L3991-L3993, `re.DOTALL`).
 pub fn strip_think(text: &str) -> String {

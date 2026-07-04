@@ -41,6 +41,9 @@ pub mod provider;
 pub mod recall;
 pub mod sanitize;
 pub mod store;
+pub mod streaming;
+#[cfg(feature = "sync")]
+pub mod sync;
 pub mod tokens;
 pub mod tools;
 pub mod util;
