@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+// tokio has no AF_UNIX support on windows; the unix-socket entry points below are unix-only, while
+// the shared mux/legacy loops stay portable (they serve the TLS/WS carriers on every platform).
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -55,6 +58,8 @@ pub(crate) enum AuthMode {
     /// Local trust ([`api].local_trust`): bind [`RequestContext::system`] (full-trust admin) for
     /// every request, advertise NO mechanisms, and run no SASL exchange. The Unix socket / FFI /
     /// CLI default — the deliberate, audited unauthenticated-but-trusted path.
+    // Only the unix-socket entry points construct this; the TLS/WS carriers are always Required.
+    #[cfg_attr(not(unix), allow(dead_code))]
     LocalSystem,
     /// Require a completed SASL exchange before any `Call`/`Open`. Advertises the authenticator's
     /// permitted mechanisms for the transport; binds the authenticated principal post-`AuthOk`.
@@ -78,6 +83,7 @@ impl AuthMode {
 /// [`RequestContext::system`] and no SASL exchange is offered. This is the default + the
 /// FFI/CLI/conformance entry point. For an authenticated Unix socket (operator disabled
 /// `local_trust`) use [`serve_api_unix_authenticated`]. Runs forever; spawn it as a background task.
+#[cfg(unix)]
 pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
     accept_unix(listener, api, Arc::new(AuthMode::LocalSystem)).await;
 }
@@ -85,6 +91,7 @@ pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
 /// As [`serve_api_unix`], but the Unix socket **requires** a SASL exchange (no local trust): the
 /// connection must authenticate via the [`Authenticator`] before any `Call`/`Open`. Used when
 /// `[api].local_trust` is disabled.
+#[cfg(unix)]
 pub async fn serve_api_unix_authenticated(
     listener: UnixListener,
     api: Arc<dyn NodeApi>,
@@ -97,6 +104,7 @@ pub async fn serve_api_unix_authenticated(
     accept_unix(listener, api, mode).await;
 }
 
+#[cfg(unix)]
 async fn accept_unix(listener: UnixListener, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
     loop {
         match listener.accept().await {
@@ -117,6 +125,7 @@ async fn accept_unix(listener: UnixListener, api: Arc<dyn NodeApi>, mode: Arc<Au
     }
 }
 
+#[cfg(unix)]
 async fn serve_conn(
     stream: UnixStream,
     api: Arc<dyn NodeApi>,
@@ -141,6 +150,8 @@ async fn serve_conn(
 /// The bare protocol carries no SASL handshake, so it is served only under [`AuthMode::LocalSystem`]
 /// (the FFI/CLI local-trust path); when auth is required this transport refuses with
 /// [`ApiError::Unauthenticated`] (a networked client must use the multiplexed SASL path).
+// unix-only because its sole caller is the unix-socket `serve_conn` (TLS/WS carriers are mux-only).
+#[cfg(unix)]
 async fn serve_legacy<R, W>(
     mut rd: R,
     mut wr: W,
@@ -768,6 +779,7 @@ impl ApiClient {
     }
 
     /// Connect, send `request`, and await the single framed response.
+    #[cfg(unix)]
     pub async fn call(&self, request: ApiRequest) -> Result<ApiResponse, ApiError> {
         let mut stream = UnixStream::connect(&self.path)
             .await
@@ -781,6 +793,17 @@ impl ApiClient {
             .ok_or_else(|| ApiError::Other("connection closed before a response".into()))?;
         from_cbor::<ApiResponse>(&bytes)
     }
+
+    /// Non-unix: there is no local-trust transport (tokio has no AF_UNIX support on windows), so a
+    /// call fails explicitly instead of pretending — a windows node serves TLS/WS/HTTP only.
+    #[cfg(not(unix))]
+    pub async fn call(&self, _request: ApiRequest) -> Result<ApiResponse, ApiError> {
+        Err(ApiError::Other(format!(
+            "the unix-socket transport ({}) is unavailable on this platform; connect over the \
+             node's TLS/WebSocket/HTTP surface instead",
+            self.path.display()
+        )))
+    }
 }
 
 /// A multiplexed client over the Unix-socket adapter: one connection, a `Hello` handshake, then
@@ -788,11 +811,14 @@ impl ApiClient {
 /// [`MuxApiClient::open`] + [`MuxApiClient::next`]). Single-stream-at-a-time in shape (the reader is
 /// `&mut self`), which suits drivers and conformance; a fully concurrent client would demux on a
 /// background task.
+// unix-only: it dials the unix socket (drivers/conformance); networked clients mux over TLS/WS.
+#[cfg(unix)]
 pub struct MuxApiClient {
     stream: UnixStream,
     next_id: u64,
 }
 
+#[cfg(unix)]
 impl MuxApiClient {
     /// Connect and complete the `Hello` handshake (sends `WireC2S::Hello`, awaits `WireS2C::Hello`).
     pub async fn connect(path: impl Into<PathBuf>) -> Result<Self, ApiError> {

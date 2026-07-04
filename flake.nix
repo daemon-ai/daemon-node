@@ -2,7 +2,7 @@
   description = "daemon Rust workspace";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:logos-co/nixpkgs/mingw-integration";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
 
@@ -254,6 +254,82 @@
           }
         );
 
+        # ------------------------------------------------------------------------------------
+        # Windows cross lane (x86_64-pc-windows-gnu): daemon.exe + daemon-cli.exe for the NSIS
+        # installer to bundle. Deliberately separate outputs — never part of the default gate.
+        # The flake's nixpkgs tracks the logos-co `mingw-integration` fork, so `pkgsCross.mingwW64`
+        # carries the MinGW fixes this lane relies on. The engine worker lanes (llama/mistralrs)
+        # are OUT OF SCOPE for windows v1; only the stub-worker daemon + the operator CLI cross.
+        pkgsWindows = pkgs.pkgsCross.mingwW64;
+        windowsTriple = "x86_64-pc-windows-gnu";
+        mingwCc = pkgsWindows.stdenv.cc;
+        mingwTargetCc = "${mingwCc}/bin/${mingwCc.targetPrefix}cc";
+
+        # The pinned stable toolchain plus the windows-gnu std, combined per fenix's cross recipe
+        # (same stable channel as `rustToolchain`, so host and cross rustc stay in lockstep).
+        rustToolchainWindows = fenix.packages.${system}.combine [
+          rustToolchain
+          fenix.packages.${system}.targets.${windowsTriple}.stable.rust-std
+        ];
+
+        craneLibWindows = (crane.mkLib pkgs).overrideToolchain rustToolchainWindows;
+
+        windowsCommonArgs = commonArgs // {
+          CARGO_BUILD_TARGET = windowsTriple;
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = mingwTargetCc;
+          # Fully static mingw runtime (libgcc + winpthread folded into the exe) so the shipped
+          # artifact depends on system DLLs only — nothing to place next to it in the installer.
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-C link-arg=-static -C link-arg=-static-libgcc -L ${pkgsWindows.windows.pthreads}/lib";
+          # cc-rs–built C deps (ring, bundled sqlite, secp256k1, aws-lc) target compiler/archiver.
+          TARGET_CC = mingwTargetCc;
+          TARGET_AR = "${mingwCc.bintools}/bin/${mingwCc.targetPrefix}ar";
+          # aws-lc-sys (rustls' aws-lc-rs provider, via daemon-host TLS): assemble from source with
+          # the real nasm — its prebuilt-NASM helper script does not run under the nix sandbox
+          # (unpatched shebang; see crane's cross-compiling-aws-lc-sys FAQ).
+          AWS_LC_SYS_PREBUILT_NASM = 0;
+          # aws-lc compiles with -Werror; these gcc-15/mingw false positives would fail the build.
+          CFLAGS = "-Wno-stringop-overflow -Wno-array-bounds -Wno-restrict";
+          # mingw pthread headers for the windows-targeted C compiles (aws-lc feature probes).
+          # Passed as path strings (here and in the -L above) rather than as buildInputs: nixpkgs
+          # splicing would try to re-resolve the windows-only package for the linux hostPlatform
+          # and refuse to evaluate it.
+          CFLAGS_x86_64_pc_windows_gnu = "-I${pkgsWindows.windows.pthreads}/include";
+          # Windows artifacts cannot run in the linux build sandbox; wine smoke is manual.
+          doCheck = false;
+          nativeBuildInputs = [
+            pkgs.nasm
+            pkgs.cmake
+          ];
+          depsBuildBuild = [ mingwCc ];
+        };
+
+        # Dependency-only artifacts for the two shipped bins. Scoped with `-p` so the unix-only
+        # dev-deps (the `nix` signal crate) and test-only trees never compile for windows.
+        windowsCargoArtifacts = craneLibWindows.buildDepsOnly (
+          windowsCommonArgs
+          // {
+            pname = "daemon-workspace-windows";
+            cargoExtraArgs = "-p daemon -p daemon-cli";
+          }
+        );
+
+        buildWindowsPackage =
+          packageName:
+          craneLibWindows.buildPackage (
+            windowsCommonArgs
+            // {
+              pname = "${packageName}-windows";
+              version = baseVersion;
+              cargoArtifacts = windowsCargoArtifacts;
+              cargoExtraArgs = "-p ${packageName}";
+              # Same reproducible build-metadata injection as the native packages.
+              DAEMON_BUILD_ID = buildId;
+            }
+          );
+
+        daemon-windows = buildWindowsPackage "daemon";
+        daemon-cli-windows = buildWindowsPackage "daemon-cli";
+
         # The MeTTa symbolic-coprocessor worker, built WITH the real engine (`--features hyperon`).
         # This is a deliberately separate output, NOT part of the default workspace gate: the default
         # `daemon-metta` (fallback engine) and every other crate never link `hyperon`. The hyperon
@@ -282,6 +358,8 @@
             daemon-infer-mistralrs
             daemon-infer-vulkan
             daemon-metta
+            daemon-windows
+            daemon-cli-windows
             ;
           # Prebuilt llama.cpp (shared, CPU + Vulkan) matching the crate's vendored commit; consumed
           # by the dev shells via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
@@ -364,6 +442,28 @@
                 pkgs.just # task runner: the justfile recipes (lint / deny / test / coverage)
               ]
               ++ engineNativeInputs;
+          };
+        }
+        // {
+          # Interactive iteration on the windows cross lane: `cargo build -p daemon` in here
+          # targets x86_64-pc-windows-gnu with the same toolchain/env as `packages.daemon-windows`.
+          windows-cross = pkgs.mkShell {
+            CARGO_BUILD_TARGET = windowsTriple;
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = mingwTargetCc;
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-C link-arg=-static -C link-arg=-static-libgcc -L ${pkgsWindows.windows.pthreads}/lib";
+            TARGET_CC = mingwTargetCc;
+            TARGET_AR = "${mingwCc.bintools}/bin/${mingwCc.targetPrefix}ar";
+            AWS_LC_SYS_PREBUILT_NASM = 0;
+            CFLAGS = "-Wno-stringop-overflow -Wno-array-bounds -Wno-restrict";
+            CFLAGS_x86_64_pc_windows_gnu = "-I${pkgsWindows.windows.pthreads}/include";
+            SSL_CERT_FILE = caBundle;
+            NIX_SSL_CERT_FILE = caBundle;
+            packages = [
+              rustToolchainWindows
+              mingwCc
+              pkgs.nasm
+              pkgs.cmake
+            ];
           };
         }
         // {

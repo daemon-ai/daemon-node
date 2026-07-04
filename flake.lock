@@ -73,16 +73,16 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1782467914,
-        "narHash": "sha256-pGvFkM8N0xEkIIXDe5YYfbEAvHrk4IxBrjB/x8OomhE=",
-        "owner": "NixOS",
+        "lastModified": 1783094257,
+        "narHash": "sha256-Fqcb8AU+bx+uWPS/KJ0IWyojx0hIJGLjwIcbd/NFvrg=",
+        "owner": "logos-co",
         "repo": "nixpkgs",
-        "rev": "e73de5be04e0eff4190a1432b946d469c794e7b4",
+        "rev": "453601d426a5bc1eb622a1c4516215f0f5091a11",
         "type": "github"
       },
       "original": {
-        "owner": "NixOS",
-        "ref": "nixos-unstable",
+        "owner": "logos-co",
+        "ref": "mingw-integration",
         "repo": "nixpkgs",
         "type": "github"
       }
