@@ -777,7 +777,11 @@ async fn unrecoverable_overflow_aborts() {
 struct DroppingContext;
 #[async_trait::async_trait]
 impl ContextEngine for DroppingContext {
-    fn before_turn(&self, _conv: &Conversation, budget: Option<usize>) -> crate::context::Pressure {
+    fn before_turn(
+        &self,
+        _conv: &mut Conversation,
+        budget: Option<usize>,
+    ) -> crate::context::Pressure {
         over_budget_pressure(budget)
     }
     async fn compact(&self, mut conv: Conversation, _budget: usize) -> Conversation {
@@ -795,7 +799,11 @@ impl ContextEngine for DroppingContext {
 struct StubbornContext;
 #[async_trait::async_trait]
 impl ContextEngine for StubbornContext {
-    fn before_turn(&self, _conv: &Conversation, budget: Option<usize>) -> crate::context::Pressure {
+    fn before_turn(
+        &self,
+        _conv: &mut Conversation,
+        budget: Option<usize>,
+    ) -> crate::context::Pressure {
         over_budget_pressure(budget)
     }
     async fn compact(&self, conv: Conversation, _budget: usize) -> Conversation {
@@ -897,7 +905,11 @@ impl ContextEngine for RecordingContext {
     fn on_model(&self, _model: &crate::context::ModelInfo) {
         self.log.lock().unwrap().push("on_model");
     }
-    fn before_turn(&self, _conv: &Conversation, budget: Option<usize>) -> crate::context::Pressure {
+    fn before_turn(
+        &self,
+        _conv: &mut Conversation,
+        budget: Option<usize>,
+    ) -> crate::context::Pressure {
         self.log.lock().unwrap().push("before_turn");
         // Force over-budget so the compaction hooks fire.
         crate::context::Pressure {

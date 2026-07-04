@@ -50,6 +50,17 @@ pub fn externalized_ref_regex() -> &'static Regex {
     })
 }
 
+/// The §8.2 ingest-payload placeholder family only (`_INGEST_PLACEHOLDER_RE`,
+/// `LCM:ingest_protection.py:104`) — `lcm_expand` prefers ingest refs over the legacy families
+/// (`extract_ingest_externalized_refs`, `LCM:tools.py:350-351`).
+fn ingest_placeholder_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)\[Externalized LCM ingest payload:[^\]]*?;\s*ref=([^;\]\s]+)\]")
+            .expect("ingest-placeholder ref regex is valid")
+    })
+}
+
 /// Whether `text` already carries an externalized-payload placeholder (so the storage guard skips it).
 pub fn contains_externalized_ref(text: &str) -> bool {
     externalized_ref_regex().is_match(text)
@@ -63,10 +74,36 @@ pub fn extract_ref(text: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
+/// All `ref`s of the §8.2 ingest-placeholder family, in text order, deduplicated
+/// (`extract_ingest_externalized_refs`, `LCM:ingest_protection.py:145-153`).
+pub fn extract_ingest_refs(text: &str) -> Vec<String> {
+    let mut refs: Vec<String> = Vec::new();
+    for cap in ingest_placeholder_regex().captures_iter(text) {
+        let reference = cap[1].trim().to_string();
+        if !reference.is_empty() && !refs.contains(&reference) {
+            refs.push(reference);
+        }
+    }
+    refs
+}
+
+/// All recovery `ref`s from every recognized placeholder family, basename-validated and
+/// deduplicated (`extract_all_externalized_payload_refs`, `LCM:ingest_protection.py:160-168`).
+pub fn extract_all_refs(text: &str) -> Vec<String> {
+    let mut refs: Vec<String> = Vec::new();
+    for cap in externalized_ref_regex().captures_iter(text) {
+        let reference = cap[1].trim().to_string();
+        if is_basename_ref(&reference) && !refs.contains(&reference) {
+            refs.push(reference);
+        }
+    }
+    refs
+}
+
 /// Metadata recorded alongside an externalized payload (and reflected in its placeholder).
 #[derive(Clone, Debug)]
 pub struct PayloadMeta<'a> {
-    /// The payload family (`data_uri`, `base64_run`, `tool_output`, `payload`, `quarantine`).
+    /// The payload family (`data_uri`, `base64_run`, `tool_result`, `raw_payload`, `quarantine`).
     pub kind: &'a str,
     /// The originating field (`content`, `tool_calls`).
     pub field: &'a str,
@@ -74,21 +111,42 @@ pub struct PayloadMeta<'a> {
     pub role: &'a str,
     /// For a tool result: the call id this payload answered.
     pub tool_call_id: Option<&'a str>,
+    /// The owning session — payload metadata/content recovery is session-scoped
+    /// (`_get_externalized_payload`, `LCM:tools.py:84-97`). Empty means unscoped (legacy records).
+    pub session_id: &'a str,
 }
 
 /// Persist `body` to `dir` and return its recovery `ref` (the file name). The directory is created
 /// `0700` and the file written `O_CREAT|O_EXCL` `0600` with JSON indent 2 (§9.1). Identical bodies
-/// dedup by a `*_{digest12}_*.json` scan, so re-ingesting the same payload reuses one file.
+/// dedup by a `*_{digest12}_*.json` scan **within the same session** — payload records are
+/// session-scoped (Python's dedup filter includes `session_id`,
+/// `LCM:externalize.py:372-386`), so the same body in another session gets its own file rather
+/// than pinning the payload to the first writer's session.
 pub fn store_payload(dir: &Path, body: &str, meta: &PayloadMeta<'_>) -> io::Result<String> {
     ensure_dir(dir)?;
     let digest = sha256_hex_prefix(body.as_bytes(), 12);
-    if let Some(existing) = find_by_digest(dir, &digest) {
+    if let Some((existing, _)) = find_payload_for_content(
+        dir,
+        body,
+        Some(meta.kind),
+        meta.tool_call_id.unwrap_or(""),
+        meta.session_id,
+    ) {
         return Ok(existing);
     }
     let chars = body.chars().count();
     let bytes = body.len();
     let kind = sanitize_kind(meta.kind);
-    let file_name = format!("{kind}_{digest}_{chars}.json");
+    // The session token keeps file names distinct across sessions for the same body (the
+    // exclusive-create dedup fallback must not alias another session's record).
+    let file_name = if meta.session_id.is_empty() {
+        format!("{kind}_{digest}_{chars}.json")
+    } else {
+        format!(
+            "{kind}_{digest}_{chars}_{}.json",
+            sha256_hex_prefix(meta.session_id.as_bytes(), 8)
+        )
+    };
     let path = dir.join(&file_name);
     let payload = json!({
         "content": body,
@@ -96,6 +154,7 @@ pub fn store_payload(dir: &Path, body: &str, meta: &PayloadMeta<'_>) -> io::Resu
         "field": meta.field,
         "role": meta.role,
         "tool_call_id": meta.tool_call_id,
+        "session_id": meta.session_id,
         "chars": chars,
         "bytes": bytes,
         "digest": digest,
@@ -114,11 +173,26 @@ pub fn store_payload(dir: &Path, body: &str, meta: &PayloadMeta<'_>) -> io::Resu
     }
 }
 
-/// Read back an externalized payload's original body by its recovery `ref` (file name). Path
-/// components are stripped to a bare file name to keep the read inside `dir`.
+/// Whether a recovery `ref` is a bare file name. A ref carrying path components (separators, `..`,
+/// a trailing slash) is **rejected**, never coerced to its basename — coercion would make a
+/// traversal-shaped ref silently resolve to a legitimate file (`load_externalized_payload`,
+/// `LCM:externalize.py:168-169`; `_is_basename_ref`, `LCM:ingest_protection.py:157-158`).
+fn is_basename_ref(reference: &str) -> bool {
+    !reference.is_empty()
+        && !reference.contains('/')
+        && !reference.contains('\\')
+        && Path::new(reference)
+            .file_name()
+            .is_some_and(|n| n == std::ffi::OsStr::new(reference))
+}
+
+/// Read back an externalized payload's original body by its recovery `ref` (a bare file name; a
+/// ref with path components is rejected).
 pub fn read_externalized(dir: &Path, reference: &str) -> Option<String> {
-    let name = Path::new(reference).file_name()?;
-    let path = dir.join(name);
+    if !is_basename_ref(reference) {
+        return None;
+    }
+    let path = dir.join(reference);
     let raw = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
@@ -128,12 +202,100 @@ pub fn read_externalized(dir: &Path, reference: &str) -> Option<String> {
 }
 
 /// Read back an externalized payload's full record (metadata + content) by its `ref`, for
-/// `lcm_describe(externalized_ref=…)` (which strips the content for its metadata-only view).
+/// `lcm_describe(externalized_ref=…)` (which strips the content for its metadata-only view). A ref
+/// with path components is rejected.
 pub fn read_payload_record(dir: &Path, reference: &str) -> Option<serde_json::Value> {
-    let name = Path::new(reference).file_name()?;
-    let path = dir.join(name);
+    if !is_basename_ref(reference) {
+        return None;
+    }
+    let path = dir.join(reference);
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Map a payload record to the Python summary shape (`_externalized_summary`,
+/// `LCM:externalize.py:97-108`): `ref`/`kind`/`tool_call_id`/`role`/`session_id`/`field_path`/
+/// `content_chars`/`content_bytes`/`created_at`, tolerating both this port's record keys
+/// (`field`/`chars`/`bytes`) and the Python ones (`field_path`/`content_chars`/`content_bytes`).
+pub fn payload_summary(reference: &str, record: &serde_json::Value) -> serde_json::Value {
+    let content = record.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let get_str = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| record.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    let get_num = |keys: &[&str], default: u64| -> u64 {
+        keys.iter()
+            .find_map(|k| record.get(*k).and_then(|v| v.as_u64()))
+            .unwrap_or(default)
+    };
+    json!({
+        "ref": reference,
+        "kind": if get_str(&["kind"]).is_empty() { "tool_result".to_string() } else { get_str(&["kind"]) },
+        "tool_call_id": get_str(&["tool_call_id"]),
+        "role": get_str(&["role"]),
+        "session_id": get_str(&["session_id"]),
+        "field_path": get_str(&["field_path", "field"]),
+        "content_chars": get_num(&["content_chars", "chars"], content.chars().count() as u64),
+        "content_bytes": get_num(&["content_bytes", "bytes"], content.len() as u64),
+        "created_at": record.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// Load an externalized payload as its Python summary shape **plus** `content`
+/// (`load_externalized_payload`, `LCM:externalize.py:167-182`). `None` for a missing/invalid ref.
+pub fn load_payload(dir: &Path, reference: &str) -> Option<serde_json::Value> {
+    let record = read_payload_record(dir, reference)?;
+    let mut summary = payload_summary(reference, &record);
+    if let serde_json::Value::Object(ref mut map) = summary {
+        map.insert(
+            "content".to_string(),
+            serde_json::Value::String(
+                record
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+        );
+    }
+    Some(summary)
+}
+
+/// Replace §8.2 ingest placeholders with their stored payload content, for identity matching only
+/// (`restore_ingest_payload_placeholders`, `LCM:ingest_protection.py:496-522`). A missing,
+/// non-ingest, or session-mismatched payload leaves the placeholder untouched so callers never
+/// fabricate content or hide a recovery problem.
+pub fn restore_ingest_placeholders(dir: &Path, text: &str, session_id: &str) -> String {
+    if !text.contains("[Externalized LCM ingest payload:") {
+        return text.to_string();
+    }
+    ingest_placeholder_regex()
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let reference = caps[1].trim();
+            let Some(payload) = load_payload(dir, reference) else {
+                return caps[0].to_string();
+            };
+            if payload.get("kind").and_then(|k| k.as_str()) != Some("ingest_payload") {
+                return caps[0].to_string();
+            }
+            let payload_session = payload
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if !session_id.is_empty()
+                && !payload_session.is_empty()
+                && payload_session != session_id
+            {
+                return caps[0].to_string();
+            }
+            match payload.get("content").and_then(|c| c.as_str()) {
+                Some(content) => content.to_string(),
+                None => caps[0].to_string(),
+            }
+        })
+        .into_owned()
 }
 
 /// The opt-in threshold-externalization gate (§9.1 `maybe_externalize_payload`): when `enabled` and
@@ -207,18 +369,65 @@ pub fn gc_placeholder(is_tool_output: bool, reference: &str) -> String {
     }
 }
 
-/// Find an existing payload file for `digest` (the dedup scan `*_{digest12}_*.json`).
-fn find_by_digest(dir: &Path, digest: &str) -> Option<String> {
+/// Scan `dir` for a payload record whose content equals `body` (the digest-prefix candidate scan of
+/// `find_externalized_payload_for_message`, `LCM:externalize.py:225-266`): candidates match on
+/// `kind` (when given), `tool_call_id`, and session — a record for the caller's session wins;
+/// otherwise the first record without a session claim is the fallback.
+pub fn find_payload_for_content(
+    dir: &Path,
+    body: &str,
+    kind: Option<&str>,
+    tool_call_id: &str,
+    session_id: &str,
+) -> Option<(String, serde_json::Value)> {
+    let digest = sha256_hex_prefix(body.as_bytes(), 12);
     let needle = format!("_{digest}_");
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".json") && name.contains(&needle) {
-            return Some(name.to_string());
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            (name.ends_with(".json") && name.contains(&needle)).then_some(name)
+        })
+        .collect();
+    names.sort();
+    let mut fallback: Option<(String, serde_json::Value)> = None;
+    for name in names {
+        let Some(record) = read_payload_record(dir, &name) else {
+            continue;
+        };
+        let record_kind = record
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("tool_result");
+        if kind.is_some_and(|k| record_kind != k) {
+            continue;
+        }
+        let record_call = record
+            .get("tool_call_id")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if record_call != tool_call_id {
+            continue;
+        }
+        if record.get("content").and_then(|c| c.as_str()) != Some(body) {
+            continue;
+        }
+        let record_session = record
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        if !session_id.is_empty() {
+            if record_session == session_id {
+                return Some((name, record));
+            }
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some((name, record));
         }
     }
-    None
+    fallback
 }
 
 /// Restrict a `kind` to a safe file-name token.
@@ -294,6 +503,7 @@ mod tests {
             field: "content",
             role: "tool",
             tool_call_id: Some("c1"),
+            session_id: "s1",
         };
         let body = "QUJD".repeat(2000);
         let reference = store_payload(&dir, &body, &meta).unwrap();
@@ -310,6 +520,7 @@ mod tests {
             field: "content",
             role: "assistant",
             tool_call_id: None,
+            session_id: "s1",
         };
         let body = "x".repeat(5000);
         let r1 = store_payload(&dir, &body, &meta).unwrap();
@@ -317,6 +528,45 @@ mod tests {
         assert_eq!(r1, r2, "same digest reuses the same file");
         let count = fs::read_dir(&dir).unwrap().count();
         assert_eq!(count, 1, "no duplicate file written");
+        // A different session never aliases another session's record (payload metadata is
+        // session-scoped, `LCM:externalize.py:259-263`).
+        let other = PayloadMeta {
+            session_id: "s2",
+            ..meta.clone()
+        };
+        let r3 = store_payload(&dir, &body, &other).unwrap();
+        assert_ne!(r1, r3, "same body in another session gets its own file");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_summary_maps_record_keys_to_python_shape() {
+        let dir = tmp("summary");
+        let meta = PayloadMeta {
+            kind: "tool_result",
+            field: "content",
+            role: "tool",
+            tool_call_id: Some("c9"),
+            session_id: "sX",
+        };
+        let body = "b".repeat(64);
+        let reference = store_payload(&dir, &body, &meta).unwrap();
+        let loaded = load_payload(&dir, &reference).unwrap();
+        assert_eq!(loaded["ref"], reference.as_str());
+        assert_eq!(loaded["kind"], "tool_result");
+        assert_eq!(loaded["tool_call_id"], "c9");
+        assert_eq!(loaded["session_id"], "sX");
+        assert_eq!(loaded["field_path"], "content");
+        assert_eq!(loaded["content_chars"], 64);
+        assert_eq!(loaded["content_bytes"], 64);
+        assert_eq!(loaded["content"], body.as_str());
+        // Content-equality lookup honors session scoping.
+        assert!(find_payload_for_content(&dir, &body, Some("tool_result"), "c9", "sX").is_some());
+        assert!(
+            find_payload_for_content(&dir, &body, Some("tool_result"), "c9", "other").is_none(),
+            "a session-claimed record never matches another session"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -330,6 +580,7 @@ mod tests {
                 field: "content",
                 role: "tool",
                 tool_call_id: Some("c1"),
+                session_id: "s1",
             },
             10,
             20,
@@ -341,6 +592,7 @@ mod tests {
                 field: "content",
                 role: "assistant",
                 tool_call_id: None,
+                session_id: "s1",
             },
             10,
             20,
@@ -368,6 +620,39 @@ mod tests {
     }
 
     #[test]
+    fn refs_with_path_components_are_rejected_not_coerced() {
+        let dir = tmp("traversal");
+        let meta = PayloadMeta {
+            kind: "payload",
+            field: "content",
+            role: "assistant",
+            tool_call_id: None,
+            session_id: "s1",
+        };
+        let body = "y".repeat(5000);
+        let reference = store_payload(&dir, &body, &meta).unwrap();
+        assert!(
+            read_externalized(&dir, &reference).is_some(),
+            "bare ref reads"
+        );
+        // A traversal-shaped ref must NOT resolve to the legitimate file via basename coercion.
+        for bad in [
+            format!("../{reference}"),
+            format!("sub/{reference}"),
+            format!("..\\{reference}"),
+            "..".to_string(),
+            String::new(),
+        ] {
+            assert!(
+                read_externalized(&dir, &bad).is_none(),
+                "rejected ref: {bad:?}"
+            );
+            assert!(read_payload_record(&dir, &bad).is_none());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn threshold_gate_respects_enabled_and_size() {
         let dir = tmp("thresh");
         let meta = PayloadMeta {
@@ -375,6 +660,7 @@ mod tests {
             field: "content",
             role: "tool",
             tool_call_id: Some("c1"),
+            session_id: "s1",
         };
         // Disabled -> None even when large.
         assert!(

@@ -71,7 +71,8 @@ message filters, and diagnostics.
 
 **Deferred (documented, not specced line-by-line):** the `/lcm` operator slash-command surface
 (`LCM:command.py`, 1,749 lines) and the benchmarking/stress harness. These are operator tooling, not
-the context-engine hot path; they become a late milestone (§15).
+the context-engine hot path; they become a late milestone (§15). The `/lcm` surface has since
+landed as milestone M9 (status / doctor [repair [apply]] / preset / backup / rotate [apply]).
 
 **Out of scope for *this artifact*:** writing crate code, editing `Cargo.toml`, or modifying
 `daemon-core`. This document is the specification that a subsequent implementation phase consumes.
@@ -1329,6 +1330,32 @@ M5/M7 deviations (all within the milestone intent):
 - **`ignore_message_patterns` matches a turn's content** (user/assistant text or a tool turn's
   assistant text + result bodies), not the role-tagged render; the platform is unknown in
   daemon-core, so session match keys reduce to the bare `session_id`.
+- **Active-replay protection required a daemon-core seam change:** `ContextEngine::before_turn` now
+  takes `&mut Conversation` so LCM can sanitize the provider-facing view in place
+  (`_redact_active_replay_messages` + `quarantine_suspicious_assistant_messages`,
+  `LCM:engine.py:3224-3289`) before measuring pressure: sensitive redaction over every turn (tool
+  `args` with JSON-string parsing) and runaway-assistant quarantine (externalized when spilling is
+  allowed, the volatile placeholder for ignore-filtered turns, skipped for ignored/stateless
+  sessions). The store still ingests the original content through the write-boundary pipeline.
+  Implementations may rewrite turn *content* but never turn structure.
+- **Session reset/carry-over hooks have no daemon-core seam.** `ContextEngine` has
+  `on_session_start`/`on_session_end` but no reset (`/new`) or old→new rollover hook, so
+  `on_session_reset`, `carry_over_new_session_context`, and `rollover_session`
+  (`LCM:engine.py:2202-2305`) are *inherent* methods on `LcmContextEngine` the host must call
+  directly. `on_session_end` performs the final best-effort flush + lifecycle finalize;
+  `on_session_start` finalizes a pending reset boundary on a session switch, resets the
+  session-scoped runtime state, and runs the empty-lifecycle-row GC (threshold 200, 24 h age guard)
+  at bind. The Hermes-host compression-boundary/auxiliary-session machinery
+  (`LCM:engine.py:2082-2131`) has no daemon analog and is not ported.
+- **Store hygiene is ported with two small deviations.** Open runs the throttled external-content
+  FTS repair (§4.4: structural check, savepoint-wrapped deep integrity-check throttled by the
+  `fts_integrity_checked_at:<table>` metadata marker, rebuild-from-content + trigger recreation);
+  `Store::repair_fts(force)`/`fts_integrity()` expose the forced/doctor variants; drop checkpoints
+  the WAL (`PRAGMA wal_checkpoint(PASSIVE)`, `LCM:store.py:1018-1029`). The check interval is the
+  §12.1 `fts_integrity_check_interval_hours` config field (threaded through `Store::open_at`; the
+  engine reads no env). Deviation: the low-disk degradation to LIKE-only search
+  (`LCM:db_bootstrap.py:534-545`) is omitted — `std` has no free-space probe, so a rebuild on a
+  full disk surfaces as the SQLite write error instead.
 
 Three deliberate deviations from the literal milestone text below, all within the milestone's intent:
 
@@ -1377,8 +1404,10 @@ Each milestone is independently testable; constants from §6/§7/§8 are carried
 - **M5 — Protection. (done)** `protection.rs` (redaction catalog + placeholder formats, base64
   storage guard, quarantine) + `externalize.rs` + `extraction.rs`; wired into `ingest_current`
   (per-message protection) and `run_compaction` (pre-compaction extraction + opt-in transcript GC via
-  `Store::update_message_content`). Acceptance (met): secrets redacted with correct digest length
-  (password omits the hash); oversized base64 externalized with a recoverable `ref` (recovered via
+  `Store::gc_externalized_tool_result` — unpinned tool rows only, payload verified recoverable on
+  disk and `kind == "tool_result"` before the inline copy is dropped, token estimate re-cached with
+  the rewrite). Acceptance (met): secrets redacted with correct digest length (password omits the
+  hash); oversized base64 externalized with a recoverable `ref` (recovered via
   `lcm_expand(externalized_ref=…)`); degenerate assistant output quarantined at the thresholds. (§8, §9)
 - **M6 — Tools + search. (done)** `search.rs` (FTS5 sanitize, LIKE fallback, sort modes, directness,
   snippets) + `tools/mod.rs` (the seven handlers) + `tools/schemas.rs`; full per-turn ingest +
@@ -1386,6 +1415,16 @@ Each milestone is independently testable; constants from §6/§7/§8 are carried
   cache + `LcmTool` adapter register the tools alongside `mnemosyne_*`. Acceptance (met): each tool's
   paged return shape + cursor families match the schema; cross-session `lcm_grep` returns raw-only;
   `lcm_expand(store_id)` recovers exact content; reconcile never duplicates the tail. (§10, §11)
+  The §11 stack is a faithful `search_query.py` port (differentially checked against the Python
+  reference): char-preserving `sanitize_fts5_query` with balanced-quote handling, the exact
+  `_QUOTED_PHRASE_RE` scanning semantics, case-preserving term extraction with `-:/` compound
+  variants + boolean-operator drops, the Python CJK/emoji ranges, the full directness score
+  (phrase-stuffing gap analysis included), SQL-side sort `ORDER BY`s with the role bias
+  (user < assistant < tool), the fetch-widening ladder with the rank-bonus early-exit proof and
+  candidate caps, the LIKE recency paging + boundary tie-group continuation (SQL score/directness
+  transliteration included), FTS `snippet(...)` (`>>>`/`<<<`) on the FTS path vs the 80-char
+  window builder on the LIKE path, and node search with the source-lineage recursive CTE
+  (`_node_matches_source`) + LIKE fallback, honoring `sort`/`source` from `lcm_grep`. (§11)
 - **M7 — Routing + presets + filters. (done)** `model_routing.rs` shim (per-route fallback chain
   with config-driven breakers threaded through `State`/`run_compaction`), `presets.rs` metadata,
   `patterns.rs` (session globs + message regex); wired into session bind (`session_ignored`/
@@ -1398,9 +1437,15 @@ Each milestone is independently testable; constants from §6/§7/§8 are carried
   on `ContextOverflow`. Acceptance: the engine/ReAct conformance suites stay green with LCM as the
   default engine; a context-overflow turn compacts and retries once; concurrent sessions attribute
   summary nodes to the correct `session_id`. (§2.5)
-- **Deferred (post-parity):** the `/lcm` slash-command operator surface (`LCM:command.py`), the
-  benchmarking/stress harness, legacy `lcm.db` import (`scripts/import_lossless_claw.py`), and a
-  reasoning sidecar column.
+- **M9 — `/lcm` operator surface. (done)** `CommandProvider` on `LcmContextEngine`: `status`,
+  `doctor` (+ `repair` read-only scan / `repair apply` backup-first forced FTS rebuild), `preset`,
+  `backup` (timestamped snapshot via SQLite's online backup API), and `rotate` / `rotate apply`
+  (tail-preserving frontier advance behind a rolling `rotate-latest` snapshot; preview and noop
+  pre-flights run before the backup so a rerun never overwrites the known-good slot). Store
+  additions: `backup_to`, `tail_min_store_id`, `scan_fts_repair`. (`LCM:command.py`,
+  `LCM:engine.py:4453-4620`)
+- **Deferred (post-parity):** the benchmarking/stress harness, legacy `lcm.db` import
+  (`scripts/import_lossless_claw.py`), and a reasoning sidecar column.
 
 ---
 

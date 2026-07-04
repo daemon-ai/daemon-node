@@ -153,7 +153,13 @@ pub trait ContextEngine: Send + Sync {
     fn on_model(&self, _model: &ModelInfo) {}
 
     /// Measure budget pressure for the conversation as it would be sent this turn.
-    fn before_turn(&self, conv: &Conversation, budget: Option<usize>) -> Pressure;
+    ///
+    /// The conversation is `&mut` so a stateful engine can sanitize the provider-facing view in
+    /// place before measuring (e.g. LCM's active-replay protection: secret redaction + runaway
+    /// assistant-output quarantine). Implementations may rewrite turn *content* but must preserve
+    /// the turn structure (count/order/pairing) — structural changes belong in
+    /// [`ContextEngine::compact`]. The default engines leave the conversation untouched.
+    fn before_turn(&self, conv: &mut Conversation, budget: Option<usize>) -> Pressure;
 
     /// Compact `conv` to fit `budget` tokens, returning the (possibly unchanged) conversation. Must
     /// preserve tool-call/result pairing — operating on whole [`Turn`]s does this by construction.
@@ -263,7 +269,7 @@ impl BudgetedContextEngine {
 
 #[async_trait]
 impl ContextEngine for BudgetedContextEngine {
-    fn before_turn(&self, conv: &Conversation, budget: Option<usize>) -> Pressure {
+    fn before_turn(&self, conv: &mut Conversation, budget: Option<usize>) -> Pressure {
         Pressure {
             used_tokens: estimate_tokens(conv),
             budget_tokens: budget,
@@ -327,12 +333,12 @@ mod tests {
 
     #[test]
     fn pressure_flags_over_budget() {
-        let c = convo(10);
+        let mut c = convo(10);
         let used = estimate_tokens(&c);
         let eng = BudgetedContextEngine::default();
-        assert!(eng.before_turn(&c, Some(used / 2)).over_budget());
-        assert!(!eng.before_turn(&c, Some(used * 2)).over_budget());
-        assert!(!eng.before_turn(&c, None).over_budget());
+        assert!(eng.before_turn(&mut c, Some(used / 2)).over_budget());
+        assert!(!eng.before_turn(&mut c, Some(used * 2)).over_budget());
+        assert!(!eng.before_turn(&mut c, None).over_budget());
     }
 
     #[tokio::test]

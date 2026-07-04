@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS summary_nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_session_depth  ON summary_nodes(session_id, depth, created_at);
 CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at);
 
--- §4.5 per-conversation compaction frontier + debt
+-- §4.5 per-conversation compaction frontier + debt (v2 adds the maintenance/rollover/reset
+-- timestamps + the finalized-session index — see MIGRATION_V2)
 CREATE TABLE IF NOT EXISTS lcm_lifecycle_state (
     conversation_id                  TEXT PRIMARY KEY,
     current_session_id               TEXT,
@@ -107,3 +108,105 @@ CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON summary_nodes BEGI
     INSERT INTO nodes_fts(nodes_fts, rowid, summary) VALUES ('delete', old.node_id, old.summary);
 END;
 "#;
+
+/// Migration v2 — the session-lifecycle timestamps + finalized-session index
+/// (`LCM:db_bootstrap.py:155-175` `ensure_lifecycle_state_columns` /
+/// `idx_lcm_lifecycle_last_finalized_session`): stamps for maintenance attempts, `/new` rollovers,
+/// and resets, plus the reverse lookup by finalized session.
+pub const MIGRATION_V2: &str = r#"
+ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL;
+ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL;
+ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL;
+CREATE INDEX IF NOT EXISTS idx_lcm_lifecycle_last_finalized_session
+    ON lcm_lifecycle_state(last_finalized_session_id);
+"#;
+
+/// One external-content FTS5 index + its sync triggers, as a repairable unit
+/// (`ExternalContentFtsSpec`, `LCM:db_bootstrap.py`). `create_sql`/`trigger_sqls` must stay
+/// byte-identical to the corresponding [`SCHEMA`] DDL (asserted by a test) so a startup rebuild
+/// leaves `sqlite_master` matching the golden schema.
+pub struct FtsSpec {
+    /// The FTS5 virtual-table name.
+    pub table: &'static str,
+    /// The single indexed column.
+    pub indexed_column: &'static str,
+    /// The external-content base table.
+    pub content_table: &'static str,
+    /// The base table's rowid column (`content_rowid=`).
+    pub content_rowid: &'static str,
+    /// The `CREATE VIRTUAL TABLE` DDL (identical to the [`SCHEMA`] copy).
+    pub create_sql: &'static str,
+    /// The sync-trigger DDL (identical to the [`SCHEMA`] copies).
+    pub trigger_sqls: &'static [&'static str],
+}
+
+/// The `messages` transcript FTS index.
+pub const MESSAGES_FTS: FtsSpec = FtsSpec {
+    table: "messages_fts",
+    indexed_column: "content",
+    content_table: "messages",
+    content_rowid: "store_id",
+    create_sql: r#"CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='store_id'
+);"#,
+    trigger_sqls: &[
+        r#"CREATE TRIGGER IF NOT EXISTS msg_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.store_id, new.content);
+END;"#,
+        r#"CREATE TRIGGER IF NOT EXISTS msg_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.store_id, old.content);
+END;"#,
+        r#"CREATE TRIGGER IF NOT EXISTS msg_fts_update AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.store_id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.store_id, new.content);
+END;"#,
+    ],
+};
+
+/// The `summary_nodes` DAG FTS index.
+pub const NODES_FTS: FtsSpec = FtsSpec {
+    table: "nodes_fts",
+    indexed_column: "summary",
+    content_table: "summary_nodes",
+    content_rowid: "node_id",
+    create_sql: r#"CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+    summary,
+    content='summary_nodes',
+    content_rowid='node_id'
+);"#,
+    trigger_sqls: &[
+        r#"CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON summary_nodes BEGIN
+    INSERT INTO nodes_fts(rowid, summary) VALUES (new.node_id, new.summary);
+END;"#,
+        r#"CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON summary_nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, summary) VALUES ('delete', old.node_id, old.summary);
+END;"#,
+    ],
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rebuild must recreate exactly the DDL the base schema declares, or a repaired database
+    /// would drift from the golden `sqlite_master` dump.
+    #[test]
+    fn fts_specs_match_schema_ddl() {
+        for spec in [&MESSAGES_FTS, &NODES_FTS] {
+            assert!(
+                SCHEMA.contains(spec.create_sql),
+                "{}: create_sql drifted from SCHEMA",
+                spec.table
+            );
+            for trigger in spec.trigger_sqls {
+                assert!(
+                    SCHEMA.contains(trigger),
+                    "{}: trigger DDL drifted from SCHEMA",
+                    spec.table
+                );
+            }
+        }
+    }
+}

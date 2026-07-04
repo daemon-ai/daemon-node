@@ -742,8 +742,7 @@ fn build_context(cfg: &NodeConfig, aux: Arc<dyn Provider>) -> ContextWiring {
                 LcmConfig::in_memory()
             };
             // Inject the `[lcm]` tunables (the context crate reads no env itself).
-            lcm_cfg.context_threshold = cfg.lcm.context_threshold;
-            lcm_cfg.fresh_tail_count = cfg.lcm.fresh_tail_count;
+            cfg.lcm.apply(&mut lcm_cfg);
             let banks = Arc::new(LcmBanks::new(
                 lcm_cfg,
                 persist,

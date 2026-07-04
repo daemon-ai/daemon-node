@@ -708,24 +708,219 @@ impl RoutingConfig {
 
 /// LCM context-engine tuning (`[lcm]` / `DAEMON_LCM__*`). Injected into the per-node `LcmConfig`
 /// template so the context crate itself reads no environment (`data_dir` is set from the profile
-/// home separately). Only the two historically env-tunable knobs are surfaced; the remaining
-/// Appendix-A compaction constants stay compile-time defaults.
+/// home separately). Mirrors the Python plugin's `LCM_*` env surface for every knob this port
+/// wires. The store location (`data_dir`/`bank`) stays node-owned, and the aux-model *selectors*
+/// (`summary_model`, `expansion_model`, fallbacks) stay out — the daemon injects the aux provider
+/// explicitly, so a selector here would claim routing the engine doesn't do.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LcmOpts {
+    // ---- core compaction ----------------------------------------------------------------------
     /// The fraction of the model context window at which compaction triggers (`0.0 < v <= 1.0`).
     pub context_threshold: f64,
     /// The number of most-recent turns always kept verbatim (the fresh tail).
     pub fresh_tail_count: usize,
+    /// The base leaf-chunk size in tokens.
+    pub leaf_chunk_tokens: usize,
+    /// The sibling count that triggers condensation to the next depth.
+    pub condensation_fanin: usize,
+    /// The maximum condensation depth — `0` disables, `-1` unlimited.
+    pub incremental_max_depth: i64,
+    /// Let leaf compaction grow its working chunk with backlog pressure (multi-pass).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub dynamic_leaf_chunk_enabled: bool,
+    /// The ceiling of the dynamic working leaf-chunk threshold in tokens.
+    pub dynamic_leaf_chunk_max: usize,
+    /// Suppress follow-on condensation right after a leaf pass until enough same-depth debt
+    /// accumulates (prefix-cache stability).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub cache_friendly_condensation_enabled: bool,
+    /// The minimum number of same-depth fanin groups before a cache-friendly condensation pass.
+    pub cache_friendly_min_debt_groups: usize,
+    /// Persist raw-backlog debt in the lifecycle row and run bounded catch-up passes later.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub deferred_maintenance_enabled: bool,
+    /// The maximum leaf passes a debt-triggered catch-up turn may spend.
+    pub deferred_maintenance_max_passes: usize,
+    /// Bypass the polite compaction gates at this fraction of the context window (`0` disables).
+    pub critical_budget_pressure_ratio: f64,
+    /// Hard cap for the assembled active context in tokens (`0` disables).
+    pub max_assembly_tokens: usize,
+    /// Tokens reserved from the model window before assembly (`0` disables).
+    pub reserve_tokens_floor: usize,
+    /// The per-summary auxiliary-provider timeout in milliseconds.
+    pub summary_timeout_ms: u64,
+    /// Custom instructions injected into every summarization prompt.
+    pub custom_instructions: String,
+    /// The L2 budget as a fraction of the L1 budget.
+    pub l2_budget_ratio: f64,
+    /// The deterministic L3 truncation budget in tokens.
+    pub l3_truncate_tokens: usize,
+
+    // ---- ingest protection --------------------------------------------------------------------
+    /// Enable sensitive-pattern redaction at the ingest boundary.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub sensitive_patterns_enabled: bool,
+    /// The active sensitive-pattern catalog names (`all`/`default` expand to the catalog).
+    pub sensitive_patterns: Vec<String>,
+    /// Enable threshold externalization of oversized non-base64 payloads.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub large_output_externalization_enabled: bool,
+    /// The character threshold for opt-in payload externalization.
+    pub large_output_externalization_threshold_chars: usize,
+    /// Enable rewriting summarized+externalized tool rows to placeholders after compaction.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub large_output_transcript_gc_enabled: bool,
+    /// Enable pre-compaction extraction of decisions/commitments to a daily markdown.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub extraction_enabled: bool,
+
+    // ---- session filters ----------------------------------------------------------------------
+    /// Session globs whose sessions are fully ignored (no ingest/compaction writes).
+    pub ignore_session_patterns: Vec<String>,
+    /// Session globs whose sessions are read-only/stateless (no writes).
+    pub stateless_session_patterns: Vec<String>,
+    /// Message-content regexes whose matching turns are filtered before the store.
+    pub ignore_message_patterns: Vec<String>,
+
+    // ---- summarization circuit breaker / expansion ----------------------------------------------
+    /// Aux failures before a summary route's circuit breaker opens.
+    pub summary_circuit_breaker_failure_threshold: u32,
+    /// Seconds an open summary circuit breaker stays open.
+    pub summary_circuit_breaker_cooldown_seconds: u64,
+    /// The expansion context budget in tokens (`lcm_expand`).
+    pub expansion_context_tokens: usize,
+    /// The per-expansion aux-provider timeout in milliseconds.
+    pub expansion_timeout_ms: u64,
+
+    // ---- session lifecycle / operator gates -----------------------------------------------------
+    /// DAG depth retained across a `/new`-style session reset (`-1` all, `0` none, `N` >= N).
+    pub new_session_retain_depth: i64,
+    /// Safety gate for the destructive `/lcm doctor clean apply` operator workflow.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub doctor_clean_apply_enabled: bool,
+    /// Enable pruning lifecycle rows for sessions that never ingested data.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub empty_lifecycle_gc_enabled: bool,
+    /// The lifecycle row count above which the empty-row GC fires.
+    pub empty_lifecycle_gc_threshold: i64,
+    /// Age guard for the empty-row GC in hours; negative prunes regardless of age.
+    pub empty_lifecycle_gc_max_age_hours: f64,
+
+    // ---- store hygiene --------------------------------------------------------------------------
+    /// Hours between startup deep FTS integrity-checks (`0` every open, negative never).
+    pub fts_integrity_check_interval_hours: f64,
 }
 
 impl Default for LcmOpts {
     fn default() -> Self {
-        // Mirrors `daemon_context_lcm::LcmConfig` Appendix-A defaults.
+        // Derived from the engine's own defaults so the two surfaces cannot drift.
+        let d = daemon_context_lcm::LcmConfig::default();
         Self {
-            context_threshold: 0.35,
-            fresh_tail_count: 32,
+            context_threshold: d.context_threshold,
+            fresh_tail_count: d.fresh_tail_count,
+            leaf_chunk_tokens: d.leaf_chunk_tokens,
+            condensation_fanin: d.condensation_fanin,
+            incremental_max_depth: d.incremental_max_depth,
+            dynamic_leaf_chunk_enabled: d.dynamic_leaf_chunk_enabled,
+            dynamic_leaf_chunk_max: d.dynamic_leaf_chunk_max,
+            cache_friendly_condensation_enabled: d.cache_friendly_condensation_enabled,
+            cache_friendly_min_debt_groups: d.cache_friendly_min_debt_groups,
+            deferred_maintenance_enabled: d.deferred_maintenance_enabled,
+            deferred_maintenance_max_passes: d.deferred_maintenance_max_passes,
+            critical_budget_pressure_ratio: d.critical_budget_pressure_ratio,
+            max_assembly_tokens: d.max_assembly_tokens,
+            reserve_tokens_floor: d.reserve_tokens_floor,
+            summary_timeout_ms: d.summary_timeout_ms,
+            custom_instructions: d.custom_instructions,
+            l2_budget_ratio: d.l2_budget_ratio,
+            l3_truncate_tokens: d.l3_truncate_tokens,
+            sensitive_patterns_enabled: d.sensitive_patterns_enabled,
+            sensitive_patterns: d.sensitive_patterns,
+            large_output_externalization_enabled: d.large_output_externalization_enabled,
+            large_output_externalization_threshold_chars: d
+                .large_output_externalization_threshold_chars,
+            large_output_transcript_gc_enabled: d.large_output_transcript_gc_enabled,
+            extraction_enabled: d.extraction_enabled,
+            ignore_session_patterns: d.ignore_session_patterns,
+            stateless_session_patterns: d.stateless_session_patterns,
+            ignore_message_patterns: d.ignore_message_patterns,
+            summary_circuit_breaker_failure_threshold: d.summary_circuit_breaker_failure_threshold,
+            summary_circuit_breaker_cooldown_seconds: d.summary_circuit_breaker_cooldown_seconds,
+            expansion_context_tokens: d.expansion_context_tokens,
+            expansion_timeout_ms: d.expansion_timeout_ms,
+            new_session_retain_depth: d.new_session_retain_depth,
+            doctor_clean_apply_enabled: d.doctor_clean_apply_enabled,
+            empty_lifecycle_gc_enabled: d.empty_lifecycle_gc_enabled,
+            empty_lifecycle_gc_threshold: d.empty_lifecycle_gc_threshold,
+            empty_lifecycle_gc_max_age_hours: d.empty_lifecycle_gc_max_age_hours.unwrap_or(-1.0),
+            fts_integrity_check_interval_hours: d.fts_integrity_check_interval_hours,
         }
+    }
+}
+
+impl LcmOpts {
+    /// Copy the tunables into an engine config template. Pattern-list provenance flips to
+    /// `config` when the host changed a list from its default — the daemon analog of Python's
+    /// `default`/`env` `*_source` fields in `lcm_status`.
+    pub fn apply(&self, cfg: &mut daemon_context_lcm::LcmConfig) {
+        let defaults = daemon_context_lcm::LcmConfig::default();
+        cfg.context_threshold = self.context_threshold;
+        cfg.fresh_tail_count = self.fresh_tail_count;
+        cfg.leaf_chunk_tokens = self.leaf_chunk_tokens;
+        cfg.condensation_fanin = self.condensation_fanin;
+        cfg.incremental_max_depth = self.incremental_max_depth;
+        cfg.dynamic_leaf_chunk_enabled = self.dynamic_leaf_chunk_enabled;
+        cfg.dynamic_leaf_chunk_max = self.dynamic_leaf_chunk_max;
+        cfg.cache_friendly_condensation_enabled = self.cache_friendly_condensation_enabled;
+        cfg.cache_friendly_min_debt_groups = self.cache_friendly_min_debt_groups;
+        cfg.deferred_maintenance_enabled = self.deferred_maintenance_enabled;
+        cfg.deferred_maintenance_max_passes = self.deferred_maintenance_max_passes;
+        cfg.critical_budget_pressure_ratio = self.critical_budget_pressure_ratio;
+        cfg.max_assembly_tokens = self.max_assembly_tokens;
+        cfg.reserve_tokens_floor = self.reserve_tokens_floor;
+        cfg.summary_timeout_ms = self.summary_timeout_ms;
+        cfg.custom_instructions = self.custom_instructions.clone();
+        cfg.l2_budget_ratio = self.l2_budget_ratio;
+        cfg.l3_truncate_tokens = self.l3_truncate_tokens;
+        cfg.sensitive_patterns_enabled = self.sensitive_patterns_enabled;
+        cfg.sensitive_patterns = self.sensitive_patterns.clone();
+        if cfg.sensitive_patterns != defaults.sensitive_patterns {
+            cfg.sensitive_patterns_source = "config".to_string();
+        }
+        cfg.large_output_externalization_enabled = self.large_output_externalization_enabled;
+        cfg.large_output_externalization_threshold_chars =
+            self.large_output_externalization_threshold_chars;
+        cfg.large_output_transcript_gc_enabled = self.large_output_transcript_gc_enabled;
+        cfg.extraction_enabled = self.extraction_enabled;
+        cfg.ignore_session_patterns = self.ignore_session_patterns.clone();
+        if cfg.ignore_session_patterns != defaults.ignore_session_patterns {
+            cfg.ignore_session_patterns_source = "config".to_string();
+        }
+        cfg.stateless_session_patterns = self.stateless_session_patterns.clone();
+        if cfg.stateless_session_patterns != defaults.stateless_session_patterns {
+            cfg.stateless_session_patterns_source = "config".to_string();
+        }
+        cfg.ignore_message_patterns = self.ignore_message_patterns.clone();
+        if cfg.ignore_message_patterns != defaults.ignore_message_patterns {
+            cfg.ignore_message_patterns_source = "config".to_string();
+        }
+        cfg.summary_circuit_breaker_failure_threshold =
+            self.summary_circuit_breaker_failure_threshold;
+        cfg.summary_circuit_breaker_cooldown_seconds =
+            self.summary_circuit_breaker_cooldown_seconds;
+        cfg.expansion_context_tokens = self.expansion_context_tokens;
+        cfg.expansion_timeout_ms = self.expansion_timeout_ms;
+        cfg.new_session_retain_depth = self.new_session_retain_depth;
+        cfg.doctor_clean_apply_enabled = self.doctor_clean_apply_enabled;
+        cfg.empty_lifecycle_gc_enabled = self.empty_lifecycle_gc_enabled;
+        cfg.empty_lifecycle_gc_threshold = self.empty_lifecycle_gc_threshold;
+        cfg.empty_lifecycle_gc_max_age_hours = if self.empty_lifecycle_gc_max_age_hours < 0.0 {
+            None
+        } else {
+            Some(self.empty_lifecycle_gc_max_age_hours)
+        };
+        cfg.fts_integrity_check_interval_hours = self.fts_integrity_check_interval_hours;
     }
 }
 
@@ -1294,6 +1489,72 @@ mod tests {
             let err = NodeConfig::from_figment(NodeConfig::base_figment())
                 .expect_err("both transport + family must fail");
             assert!(err.to_string().contains("pick one"), "{err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn lcm_opts_defaults_mirror_the_engine_and_apply_is_identity() {
+        // The `[lcm]` defaults derive from the engine's own defaults, so applying an untouched
+        // LcmOpts must reproduce `LcmConfig::default()` exactly (including provenance fields).
+        let mut cfg = daemon_context_lcm::LcmConfig::default();
+        LcmOpts::default().apply(&mut cfg);
+        let d = daemon_context_lcm::LcmConfig::default();
+        assert_eq!(cfg.context_threshold, d.context_threshold);
+        assert_eq!(cfg.fresh_tail_count, d.fresh_tail_count);
+        assert_eq!(cfg.leaf_chunk_tokens, d.leaf_chunk_tokens);
+        assert_eq!(cfg.dynamic_leaf_chunk_enabled, d.dynamic_leaf_chunk_enabled);
+        assert_eq!(
+            cfg.deferred_maintenance_enabled,
+            d.deferred_maintenance_enabled
+        );
+        assert_eq!(cfg.max_assembly_tokens, d.max_assembly_tokens);
+        assert_eq!(cfg.sensitive_patterns, d.sensitive_patterns);
+        assert_eq!(cfg.sensitive_patterns_source, "default");
+        assert_eq!(cfg.ignore_session_patterns_source, "default");
+        assert_eq!(
+            cfg.empty_lifecycle_gc_max_age_hours,
+            d.empty_lifecycle_gc_max_age_hours
+        );
+        assert_eq!(
+            cfg.fts_integrity_check_interval_hours,
+            d.fts_integrity_check_interval_hours
+        );
+    }
+
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    #[test]
+    fn lcm_env_overrides_apply_with_provenance() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("DAEMON_LCM__DYNAMIC_LEAF_CHUNK_ENABLED", "1");
+            jail.set_env("DAEMON_LCM__DEFERRED_MAINTENANCE_ENABLED", "true");
+            jail.set_env("DAEMON_LCM__MAX_ASSEMBLY_TOKENS", "50000");
+            jail.set_env("DAEMON_LCM__CRITICAL_BUDGET_PRESSURE_RATIO", "0.9");
+            jail.set_env("DAEMON_LCM__IGNORE_SESSION_PATTERNS", "[\"cron-*\"]");
+            jail.set_env("DAEMON_LCM__EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS", "-1");
+            jail.set_env("DAEMON_LCM__FTS_INTEGRITY_CHECK_INTERVAL_HOURS", "0.5");
+            let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
+                .unwrap_or_else(|e| panic!("env layer must extract: {e:#}"));
+            let mut lcm = daemon_context_lcm::LcmConfig::in_memory();
+            cfg.lcm.apply(&mut lcm);
+            assert!(lcm.dynamic_leaf_chunk_enabled);
+            assert!(lcm.deferred_maintenance_enabled);
+            assert_eq!(lcm.max_assembly_tokens, 50_000);
+            assert_eq!(lcm.critical_budget_pressure_ratio, 0.9);
+            assert_eq!(lcm.ignore_session_patterns, vec!["cron-*".to_string()]);
+            assert_eq!(
+                lcm.ignore_session_patterns_source, "config",
+                "a changed pattern list flips provenance"
+            );
+            assert_eq!(
+                lcm.sensitive_patterns_source, "default",
+                "untouched lists keep default provenance"
+            );
+            assert_eq!(
+                lcm.empty_lifecycle_gc_max_age_hours, None,
+                "a negative age guard disables it"
+            );
+            assert_eq!(lcm.fts_integrity_check_interval_hours, 0.5);
             Ok(())
         });
     }
