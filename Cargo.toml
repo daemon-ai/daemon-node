@@ -250,8 +250,15 @@ daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
 daemon-skills = { path = "crates/skills/daemon-skills" }
 daemon-tool-skill = { path = "tools/daemon-tool-skill" }
 
+# Size-tuned release profile (the flake's crane buildPackage builds --release, so Nix outputs
+# inherit this). Measured on the full workspace: together these take the `daemon` binary
+# 124 MiB -> 57 MiB (-54%) and `daemon-cli` 6.4 MiB -> 3.3 MiB (-49%).
 [profile.release]
-panic = "unwind"   # catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)
+panic = "unwind"   # REQUIRED: catch_unwind supervision is void under abort (see docs/research/beam-substrate-reference-extraction.md §2.2)
+strip = "symbols"  # -21% alone: drop .symtab/.strtab; unwinding (.eh_frame) is kept, only backtrace symbol names go
+lto = "thin"       # cross-crate DCE+inlining; -3% size on top of opt-s/cgu1 (-17% on daemon-cli) at ~no wall cost
+opt-level = "s"    # -31% vs opt 3 at same settings; hot compute (ggml, aws-lc-rs, SQLite) is C/asm built at its own -O3, the Rust side is control plane + CBOR framing
+codegen-units = 1  # -17% more (better DCE/less duplication); full rebuild 5m08 -> 6m09 on 32 cores, and thin-LTO link stays parallel
 
 [profile.dev]
 panic = "unwind"
