@@ -6,7 +6,6 @@
 //! `engine.rs` (W-MNEMO).
 
 use super::*;
-use crate::config::RecallScope;
 use crate::util;
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -14,14 +13,46 @@ use serde_json::json;
 impl Engine {
     // ── Tool-surface backing methods (`beam.py` get/update/forget/invalidate/validate/stats/...) ──
 
-    /// Fetch a single live memory by id, working tier first then episodic (`beam.py` `get`).
+    /// Fetch a single memory by id — a pure read with no recall bump and no validity filter
+    /// (`beam.py` `get` L3855-L3911): the session-scoped working row first, then the
+    /// session-or-global episodic row.
     pub fn get(&self, id: &str) -> Result<Option<MemoryRow>> {
         let conn = self.store.conn.lock().unwrap();
-        let scope = RecallScope::default();
-        if let Some(row) = self.fetch_working(&conn, id, &scope)? {
-            return Ok(Some(row));
+        let map = |tier: Tier| {
+            move |r: &rusqlite::Row<'_>| -> rusqlite::Result<MemoryRow> {
+                Ok(MemoryRow {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    source: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    timestamp: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    importance: r.get::<_, Option<f64>>(4)?.unwrap_or(0.5),
+                    veracity: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    scope: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    tier,
+                    tier_level: 1,
+                    ..Default::default()
+                })
+            }
+        };
+        let working = conn
+            .query_row(
+                "SELECT id, content, source, timestamp, importance, veracity, scope \
+                 FROM working_memory WHERE id = ?1 AND session_id = ?2",
+                params![id, self.config.session_id],
+                map(Tier::Working),
+            )
+            .ok();
+        if working.is_some() {
+            return Ok(working);
         }
-        self.fetch_episodic(&conn, id, &scope)
+        Ok(conn
+            .query_row(
+                "SELECT id, content, source, timestamp, importance, veracity, scope \
+                 FROM episodic_memory WHERE id = ?1 AND (session_id = ?2 OR scope = 'global')",
+                params![id, self.config.session_id],
+                map(Tier::Episodic),
+            )
+            .ok())
     }
 
     /// Update a memory's `content` and/or `importance` in whichever tier holds it (`beam.py`
@@ -66,64 +97,146 @@ impl Engine {
         }
     }
 
-    pub fn update(&self, id: &str, content: Option<&str>, importance: Option<f64>) -> Result<bool> {
+    /// Tool-level audit event with explicit `bank`/`source_tool`/`metadata` stamps
+    /// (`hermes_memory_provider/__init__.py` `_audit_event`). Like [`Engine::audit`] the row
+    /// lands in THIS engine's bank-co-located `audit_log` — shared-surface tool events audit
+    /// into the private provider DB with `bank="surface"`, matching Python's provider-side log.
+    /// Fire-and-forget: locks the connection itself and swallows errors.
+    pub(crate) fn audit_tool(
+        &self,
+        action: &str,
+        memory_id: Option<&str>,
+        bank: &str,
+        source_tool: &str,
+        metadata: Option<&serde_json::Value>,
+    ) {
         let conn = self.store.conn.lock().unwrap();
-        let mut changed = false;
-        for table in ["working_memory", "episodic_memory"] {
-            if let Some(c) = content {
-                changed |= conn.execute(
-                    &format!("UPDATE {table} SET content = ?2 WHERE id = ?1"),
-                    params![id, c],
-                )? > 0;
-            }
-            if let Some(imp) = importance {
-                changed |= conn.execute(
-                    &format!("UPDATE {table} SET importance = ?2 WHERE id = ?1"),
-                    params![id, imp],
-                )? > 0;
-            }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let none = Option::<String>::None;
+        let res = conn.execute(
+            "INSERT INTO audit_log \
+             (timestamp, action, memory_id, bank, scope, profile, session_id, source_tool, \
+              tokens_used, reason, metadata_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                ts,
+                action,
+                memory_id,
+                bank,
+                none,
+                none,
+                self.config.session_id,
+                source_tool,
+                Option::<i64>::None,
+                none,
+                metadata.map(|m| m.to_string()),
+            ],
+        );
+        if let Err(e) = res {
+            tracing::debug!(error = %e, action, "tool audit log insert failed (non-fatal)");
         }
-        if changed {
-            self.audit(&conn, "update", Some(id), None);
-        }
-        Ok(changed)
     }
 
-    /// Hard-delete a memory from both tiers plus its stored embedding (`beam.py` `forget`). FTS rows
-    /// are removed by the delete triggers. Returns whether anything was deleted.
+    /// Test-only: the audit_log actions recorded against a bank label, insertion-ordered.
+    #[cfg(test)]
+    pub(crate) fn audit_rows_for_test(&self, bank: &str) -> Result<Vec<String>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT action FROM audit_log WHERE bank = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![bank], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Update a session-scoped working-memory row's `content` and/or `importance` (`beam.py`
+    /// `update_working` L3809-L3853). FTS stays in sync via the `wm_au` trigger; on a content
+    /// change the stale dense embedding is dropped so vector recall can't serve outdated state
+    /// (Python re-embeds inline; the sync engine defers that to the async provider/tool layer).
+    /// Returns whether a row changed.
+    pub fn update(&self, id: &str, content: Option<&str>, importance: Option<f64>) -> Result<bool> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut sets: Vec<&str> = Vec::new();
+        let mut bind: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(c) = content {
+            sets.push("content = ?");
+            bind.push(rusqlite::types::Value::Text(c.to_string()));
+        }
+        if let Some(imp) = importance {
+            sets.push("importance = ?");
+            bind.push(rusqlite::types::Value::Real(imp));
+        }
+        if sets.is_empty() {
+            return Ok(false);
+        }
+        bind.push(rusqlite::types::Value::Text(id.to_string()));
+        bind.push(rusqlite::types::Value::Text(self.config.session_id.clone()));
+        let affected = conn.execute(
+            &format!(
+                "UPDATE working_memory SET {} WHERE id = ? AND session_id = ?",
+                sets.join(", ")
+            ),
+            rusqlite::params_from_iter(bind),
+        )?;
+        if content.is_some() && affected > 0 {
+            conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+            )?;
+        }
+        if affected > 0 {
+            self.audit(&conn, "update", Some(id), None);
+        }
+        Ok(affected > 0)
+    }
+
+    /// Hard-delete a working-memory row plus its derived state (`beam.py` `forget_working`
+    /// L3913-L3958): the session-or-global-scoped delete is the authorization boundary for the
+    /// annotation/embedding cascade (E6.a). FTS rows are removed by the delete trigger. Returns
+    /// whether anything was deleted.
     pub fn forget(&self, id: &str) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
-        let mut deleted = conn.execute("DELETE FROM working_memory WHERE id = ?1", params![id])?;
-        deleted += conn.execute("DELETE FROM episodic_memory WHERE id = ?1", params![id])?;
-        conn.execute(
-            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
-            params![id],
+        let deleted = conn.execute(
+            "DELETE FROM working_memory WHERE id = ?1 AND (session_id = ?2 OR scope = 'global')",
+            params![id, self.config.session_id],
         )?;
         if deleted > 0 {
+            conn.execute("DELETE FROM annotations WHERE memory_id = ?1", params![id])?;
+            conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+            )?;
             self.audit(&conn, "forget", Some(id), None);
         }
         Ok(deleted > 0)
     }
 
     /// Soft-invalidate a memory: stamp `valid_until` now and point `superseded_by` at an optional
-    /// replacement (`beam.py` `invalidate` L7725). The row drops out of recall (which filters
-    /// `valid_until IS NULL AND superseded_by IS NULL`). Returns whether a row changed.
+    /// replacement (`beam.py` `invalidate` L3610-L3632), session-or-global scoped, working tier
+    /// first. The row drops out of recall (which filters validity). Returns whether a row changed.
     pub fn invalidate(&self, id: &str, replacement_id: Option<&str>) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
         let now = util::now_iso();
         let mut changed = false;
         for table in ["working_memory", "episodic_memory"] {
-            changed |= conn.execute(
+            changed = conn.execute(
                 &format!(
                     "UPDATE {table} SET valid_until = ?2, superseded_by = ?3 \
-                     WHERE id = ?1 AND valid_until IS NULL"
+                     WHERE id = ?1 AND (session_id = ?4 OR scope = 'global')"
                 ),
-                params![id, now, replacement_id],
+                params![id, now, replacement_id, self.config.session_id],
             )? > 0;
+            if changed {
+                break;
+            }
         }
         if changed {
             let reason = replacement_id.map(|r| format!("superseded_by={r}"));
             self.audit(&conn, "invalidate", Some(id), reason.as_deref());
+            if let Some(pm) = self.plugins_if_active() {
+                pm.notify_invalidate(id);
+            }
         }
         Ok(changed)
     }
@@ -202,6 +315,46 @@ impl Engine {
         })
     }
 
+    /// All identity memories for the active session, importance-then-recency ordered — the
+    /// always-inject prefetch rows (`__init__.py` `_identity_fichas` L1547-L1582). Query-independent
+    /// and strictly session-scoped so there is zero cross-session leakage.
+    pub fn identity_rows(&self) -> Result<Vec<crate::prefetch::IdentityRow>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT content, importance, timestamp FROM working_memory \
+             WHERE source = 'identity' AND session_id = ?1 \
+             ORDER BY importance DESC, timestamp DESC",
+        )?;
+        let rows = stmt.query_map(params![self.config.session_id], |r| {
+            Ok(crate::prefetch::IdentityRow {
+                content: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                importance: r.get::<_, Option<f64>>(1)?.unwrap_or(0.95),
+                timestamp: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.flatten().filter(|r| !r.content.is_empty()).collect())
+    }
+
+    /// Count working rows a non-forced sleep pass would claim right now (`beam.py`
+    /// `_count_unconsolidated_before`; the auto-sleep eligibility gate, `__init__.py` L1735-L1738).
+    /// Matches [`Engine::sleep_plan`]'s candidate WHERE exactly.
+    pub fn eligible_for_sleep(&self) -> Result<i64> {
+        let half_ttl_minutes = (self.config.working_memory_ttl_hours * 30.0) as i64;
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::minutes(half_ttl_minutes)).to_rfc3339();
+        let conn = self.store.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM working_memory \
+             WHERE COALESCE(session_id, 'default') = ?1 \
+               AND timestamp < ?2 \
+               AND consolidated_at IS NULL \
+               AND (pinned IS NULL OR pinned = 0) \
+               AND superseded_by IS NULL",
+            params![self.config.session_id, cutoff],
+            |r| r.get(0),
+        )?)
+    }
+
     /// A lightweight diagnostics summary (`beam.py` `health`).
     pub fn diagnose(&self) -> Result<Diagnostics> {
         let conn = self.store.conn.lock().unwrap();
@@ -231,6 +384,137 @@ impl Engine {
                 |r| r.get(0),
             )?,
         })
+    }
+
+    /// PII-safe coverage counters for the vector stores the Rust engine actually uses
+    /// (`beam.py` `vec_working_coverage` L1906-L1997, remapped per the §7 storage decision:
+    /// there is no `vec0` mirror table here — `memory_embeddings` f32-JSON is the primary
+    /// store and `episodic_memory.binary_vector` the MIB derivative). Count-only: no ids,
+    /// content, or vectors.
+    pub fn vector_coverage(&self) -> Result<serde_json::Value> {
+        let conn = self.store.conn.lock().unwrap();
+        let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
+        let working_rows = count("SELECT COUNT(*) FROM working_memory")?;
+        let episodic_rows = count("SELECT COUNT(*) FROM episodic_memory")?;
+        let working_embedded = count(
+            "SELECT COUNT(*) FROM working_memory wm \
+             JOIN memory_embeddings me ON me.memory_id = wm.id",
+        )?;
+        let episodic_embedded = count(
+            "SELECT COUNT(*) FROM episodic_memory em \
+             JOIN memory_embeddings me ON me.memory_id = em.id",
+        )?;
+        let episodic_binary =
+            count("SELECT COUNT(*) FROM episodic_memory WHERE binary_vector IS NOT NULL")?;
+        // Repairable gap: episodic rows with a stored f32 embedding but no MIB binary (the
+        // binarization is deterministic, so backfill needs no model).
+        let missing_episodic_binary = count(
+            "SELECT COUNT(*) FROM episodic_memory em \
+             JOIN memory_embeddings me ON me.memory_id = em.id \
+             WHERE em.binary_vector IS NULL",
+        )?;
+        // Not deterministically repairable (needs the embedder): rows with no embedding at all.
+        let missing_working_embeddings = working_rows - working_embedded;
+        let orphan_embeddings = count(
+            "SELECT COUNT(*) FROM memory_embeddings me \
+             LEFT JOIN working_memory wm ON wm.id = me.memory_id \
+             LEFT JOIN episodic_memory em ON em.id = me.memory_id \
+             WHERE wm.id IS NULL AND em.id IS NULL",
+        )?;
+        let status = if working_rows == 0 && episodic_rows == 0 {
+            "empty"
+        } else if working_embedded + episodic_embedded == 0 && episodic_binary == 0 {
+            "no_vectors"
+        } else if missing_episodic_binary > 0 {
+            "partial"
+        } else {
+            "complete"
+        };
+        Ok(json!({
+            "backend": "memory_embeddings+binary",
+            "working_memory_rows": working_rows,
+            "working_embedding_rows": working_embedded,
+            "missing_working_embeddings": missing_working_embeddings,
+            "episodic_rows": episodic_rows,
+            "episodic_embedding_rows": episodic_embedded,
+            "episodic_binary_rows": episodic_binary,
+            "missing_episodic_binary": missing_episodic_binary,
+            "orphan_embedding_rows": orphan_embeddings,
+            "status": status,
+        }))
+    }
+
+    /// Idempotently backfill the deterministic vector gap: episodic rows that have an f32
+    /// embedding in `memory_embeddings` but a NULL MIB `binary_vector` (`beam.py`
+    /// `repair_vec_working` L2000-L2025, remapped to the Rust stores). `dry_run` reports the gap
+    /// without writing. Working rows with no embedding at all are only reported — re-embedding
+    /// needs the async host embedder (Python's `reindex_vectors`, a host operation).
+    pub fn repair_vector_coverage(&self, dry_run: bool) -> Result<serde_json::Value> {
+        let before = self.vector_coverage()?;
+        if dry_run {
+            return Ok(json!({
+                "status": "dry_run",
+                "dry_run": true,
+                "inserted": 0,
+                "would_insert": before["missing_episodic_binary"],
+                "before": before.clone(),
+                "after": before,
+            }));
+        }
+        let mut inserted = 0i64;
+        {
+            let conn = self.store.conn.lock().unwrap();
+            let rows: Vec<(String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT em.id, me.embedding_json FROM episodic_memory em \
+                     JOIN memory_embeddings me ON me.memory_id = em.id \
+                     WHERE em.binary_vector IS NULL",
+                )?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                mapped.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (id, embedding_json) in rows {
+                let Ok(vec) = serde_json::from_str::<Vec<f32>>(&embedding_json) else {
+                    tracing::warn!(id, "vector repair skipped: unparseable embedding_json");
+                    continue;
+                };
+                let packed = crate::binary_vectors::maximally_informative_binarization(&vec);
+                conn.execute(
+                    "UPDATE episodic_memory SET binary_vector = ?2 WHERE id = ?1",
+                    params![id, packed],
+                )?;
+                inserted += 1;
+            }
+        }
+        Ok(json!({
+            "status": "repaired",
+            "dry_run": false,
+            "inserted": inserted,
+            "before": before,
+            "after": self.vector_coverage()?,
+        }))
+    }
+
+    /// Test-only: manufacture the coverage gap a legacy / interrupted consolidation leaves — an
+    /// episodic row with a stored f32 embedding but no MIB `binary_vector`.
+    #[cfg(test)]
+    pub(crate) fn insert_episodic_embedding_gap_for_test(&self, id: &str, content: &str) {
+        let conn = self.store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO episodic_memory (id, content, timestamp, session_id) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, content, util::now_iso(), self.config.session_id],
+        )
+        .expect("insert episodic gap row");
+        let embedding: Vec<f32> = (0..crate::binary_vectors::EMBEDDING_DIM)
+            .map(|i| if i % 3 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) \
+             VALUES (?1, ?2, 'test')",
+            params![id, serde_json::to_string(&embedding).unwrap()],
+        )
+        .expect("insert gap embedding");
     }
 
     /// Write a scratchpad note for the session (`beam.py` scratchpad). Returns the row id.
@@ -330,6 +614,7 @@ impl Engine {
                         importance,
                         scope,
                         veracity,
+                        ..Default::default()
                     },
                     None,
                     "",

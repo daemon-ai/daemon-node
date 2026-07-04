@@ -9,35 +9,20 @@
 //! embeddings (cosine), and a recency/importance fallback scan, then scores them
 //! ([`crate::recall::scoring`]) with the FTS-blended lexical relevance, vector similarity, the MIB
 //! `binary_bonus`, and the tier/veracity multipliers — merged, content-deduped, and MMR-diversified.
-//! [`Engine::consolidate`] is a minimal WM->episodic promotion (no LLM summarization/degradation).
-//! Knowledge ingestion (graph/fact bonuses) and full `sleep` remain port-spec P1 work.
+//! Recall dispatches on [`crate::config::RecallMode`] (base / enhanced / polyphonic), the knowledge
+//! layer (graph/fact bonuses) is wired into ingest, and `sleep` is the full plan/claim/summarize/
+//! degrade pipeline ([`Engine::sleep_plan`] / [`Engine::finish_sleep`]).
 
-use crate::config::{MnemosyneConfig, RecallScope};
+use crate::config::{MnemosyneConfig, RecallFilters, RecallScope};
 use crate::error::Result;
+use crate::recall::diagnostics::RecallDiagnostics;
 use crate::recall::query_cache::QueryCache;
 use crate::store::Store;
 use std::sync::OnceLock;
 
-/// Max co-occurrence edges drawn per shared entity at ingest, bounding the proactive-link fan-out
-/// (`beam.py` `_proactively_link` is similarly capped).
-const MAX_COOCCURRENCE_EDGES_PER_ENTITY: usize = 10;
-
 /// The vector-similarity floor that lets a vector-only hit survive the lexical gate (mirrors the
 /// episodic candidate-drop rule `lexical < floor && sim < 0.65 -> drop`, `beam.py` L5720+).
 const VEC_SIM_FLOOR: f64 = 0.65;
-
-/// Working-memory TTL in hours (`beam.py` `WORKING_MEMORY_TTL_HOURS` L269). Sleep's age cutoff is
-/// half this (rows older than `TTL/2` are eligible for consolidation).
-const WORKING_MEMORY_TTL_HOURS: i64 = 168;
-
-/// Max working rows claimed per sleep pass (`beam.py` `SLEEP_BATCH_SIZE` L276).
-const SLEEP_BATCH_SIZE: usize = 5000;
-
-/// Tier 1->2 degradation age in days (`beam.py` `TIER2_DAYS` L281).
-const TIER2_DAYS: i64 = 30;
-
-/// Tier 2->3 degradation age in days (`beam.py` `TIER3_DAYS` L282).
-const TIER3_DAYS: i64 = 180;
 
 /// Max rows degraded per tier per pass (`beam.py` `DEGRADE_BATCH_SIZE` L286).
 const DEGRADE_BATCH_SIZE: usize = 100;
@@ -61,6 +46,36 @@ pub struct SleepGroup {
     pub veracity: String,
     /// Aggregated `valid_until` (earliest member expiry, if any).
     pub valid_until: Option<String>,
+}
+
+impl SleepGroup {
+    /// The deterministic no-LLM summary for this group: `[source] <aaak_encode>` (`beam.py` sleep
+    /// AAAK fallback L7784). Shared by [`Engine::finish_sleep`]'s fallback and the async seam (which
+    /// must know the final text up front to embed it).
+    pub fn aaak_summary(&self) -> String {
+        format!(
+            "[{}] {}",
+            self.source,
+            crate::aaak::summarize_group(&self.contents)
+        )
+    }
+}
+
+/// One sleep group's summarization outcome, produced at the async seam (`tools::run_sleep`) and
+/// keyed by group `source` in [`Engine::finish_sleep`]. Python's `consolidate_to_episodic`
+/// (`beam.py` L3956-L4032) embeds the summary inline; the synchronous Rust engine instead receives
+/// the precomputed embedding of the **final** summary text alongside it.
+#[derive(Clone, Debug, Default)]
+pub struct GroupSummary {
+    /// The final summary text (LLM output or the AAAK fallback), `<think>`-stripped.
+    pub text: String,
+    /// Whether an LLM produced `text` (drives [`SleepReport::llm_used`]).
+    pub llm: bool,
+    /// A dense embedding of `text`, persisted to `memory_embeddings` and binarized into
+    /// `episodic_memory.binary_vector` (`beam.py` L4005-L4032). `None` in keyword-only mode.
+    pub embedding: Option<Vec<f32>>,
+    /// The embedding model tag for `memory_embeddings.model`.
+    pub model: String,
 }
 
 /// A heuristic sleep-time conflict: an older memory that a newer, near-identical one supersedes
@@ -126,23 +141,36 @@ pub struct SleepReport {
     pub tier1_to_tier2: usize,
     /// Tier 2->3 degradations.
     pub tier2_to_tier3: usize,
+    /// Well-attested `(subject, predicate)` fact conflicts auto-resolved by
+    /// [`crate::knowledge::veracity::run_consolidation_pass`] at the end of the pass. (Python
+    /// defines the pass but never calls it — `veracity_consolidation.py` L777; the port wires it
+    /// into sleep so consolidation actually converges contested facts.)
+    pub facts_auto_resolved: usize,
 }
 
-/// Which BEAM tier a row lives in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Which BEAM tier a recall row came from (`beam.py` result `tier` labels).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// Hot, recent, auto-injected context.
+    #[default]
     Working,
     /// Long-term consolidated memory.
     Episodic,
+    /// The MEMORIA structured-fact supplement row (`beam.py` L6023).
+    Memoria,
+    /// A working row surfaced as a MEMORIA fact source (`beam.py` L6049).
+    MemoriaSource,
+    /// A structured `fact_recall` row merged into recall output (`beam.py` L6167).
+    Fact,
 }
 
-/// A recalled / stored memory row (the `recall` result shape, `beam.py` L5996+).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// A recalled / stored memory row (the `recall` result dict shape, `beam.py` L5344-L5366).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MemoryRow {
     /// Memory id.
     pub id: String,
-    /// Content text.
+    /// Content text (recall truncates to 500 chars, `beam.py` L5346).
     pub content: String,
     /// Ingestion source.
     pub source: String,
@@ -156,10 +184,54 @@ pub struct MemoryRow {
     pub trust_tier: String,
     /// Which tier the row came from.
     pub tier: Tier,
-    /// The episodic tier level (`1`/`2`/`3`); working rows are always `1` (`beam.py` L5931).
+    /// The episodic degradation tier (`1`/`2`/`3`); working rows are always `1` (`beam.py` L5960).
     pub tier_level: i64,
-    /// The recall score (0 for direct fetches).
+    /// The recall score (0 for direct fetches), rounded to 4 places.
     pub score: f64,
+    /// The lexical relevance signal that fed the score (`keyword_score`).
+    #[serde(default)]
+    pub keyword_score: f64,
+    /// The dense/vector similarity signal (`dense_score`).
+    #[serde(default)]
+    pub dense_score: f64,
+    /// The FTS5 signal (`fts_score`).
+    #[serde(default)]
+    pub fts_score: f64,
+    /// The recency decay factor applied (`recency_decay`).
+    #[serde(default)]
+    pub recency_decay: f64,
+    /// Times this row has been recalled (`recall_count`).
+    #[serde(default)]
+    pub recall_count: i64,
+    /// When this row was last recalled (`last_recalled`).
+    #[serde(default)]
+    pub last_recalled: Option<String>,
+    /// Row scope (`session`/`global`).
+    #[serde(default)]
+    pub scope: String,
+    /// Multi-agent author id, when stamped.
+    #[serde(default)]
+    pub author_id: Option<String>,
+    /// Multi-agent author type, when stamped.
+    #[serde(default)]
+    pub author_type: Option<String>,
+    /// Multi-agent channel id, when stamped.
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// Row expiry; recall admits rows with `valid_until > now` (`beam.py` L5177).
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// Whether the entity-aware pass matched/boosted this row (`entity_match`).
+    #[serde(default)]
+    pub entity_match: bool,
+    /// Whether the fact-aware pass matched/boosted this row (`fact_match`).
+    #[serde(default)]
+    pub fact_match: bool,
+    /// Per-signal provenance (`voice_scores`): the linear path collapses its scoring signals into
+    /// `vec/fts/keyword/importance/recency_decay` (`beam.py` L5987-L5994, Gap G); the polyphonic
+    /// path carries per-voice RRF contributions (`beam.py` L6649).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_scores: Option<std::collections::HashMap<String, f64>>,
 }
 
 /// An unresolved `(subject, predicate)` contradiction awaiting LLM validation in sleep.
@@ -187,8 +259,23 @@ pub struct RememberArgs {
     /// Scope: `session` (default) or `global`. Note: the column default is `global` but
     /// `remember()` defaults to `session` (`beam.py` L2838).
     pub scope: String,
-    /// Trust label (default `unknown`).
+    /// Trust label (default `unknown`; clamped to the canonical set on write).
     pub veracity: String,
+    /// Caller-supplied metadata object persisted to `metadata_json` (`beam.py` `metadata`).
+    pub metadata: Option<serde_json::Value>,
+    /// Expiry timestamp; the row drops out of recall past it (`beam.py` `valid_until`).
+    pub valid_until: Option<String>,
+    /// Pre-generated memory id; a fresh time-salted id is derived when absent
+    /// (`beam.py` `memory_id` passthrough, L2843).
+    pub memory_id: Option<String>,
+    /// Extract regex entity `mentions` annotations (`beam.py` `extract_entities`, default off).
+    pub extract_entities: bool,
+    /// Request LLM fact extraction (`beam.py` `extract`, default off). The synchronous engine
+    /// records the request; the async provider/tool layer honors it via
+    /// [`Engine::ingest_extracted`] after the LLM round-trip.
+    pub extract: bool,
+    /// Explicit trust tier; derived from `source` when absent (`beam.py` `trust_tier` L152-L188).
+    pub trust_tier: Option<String>,
 }
 
 impl Default for RememberArgs {
@@ -198,6 +285,12 @@ impl Default for RememberArgs {
             importance: 0.5,
             scope: "session".to_string(),
             veracity: "unknown".to_string(),
+            metadata: None,
+            valid_until: None,
+            memory_id: None,
+            extract_entities: false,
+            extract: false,
+            trust_tier: None,
         }
     }
 }
@@ -214,33 +307,8 @@ pub struct RecallReq<'a> {
     pub query_vector: Option<&'a [f32]>,
     /// The multi-agent recall scope.
     pub scope: &'a RecallScope,
-}
-
-/// Per-tier candidate-gathering context for [`Engine::gather_working`] / [`Engine::gather_episodic`]:
-/// the tokenized/entity-extracted query, the candidate caps, the lexical floor, the query vector,
-/// the `(vec, fts, importance)` blend weights, and the recall scope.
-pub(crate) struct GatherCtx<'a> {
-    pub q_tokens: &'a [String],
-    pub q_entities: &'a [String],
-    pub top_k: usize,
-    pub floor: f64,
-    pub query_vector: Option<&'a [f32]>,
-    pub weights: (f64, f64, f64),
-    pub scope: &'a RecallScope,
-}
-
-/// A freshly-stored memory to run deterministic knowledge ingestion over ([`Engine::ingest_knowledge`]).
-pub(crate) struct IngestItem<'a> {
-    pub memory_id: &'a str,
-    pub content: &'a str,
-    pub veracity: &'a str,
-}
-
-/// Entity-seeded candidate-injection context for [`Engine::inject_entity_candidates`].
-pub(crate) struct EntityInjectCtx<'a> {
-    pub q_entities: &'a [String],
-    pub present: &'a std::collections::HashSet<String>,
-    pub scope: &'a RecallScope,
+    /// Row filters + temporal scoring knobs (`beam.py` `recall` kwargs).
+    pub filters: RecallFilters,
 }
 
 /// Arguments for [`Engine::triple_add`] — a temporal-triple upsert.
@@ -337,6 +405,20 @@ pub struct Engine {
     persistent: bool,
     /// Lazily-opened 5-tier semantic query cache (enhanced recall only).
     query_cache: OnceLock<QueryCache>,
+    /// Stable per-bank device identity for the event log (`sync.py` L628-L640), lazily read from /
+    /// persisted to `sync_meta`.
+    device_id: OnceLock<String>,
+    /// Monotonic per-process disambiguator for event ids minted within the same instant.
+    event_seq: std::sync::atomic::AtomicU64,
+    /// Recall path provenance counters (`recall_diagnostics.py`; Python's process-global
+    /// singleton, owned per engine here).
+    recall_diag: RecallDiagnostics,
+    /// Lazily-materialized plugin manager (`memory.py` "Phase 8: Plugins" lazy property
+    /// L286-L292). Never touched by a host = never built = zero overhead per event.
+    plugins: OnceLock<crate::plugins::PluginManager>,
+    /// Lazily-enabled in-process event stream (`memory.py` "Phase 8: Streaming" lazy `stream`
+    /// property + `enable_streaming` L166-L189). Never enabled = one atomic load per write.
+    stream: OnceLock<std::sync::Arc<crate::streaming::MemoryStream>>,
 }
 
 impl Engine {
@@ -348,6 +430,11 @@ impl Engine {
             config,
             persistent: true,
             query_cache: OnceLock::new(),
+            device_id: OnceLock::new(),
+            event_seq: std::sync::atomic::AtomicU64::new(0),
+            recall_diag: RecallDiagnostics::default(),
+            plugins: OnceLock::new(),
+            stream: OnceLock::new(),
         })
     }
 
@@ -359,7 +446,56 @@ impl Engine {
             config,
             persistent: false,
             query_cache: OnceLock::new(),
+            device_id: OnceLock::new(),
+            event_seq: std::sync::atomic::AtomicU64::new(0),
+            recall_diag: RecallDiagnostics::default(),
+            plugins: OnceLock::new(),
+            stream: OnceLock::new(),
         })
+    }
+
+    /// The recall path provenance counters (`recall_diagnostics.py` `get_diagnostics`).
+    pub fn recall_diagnostics(&self) -> &RecallDiagnostics {
+        &self.recall_diag
+    }
+
+    /// The plugin manager, materialized on first access (`memory.py` lazy `plugins` property
+    /// L286-L292). Built-ins are registered but unloaded; call
+    /// [`crate::plugins::PluginManager::load_all`] or load individually to activate them.
+    pub fn plugins(&self) -> &crate::plugins::PluginManager {
+        self.plugins.get_or_init(crate::plugins::PluginManager::new)
+    }
+
+    /// The plugin manager only if a host has materialized it — the lifecycle notification
+    /// call sites use this so an untouched manager costs one atomic load per event.
+    pub(crate) fn plugins_if_active(&self) -> Option<&crate::plugins::PluginManager> {
+        self.plugins.get()
+    }
+
+    /// Enable event streaming for this engine (`memory.py` `enable_streaming` L174-L184): wires
+    /// a [`crate::streaming::MemoryStream`] into the write path so mutations emit
+    /// `MEMORY_ADDED`/`MEMORY_UPDATED`/`MEMORY_CONSOLIDATED` events. Idempotent — repeat calls
+    /// return the same stream. Streaming failures never block memory operations.
+    pub fn enable_streaming(&self) -> std::sync::Arc<crate::streaming::MemoryStream> {
+        self.stream
+            .get_or_init(|| std::sync::Arc::new(crate::streaming::MemoryStream::default()))
+            .clone()
+    }
+
+    /// The stream only if a host has enabled it (`beam.py` `_event_emitter is None` gate L2817).
+    pub(crate) fn stream_if_active(&self) -> Option<&crate::streaming::MemoryStream> {
+        self.stream.get().map(std::sync::Arc::as_ref)
+    }
+
+    /// Run `f` against the bank connection. The seam for the sibling sync/streaming modules
+    /// ([`crate::streaming::DeltaSync`], `sync::SyncEngine`) which own their SQL but not the
+    /// connection (Python hands them `self.conn` directly).
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.store.conn.lock().unwrap();
+        f(&conn)
     }
 
     /// The lazily-opened query cache (`query_cache.db` next to the bank when persistent, else
@@ -384,9 +520,62 @@ impl Engine {
         &self.config.session_id
     }
 
+    /// The engine configuration (read-only; the provider/tool layer reads its knobs).
+    pub fn config(&self) -> &MnemosyneConfig {
+        &self.config
+    }
+
+    /// Whether this engine is backed by a disk file (false for the ephemeral in-memory banks).
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
     /// Whether the opt-in tier-2 LLM conflict detector is enabled (`MNEMOSYNE_LLM_CONFLICT_DETECTION`).
     pub fn llm_conflict_detection(&self) -> bool {
         self.config.llm_conflict_detection
+    }
+
+    // ── SHMR (opt-in background pass; `shmr.py`) ────────────────────────────────────────────────
+
+    /// Run one SHMR harmonic cycle over recent memories (`shmr.py` `harmonize`). Off the hot path
+    /// — Python never wires it into `sleep()` — and the engine owns no LLM/embedding runtime, so
+    /// both are injected ([`crate::recall::shmr`]).
+    pub fn harmonize(
+        &self,
+        opts: &crate::recall::shmr::ShmrOptions,
+        embed: crate::recall::shmr::EmbedFn,
+        llm: crate::recall::shmr::LlmFn,
+    ) -> Result<crate::recall::shmr::HarmonizeStats> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::recall::shmr::harmonize(&conn, &self.config.session_id, opts, embed, llm)
+    }
+
+    /// Search `harmonic_beliefs` for a query (`shmr.py` `recall_beliefs`).
+    pub fn recall_beliefs(
+        &self,
+        query: &str,
+        top_k: usize,
+        embed: crate::recall::shmr::EmbedFn,
+    ) -> Result<Vec<crate::recall::shmr::BeliefHit>> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::recall::shmr::recall_beliefs(&conn, query, top_k, embed)
+    }
+
+    /// Phase-3A reflective synthesis over [`Engine::fact_recall`] hits (`shmr.py` `reflect`).
+    pub fn reflect(
+        &self,
+        question: &str,
+        top_k: usize,
+        llm: crate::recall::shmr::LlmFn,
+    ) -> Result<Option<String>> {
+        let facts = self.fact_recall(question, top_k)?;
+        Ok(crate::recall::shmr::reflect(question, &facts, top_k, llm))
+    }
+
+    /// Recent harmonization run logs (`shmr.py` `get_resonance_log`).
+    pub fn resonance_log(&self, limit: usize) -> Result<Vec<crate::recall::shmr::ResonanceEntry>> {
+        let conn = self.store.conn.lock().unwrap();
+        crate::recall::shmr::get_resonance_log(&conn, limit)
     }
 }
 
@@ -399,9 +588,9 @@ mod recall;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "sync")]
+pub(crate) use ingest::suppress_event_log;
+pub(crate) use query::load_embeddings;
 #[cfg(all(feature = "vec-ext", test))]
 pub(crate) use query::native_cosine_sim_map;
-pub(crate) use query::{cosine_sim_map, load_embeddings};
-pub(crate) use recall::age_hours;
-#[cfg(test)]
-pub(crate) use recall::lexical_relevance;
+pub use recall::FactHit;

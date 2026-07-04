@@ -21,9 +21,13 @@
 #![cfg_attr(not(feature = "vec-ext"), forbid(unsafe_code))]
 
 pub mod aaak;
+pub mod banks;
 pub mod binary_vectors;
 pub mod chat_normalize;
 pub mod config;
+pub mod cost_log;
+pub mod diagnose;
+pub mod dr;
 pub mod dynamics;
 pub mod embeddings;
 pub mod engine;
@@ -31,10 +35,15 @@ pub mod error;
 pub mod extract;
 pub mod knowledge;
 pub mod memoria;
+pub mod plugins;
+pub mod prefetch;
 pub mod provider;
 pub mod recall;
 pub mod sanitize;
 pub mod store;
+pub mod streaming;
+#[cfg(feature = "sync")]
+pub mod sync;
 pub mod tokens;
 pub mod tools;
 pub mod util;

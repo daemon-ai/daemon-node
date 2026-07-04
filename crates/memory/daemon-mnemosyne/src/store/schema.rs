@@ -106,10 +106,10 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 
 CREATE TABLE IF NOT EXISTS memory_events (
     event_id         TEXT PRIMARY KEY,
-    memory_id        TEXT,
-    operation        TEXT CHECK(operation IN ('CREATE','UPDATE','DELETE','CONSOLIDATE')),
-    timestamp        TEXT,
-    device_id        TEXT,
+    memory_id        TEXT NOT NULL,
+    operation        TEXT NOT NULL CHECK(operation IN ('CREATE','UPDATE','DELETE','CONSOLIDATE')),
+    timestamp        TEXT NOT NULL,
+    device_id        TEXT NOT NULL,
     payload          TEXT,
     parent_event_ids TEXT DEFAULT '[]',
     importance       REAL DEFAULT 0.5,
@@ -117,14 +117,13 @@ CREATE TABLE IF NOT EXISTS memory_events (
     event_hash       TEXT,
     synced_at        TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_ev_timestamp ON memory_events(timestamp);
 
 CREATE TABLE IF NOT EXISTS memory_validations (
     validation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    memory_id     TEXT,
-    validator     TEXT,
-    validated_at  TEXT,
-    action        TEXT,
+    memory_id     TEXT NOT NULL,
+    validator     TEXT NOT NULL,
+    validated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    action        TEXT NOT NULL,
     new_content   TEXT,
     note          TEXT
 );
@@ -140,31 +139,36 @@ CREATE TABLE IF NOT EXISTS consolidation_log (
 -- ── Structured facts + MEMORIA tables ──────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS facts (
     fact_id       TEXT PRIMARY KEY,
-    session_id    TEXT,
-    subject       TEXT,
-    predicate     TEXT,
-    object        TEXT,
+    session_id    TEXT NOT NULL,
+    subject       TEXT NOT NULL,
+    predicate     TEXT NOT NULL,
+    object        TEXT NOT NULL,
     timestamp     TEXT,
     source_msg_id TEXT,
-    confidence    REAL,
+    confidence    REAL DEFAULT 1.0,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS memoria_facts (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id       TEXT,
-    message_idx      INTEGER,
-    fact_type        TEXT,
-    key              TEXT,
-    value            TEXT,
-    context_snippet  TEXT,
-    importance       REAL,
-    timestamp        TEXT,
-    source_memory_id TEXT
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         TEXT DEFAULT 'default',
+    message_idx        INTEGER,
+    fact_type          TEXT,
+    key                TEXT,
+    value              TEXT,
+    context_snippet    TEXT,
+    importance         REAL DEFAULT 0.5,
+    timestamp          TEXT,
+    version_id         INTEGER DEFAULT 0,
+    previous_value     TEXT,
+    updated_msg_idx    INTEGER,
+    valid_from_msg_idx INTEGER,
+    valid_to_msg_idx   INTEGER,
+    source_memory_id   TEXT
 );
 CREATE TABLE IF NOT EXISTS memoria_timelines (
     event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id       TEXT,
+    session_id       TEXT DEFAULT 'default',
     date             TEXT,
     message_idx      INTEGER,
     description      TEXT,
@@ -173,7 +177,7 @@ CREATE TABLE IF NOT EXISTS memoria_timelines (
 );
 CREATE TABLE IF NOT EXISTS memoria_instructions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id       TEXT,
+    session_id       TEXT DEFAULT 'default',
     message_idx      INTEGER,
     instruction      TEXT,
     active           INTEGER DEFAULT 1,
@@ -183,7 +187,7 @@ CREATE TABLE IF NOT EXISTS memoria_instructions (
 );
 CREATE TABLE IF NOT EXISTS memoria_preferences (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id       TEXT,
+    session_id       TEXT DEFAULT 'default',
     message_idx      INTEGER,
     preference       TEXT,
     topic            TEXT,
@@ -193,12 +197,12 @@ CREATE TABLE IF NOT EXISTS memoria_preferences (
 );
 CREATE TABLE IF NOT EXISTS memoria_kg (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id       TEXT,
+    session_id       TEXT DEFAULT 'default',
     subject          TEXT,
     predicate        TEXT,
     object           TEXT,
     message_idx      INTEGER,
-    confidence       REAL,
+    confidence       REAL DEFAULT 0.7,
     source_memory_id TEXT
 );
 
@@ -338,4 +342,121 @@ CREATE TABLE IF NOT EXISTS conflicts (
     resolved_at   TEXT,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+"#;
+
+/// Parity migration (M2): the sync metadata table (`sync.py` `_init_events_table` L661-L666).
+pub const SCHEMA_V2: &str = r#"
+-- Device identity + sync state, persisted across restarts (`sync.py` L661-L666).
+CREATE TABLE IF NOT EXISTS sync_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"#;
+
+/// Parity migration (M3): the full Python index set + the maintenance triggers.
+///
+/// - Indexes as created by `init_beam` (beam.py L504-L1026) and the knowledge-layer `init_*`
+///   functions (`triples.py`, `annotations.py`, `canonical.py`, `episodic_graph.py`,
+///   `veracity_consolidation.py`). Two Python quirks are ported faithfully: `idx_facts_session`
+///   lands on `memoria_facts` — beam creates it there first (L775) and the later
+///   `ON facts(session_id)` statement (L983) silently no-ops on the taken name, so `facts` has no
+///   session index; and `idx_ev_timestamp` (a pre-parity Rust name) is renamed to Python's
+///   `idx_me_timestamp`.
+/// - `trim_validations_to_3` ring-buffer trigger (beam.py L953-L965) and the `facts` FTS sync
+///   triggers `facts_ai`/`facts_ad` (beam.py L993-L1004), followed by an external-content
+///   `'rebuild'` so `facts` rows written before this migration become searchable.
+///
+/// SHMR belief tables stay lazily created by [`crate::recall::shmr::ensure_schema`], exactly like
+/// Python's `_init_schema`.
+pub const SCHEMA_V3: &str = r#"
+-- ── working_memory (beam.py L504-L506, L614-L622, L889-L898, L921-L936, L1017-L1026) ──
+CREATE INDEX IF NOT EXISTS idx_wm_source ON working_memory(source);
+CREATE INDEX IF NOT EXISTS idx_wm_consolidation_claims
+    ON working_memory(consolidation_claimed_at) WHERE consolidation_claimed_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_wm_session_recall
+    ON working_memory(session_id, last_recalled) WHERE valid_until IS NULL;
+CREATE INDEX IF NOT EXISTS idx_wm_context_global
+    ON working_memory(scope, importance DESC, timestamp DESC) WHERE superseded_by IS NULL;
+CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date);
+CREATE INDEX IF NOT EXISTS idx_wm_author ON working_memory(author_id);
+CREATE INDEX IF NOT EXISTS idx_wm_channel ON working_memory(channel_id);
+CREATE INDEX IF NOT EXISTS idx_wm_validator ON working_memory(validator);
+CREATE INDEX IF NOT EXISTS idx_wm_validated_at ON working_memory(validated_at);
+
+-- ── episodic_memory (beam.py L524-L526, L889-L890, L921-L924, L1017-L1026) ──
+CREATE INDEX IF NOT EXISTS idx_em_timestamp ON episodic_memory(timestamp);
+CREATE INDEX IF NOT EXISTS idx_em_source ON episodic_memory(source);
+CREATE INDEX IF NOT EXISTS idx_em_scope_imp
+    ON episodic_memory(scope, importance) WHERE superseded_by IS NULL;
+CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date);
+CREATE INDEX IF NOT EXISTS idx_em_author ON episodic_memory(author_id);
+CREATE INDEX IF NOT EXISTS idx_em_channel ON episodic_memory(channel_id);
+
+-- ── memory_events (beam.py L652-L660; idx_ev_timestamp renamed to the Python name) ──
+DROP INDEX IF EXISTS idx_ev_timestamp;
+CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id);
+CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id);
+
+-- ── memory_validations + ring-buffer trigger (beam.py L950-L965) ──
+CREATE INDEX IF NOT EXISTS idx_validations_memory ON memory_validations(memory_id);
+CREATE INDEX IF NOT EXISTS idx_validations_validator ON memory_validations(validator);
+CREATE TRIGGER IF NOT EXISTS trim_validations_to_3
+AFTER INSERT ON memory_validations
+BEGIN
+    DELETE FROM memory_validations
+    WHERE memory_id = NEW.memory_id
+      AND validation_id NOT IN (
+          SELECT validation_id FROM memory_validations
+          WHERE memory_id = NEW.memory_id
+          ORDER BY validation_id DESC
+          LIMIT 3
+      );
+END;
+
+-- ── memory_embeddings (beam.py L899-L900) ──
+CREATE INDEX IF NOT EXISTS idx_mem_emb_type ON memory_embeddings(memory_id, model);
+
+-- ── facts + FTS sync (beam.py L982-L1004, episodic_graph.py) ──
+CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
+CREATE INDEX IF NOT EXISTS idx_facts_predicate ON facts(predicate);
+CREATE INDEX IF NOT EXISTS idx_facts_object ON facts(object);
+CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source_msg_id);
+CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+    INSERT INTO fts_facts(rowid, subject, predicate, object)
+    VALUES (new.rowid, new.subject, new.predicate, new.object);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+    INSERT INTO fts_facts(fts_facts, rowid, subject, predicate, object)
+    VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
+END;
+INSERT INTO fts_facts(fts_facts) VALUES ('rebuild');
+
+-- ── MEMORIA tables (beam.py L774-L850) ──
+CREATE INDEX IF NOT EXISTS idx_facts_key ON memoria_facts(key);
+CREATE INDEX IF NOT EXISTS idx_facts_type ON memoria_facts(fact_type);
+CREATE INDEX IF NOT EXISTS idx_facts_session ON memoria_facts(session_id);
+CREATE INDEX IF NOT EXISTS idx_timelines_date ON memoria_timelines(date);
+CREATE INDEX IF NOT EXISTS idx_timelines_session ON memoria_timelines(session_id);
+CREATE INDEX IF NOT EXISTS idx_instr_session ON memoria_instructions(session_id);
+CREATE INDEX IF NOT EXISTS idx_instr_active ON memoria_instructions(active);
+CREATE INDEX IF NOT EXISTS idx_pref_session ON memoria_preferences(session_id);
+CREATE INDEX IF NOT EXISTS idx_kg_subject ON memoria_kg(subject);
+CREATE INDEX IF NOT EXISTS idx_kg_predicate ON memoria_kg(predicate);
+CREATE INDEX IF NOT EXISTS idx_kg_session ON memoria_kg(session_id);
+
+-- ── knowledge layer (triples.py L105-L108, annotations.py L144-L160, canonical.py L134-L143,
+--    episodic_graph.py, veracity_consolidation.py) ──
+CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object);
+CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from);
+CREATE INDEX IF NOT EXISTS idx_annot_memory_kind ON annotations(memory_id, kind);
+CREATE INDEX IF NOT EXISTS idx_annot_kind_value ON annotations(kind, value);
+CREATE INDEX IF NOT EXISTS idx_canonical_slot ON canonical_facts(owner_id, category, name);
+CREATE INDEX IF NOT EXISTS idx_canonical_owner_category ON canonical_facts(owner_id, category);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON graph_edges(source);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON graph_edges(target);
+CREATE INDEX IF NOT EXISTS idx_edges_type ON graph_edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_cf_subject ON consolidated_facts(subject);
+CREATE INDEX IF NOT EXISTS idx_cf_predicate ON consolidated_facts(predicate);
+CREATE INDEX IF NOT EXISTS idx_cf_object ON consolidated_facts(object);
 "#;

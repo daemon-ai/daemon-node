@@ -20,6 +20,7 @@ extend-exclude = [
 [default.extend-words]
 unparseable = "unparseable" # accepted variant of "unparsable"
 clonable = "clonable"       # accepted variant of "cloneable"
+flate = "flate"             # the flate2 crate (DEFLATE)
 togglable = "togglable"     # accepted variant of "toggleable"
 invokable = "invokable"     # Qt's Q_INVOKABLE macro
 cose = "cose"               # COSE: CBOR Object Signing and Encryption

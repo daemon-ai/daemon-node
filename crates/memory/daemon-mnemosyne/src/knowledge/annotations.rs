@@ -12,8 +12,19 @@ use rusqlite::{params, Connection};
 /// The annotation kinds (`annotations.py` `ANNOTATION_KINDS` L77-L82).
 pub const ANNOTATION_KINDS: &[&str] = &["mentions", "fact", "occurred_on", "has_source"];
 
-/// Minimum fact length kept by the read-time filter (`annotations.py` L89).
+/// Minimum fact length kept by [`filter_facts`] (`annotations.py` `MIN_FACT_LENGTH` L89).
 pub const MIN_FACT_LENGTH: usize = 10;
+
+/// Drop empty / too-short candidate facts (`annotations.py` `filter_facts` L92-L97: keeps
+/// `len(f) > MIN_FACT_LENGTH`, counted in characters like Python). Applied by extraction call
+/// sites before writing `fact` annotations so the threshold lives in one place.
+pub fn filter_facts(facts: &[String]) -> Vec<String> {
+    facts
+        .iter()
+        .filter(|f| f.chars().count() > MIN_FACT_LENGTH)
+        .cloned()
+        .collect()
+}
 
 /// One annotation row.
 #[derive(Clone, Debug)]
@@ -37,7 +48,8 @@ fn is_mentions_noise(value: &str) -> bool {
 }
 
 /// Append an annotation (`annotations.py` `add` L208-L230). `INSERT OR IGNORE` against the
-/// `(memory_id, kind, value)` unique index dedups repeats. Returns the new row id (0 if ignored).
+/// `(memory_id, kind, value)` unique index dedups repeats. An empty `source` is stored as NULL
+/// (Python's `source=None` default). Returns the new row id (0 if ignored).
 pub fn add(
     conn: &Connection,
     memory_id: &str,
@@ -46,6 +58,11 @@ pub fn add(
     source: &str,
     confidence: f64,
 ) -> Result<i64> {
+    let source = if source.is_empty() {
+        None
+    } else {
+        Some(source)
+    };
     conn.execute(
         "INSERT OR IGNORE INTO annotations (memory_id, kind, value, source, confidence) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -169,6 +186,19 @@ mod tests {
         add(&c, "m1", "mentions", "Acme", "regex", 1.0).unwrap();
         let rows = query_by_memory(&c, "m1", Some("mentions")).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn filter_facts_drops_short_candidates() {
+        let facts = vec![
+            "short".to_string(),
+            "exactly ten".to_string(), // 11 chars — kept
+            "0123456789".to_string(),  // exactly 10 — dropped (strict >)
+            String::new(),             // empty — dropped
+            "Maya works at Acme Corp".to_string(),
+        ];
+        let kept = filter_facts(&facts);
+        assert_eq!(kept, vec!["exactly ten", "Maya works at Acme Corp"]);
     }
 
     #[test]

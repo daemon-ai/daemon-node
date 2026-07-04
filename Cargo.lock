@@ -109,7 +109,7 @@ dependencies = [
  "once_cell",
  "serde",
  "version_check",
- "zerocopy 0.8.52",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2496,6 +2496,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "daemon-core",
+ "flate2",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
@@ -2504,12 +2505,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlite-vec",
+ "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
  "tracing",
  "unicode-normalization",
- "zerocopy 0.7.35",
 ]
 
 [[package]]
@@ -4512,7 +4513,7 @@ dependencies = [
  "num-traits",
  "rand 0.9.4",
  "rand_distr 0.5.1",
- "zerocopy 0.8.52",
+ "zerocopy",
 ]
 
 [[package]]
@@ -7427,7 +7428,7 @@ version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
- "zerocopy 0.8.52",
+ "zerocopy",
 ]
 
 [[package]]
@@ -11824,32 +11825,11 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
-dependencies = [
- "byteorder",
- "zerocopy-derive 0.7.35",
-]
-
-[[package]]
-name = "zerocopy"
 version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
 dependencies = [
- "zerocopy-derive 0.8.52",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
+ "zerocopy-derive",
 ]
 
 [[package]]

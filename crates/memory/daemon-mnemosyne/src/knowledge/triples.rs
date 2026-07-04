@@ -35,6 +35,11 @@ pub struct Triple {
 /// `(subject, predicate)` by stamping their `valid_until` to the new `valid_from` (single-valued
 /// truth); `supersede=false` leaves priors open (multi-valued predicates). `valid_from` defaults to
 /// today; `valid_until` is an optional explicit expiry. Returns the new row id.
+///
+/// The supersede match is case-insensitive on subject — a deliberate divergence from Python,
+/// where the write side is case-sensitive while [`query`] matches `COLLATE NOCASE`: adding
+/// `("maya", p, ...)` over `("Maya", p, ...)` would leave both rows open and `query("maya")`
+/// would return two "current" truths for one `(subject, predicate)`.
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     conn: &Connection,
@@ -53,7 +58,7 @@ pub fn add(
     if supersede {
         conn.execute(
             "UPDATE triples SET valid_until = ?1 \
-             WHERE subject = ?2 AND predicate = ?3 AND valid_until IS NULL",
+             WHERE subject = ?2 COLLATE NOCASE AND predicate = ?3 AND valid_until IS NULL",
             rusqlite::params![valid_from, subject, predicate],
         )?;
     }
@@ -67,7 +72,8 @@ pub fn add(
 
 /// Expire open triples without replacing them (`triples.py` `end` L178-L197). Closes all open rows
 /// for `(subject, predicate)`, or only the one matching `object` when supplied. Returns the number
-/// of rows closed.
+/// of rows closed. Subject matches `COLLATE NOCASE` for the same reason as [`add`]'s supersede:
+/// the close must reach every row the `NOCASE` read side would report as current.
 pub fn end(
     conn: &Connection,
     subject: &str,
@@ -80,7 +86,7 @@ pub fn end(
         .unwrap_or_else(util::today_iso);
     let mut sql = String::from(
         "UPDATE triples SET valid_until = ?1 \
-         WHERE subject = ?2 AND predicate = ?3 AND valid_until IS NULL",
+         WHERE subject = ?2 COLLATE NOCASE AND predicate = ?3 AND valid_until IS NULL",
     );
     let mut binds: Vec<Value> = vec![
         Value::Text(valid_until),
@@ -193,6 +199,50 @@ mod tests {
         let then = query(&c, Some("user"), Some("city"), None, Some("2024-03-01")).unwrap();
         assert_eq!(then.len(), 1);
         assert_eq!(then[0].object, "Berlin");
+    }
+
+    #[test]
+    fn supersede_is_case_insensitive_on_subject() {
+        let store = conn();
+        let c = store.conn.lock().unwrap();
+        add(
+            &c,
+            "Maya",
+            "role",
+            "engineer",
+            Some("2024-01-01"),
+            None,
+            "t",
+            1.0,
+            true,
+        )
+        .unwrap();
+        // A differently-cased subject must still close the prior open row — otherwise the NOCASE
+        // read side reports two current truths for one (subject, predicate).
+        add(
+            &c,
+            "maya",
+            "role",
+            "manager",
+            Some("2024-06-01"),
+            None,
+            "t",
+            1.0,
+            true,
+        )
+        .unwrap();
+        let now = query(&c, Some("MAYA"), Some("role"), None, Some("2024-07-01")).unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].object, "manager");
+
+        // end() reaches case-variant open rows the same way.
+        let closed = end(&c, "MaYa", "role", None, Some("2024-08-01")).unwrap();
+        assert_eq!(closed, 1);
+        assert!(
+            query(&c, Some("maya"), Some("role"), None, Some("2024-09-01"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

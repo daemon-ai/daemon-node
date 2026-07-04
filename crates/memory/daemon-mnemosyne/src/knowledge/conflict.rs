@@ -6,9 +6,13 @@
 //! Opt-in tier-2 validator (`MNEMOSYNE_LLM_CONFLICT_DETECTION`) layered atop the deterministic
 //! `(subject, predicate)` veracity-contradiction path that records `conflicts` rows during
 //! consolidation. In the Rust port the LLM call routes through the daemon-core `Provider` (the same
-//! seam used by [`crate::extract::Extractor`]); there is no bespoke HTTP client, retry ladder, or
-//! cost catalog (`_call_conflict_llm_with_retry` L56-L132 / `MODEL_PRICING` L35-L40 are host
-//! concerns). The prompt + JSON contract are ported verbatim from `validate_conflict_pair` L135-L214.
+//! seam used by [`crate::extract::Extractor`]); Python's exponential-backoff retry ladder
+//! (`_call_conflict_llm_with_retry` L86-L128: 2 retries, 1s/2s delays) is ported, while the bespoke
+//! HTTP client and sampling params (temperature 0.0) stay host concerns — the daemon-core `Request`
+//! carries no sampling knobs. Cost accounting ports via [`crate::cost_log`]
+//! ([`validate_conflict_pair_logged`] estimates tokens at ~4 chars each and appends a
+//! fire-and-forget `cost_entries` row, `llm_conflict_detector.py` L184-L209). The prompt + JSON
+//! contract are ported verbatim from `validate_conflict_pair` L135-L214.
 
 use crate::extract::Extractor;
 use serde::Deserialize;
@@ -73,9 +77,32 @@ pub fn parse_verdict(raw: &str) -> Option<ConflictVerdict> {
     serde_json::from_str::<ConflictVerdict>(strip_json(raw)).ok()
 }
 
+/// Max retries after the first failed attempt (`_call_conflict_llm_with_retry` L86).
+const MAX_RETRIES: u32 = 2;
+
+/// Initial backoff delay in seconds, doubled per attempt (`_call_conflict_llm_with_retry` L87-L88).
+const INITIAL_DELAY_SECS: f64 = 1.0;
+
+/// Run the completion with exponential backoff (1s, 2s — `_call_conflict_llm_with_retry`
+/// L90-L128). `None` when every attempt times out / errors.
+async fn call_with_retry(extractor: &Extractor, prompt: &str) -> Option<String> {
+    for attempt in 0..=MAX_RETRIES {
+        if let Some(raw) = extractor.summarize(prompt.to_string()).await {
+            return Some(raw);
+        }
+        if attempt < MAX_RETRIES {
+            let delay = INITIAL_DELAY_SECS * 2f64.powi(attempt as i32);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await;
+        }
+    }
+    None
+}
+
 /// Ask the injected LLM whether `newer_content` contradicts/supersedes `older_content`
-/// (`validate_conflict_pair` L135-L214). `None` in regex-only mode, on timeout/backend error, or
-/// when the completion isn't parseable JSON (the Python `(False, 0.0, None)` failure shape).
+/// (`validate_conflict_pair` L135-L214), retrying failed calls with exponential backoff. `None`
+/// in regex-only mode, when every attempt times out / errors, or when the completion isn't
+/// parseable JSON (the Python `(False, 0.0, None)` failure shape; a parse failure is a model
+/// answer, not retried).
 pub async fn validate_conflict_pair(
     extractor: &Extractor,
     older_content: &str,
@@ -84,9 +111,40 @@ pub async fn validate_conflict_pair(
     if !extractor.available() {
         return None;
     }
-    let raw = extractor
-        .summarize(build_prompt(older_content, newer_content))
-        .await?;
+    let raw = call_with_retry(extractor, &build_prompt(older_content, newer_content)).await?;
+    parse_verdict(&raw)
+}
+
+/// [`validate_conflict_pair`] plus the cost-log write (`llm_conflict_detector.py` L184-L209):
+/// tokens are estimated at ~4 chars each for prompt and response, priced at the default tier,
+/// and appended to the bank-adjacent `cost_log.db` as a fire-and-forget row (`memory_count = 2`
+/// — the validated pair). Skipped for in-memory banks (no data dir to co-locate with).
+pub async fn validate_conflict_pair_logged(
+    extractor: &Extractor,
+    engine: &crate::engine::Engine,
+    older_content: &str,
+    newer_content: &str,
+) -> Option<ConflictVerdict> {
+    if !extractor.available() {
+        return None;
+    }
+    let prompt = build_prompt(older_content, newer_content);
+    let input_t = crate::cost_log::estimate_tokens(&prompt);
+    let raw = call_with_retry(extractor, &prompt).await?;
+    let output_t = crate::cost_log::estimate_tokens(&raw);
+    if engine.is_persistent() {
+        let est = crate::cost_log::calculate_cost(input_t, output_t);
+        if let Err(e) = crate::cost_log::log_cost(
+            &engine.config().data_dir,
+            engine.session_id(),
+            2,
+            input_t + output_t,
+            est,
+            "host-provider",
+        ) {
+            tracing::debug!(error = %e, "cost log write failed (non-fatal)");
+        }
+    }
     parse_verdict(&raw)
 }
 

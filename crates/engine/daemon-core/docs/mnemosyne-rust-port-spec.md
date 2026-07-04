@@ -185,7 +185,7 @@ New crate `crates/memory/daemon-mnemosyne` (auto-included by the `crates/*/*` wo
 | `chat_normalize.rs` | `chat_normalize.py` | 149 | message normalization |
 | `sync.rs` | `sync.py` + `sync_server.py` | 1607 | `sync` feature |
 | `streaming.rs` | `streaming.py` | 617 | `sync` feature |
-| `dr.rs` | [`dr/recovery.py`](Mnemosyne/mnemosyne/dr/recovery.py) | 338 | backup/restore/integrity; `backup` feature |
+| `dr.rs` | [`dr/recovery.py`](Mnemosyne/mnemosyne/dr/recovery.py) | 338 | backup/restore/integrity (no feature gate; §12.2) |
 | `diagnose.rs` | [`diagnose.py`](Mnemosyne/mnemosyne/diagnose.py) | 353 | `run_diagnostics`/`auto_fix`; backs `mnemosyne_diagnose` |
 | `cost_log.rs` | `cost_log.py` | 78 | `cost_entries` table; LLM cost accounting |
 | `plugins.rs` | `plugins.py` | 676 | hook fan-out |
@@ -284,6 +284,28 @@ then conditional `ALTER TABLE ADD COLUMN`). The Rust port emits all *current* co
 `CREATE TABLE` DDL (no historical migration needed for a fresh store) but keeps an idempotent
 `add_column_if_missing(conn, table, col, ty)` helper for opening pre-existing Python DBs.
 
+**As-built ([`banks.rs`](../../../memory/daemon-mnemosyne/src/banks.rs)):** the `banks.py`
+`BankManager` CRUD is ported 1:1 — `create_bank` / `delete_bank(force)` / `list_banks` /
+`bank_exists` / `rename_bank` / `bank_stats`, with the same name validation (alphanumeric + `-_`,
+max 64, `default` reserved: always listed, force-only delete, never renamed) and the same path
+mapping as `MnemosyneConfig::bank_db_path`. One divergence: no env-derived default root — the
+host injects `data_dir`, as everywhere else in the crate.
+
+**As-built ([`store/mod.rs`](../../../memory/daemon-mnemosyne/src/store/mod.rs) `legacy`):** the
+open path is `reconcile_columns` -> migration ladder -> `e6_backfill`, all idempotent no-ops on
+Rust-created banks. `reconcile_columns` generalizes Python's ladder: the expected shape is read
+from a fresh in-memory reference database built by the same migrations, and every existing table
+is diffed via `PRAGMA table_info` and `ALTER TABLE ADD COLUMN`-reconciled (non-constant
+`CURRENT_TIMESTAMP` defaults are added defaultless, as SQLite requires). It runs *before* the
+ladder because the ladder's partial indexes reference columns a legacy bank lacks. E3 semantics
+are preserved: when `working_memory.consolidated_at` itself had to be added, pre-existing rows are
+backfilled as already-consolidated (beam L578-L607). `e6_backfill` then runs the E6
+triplestore-split copy on every open (`migrations/e6_triplestore_split.py` via
+`_ensure_e6_schema_with_migration` beam L2688): `INSERT OR IGNORE` against the
+`idx_annot_unique` index (same name/shape as Python's) copies — never deletes — annotation-kind
+`triples` rows into `annotations`. A `legacy_python_bank_reconciles_on_open` test opens a
+hand-built pre-E3/pre-E6 bank and pins all three behaviors.
+
 ### 4.2 `working_memory` (hot tier) — `beam.py` L491-L502 + migrations
 
 Columns (with the lifecycle/identity/trust/temporal migrations folded in):
@@ -330,6 +352,22 @@ Same shape as working memory plus: `rowid INTEGER PRIMARY KEY AUTOINCREMENT` (th
   timestamp, source_msg_id, confidence, created_at`.
 - `memoria_facts/timelines/instructions/preferences/kg` (L754-L840): regex-extracted MEMORIA tables.
 
+**As-built ([`store/schema.rs`](../../../memory/daemon-mnemosyne/src/store/schema.rs)):** the
+`PRAGMA user_version` ladder is M1 (full bank schema) → M2 (`sync_meta`) → M3 (index/trigger
+completeness). M1 carries Python's write-path `NOT NULL`s (`memory_events.memory_id/operation/
+timestamp/device_id`, `memory_validations.memory_id/validator/action`, `facts.session_id/subject/
+predicate/object`) and the full `memoria_*` shape — `memoria_facts` versioning columns
+(`version_id`, `previous_value`, `updated_msg_idx`, `valid_from/to_msg_idx`, beam L777-L787 —
+with the `_insert_fact` version-chaining write path and the evolution-chain fact rendering ported
+in [`memoria.rs`](../../../memory/daemon-mnemosyne/src/memoria.rs), beam L4477/L4787) and
+the `session_id DEFAULT 'default'` / `confidence REAL DEFAULT 0.7` defaults on the other four. M3
+adds every remaining Python index (working-memory source/claims/recall/context/temporal/identity,
+episodic timestamp/source/scope/temporal/identity, events, validations, embeddings, facts,
+memoria, knowledge-layer) plus the `trim_validations_to_3` ring-buffer trigger and the
+`facts_ai`/`facts_ad` FTS sync triggers with a one-shot `fts_facts` rebuild. A golden-file test
+(`schema.golden.sql`, `DAEMON_UPDATE_SCHEMA=1` to refresh) pins the final shape; SHMR tables stay
+lazily created by `shmr::ensure_schema` exactly as in Python.
+
 ### 4.5 Virtual tables and triggers
 
 - sqlite-vec (`vec-ext` feature): `vec_episodes` / `vec_working` / `vec_facts` as
@@ -341,6 +379,14 @@ Same shape as working memory plus: `rowid INTEGER PRIMARY KEY AUTOINCREMENT` (th
   `fts_facts` external-content over `facts` (L987-L990).
 - Triggers keep FTS in sync: `em_ai/em_ad/em_au` (L711-L725), `wm_ai/wm_ad/wm_au` (L729-L750),
   `facts_ai/facts_ad` (L993-L1003).
+
+**As-built decision (ratified):** the default vector path is f32-BLOB columns + in-Rust scalar
+cosine (`recall/vector.rs`) — no `vec0` virtual tables are created, and `binary_vector` BLOBs
+(§5.2) provide the Hamming prefilter. This matches Python's own no-extension fallback
+(`sqlite_vec` absent → JSON/BLOB cosine) and keeps the default build free of C extensions and
+`unsafe`. The `vec-ext` feature gates the sqlite-vec auto-extension registration; wiring
+`vec_episodes`/`vec_working`/`vec_facts` vec0 tables + KNN `MATCH` queries onto it is deferred
+until profiling shows the scalar path limiting (banks ≫ 10k episodic rows).
 
 ### 4.6 Knowledge tables (co-located in the same bank DB)
 
@@ -579,16 +625,22 @@ rank starts at 1, missing -> 999):
 keyed on `MnemosyneConfig::recall_mode` (`Base`/`Enhanced`/`Polyphonic`, §13 config). `recall_enhanced`
 runs `classify_intent` → `adjust_weights` → `normalize_query`/`expand_query` → `query_cache().get` →
 `recall_base` (with the intent-biased weights threaded through `gather_working`/`gather_episodic`) →
-`weibull_rescore` (fetches each row's `memory_type` from the bank, `score*0.7 + wb*0.3`) →
-`mmr_rerank` → `episodic_graph::find_related_memories` expansion → `query_cache().put`. The cache
+`weibull_rescore` (only when no explicit `temporal_weight` filter is set; fetches each row's
+`memory_type` from the bank, supplement tiers default to `general`, `score*0.7 + wb*0.3`) →
+`mmr_rerank` over `top_k*2` → final sort/truncate to `top_k` →
+`episodic_graph::find_related_memories` expansion → `query_cache().put`, matching Python's stage
+order exactly. The cache
 ([`recall/query_cache.rs`](../../../memory/daemon-mnemosyne/src/recall/query_cache.rs)) is a
 `OnceLock<QueryCache>` on the engine, persistent (`query_cache.db`) when the bank is on disk and
 in-memory otherwise, and is invalidated on `remember` only once initialized. `recall_polyphonic`
-gathers the four `VoiceHit` lists, fuses them with the pure-RRF
-[`polyphonic::fuse`](../../../memory/daemon-mnemosyne/src/recall/polyphonic.rs) (`RRF_K=60`), applies
-`diversity_rerank` (0.8 Jaccard), then resolves ids back to `MemoryRow`s. The fact voice queries the
-`facts` table directly by subject word (returning `source_msg_id` + confidence) rather than Python's
-non-memory `consolidated_fact` ids, so every fused hit maps to a real memory.
+gathers the four `VoiceHit` lists (`engine/recall.rs` `poly_*_voice`), fuses them with the pure-RRF
+[`polyphonic::combine_voices`](../../../memory/daemon-mnemosyne/src/recall/polyphonic.rs)
+(`RRF_K=60`, missing rank 999), applies `diversity_rerank` (0.8 Jaccard on voice-key sets) and the
+`budget*4`-char `assemble_context` cut, then materializes ids to `MemoryRow`s with per-voice RRF
+provenance in `MemoryRow::voice_scores` and post-RRF veracity + tier-degradation multipliers. The
+fact voice reads `consolidated_facts` faithfully: its synthetic `cf_<id>` hits become Fact-tier rows
+(`[FACT] subject predicate object`) rather than being dropped, and a low-signal
+`memoria_retrieve` supplement is prepended exactly as in Python.
 
 ### 8.3 SHMR (`shmr.py`) — opt-in background
 
@@ -597,6 +649,16 @@ Self-Harmonizing Memory Reasoning: greedy connected-component clustering on cosi
 persists to `harmonic_beliefs` + `memory_resonance_log`. **Not wired into `sleep()` in Python** (the
 docstring claims it is, but `beam.sleep` never calls `harmonize` — `shmr.py` L356). The Rust port
 ships it as an explicit opt-in background pass, not on the hot path.
+
+**As-built ([`recall/shmr.rs`](../../../memory/daemon-mnemosyne/src/recall/shmr.rs)):**
+`Engine::{harmonize, recall_beliefs, reflect, resonance_log}` wrap the module; `harmonize` takes
+injected `EmbedFn`/`LlmFn` callbacks (the engine is sync and LLM-free by design) plus
+`ShmrOptions` mirroring the env knobs (batch 50, <=3 iterations, sim 0.70, harmony 0.60, min
+cluster 2). The `harmonic_beliefs`/`memory_resonance_log` tables are created lazily on first use,
+exactly like Python. Belief application ports `_apply_beliefs` verbatim: `reinforce`/`generalize`
+insert working-memory rows tagged `[HARMONIC]`/`[PATTERN]`, `dampen` floors fact confidence at 0.1.
+One deliberate deviation: Python's `harmonize` filters facts on a nonexistent `facts.status`
+column (an OperationalError on any standard bank); the Rust query drops that predicate.
 
 ---
 
@@ -628,10 +690,12 @@ table (L28-L59), to port verbatim:
 **As-built ([`dynamics/`](../../../memory/daemon-mnemosyne/src/dynamics/)):** `typed_memory::classify`
 ports the full 69-pattern `TYPE_PATTERNS` table + `CONFIDENCE_BOOSTERS` (regexes compiled once via
 `OnceLock`, case-insensitive), the booster/length confidence math, the `confidence*(1 + 0.1*type_index)`
-tie-break, and the no-match default; it is called from `remember_with_vector` and persisted as
-`memory_type`. A `labeled_corpus_matches_python` test pins the classifications. `weibull::weibull_boost`
-wraps `weibull_decay_factor` (returns `0.0` for a `None` age) and is consumed by `weibull_rescore` on
-the **enhanced** finalize only — base recall is left untouched to preserve P0 parity.
+tie-break, and the no-match default; it is called from `remember_with_vector` (and on the sleep
+summary at `finish_sleep`) and persisted as `memory_type`. A `labeled_corpus_matches_python` test
+pins the classifications. `weibull::weibull_boost` wraps `weibull_decay_factor` (returns `0.0` for a
+`None` age) and honors the `halflife` override (`exp(-age/halflife)`, L129-L134); it is consumed by
+`weibull_rescore` on the **enhanced** finalize only — base recall is left untouched to preserve P0
+parity.
 
 ### 9.3 Sleep / consolidation — `beam.py` L7576-L7844
 
@@ -644,27 +708,48 @@ L7773); `consolidate_to_episodic` (L3956) inserts episodic + embeds + graph; cle
 `consolidation_log`; run `degrade_episodic` (tier T1->T2 at 30d, T2->T3 at 180d). `pinned=1` rows
 skip sleep. Consolidation is **additive**: WM rows are marked, not deleted.
 
-**As-built ([`engine.rs`](../../../memory/daemon-mnemosyne/src/engine.rs), [`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs)):**
-the full `sleep` is live. `Engine::sleep_plan(force)` applies the 84h cutoff (`WORKING_MEMORY_TTL_HOURS/2`,
-skipped on `force`), skips pinned rows, batches at `SLEEP_BATCH_SIZE`, **atomically claims** rows
+**As-built ([`engine/consolidation.rs`](../../../memory/daemon-mnemosyne/src/engine/consolidation.rs), [`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs)):**
+the full `sleep` is live. `Engine::sleep_plan(force)` applies the TTL/2 cutoff
+(`MnemosyneConfig::working_memory_ttl_hours`, 84h default; skipped on `force`), skips pinned rows,
+batches at `MnemosyneConfig::sleep_batch_size`, **atomically claims** rows
 (`consolidated_at`/`consolidation_claimed_at` gated on `consolidated_at IS NULL`), and groups them by
 source with aggregated scope (any-global), `valid_until` (earliest), and `veracity::aggregate_veracity`
-(mode, conservative tie-break). The async provider summarizes each group through the injected
-[`Extractor`] LLM (`Engine::summary_prompt`); `Engine::finish_sleep` writes one episodic summary per
-group (`summary_of` = the source WM id list, importance 0.6), falling back to the deterministic
-**AAAK** summary `[source] <aaak_encode>` when no LLM is present, then logs to `consolidation_log` and
-runs `degrade_episodic`. `Engine::sleep(force)` is the standalone no-LLM entrypoint (plan + finish with
-AAAK). `degrade_episodic` promotes tier 1->2 at `TIER2_DAYS=30` (AAAK-compressed) and tier 2->3 at
-`TIER3_DAYS=180` (signal-compressed to `TIER3_MAX_CHARS=300`), invalidating the stale dense embedding
-(+ binary vector) when content changes so recall falls back to lexical/FTS. The provider runs a forced
-sleep at session End/Handoff and an unforced auto-sleep every `AUTO_SLEEP_EVERY_TURNS=10` turns. Still
-open: the embedding-cosine>0.88 conflict heuristic (the `(S,P)` veracity contradiction path is reused
-instead) and the Weibull recall blend (§9.2).
+(mode, conservative tie-break). `Engine::heuristic_sleep_conflicts` ports `_detect_conflicts` (L3634):
+per in-group pair, timestamps >=1h apart AND stored-embedding cosine >0.88 AND >=2 shared significant
+tokens AND edit-distance ratio >0.3 flags the older row; the no-LLM path invalidates every pair
+(`resolve_sleep_conflicts`), while `tools::run_sleep` validates each through the §10.7 LLM gate first.
+The async provider summarizes each group through the injected [`Extractor`] LLM
+(`Engine::summary_prompt`) and embeds the final text through the injected [`Embedder`], passing both
+down as a `GroupSummary`; `Engine::finish_sleep` `<think>`-strips the text (AAAK fallback when it
+strips to nothing), typed-memory-classifies it, writes one episodic summary per group (`summary_of` =
+the source WM id list, importance 0.6, author/channel stamps from config), embeds + MIB-binarizes it
+into `memory_embeddings`/`binary_vector` (beam L4005-L4032), then logs to `consolidation_log`, runs
+`degrade_episodic`, and finishes with `veracity::run_consolidation_pass` (§10.6; counted as
+`SleepReport::facts_auto_resolved`). `Engine::sleep(force)` is the standalone no-LLM entrypoint
+(plan + heuristic-conflict resolve + finish with AAAK). `degrade_episodic` promotes tier 1->2 at
+`MnemosyneConfig::tier2_days` (30d default, AAAK-compressed) and tier 2->3 at `tier3_days` (180d,
+signal-compressed to `TIER3_MAX_CHARS=300`), invalidating the stale dense embedding (+ binary vector)
+when content changes so recall falls back to lexical/FTS. The provider runs a forced sleep at session
+End/Handoff and an unforced auto-sleep every `AUTO_SLEEP_EVERY_TURNS=10` turns.
 
 ### 9.4 Patterns — `patterns.py`
 
 `MemoryCompressor` (dict/RLE/semantic/auto) and `PatternDetector` (temporal/content/sequence). Pure
 logic; P3 priority.
+
+**As-built ([`dynamics/patterns.rs`](../../../memory/daemon-mnemosyne/src/dynamics/patterns.rs)):**
+full port. `MemoryCompressor` reproduces dict (sequential ordered phrase replacement), RLE (runs
+> 3 -> `[c*count]`, capped 255), semantic (>500 bytes -> first 250 + `[...]` + last 100 chars),
+`auto` (dict first, RLE fallback when savings < 5%), `compress_batch`, and `decompress` (dict
+reverse map is last-duplicate-wins like Python's `{v: k}` — minus Python's empty-token
+`str.replace("", ...)` bug — and RLE is exact), all reporting `CompressionStats`.
+`PatternDetector` ports temporal (top-3 hour / top-2 weekday concentrations over >= 3 parseable
+timestamps), content (top-5 stopword-filtered keywords + top-3 co-occurring pairs, `most_common`
+first-seen tie-order via `BTreeSet` where Python's set iteration is nondeterministic), and
+sequence (adjacent source bigrams in timestamp order); `detect_all` sorts by confidence and
+`summarize_patterns` emits the JSON summary. Pure logic, no tables; like Python's
+`MemoryCore._compressor`/`._pattern_detector`, it is a leaf library not yet called on the hot
+path.
 
 ---
 
@@ -686,10 +771,12 @@ the graph/fact signals (§7.8).
 **As-built (K2 — LLM extraction + temporal, this milestone):** `Engine::ingest_extracted` layers an
 injected-LLM extraction pass (§11) *on top of* the always-on regex baseline — LLM entities become
 higher-confidence `mentions`, SPO triples become `facts` + `consolidated_facts`, and free-text
-statements become `fact` annotations (all stores dedupe, so re-ingesting a regex-captured item is a
-no-op). Deterministic temporal parsing (§10.5 `parse_nl_date`/`extract_temporal`) is live and wired
-into the write path (the `event_date`/`event_date_precision`/`temporal_tags` columns on both tiers).
-Still TODO: the tier-2 LLM conflict detector (§10.7), rule-based gists, and the E6 legacy migration.
+statements become `fact` annotations after the shared `annotations::filter_facts` write filter
+(`> MIN_FACT_LENGTH` chars, §10.2 L89; all stores dedupe, so re-ingesting a regex-captured item is
+a no-op). Deterministic temporal parsing (§10.5 `parse_nl_date`/`extract_temporal`) is live and
+wired into the write path (the `event_date`/`event_date_precision`/`temporal_tags` columns on both
+tiers). The tier-2 LLM conflict detector (§10.7), rule-based gists (§10.4), and the E6 legacy
+backfill (§4.1) are all live.
 
 ### 10.1 TripleStore — `triples.py`
 
@@ -699,6 +786,11 @@ confidence`. Single-current-truth: `add(supersede=True)` (default) stamps prior 
 `query(as_of)` filters `valid_from <= as_of AND (valid_until IS NULL OR valid_until > as_of)`
 (L220-L227); subject match `COLLATE NOCASE`; default `as_of = today`. `supersede=False` allows
 simultaneous multi-valued objects.
+
+**As-built divergence:** the Rust `add` supersede and `end` also match the subject
+`COLLATE NOCASE`. Python is case-sensitive on the write side while its read side is `NOCASE`, so
+`add("maya", p, ...)` over `add("Maya", p, ...)` leaves both rows open and `query` reports two
+"current" truths for one `(subject, predicate)`; the port closes the case-variant row instead.
 
 ### 10.2 AnnotationStore — `annotations.py`
 
@@ -717,6 +809,13 @@ valid_from, valid_until`; partial unique index on live rows `WHERE valid_until I
 (L230-L287, `BEGIN IMMEDIATE`): identical body -> `status="unchanged"`; else `version = max+1`, close
 current (`valid_until=now`), insert new. `forget()` stamps `valid_until` (no delete). Owner-scoped
 identity cards with version history.
+
+**As-built ([`knowledge/canonical.rs`](../../../memory/daemon-mnemosyne/src/knowledge/canonical.rs)):**
+`remember` wraps its read-current + supersede + insert in `BEGIN IMMEDIATE`/`COMMIT` (rollback on
+error) like Python — the in-process `Mutex<Connection>` already serializes Rust callers, but the
+write lock protects against another *process* (e.g. Python) sharing the bank file. `CanonicalRow`
+carries the full provenance (`source`/`confidence`/`valid_from`), and the
+`mnemosyne_recall_canonical` tool returns it, matching Python's `dict(row)` results.
 
 ### 10.4 EpisodicGraph — `episodic_graph.py`
 
@@ -812,7 +911,10 @@ by sleep. The provider injects it via `with_backends`/`open_with_backends`, the 
 same way as `lcm_aux` (the profile builder, mock fallback), and `after_turn` runs extraction at the
 async seam before `Engine::ingest_extracted` merges it. The remote-API hop (1) and local GGUF (2) stay
 deferred; **AAAK** ([`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs), full category/phrase/
-structural maps) is the no-LLM fallback.
+structural maps) is the no-LLM fallback — both directions: `encode` and the `decode` reversal
+(REV maps built with Python's dict-comprehension **last-wins** collision semantics for duplicate
+shorthands, longest-key-first replacement, category prefixes restored) round-trip
+encode→decode→encode stably.
 
 **Cost logging** (`cost_log.rs` <- [`core/cost_log.py`](Mnemosyne/mnemosyne/core/cost_log.py)): when
 an LLM call is made (extraction and `llm_conflict_detector`), `log_cost(session_id, memory_count,
@@ -821,6 +923,32 @@ token_count, estimated_cost_usd, model)` (L41-L51) appends a row to the `cost_en
 the bank DB — the Rust port keeps it in its own connection (or, behind a `cost-log` feature, an
 in-bank `cost_entries` table if co-location is preferred). `get_cost_stats` (L54-L78) aggregates
 calls/tokens/cost for benchmarking.
+
+**As-built ([`cost_log.rs`](../../../memory/daemon-mnemosyne/src/cost_log.rs)):** a standalone
+module (no feature gate — it is 3 functions over one table) owning `<data_dir>/cost_log.db`:
+`log_cost` opens/creates on demand and appends, `get_cost_stats` aggregates
+calls/memories/tokens/cost + per-model breakdown, `estimate_tokens` keeps Python's `len/4`
+heuristic and `calculate_cost` its default price tier. Wired exactly where Python wires it —
+`validate_conflict_pair_logged` in [`knowledge/conflict.rs`](../../../memory/daemon-mnemosyne/src/knowledge/conflict.rs)
+(both the sleep-path and provider-path tier-2 validations) estimates prompt/response tokens and
+appends a fire-and-forget row (`memory_count = 2`, model `host-provider`); in-memory banks skip
+the write. Extraction itself does not log (parity: Python's `log_cost` has exactly one caller,
+`llm_conflict_detector.py`).
+
+**Conversation-level fact extraction as-built:** `extract.rs` also ports the C13 fact-array
+schema — `EXTRACTION_SYSTEM_PROMPT` + user template verbatim from `extraction/prompts.py`,
+`ExtractedFact {subject, predicate, object, timestamp, source, confidence}`, `parse_fact_array`
+(first `[` .. last `]`, list-or-nothing, `client.py` L197-L208), and
+`Extractor::extract_conversation_facts` formatting messages as `[i] [role]: content`. Every
+attempt (both schemas) feeds the process-global **extraction diagnostics** singleton
+([`extract/diagnostics.rs`](../../../memory/daemon-mnemosyne/src/extract/diagnostics.rs) <-
+`extraction/diagnostics.py` C13.b): per-tier attempt/success/no_output/failure counters with
+bounded, sanitized error samples, outer-call totals + `success_rate`, and a
+`get_extraction_stats()` snapshot in the Python shape. The Rust node has one live tier (`host` —
+the injected Provider); `remote/local/cloud/wrapper` are kept for shape parity. Divergence:
+unknown tiers are logged-and-dropped instead of raising (`ValueError` has no place inside the
+extraction path), and Rust error strings are flattened to one line before capping (Python gets
+that for free from `repr(exc)`).
 
 `content_sanitizer.rs` (size cap 1 MB, base64/data-URI detection, entropy >5.0 spill to blob),
 `tokens.rs` (`len/4` or tiktoken), and `chat_normalize.rs` (contraction/filler normalization) are
@@ -862,6 +990,25 @@ Not on the default recall path — an operator/maintenance capability behind a `
 - `list_backups` (L202-L231), `rotate_backups(keep=10)` (L232-L265), and `health_check` (L266+) round
   out backup lifecycle management.
 
+**As-built ([`dr.rs`](../../../memory/daemon-mnemosyne/src/dr.rs)):** no feature gate (flate2 +
+sha2 are already in the tree; a `backup` feature bought nothing). The archive format is Python's —
+gzipped SQL text (`mnemosyne_backup_YYYYMMDD_HHMMSS.db.gz` + `.gz.json` sidecar with
+timestamp/sizes/16-hex-truncated SHA-256 checksums) — and restore is `execute_batch` of the
+decompressed script, i.e. `executescript` semantics: **any archive Python's restore accepts, the
+Rust restore accepts** (covered by a legacy-shape round-trip test that restores a Python-style
+dump and reopens it through the reconcile ladder). Deliberate divergences: (a) paths are explicit
+args (+ `default_backup_dir(config)` = `<data_dir>/backups`) — the node never resolves `~`; (b)
+the dump is schema-aware where CPython `iterdump` is broken — FTS5 shadow tables are skipped
+(gh-90016 would make the archive fail its own restore), triggers are emitted *after* data so
+restore can't double-fire them, external-content FTS indexes get `'rebuild'` commands (+ a
+repopulating `INSERT ... SELECT` for the regular `fts_working`), and `PRAGMA user_version` is
+embedded so the migration ladder no-ops on a restored bank; (c) restore is atomic — rebuild into
+a sibling temp file, `PRAGMA integrity_check`, then rename over the target with WAL sidecars
+removed (Python rebuilds in `:memory:` and overwrites in place), keeping the
+`.emergency_backup.db` pre-restore copy; (d) `emergency_restore` reports the real `attempts`
+count (Python hardcodes 1). `verify_integrity`/`list_backups`/`rotate_backups`/`health_check`
+are line-for-line ports.
+
 ### 12.3 Diagnostics (`diagnose.rs` <- `diagnose.py`)
 
 Backs the `mnemosyne_diagnose` tool listed in §13.
@@ -873,6 +1020,26 @@ Backs the `mnemosyne_diagnose` tool listed in §13.
 - `auto_fix(repair_vec_working=…)` (L294+): the repair path — rebuilds the sqlite-vec shadow tables
   from the canonical rows, reindexes FTS, and reclaims orphans. In Rust this is feature-gated on
   `vec-ext` for the vector-rebuild branch; the integrity/FTS branches are always available.
+
+**As-built ([`diagnose.rs`](../../../memory/daemon-mnemosyne/src/diagnose.rs)):**
+`run_diagnostics(engine, embedder, extractor, opts)` emits the Python entry shape
+(`{ts, category, check, status, detail}`), writes the PII-safe JSONL to `<data_dir>/logs/diagnose_*.jsonl`
+(bank-adjacent, not `~/.hermes`; skipped for in-memory banks), and returns the summary
+(`log_path/checks_total/checks_passed/checks_failed/key_findings/fixable/entries`, same
+non-failure status set `OK/YES/set/OPTIONAL`). Check remapping: Python's pip-dependency section
+becomes injection/compile facts — `embedder` OK/MISSING (host provider vs hash fallback),
+`sqlite_vec` OK/OPTIONAL (`vec-ext` compiled; never a failure since §7 made scalar the runtime
+path), `llm_extractor` OK/OPTIONAL (the `ctransformers` analogue). The `vec_working` block maps
+to the stores the Rust engine actually reads via `Engine::vector_coverage()` —
+`memory_embeddings` (f32 JSON source) + `episodic_memory.binary_vector` (MIB derivative) — with
+Python's status vocabulary (`empty/no_vectors/partial/complete`) and count-only fields;
+`Engine::repair_vector_coverage(dry_run)` idempotently backfills episodic MIB binaries from
+stored embeddings (the deterministic gap; re-embedding absent embeddings stays a host operation,
+Python's `reindex_vectors`). The `mnemosyne_diagnose` tool keeps Python's wire args
+(`repair_vec_working`, `dry_run` — `_handle_diagnose`) and appends `active_provider_db_path`.
+`auto_fix` is shape-compatible (`{fixed, failed, skipped, ran}`) but never executes anything —
+there is no pip in a daemon node; fixable findings land in `skipped` with host-side remediations
+(dry-run keeps the `WOULD …` phrasing).
 
 ---
 
@@ -893,10 +1060,26 @@ Arc<Engine>, config }`.
 - `after_turn(turn, conv)` <- `sync_turn` (L1668-L1692): from the `Turn`, persist the user text
   (`len > 5`, importance 0.5, `extract_entities=true`) and assistant text (`len > 10`, importance
   0.15); identity-signal capture (substring match -> `[IDENTITY]` row, importance 0.85, scope
-  global); increment turn counter; auto-sleep every 10 turns when enabled. No LLM extraction on the
-  hot path (tool-driven only).
-- `before_compact(conv)` -> persist salient facts; `on_session_switch(reason)` /
-  session end -> `engine.sleep()` on a background task.
+  global); increment turn counter; auto-sleep every 10 turns when enabled.
+
+  **As-built:** both writes are gated by `sync_roles` (default `["user"]`, `MEMORY_SYNC_ROLES`)
+  and the case-insensitive `ignore_patterns` regex list (`_should_filter` L1215); identity capture
+  runs on user turns (`IDENTITY_SIGNALS` substring set); LLM fact extraction *does* run at this
+  async seam when a `Provider` is injected (the seam is Rust's equivalent of Python's
+  tool/CLI-driven extraction path); auto-sleep checks every 10th persisted turn but only fires when
+  `auto_sleep_enabled` (default **off**, `MNEMOSYNE_AUTO_SLEEP`) and `eligible_for_sleep() >=
+  auto_sleep_threshold` (default 50).
+- `recall(q)` **prefetch hardening as-built ([`prefetch.rs`](../../../memory/daemon-mnemosyne/src/prefetch.rs)
+  <- `_prefetch_*`, `__init__.py` L1230-L1546):** 3x over-fetch, then profile-driven filter/rank —
+  low-quality fragment drop (len<40 after `[RAW]`-prefix strip, mid-sentence starts, filler/stopword
+  openers), distilled-source-only + topic-signal gates (`social-chat` profile), adjusted score
+  (`score*(0.5+0.5*source_quality) - raw_penalty`), token-set semantic dedup (0.82 Jaccard), content
+  render truncation (300/220 chars), and the always-injected session-scoped identity block
+  (`_identity_fichas` L1547: importance-then-recency, deduped against recall output). Profiles:
+  `general` (default) and `social-chat` (`MEMORY_PREFETCH_PROFILE`).
+- `before_compact(conv)` -> deliberate no-op (Python provider defines no compaction hook; sleep
+  covers durability at session boundaries); `on_session_switch(reason)` /
+  session end -> forced `run_sleep` on a background task.
 - `tools()` / `call_tool()` <- the **26-tool** dispatch (`__init__.py` L920-L929, L1771-L1824), each
   returning a JSON string: `mnemosyne_remember/recall/get/update/forget/invalidate/validate`,
   `mnemosyne_sleep/stats/diagnose`, `mnemosyne_triple_{add,end,query}`,
@@ -905,15 +1088,49 @@ Arc<Engine>, config }`.
   `mnemosyne_sync_*` tools are added under the `sync` feature (parity with `mnemosyne_hermes`).
 
 **As-built ([`tools.rs`](../../../memory/daemon-mnemosyne/src/tools.rs)):** the dispatch is factored
-into `crate::tools::{defs, dispatch}` (one table + one match, not a giant method); `tools()`/
-`call_tool()` delegate to it. The full surface is implemented over the §13 backing `Engine` methods
+into `crate::tools::{defs, dispatch}` (one table + one match, not a giant method) over a `ToolCx`
+carrying the private engine, the embedder/extractor seams, and the lazily-opened shared-surface
+engine; `tools()`/`call_tool()` delegate to it. The full surface is implemented over the §13 backing
+`Engine` methods
 (`get`/`update`/`forget`/`invalidate`/`validate`/`stats`/`diagnose`/`scratchpad_{write,read,clear}`/
 `export`/`import`/`graph_{query,link}`/`triple_{add,end,query}`/`canonical_{remember,recall,forget}`):
 `remember/recall/get/update/forget/invalidate/validate`, `sleep/stats/diagnose`, `triple_{add,end,query}`,
 `{remember,recall}_canonical`, `scratchpad_{write,read,clear}`, `graph_{query,link}`, `export/import`,
-and the `shared_{remember,recall,forget,stats}` surface (`shared_remember` = global scope). Under the
+and the `shared_{remember,recall,forget,stats}` surface. Under the
 `sync` feature, `sync_{status,export,import}` land as wrappers over the export-bundle / local surface;
-the full event-log replication subsystem stays P3.
+the full event-log replication subsystem stays P3. Arg/response parity notes:
+
+- `mnemosyne_remember` takes the full `_handle_remember` arg set (`source` default **user**, `scope`,
+  `valid_until`, `extract_entities`, `extract`, `metadata`, clamped `veracity`) and returns the
+  `{"status":"stored", "memory_id", "content_preview", ...}` shape; `extract=true` runs LLM
+  extraction at the async dispatch seam.
+- `mnemosyne_recall` accepts `limit` (Python's arg name; `top_k` kept as an alias), the temporal
+  knobs, the row filters, and per-call `vec_weight`/`fts_weight`/`importance_weight` overrides
+  forwarded **only when supplied** (issue #45); results are full row dicts tagged `bank:"private"`,
+  and when `shared_surface_read` is on, surface results (tagged `bank:"surface"`,
+  `shared_surface:true`) are merged by score and truncated to `limit` (`_handle_recall` L1906).
+- `mnemosyne_sleep` supports `dry_run` (non-claiming `sleep_plan_dry_run`, `beam.py` L7639) and
+  `force`.
+
+**Shared surface (`_ensure_surface_beam` L1954 -> `MnemosyneProvider::surface_engine`):** a second
+`Engine` on its own cross-profile DB (`shared_surface_dir()/mnemosyne.db`, default
+`<data_dir>/shared/`, override `HERMES_SHARED_MEMORY_DIR`; in-memory when the private bank is
+in-memory), session id `hermes_shared_surface`, lazily opened via `OnceLock` — init failure makes
+`shared_*` tools report `{"error": "shared surface DB is not initialized"}` rather than fall back to
+the private bank. `shared_remember` ports the whole L1973-L2017 pipeline: `[USER]`/`[ASSISTANT]`
+raw-content rejection, `kind` whitelist (meta/preference/correction/identity), kind labeling
+(`Surface preference: ...`), the stable content-hash id (`sf_` + sha256(`surface:v1:` +
+lowercased/whitespace-collapsed content)[..24]), importance clamp (default 0.8), metadata stamps
+(`shared_memory`/`surface_kind`/`write_path`/`source_profile_session`), and
+`existing_shared`/`stored_shared` status via the exact-dedup probe. `shared_forget` takes
+`memory_id` (Python arg name).
+
+**Audit (`audit.py` + `_audit_event`):** every engine-level mutation writes a fire-and-forget row
+into the bank-co-located `audit_log` (remember/update/forget/invalidate/validate/consolidate, §12.4);
+tool-level events with no engine counterpart go through `Engine::audit_tool` with explicit
+`bank`/`source_tool`/`metadata_json` stamps — `shared_remember`/`shared_forget` audit into the
+**private** provider DB with `bank="surface"` (matching Python's provider-side log placement), and
+`mnemosyne_sleep` audits `action="sleep"`.
 
 `on_pre_compress` and `on_session_switch` are **not implemented** in the Python provider; in Rust
 they are real (no-op-safe) hooks that map to `before_compact` and a session-end sleep respectively.
@@ -925,8 +1142,21 @@ The `mnemosyne_diagnose` tool dispatches to the diagnostics subsystem documented
 L449) fans out four lifecycle hooks to registered plugins, swallowing per-plugin errors (L620-L649):
 `on_remember` (L61), `on_recall` (L66), `on_consolidate` (L71), `on_invalidate` (L76). Four built-ins
 ship: `LoggingPlugin` (L91), `MetricsPlugin` (L167), `FilterPlugin` (L245, content/PII filtering),
-and `CompressionPlugin` (L322). In Rust this is a `trait MnemosynePlugin` with a `Vec<Arc<dyn …>>`
-fan-out invoked from `Engine` at the corresponding seams; errors are logged, never propagated.
+and `CompressionPlugin` (L322).
+
+**As-built ([`plugins.rs`](../../../memory/daemon-mnemosyne/src/plugins.rs)):** `trait
+MnemosynePlugin` (no-op default hooks; `&self` + interior mutability) with the four built-ins ported;
+`PluginManager` registers instances (`Arc<dyn MnemosynePlugin>`; no runtime source-file discovery —
+hosts link plugins in and register explicitly), lazily loads on `get_plugin`, and fans out
+`notify_{remember,recall,consolidate,invalidate}` to loaded+enabled plugins. The manager is a lazy
+`OnceLock` on `Engine` (`memory.py`'s lazy `plugins` property): the engine emits the four lifecycle
+events from `remember`/`recall_with_scope`/`invalidate`/`finish_sleep` and consults the concrete
+`CompressionPlugin` before sleep summarization (`beam.py` L7736-L7743) — all gated on the manager
+having been materialized, so an untouched engine pays one atomic load per event. Note the Rust
+wiring is a deliberate superset: Python defines `notify_*` but never calls them from `beam.py`
+(only the compression consult is wired); Rust makes Logging/Metrics actually observe engine events.
+`CompressionPlugin` is permanently in Python's backend-unavailable state (`compress_lines` =
+identity) since no `rust_cave_001` equivalent is linked.
 
 ---
 
@@ -986,8 +1216,13 @@ fan-out invoked from `Engine` at the corresponding seams; errors are logged, nev
   (`validate_conflict_pair` via the injected `daemon_core::Provider`, `[mnemosyne].llm_conflict_detection`,
   layered atop the `(S,P)` veracity path in `run_sleep`); and threshold-0.8 fuzzy entity matching
   (`entities::find_similar_entities`) wired into `inject_entity_candidates`. MIB binary bonus shipped
-  in P0; plugins remain P3.
-- **P3 — ecosystem:** sync/streaming, SHMR, patterns, plugins, local-GGUF fallback.
+  in P0.
+- **P3 — ecosystem:** SHMR, patterns, and plugins have since landed (§9.4, §13), and the peripheral
+  systems followed: AAAK decode (encode/decode round-trip, §11), `cost_log.rs` wired into the tier-2
+  conflict validator (§11), the C13 conversation-level fact-array extraction + process-global
+  extraction diagnostics (§11), `diagnose.rs` behind the full `mnemosyne_diagnose` tool surface with
+  the §7-remapped vector coverage/repair (§12.3), and `dr.rs` gzip backup/restore compatible with
+  Python's archive format (§12.2). Sync/streaming and the local-GGUF fallback remain.
 
 ---
 

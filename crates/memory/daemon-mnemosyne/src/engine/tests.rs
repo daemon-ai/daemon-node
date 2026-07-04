@@ -110,6 +110,241 @@ fn native_vec_cosine_matches_f32_fallback() {
 }
 
 #[test]
+fn remember_dedups_exact_content_and_refreshes_row() {
+    let e = engine();
+    let id1 = e
+        .remember(
+            "the deploy target is us-east-1",
+            &RememberArgs {
+                importance: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Simulate a consolidated row: dedup must clear the stamp so sleep re-runs.
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE working_memory SET consolidated_at = 'x', veracity = 'unknown' WHERE id = ?1",
+            params![id1],
+        )
+        .unwrap();
+    let id2 = e
+        .remember(
+            "the deploy target is us-east-1",
+            &RememberArgs {
+                importance: 0.2,
+                veracity: "stated".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        id1, id2,
+        "exact-content re-remember returns the existing id"
+    );
+
+    let conn = e.store.conn.lock().unwrap();
+    let (count, importance, veracity, consolidated_at): (i64, f64, String, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(importance), MAX(veracity), MAX(consolidated_at) \
+             FROM working_memory WHERE content = 'the deploy target is us-east-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "no duplicate row");
+    assert!((importance - 0.9).abs() < 1e-9, "importance keeps the max");
+    assert_eq!(veracity, "stated", "non-unknown veracity upgrades the row");
+    assert!(
+        consolidated_at.is_none(),
+        "dedup clears consolidated_at so the row is sleep-eligible again"
+    );
+}
+
+#[test]
+fn remember_derives_and_clamps_trust_tier() {
+    let e = engine();
+    for (source, expected) in [
+        ("conversation", "STATED"),
+        ("mcp", "EXTERNAL_WRITE"),
+        ("bulk_import", "IMPORTED"),
+        ("sleep_consolidation", "DERIVED"),
+        ("somewhere_else", "STATED"),
+    ] {
+        let id = e
+            .remember(
+                &format!("trust tier probe via {source}"),
+                &RememberArgs {
+                    source: source.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let tier: String = e
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT trust_tier FROM working_memory WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tier, expected, "source {source}");
+    }
+    // Explicit-but-bogus tiers clamp to STATED; bogus veracity labels clamp to unknown.
+    let id = e
+        .remember(
+            "explicit tier probe",
+            &RememberArgs {
+                trust_tier: Some("ROOT".to_string()),
+                veracity: "Gospel Truth".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (tier, veracity): (String, String) = e
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT trust_tier, veracity FROM working_memory WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(tier, "STATED");
+    assert_eq!(veracity, "unknown");
+}
+
+#[test]
+fn remember_emits_memory_events_with_stable_device_id() {
+    let e = engine();
+    let id = e
+        .remember("an event-logged memory", &RememberArgs::default())
+        .unwrap();
+    // Exact-content re-remember logs an UPDATE against the same memory id.
+    e.remember("an event-logged memory", &RememberArgs::default())
+        .unwrap();
+    let conn = e.store.conn.lock().unwrap();
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT operation, memory_id, device_id FROM memory_events ORDER BY timestamp ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        rows
+    };
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "CREATE");
+    assert_eq!(rows[1].0, "UPDATE");
+    assert!(rows.iter().all(|r| r.1 == id));
+    assert!(rows[0].2.starts_with("device-"));
+    assert_eq!(rows[0].2, rows[1].2, "device id is stable per bank");
+    // The persisted identity matches sync_meta.
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM sync_meta WHERE key = 'device_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, rows[0].2);
+    // Events carry a dedup hash.
+    let no_hash: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE event_hash IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_hash, 0);
+}
+
+#[test]
+fn trim_caps_unconsolidated_working_rows() {
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        working_memory_max_items: 3,
+        ..Default::default()
+    })
+    .unwrap();
+    // A consolidated row is exempt from the cap ("originals stay").
+    let kept = e
+        .remember("consolidated original zero", &RememberArgs::default())
+        .unwrap();
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE working_memory SET consolidated_at = 'x', timestamp = '2000-01-01T00:00:00' \
+             WHERE id = ?1",
+            params![kept],
+        )
+        .unwrap();
+    for i in 0..5 {
+        e.remember(&format!("fresh row number {i}"), &RememberArgs::default())
+            .unwrap();
+    }
+    let conn = e.store.conn.lock().unwrap();
+    let unconsolidated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM working_memory WHERE consolidated_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unconsolidated, 3, "trim caps not-yet-consolidated rows");
+    let exempt: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM working_memory WHERE id = ?1",
+            params![kept],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(exempt, 1, "consolidated rows survive the trim");
+}
+
+#[test]
+fn remember_writes_occurred_on_and_has_source_annotations() {
+    let e = engine();
+    let id = e
+        .remember(
+            "annotated for provenance",
+            &RememberArgs {
+                source: "toolbelt".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let conn = e.store.conn.lock().unwrap();
+    let occurred = annotations::query_by_memory(&conn, &id, Some("occurred_on")).unwrap();
+    assert_eq!(occurred.len(), 1);
+    assert_eq!(occurred[0].value.len(), 10, "YYYY-MM-DD grain");
+    let has_source = annotations::query_by_memory(&conn, &id, Some("has_source")).unwrap();
+    assert_eq!(has_source.len(), 1);
+    assert_eq!(has_source[0].value, "toolbelt");
+    // Conversational sources skip has_source (`beam.py` L3487).
+    drop(conn);
+    let id2 = e
+        .remember("plain conversational note", &RememberArgs::default())
+        .unwrap();
+    let conn = e.store.conn.lock().unwrap();
+    let none = annotations::query_by_memory(&conn, &id2, Some("has_source")).unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
 fn mutations_write_audit_log_rows() {
     let e = engine();
     let id = e
@@ -336,6 +571,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &empty,
+            filters: Default::default(),
         })
         .unwrap()
         .iter()
@@ -354,6 +590,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &author_scope,
+            filters: Default::default(),
         })
         .unwrap();
     assert!(
@@ -373,6 +610,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &other_author,
+            filters: Default::default(),
         })
         .unwrap()
         .is_empty(),
@@ -390,6 +628,7 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
             top_k: 5,
             query_vector: None,
             scope: &channel_scope,
+            filters: Default::default(),
         })
         .unwrap();
     assert!(
@@ -401,29 +640,96 @@ fn author_and_channel_scope_widen_recall_across_sessions() {
 }
 
 #[test]
-fn vector_recall_surfaces_semantic_match_lexical_misses() {
+fn wm_vector_signal_blends_but_lexical_gates() {
     let e = engine();
-    // A query vector, one near-parallel memory vector (cos ~0.96) and one orthogonal — with
-    // content that shares NO tokens with the query, so lexical recall finds nothing.
     let q = [1.0f32, 0.0, 0.0];
     let near = [0.96f32, 0.28, 0.0];
     let far = [0.0f32, 0.0, 1.0];
-    e.remember_with_vector("alpha apple", &RememberArgs::default(), Some(&near), "mock")
-        .unwrap();
-    e.remember_with_vector("beta banana", &RememberArgs::default(), Some(&far), "mock")
-        .unwrap();
+    // Two rows with identical lexical relevance for the query; only the vectors differ.
+    e.remember_with_vector(
+        "apple pie recipe",
+        &RememberArgs::default(),
+        Some(&near),
+        "mock",
+    )
+    .unwrap();
+    e.remember_with_vector(
+        "apple tart recipe",
+        &RememberArgs::default(),
+        Some(&far),
+        "mock",
+    )
+    .unwrap();
 
-    // Lexical-only recall for a disjoint query returns nothing.
-    assert!(e.recall("zzz", 5).unwrap().is_empty());
+    // Working-memory candidates are lexically gated (`beam.py` L5313): a vector-only match with
+    // zero lexical relevance is dropped — pure semantic matches surface via the episodic tier.
+    assert!(e.recall_with_vector("zzz", 5, Some(&q)).unwrap().is_empty());
 
-    // Vector recall surfaces the semantically-close memory and ranks it first.
-    let hits = e.recall_with_vector("zzz", 5, Some(&q)).unwrap();
-    assert!(!hits.is_empty(), "vector recall should surface a match");
-    assert_eq!(hits[0].content, "alpha apple");
+    // With lexical parity, the dense blend (`base*0.8 + sim*0.2`, `beam.py` L5321-L5323) breaks
+    // the tie toward the semantically-close row.
+    let hits = e.recall_with_vector("apple recipe", 5, Some(&q)).unwrap();
+    assert_eq!(hits.len(), 2, "both rows pass the lexical gate");
+    assert_eq!(hits[0].content, "apple pie recipe");
+    assert!(hits[0].dense_score > hits[1].dense_score);
+}
+
+#[test]
+fn wm_score_matches_python_reference_formula() {
+    // Golden check against the live Python engine (BeamMemory.recall on a fresh bank):
+    //   remember("the database password rotation policy runs monthly"); recall("database password")
+    //   -> score 0.53232, keyword_score 1.0, fts_score 1.0, dense_score 0.0.
+    // Composition: base = 1.0*0.48 + 0.5*0.2 + 1.0^2*0.08 = 0.66; score = base * (0.32 + 0.68*decay)
+    // * veracity(unknown)=0.8. With decay ~= 1.0 for a fresh row -> ~0.5282 (Python's 0.53232
+    // reflects its local-vs-utc timestamp skew inflating decay slightly above 1.0).
+    let e = engine();
+    e.remember(
+        "the database password rotation policy runs monthly",
+        &RememberArgs::default(),
+    )
+    .unwrap();
+    let hits = e.recall("database password", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    let h = &hits[0];
+    assert_eq!(h.keyword_score, 1.0);
+    assert_eq!(h.fts_score, 1.0);
+    assert_eq!(h.dense_score, 0.0);
     assert!(
-        hits.iter().all(|h| h.content != "beta banana"),
-        "orthogonal memory must not pass the vector gate"
+        (h.score - 0.5282).abs() < 0.005,
+        "score {} should match the Python formula chain",
+        h.score
     );
+}
+
+#[test]
+fn recall_diagnostics_record_paths_and_fallbacks() {
+    let e = engine();
+    // Miss on an EMPTY bank: both fallbacks fire with zero scanned rows -> truly empty.
+    assert!(e.recall("zzz qqq", 5).unwrap().is_empty());
+    e.remember("kubernetes deploy pipeline", &RememberArgs::default())
+        .unwrap();
+    // Hit: the FTS path contributes the kept WM row.
+    assert!(!e.recall("kubernetes pipeline", 5).unwrap().is_empty());
+    // Miss over a non-empty bank: the fallback scan credits its scanned candidates even though
+    // the relevance gate kept none (`beam.py` L5366-L5370), so this is NOT truly empty.
+    assert!(e.recall("zzz qqq", 5).unwrap().is_empty());
+
+    let snap = e.recall_diagnostics().snapshot();
+    assert_eq!(snap.totals.calls, 3);
+    assert_eq!(snap.totals.calls_truly_empty, 1);
+    let wm_fts = &snap.by_tier[0];
+    assert_eq!(wm_fts.0, "wm_fts");
+    assert_eq!(wm_fts.1.calls_with_hits, 1);
+    let wm_fallback = &snap.by_tier[2];
+    assert_eq!(wm_fallback.0, "wm_fallback");
+    assert_eq!(
+        wm_fallback.1.total_hits, 1,
+        "the non-empty miss scanned one fallback candidate"
+    );
+    assert_eq!(snap.totals.calls_using_wm_fallback, 2);
+    assert!((snap.totals.wm_fallback_rate - 2.0 / 3.0).abs() < 1e-9);
+
+    e.recall_diagnostics().reset();
+    assert_eq!(e.recall_diagnostics().snapshot().totals.calls, 0);
 }
 
 #[test]
@@ -451,18 +757,24 @@ fn get_context_orders_by_importance() {
 
 #[test]
 fn lexical_relevance_scores() {
+    use crate::recall::lexical::lexical_relevance;
     let q = vec!["auth".to_string(), "flow".to_string()];
     // Both tokens present as whole words + full-query substring -> clamped to 1.0.
-    assert!((lexical_relevance(&q, "the auth flow uses jwt") - 1.0).abs() < 1e-9);
+    assert!((lexical_relevance(&q, "the auth flow uses jwt", "auth flow") - 1.0).abs() < 1e-9);
     // One exact token of two -> 0.5.
-    assert!((lexical_relevance(&q, "the auth subsystem") - 0.5).abs() < 1e-9);
+    assert!((lexical_relevance(&q, "the auth subsystem", "auth flow") - 0.5).abs() < 1e-9);
     // A >=4-char substring (no whole-word match, and the full query is not a substring)
     // contributes the 0.4 partial: one of two tokens at 0.4 -> 0.2.
     let q2 = vec!["serialize".to_string(), "absent".to_string()];
-    assert!((lexical_relevance(&q2, "the deserializer ran") - 0.2).abs() < 1e-9);
+    assert!(
+        (lexical_relevance(&q2, "the deserializer ran", "serialize absent") - 0.2).abs() < 1e-9
+    );
     // Disjoint query -> 0.0; empty query -> 0.0.
-    assert_eq!(lexical_relevance(&q, "completely unrelated"), 0.0);
-    assert_eq!(lexical_relevance(&[], "anything"), 0.0);
+    assert_eq!(
+        lexical_relevance(&q, "completely unrelated", "auth flow"),
+        0.0
+    );
+    assert_eq!(lexical_relevance(&[], "anything", ""), 0.0);
 }
 
 #[test]
@@ -583,10 +895,15 @@ fn episodic_vector_recall_uses_binary_and_cosine() {
 #[test]
 fn remember_extracts_entities_and_facts() {
     let e = engine();
+    // `mentions` annotations are opt-in (`beam.py` `extract_entities=False` default); the SPO
+    // fact/graph pipeline is always on.
     let id = e
         .remember(
             "Maya works at Acme and uses Postgres",
-            &RememberArgs::default(),
+            &RememberArgs {
+                extract_entities: true,
+                ..Default::default()
+            },
         )
         .unwrap();
     let c = e.store.conn.lock().unwrap();
@@ -621,44 +938,62 @@ fn remember_extracts_entities_and_facts() {
 #[test]
 fn entity_and_fact_match_reorders_recall() {
     let e = engine();
-    // The entity-/fact-bearing memory (capitalized "Acme" -> entity + `works_at` fact)...
+    // The entity-bearing memory: `extract_entities` stores `mentions` annotations (Maya, Acme),
+    // which is what the entity-aware recall pass matches on (`beam.py` `_find_memories_by_entity`
+    // reads mention annotations — without them the 1.3x boost never fires and the two rows tie).
     e.remember(
         "Maya works at Acme on infrastructure",
-        &RememberArgs::default(),
+        &RememberArgs {
+            extract_entities: true,
+            ..Default::default()
+        },
     )
     .unwrap();
     // ...and a lexical-only distractor that mentions "acme" lowercase (no entity extracted).
     e.remember("the acme deadline is approaching", &RememberArgs::default())
         .unwrap();
 
-    // A capitalized-entity query: both rows match lexically, but the entity/fact multipliers
-    // must lift the structured memory to the top.
+    // A capitalized-entity query: both rows match lexically, but the 1.3x entity multiplier must
+    // lift the annotated memory to the top.
     let hits = e.recall("Acme", 5).unwrap();
     assert!(!hits.is_empty());
     assert!(
         hits[0].content.contains("Maya"),
-        "entity+fact match should rank first, got {:?}",
+        "entity match should rank first, got {:?}",
         hits.iter()
             .map(|h| (&h.content, h.score))
             .collect::<Vec<_>>()
+    );
+    assert!(
+        hits[0].entity_match,
+        "the winning row must be marked entity_match"
     );
 }
 
 #[test]
 fn cooccurrence_links_memories_sharing_an_entity() {
-    let e = engine();
-    let a = e
-        .remember("Maya leads the Phoenix team", &RememberArgs::default())
-        .unwrap();
+    // Proactive linking is env-gated in Python (`MNEMOSYNE_PROACTIVE_LINKING=1`) and config-gated
+    // here; entity-overlap linking additionally requires the `mentions` annotations.
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        proactive_linking: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let args = RememberArgs {
+        extract_entities: true,
+        ..Default::default()
+    };
+    let a = e.remember("Maya leads the Phoenix team", &args).unwrap();
     let b = e
-        .remember("Maya approved the Phoenix budget", &RememberArgs::default())
+        .remember("Maya approved the Phoenix budget", &args)
         .unwrap();
     let c = e.store.conn.lock().unwrap();
-    // The two memories share the "Maya"/"Phoenix" entities -> a `references` edge was drawn.
-    assert!(episodic_graph::edge_count(&c, &a).unwrap() >= 1);
-    let related = episodic_graph::find_related_memories(&c, &a, 2, "", 0.0).unwrap();
+    // The second memory shares the "Maya"/"Phoenix" entities -> a `references` edge was drawn
+    // from the newer memory to the older one.
+    assert!(episodic_graph::edge_count(&c, &b).unwrap() >= 1);
+    let related = episodic_graph::find_related_memories(&c, &b, 2, "", 0.0).unwrap();
     assert!(
-        related.iter().any(|r| r.memory_id == b),
+        related.iter().any(|r| r.memory_id == a),
         "graph should relate the two Maya/Phoenix memories"
     );
 }
@@ -677,7 +1012,10 @@ fn ingest_extracted_merges_llm_entities_and_triples() {
             object: "Atlas".into(),
             confidence: 0.9,
         }],
-        facts: vec!["Denis manages the Atlas project".into()],
+        facts: vec![
+            "Denis manages the Atlas project".into(),
+            "too short".into(), // <= MIN_FACT_LENGTH chars — dropped by filter_facts
+        ],
     };
     e.ingest_extracted(&id, &extracted).unwrap();
     let c = e.store.conn.lock().unwrap();
@@ -759,6 +1097,77 @@ fn sleep_groups_and_summarizes_with_aaak() {
         )
         .unwrap();
     assert_eq!(pending, 0, "all working rows claimed");
+}
+
+#[test]
+fn finish_sleep_embeds_and_binarizes_llm_summary() {
+    let e = engine();
+    e.remember("User decided to migrate the service to Rust", &{
+        RememberArgs {
+            source: "conversation".to_string(),
+            ..Default::default()
+        }
+    })
+    .unwrap();
+    e.remember("User decided the migration ships next quarter", &{
+        RememberArgs {
+            source: "conversation".to_string(),
+            ..Default::default()
+        }
+    })
+    .unwrap();
+    let groups = e.sleep_plan(true).expect("plan");
+    assert_eq!(groups.len(), 1);
+
+    // The async seam supplies an LLM summary (with a <think> block to strip) and its embedding.
+    let vec: Vec<f32> = vec![0.9, -0.4, 0.2, -0.1];
+    let mut summaries = std::collections::HashMap::new();
+    summaries.insert(
+        groups[0].source.clone(),
+        GroupSummary {
+            text: "<think>reasoning</think>We decided to migrate the service to Rust next quarter"
+                .to_string(),
+            llm: true,
+            embedding: Some(vec.clone()),
+            model: "mock-embed".to_string(),
+        },
+    );
+    let report = e.finish_sleep(&groups, &summaries).expect("finish");
+    assert_eq!(report.summaries_created, 1);
+    assert_eq!(report.llm_used, 1);
+
+    let c = e.store.conn.lock().unwrap();
+    let (id, content, memory_type, binary): (String, String, String, Option<Vec<u8>>) = c
+        .query_row(
+            "SELECT id, content, memory_type, binary_vector FROM episodic_memory \
+             WHERE source = 'sleep_consolidation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(
+        !content.contains("<think>"),
+        "think block must be stripped: {content}"
+    );
+    assert_eq!(
+        memory_type, "decision",
+        "summary must be typed-memory classified"
+    );
+    // The embedding row and MIB binary vector make the summary visible to vector recall.
+    let (emb_json, model): (String, String) = c
+        .query_row(
+            "SELECT embedding_json, model FROM memory_embeddings WHERE memory_id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("summary embedding row");
+    assert_eq!(serde_json::from_str::<Vec<f32>>(&emb_json).unwrap(), vec);
+    assert_eq!(model, "mock-embed");
+    assert_eq!(
+        binary.as_deref(),
+        Some(crate::binary_vectors::maximally_informative_binarization(&vec).as_slice()),
+        "episodic row must carry the MIB binary vector"
+    );
 }
 
 #[test]
@@ -880,9 +1289,11 @@ fn tool_backing_methods_round_trip() {
     assert_eq!(status, crate::knowledge::canonical::Status::Created);
     assert_eq!(e.canonical_recall("ada", None, None).unwrap().len(), 1);
 
-    // Invalidate drops it from recall surface.
+    // Invalidate drops it from the recall surface, but `get` stays a pure read that still returns
+    // the row (`beam.py` `get` L3855-L3911 applies no validity filter).
     assert!(e.invalidate(&id, None).unwrap());
-    assert!(e.get(&id).unwrap().is_none());
+    assert!(e.get(&id).unwrap().is_some());
+    assert!(e.recall("updated fact", 5).unwrap().is_empty());
 
     // Forget hard-deletes.
     let id2 = e.remember("ephemeral", &RememberArgs::default()).unwrap();
