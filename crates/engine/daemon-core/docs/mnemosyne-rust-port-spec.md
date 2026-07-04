@@ -183,8 +183,8 @@ New crate `crates/memory/daemon-mnemosyne` (auto-included by the `crates/*/*` wo
 | `sanitize.rs` | `content_sanitizer.py` | 169 | blob extraction |
 | `tokens.rs` | `token_counter.py` | 72 | `len/4` or tiktoken |
 | `chat_normalize.rs` | `chat_normalize.py` | 149 | message normalization |
-| `sync.rs` | `sync.py` + `sync_server.py` | 1607 | `sync` feature |
-| `streaming.rs` | `streaming.py` | 617 | `sync` feature |
+| `sync/mod.rs` + `sync/endpoints.rs` | `sync.py` + `sync_server.py` | 1607 | `sync` feature; endpoints are transport-free (no listener — §12.1) |
+| `streaming.rs` | `streaming.py` | 617 | always-on (std-only) |
 | `dr.rs` | [`dr/recovery.py`](Mnemosyne/mnemosyne/dr/recovery.py) | 338 | backup/restore/integrity (no feature gate; §12.2) |
 | `diagnose.rs` | [`diagnose.py`](Mnemosyne/mnemosyne/diagnose.py) | 353 | `run_diagnostics`/`auto_fix`; backs `mnemosyne_diagnose` |
 | `cost_log.rs` | `cost_log.py` | 78 | `cost_entries` table; LLM cost accounting |
@@ -195,9 +195,9 @@ Folded (no dedicated Rust module): `llm_backends.py` and
 [`hermes_memory_provider/hermes_llm_adapter.py`](Mnemosyne/hermes_memory_provider/hermes_llm_adapter.py)
 collapse into `extract.rs` (the daemon-core `Provider` *is* the host backend, §11);
 `extraction/diagnostics.py` becomes `extract.rs` tier counters;
-[`hermes_memory_provider/sync_adapter.py`](Mnemosyne/hermes_memory_provider/sync_adapter.py) and
-[`audit.py`](Mnemosyne/hermes_memory_provider/audit.py) fold into `provider.rs` (`sync` feature +
-audit log).
+[`hermes_memory_provider/sync_adapter.py`](Mnemosyne/hermes_memory_provider/sync_adapter.py)
+becomes the `sync_tool` dispatcher in `tools.rs` (`sync` feature; config-injected, no env reads) and
+[`audit.py`](Mnemosyne/hermes_memory_provider/audit.py) folds into `provider.rs` (audit log).
 
 ---
 
@@ -958,19 +958,36 @@ straightforward pure ports.
 
 ## 12. Sync, streaming, disaster recovery, and diagnostics
 
-### 12.1 Sync and streaming (`sync` feature)
+### 12.1 Sync and streaming (as built)
 
-- `sync.rs` <- `sync.py`: `SyncEvent` (event_id/memory_id/operation/timestamp/device_id/payload/
-  parent_event_ids/importance/expiry/event_hash), `event_hash = sha256(memory_id|operation|timestamp|
-  device_id|payload|parents|importance)` (L692-L699). `SyncEngine.{log_event, pull_changes(cursor),
-  push_changes(events), sync_with(remote)}`. LWW conflict resolution by `(timestamp, importance,
-  device_id)` (L263-L280); v2 causal-chain variant via `parent_event_ids` (L318-L397). Encryption
-  (`SyncEncryption`): Fernet/NaCl secretbox over a derived key (Argon2id/PBKDF2) -> Rust
-  `chacha20poly1305` + `argon2`. HTTP server endpoints `/sync/{pull,push,status}`
-  (`sync_server.py`).
-- `streaming.rs` <- `streaming.py`: `MemoryStream` (in-process pub/sub of `MemoryEvent`) and
-  `DeltaSync` (row-level mirror of `working_memory`/`episodic_memory` with column allowlists and
-  per-peer JSON checkpoints).
+- `sync/mod.rs` <- `sync.py` (`sync` feature): `SyncEvent` (event_id/memory_id/operation/timestamp/
+  device_id/payload/parent_event_ids/importance/expiry/event_hash; wire-tolerant of Python shapes),
+  `event_hash = sha256(memory_id|operation|timestamp|device_id|payload|parents|importance)` with
+  Python float formatting (L692-L699). `SyncEngine.{log_event, find_unlogged_memories,
+  pull_changes(cursor), push_changes(events), sync_with(remote), get_status}`. v1 LWW resolution by
+  `(timestamp, importance, device_id)` with Python's stable-sort tie behavior (L263-L280); v2
+  causal-chain variant over transitive `parent_event_ids` (L318-L397); `detect_conflicts` (±5s
+  window) and `propose_merge` shapes. `push_changes` applies through the **full** write pipeline
+  (`remember(memory_id=...)` / `forget`) with the write-path event log suppressed (thread-local
+  guard), then records the peer's original event with `synced_at` — one log row per replicated
+  event, no ping-pong. Encryption (`SyncEncryption`): XChaCha20-Poly1305 over an Argon2id-derived
+  (Python's parameters) or config-injected urlsafe-base64 key; sealed format `mn1.<b64(nonce‖ct)>`;
+  Fernet payloads (`gAAAAA`) are detected and relayed opaque (§14.11).
+- `sync/endpoints.rs` <- `sync_server.py`: **transport-free** — `SyncRequest` -> `route()` ->
+  `(status, JSON)` covering Bearer auth, CORS preflight, and the `/sync/{pull,push,status}` wire
+  shapes. The crate binds **no listener** (the node owns transport); a host that wants to be a
+  sync target mounts `route`/handlers behind its own router, and the module tests drive a socket
+  fixture over these functions to exercise `sync_with` + the tools end-to-end against real HTTP.
+  Success responses add `"status": "ok"` (the key `sync_adapter.py` always expected but Python's
+  server never sent).
+- Tools (`tools.rs` `sync_tool` <- `sync_adapter.py`): `mnemosyne_sync_{push,pull,status}` (the
+  export/import placeholders are gone; `mnemosyne_{export,import}` remain as the local bundle
+  tools). Config-driven via `MnemosyneConfig.sync_{remote,token,key,mode}` — no env reads.
+- `streaming.rs` <- `streaming.py` (**always-on**, std-only): `MemoryStream` (in-process pub/sub of
+  `MemoryEvent`; `Arc` callbacks invoked outside the lock — reentrancy-safe, panic-contained;
+  ring buffer + pull-style `listen`) wired into `emit_event` behind `Engine::enable_streaming`, and
+  `DeltaSync` (row-level mirror of `working_memory`/`episodic_memory` with C25 table/column
+  allowlists, per-peer JSON checkpoints, base64 BLOB transport that round-trips `binary_vector`).
 
 Sync is **not** required for the default `MemoryProvider`; it is an opt-in capability.
 
@@ -1181,6 +1198,23 @@ identity) since no `rust_cave_001` equivalent is linked.
    via `EngineProfile::with_memory_builder` (the bank is agent-wide; sessions are row-scoped by
    `session_id`), held in a shared `MnemosyneBanks` cache so the §11 hook and `mnemosyne_*` tools
    share the same instance — replacing Python's `clone_for_agent`/singleton model.
+10. **No sync listener:** `sync_server.py` binds its own HTTP socket; the Rust port ships only the
+    outbound client (`sync_with`, reqwest) plus transport-free `sync/endpoints.rs` a host can mount
+    — the node owns transport. The socket loop exists only as a test fixture.
+11. **Sync cipher:** XChaCha20-Poly1305 + Argon2id (`mn1.` format) instead of Fernet/NaCl.
+    Plaintext sync interoperates with Python peers; encrypted payloads are mutually opaque across
+    languages and relay unmodified (both sides already store-and-relay undecryptable payloads).
+12. **Sync cursor fixes:** the push phase keeps a per-remote `last_push_cursor_<url>` over the
+    local log (Python filters by the remote's high-water timestamp, permanently masking older
+    local events — bidirectional sync never converges); the pull tool sends `since` (Python sent
+    `since_token`, which the server ignores — silent full pull every time); tool cursors are
+    per-remote (Python shares one global `last_sync_cursor` between push and pull). Re-sends stay
+    idempotent through `event_hash` dedup.
+13. **Apply-side event logging:** Rust's write path logs `memory_events` natively, so sync-applied
+    mutations run under a thread-local suppress guard and land as the peer's original event only —
+    net-identical log growth to Python (whose `remember` never self-logs).
+14. **`get_status(remote)` is read-only:** it reports persisted per-remote sync metadata but does
+    not run Python's embedded `sync_with` pull inside a status read.
 
 ---
 
