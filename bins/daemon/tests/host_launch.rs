@@ -437,6 +437,193 @@ fn live_socket_occupied_host_launch_fails_fast() {
     assert!(socket.exists(), "the live socket must be left in place");
 }
 
+// --- D2: Daemon Cloud attach-credential + default-profile seeding --------------------------------
+
+/// Boot the host role over an explicit `data_dir` (so the test can inspect the persisted
+/// `credentials.json` / `profiles/` afterwards), with `DAEMON_STORE=sqlite` forced so the durable
+/// file-backed stores are used. Returns `(booted_and_serving, child, socket)`; the caller stops it.
+fn spawn_over_data_dir(
+    data_dir: &Path,
+    extra: &[(&str, &str)],
+    timeout: Duration,
+) -> (bool, std::process::Child, std::path::PathBuf) {
+    let _ = std::fs::create_dir_all(data_dir);
+    let socket = data_dir.join("api.sock");
+    // `DAEMON_STORE=sqlite` (via `extra`, applied after the harness memory default) makes the node
+    // durable, so `credentials.json` + `profiles/` are written under the data dir. The seed runs
+    // before the socket is bound, so "serving" is a safe signal that seeding completed.
+    let mut merged: Vec<(&str, &str)> = vec![("DAEMON_STORE", "sqlite")];
+    merged.extend_from_slice(extra);
+    let mut child = host_command(data_dir, &socket, &merged)
+        .spawn()
+        .expect("spawn daemon binary");
+    let booted = wait_until_serving(&mut child, &socket, timeout);
+    (booted, child, socket)
+}
+
+/// SIGTERM the child and wait (bounded) for its graceful exit — the clean way to release the sqlite
+/// stores between two boots over the same data dir.
+fn graceful_stop(child: &mut std::process::Child) {
+    let pid = nix::unistd::Pid::from_raw(child.id().try_into().expect("pid fits i32"));
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+    let _ = wait_bounded(child, Duration::from_secs(20));
+}
+
+/// `DAEMON_CLOUD_API_KEY` on a fresh (durable) node seeds the credential-store entry for the node's
+/// profile AND lands a default profile that selects the `daemon_api` ("Daemon Cloud") provider — the
+/// zero-GUI attach wiring (D2). The key is never written to stderr.
+#[test]
+fn cloud_api_key_seeds_credential_and_daemon_api_profile() {
+    let data_dir = unique_tmp("daemon-d2-seed");
+    let key = "sk-daemon-cloud-seed-test";
+    let (booted, mut child, _socket) = spawn_over_data_dir(
+        &data_dir,
+        &[("DAEMON_PROFILE", "hosted"), ("DAEMON_CLOUD_API_KEY", key)],
+        Duration::from_secs(20),
+    );
+    assert!(
+        booted,
+        "the node must boot and serve with the cloud key set"
+    );
+    graceful_stop(&mut child);
+    let stderr = drain_stderr(&mut child);
+
+    // The credential store maps the node's profile id to the injected key.
+    let creds = std::fs::read_to_string(data_dir.join("credentials.json"))
+        .expect("credentials.json must exist on a durable node");
+    assert!(
+        creds.contains("hosted") && creds.contains(key),
+        "credentials.json must hold the attach key under the profile; got: {creds}"
+    );
+    // The seeded default profile selects the daemon_api provider.
+    let profile = std::fs::read_to_string(data_dir.join("profiles").join("hosted.json"))
+        .expect("the seeded profile must be persisted");
+    assert!(
+        profile.contains("\"daemon_api\""),
+        "the seeded default profile must select daemon_api; got: {profile}"
+    );
+    // The secret must NEVER reach the log/stderr surface.
+    assert!(
+        !stderr.contains(key),
+        "the attach key must never be logged; stderr:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// A rotated secret + restart re-seeds in place (create-or-update): the new key overwrites the old,
+/// never a duplicate. This is the §9.4 attach-key rotation flow (control plane updates the secret,
+/// restarts the node).
+#[test]
+fn cloud_api_key_rotation_overwrites_in_place() {
+    let data_dir = unique_tmp("daemon-d2-rotate");
+    let key_a = "sk-attach-rotation-AAA";
+    let key_b = "sk-attach-rotation-BBB";
+
+    let (booted, mut child, _s) = spawn_over_data_dir(
+        &data_dir,
+        &[
+            ("DAEMON_PROFILE", "hosted"),
+            ("DAEMON_CLOUD_API_KEY", key_a),
+        ],
+        Duration::from_secs(20),
+    );
+    assert!(booted, "first boot (key A) must serve");
+    graceful_stop(&mut child);
+
+    let (booted, mut child, _s) = spawn_over_data_dir(
+        &data_dir,
+        &[
+            ("DAEMON_PROFILE", "hosted"),
+            ("DAEMON_CLOUD_API_KEY", key_b),
+        ],
+        Duration::from_secs(20),
+    );
+    assert!(booted, "second boot (rotated key B) must serve");
+    graceful_stop(&mut child);
+
+    let creds = std::fs::read_to_string(data_dir.join("credentials.json"))
+        .expect("credentials.json must exist");
+    assert!(
+        creds.contains(key_b),
+        "the rotated key must be seeded; got: {creds}"
+    );
+    assert!(
+        !creds.contains(key_a),
+        "the old key must be overwritten in place (no duplicate); got: {creds}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// The `DAEMON_CLOUD_API_KEY_FILE` variant seeds from the (trimmed) file contents — the secret-file
+/// injection shape (mirrors `DAEMON_ADMIN_PASSWORD_FILE`).
+#[test]
+fn cloud_api_key_file_variant_seeds() {
+    let data_dir = unique_tmp("daemon-d2-file");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let key = "sk-attach-from-file";
+    let key_path = data_dir.join("attach-key.txt");
+    std::fs::write(&key_path, format!("{key}\n")).expect("write key file");
+
+    let (booted, mut child, _s) = spawn_over_data_dir(
+        &data_dir,
+        &[
+            ("DAEMON_PROFILE", "hosted"),
+            (
+                "DAEMON_CLOUD_API_KEY_FILE",
+                key_path.to_str().expect("utf8 path"),
+            ),
+        ],
+        Duration::from_secs(20),
+    );
+    assert!(booted, "boot with the _FILE variant must serve");
+    graceful_stop(&mut child);
+
+    let creds = std::fs::read_to_string(data_dir.join("credentials.json"))
+        .expect("credentials.json must exist");
+    assert!(
+        creds.contains(key),
+        "the _FILE key must be seeded (trimmed); got: {creds}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Unsetting the secret must NEVER scrub an already-seeded credential (seed-if-present, mirroring
+/// the first-admin seed): a reboot with no cloud env leaves the prior credential in place.
+#[test]
+fn cloud_api_key_unset_does_not_scrub() {
+    let data_dir = unique_tmp("daemon-d2-unset");
+    let key = "sk-attach-persist-test";
+
+    let (booted, mut child, _s) = spawn_over_data_dir(
+        &data_dir,
+        &[("DAEMON_PROFILE", "hosted"), ("DAEMON_CLOUD_API_KEY", key)],
+        Duration::from_secs(20),
+    );
+    assert!(booted, "first boot (key set) must serve");
+    graceful_stop(&mut child);
+
+    // Reboot with the cloud env removed entirely (host_command's env_clear omits it already).
+    let (booted, mut child, _s) = spawn_over_data_dir(
+        &data_dir,
+        &[("DAEMON_PROFILE", "hosted")],
+        Duration::from_secs(20),
+    );
+    assert!(booted, "second boot (key unset) must serve");
+    graceful_stop(&mut child);
+
+    let creds = std::fs::read_to_string(data_dir.join("credentials.json"))
+        .expect("credentials.json must still exist");
+    assert!(
+        creds.contains(key),
+        "unset must not scrub the seeded credential; got: {creds}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// A stale socket FILE with no listener (a previous daemon that died without cleanup) must not
 /// block a fresh launch: the node clears it and boots. Boot signal is a successful connect — the
 /// file exists from the start, so file-existence polling would prove nothing.

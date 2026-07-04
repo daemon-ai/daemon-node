@@ -15,12 +15,15 @@
 //!   allow-map design: a sentinel file OUTSIDE the root stays unreachable);
 //! - a same-origin WebSocket upgrade on `/ws` (Origin == the listener's own origin, derived from
 //!   `Host`) completes subprotocol + Hello + SCRAM + Health with ZERO origin configuration;
-//!   a cross-origin upgrade is refused with 403 unless allow-listed via the extra origins.
+//!   a cross-origin upgrade is refused with 403 unless allow-listed via the extra origins;
+//! - `GET /healthz` (D3) answers the readiness verdict UNAUTHENTICATED on the same listener:
+//!   200 `{"status":"ready",…}` when every wired check passes, 503 `{"status":"degraded",…}`
+//!   naming the failing check when one does not — HEAD mirrors GET, other methods 405.
 
 use super::harness::*;
 use super::ws_transport::WsMuxClient;
 use daemon_auth::{AuthStore, Role};
-use daemon_host::{Authenticator, WebRoot};
+use daemon_host::{Authenticator, WebHealth, WebRoot};
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,6 +57,20 @@ async fn serve_root(
     tokio::task::JoinHandle<()>,
     daemon_host::SupervisorHandle,
 ) {
+    serve_root_with_health(root, allowed_origins, WebHealth::new()).await
+}
+
+/// As [`serve_root`] with an explicit `/healthz` evaluator (the D3 readiness-probe gates inject
+/// passing/failing checks through it).
+async fn serve_root_with_health(
+    root: &Path,
+    allowed_origins: &[&str],
+    health: WebHealth,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    daemon_host::SupervisorHandle,
+) {
     let (node, handle) = assemble();
     let store = Arc::new(AuthStore::open_in_memory().expect("auth store"));
     store
@@ -69,6 +86,7 @@ async fn serve_root(
         node,
         auth,
         allowed_origins.iter().map(|s| s.to_string()).collect(),
+        health,
     ));
     (addr, server, handle)
 }
@@ -444,6 +462,97 @@ async fn web_ws_cross_origin_upgrades_are_gated() {
         .expect("scram over the allow-listed cross-origin upgrade");
     let res = cross.call(ApiRequest::Health).await.expect("health call");
     assert!(!matches!(res, ApiResponse::Error(_)));
+    server.abort();
+    handle.shutdown().await;
+}
+
+/// The D3 readiness probe, healthy path: `GET /healthz` answers 200 `application/json` with
+/// `status: ready` and every wired check reporting ok — over a raw connection carrying NO
+/// credentials (the probe is for infrastructure, not users). HEAD mirrors the headers with an
+/// empty body; non-GET/HEAD is 405 like the rest of the static surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_healthz_reports_ready_unauthenticated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bundle(dir.path(), BUNDLE);
+    let health = WebHealth::new()
+        .with_check("store", || async { Ok(()) })
+        .with_check("auth", || async { Ok(()) })
+        .with_check("journal", || async { Ok(()) });
+    let (addr, server, handle) = serve_root_with_health(dir.path(), &[], health).await;
+
+    // GET: 200, JSON, ready, every check ok. The raw request carries no Authorization/cookies.
+    let (status, headers, body) = get(addr, "/healthz", "").await;
+    assert_eq!(status, 200, "a healthy node must probe ready");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(
+        headers.get("cache-control").map(String::as_str),
+        Some("no-store"),
+        "intermediaries must not cache the verdict"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(v["status"], "ready");
+    assert_eq!(v["checks"]["store"], "ok");
+    assert_eq!(v["checks"]["auth"], "ok");
+    assert_eq!(v["checks"]["journal"], "ok");
+
+    // HEAD: the GET headers (incl. the body length) without a body.
+    let (status, headers, head_body) = http_exchange(
+        addr,
+        &format!("HEAD /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some(body.len().to_string().as_str()),
+        "HEAD must carry the entity length"
+    );
+    assert!(head_body.is_empty(), "HEAD must not carry a body");
+
+    // The probe is GET/HEAD only.
+    let (status, headers, _) = http_exchange(
+        addr,
+        &format!("POST /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status, 405);
+    assert_eq!(headers.get("allow").map(String::as_str), Some("GET, HEAD"));
+
+    server.abort();
+    handle.shutdown().await;
+}
+
+/// The D3 readiness probe, degraded path: one failing check flips the verdict to 503
+/// `status: degraded`, names the failure under its check (terse reason, no secrets), and keeps
+/// reporting the passing checks — while the static surface stays up (degraded readiness must not
+/// take the GUI down with it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_healthz_reports_degraded_on_failing_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bundle(dir.path(), BUNDLE);
+    let health = WebHealth::new()
+        .with_check("store", || async { Err("disk I/O error".to_string()) })
+        .with_check("auth", || async { Ok(()) });
+    let (addr, server, handle) = serve_root_with_health(dir.path(), &[], health).await;
+
+    let (status, headers, body) = get(addr, "/healthz", "").await;
+    assert_eq!(status, 503, "a failing check must probe 503");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(v["status"], "degraded");
+    assert_eq!(v["checks"]["store"], "failed: disk I/O error");
+    assert_eq!(v["checks"]["auth"], "ok");
+
+    // Degraded readiness does not take the static surface down.
+    let (status, _, _) = get(addr, "/", "").await;
+    assert_eq!(status, 200, "the GUI keeps serving while degraded");
+
     server.abort();
     handle.shutdown().await;
 }

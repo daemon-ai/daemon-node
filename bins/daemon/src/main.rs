@@ -647,19 +647,32 @@ fn provider_builder_for(
 /// Seed the launch [`NodeConfig`] as the node's default [`ProfileSpec`] so existing env/TOML
 /// launches keep working: the active profile mirrors the configured provider/model/base-URL/engine
 /// tunables, and a GUI can then clone/edit/select alternatives over the `ProfileApi`.
-fn default_profile_spec(cfg: &NodeConfig, provider_kind: Option<ProviderKind>) -> ProfileSpec {
-    let provider = match provider_kind {
-        // Unconfigured boot: seed a Daemon Cloud selector with an EMPTY model so the profile does
-        // not silently chat — `provider_builder_for` resolves it to `UnconfiguredProvider` until the
-        // GUI picks a provider + model. New-profile default surface is Daemon Cloud (base prefilled).
-        None => ProviderSelector::DaemonApi,
-        // Scripted is binary-internal: the durable profile records Mock so the wire stays unchanged
-        // (provider_builder_for swaps in the scripted provider for the live session).
-        Some(ProviderKind::Mock | ProviderKind::Scripted) => ProviderSelector::Mock,
-        Some(ProviderKind::GenAi) => ProviderSelector::GenAi,
-        Some(ProviderKind::DaemonApi) => ProviderSelector::DaemonApi,
-        Some(ProviderKind::LlamaCpp) => ProviderSelector::LlamaCpp,
-        Some(ProviderKind::MistralRs) => ProviderSelector::MistralRs,
+fn default_profile_spec(
+    cfg: &NodeConfig,
+    provider_kind: Option<ProviderKind>,
+    cloud_seed: bool,
+) -> ProfileSpec {
+    // D2: when a Daemon Cloud attach key was seeded (`DAEMON_CLOUD_API_KEY[_FILE]`), the first-boot
+    // default profile must deterministically select the `daemon_api` ("Daemon Cloud") provider at
+    // the gateway base, regardless of any `DAEMON_MODEL_PROVIDER`. The model (below) still comes
+    // from `DAEMON_MODEL` (`cfg.model`), which stays empty ("pick a model at first turn") when
+    // unset — D2 wires provider + credential + base, not a default model.
+    let provider = if cloud_seed {
+        ProviderSelector::DaemonApi
+    } else {
+        match provider_kind {
+            // Unconfigured boot: seed a Daemon Cloud selector with an EMPTY model so the profile does
+            // not silently chat — `provider_builder_for` resolves it to `UnconfiguredProvider` until the
+            // GUI picks a provider + model. New-profile default surface is Daemon Cloud (base prefilled).
+            None => ProviderSelector::DaemonApi,
+            // Scripted is binary-internal: the durable profile records Mock so the wire stays unchanged
+            // (provider_builder_for swaps in the scripted provider for the live session).
+            Some(ProviderKind::Mock | ProviderKind::Scripted) => ProviderSelector::Mock,
+            Some(ProviderKind::GenAi) => ProviderSelector::GenAi,
+            Some(ProviderKind::DaemonApi) => ProviderSelector::DaemonApi,
+            Some(ProviderKind::LlamaCpp) => ProviderSelector::LlamaCpp,
+            Some(ProviderKind::MistralRs) => ProviderSelector::MistralRs,
+        }
     };
     let context_engine = match cfg.context_engine {
         ContextEngineKind::Lcm => ContextEngineSel::Lcm,
@@ -1617,6 +1630,14 @@ const ADMIN_USERNAME_ENV: &str = "DAEMON_ADMIN_USERNAME";
 const ADMIN_PASSWORD_ENV: &str = "DAEMON_ADMIN_PASSWORD";
 const ADMIN_PASSWORD_FILE_ENV: &str = "DAEMON_ADMIN_PASSWORD_FILE";
 
+/// Environment keys for the Daemon Cloud attach-credential bootstrap (D2). Read directly here
+/// (one-shot startup reads), mirroring the first-admin (#2) pattern above rather than threading a
+/// non-config secret through [`NodeConfig`]. The `__`-nesting convention is deliberately NOT used:
+/// these are direct-read secret vars, not figment config paths (a `DAEMON_BOOTSTRAP__…` name would
+/// read as the config path `bootstrap.…`, which `NodeConfig` does not own and figment would ignore).
+const CLOUD_API_KEY_ENV: &str = "DAEMON_CLOUD_API_KEY";
+const CLOUD_API_KEY_FILE_ENV: &str = "DAEMON_CLOUD_API_KEY_FILE";
+
 /// Resolve the first-admin seeding policy from the environment: **env-first** — if
 /// `DAEMON_ADMIN_USERNAME` is set, require a password from `DAEMON_ADMIN_PASSWORD` or
 /// `DAEMON_ADMIN_PASSWORD_FILE` and refuse an empty/whitespace one (never seed `admin`/`<blank>`);
@@ -1648,6 +1669,37 @@ fn resolve_admin_seed() -> anyhow::Result<daemon_auth::AdminSeed> {
         anyhow::bail!("first-admin password is empty/whitespace; refusing to seed an admin");
     }
     Ok(daemon_auth::AdminSeed::Explicit { username, password })
+}
+
+/// Resolve the Daemon Cloud attach key for the D2 credential-store seed: **env-first** —
+/// `DAEMON_CLOUD_API_KEY`, else the (trimmed) contents of the file named by
+/// `DAEMON_CLOUD_API_KEY_FILE`. `Ok(None)` when neither source is set (no cloud credential is
+/// seeded — a keyless boot is a supported state; a turn against the unconfigured profile fails
+/// clearly). A source that IS set but blank/whitespace is a deliberate misconfiguration and is
+/// refused (never seed an empty bearer). Factored out so it is unit-testable without a store.
+fn resolve_cloud_api_key() -> anyhow::Result<Option<String>> {
+    let direct = std::env::var(CLOUD_API_KEY_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let raw = match direct {
+        Some(key) => key,
+        None => match std::env::var(CLOUD_API_KEY_FILE_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(path) => std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("reading {CLOUD_API_KEY_FILE_ENV} ({path}): {e}"))?,
+            None => return Ok(None),
+        },
+    };
+    let key = raw.trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!(
+            "{CLOUD_API_KEY_ENV}/{CLOUD_API_KEY_FILE_ENV} is set but empty/whitespace; \
+             refusing to seed an empty Daemon Cloud credential"
+        );
+    }
+    Ok(Some(key))
 }
 
 /// Idempotently seed the first admin (delegates the empty-table guard + create to
@@ -1798,6 +1850,25 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         credential_store
             .set(&cfg.profile, &cfg.credential_key)
             .map_err(|e| anyhow::anyhow!("seeding credential: {e}"))?;
+    }
+    // D2: first-boot Daemon Cloud attach-credential seed. When the provisioner injects
+    // `DAEMON_CLOUD_API_KEY[_FILE]`, idempotently seed the credential-store entry for this node's
+    // profile so a hosted node routes inference through the metered gateway with no GUI setup.
+    // `CredentialStore::set` is create-or-update, so a rotated secret + restart re-seeds (the §9.4
+    // rotation flow) and the same secret is a no-op — never a duplicate. The seed is
+    // ENV-AUTHORITATIVE: while the attach key is present it wins over a same-profile GUI-set key on
+    // every boot (the control plane owns the attach credential; BYOK belongs on another profile).
+    // Unset never scrubs an existing credential (mirrors the first-admin seed). The key value is
+    // NEVER logged.
+    let cloud_api_key = resolve_cloud_api_key()?;
+    if let Some(key) = &cloud_api_key {
+        credential_store
+            .set(&cfg.profile, key)
+            .map_err(|e| anyhow::anyhow!("seeding Daemon Cloud credential: {e}"))?;
+        tracing::info!(
+            profile = %cfg.profile,
+            "seeded Daemon Cloud credential from environment (D2)"
+        );
     }
 
     // Credentials: a PER-PROFILE owner broker over the credential store, brokered into *every*
@@ -2004,7 +2075,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         Arc::new(MemProfileStore::new())
     };
     profile_store
-        .seed(default_profile_spec(&cfg, provider_kind))
+        .seed(default_profile_spec(
+            &cfg,
+            provider_kind,
+            cloud_api_key.is_some(),
+        ))
         .map_err(|e| anyhow::anyhow!("seeding default profile: {e}"))?;
     // The per-session provider resolution seam: maps the active profile bundle onto a provider
     // client (so a GUI can switch model/provider live).
@@ -2125,8 +2200,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             .with_auth_store(auth_store.clone())
             .with_auth_audit(auth_audit.clone()),
     );
+    // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
+    // keeps its own reference for the auth check.
     let authenticator =
-        Arc::new(daemon_host::Authenticator::new(auth_store).with_audit(auth_audit));
+        Arc::new(daemon_host::Authenticator::new(auth_store.clone()).with_audit(auth_audit));
     // B5: `[api].local_trust` defaults to `system` — the Unix socket / FFI / in-process HTTP run as
     // the deliberate full-trust principal. Disable it to require SCRAM on the Unix socket and fully
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
@@ -2221,11 +2298,48 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 )
             })?;
             let web_listener = tokio::net::TcpListener::bind(addr).await?;
+            // D3: the unauthenticated `GET /healthz` readiness probe on this same listener. The
+            // checks are wired here (the binary owns the handles); evaluation is bounded + TTL-
+            // cached inside the web front, so infrastructure polling costs at most one pass per
+            // window. Depth achieved (honest accounting):
+            // - `store`: a live query round-trip via `SessionStore::stats()` — proves the durable
+            //   handle + connection lock complete a read (a wedged store hangs into the probe
+            //   timeout => 503). Its signature is infallible (the sqlite impl folds SQL errors to
+            //   zeros), so corruption/read errors do NOT degrade it; a deeper check needs a
+            //   fallible ping (e.g. a `PRAGMA`-backed `SessionStore` health op).
+            // - `auth`: `AuthStore::user_count()` — a genuinely fallible COUNT on the (tiny) users
+            //   table; proves auth.sqlite answers queries on the data volume.
+            // - `journal`: a boot-time fact — the seed-derived journal signer is constructed
+            //   before any listener binds (boot fails otherwise), and journal appends ride the
+            //   same durable store the `store` check exercises, so there is nothing cheaper to
+            //   probe per poll; this flips to a real check if journal init ever becomes lazy.
+            let health = {
+                let store = store.clone();
+                let auth_store = auth_store.clone();
+                daemon_host::WebHealth::new()
+                    .with_check("store", move || {
+                        let store = store.clone();
+                        async move {
+                            let _ = store.stats().await;
+                            Ok(())
+                        }
+                    })
+                    .with_check("auth", move || {
+                        let auth_store = auth_store.clone();
+                        async move {
+                            auth_store
+                                .user_count()
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                    .with_check("journal", || async { Ok(()) })
+            };
             tracing::info!(
                 %addr,
                 root = %root.display(),
                 files = site.len(),
-                "serving web app bundle + daemon-api WebSocket at /ws (single origin, authentication required)"
+                "serving web app bundle + daemon-api WebSocket at /ws + /healthz readiness (single origin, authentication required)"
             );
             Some(tokio::spawn(daemon_host::serve_web(
                 web_listener,
@@ -2233,6 +2347,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 node.clone(),
                 authenticator.clone(),
                 cfg.api.ws_allowed_origins.clone(),
+                health,
             )))
         }
         None => None,
@@ -2741,6 +2856,85 @@ mod tests {
         }
         clear_admin_env();
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Daemon Cloud attach-credential bootstrap (D2) ------------------------------------------
+
+    /// Clear both D2 env keys so each case starts from a known state.
+    fn clear_cloud_env() {
+        std::env::remove_var(CLOUD_API_KEY_ENV);
+        std::env::remove_var(CLOUD_API_KEY_FILE_ENV);
+    }
+
+    #[test]
+    fn no_cloud_env_seeds_nothing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_cloud_env();
+        assert!(
+            resolve_cloud_api_key().unwrap().is_none(),
+            "no cloud env must seed no credential (keyless boot is supported)"
+        );
+    }
+
+    #[test]
+    fn cloud_key_env_is_read() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_cloud_env();
+        std::env::set_var(CLOUD_API_KEY_ENV, "sk-daemon-cloud-attach");
+        assert_eq!(
+            resolve_cloud_api_key().unwrap().as_deref(),
+            Some("sk-daemon-cloud-attach")
+        );
+        clear_cloud_env();
+    }
+
+    #[test]
+    fn cloud_key_file_is_read_and_trimmed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_cloud_env();
+        let dir = std::env::temp_dir().join(format!("daemon-cloud-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("attach.txt");
+        std::fs::write(&path, "  sk-from-file\n").unwrap();
+        std::env::set_var(CLOUD_API_KEY_FILE_ENV, &path);
+        assert_eq!(
+            resolve_cloud_api_key().unwrap().as_deref(),
+            Some("sk-from-file"),
+            "file contents are trimmed"
+        );
+        clear_cloud_env();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cloud_key_env_wins_over_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_cloud_env();
+        let dir = std::env::temp_dir().join(format!("daemon-cloud-prec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("attach.txt");
+        std::fs::write(&path, "sk-from-file").unwrap();
+        std::env::set_var(CLOUD_API_KEY_ENV, "sk-from-env");
+        std::env::set_var(CLOUD_API_KEY_FILE_ENV, &path);
+        assert_eq!(
+            resolve_cloud_api_key().unwrap().as_deref(),
+            Some("sk-from-env"),
+            "the direct env var wins over the file"
+        );
+        clear_cloud_env();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blank_cloud_key_is_refused() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_cloud_env();
+        std::env::set_var(CLOUD_API_KEY_ENV, "   ");
+        assert!(
+            resolve_cloud_api_key().is_err(),
+            "a set-but-whitespace key must be refused (never seed an empty bearer)"
+        );
+        clear_cloud_env();
     }
 
     // --- provider + model discovery (Track 2) ---------------------------------------------------

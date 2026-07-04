@@ -31,6 +31,13 @@
 //!   (`Content-Encoding` + the *underlying* Content-Type + `Vary: Accept-Encoding`).
 //! * **GET/HEAD only**, sequential HTTP/1.1 keep-alive, unknown paths 404. `https://` (and thus
 //!   `wss://`) terminate at a reverse proxy for now, exactly like the other TCP listeners.
+//! * **`GET /healthz` is the unauthenticated readiness probe** (hosted-nodes dependency D3): a
+//!   reserved route (like `/ws`) answering 200 `{"status":"ready",…}` / 503
+//!   `{"status":"degraded",…}` from a [`WebHealth`] evaluation — named checks the binary wires in
+//!   (store/auth/journal), each bounded by a timeout, with the verdict TTL-cached so
+//!   infrastructure polling (provider checks + the control-plane reconciler) can never turn into
+//!   store-lock pressure. It never touches authentication or sessions; the body carries check
+//!   names + terse failure reasons, never secrets.
 //!
 //! The HTTP/1.1 front is deliberately hand-rolled on tokio: the daemon's layering keeps axum
 //! isolated in the `daemon-http` adapter crate, and the request surface here (two verbs, no
@@ -42,8 +49,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use daemon_api::NodeApi;
+use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -57,6 +66,9 @@ use crate::ws::{apply_upgrade_policy, serve_mux_over_ws};
 const INDEX_FILE: &str = "daemon-app.html";
 /// The reserved WebSocket upgrade path on the single-origin listener.
 const WS_PATH: &str = "/ws";
+/// The reserved readiness-probe path on the single-origin listener (D3). Like `/ws`, it shadows
+/// any same-named bundle file by construction.
+const HEALTHZ_PATH: &str = "/healthz";
 /// Upper bound on one request head (request line + headers) — far beyond any browser's.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// Directory-recursion bound for the startup scan (a symlink-loop guard; bundles are flat).
@@ -247,6 +259,169 @@ fn accepts_coding(accept_encoding: &str, coding: &str) -> bool {
     })
 }
 
+// --- the readiness probe (`GET /healthz`, D3) ---------------------------------------------------
+
+/// The default per-check evaluation bound: a check that cannot answer within this window (e.g. a
+/// wedged store mutex, a hung disk) reports degraded instead of hanging the probe.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+/// The default verdict TTL: probes within this window are served the cached snapshot, so an
+/// unauthenticated, infrastructure-polled endpoint costs at most one evaluation per window.
+const HEALTH_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// One named readiness check: `Ok(())` = ready, `Err(terse reason)` = degraded. The reason lands
+/// verbatim in the probe body — keep it secret-free (paths are acceptable).
+type HealthCheckFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+/// The rendered verdict of one evaluation pass (status + the pre-serialized JSON body).
+#[derive(Clone)]
+struct HealthSnapshot {
+    ready: bool,
+    body: Arc<str>,
+}
+
+/// The `GET /healthz` readiness evaluator: named async checks wired by the binary (the layer that
+/// owns the store/auth handles), each bounded by [`WebHealth::check_timeout`], the combined
+/// verdict cached for [`WebHealth::cache_ttl`]. Evaluation runs under its own async mutex, so
+/// concurrent probes coalesce onto one pass and the hot path (static files, `/ws`) shares no lock
+/// with it. With no checks wired it reports `ready` — "the process is up and the web front
+/// serves" — which is the baseline liveness the hosted-node image was health-checked with before
+/// D3 (`GET /`).
+pub struct WebHealth {
+    checks: Vec<(&'static str, HealthCheckFn)>,
+    check_timeout: Duration,
+    cache_ttl: Duration,
+    cache: tokio::sync::Mutex<Option<(Instant, HealthSnapshot)>>,
+}
+
+impl Default for WebHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebHealth {
+    /// An evaluator with no checks (reports `ready`; see the type docs) and the default bounds.
+    pub fn new() -> Self {
+        Self {
+            checks: Vec::new(),
+            check_timeout: HEALTH_CHECK_TIMEOUT,
+            cache_ttl: HEALTH_CACHE_TTL,
+            cache: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Add a named readiness check. `name` keys the probe body's `checks` map; the closure is
+    /// re-invoked per (uncached) evaluation and must be cheap — the store round-trip class, never
+    /// a scan.
+    pub fn with_check<F, Fut>(mut self, name: &'static str, check: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.checks
+            .push((name, Arc::new(move || Box::pin(check()))));
+        self
+    }
+
+    /// Override the per-check timeout (tests; the default suits production probes).
+    pub fn with_check_timeout(mut self, timeout: Duration) -> Self {
+        self.check_timeout = timeout;
+        self
+    }
+
+    /// Override the verdict TTL (tests use `Duration::ZERO` to force re-evaluation).
+    pub fn with_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = ttl;
+        self
+    }
+
+    /// The current verdict: the cached snapshot when fresh, else one evaluation pass (run under
+    /// the cache lock, so concurrent probes wait for — and then share — that single pass).
+    async fn evaluate(&self) -> HealthSnapshot {
+        let mut cache = self.cache.lock().await;
+        if let Some((at, snap)) = cache.as_ref() {
+            if at.elapsed() < self.cache_ttl {
+                return snap.clone();
+            }
+        }
+        let snap = self.run_checks().await;
+        *cache = Some((Instant::now(), snap.clone()));
+        snap
+    }
+
+    /// Run every check (sequentially — the list is short and each is bounded) and render the
+    /// snapshot. A check outcome is `"ok"` or `"failed: <reason>"`; a check that outruns
+    /// [`WebHealth::check_timeout`] reports `"failed: timed out"`.
+    async fn run_checks(&self) -> HealthSnapshot {
+        let mut ready = true;
+        let mut checks = serde_json::Map::new();
+        for (name, check) in &self.checks {
+            let outcome = match tokio::time::timeout(self.check_timeout, check()).await {
+                Ok(Ok(())) => "ok".to_string(),
+                Ok(Err(reason)) => {
+                    ready = false;
+                    format!("failed: {reason}")
+                }
+                Err(_) => {
+                    ready = false;
+                    format!("failed: timed out after {:?}", self.check_timeout)
+                }
+            };
+            checks.insert((*name).to_string(), serde_json::Value::String(outcome));
+        }
+        let body = serde_json::json!({
+            "status": if ready { "ready" } else { "degraded" },
+            "checks": checks,
+        });
+        HealthSnapshot {
+            ready,
+            body: body.to_string().into(),
+        }
+    }
+}
+
+/// Serve one `/healthz` probe: GET/HEAD only (405 otherwise, like the static surface), evaluate
+/// (or reuse) the verdict, answer 200/503 with the JSON body (`cache-control: no-store` — the
+/// server caches the verdict; intermediaries must not). Returns whether the connection stays open.
+async fn respond_healthz(
+    stream: &mut TcpStream,
+    health: &WebHealth,
+    head: &RequestHead,
+) -> io::Result<bool> {
+    let keep = head.keep_alive();
+    if head.method != "GET" && head.method != "HEAD" {
+        write_simple(
+            stream,
+            405,
+            "Method Not Allowed",
+            Some("allow: GET, HEAD"),
+            keep,
+        )
+        .await?;
+        return Ok(keep);
+    }
+    let snap = health.evaluate().await;
+    let (status, reason) = if snap.ready {
+        (200, "OK")
+    } else {
+        (503, "Service Unavailable")
+    };
+    let mut resp = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\n",
+        snap.body.len()
+    );
+    if !keep {
+        resp.push_str("connection: close\r\n");
+    }
+    resp.push_str("\r\n");
+    stream.write_all(resp.as_bytes()).await?;
+    if head.method == "GET" {
+        stream.write_all(snap.body.as_bytes()).await?;
+    }
+    stream.flush().await?;
+    Ok(keep)
+}
+
 // --- the request head -------------------------------------------------------------------------
 
 /// A parsed HTTP/1.x request head (the routing surface: method, target, headers). Bodies are
@@ -366,17 +541,20 @@ fn head_end(buf: &[u8]) -> Option<usize> {
 /// Serve the single-origin web front until the listener errors: static bundle files from the
 /// startup-scanned `site`, plus the authenticated mux-over-WebSocket carrier on `GET /ws` (the
 /// same serving as [`serve_mux_ws`](crate::ws::serve_mux_ws) — same-origin upgrades pass with
-/// zero config, `allowed_origins` grants extra cross-origin allowance). Spawn it as a background
-/// task alongside the other listeners.
+/// zero config, `allowed_origins` grants extra cross-origin allowance), plus the unauthenticated
+/// `GET /healthz` readiness probe answered from `health`. Spawn it as a background task alongside
+/// the other listeners.
 pub async fn serve_web(
     listener: TcpListener,
     site: WebRoot,
     api: Arc<dyn NodeApi>,
     auth: Arc<Authenticator>,
     allowed_origins: Vec<String>,
+    health: WebHealth,
 ) {
     let site = Arc::new(site);
     let allowed = Arc::new(allowed_origins);
+    let health = Arc::new(health);
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -384,10 +562,11 @@ pub async fn serve_web(
                 let api = api.clone();
                 let auth = auth.clone();
                 let allowed = allowed.clone();
+                let health = health.clone();
                 tokio::spawn(async move {
                     // A failed conversation (malformed request, refused upgrade, an aborted
                     // download) is dropped cleanly — never panics the accept loop.
-                    if let Err(e) = handle_conn(stream, &site, api, auth, &allowed).await {
+                    if let Err(e) = handle_conn(stream, &site, api, auth, &allowed, &health).await {
                         tracing::debug!("web connection ended: {e}");
                     }
                 });
@@ -402,13 +581,14 @@ pub async fn serve_web(
 
 /// One connection: sequential HTTP/1.1 requests served off the same socket until the client
 /// closes (or asks to), with `GET /ws` + `Upgrade: websocket` handing the connection over to the
-/// mux carrier for the rest of its life.
+/// mux carrier for the rest of its life and `/healthz` answered as the reserved readiness probe.
 async fn handle_conn(
     mut stream: TcpStream,
     site: &WebRoot,
     api: Arc<dyn NodeApi>,
     auth: Arc<Authenticator>,
     allowed_origins: &[String],
+    health: &WebHealth,
 ) -> io::Result<()> {
     let mut carry = Vec::new();
     loop {
@@ -431,7 +611,11 @@ async fn handle_conn(
             return serve_mux_over_ws(ws, api, auth).await;
         }
 
-        let keep = respond_static(&mut stream, site, &head).await?;
+        let keep = if head.path() == HEALTHZ_PATH {
+            respond_healthz(&mut stream, health, &head).await?
+        } else {
+            respond_static(&mut stream, site, &head).await?
+        };
         if !keep {
             return Ok(());
         }
@@ -827,5 +1011,112 @@ mod tests {
         let mut all = String::new();
         rewound.read_to_string(&mut all).await.expect("read");
         assert_eq!(all, "replayed live");
+    }
+
+    // --- the readiness probe (D3) ---------------------------------------------------------------
+
+    /// Parse a snapshot body into (status, checks-map) for shape assertions.
+    fn parse_health(snap: &HealthSnapshot) -> (String, serde_json::Map<String, serde_json::Value>) {
+        let v: serde_json::Value = serde_json::from_str(&snap.body).expect("valid JSON body");
+        let status = v["status"].as_str().expect("status string").to_string();
+        let checks = v["checks"].as_object().expect("checks object").clone();
+        (status, checks)
+    }
+
+    /// All checks passing => ready/200-shape; one failing => degraded with the terse reason under
+    /// its name while the passing check still reports ok. No checks wired => ready (the process-up
+    /// baseline).
+    #[tokio::test]
+    async fn health_evaluates_ready_and_degraded() {
+        let ready = WebHealth::new()
+            .with_check("store", || async { Ok(()) })
+            .with_check("auth", || async { Ok(()) });
+        let snap = ready.evaluate().await;
+        assert!(snap.ready);
+        let (status, checks) = parse_health(&snap);
+        assert_eq!(status, "ready");
+        assert_eq!(checks["store"], "ok");
+        assert_eq!(checks["auth"], "ok");
+
+        let degraded = WebHealth::new()
+            .with_check("store", || async { Err("disk I/O error".to_string()) })
+            .with_check("auth", || async { Ok(()) });
+        let snap = degraded.evaluate().await;
+        assert!(!snap.ready);
+        let (status, checks) = parse_health(&snap);
+        assert_eq!(status, "degraded");
+        assert_eq!(checks["store"], "failed: disk I/O error");
+        assert_eq!(checks["auth"], "ok", "passing checks still report");
+
+        let empty = WebHealth::new();
+        let snap = empty.evaluate().await;
+        assert!(snap.ready, "no checks wired = the process-up baseline");
+        let (status, checks) = parse_health(&snap);
+        assert_eq!(status, "ready");
+        assert!(checks.is_empty());
+    }
+
+    /// The verdict is TTL-cached: within the window repeated probes reuse one evaluation (the
+    /// polled-by-infrastructure cost bound); a zero TTL re-evaluates every probe.
+    #[tokio::test]
+    async fn health_caches_the_verdict_within_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let counted = calls.clone();
+        let cached = WebHealth::new().with_check("store", move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        for _ in 0..5 {
+            cached.evaluate().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "probes within the TTL must share one evaluation"
+        );
+
+        calls.store(0, Ordering::SeqCst);
+        let counted = calls.clone();
+        let uncached =
+            WebHealth::new()
+                .with_cache_ttl(Duration::ZERO)
+                .with_check("store", move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                });
+        for _ in 0..3 {
+            uncached.evaluate().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a zero TTL re-evaluates every probe"
+        );
+    }
+
+    /// A hung check (e.g. a wedged store mutex) degrades the verdict at the timeout instead of
+    /// hanging the probe.
+    #[tokio::test]
+    async fn health_check_timeout_degrades() {
+        let hung = WebHealth::new()
+            .with_check_timeout(Duration::from_millis(20))
+            .with_check("store", futures::future::pending::<Result<(), String>>);
+        let snap = hung.evaluate().await;
+        assert!(!snap.ready);
+        let (status, checks) = parse_health(&snap);
+        assert_eq!(status, "degraded");
+        let outcome = checks["store"].as_str().expect("outcome string");
+        assert!(
+            outcome.starts_with("failed: timed out"),
+            "a hung check must report the timeout, got {outcome}"
+        );
     }
 }

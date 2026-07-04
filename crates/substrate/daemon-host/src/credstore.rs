@@ -391,6 +391,40 @@ mod tests {
     }
 
     #[test]
+    fn file_store_set_is_create_or_update_no_duplicate() {
+        // The D2 attach-credential seed relies on `set` being an idempotent create-or-update on the
+        // durable backend a hosted node uses: seed creates; a rotated secret + restart overwrites in
+        // place (never a second entry); the same secret is a no-op.
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-credstore-d2-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        let store = FileCredentialStore::open(&path).unwrap();
+
+        // Create.
+        store.set("hosted", "sk-attach-A").unwrap();
+        assert_eq!(store.get("hosted").as_deref(), Some("sk-attach-A"));
+        // Update (rotation): overwrite in place.
+        store.set("hosted", "sk-attach-B").unwrap();
+        assert_eq!(store.get("hosted").as_deref(), Some("sk-attach-B"));
+        // No duplicate: exactly one entry for the profile.
+        assert_eq!(
+            store.list_redacted().len(),
+            1,
+            "rotation must not create a second credential entry"
+        );
+        // Same secret again: still a no-op single entry.
+        store.set("hosted", "sk-attach-B").unwrap();
+        assert_eq!(store.list_redacted().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn source_provisions_stored_then_fallback() {
         use std::sync::Arc;
         let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
