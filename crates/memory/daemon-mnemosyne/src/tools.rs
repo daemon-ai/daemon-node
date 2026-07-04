@@ -429,9 +429,21 @@ pub async fn dispatch(
                 s(&args, "name"),
             ) {
                 Ok(rows) => {
+                    // Full-row output like Python's dict(row) results (source/confidence/
+                    // valid_from included).
                     let facts: Vec<Value> = rows
                         .iter()
-                        .map(|r| json!({"category":r.category,"name":r.name,"body":r.body,"version":r.version}))
+                        .map(|r| {
+                            json!({
+                                "category": r.category,
+                                "name": r.name,
+                                "body": r.body,
+                                "version": r.version,
+                                "source": r.source,
+                                "confidence": r.confidence,
+                                "valid_from": r.valid_from,
+                            })
+                        })
                         .collect();
                     json!({"status": "ok", "count": facts.len(), "facts": facts}).to_string()
                 }

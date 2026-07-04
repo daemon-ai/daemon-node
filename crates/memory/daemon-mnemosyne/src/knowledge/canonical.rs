@@ -37,11 +37,37 @@ pub struct CanonicalRow {
     pub body: String,
     /// Monotonic version.
     pub version: i64,
+    /// Source tag.
+    pub source: String,
+    /// Confidence `[0, 1]`.
+    pub confidence: f64,
+    /// Start of validity (ISO timestamp).
+    pub valid_from: String,
+}
+
+const ROW_COLUMNS: &str = "id, owner_id, category, name, body, version, \
+                           COALESCE(source, ''), COALESCE(confidence, 1.0), valid_from";
+
+fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<CanonicalRow> {
+    Ok(CanonicalRow {
+        id: r.get(0)?,
+        owner_id: r.get(1)?,
+        category: r.get(2)?,
+        name: r.get(3)?,
+        body: r.get(4)?,
+        version: r.get(5)?,
+        source: r.get(6)?,
+        confidence: r.get(7)?,
+        valid_from: r.get(8)?,
+    })
 }
 
 /// Upsert the canonical value for `(owner_id, category, name)` (`canonical.py` `remember`
 /// L196-L287). Inserts version 1 if empty; no-ops if the body is unchanged; otherwise supersedes
-/// (stamps `valid_until` on the current row) and inserts `version + 1`. Returns the resulting live
+/// (stamps `valid_until` on the current row) and inserts `version + 1`. The read-current +
+/// supersede + insert sequence runs under `BEGIN IMMEDIATE` (canonical.py L226-L230) so a
+/// concurrent writer racing on the same slot — e.g. a Python process sharing the bank file — hits
+/// a clean transaction rather than a partial-unique-index violation. Returns the resulting live
 /// row plus a [`Status`].
 pub fn remember(
     conn: &Connection,
@@ -63,6 +89,28 @@ pub fn remember(
         ));
     }
 
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match remember_in_txn(conn, owner_id, category, name, body, source, confidence) {
+        Ok(out) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn remember_in_txn(
+    conn: &Connection,
+    owner_id: &str,
+    category: &str,
+    name: &str,
+    body: &str,
+    source: &str,
+    confidence: f64,
+) -> Result<(CanonicalRow, Status)> {
     let current: Option<(i64, String)> = conn
         .query_row(
             "SELECT id, body FROM canonical_facts \
@@ -126,9 +174,8 @@ pub fn current(
     name: Option<&str>,
 ) -> Result<Vec<CanonicalRow>> {
     use rusqlite::types::Value;
-    let mut sql = String::from(
-        "SELECT id, owner_id, category, name, body, version FROM canonical_facts \
-         WHERE owner_id = ? AND valid_until IS NULL",
+    let mut sql = format!(
+        "SELECT {ROW_COLUMNS} FROM canonical_facts WHERE owner_id = ? AND valid_until IS NULL"
     );
     let mut binds: Vec<Value> = vec![Value::Text(owner_id.to_string())];
     if let Some(c) = category {
@@ -141,33 +188,15 @@ pub fn current(
     }
     sql.push_str(" ORDER BY category ASC, name ASC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
-        Ok(CanonicalRow {
-            id: r.get(0)?,
-            owner_id: r.get(1)?,
-            category: r.get(2)?,
-            name: r.get(3)?,
-            body: r.get(4)?,
-            version: r.get(5)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), row_from)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn fetch_by_id(conn: &Connection, id: i64) -> Result<CanonicalRow> {
     let row = conn.query_row(
-        "SELECT id, owner_id, category, name, body, version FROM canonical_facts WHERE id = ?1",
+        &format!("SELECT {ROW_COLUMNS} FROM canonical_facts WHERE id = ?1"),
         params![id],
-        |r| {
-            Ok(CanonicalRow {
-                id: r.get(0)?,
-                owner_id: r.get(1)?,
-                category: r.get(2)?,
-                name: r.get(3)?,
-                body: r.get(4)?,
-                version: r.get(5)?,
-            })
-        },
+        row_from,
     )?;
     Ok(row)
 }
@@ -182,9 +211,14 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let c = store.conn.lock().unwrap();
 
-        let (r1, s1) = remember(&c, "alice", "identity", "role", "engineer", "t", 1.0).unwrap();
+        let (r1, s1) = remember(&c, "alice", "identity", "role", "engineer", "t", 0.9).unwrap();
         assert_eq!(s1, Status::Created);
         assert_eq!(r1.version, 1);
+        // The row carries the provenance fields (source/confidence/valid_from), like Python's
+        // dict(row) return.
+        assert_eq!(r1.source, "t");
+        assert!((r1.confidence - 0.9).abs() < 1e-9);
+        assert!(!r1.valid_from.is_empty());
 
         let (_r2, s2) = remember(&c, "alice", "identity", "role", "engineer", "t", 1.0).unwrap();
         assert_eq!(s2, Status::Unchanged);

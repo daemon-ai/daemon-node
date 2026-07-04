@@ -284,6 +284,21 @@ then conditional `ALTER TABLE ADD COLUMN`). The Rust port emits all *current* co
 `CREATE TABLE` DDL (no historical migration needed for a fresh store) but keeps an idempotent
 `add_column_if_missing(conn, table, col, ty)` helper for opening pre-existing Python DBs.
 
+**As-built ([`store/mod.rs`](../../../memory/daemon-mnemosyne/src/store/mod.rs) `legacy`):** the
+open path is `reconcile_columns` -> migration ladder -> `e6_backfill`, all idempotent no-ops on
+Rust-created banks. `reconcile_columns` generalizes Python's ladder: the expected shape is read
+from a fresh in-memory reference database built by the same migrations, and every existing table
+is diffed via `PRAGMA table_info` and `ALTER TABLE ADD COLUMN`-reconciled (non-constant
+`CURRENT_TIMESTAMP` defaults are added defaultless, as SQLite requires). It runs *before* the
+ladder because the ladder's partial indexes reference columns a legacy bank lacks. E3 semantics
+are preserved: when `working_memory.consolidated_at` itself had to be added, pre-existing rows are
+backfilled as already-consolidated (beam L578-L607). `e6_backfill` then runs the E6
+triplestore-split copy on every open (`migrations/e6_triplestore_split.py` via
+`_ensure_e6_schema_with_migration` beam L2688): `INSERT OR IGNORE` against the
+`idx_annot_unique` index (same name/shape as Python's) copies — never deletes — annotation-kind
+`triples` rows into `annotations`. A `legacy_python_bank_reconciles_on_open` test opens a
+hand-built pre-E3/pre-E6 bank and pins all three behaviors.
+
 ### 4.2 `working_memory` (hot tier) — `beam.py` L491-L502 + migrations
 
 Columns (with the lifecycle/identity/trust/temporal migrations folded in):
@@ -725,10 +740,12 @@ the graph/fact signals (§7.8).
 **As-built (K2 — LLM extraction + temporal, this milestone):** `Engine::ingest_extracted` layers an
 injected-LLM extraction pass (§11) *on top of* the always-on regex baseline — LLM entities become
 higher-confidence `mentions`, SPO triples become `facts` + `consolidated_facts`, and free-text
-statements become `fact` annotations (all stores dedupe, so re-ingesting a regex-captured item is a
-no-op). Deterministic temporal parsing (§10.5 `parse_nl_date`/`extract_temporal`) is live and wired
-into the write path (the `event_date`/`event_date_precision`/`temporal_tags` columns on both tiers).
-Still TODO: the tier-2 LLM conflict detector (§10.7), rule-based gists, and the E6 legacy migration.
+statements become `fact` annotations after the shared `annotations::filter_facts` write filter
+(`> MIN_FACT_LENGTH` chars, §10.2 L89; all stores dedupe, so re-ingesting a regex-captured item is
+a no-op). Deterministic temporal parsing (§10.5 `parse_nl_date`/`extract_temporal`) is live and
+wired into the write path (the `event_date`/`event_date_precision`/`temporal_tags` columns on both
+tiers). The tier-2 LLM conflict detector (§10.7), rule-based gists (§10.4), and the E6 legacy
+backfill (§4.1) are all live.
 
 ### 10.1 TripleStore — `triples.py`
 
@@ -738,6 +755,11 @@ confidence`. Single-current-truth: `add(supersede=True)` (default) stamps prior 
 `query(as_of)` filters `valid_from <= as_of AND (valid_until IS NULL OR valid_until > as_of)`
 (L220-L227); subject match `COLLATE NOCASE`; default `as_of = today`. `supersede=False` allows
 simultaneous multi-valued objects.
+
+**As-built divergence:** the Rust `add` supersede and `end` also match the subject
+`COLLATE NOCASE`. Python is case-sensitive on the write side while its read side is `NOCASE`, so
+`add("maya", p, ...)` over `add("Maya", p, ...)` leaves both rows open and `query` reports two
+"current" truths for one `(subject, predicate)`; the port closes the case-variant row instead.
 
 ### 10.2 AnnotationStore — `annotations.py`
 
@@ -756,6 +778,13 @@ valid_from, valid_until`; partial unique index on live rows `WHERE valid_until I
 (L230-L287, `BEGIN IMMEDIATE`): identical body -> `status="unchanged"`; else `version = max+1`, close
 current (`valid_until=now`), insert new. `forget()` stamps `valid_until` (no delete). Owner-scoped
 identity cards with version history.
+
+**As-built ([`knowledge/canonical.rs`](../../../memory/daemon-mnemosyne/src/knowledge/canonical.rs)):**
+`remember` wraps its read-current + supersede + insert in `BEGIN IMMEDIATE`/`COMMIT` (rollback on
+error) like Python — the in-process `Mutex<Connection>` already serializes Rust callers, but the
+write lock protects against another *process* (e.g. Python) sharing the bank file. `CanonicalRow`
+carries the full provenance (`source`/`confidence`/`valid_from`), and the
+`mnemosyne_recall_canonical` tool returns it, matching Python's `dict(row)` results.
 
 ### 10.4 EpisodicGraph — `episodic_graph.py`
 

@@ -1012,7 +1012,10 @@ fn ingest_extracted_merges_llm_entities_and_triples() {
             object: "Atlas".into(),
             confidence: 0.9,
         }],
-        facts: vec!["Denis manages the Atlas project".into()],
+        facts: vec![
+            "Denis manages the Atlas project".into(),
+            "too short".into(), // <= MIN_FACT_LENGTH chars — dropped by filter_facts
+        ],
     };
     e.ingest_extracted(&id, &extracted).unwrap();
     let c = e.store.conn.lock().unwrap();

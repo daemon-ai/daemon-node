@@ -659,12 +659,15 @@ impl Engine {
             veracity::consolidate_fact(&conn, subject, predicate, object, "inferred", memory_id)?;
         }
 
-        let statements: Vec<String> = extracted
-            .facts
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| s.len() >= 5)
-            .collect();
+        // The shared write-side fact filter (`annotations.py` `filter_facts`, applied by
+        // `_extract_and_store_facts` beam L1365 before `add_many(kind="fact")`).
+        let statements = annotations::filter_facts(
+            &extracted
+                .facts
+                .iter()
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>(),
+        );
         if !statements.is_empty() {
             annotations::add_many(&conn, memory_id, "fact", &statements, "llm", 0.9)?;
         }

@@ -52,11 +52,152 @@ impl Store {
         // cannot change inside a transaction.
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // Legacy Python banks (`user_version = 0`, old-shape tables already present): reconcile
+        // missing columns BEFORE the ladder — its `IF NOT EXISTS` DDL no-ops on existing tables,
+        // and its partial indexes reference columns an old bank may not have yet.
+        legacy::reconcile_columns(&conn)?;
         // Schema is owned by the `PRAGMA user_version` ladder.
         MIGRATIONS.to_latest(&mut conn)?;
+        legacy::e6_backfill(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+}
+
+/// Legacy Python-bank compatibility — the Rust twin of `beam.py`'s in-place migration ladder.
+///
+/// Python evolves an existing database by sprinkling `_add_column_if_missing` / `ALTER TABLE`
+/// calls through `init_beam` (beam.py L529-L607, L872-L883, L1147-L1154) and auto-runs the E6
+/// triplestore split on init (`_ensure_e6_schema_with_migration` L2688,
+/// `migrations/e6_triplestore_split.py`). The Rust schema instead folds every column into the
+/// `CREATE TABLE` DDL — correct for fresh banks, but a bank created by Python has old-shape
+/// tables that `IF NOT EXISTS` leaves untouched, and every Rust statement referencing a newer
+/// column would fail. These passes run on every open and are idempotent no-ops on Rust-created
+/// banks.
+mod legacy {
+    use crate::error::Result;
+    use rusqlite::Connection;
+
+    /// One expected column, described by the reference (fresh) schema.
+    struct ColSpec {
+        name: String,
+        decl_type: String,
+        dflt: Option<String>,
+    }
+
+    /// Diff every reference table against the live database and `ALTER TABLE ADD COLUMN` any
+    /// column a legacy bank is missing (the `_add_column_if_missing` ladder, generalized: the
+    /// expected shape is read from a fresh in-memory database built by the same migration
+    /// ladder, so new columns never need a hand-written compat entry). Returns the number of
+    /// columns added.
+    ///
+    /// E3 semantics are preserved (beam.py L578-L607): when `working_memory.consolidated_at`
+    /// itself had to be added, every pre-existing row is backfilled as already-consolidated —
+    /// pre-E3 Python `sleep()` deleted consolidated rows, so an un-backfilled legacy backlog
+    /// would be re-summarized wholesale on the first sleep.
+    pub(super) fn reconcile_columns(conn: &Connection) -> Result<usize> {
+        let mut reference = Connection::open_in_memory()?;
+        super::MIGRATIONS
+            .to_latest(&mut reference)
+            .map_err(|e| crate::error::Error::Invalid(format!("reference schema: {e}")))?;
+
+        // Real tables only: FTS virtual tables + their shadows (all `fts_`-prefixed here) are
+        // owned by the FTS5 module, not column reconciliation.
+        let tables: Vec<String> = {
+            let mut stmt = reference.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'fts_%' ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut added = 0usize;
+        for table in &tables {
+            // Only reconcile tables that already exist: anything absent is created in full
+            // (current shape) by the migration ladder that runs right after this pass.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if !exists {
+                continue;
+            }
+            let expected = table_columns(&reference, table)?;
+            let live: std::collections::HashSet<String> = table_columns(conn, table)?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            let mut backfill_consolidated_at = false;
+            for col in expected {
+                if live.contains(&col.name) {
+                    continue;
+                }
+                // `ALTER TABLE ADD COLUMN` rejects non-constant defaults (CURRENT_TIMESTAMP);
+                // those columns are added defaultless (NULL on legacy rows), exactly what
+                // Python's except-and-continue ladder produced.
+                let mut ddl = format!(
+                    "ALTER TABLE {table} ADD COLUMN {} {}",
+                    col.name, col.decl_type
+                );
+                if let Some(d) = &col.dflt {
+                    if !d.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
+                        ddl.push_str(&format!(" DEFAULT {d}"));
+                    }
+                }
+                conn.execute(&ddl, [])?;
+                added += 1;
+                if table == "working_memory" && col.name == "consolidated_at" {
+                    backfill_consolidated_at = true;
+                }
+            }
+            if backfill_consolidated_at {
+                conn.execute(
+                    "UPDATE working_memory SET consolidated_at = ?1 WHERE consolidated_at IS NULL",
+                    [crate::util::now_iso()],
+                )?;
+            }
+        }
+        Ok(added)
+    }
+
+    fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ColSpec>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ColSpec {
+                name: r.get(1)?,
+                decl_type: r.get(2)?,
+                dflt: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The E6 triplestore-split backfill (`migrations/e6_triplestore_split.py`): legacy `triples`
+    /// rows whose predicate is an annotation kind are *copied* (never deleted — reversible, like
+    /// Python) into `annotations` under the `(memory_id=subject, kind=predicate, value=object)`
+    /// mapping. `INSERT OR IGNORE` against the `(memory_id, kind, value)` unique index is the
+    /// anti-join: re-running is a no-op. Returns the number of rows copied.
+    pub(super) fn e6_backfill(conn: &Connection) -> Result<usize> {
+        let kinds = crate::knowledge::annotations::ANNOTATION_KINDS
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let n = conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO annotations \
+                     (memory_id, kind, value, source, confidence, created_at) \
+                 SELECT subject, predicate, object, source, COALESCE(confidence, 1.0), created_at \
+                 FROM triples WHERE predicate IN ({kinds})"
+            ),
+            [],
+        )?;
+        Ok(n)
     }
 }
 
@@ -129,6 +270,111 @@ mod tests {
             "schema drift: add a migration (M::up) and refresh src/store/schema.golden.sql via \
              DAEMON_UPDATE_SCHEMA=1",
         );
+    }
+
+    /// Opening a bank created by legacy Python Mnemosyne (old-shape tables, `user_version=0`,
+    /// pre-E6 triples, no annotations) must reconcile it in place: missing columns added, the
+    /// pre-existing working rows backfilled as consolidated (E3), and annotation-flavored triples
+    /// copied (not moved) into `annotations` (E6). Idempotent across reopens.
+    #[test]
+    fn legacy_python_bank_reconciles_on_open() {
+        let dir = std::env::temp_dir().join(format!("mnemosyne-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bank.db");
+
+        {
+            // A minimal pre-E3/pre-E6 Python bank: v1 working_memory, Python-shape triples with
+            // annotation-flavored and knowledge rows, no annotations table.
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE working_memory (
+                         id TEXT PRIMARY KEY,
+                         content TEXT NOT NULL,
+                         source TEXT,
+                         timestamp TEXT,
+                         session_id TEXT DEFAULT 'default',
+                         importance REAL DEFAULT 0.5,
+                         metadata_json TEXT,
+                         veracity TEXT DEFAULT 'unknown',
+                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                     );
+                     INSERT INTO working_memory (id, content, timestamp)
+                         VALUES ('legacy1', 'an old python row', '2024-01-01T00:00:00');
+                     CREATE TABLE triples (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         subject TEXT NOT NULL,
+                         predicate TEXT NOT NULL,
+                         object TEXT NOT NULL,
+                         valid_from TEXT NOT NULL,
+                         valid_until TEXT,
+                         source TEXT,
+                         confidence REAL DEFAULT 1.0,
+                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                     );
+                     INSERT INTO triples (subject, predicate, object, valid_from, source)
+                         VALUES ('mem1', 'mentions', 'Acme', '2024-01-01', 'regex');
+                     INSERT INTO triples (subject, predicate, object, valid_from, source)
+                         VALUES ('Maya', 'works_at', 'Acme', '2024-01-01', 'stated');",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).expect("legacy bank must open");
+        {
+            let conn = store.conn.lock().unwrap();
+            // Column reconcile: newer columns exist and are usable.
+            let (consolidated_at, trust_tier, scope): (Option<String>, String, String) = conn
+                .query_row(
+                    "SELECT consolidated_at, COALESCE(trust_tier, 'STATED'), \
+                            COALESCE(scope, 'global') \
+                     FROM working_memory WHERE id = 'legacy1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            // E3 backfill: the pre-existing row is treated as already consolidated.
+            assert!(
+                consolidated_at.is_some(),
+                "legacy rows must be backfilled as consolidated"
+            );
+            assert_eq!(trust_tier, "STATED");
+            assert_eq!(scope, "global");
+            // E6 backfill: the annotation-flavored triple was copied, the knowledge one was not,
+            // and the source triples row survives (reversible migration).
+            let anns: Vec<(String, String, String)> = {
+                let mut stmt = conn
+                    .prepare("SELECT memory_id, kind, value FROM annotations ORDER BY id")
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .unwrap();
+                rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+            };
+            assert_eq!(
+                anns,
+                vec![(
+                    "mem1".to_string(),
+                    "mentions".to_string(),
+                    "Acme".to_string()
+                )]
+            );
+            let triples: i64 = conn
+                .query_row("SELECT COUNT(*) FROM triples", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(triples, 2, "E6 copies, never deletes");
+        }
+        drop(store);
+
+        // Reopen: both passes are idempotent.
+        let store = Store::open(&path).expect("reopen");
+        let conn = store.conn.lock().unwrap();
+        let anns: i64 = conn
+            .query_row("SELECT COUNT(*) FROM annotations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(anns, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
