@@ -128,7 +128,11 @@ pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
     TransportPattern,
 };
-pub use socket::{serve_api_unix, serve_api_unix_authenticated, ApiClient, MuxApiClient};
+pub use socket::ApiClient;
+// The unix-socket transport itself does not exist on windows (tokio lacks AF_UNIX there); a
+// windows node serves the portable TLS/WS/HTTP surfaces only.
+#[cfg(unix)]
+pub use socket::{serve_api_unix, serve_api_unix_authenticated, MuxApiClient};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,

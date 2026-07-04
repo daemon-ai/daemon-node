@@ -38,13 +38,17 @@ use daemon_core::{
     UnconfiguredProvider,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
+// The unix-socket api transport is unix-only (tokio has no AF_UNIX on windows); a windows node
+// serves the networked TLS/WS/HTTP surfaces instead (see `run_as_host`).
+#[cfg(unix)]
+use daemon_host::serve_api_unix;
 use daemon_host::{
-    run_placed_child, run_placed_child_journaled, serve_api_unix, BrokeredCredentialProvider,
-    CloudCatalog, CommandRegistry, CoreEngineFactory, CredentialAuditDrain, CredentialBroker,
-    CredentialStore, EngineUnit, FileCredentialStore, FileProfileStore, FileRevisionLog,
-    HostConfig, JournalFeeder, JournalSink, MemCredentialStore, MemProfileStore,
-    MultiProfileStoreBroker, OriginMatcher, OwnerBroker, PooledStoreCredentialSource, ProfileStore,
-    RoutingRegistry, ScopePattern, SessionBinding, TransportPattern,
+    run_placed_child, run_placed_child_journaled, BrokeredCredentialProvider, CloudCatalog,
+    CommandRegistry, CoreEngineFactory, CredentialAuditDrain, CredentialBroker, CredentialStore,
+    EngineUnit, FileCredentialStore, FileProfileStore, FileRevisionLog, HostConfig, JournalFeeder,
+    JournalSink, MemCredentialStore, MemProfileStore, MultiProfileStoreBroker, OriginMatcher,
+    OwnerBroker, PooledStoreCredentialSource, ProfileStore, RoutingRegistry, ScopePattern,
+    SessionBinding, TransportPattern,
 };
 use daemon_infer::protocol::{Engine, ModelParams};
 use daemon_metta::protocol::Bounds as MettaBounds;
@@ -1678,20 +1682,21 @@ fn seed_first_admin_if_empty(
 /// stderr still carries the secret). Called only on a fresh node with no configured admin.
 fn emit_generated_admin(cfg: &NodeConfig, username: &str, password: &str) {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
 
     let path = cfg.data_dir.join("first-admin-credentials.txt");
     let contents = format!(
         "daemon first-admin bootstrap (delete this file once you have saved the password)\n\
          username: {username}\npassword: {password}\n"
     );
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    // Owner-only on unix; windows has no mode bits (the file inherits the data dir's ACL).
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(contents.as_bytes()) {
                 tracing::warn!(error = %e, path = %path.display(), "writing first-admin credentials file");
@@ -2136,19 +2141,35 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // Bind the api socket (fresh) and serve the unified surface over it. A managed/user launch may
     // target a nested runtime path (e.g. under $XDG_RUNTIME_DIR) whose parent dir does not exist
     // yet, so ensure the parent exists (and clear any stale socket) before binding.
-    prepare_api_socket(&cfg.socket_path)?;
-    let listener = tokio::net::UnixListener::bind(&cfg.socket_path)?;
-    let server = if local_trust {
-        tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (local trust: system)");
-        tokio::spawn(serve_api_unix(listener, node.clone()))
-    } else {
-        tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (SCRAM required)");
-        tokio::spawn(daemon_host::serve_api_unix_authenticated(
-            listener,
-            node.clone(),
-            authenticator.clone(),
-        ))
+    #[cfg(unix)]
+    let server = {
+        prepare_api_socket(&cfg.socket_path)?;
+        let listener = tokio::net::UnixListener::bind(&cfg.socket_path)?;
+        if local_trust {
+            tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (local trust: system)");
+            tokio::spawn(serve_api_unix(listener, node.clone()))
+        } else {
+            tracing::info!(socket = %cfg.socket_path.display(), "serving daemon-api over unix socket (SCRAM required)");
+            tokio::spawn(daemon_host::serve_api_unix_authenticated(
+                listener,
+                node.clone(),
+                authenticator.clone(),
+            ))
+        }
     };
+    // No unix-socket surface on windows: require at least one networked listener so a launch that
+    // would serve nothing fails loudly at boot instead of idling unreachable.
+    #[cfg(not(unix))]
+    if cfg.api.tls_addr.is_none()
+        && cfg.api.ws_addr.is_none()
+        && cfg.web.addr.is_none()
+        && cfg.http_addr.is_none()
+    {
+        anyhow::bail!(
+            "no api surface configured: the unix-socket transport is unavailable on this \
+             platform — set [api].ws_addr, [api].tls_addr, [web].addr, or http_addr"
+        );
+    }
 
     // The networked TLS/TCP api transport (opt-in via `[api].tls_addr`). TCP always requires
     // authentication (never local-trusted).
@@ -2288,6 +2309,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let signal = shutdown.await?;
     tracing::info!(signal, "shutdown signal received; shutting down");
+    #[cfg(unix)]
     server.abort();
     if let Some(tls_server) = tls_server {
         tls_server.abort();
@@ -2306,6 +2328,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     }
     cred_audit_drain.abort();
     handle.shutdown().await;
+    // Clear the socket file this run bound (windows never bound one).
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&cfg.socket_path);
     Ok(())
 }
@@ -2585,6 +2609,7 @@ async fn run_as_placed_child() {
 /// displace a LIVE daemon already serving the path, and clear a stale (dead) socket file left by a
 /// previous run. Kept separate from [`run_as_host`] so it is unit-testable without standing up the
 /// full host.
+#[cfg(unix)]
 fn prepare_api_socket(path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2618,6 +2643,7 @@ mod tests {
 
     /// The api socket bind path may point at a nested runtime dir that does not exist yet
     /// (managed/user launch); `prepare_api_socket` must create the parent so `bind` succeeds.
+    #[cfg(unix)]
     #[test]
     fn prepare_api_socket_creates_missing_parent_dir() {
         let base = std::env::temp_dir().join(format!(
@@ -2642,6 +2668,7 @@ mod tests {
 
     /// A LIVE listener on the api socket path must fail the prepare (and thus the launch) instead
     /// of being unlinked out from under its daemon — the orphaned-daemon incident.
+    #[cfg(unix)]
     #[test]
     fn prepare_api_socket_refuses_live_listener() {
         let base = std::env::temp_dir().join(format!(
