@@ -210,9 +210,9 @@ mod legacy {
 ///
 /// This is the single `unsafe` boundary in the crate (a `RawAutoExtension` transmute, per the
 /// sqlite-vec rusqlite guide). With the feature off this is a no-op and the engine uses the f32-BLOB
-/// cosine fallback.
+/// cosine fallback. `pub(crate)` so [`crate::dr`] restore connections resolve vec0 DDL too.
 #[cfg(feature = "vec-ext")]
-fn register_vec_extension() {
+pub(crate) fn register_vec_extension() {
     use std::sync::Once;
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| unsafe {
@@ -224,7 +224,7 @@ fn register_vec_extension() {
 }
 
 #[cfg(not(feature = "vec-ext"))]
-fn register_vec_extension() {}
+pub(crate) fn register_vec_extension() {}
 
 #[cfg(test)]
 mod tests {

@@ -67,7 +67,12 @@ pub fn defs() -> Vec<ToolDef> {
             r#"{"type":"object","properties":{"force":{"type":"boolean"},"dry_run":{"type":"boolean"}}}"#,
         ),
         def("mnemosyne_stats", r#"{"type":"object","properties":{}}"#),
-        def("mnemosyne_diagnose", r#"{"type":"object","properties":{}}"#),
+        def(
+            "mnemosyne_diagnose",
+            r#"{"type":"object","properties":{
+                "repair_vec_working":{"type":"boolean","description":"Idempotently backfill missing derived vectors (episodic MIB binaries) from stored embeddings"},
+                "dry_run":{"type":"boolean","description":"With repair_vec_working, report what would be repaired without writing"}}}"#,
+        ),
         def(
             "mnemosyne_triple_add",
             r#"{"type":"object","properties":{"subject":{"type":"string"},"predicate":{"type":"string"},"object":{"type":"string"},"valid_from":{"type":"string"},"valid_until":{"type":"string"},"source":{"type":"string"},"confidence":{"type":"number"},"supersede":{"type":"boolean"}},"required":["subject","predicate","object"]}"#,
@@ -260,8 +265,9 @@ pub async fn run_sleep(
         let gate = engine.llm_conflict_detection() && extractor.available();
         for c in &conflicts {
             let confirmed = if gate {
-                crate::knowledge::conflict::validate_conflict_pair(
+                crate::knowledge::conflict::validate_conflict_pair_logged(
                     extractor,
+                    engine,
                     &c.older_content,
                     &c.newer_content,
                 )
@@ -686,10 +692,28 @@ pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
             Ok(stats) => json!({"status": "ok", "stats": stats}).to_string(),
             Err(e) => err(e),
         },
-        "mnemosyne_diagnose" => match engine.diagnose() {
-            Ok(d) => json!({"status": "ok", "diagnostics": d}).to_string(),
-            Err(e) => err(e),
-        },
+        // Full diagnostics scan (`_handle_diagnose`): summary + JSONL log + optional idempotent
+        // vector repair. The arg keeps Python's wire name `repair_vec_working` even though the
+        // Rust repair targets the §7 stores (episodic MIB binaries), so clients stay compatible.
+        "mnemosyne_diagnose" => {
+            let mut summary = crate::diagnose::run_diagnostics(
+                engine,
+                embedder,
+                extractor,
+                crate::diagnose::DiagnoseOptions {
+                    repair_vec_working: args
+                        .get("repair_vec_working")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    dry_run: args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false),
+                },
+            );
+            if engine.is_persistent() {
+                summary["active_provider_db_path"] =
+                    json!(engine.config().bank_db_path().display().to_string());
+            }
+            summary.to_string()
+        }
         "mnemosyne_triple_add" => {
             match engine.triple_add(&TripleAdd {
                 subject: s(&args, "subject").unwrap_or(""),

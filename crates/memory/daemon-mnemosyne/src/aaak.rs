@@ -159,6 +159,59 @@ pub fn summarize_group(contents: &[String]) -> String {
     encoded.join(" || ")
 }
 
+/// Reverse category map with Python's dict semantics (`aaak.py` `REV_CATEGORY` L93): code -> full
+/// category. Codes are unique, so insertion order is irrelevant here.
+fn rev_category(code: &str) -> Option<&'static str> {
+    CATEGORY_MAP
+        .iter()
+        .find(|(_, c)| *c == code)
+        .map(|(full, _)| *full)
+}
+
+/// Reverse phrase map with Python's dict-comprehension semantics (`aaak.py` `REV_PHRASE` L94):
+/// duplicate shorthand keys resolve to the LAST phrase that produced them (`{v: k}` last-wins —
+/// e.g. `"ASK "` -> `"User asked for "`, `"@"` -> `"User email is "`).
+fn rev_phrases() -> &'static [(&'static str, &'static str)] {
+    static R: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    R.get_or_init(|| {
+        let mut rev: Vec<(&'static str, &'static str)> = Vec::new();
+        for (phrase, shorthand) in PHRASE_MAP {
+            if let Some(slot) = rev.iter_mut().find(|(s, _)| s == shorthand) {
+                slot.1 = phrase; // last-wins, like the Python dict comprehension
+            } else {
+                rev.push((shorthand, phrase));
+            }
+        }
+        // Longest shorthand first so e.g. "STACK|" is restored before "|" handling by callers.
+        rev.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        rev
+    })
+}
+
+/// Best-effort AAAK decode using exactly the reverse maps Python builds (`REV_CATEGORY` /
+/// `REV_PHRASE`, `aaak.py` L92-L94 — defined there but never shipped with a `decode`; the Rust
+/// port completes the round-trip). Restores the `CATEGORY: ` prefix and the phrase shorthands.
+/// Structural replacements (`+`, `→`, `|`, ...) are many-to-one and Python builds no reverse map
+/// for them, so they are left as-is — AAAK is a "lossless *shorthand* LLMs parse without a
+/// decoder", not a bijective codec.
+pub fn decode(text: &str) -> String {
+    if text.is_empty() {
+        return text.to_string();
+    }
+    let mut result = text.trim().to_string();
+    // Category code prefix: `CODE|rest` -> `CATEGORY: rest`.
+    if let Some(bar) = result.find('|') {
+        let (code, rest) = result.split_at(bar);
+        if let Some(full) = rev_category(code) {
+            result = format!("{full}: {}", &rest[1..]);
+        }
+    }
+    for (shorthand, phrase) in rev_phrases() {
+        result = result.replace(shorthand, phrase);
+    }
+    result.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +258,27 @@ mod tests {
     fn summarize_group_joins() {
         let got = summarize_group(&["User likes tea".into(), "User likes coffee".into()]);
         assert!(got.contains("||"), "got: {got}");
+    }
+
+    #[test]
+    fn decode_restores_category_prefix() {
+        assert_eq!(decode("PREF|dark mode"), "PREFERENCE: dark mode");
+        assert_eq!(decode("EVT|standup moved"), "EVENT: standup moved");
+        // Unknown code: left alone.
+        assert_eq!(decode("NOPE|x"), "NOPE|x");
+    }
+
+    #[test]
+    fn decode_reverses_phrases_with_last_wins_semantics() {
+        // "ASK " maps back to "User asked for " (the LAST phrase producing it, dict semantics).
+        assert_eq!(decode("ASK help"), "User asked for help");
+        // "LIKE " is unambiguous.
+        assert_eq!(decode("LIKE tea"), "User likes tea");
+    }
+
+    #[test]
+    fn encode_decode_round_trips_phrase_content() {
+        let original = "User likes tea";
+        assert_eq!(decode(&encode(original)), original);
     }
 }

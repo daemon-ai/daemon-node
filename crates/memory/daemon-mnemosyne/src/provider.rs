@@ -467,8 +467,9 @@ impl MnemosyneProvider {
             Err(_) => return,
         };
         for c in pending {
-            if let Some(verdict) = crate::knowledge::conflict::validate_conflict_pair(
+            if let Some(verdict) = crate::knowledge::conflict::validate_conflict_pair_logged(
                 &self.extractor,
+                &self.engine,
                 &c.older_text,
                 &c.newer_text,
             )

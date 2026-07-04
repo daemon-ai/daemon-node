@@ -386,6 +386,137 @@ impl Engine {
         })
     }
 
+    /// PII-safe coverage counters for the vector stores the Rust engine actually uses
+    /// (`beam.py` `vec_working_coverage` L1906-L1997, remapped per the §7 storage decision:
+    /// there is no `vec0` mirror table here — `memory_embeddings` f32-JSON is the primary
+    /// store and `episodic_memory.binary_vector` the MIB derivative). Count-only: no ids,
+    /// content, or vectors.
+    pub fn vector_coverage(&self) -> Result<serde_json::Value> {
+        let conn = self.store.conn.lock().unwrap();
+        let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
+        let working_rows = count("SELECT COUNT(*) FROM working_memory")?;
+        let episodic_rows = count("SELECT COUNT(*) FROM episodic_memory")?;
+        let working_embedded = count(
+            "SELECT COUNT(*) FROM working_memory wm \
+             JOIN memory_embeddings me ON me.memory_id = wm.id",
+        )?;
+        let episodic_embedded = count(
+            "SELECT COUNT(*) FROM episodic_memory em \
+             JOIN memory_embeddings me ON me.memory_id = em.id",
+        )?;
+        let episodic_binary =
+            count("SELECT COUNT(*) FROM episodic_memory WHERE binary_vector IS NOT NULL")?;
+        // Repairable gap: episodic rows with a stored f32 embedding but no MIB binary (the
+        // binarization is deterministic, so backfill needs no model).
+        let missing_episodic_binary = count(
+            "SELECT COUNT(*) FROM episodic_memory em \
+             JOIN memory_embeddings me ON me.memory_id = em.id \
+             WHERE em.binary_vector IS NULL",
+        )?;
+        // Not deterministically repairable (needs the embedder): rows with no embedding at all.
+        let missing_working_embeddings = working_rows - working_embedded;
+        let orphan_embeddings = count(
+            "SELECT COUNT(*) FROM memory_embeddings me \
+             LEFT JOIN working_memory wm ON wm.id = me.memory_id \
+             LEFT JOIN episodic_memory em ON em.id = me.memory_id \
+             WHERE wm.id IS NULL AND em.id IS NULL",
+        )?;
+        let status = if working_rows == 0 && episodic_rows == 0 {
+            "empty"
+        } else if working_embedded + episodic_embedded == 0 && episodic_binary == 0 {
+            "no_vectors"
+        } else if missing_episodic_binary > 0 {
+            "partial"
+        } else {
+            "complete"
+        };
+        Ok(json!({
+            "backend": "memory_embeddings+binary",
+            "working_memory_rows": working_rows,
+            "working_embedding_rows": working_embedded,
+            "missing_working_embeddings": missing_working_embeddings,
+            "episodic_rows": episodic_rows,
+            "episodic_embedding_rows": episodic_embedded,
+            "episodic_binary_rows": episodic_binary,
+            "missing_episodic_binary": missing_episodic_binary,
+            "orphan_embedding_rows": orphan_embeddings,
+            "status": status,
+        }))
+    }
+
+    /// Idempotently backfill the deterministic vector gap: episodic rows that have an f32
+    /// embedding in `memory_embeddings` but a NULL MIB `binary_vector` (`beam.py`
+    /// `repair_vec_working` L2000-L2025, remapped to the Rust stores). `dry_run` reports the gap
+    /// without writing. Working rows with no embedding at all are only reported — re-embedding
+    /// needs the async host embedder (Python's `reindex_vectors`, a host operation).
+    pub fn repair_vector_coverage(&self, dry_run: bool) -> Result<serde_json::Value> {
+        let before = self.vector_coverage()?;
+        if dry_run {
+            return Ok(json!({
+                "status": "dry_run",
+                "dry_run": true,
+                "inserted": 0,
+                "would_insert": before["missing_episodic_binary"],
+                "before": before.clone(),
+                "after": before,
+            }));
+        }
+        let mut inserted = 0i64;
+        {
+            let conn = self.store.conn.lock().unwrap();
+            let rows: Vec<(String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT em.id, me.embedding_json FROM episodic_memory em \
+                     JOIN memory_embeddings me ON me.memory_id = em.id \
+                     WHERE em.binary_vector IS NULL",
+                )?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                mapped.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (id, embedding_json) in rows {
+                let Ok(vec) = serde_json::from_str::<Vec<f32>>(&embedding_json) else {
+                    tracing::warn!(id, "vector repair skipped: unparseable embedding_json");
+                    continue;
+                };
+                let packed = crate::binary_vectors::maximally_informative_binarization(&vec);
+                conn.execute(
+                    "UPDATE episodic_memory SET binary_vector = ?2 WHERE id = ?1",
+                    params![id, packed],
+                )?;
+                inserted += 1;
+            }
+        }
+        Ok(json!({
+            "status": "repaired",
+            "dry_run": false,
+            "inserted": inserted,
+            "before": before,
+            "after": self.vector_coverage()?,
+        }))
+    }
+
+    /// Test-only: manufacture the coverage gap a legacy / interrupted consolidation leaves — an
+    /// episodic row with a stored f32 embedding but no MIB `binary_vector`.
+    #[cfg(test)]
+    pub(crate) fn insert_episodic_embedding_gap_for_test(&self, id: &str, content: &str) {
+        let conn = self.store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO episodic_memory (id, content, timestamp, session_id) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, content, util::now_iso(), self.config.session_id],
+        )
+        .expect("insert episodic gap row");
+        let embedding: Vec<f32> = (0..crate::binary_vectors::EMBEDDING_DIM)
+            .map(|i| if i % 3 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) \
+             VALUES (?1, ?2, 'test')",
+            params![id, serde_json::to_string(&embedding).unwrap()],
+        )
+        .expect("insert gap embedding");
+    }
+
     /// Write a scratchpad note for the session (`beam.py` scratchpad). Returns the row id.
     pub fn scratchpad_write(&self, content: &str) -> Result<String> {
         let conn = self.store.conn.lock().unwrap();

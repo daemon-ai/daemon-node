@@ -185,7 +185,7 @@ New crate `crates/memory/daemon-mnemosyne` (auto-included by the `crates/*/*` wo
 | `chat_normalize.rs` | `chat_normalize.py` | 149 | message normalization |
 | `sync.rs` | `sync.py` + `sync_server.py` | 1607 | `sync` feature |
 | `streaming.rs` | `streaming.py` | 617 | `sync` feature |
-| `dr.rs` | [`dr/recovery.py`](Mnemosyne/mnemosyne/dr/recovery.py) | 338 | backup/restore/integrity; `backup` feature |
+| `dr.rs` | [`dr/recovery.py`](Mnemosyne/mnemosyne/dr/recovery.py) | 338 | backup/restore/integrity (no feature gate; §12.2) |
 | `diagnose.rs` | [`diagnose.py`](Mnemosyne/mnemosyne/diagnose.py) | 353 | `run_diagnostics`/`auto_fix`; backs `mnemosyne_diagnose` |
 | `cost_log.rs` | `cost_log.py` | 78 | `cost_entries` table; LLM cost accounting |
 | `plugins.rs` | `plugins.py` | 676 | hook fan-out |
@@ -911,7 +911,10 @@ by sleep. The provider injects it via `with_backends`/`open_with_backends`, the 
 same way as `lcm_aux` (the profile builder, mock fallback), and `after_turn` runs extraction at the
 async seam before `Engine::ingest_extracted` merges it. The remote-API hop (1) and local GGUF (2) stay
 deferred; **AAAK** ([`aaak.rs`](../../../memory/daemon-mnemosyne/src/aaak.rs), full category/phrase/
-structural maps) is the no-LLM fallback.
+structural maps) is the no-LLM fallback — both directions: `encode` and the `decode` reversal
+(REV maps built with Python's dict-comprehension **last-wins** collision semantics for duplicate
+shorthands, longest-key-first replacement, category prefixes restored) round-trip
+encode→decode→encode stably.
 
 **Cost logging** (`cost_log.rs` <- [`core/cost_log.py`](Mnemosyne/mnemosyne/core/cost_log.py)): when
 an LLM call is made (extraction and `llm_conflict_detector`), `log_cost(session_id, memory_count,
@@ -920,6 +923,32 @@ token_count, estimated_cost_usd, model)` (L41-L51) appends a row to the `cost_en
 the bank DB — the Rust port keeps it in its own connection (or, behind a `cost-log` feature, an
 in-bank `cost_entries` table if co-location is preferred). `get_cost_stats` (L54-L78) aggregates
 calls/tokens/cost for benchmarking.
+
+**As-built ([`cost_log.rs`](../../../memory/daemon-mnemosyne/src/cost_log.rs)):** a standalone
+module (no feature gate — it is 3 functions over one table) owning `<data_dir>/cost_log.db`:
+`log_cost` opens/creates on demand and appends, `get_cost_stats` aggregates
+calls/memories/tokens/cost + per-model breakdown, `estimate_tokens` keeps Python's `len/4`
+heuristic and `calculate_cost` its default price tier. Wired exactly where Python wires it —
+`validate_conflict_pair_logged` in [`knowledge/conflict.rs`](../../../memory/daemon-mnemosyne/src/knowledge/conflict.rs)
+(both the sleep-path and provider-path tier-2 validations) estimates prompt/response tokens and
+appends a fire-and-forget row (`memory_count = 2`, model `host-provider`); in-memory banks skip
+the write. Extraction itself does not log (parity: Python's `log_cost` has exactly one caller,
+`llm_conflict_detector.py`).
+
+**Conversation-level fact extraction as-built:** `extract.rs` also ports the C13 fact-array
+schema — `EXTRACTION_SYSTEM_PROMPT` + user template verbatim from `extraction/prompts.py`,
+`ExtractedFact {subject, predicate, object, timestamp, source, confidence}`, `parse_fact_array`
+(first `[` .. last `]`, list-or-nothing, `client.py` L197-L208), and
+`Extractor::extract_conversation_facts` formatting messages as `[i] [role]: content`. Every
+attempt (both schemas) feeds the process-global **extraction diagnostics** singleton
+([`extract/diagnostics.rs`](../../../memory/daemon-mnemosyne/src/extract/diagnostics.rs) <-
+`extraction/diagnostics.py` C13.b): per-tier attempt/success/no_output/failure counters with
+bounded, sanitized error samples, outer-call totals + `success_rate`, and a
+`get_extraction_stats()` snapshot in the Python shape. The Rust node has one live tier (`host` —
+the injected Provider); `remote/local/cloud/wrapper` are kept for shape parity. Divergence:
+unknown tiers are logged-and-dropped instead of raising (`ValueError` has no place inside the
+extraction path), and Rust error strings are flattened to one line before capping (Python gets
+that for free from `repr(exc)`).
 
 `content_sanitizer.rs` (size cap 1 MB, base64/data-URI detection, entropy >5.0 spill to blob),
 `tokens.rs` (`len/4` or tiktoken), and `chat_normalize.rs` (contraction/filler normalization) are
@@ -961,6 +990,25 @@ Not on the default recall path — an operator/maintenance capability behind a `
 - `list_backups` (L202-L231), `rotate_backups(keep=10)` (L232-L265), and `health_check` (L266+) round
   out backup lifecycle management.
 
+**As-built ([`dr.rs`](../../../memory/daemon-mnemosyne/src/dr.rs)):** no feature gate (flate2 +
+sha2 are already in the tree; a `backup` feature bought nothing). The archive format is Python's —
+gzipped SQL text (`mnemosyne_backup_YYYYMMDD_HHMMSS.db.gz` + `.gz.json` sidecar with
+timestamp/sizes/16-hex-truncated SHA-256 checksums) — and restore is `execute_batch` of the
+decompressed script, i.e. `executescript` semantics: **any archive Python's restore accepts, the
+Rust restore accepts** (covered by a legacy-shape round-trip test that restores a Python-style
+dump and reopens it through the reconcile ladder). Deliberate divergences: (a) paths are explicit
+args (+ `default_backup_dir(config)` = `<data_dir>/backups`) — the node never resolves `~`; (b)
+the dump is schema-aware where CPython `iterdump` is broken — FTS5 shadow tables are skipped
+(gh-90016 would make the archive fail its own restore), triggers are emitted *after* data so
+restore can't double-fire them, external-content FTS indexes get `'rebuild'` commands (+ a
+repopulating `INSERT ... SELECT` for the regular `fts_working`), and `PRAGMA user_version` is
+embedded so the migration ladder no-ops on a restored bank; (c) restore is atomic — rebuild into
+a sibling temp file, `PRAGMA integrity_check`, then rename over the target with WAL sidecars
+removed (Python rebuilds in `:memory:` and overwrites in place), keeping the
+`.emergency_backup.db` pre-restore copy; (d) `emergency_restore` reports the real `attempts`
+count (Python hardcodes 1). `verify_integrity`/`list_backups`/`rotate_backups`/`health_check`
+are line-for-line ports.
+
 ### 12.3 Diagnostics (`diagnose.rs` <- `diagnose.py`)
 
 Backs the `mnemosyne_diagnose` tool listed in §13.
@@ -972,6 +1020,26 @@ Backs the `mnemosyne_diagnose` tool listed in §13.
 - `auto_fix(repair_vec_working=…)` (L294+): the repair path — rebuilds the sqlite-vec shadow tables
   from the canonical rows, reindexes FTS, and reclaims orphans. In Rust this is feature-gated on
   `vec-ext` for the vector-rebuild branch; the integrity/FTS branches are always available.
+
+**As-built ([`diagnose.rs`](../../../memory/daemon-mnemosyne/src/diagnose.rs)):**
+`run_diagnostics(engine, embedder, extractor, opts)` emits the Python entry shape
+(`{ts, category, check, status, detail}`), writes the PII-safe JSONL to `<data_dir>/logs/diagnose_*.jsonl`
+(bank-adjacent, not `~/.hermes`; skipped for in-memory banks), and returns the summary
+(`log_path/checks_total/checks_passed/checks_failed/key_findings/fixable/entries`, same
+non-failure status set `OK/YES/set/OPTIONAL`). Check remapping: Python's pip-dependency section
+becomes injection/compile facts — `embedder` OK/MISSING (host provider vs hash fallback),
+`sqlite_vec` OK/OPTIONAL (`vec-ext` compiled; never a failure since §7 made scalar the runtime
+path), `llm_extractor` OK/OPTIONAL (the `ctransformers` analogue). The `vec_working` block maps
+to the stores the Rust engine actually reads via `Engine::vector_coverage()` —
+`memory_embeddings` (f32 JSON source) + `episodic_memory.binary_vector` (MIB derivative) — with
+Python's status vocabulary (`empty/no_vectors/partial/complete`) and count-only fields;
+`Engine::repair_vector_coverage(dry_run)` idempotently backfills episodic MIB binaries from
+stored embeddings (the deterministic gap; re-embedding absent embeddings stays a host operation,
+Python's `reindex_vectors`). The `mnemosyne_diagnose` tool keeps Python's wire args
+(`repair_vec_working`, `dry_run` — `_handle_diagnose`) and appends `active_provider_db_path`.
+`auto_fix` is shape-compatible (`{fixed, failed, skipped, ran}`) but never executes anything —
+there is no pip in a daemon node; fixable findings land in `skipped` with host-side remediations
+(dry-run keeps the `WOULD …` phrasing).
 
 ---
 
@@ -1149,8 +1217,12 @@ identity) since no `rust_cave_001` equivalent is linked.
   layered atop the `(S,P)` veracity path in `run_sleep`); and threshold-0.8 fuzzy entity matching
   (`entities::find_similar_entities`) wired into `inject_entity_candidates`. MIB binary bonus shipped
   in P0.
-- **P3 — ecosystem:** SHMR, patterns, and plugins have since landed (§9.4, §13); sync/streaming and
-  the local-GGUF fallback remain.
+- **P3 — ecosystem:** SHMR, patterns, and plugins have since landed (§9.4, §13), and the peripheral
+  systems followed: AAAK decode (encode/decode round-trip, §11), `cost_log.rs` wired into the tier-2
+  conflict validator (§11), the C13 conversation-level fact-array extraction + process-global
+  extraction diagnostics (§11), `diagnose.rs` behind the full `mnemosyne_diagnose` tool surface with
+  the §7-remapped vector coverage/repair (§12.3), and `dr.rs` gzip backup/restore compatible with
+  Python's archive format (§12.2). Sync/streaming and the local-GGUF fallback remain.
 
 ---
 
