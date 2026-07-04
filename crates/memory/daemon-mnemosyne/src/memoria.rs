@@ -10,13 +10,15 @@
 //! extra candidate (`beam.py` L6006-L6059).
 //!
 //! This is an English-language port: it uses the `MULTILINGUAL_PATTERNS['en']` rules
-//! (`beam.py` L4126-L4147). Language detection and the de/ru/it/es pattern banks are out of scope;
-//! the `memoria_facts` versioning columns absent from the Rust schema are likewise dropped, so each
-//! extracted fact is stored as a fresh row (no version chains / evolution pointers).
+//! (`beam.py` L4126-L4147). Language detection and the de/ru/it/es pattern banks are out of scope.
+//! Fact versioning is ported: when a `(session, key, fact_type)` slot gets a new value, the old
+//! row is closed (`valid_to_msg_idx`) and the new row carries `version_id + 1` with a
+//! `previous_value` pointer (`beam.py` `_insert_fact` L4477), and the fact retriever renders the
+//! evolution chain (`beam.py` L4787-L4814).
 
 use crate::error::Result;
 use regex::Regex;
-use rusqlite::{params, params_from_iter, types::Value, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use std::sync::OnceLock;
 
 /// A MEMORIA retrieval hit (`beam.py` `memoria_retrieve` return dict). `source == "fallback"` means
@@ -262,13 +264,86 @@ fn insert_fact(
     importance: f64,
     source_memory_id: &str,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO memoria_facts \
-         (session_id, message_idx, fact_type, key, value, context_snippet, importance, timestamp, source_memory_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![session, msg_idx, ftype, key, value, ctx, importance, crate::util::now_iso(), source_memory_id],
-    )?;
-    Ok(())
+    let plain_insert = |conn: &Connection| -> Result<()> {
+        conn.execute(
+            "INSERT INTO memoria_facts \
+             (session_id, message_idx, fact_type, key, value, context_snippet, importance, \
+              timestamp, valid_from_msg_idx, source_memory_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session,
+                msg_idx,
+                ftype,
+                key,
+                value,
+                ctx,
+                importance,
+                crate::util::now_iso(),
+                msg_idx,
+                source_memory_id
+            ],
+        )?;
+        Ok(())
+    };
+
+    // Dates all share generic keys ("iso_date", "named_date"): versioning would create false
+    // evolution chains when different events happen on different dates (`beam.py` L4480-L4489).
+    if ftype == "date" {
+        return plain_insert(conn);
+    }
+
+    // Version the (session, key, fact_type) slot: close the current row and chain the new value
+    // to it (`beam.py` `_insert_fact` L4491-L4517).
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, value FROM memoria_facts \
+             WHERE session_id = ?1 AND key = ?2 AND fact_type = ?3 AND valid_to_msg_idx IS NULL \
+             ORDER BY version_id DESC LIMIT 1",
+            params![session, key, ftype],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match existing {
+        Some((old_id, old_value)) if old_value != value => {
+            conn.execute(
+                "UPDATE memoria_facts SET valid_to_msg_idx = ?1, previous_value = value \
+                 WHERE id = ?2",
+                params![msg_idx, old_id],
+            )?;
+            let prev_version: i64 = conn
+                .query_row(
+                    "SELECT version_id FROM memoria_facts WHERE id = ?1",
+                    params![old_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT INTO memoria_facts \
+                 (session_id, message_idx, fact_type, key, value, context_snippet, importance, \
+                  timestamp, version_id, previous_value, updated_msg_idx, valid_from_msg_idx, \
+                  source_memory_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    session,
+                    msg_idx,
+                    ftype,
+                    key,
+                    value,
+                    ctx,
+                    importance,
+                    crate::util::now_iso(),
+                    prev_version + 1,
+                    old_value,
+                    msg_idx,
+                    msg_idx,
+                    source_memory_id
+                ],
+            )?;
+            Ok(())
+        }
+        _ => plain_insert(conn),
+    }
 }
 
 fn insert_timeline(
@@ -869,21 +944,31 @@ fn classify_ability(query: &str) -> String {
     String::new()
 }
 
-fn query_facts(
-    conn: &Connection,
-    sql: &str,
-    binds: &[Value],
-) -> Vec<(String, String, String, String, Option<String>)> {
+/// One `memoria_facts` candidate row with its version metadata (`beam.py` L4688).
+#[derive(Clone)]
+struct FactRow {
+    ftype: String,
+    key: String,
+    value: String,
+    previous_value: Option<String>,
+    updated_msg_idx: Option<i64>,
+    version_id: i64,
+    source_memory_id: Option<String>,
+}
+
+fn query_facts(conn: &Connection, sql: &str, binds: &[Value]) -> Vec<FactRow> {
     let mut out = Vec::new();
     if let Ok(mut stmt) = conn.prepare(sql) {
         if let Ok(rows) = stmt.query_map(params_from_iter(binds.iter().cloned()), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(4)?,
-            ))
+            Ok(FactRow {
+                ftype: r.get(0)?,
+                key: r.get(1)?,
+                value: r.get(2)?,
+                previous_value: r.get(3)?,
+                updated_msg_idx: r.get(4)?,
+                version_id: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                source_memory_id: r.get(6)?,
+            })
         }) {
             out = rows.flatten().collect();
         }
@@ -900,20 +985,19 @@ fn fact_retrieve(
     top_k: usize,
 ) -> Option<MemoriaResult> {
     let q_lower = query.to_lowercase();
-    let mut facts: Vec<(String, String, String, String, Option<String>)> = Vec::new();
+    let mut facts: Vec<FactRow> = Vec::new();
     let mut seen: Vec<(String, String)> = Vec::new();
-    let push = |rows: Vec<(String, String, String, String, Option<String>)>,
-                facts: &mut Vec<(String, String, String, String, Option<String>)>,
-                seen: &mut Vec<(String, String)>| {
+    let push = |rows: Vec<FactRow>, facts: &mut Vec<FactRow>, seen: &mut Vec<(String, String)>| {
         for row in rows {
-            let fk = (row.1.clone(), row.2.clone());
+            let fk = (row.key.clone(), row.value.clone());
             if !seen.contains(&fk) {
                 seen.push(fk);
                 facts.push(row);
             }
         }
     };
-    let sel = "SELECT fact_type, key, value, context_snippet, source_memory_id FROM memoria_facts";
+    let sel = "SELECT fact_type, key, value, previous_value, updated_msg_idx, version_id, \
+               source_memory_id FROM memoria_facts";
 
     // Pass 1: numbers in the query -> match fact values.
     let numbers: Vec<&str> = re(r"\b(\d+)\b")
@@ -1043,11 +1127,46 @@ fn fact_retrieve(
     if facts.is_empty() {
         return None;
     }
+
+    // Group by key and keep only the newest version per key — multiple versions of one key read
+    // as contradictions — rendering the older hits as an evolution chain (`beam.py` L4787-L4814).
+    let mut key_order: Vec<String> = Vec::new();
+    let mut by_key: std::collections::HashMap<String, Vec<FactRow>> =
+        std::collections::HashMap::new();
+    for f in facts {
+        if !by_key.contains_key(&f.key) {
+            key_order.push(f.key.clone());
+        }
+        by_key.entry(f.key.clone()).or_default().push(f);
+    }
+    let mut latest: Vec<(FactRow, Option<String>)> = Vec::new();
+    for key in key_order {
+        let mut versions = by_key.remove(&key).unwrap_or_default();
+        versions.sort_by_key(|v| std::cmp::Reverse(v.version_id));
+        let newest = versions[0].clone();
+        let evolution = (versions.len() > 1).then(|| {
+            let mut chain: Vec<&str> = versions[1..].iter().map(|v| v.value.as_str()).collect();
+            chain.reverse();
+            format!("{} -> {}", chain.join(" -> "), newest.value)
+        });
+        latest.push((newest, evolution));
+    }
+    latest.sort_by_key(|(f, _)| std::cmp::Reverse(f.version_id));
+
     let mut lines = Vec::new();
     let mut source_ids = Vec::new();
-    for f in facts.iter().take(top_k) {
-        lines.push(format!("[Fact {}] {}: {}", f.0, f.1, f.2));
-        if let Some(sid) = &f.4 {
+    for (f, evolution) in latest.iter().take(top_k) {
+        let mut line = format!("[Fact {}] {}: {}", f.ftype, f.key, f.value);
+        if let Some(evo) = evolution {
+            line.push_str(&format!(" (evolved: {evo})"));
+        } else if let (Some(prev), true) = (&f.previous_value, f.version_id > 0) {
+            let at = f
+                .updated_msg_idx
+                .map_or_else(|| "?".to_string(), |i| i.to_string());
+            line.push_str(&format!(" (was: {prev}, updated at msg_idx {at})"));
+        }
+        lines.push(line);
+        if let Some(sid) = &f.source_memory_id {
             source_ids.push(sid.clone());
         }
     }
@@ -1509,6 +1628,62 @@ mod tests {
         assert!(
             got.context.to_lowercase().contains("mongodb"),
             "ctx: {}",
+            got.context
+        );
+    }
+
+    #[test]
+    fn fact_versioning_chains_value_changes() {
+        let s = store();
+        let conn = s.conn.lock().unwrap();
+        // Same slot (postgresql_version), three values across messages -> a version chain.
+        extract_and_store(&conn, "sess", "We run PostgreSQL v14.2 in prod.", 0, "m1").unwrap();
+        extract_and_store(
+            &conn,
+            "sess",
+            "Upgraded to PostgreSQL v15.1 today.",
+            4,
+            "m2",
+        )
+        .unwrap();
+        extract_and_store(&conn, "sess", "Now on PostgreSQL v16.0 finally.", 9, "m3").unwrap();
+
+        // The write side closes superseded rows and bumps version_id (`beam.py` L4491-L4517).
+        let (open_rows, max_version): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE valid_to_msg_idx IS NULL), MAX(version_id) \
+                 FROM memoria_facts WHERE key = 'postgresql_version'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(open_rows, 1, "exactly one current version per slot");
+        assert_eq!(max_version, 2, "two supersessions -> version_id 2");
+        let (prev, updated_at): (String, i64) = conn
+            .query_row(
+                "SELECT previous_value, updated_msg_idx FROM memoria_facts \
+                 WHERE key = 'postgresql_version' AND valid_to_msg_idx IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(prev, "15.1");
+        assert_eq!(updated_at, 9);
+
+        // The read side renders only the newest value, with the evolution chain when the older
+        // versions also matched (`beam.py` L4787-L4814).
+        let got = memoria_retrieve(&conn, "sess", "What version of PostgreSQL?", 5).expect("hit");
+        assert!(got.context.contains("16.0"), "ctx: {}", got.context);
+        assert_eq!(
+            got.context.matches("postgresql_version:").count(),
+            1,
+            "one line per key: {}",
+            got.context
+        );
+        assert!(
+            got.context.contains("(evolved: 14.2 -> 15.1 -> 16.0)")
+                || got.context.contains("(was: 15.1, updated at msg_idx 9)"),
+            "version history rendered: {}",
             got.context
         );
     }

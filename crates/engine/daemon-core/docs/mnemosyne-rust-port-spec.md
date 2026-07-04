@@ -284,6 +284,13 @@ then conditional `ALTER TABLE ADD COLUMN`). The Rust port emits all *current* co
 `CREATE TABLE` DDL (no historical migration needed for a fresh store) but keeps an idempotent
 `add_column_if_missing(conn, table, col, ty)` helper for opening pre-existing Python DBs.
 
+**As-built ([`banks.rs`](../../../memory/daemon-mnemosyne/src/banks.rs)):** the `banks.py`
+`BankManager` CRUD is ported 1:1 — `create_bank` / `delete_bank(force)` / `list_banks` /
+`bank_exists` / `rename_bank` / `bank_stats`, with the same name validation (alphanumeric + `-_`,
+max 64, `default` reserved: always listed, force-only delete, never renamed) and the same path
+mapping as `MnemosyneConfig::bank_db_path`. One divergence: no env-derived default root — the
+host injects `data_dir`, as everywhere else in the crate.
+
 **As-built ([`store/mod.rs`](../../../memory/daemon-mnemosyne/src/store/mod.rs) `legacy`):** the
 open path is `reconcile_columns` -> migration ladder -> `e6_backfill`, all idempotent no-ops on
 Rust-created banks. `reconcile_columns` generalizes Python's ladder: the expected shape is read
@@ -345,6 +352,22 @@ Same shape as working memory plus: `rowid INTEGER PRIMARY KEY AUTOINCREMENT` (th
   timestamp, source_msg_id, confidence, created_at`.
 - `memoria_facts/timelines/instructions/preferences/kg` (L754-L840): regex-extracted MEMORIA tables.
 
+**As-built ([`store/schema.rs`](../../../memory/daemon-mnemosyne/src/store/schema.rs)):** the
+`PRAGMA user_version` ladder is M1 (full bank schema) → M2 (`sync_meta`) → M3 (index/trigger
+completeness). M1 carries Python's write-path `NOT NULL`s (`memory_events.memory_id/operation/
+timestamp/device_id`, `memory_validations.memory_id/validator/action`, `facts.session_id/subject/
+predicate/object`) and the full `memoria_*` shape — `memoria_facts` versioning columns
+(`version_id`, `previous_value`, `updated_msg_idx`, `valid_from/to_msg_idx`, beam L777-L787 —
+with the `_insert_fact` version-chaining write path and the evolution-chain fact rendering ported
+in [`memoria.rs`](../../../memory/daemon-mnemosyne/src/memoria.rs), beam L4477/L4787) and
+the `session_id DEFAULT 'default'` / `confidence REAL DEFAULT 0.7` defaults on the other four. M3
+adds every remaining Python index (working-memory source/claims/recall/context/temporal/identity,
+episodic timestamp/source/scope/temporal/identity, events, validations, embeddings, facts,
+memoria, knowledge-layer) plus the `trim_validations_to_3` ring-buffer trigger and the
+`facts_ai`/`facts_ad` FTS sync triggers with a one-shot `fts_facts` rebuild. A golden-file test
+(`schema.golden.sql`, `DAEMON_UPDATE_SCHEMA=1` to refresh) pins the final shape; SHMR tables stay
+lazily created by `shmr::ensure_schema` exactly as in Python.
+
 ### 4.5 Virtual tables and triggers
 
 - sqlite-vec (`vec-ext` feature): `vec_episodes` / `vec_working` / `vec_facts` as
@@ -356,6 +379,14 @@ Same shape as working memory plus: `rowid INTEGER PRIMARY KEY AUTOINCREMENT` (th
   `fts_facts` external-content over `facts` (L987-L990).
 - Triggers keep FTS in sync: `em_ai/em_ad/em_au` (L711-L725), `wm_ai/wm_ad/wm_au` (L729-L750),
   `facts_ai/facts_ad` (L993-L1003).
+
+**As-built decision (ratified):** the default vector path is f32-BLOB columns + in-Rust scalar
+cosine (`recall/vector.rs`) — no `vec0` virtual tables are created, and `binary_vector` BLOBs
+(§5.2) provide the Hamming prefilter. This matches Python's own no-extension fallback
+(`sqlite_vec` absent → JSON/BLOB cosine) and keeps the default build free of C extensions and
+`unsafe`. The `vec-ext` feature gates the sqlite-vec auto-extension registration; wiring
+`vec_episodes`/`vec_working`/`vec_facts` vec0 tables + KNN `MATCH` queries onto it is deferred
+until profiling shows the scalar path limiting (banks ≫ 10k episodic rows).
 
 ### 4.6 Knowledge tables (co-located in the same bank DB)
 

@@ -19,8 +19,13 @@ use std::sync::{LazyLock, Mutex};
 /// full bank schema; future schema changes append an `M::up("…")`. `busy_timeout` is applied in
 /// [`Store::init`] before `to_latest`; the `vec-ext` `vec0` virtual tables in the schema resolve
 /// because [`register_vec_extension`] runs before the connection is opened.
-static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(schema::SCHEMA), M::up(schema::SCHEMA_V2)]));
+static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(schema::SCHEMA),
+        M::up(schema::SCHEMA_V2),
+        M::up(schema::SCHEMA_V3),
+    ])
+});
 
 /// The SQLite-backed BEAM store (one file per bank).
 pub struct Store {
@@ -236,7 +241,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 3, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

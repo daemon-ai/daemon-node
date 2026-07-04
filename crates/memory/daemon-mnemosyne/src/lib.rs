@@ -21,6 +21,7 @@
 #![cfg_attr(not(feature = "vec-ext"), forbid(unsafe_code))]
 
 pub mod aaak;
+pub mod banks;
 pub mod binary_vectors;
 pub mod chat_normalize;
 pub mod config;
