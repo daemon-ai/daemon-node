@@ -639,9 +639,11 @@ impl Engine {
             }
         }
         let budget = self.config.context_budget_tokens.map(|b| b as usize);
+        // `before_turn` may sanitize the provider-facing conversation in place (LCM active-replay
+        // redaction/quarantine) in addition to measuring pressure.
         let pressure = self
             .context
-            .before_turn(&self.snapshot.conversation, budget);
+            .before_turn(&mut self.snapshot.conversation, budget);
         let max_context = self.provider.capabilities().max_context.map(|c| c as u64);
         // Compact to the context engine's *effective* budget: the host `context_budget_tokens`
         // override when set, else the engine's own threshold (LCM sizes one from the model window in

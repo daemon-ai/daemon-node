@@ -127,8 +127,9 @@ fn media_uri_re() -> &'static Regex {
 }
 
 /// Convert unix seconds (UTC) to `(year, month, day, hour, min, sec)` (Howard Hinnant's
-/// `civil_from_days`); avoids a `chrono` dependency for the daily-file name.
-fn civil_datetime(secs: f64) -> (i64, u32, u32, u32, u32, u32) {
+/// `civil_from_days`); avoids a `chrono` dependency for the daily-file name (also stamps the
+/// `/lcm backup` snapshot filename).
+pub(crate) fn civil_datetime(secs: f64) -> (i64, u32, u32, u32, u32, u32) {
     let secs = secs.max(0.0) as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);

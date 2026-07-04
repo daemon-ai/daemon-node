@@ -1,5 +1,7 @@
 CREATE INDEX idx_lcm_lifecycle_current_session
     ON lcm_lifecycle_state(current_session_id);
+CREATE INDEX idx_lcm_lifecycle_last_finalized_session
+    ON lcm_lifecycle_state(last_finalized_session_id);
 CREATE INDEX idx_msg_session        ON messages(session_id, store_id);
 CREATE INDEX idx_msg_session_ts     ON messages(session_id, timestamp);
 CREATE INDEX idx_msg_source_session ON messages(source, session_id, store_id);
@@ -17,7 +19,7 @@ CREATE TABLE lcm_lifecycle_state (
     last_finalized_at                REAL,
     debt_updated_at                  REAL,
     updated_at                       REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
+, last_maintenance_attempt_at REAL, last_rollover_at REAL, last_reset_at REAL);
 CREATE TABLE lcm_migration_state (
     step_name    TEXT PRIMARY KEY,
     completed_at REAL

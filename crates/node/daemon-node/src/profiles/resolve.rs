@@ -467,6 +467,6 @@ mod tests {
             serde_json::from_str(&lcm.call_tool("lcm_status", serde_json::json!({})).await)
                 .expect("lcm_status returns JSON");
         assert_eq!(status["session_id"], "lcm-tools");
-        assert!(status["store"]["session_messages"].is_number());
+        assert!(status["store"]["messages"].is_number());
     }
 }
