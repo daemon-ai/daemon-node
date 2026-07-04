@@ -224,10 +224,14 @@
               pname = "daemon-infer-${name}";
               inherit cargoArtifacts;
               cargoExtraArgs = "-p daemon-infer --features ${features}";
-              nativeBuildInputs = engineNativeInputs ++ [ pkgs.patchelf ];
+              # The patchelf/libgomp RUNPATH fixup is a Linux-only concern (ELF binaries +
+              # libgomp.so). On darwin the worker is a Mach-O binary and llama.cpp's OpenMP is
+              # resolved through the Apple toolchain, so both the tool and the postInstall step
+              # are gated to Linux (avoids "patchelf: not an ELF executable" on aarch64-darwin).
+              nativeBuildInputs = engineNativeInputs ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.patchelf ];
               LIBCLANG_PATH = libclangPath;
               doCheck = false;
-              postInstall = ''
+              postInstall = lib.optionalString pkgs.stdenv.isLinux ''
                 patchelf --add-rpath ${pkgs.gcc.cc.lib}/lib "$out/bin/daemon-infer"
               '';
             }
