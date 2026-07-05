@@ -244,6 +244,47 @@
         daemon-infer-llama = buildEngineWorker "llama" "llama,mtmd";
         daemon-infer-mistralrs = buildEngineWorker "mistralrs" "mistralrs";
 
+        # ------------------------------------------------------------------------------------
+        # macOS (aarch64-darwin) Metal inference lanes. Metal is the first-class Apple GPU path
+        # for both engines and these outputs are darwin-gated (see `packages` below), so Linux
+        # evaluation is untouched.
+        #
+        # Deliberate decision: NO Vulkan/MoltenVK lane on macOS. Metal is the native Apple
+        # backend; layering the Vulkan lane through MoltenVK would add a translation shim (and a
+        # MoltenVK dependency) for no benefit — the engines target Metal directly and fall back to
+        # Metal anyway. The Linux `daemon-infer-vulkan` lane stays the only Vulkan output.
+        #
+        # Framework linkage: on this modern nixpkgs-darwin the default `apple-sdk` in the stdenv
+        # supplies Foundation/Metal/MetalKit/Accelerate to the linker automatically, so these
+        # lanes add NO explicit framework/SDK inputs (verified: the four lanes build green on an
+        # M1 without them). Add SDK inputs here only if a future configure/link error demands it.
+
+        # llama.cpp Metal lane: `--features llama,mtmd,metal` forwards to `llama-cpp-4/metal` ->
+        # `llama-cpp-sys-4` -> `GGML_METAL=ON` in the from-source cmake build. `mtmd` rides the
+        # same sandbox cmake build (LLAMA_BUILD_TOOLS) exactly as the Linux llama lane. No xcrun
+        # shader step is needed: `GGML_METAL_EMBED_LIBRARY` defaults on from `GGML_METAL`, so the
+        # Metal shader library is embedded and JIT-compiled at runtime.
+        daemon-infer-metal = buildEngineWorker "metal" "llama,mtmd,metal";
+
+        # mistral.rs Metal lane: `--features mistralrs,mistralrs-metal` forwards to
+        # `mistralrs/metal`. `MISTRALRS_METAL_PRECOMPILE=0` forces mistral.rs to JIT-compile its
+        # Metal kernels at runtime instead of precompiling them with `xcrun metal` at build time
+        # — the xcrun precompile step cannot run in the nix sandbox. Not routed through
+        # `buildEngineWorker` because it needs that extra build-time env var; the rest mirrors the
+        # Linux mistralrs lane (engine toolchain, LIBCLANG_PATH, doCheck = false, no patchelf).
+        daemon-infer-mistralrs-metal = craneLib.buildPackage (
+          commonArgs
+          // {
+            pname = "daemon-infer-mistralrs-metal";
+            inherit cargoArtifacts;
+            cargoExtraArgs = "-p daemon-infer --features mistralrs,mistralrs-metal";
+            nativeBuildInputs = engineNativeInputs;
+            LIBCLANG_PATH = libclangPath;
+            MISTRALRS_METAL_PRECOMPILE = "0";
+            doCheck = false;
+          }
+        );
+
         # The authoritative "llama-cpp-4 compiles with the Vulkan backend" gate: build the worker
         # `--features vulkan`, which forwards to `llama-cpp-4/vulkan` -> `llama-cpp-sys-4/vulkan` ->
         # `GGML_VULKAN=ON` in cmake. Unlike the CPU lanes this needs the Vulkan SDK pieces at build
@@ -693,6 +734,15 @@
           # `daemon-infer-llama-windows` lane and available for the superproject's NSIS bundling.
           llama-cpp-windows = llamaCppWindows;
           default = daemon;
+        }
+        # macOS-only Metal inference lanes. Darwin-gated (mirroring how the devShells gate the
+        # Linux-only vulkan/cuda shells) so `nix flake show` / eval on Linux never lists or forces
+        # them; they only appear under `packages.aarch64-darwin`.
+        // lib.optionalAttrs pkgs.stdenv.isDarwin {
+          inherit
+            daemon-infer-metal
+            daemon-infer-mistralrs-metal
+            ;
         };
 
         apps = {
