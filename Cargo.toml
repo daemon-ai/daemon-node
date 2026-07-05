@@ -242,6 +242,7 @@ daemon-infer = { path = "crates/providers/daemon-infer", default-features = fals
 daemon-models = { path = "crates/providers/daemon-models" }
 daemon-auth = { path = "crates/substrate/daemon-auth" }
 daemon-store = { path = "crates/substrate/daemon-store" }
+daemon-workspace-index = { path = "crates/substrate/daemon-workspace-index" }
 daemon-processes = { path = "crates/substrate/daemon-processes" }
 daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
@@ -279,6 +280,7 @@ daemon-tool-todo = { path = "tools/daemon-tool-todo" }
 daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
 daemon-tool-execute-code = { path = "tools/daemon-tool-execute-code" }
 daemon-tool-session-search = { path = "tools/daemon-tool-session-search" }
+daemon-tool-semantic-search = { path = "tools/daemon-tool-semantic-search" }
 daemon-skills = { path = "crates/skills/daemon-skills" }
 daemon-tool-skill = { path = "tools/daemon-tool-skill" }
 

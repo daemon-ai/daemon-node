@@ -68,6 +68,7 @@ use daemon_supervision::ManagedUnit;
 use daemon_tool_clarify::ClarifyTool;
 use daemon_tool_execute_code::{ExecuteCodeSettings, ExecuteCodeTool};
 use daemon_tool_metta::MettaTool;
+use daemon_tool_semantic_search::SemanticSearchTool;
 use daemon_tool_session_search::{
     ArchiveBrief, ArchiveHit, ArchiveSession, ArchiveTurn, SessionArchive, SessionSearchTool,
 };
@@ -78,6 +79,7 @@ use daemon_tool_web::{
     WebSearchTool,
 };
 use daemon_transport::RemoteHost;
+use daemon_workspace_index::WorkspaceIndex;
 
 use config::{
     ContextEngineKind, EmbedKind, MemoryProviderKind, NodeConfig, ProviderKind, RoutingConfig,
@@ -2156,7 +2158,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         .builder_for(&cred_profile)
         .map(|b| b())
         .unwrap_or_else(|| Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>);
-    let memory = build_memory(&cfg, embedder, Some(mnemosyne_llm));
+    let memory = build_memory(&cfg, embedder.clone(), Some(mnemosyne_llm));
     // Both context (`lcm_*`) and memory (`mnemosyne_*`) tools register on every role registry.
     let mut extra_tools: Vec<Arc<dyn Tool>> = memory
         .tools
@@ -2182,6 +2184,30 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // late-bound to the assembled node below (`set_live`) so resident live sessions are readable.
     let session_archive = Arc::new(NodeSessionArchive::new(store.clone()));
     extra_tools.push(Arc::new(SessionSearchTool::new(session_archive.clone())) as Arc<dyn Tool>);
+
+    // Embedding-based workspace search (`semantic_search`, Cursor SemanticSearch parity): a
+    // background task keeps a per-workspace vector index fresh and the tool queries it, scoped to the
+    // calling session's workspace subtree. Wired only when an embedder is configured AND
+    // `[workspace_index].enable` is set; an open failure logs and skips so the node still boots. The
+    // cancel token rides the existing shutdown path (below) to stop the reconcile loop cleanly.
+    let workspace_index_cancel = tokio_util::sync::CancellationToken::new();
+    if let (Some(embedder), true) = (embedder.clone(), cfg.workspace_index.enable) {
+        match WorkspaceIndex::open(
+            &cfg.data_dir.join("workspace-index.sqlite"),
+            cfg.workspace_root(),
+            embedder,
+            cfg.workspace_index.clone().into(),
+        ) {
+            Ok(index) => {
+                index.spawn(workspace_index_cancel.clone());
+                extra_tools.push(Arc::new(SemanticSearchTool::new(index)) as Arc<dyn Tool>);
+                tracing::info!("semantic_search tool enabled (workspace index building)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "opening the workspace index failed; semantic_search off");
+            }
+        }
+    }
 
     // The auxiliary provider for background session-title generation, resolved like `lcm_aux`
     // (the profile's builder). `None` — provider unset or `[sessions].title_generation = false` —
@@ -2707,6 +2733,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let signal = shutdown.await?;
     tracing::info!(signal, "shutdown signal received; shutting down");
+    // Stop the workspace-index reconcile loop cleanly (no-op when the index was never wired).
+    workspace_index_cancel.cancel();
     #[cfg(unix)]
     server.abort();
     #[cfg(windows)]

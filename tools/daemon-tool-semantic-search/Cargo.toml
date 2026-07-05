@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-tool-semantic-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+# The embedding index this tool queries.
+daemon-workspace-index = { workspace = true }
+async-trait = { workspace = true }
+# Parse the JSON tool-call args.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true
