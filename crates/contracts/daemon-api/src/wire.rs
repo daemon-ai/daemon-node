@@ -517,6 +517,11 @@ pub enum ApiRequest {
         /// Max hits (`0` = a server default).
         limit: u32,
     },
+    /// [`ControlApi::session_recap`] — a pure-local recap of one session's recent activity.
+    SessionRecap {
+        /// The session to recap.
+        session: SessionId,
+    },
     /// [`ControlApi::session_update_meta`] — rename/pin/archive a session (roster session actions).
     SessionUpdateMeta {
         /// The session to update.
@@ -1045,6 +1050,8 @@ pub enum ApiResponse {
     SessionDetail(Option<SessionDetail>),
     /// Full-text session-search hits (session_search).
     SessionSearch(Vec<SessionSearchHit>),
+    /// A session's pure-local activity recap, or `None` if unknown/unrecoverable (session_recap).
+    SessionRecap(Option<SessionRecap>),
     /// The ACP agent catalog (acp_discover / acp_catalog).
     AcpCatalog(Vec<AcpAgentEntry>),
     /// The runtime provider registry (provider_list).

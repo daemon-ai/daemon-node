@@ -244,6 +244,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // The node-wide event feed (L3): `events_since` serves from this ring and the §5 emit hooks
     // push onto it.
     .with_node_events(shared.node_events.clone());
+    // Background session-title generation (hermes title_generator parity), when the binary resolved
+    // an auxiliary provider for it.
+    if let Some(aux) = a.title_aux.clone() {
+        node_api = node_api.with_title_aux(aux);
+    }
     // Bind every optional sub-surface (workspace/blob/cron/models/profiles/credentials/auth/skills/
     // routing/cloud/acp/model-factory/background/checkpoints) + the fleet-change bridge. Order
     // preserved from the original inline block.

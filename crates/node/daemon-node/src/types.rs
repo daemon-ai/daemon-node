@@ -162,6 +162,11 @@ pub struct NodeAssembly {
     /// 180 s/600 s foreground timeouts, watch rate limits), so tests just pass
     /// `Default::default()`.
     pub processes: daemon_processes::ProcessesConfig,
+    /// The auxiliary provider for background session-title generation (resolved by the binary the
+    /// same way as the LCM/Mnemosyne aux providers): after a live session's first exchange, one
+    /// best-effort `task = "title_generation"` call replaces the truncation-seeded roster title.
+    /// `None` keeps seeded titles only (tests / nodes without an aux provider).
+    pub title_aux: Option<Arc<dyn daemon_core::Provider>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.

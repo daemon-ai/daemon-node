@@ -151,7 +151,7 @@ use daemon_core::{
 };
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
-    AgentCommand, AgentEvent, DeliveryTarget, Direction, Disposition, HostRequest,
+    AgentCommand, AgentEvent, ConvView, DeliveryTarget, Direction, Disposition, HostRequest,
     HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin,
     OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId, UserMsg,
 };
@@ -542,7 +542,7 @@ pub(crate) use messaging::participant_label;
 pub(crate) use overlay::approval_mode_to_policy;
 pub(crate) use profile::profile_err;
 pub(crate) use roster::{
-    filtered_tree, forward_event, owner_visible, paginate_roster, session_in_scope,
+    filtered_tree, forward_event, owner_visible, paginate_roster, seed_title, session_in_scope,
     session_info_from,
 };
 pub(crate) use routing::{

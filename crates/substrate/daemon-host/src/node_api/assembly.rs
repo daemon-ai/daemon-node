@@ -250,6 +250,15 @@ impl NodeApiImpl {
         self
     }
 
+    /// Attach the auxiliary provider for background session-title generation: after a live
+    /// session's first exchange completes, one best-effort `task = "title_generation"` call
+    /// replaces the truncation-seeded roster title (hermes `title_generator` parity). Absent,
+    /// sessions keep their seeded titles. Call during assembly.
+    pub fn with_title_aux(self, aux: Arc<dyn daemon_core::Provider>) -> Self {
+        self.live.set_title_aux(aux);
+        self
+    }
+
     /// Attach the model-management facade backing the `ModelApi` sub-surface, with the default
     /// profile a `model_activate` (no explicit profile) applies to. Call during assembly.
     pub fn with_models(

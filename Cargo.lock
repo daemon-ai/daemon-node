@@ -2099,6 +2099,7 @@ dependencies = [
  "daemon-tool-execute-code",
  "daemon-tool-fs",
  "daemon-tool-metta",
+ "daemon-tool-session-search",
  "daemon-tool-skill",
  "daemon-tool-todo",
  "daemon-tool-vision",
@@ -2909,6 +2910,20 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-processes",
+ "daemon-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "daemon-tool-session-search"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
  "daemon-protocol",
  "serde",
  "serde_json",

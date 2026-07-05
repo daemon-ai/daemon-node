@@ -181,6 +181,8 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `routing.instance_profile` | `DAEMON_ROUTING__INSTANCE_PROFILE` | array | `[]` |
 | `routing.route` | `DAEMON_ROUTING__ROUTE` | array | `[]` |
 | `scan_interval_ms` | `DAEMON_SCAN_INTERVAL_MS` | number | `10` |
+| `sessions.backfill_index` | `DAEMON_SESSIONS__BACKFILL_INDEX` | bool | `true` |
+| `sessions.title_generation` | `DAEMON_SESSIONS__TITLE_GENERATION` | bool | `true` |
 | `shell.persist_cwd` | `DAEMON_SHELL__PERSIST_CWD` | bool | `true` |
 | `shell.timeout_default_secs` | `DAEMON_SHELL__TIMEOUT_DEFAULT_SECS` | number | `180` |
 | `shell.timeout_max_secs` | `DAEMON_SHELL__TIMEOUT_MAX_SECS` | number | `600` |

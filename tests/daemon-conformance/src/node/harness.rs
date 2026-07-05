@@ -81,6 +81,7 @@ pub fn assemble_over(
         blob_root: None,
         fs: Default::default(),
         processes: Default::default(),
+        title_aux: None,
     })
 }
 
@@ -160,6 +161,7 @@ pub fn assemble_demo() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
         blob_root: None,
         fs: Default::default(),
         processes: Default::default(),
+        title_aux: None,
     });
     (node, handle)
 }
@@ -294,6 +296,7 @@ fn assemble_daemon_api_gateway_inner(
         blob_root: None,
         fs: Default::default(),
         processes: Default::default(),
+        title_aux: None,
     });
     (node, cred_store, handle)
 }

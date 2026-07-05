@@ -224,6 +224,25 @@ impl ControlApi for NodeApiImpl {
         out
     }
 
+    async fn session_recap(&self, session: SessionId) -> Option<daemon_api::SessionRecap> {
+        // Auth 4 (read-of-one): behave as not-found for a session the caller may not see (own
+        // sessions only unless `SessionSeeAll`), exactly like `session_get` — no existence oracle.
+        let meta = self.store.session_meta(&session).await.unwrap_or_default();
+        if !owner_visible(&current_principal(), &meta.owner) {
+            return None;
+        }
+        // Source order: the durable snapshot first (full fidelity — tool args feed `files_touched`;
+        // for a resident mid-turn session this is its LAST CHECKPOINT, by design), else a resident
+        // live session's conversation view (tool names only — `files_touched` stays empty there).
+        let turns = match self.store.peek_snapshot(&session).await {
+            Some(blob) => crate::session_index::turns_from_conversation(
+                &Snapshot::decode(&blob).ok()?.conversation,
+            ),
+            None => crate::session_index::turns_from_view(&self.live.conv_view(&session).await?),
+        };
+        Some(crate::session_index::build_recap(&turns, meta.title))
+    }
+
     async fn session_update_meta(
         &self,
         session: SessionId,

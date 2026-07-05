@@ -483,6 +483,27 @@ impl Incarnation for CoreIncarnation {
             }
         }
 
+        // Re-index this session's searchable text at the turn boundary (the durable half of the
+        // `session_search` FTS surface; the live pump indexes interactive sessions): the coalesced
+        // full conversation (user + assistant text + tool names) replaces the prior row, so search
+        // reflects the whole conversation, not just the opening turn. Best-effort by construction
+        // (`index_session_text` swallows store errors).
+        if let Some(cfg) = &self.journal {
+            let title = cfg
+                .store
+                .session_meta(&session_id)
+                .await
+                .and_then(|m| m.title);
+            let turns =
+                crate::session_index::turns_from_conversation(&engine.snapshot().conversation);
+            let body = crate::session_index::coalesce_body(&turns);
+            if !body.trim().is_empty() {
+                cfg.store
+                    .index_session_text(&session_id, title, &body)
+                    .await;
+            }
+        }
+
         match outcome {
             TurnOutcome::Completed(_) => {
                 // Terminal deactivation (§10/§11): `Step::Completed` marks the session `Completed`

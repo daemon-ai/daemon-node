@@ -68,6 +68,9 @@ use daemon_supervision::ManagedUnit;
 use daemon_tool_clarify::ClarifyTool;
 use daemon_tool_execute_code::{ExecuteCodeSettings, ExecuteCodeTool};
 use daemon_tool_metta::MettaTool;
+use daemon_tool_session_search::{
+    ArchiveBrief, ArchiveHit, ArchiveSession, ArchiveTurn, SessionArchive, SessionSearchTool,
+};
 use daemon_tool_todo::TodoTool;
 use daemon_tool_vision::{VisionAnalyzeTool, VisionToolConfig};
 use daemon_tool_web::{
@@ -1498,6 +1501,121 @@ impl Tool for MemoryProviderTool {
     }
 }
 
+/// The `session_search` tool's read surface over this node's store + live surface (the injected
+/// [`SessionArchive`] handle, mirroring [`MnemosyneBanks`]): FTS + recents via the durable store,
+/// transcripts from decoded durable snapshots with a resident-live conversation-view fallback, and
+/// lineage from the session-meta parent links. The live half is late-bound (`set_live`) because the
+/// node is assembled AFTER the tool registries are built. Node-wide (no per-principal filtering):
+/// the agent tool runs inside the node with no request principal, exactly like the memory tools.
+struct NodeSessionArchive {
+    store: Arc<dyn SessionStore>,
+    live: std::sync::OnceLock<Arc<daemon_host::NodeApiImpl>>,
+}
+
+impl NodeSessionArchive {
+    fn new(store: Arc<dyn SessionStore>) -> Self {
+        Self {
+            store,
+            live: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Late-bind the assembled node so resident live sessions become readable (first set wins).
+    fn set_live(&self, node: Arc<daemon_host::NodeApiImpl>) {
+        let _ = self.live.set(node);
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionArchive for NodeSessionArchive {
+    async fn search(&self, query: &str, limit: u32) -> Vec<ArchiveHit> {
+        self.store
+            .search_sessions(query, limit)
+            .await
+            .into_iter()
+            .map(|hit| ArchiveHit {
+                session_id: hit.session_id.to_string(),
+                title: (!hit.title.is_empty()).then_some(hit.title),
+                snippet: hit.snippet,
+            })
+            .collect()
+    }
+
+    async fn recent(&self, limit: u32) -> Vec<ArchiveBrief> {
+        // Top-level conversations only (hermes hides subagent/tool sessions from browse), and never
+        // archived ones — mirroring the default roster scopes.
+        let mut rows: Vec<(SessionId, daemon_store::SessionMeta)> = self
+            .store
+            .session_meta_list()
+            .await
+            .into_iter()
+            .filter(|(_, meta)| {
+                !meta.archived
+                    && matches!(meta.role, None | Some(daemon_store::SessionRole::Primary))
+            })
+            .collect();
+        rows.sort_by_key(|(_, meta)| std::cmp::Reverse(meta.last_activity_ms));
+        rows.truncate(limit as usize);
+        rows.into_iter()
+            .map(|(id, meta)| ArchiveBrief {
+                session_id: id.to_string(),
+                title: meta.title,
+                last_activity_ms: meta.last_activity_ms,
+            })
+            .collect()
+    }
+
+    async fn turns(&self, session: &str) -> Option<ArchiveSession> {
+        let id = SessionId::new(session);
+        let meta = self.store.session_meta(&id).await.unwrap_or_default();
+        // The durable snapshot first (full fidelity), else a resident live session's conversation
+        // view. A live-only session from before a restart has neither -> `None` (its FTS row still
+        // surfaces it in discovery, minus the transcript).
+        let turns = match self
+            .store
+            .peek_snapshot(&id)
+            .await
+            .and_then(|blob| daemon_core::Snapshot::decode(&blob).ok())
+        {
+            Some(snap) => daemon_host::session_index::turns_from_conversation(&snap.conversation),
+            None => {
+                let view = self.live.get()?.live_conv_view(&id).await?;
+                daemon_host::session_index::turns_from_view(&view)
+            }
+        };
+        Some(ArchiveSession {
+            session_id: session.to_string(),
+            title: meta.title,
+            last_activity_ms: meta.last_activity_ms,
+            turns: turns
+                .into_iter()
+                .map(|t| ArchiveTurn {
+                    role: t.role.label(),
+                    text: t.text,
+                    tools: t.tools,
+                })
+                .collect(),
+        })
+    }
+
+    async fn lineage_root(&self, session: &str) -> String {
+        let mut current = SessionId::new(session);
+        // Walk the parent links to the top; bounded defensively against a pathological cycle.
+        for _ in 0..32 {
+            match self
+                .store
+                .session_meta(&current)
+                .await
+                .and_then(|m| m.parent)
+            {
+                Some(parent) if parent != current => current = parent,
+                _ => break,
+            }
+        }
+        current.to_string()
+    }
+}
+
 /// Parse the configured `model` string into a [`ModelRef`] for a local engine: an existing local
 /// path becomes a [`ModelSource::Local`]; otherwise it is a Hugging Face id (`org/name` for
 /// mistral.rs; `org/name/file.gguf` for llama, which names the GGUF to fetch).
@@ -2059,6 +2177,21 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     extra_tools.push(Arc::new(TodoTool::new()) as Arc<dyn Tool>);
     extra_tools.push(Arc::new(ClarifyTool::new()) as Arc<dyn Tool>);
 
+    // Long-term conversation recall (`session_search`, hermes parity): FTS + read/scroll/browse
+    // over the durable session archive. The archive handle is built over the store now and
+    // late-bound to the assembled node below (`set_live`) so resident live sessions are readable.
+    let session_archive = Arc::new(NodeSessionArchive::new(store.clone()));
+    extra_tools.push(Arc::new(SessionSearchTool::new(session_archive.clone())) as Arc<dyn Tool>);
+
+    // The auxiliary provider for background session-title generation, resolved like `lcm_aux`
+    // (the profile's builder). `None` — provider unset or `[sessions].title_generation = false` —
+    // keeps the truncation-seeded titles.
+    let title_aux: Option<Arc<dyn Provider>> = cfg
+        .sessions
+        .title_generation
+        .then(|| providers.builder_for(&cred_profile).map(|b| b()))
+        .flatten();
+
     // The skills subsystem (opt-out via `[skills].enable = false`): the `skill_*` tools join every
     // role registry, and the progressive-disclosure index is folded into the stable system-prompt
     // tier (`prompt_sources`). The background `skill_review` curator activates only when the engine's
@@ -2251,7 +2384,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             registry: cfg.processes,
             shell: cfg.shell,
         },
+        title_aux,
     });
+    // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
+    // conversations are readable through the tool (the node did not exist when the tool was built).
+    session_archive.set_live(node.clone());
     // Build the daemon-authoritative command catalog (`command_list`/`command_invoke`): the built-in
     // node-op commands unified with the provider commands the context engine (`/lcm`) and memory
     // provider (`/memory`) contribute, each resolving its per-session bank at invocation time. Bound
@@ -2270,6 +2407,36 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // overrides survive restarts; rides the same hot-reload seam profile/auth changes use.
     node.load_routing_pins().await;
     tracing::info!("daemon host node started");
+
+    // Best-effort boot backfill of the `session_search` FTS surface (`[sessions].backfill_index`):
+    // re-index every durable session's coalesced conversation in the background, so sessions
+    // recorded before indexing existed (or under the older opening-turn-only index) become fully
+    // searchable. Sequential + background; a decode/read failure just skips that session.
+    if cfg.sessions.backfill_index {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut indexed = 0usize;
+            for (id, _status) in store.list_sessions().await {
+                let Some(blob) = store.peek_snapshot(&id).await else {
+                    continue;
+                };
+                let Ok(snap) = daemon_core::Snapshot::decode(&blob) else {
+                    continue;
+                };
+                let turns = daemon_host::session_index::turns_from_conversation(&snap.conversation);
+                let body = daemon_host::session_index::coalesce_body(&turns);
+                if body.trim().is_empty() {
+                    continue;
+                }
+                let title = store.session_meta(&id).await.and_then(|m| m.title);
+                store.index_session_text(&id, title, &body).await;
+                indexed += 1;
+            }
+            if indexed > 0 {
+                tracing::info!(sessions = indexed, "session_search index backfilled");
+            }
+        });
+    }
 
     // The identity store backing the authenticator (created if absent), shared by every
     // auth-required transport (the Unix socket when local trust is disabled, and TCP/TLS always).

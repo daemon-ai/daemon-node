@@ -278,6 +278,7 @@ daemon-tool-browser = { path = "tools/daemon-tool-browser" }
 daemon-tool-todo = { path = "tools/daemon-tool-todo" }
 daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
 daemon-tool-execute-code = { path = "tools/daemon-tool-execute-code" }
+daemon-tool-session-search = { path = "tools/daemon-tool-session-search" }
 daemon-skills = { path = "crates/skills/daemon-skills" }
 daemon-tool-skill = { path = "tools/daemon-tool-skill" }
 

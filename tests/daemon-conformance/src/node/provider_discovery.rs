@@ -110,6 +110,7 @@ fn assemble_with_catalog(
         blob_root: None,
         fs: Default::default(),
         processes: Default::default(),
+        title_aux: None,
     });
     node
 }
@@ -288,6 +289,7 @@ async fn projector_records_are_excluded_and_activate_rejects() {
         blob_root: None,
         fs: Default::default(),
         processes: Default::default(),
+        title_aux: None,
     });
 
     // The local chat offer carries the text model but never the projector.
@@ -364,6 +366,7 @@ async fn unconfigured_node_still_lists_providers() {
         blob_root: None,
         fs: Default::default(),
         processes: Default::default(),
+        title_aux: None,
     });
     let providers = node.provider_catalog().await;
     let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
