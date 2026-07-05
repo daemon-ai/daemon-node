@@ -153,6 +153,11 @@ pub struct NodeAssembly {
     /// `fs_read` attaches a `BlobRef` to untruncated reads. `None` leaves the content surface
     /// unbound (the ops resolve to `ApiError::Unsupported`).
     pub blob_root: Option<PathBuf>,
+    /// The ephemeral-subagent reaper policy ([`EphemeralReaper`](crate::fleet::EphemeralReaper)):
+    /// archive `EphemeralSubagent` sessions `grace` after their terminal state, swept every
+    /// `interval`. The default is enabled (300s grace / 60s interval); the first sweep runs one
+    /// interval after start, so short-lived test nodes never observe one.
+    pub reaper: crate::fleet::ReaperConfig,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.

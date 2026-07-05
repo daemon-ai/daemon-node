@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use daemon_api::{ManageEventView, SubagentPhase, TreeEvent};
-use daemon_common::{PartitionId, SessionId, UnitId};
+use daemon_common::{PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::EngineProfile;
 use daemon_host::{BlobStore, JobWorker, ServiceError, WorkspaceRoots};
 
@@ -171,6 +171,8 @@ impl JobWorker for FleetJobWorker {
                 let input = daemon_protocol::DelegationInput::decode(&job.payload);
                 self.materialize_attachments(&job.session_id, &child, &input.attachments)
                     .await;
+                // Captured before the task moves into the seed turn: the child's roster/tree title.
+                let child_title: String = input.task.chars().take(80).collect();
                 let mut engine = self.profile.fresh(child.clone());
                 engine.push_user(daemon_protocol::UserMsg::new(input.task));
                 let blob = engine.snapshot().encode().map_err(ServiceError::new)?;
@@ -194,6 +196,18 @@ impl JobWorker for FleetJobWorker {
                     .session_meta(&job.session_id)
                     .await
                     .and_then(|m| m.owner);
+                // Per-child profile: a named profile in the delegation binds the child's engine
+                // resolution — the durable resolver rehydrates it from `bound_profile` exactly like
+                // an interactive session's binding. Unset keeps the one default engine shape, and
+                // an unknown name silently falls back at resolve time (the resolver declines).
+                if let Some(profile) = &input.profile {
+                    meta.bound_profile = Some(ProfileRef::new(profile.clone()));
+                }
+                // Title the child from its task (truncated) so the parent's `status` verb and the
+                // GUI tree show what each child is doing; never clobbers an existing title.
+                if meta.title.is_none() && !child_title.is_empty() {
+                    meta.title = Some(child_title);
+                }
                 self.store
                     .set_session_meta(&child, meta)
                     .await
@@ -258,5 +272,82 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&cas);
+    }
+
+    /// Processing a delegation job stamps the child's host meta from the structured payload: the
+    /// role derives from the declared `ChildLifetime`, a named profile binds `bound_profile` (the
+    /// durable resolver's key), and the task becomes the child's title (the status/tree label).
+    #[tokio::test]
+    async fn worker_stamps_role_profile_and_title_from_the_delegation() {
+        use daemon_common::{Epoch, FenceToken, JobId};
+        use daemon_store::{Checkpoint, JobCommand, SessionStore as _};
+
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("x")) as Arc<dyn daemon_core::Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("t"),
+        );
+        let worker = FleetJobWorker::new(store.clone(), PartitionId::DEFAULT, profile);
+
+        // A parent whose suspension enqueued an ephemeral, profile-bound delegation.
+        let parent = SessionId::new("parent");
+        store
+            .create_session(
+                parent.clone(),
+                PartitionId::DEFAULT,
+                daemon_common::SnapshotBlob::default(),
+            )
+            .await
+            .unwrap();
+        let payload = daemon_protocol::DelegationInput {
+            task: "summarize the repo".into(),
+            attachments: Vec::new(),
+            lifetime: daemon_protocol::DelegationLifetime::Ephemeral,
+            profile: Some("opus".into()),
+        }
+        .encode();
+        let job = JobCommand {
+            job_id: JobId::new("parent:1:job"),
+            session_id: parent.clone(),
+            epoch: Epoch(1),
+            payload,
+            lifetime: daemon_store::ChildLifetime::Ephemeral,
+        };
+        store
+            .checkpoint_and_enqueue(
+                Checkpoint::new(
+                    parent.clone(),
+                    Epoch(1),
+                    daemon_common::SnapshotBlob::default(),
+                ),
+                job,
+                FenceToken::ZERO,
+            )
+            .await
+            .unwrap();
+
+        worker.process_jobs_once().await.unwrap();
+
+        let child = SessionId::new("parent/c1");
+        assert!(store.status(&child).await.is_some(), "child materialized");
+        let meta = store.session_meta(&child).await.expect("child meta");
+        assert_eq!(
+            meta.role,
+            Some(daemon_store::SessionRole::EphemeralSubagent),
+            "role derives from the job's declared lifetime"
+        );
+        assert_eq!(
+            meta.bound_profile.as_ref().map(|p| p.as_str()),
+            Some("opus"),
+            "the named profile binds the child's engine resolution"
+        );
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("summarize the repo"),
+            "the task titles the child for status/tree views"
+        );
+        assert_eq!(meta.parent, Some(parent));
     }
 }

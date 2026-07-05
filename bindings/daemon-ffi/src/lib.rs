@@ -223,6 +223,7 @@ fn build_node(cfg: &HostFfiConfig) -> Result<AssembledNode, String> {
         auth_factories: vec![],
         workspace_root: cfg.workspace_root.clone().map(PathBuf::from),
         blob_root: cfg.blob_root.clone().map(PathBuf::from),
+        reaper: Default::default(),
     }))
 }
 
