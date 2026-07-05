@@ -114,13 +114,20 @@ pub trait ContextEngine: Send + Sync {
     fn after_response(&self, usage: &UsageDelta) {}
     fn on_session_start(&self, session: &SessionId) {}                        // once, before turn 1
     fn on_session_end(&self, session: &SessionId, conv: &Conversation) {}     // on teardown
+    fn on_session_reset(&self, session: &SessionId) {}                        // full-clear rewind
+    fn rollover_session(&self, old: &SessionId, new: &SessionId,
+                        old_conv: Option<&Conversation>, carry_over: bool) {} // old→new switch
     fn tools(&self) -> Vec<String> { Vec::new() }                            // advisory names only
 }
 ```
 
 `ModelInfo { model: String, max_context: Option<u32> }` is supplied by the engine from
 `Provider::capabilities()`. The engine calls `on_model` + `on_session_start` once before the first
-turn and `on_session_end` from `Engine::end_session` on teardown.
+turn and `on_session_end` from `Engine::end_session` on teardown (the in-process actor fires it
+when its command loop drains; the durable activation path fires it when a turn reaches the
+terminal `Completed` step). `on_session_reset` fires from a full-clear `Engine::rewind_to`
+(retained == 0 — the daemon's `/new` analog); `rollover_session` is the old→new switch seam whose
+host trigger is a later workstream (§15).
 
 The §11 hook order the loop guarantees (`SPEC §10`/§11 mermaid, lines 913–933):
 
@@ -796,9 +803,10 @@ per-call model/provider kwarg** — the provider *is* the model.
   per index.
 - `model_routing.py`'s `provider/model` parsing (`:61–104`) becomes config that selects which
   registered aux profile to resolve; document it as a thin config-to-profile shim (§12.4).
-- Temperatures (compression 0.3, extraction 0.2) and `task` labels have no direct daemon-core
-  equivalent; carry temperature only if the aux `Provider` exposes it (otherwise it is the aux
-  provider's fixed config).
+- Temperatures (compression 0.3, extraction 0.2) and `task` labels ride the per-call
+  `Request::params` (`RequestParams { temperature, max_tokens, … }`) and `Request::task` surface
+  (the provider-surface phase); a provider maps the subset it supports and ignores the rest, so an
+  aux provider without per-call sampling still works on its fixed config.
 
 ---
 
@@ -1322,9 +1330,13 @@ M5/M7 deviations (all within the milestone intent):
   (`summary_circuit_breaker_*`); `model_routing::parse_lcm_model_override` parses the override strings
   and documents the config→provider-selection effect. The binary wires a single aux provider (chain
   length 1); multi-provider resolution from a registry is out of scope.
-- **Temperature/`task` labels are not passed.** `Provider::chat` has no per-call kwargs, so the
-  extraction `temperature=0.2` / compression `0.3` and `task` labels are dropped; the aux provider's
-  fixed config governs.
+- **Temperature/`task` labels are passed (divergence closed).** `Request` now carries per-call
+  `params: RequestParams` + `task: Option<String>` (the provider-surface phase), and every LCM aux
+  call sets the Python values: compression `temperature=0.3` + `max_tokens = level_budget * 2`
+  (`LCM:escalation.py:103-107/313/332`), extraction `temperature=0.2` + `max_tokens=2000`
+  (`LCM:extraction.py:50-55`), and `lcm_expand_query` synthesis with the tool's answer budget as
+  the cap and no temperature (`LCM:tools.py:609-618`); task labels are `"compression"` /
+  `"extraction"`. Providers map the subset they support and ignore the rest.
 - **`_EXTERNALIZED_REF_RE` is faithfully broadened** to `[;:]\s*ref=` so the §8.2 ingest-payload,
   §9.1 tool-output/payload, GC, and quarantine placeholders are all captured by one pattern.
 - **`ignore_message_patterns` matches a turn's content** (user/assistant text or a tool turn's
@@ -1338,24 +1350,33 @@ M5/M7 deviations (all within the milestone intent):
   allowed, the volatile placeholder for ignore-filtered turns, skipped for ignored/stateless
   sessions). The store still ingests the original content through the write-boundary pipeline.
   Implementations may rewrite turn *content* but never turn structure.
-- **Session reset/carry-over hooks have no daemon-core seam.** `ContextEngine` has
-  `on_session_start`/`on_session_end` but no reset (`/new`) or old→new rollover hook, so
-  `on_session_reset`, `carry_over_new_session_context`, and `rollover_session`
-  (`LCM:engine.py:2202-2305`) are *inherent* methods on `LcmContextEngine` the host must call
-  directly. `on_session_end` performs the final best-effort flush + lifecycle finalize;
-  `on_session_start` finalizes a pending reset boundary on a session switch, resets the
-  session-scoped runtime state, and runs the empty-lifecycle-row GC (threshold 200, 24 h age guard)
-  at bind. The Hermes-host compression-boundary/auxiliary-session machinery
-  (`LCM:engine.py:2082-2131`) has no daemon analog and is not ported.
-- **Store hygiene is ported with two small deviations.** Open runs the throttled external-content
-  FTS repair (§4.4: structural check, savepoint-wrapped deep integrity-check throttled by the
-  `fts_integrity_checked_at:<table>` metadata marker, rebuild-from-content + trigger recreation);
-  `Store::repair_fts(force)`/`fts_integrity()` expose the forced/doctor variants; drop checkpoints
-  the WAL (`PRAGMA wal_checkpoint(PASSIVE)`, `LCM:store.py:1018-1029`). The check interval is the
-  §12.1 `fts_integrity_check_interval_hours` config field (threaded through `Store::open_at`; the
-  engine reads no env). Deviation: the low-disk degradation to LIKE-only search
-  (`LCM:db_bootstrap.py:534-545`) is omitted — `std` has no free-space probe, so a rebuild on a
-  full disk surfaces as the SQLite write error instead.
+- **Session reset/rollover ride `ContextEngine` hooks (divergence closed).** The seam now carries
+  default-no-op `on_session_reset(&SessionId)` and `rollover_session(old, new, old_conv,
+  carry_over)` hooks; `LcmContextEngine` implements both, delegating to the inherent
+  `reset_bound_session` / `rollover_sessions` (`LCM:engine.py:2202-2305` semantics: reset boundary
+  + lifecycle stamp + retained-DAG prune by `new_session_retain_depth`; ordered
+  end→reset→start→carry-over). The engine fires `on_session_reset` on a full-clear
+  `rewind_to` (retained == 0), so the reset path is no longer a host-must-remember inherent call;
+  a first-class host trigger for rollover-with-carry-over (a session-creation intent carrying the
+  previous session id) remains future work. `on_session_end` performs the final best-effort flush
+  + lifecycle finalize and fires from `Engine::end_session` (the actor's drained command loop; the
+  durable path's terminal `Completed` step); `on_session_start` finalizes a pending reset boundary
+  on a session switch, resets the session-scoped runtime state, and runs the empty-lifecycle-row
+  GC (threshold 200, 24 h age guard) at bind. The Hermes-host compression-boundary/
+  auxiliary-session machinery (`LCM:engine.py:2082-2131`) has no daemon analog and is not ported.
+- **Store hygiene is ported, including low-disk degradation (divergence closed).** Open runs the
+  throttled external-content FTS repair (§4.4: structural check, savepoint-wrapped deep
+  integrity-check throttled by the `fts_integrity_checked_at:<table>` metadata marker,
+  rebuild-from-content + trigger recreation); `Store::repair_fts(force)`/`fts_integrity()` expose
+  the forced/doctor variants; drop checkpoints the WAL (`PRAGMA wal_checkpoint(PASSIVE)`,
+  `LCM:store.py:1018-1029`). The check interval is the §12.1 `fts_integrity_check_interval_hours`
+  config field (threaded through `Store::open_at`; the engine reads no env). Low-disk degradation
+  (`LCM:db_bootstrap.py:533-545`): a rebuild that hits a disk-space-class write error
+  (`SQLITE_FULL`/`SQLITE_IOERR`) drops the index's artifacts and flags the store degraded — search
+  routes to LIKE-only, `lcm_status` reports `store.fts_degraded` — until a later repair pass (next
+  open, or `/lcm doctor repair apply`) rebuilds cleanly. Mechanism deviation from Python: the
+  write error itself is the probe (no pre-emptive `statvfs`), so degradation triggers on the
+  actual failure with no platform dependency.
 
 Three deliberate deviations from the literal milestone text below, all within the milestone's intent:
 

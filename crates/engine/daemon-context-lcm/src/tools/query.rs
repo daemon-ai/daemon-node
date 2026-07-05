@@ -10,7 +10,7 @@ use super::{err, ToolCx};
 use crate::escalation::strip_reasoning_blocks;
 use crate::search::{self, SortMode};
 use crate::store::{SourceType, SummaryNode};
-use daemon_core::{Request, RequestMsg};
+use daemon_core::{Request, RequestMsg, RequestParams};
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 
@@ -118,11 +118,14 @@ fn context_content_token_count(cx: &ToolCx<'_>, blocks: &[Value]) -> i64 {
 
 /// `_synthesize_expansion_answer` (`LCM:tools.py:589-624`), over the injected aux provider. The
 /// Python model-routing layer has no daemon counterpart — the engine's aux provider *is* the
-/// route. Reasoning blocks are stripped like every other aux response.
+/// route. The call carries the tool's answer budget as the output cap plus the `"compression"`
+/// task label (`LCM:tools.py:609-618`); temperature stays at the provider default (Python passes
+/// none). Reasoning blocks are stripped like every other aux response.
 async fn synthesize_expansion_answer(
     cx: &ToolCx<'_>,
     prompt: &str,
     context_blocks: &[Value],
+    max_tokens: i64,
     timeout: Duration,
 ) -> Result<String, SynthesisError> {
     let system_prompt = "You answer questions using expanded LCM retrieval context. \
@@ -139,7 +142,12 @@ async fn synthesize_expansion_answer(
             ..Default::default()
         }],
         ..Default::default()
-    };
+    }
+    .with_params(RequestParams {
+        max_tokens: Some(u32::try_from(max_tokens).unwrap_or(u32::MAX)),
+        ..Default::default()
+    })
+    .with_task("compression");
     match tokio::time::timeout(timeout, cx.aux.chat(request)).await {
         Err(_) => Err(SynthesisError::Timeout),
         Ok(Err(e)) => Err(SynthesisError::Provider(e.to_string())),
@@ -299,7 +307,15 @@ pub(super) async fn expand_query(cx: &ToolCx<'_>, args: &Value) -> String {
         Value::Object(payload).to_string()
     };
 
-    let answer = match synthesize_expansion_answer(cx, &prompt, &context_blocks, timeout).await {
+    let answer = match synthesize_expansion_answer(
+        cx,
+        &prompt,
+        &context_blocks,
+        max_tokens,
+        timeout,
+    )
+    .await
+    {
         Ok(answer) => answer,
         Err(SynthesisError::Timeout) => {
             tracing::warn!(

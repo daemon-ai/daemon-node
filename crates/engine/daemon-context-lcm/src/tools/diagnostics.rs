@@ -546,6 +546,9 @@ pub(super) fn status(cx: &ToolCx<'_>) -> String {
         "store": {
             "messages": store_messages,
             "estimated_tokens": store_tokens,
+            // Low-disk degradation: FTS was dropped on a full-disk rebuild; search is LIKE-only
+            // until a later repair pass (reopen / `/lcm doctor repair apply`) rebuilds cleanly.
+            "fts_degraded": cx.store.is_degraded(),
         },
         "dag": {
             "total_nodes": all_nodes.len(),
