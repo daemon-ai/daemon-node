@@ -17,13 +17,32 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// The local execution environment: a contained per-session workspace on the host filesystem.
 pub struct LocalEnvironment {
     root: PathBuf,
+    /// Whether `root` is a node-managed isolated sandbox (`true`) vs. an operator-bound external
+    /// directory whose contents may be attacker-influenced (`false`). Surfaced via
+    /// [`ExecutionEnvironment::workspace_trusted`]; consumed by tools that must not auto-trust
+    /// workspace-discovered artifacts on an untrusted root (Cluster E — `execute_code` venv trust).
+    trusted: bool,
 }
 
 impl LocalEnvironment {
-    /// A local environment rooted at `root` (the session's workspace). The directory is created on
-    /// first use; reads/writes/commands are confined to it.
+    /// A local environment rooted at `root` (the session's workspace), treated as **trusted** (the
+    /// node-managed isolated-sandbox case). The directory is created on first use; reads/writes/
+    /// commands are confined to it.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            trusted: true,
+        }
+    }
+
+    /// A local environment rooted at `root` with an explicit trust flag. Pass `trusted = false` for
+    /// an operator-bound external directory (`WorkspaceBinding::Bound`), whose contents may be
+    /// attacker-influenced, so tools suppress auto-trust of workspace-discovered artifacts.
+    pub fn with_trust(root: impl Into<PathBuf>, trusted: bool) -> Self {
+        Self {
+            root: root.into(),
+            trusted,
+        }
     }
 
     /// A local environment under the OS temp dir, keyed by `session` — the default sandbox when the
@@ -144,6 +163,10 @@ impl ExecutionEnvironment for LocalEnvironment {
 
     fn cwd(&self) -> &Path {
         &self.root
+    }
+
+    fn workspace_trusted(&self) -> bool {
+        self.trusted
     }
 }
 

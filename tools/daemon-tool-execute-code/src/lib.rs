@@ -251,7 +251,13 @@ impl Tool for ExecuteCodeTool {
         }
 
         let ws_root = cx.exec.cwd().to_path_buf();
-        match self.execute(&ws_root, mode, &args.code, &cx.cancel).await {
+        // Cluster E: on an untrusted (operator-bound) workspace root, project mode must not
+        // auto-trust a workspace-discovered venv interpreter — thread the trust bit into resolution.
+        let trusted = cx.exec.workspace_trusted();
+        match self
+            .execute(&ws_root, mode, trusted, &args.code, &cx.cancel)
+            .await
+        {
             Ok(exec) => self.success_outcome(call, exec),
             Err(e) => setup_error_outcome(call, &e.to_string()),
         }
@@ -264,12 +270,13 @@ impl ExecuteCodeTool {
         &self,
         ws_root: &Path,
         mode: Mode,
+        trusted: bool,
         code: &str,
         cancel: &CancellationToken,
     ) -> std::io::Result<Executed> {
         // Fail before staging when the interpreter or a required sandbox is unavailable, so a
         // setup error never leaves a stray staging dir behind.
-        let interpreter = python::resolve_interpreter(mode, ws_root)
+        let interpreter = python::resolve_interpreter(mode, ws_root, trusted)
             .await
             .ok_or_else(|| {
                 std::io::Error::new(

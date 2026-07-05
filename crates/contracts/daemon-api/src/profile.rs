@@ -407,6 +407,18 @@ impl SessionOverlay {
             && self.workspace.is_none()
     }
 
+    /// Whether this overlay *widens* the session's security posture — a security-relevant change that
+    /// requires an operator-tier capability to apply (Cluster E policy partition). Two widenings:
+    /// an autonomy-widening `approval_mode` ([`ApprovalMode::widens_autonomy`]), or
+    /// [`ToolsOverride::FullToolset`] (override to the full node toolset). Every other overlay field —
+    /// model/provider/workspace switches, an explicit `Allowlist` (a restriction), `Inherit`, and the
+    /// non-widening `Ask`/`Deny` approval modes — is not a widening and stays owner-allowed.
+    pub fn widens_security_posture(&self) -> bool {
+        self.approval_mode
+            .is_some_and(crate::ApprovalMode::widens_autonomy)
+            || matches!(self.tool_allowlist, ToolsOverride::FullToolset)
+    }
+
     /// Apply the model/provider/tool-allowlist overrides onto a profile spec in place. The
     /// `approval_mode` is applied to the engine separately (it is not a `ProfileSpec` field).
     pub fn apply_to(&self, spec: &mut ProfileSpec) {
@@ -635,6 +647,53 @@ mod tests {
         assert_eq!(spec.model, "override-model");
         assert_eq!(spec.provider, ProviderSelector::Mock);
         assert_eq!(spec.tool_allowlist, Some(vec!["fs".to_string()]));
+    }
+
+    #[test]
+    fn approval_mode_widening_classification() {
+        // Cluster E: only the autonomy-*widening* modes are operator-gated on an overlay; the safe
+        // directions (default `Ask`, strictest `Deny`) are not widenings and stay owner-allowed.
+        assert!(crate::ApprovalMode::AcceptEdits.widens_autonomy());
+        assert!(crate::ApprovalMode::AutoAllow.widens_autonomy());
+        assert!(!crate::ApprovalMode::Ask.widens_autonomy());
+        assert!(!crate::ApprovalMode::Deny.widens_autonomy());
+    }
+
+    #[test]
+    fn overlay_widens_on_full_toolset_or_autonomy_widening() {
+        // FullToolset widens the tool surface.
+        let full = SessionOverlay {
+            tool_allowlist: ToolsOverride::FullToolset,
+            ..SessionOverlay::default()
+        };
+        assert!(full.widens_security_posture());
+        // A widening approval mode widens autonomy.
+        let yolo = SessionOverlay {
+            approval_mode: Some(crate::ApprovalMode::AutoAllow),
+            ..SessionOverlay::default()
+        };
+        assert!(yolo.widens_security_posture());
+        let accept = SessionOverlay {
+            approval_mode: Some(crate::ApprovalMode::AcceptEdits),
+            ..SessionOverlay::default()
+        };
+        assert!(accept.widens_security_posture());
+        // Non-widening: an explicit allowlist, a narrowing/neutral approval mode, and a bare
+        // model/provider/workspace switch are all owner-allowed (not security-widening).
+        let allowlist = SessionOverlay {
+            tool_allowlist: ToolsOverride::Allowlist(vec!["fs".into()]),
+            approval_mode: Some(crate::ApprovalMode::Deny),
+            model: Some("m".into()),
+            provider: Some(ProviderSelector::Mock),
+            ..SessionOverlay::default()
+        };
+        assert!(!allowlist.widens_security_posture());
+        assert!(!SessionOverlay::default().widens_security_posture());
+        let ask = SessionOverlay {
+            approval_mode: Some(crate::ApprovalMode::Ask),
+            ..SessionOverlay::default()
+        };
+        assert!(!ask.widens_security_posture());
     }
 
     #[test]

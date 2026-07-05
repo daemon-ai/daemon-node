@@ -185,6 +185,7 @@ impl CronOps {
     /// Create a job from `spec`, returning the new opaque id. Validates the schedule, computes the
     /// first fire, and persists the job (paused iff `!spec.enabled`).
     pub async fn create(&self, spec: CronSpec) -> Result<String, ApiError> {
+        require_operator_for_security_fields(&spec)?;
         let schedule = Self::validate(&spec)?;
         let now = Self::now_unix();
         let id = Self::gen_id("cron");
@@ -217,6 +218,7 @@ impl CronOps {
 
     /// Replace an existing job's spec (preserving run bookkeeping), recomputing its next fire.
     pub async fn update(&self, id: String, spec: CronSpec) -> Result<(), ApiError> {
+        require_operator_for_security_fields(&spec)?;
         let schedule = Self::validate(&spec)?;
         let Some(mut stored) = self.store.cron_get(&id).await else {
             return Err(ApiError::Other(format!("unknown cron job: {id}")));
@@ -384,6 +386,35 @@ impl CronOps {
             .cron_suggestion_set(stored)
             .await
             .map_err(|e| ApiError::Other(format!("cron store: {e}")))
+    }
+}
+
+/// Cluster E (policy partition): the security-relevant `CronSpec` fields — `workdir` (projected to a
+/// `WorkspaceBinding::Bound` at hydrate, a per-session sandbox escape) and `enabled_toolsets` (pins an
+/// unattended run's tool surface) — require an operator-tier capability
+/// ([`SessionControlAny`](daemon_auth::Capability::SessionControlAny)). This is the single choke point
+/// for both control-plane cron ops and `accept_suggestion` (which calls `create`); the agent `cron`
+/// tool additionally refuses these fields outright as defense in depth. Fail-closed on no principal.
+fn require_operator_for_security_fields(spec: &CronSpec) -> Result<(), ApiError> {
+    let sets_workdir = spec
+        .workdir
+        .as_deref()
+        .is_some_and(|w| !w.trim().is_empty());
+    let sets_toolset = spec
+        .enabled_toolsets
+        .as_ref()
+        .is_some_and(|t| !t.is_empty());
+    if !(sets_workdir || sets_toolset) {
+        return Ok(());
+    }
+    match crate::request_context::current_principal() {
+        Some(p) if p.has(daemon_auth::Capability::SessionControlAny) => Ok(()),
+        Some(_) => Err(ApiError::Forbidden(
+            "cron workdir/enabled_toolsets require an operator-tier capability".into(),
+        )),
+        None => Err(ApiError::Unauthenticated(
+            "no authenticated principal bound to this request".into(),
+        )),
     }
 }
 

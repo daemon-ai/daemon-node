@@ -261,6 +261,11 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
         self.require_session_access(&session, true).await?;
+        // Cluster E: widening a session's autonomy (`AcceptEdits`/`AutoAllow`) is operator-tier — a
+        // non-operator owner may narrow (`Ask`/`Deny`) but not widen its own approval posture.
+        if mode.widens_autonomy() {
+            self.require_operator("widening the session approval mode")?;
+        }
         // Persist the edit-approval override on the overlay, then switch the live actor's policy in
         // place when resident (the live ParkingHandler reads `session_modes` to auto-allow vs park).
         let overlay = self
@@ -281,6 +286,13 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
         self.require_session_access(&session, true).await?;
+        // Cluster E: the security-widening subset of an overlay (autonomy-widening approval mode, or
+        // `FullToolset`) is operator-tier; the rest (model/provider/workspace/`Allowlist`/`Ask`/
+        // `Deny`) stays owner-allowed. A non-operator owner cannot widen its own approval posture or
+        // tool surface through the unified overlay write.
+        if overlay.widens_security_posture() {
+            self.require_operator("widening the session approval mode or tool surface")?;
+        }
         // The unified per-session override write: persist the whole overlay, then apply what can be
         // hot-applied to a resident actor (model/provider/approval). A tool-allowlist change takes
         // effect on the next (re)hydration (the live registry is fixed for an actor's lifetime).
