@@ -12,8 +12,20 @@ use daemon_core::{
     StablePromptSource, Tool, ToolRegistry,
 };
 use daemon_host::WorkspaceRoots;
+use daemon_processes::{ProcessRegistry, ShellConfig};
 
 use crate::types::NodeAssembly;
+
+/// The process-service handles every tool registry captures: the one resident
+/// [`ProcessRegistry`] (background/PTY spawn + sticky cwd) and the `[shell]` limits. Built once in
+/// [`assemble`](crate::assemble) and threaded to each registry builder.
+#[derive(Clone)]
+pub(crate) struct ProcessToolkit {
+    /// The resident registry (shared by the shell tool, the process tool, and the notifier).
+    pub(crate) registry: Arc<ProcessRegistry>,
+    /// The `[shell]` limits (foreground timeouts, truncation, cwd persistence, `wait` clamp).
+    pub(crate) shell: ShellConfig,
+}
 
 /// The provider-registry profile name the orchestrator (parent) engine resolves to.
 pub(crate) const ORCHESTRATOR_PROFILE: &str = "orchestrator";
@@ -97,13 +109,22 @@ pub(crate) fn provider_for(providers: &ProviderRegistry, name: &str) -> Provider
         .unwrap_or_else(|| panic!("no provider registered for {name:?} and no default set"))
 }
 
-/// A registry seeded with the core local toolset (fs + shell) every daemon-core engine carries, so a
-/// leaf or session can do real work in its contained workspace (§12/§13), plus any node-level
-/// `extra` tools (e.g. `mnemosyne_*` / `lcm_*`). Callers add role tools (e.g. orchestrate) on top.
-pub(crate) fn core_tool_registry(extra: &[Arc<dyn Tool>]) -> ToolRegistry {
+/// A registry seeded with the core local toolset (fs + shell + process) every daemon-core engine
+/// carries, so a leaf or session can do real work in its contained workspace (§12/§13), plus any
+/// node-level `extra` tools (e.g. `mnemosyne_*` / `lcm_*`). The shell tool gets the resident
+/// process registry (background/PTY spawn + sticky cwd) and the `process` tool manages what it
+/// spawned. Callers add role tools (e.g. orchestrate) on top.
+pub(crate) fn core_tool_registry(extra: &[Arc<dyn Tool>], procs: &ProcessToolkit) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(daemon_tool_fs::FsTool::new()));
-    registry.register(Arc::new(daemon_tool_shell::ShellTool::new()));
+    registry.register(Arc::new(daemon_tool_shell::ShellTool::with_processes(
+        procs.registry.clone(),
+        procs.shell,
+    )));
+    registry.register(Arc::new(daemon_tool_process::ProcessTool::new(
+        procs.registry.clone(),
+        procs.shell,
+    )));
     for tool in extra {
         registry.register(tool.clone());
     }
@@ -116,8 +137,9 @@ pub(crate) fn core_tool_registry(extra: &[Arc<dyn Tool>]) -> ToolRegistry {
 pub(crate) fn core_tool_registry_with_skills(
     extra: &[Arc<dyn Tool>],
     skills: &[Arc<dyn Tool>],
+    procs: &ProcessToolkit,
 ) -> ToolRegistry {
-    let mut registry = core_tool_registry(extra);
+    let mut registry = core_tool_registry(extra, procs);
     for tool in skills {
         registry.register(tool.clone());
     }

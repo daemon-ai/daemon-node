@@ -155,16 +155,24 @@ pub(crate) fn merged_config(base: Config, t: &EngineTunables) -> Config {
     c
 }
 
-/// Build the interactive tool registry for a session: the core fs + shell toolset plus node-level
-/// `extra` tools, optionally narrowed to an allowlist of tool names.
+/// Build the interactive tool registry for a session: the core fs + shell + process toolset plus
+/// node-level `extra` tools, optionally narrowed to an allowlist of tool names.
 pub(crate) fn session_tool_registry(
     extra: &[Arc<dyn Tool>],
     allowlist: Option<&[String]>,
+    procs: &crate::profiles::dress::ProcessToolkit,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     let mut candidates: Vec<Arc<dyn Tool>> = vec![
         Arc::new(daemon_tool_fs::FsTool::new()) as Arc<dyn Tool>,
-        Arc::new(daemon_tool_shell::ShellTool::new()) as Arc<dyn Tool>,
+        Arc::new(daemon_tool_shell::ShellTool::with_processes(
+            procs.registry.clone(),
+            procs.shell,
+        )) as Arc<dyn Tool>,
+        Arc::new(daemon_tool_process::ProcessTool::new(
+            procs.registry.clone(),
+            procs.shell,
+        )) as Arc<dyn Tool>,
     ];
     candidates.extend(extra.iter().cloned());
     for tool in candidates {

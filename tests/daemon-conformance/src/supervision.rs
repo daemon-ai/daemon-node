@@ -141,8 +141,14 @@ async fn transient_vs_permanent() {
         handle.restarts("trans_ok").unwrap() == 0,
         "transient + clean exit must not restart"
     );
+    // Like `perm` above, give the erroring transient child its own bounded window: the two
+    // children restart independently, so under load `trans_err` may lag the `perm` count.
     assert!(
-        handle.restarts("trans_err").unwrap() >= 2,
+        wait_until(Duration::from_secs(2), || handle
+            .restarts("trans_err")
+            .unwrap_or(0)
+            >= 2)
+        .await,
         "transient + error must restart"
     );
 

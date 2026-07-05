@@ -79,6 +79,7 @@ pub fn assemble_over(
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        processes: Default::default(),
     })
 }
 
@@ -156,6 +157,7 @@ pub fn assemble_demo() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        processes: Default::default(),
     });
     (node, handle)
 }
@@ -288,6 +290,7 @@ fn assemble_daemon_api_gateway_inner(
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        processes: Default::default(),
     });
     (node, cred_store, handle)
 }

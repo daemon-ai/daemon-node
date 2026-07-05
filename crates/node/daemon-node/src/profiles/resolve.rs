@@ -39,6 +39,8 @@ pub(crate) struct SessionFactoryCtx {
     /// The node's workspace-root resolver (shared with the engine exec builder + the filesystem
     /// surface). `None` keeps engines on the temp-sandbox default.
     pub(crate) workspace_roots: Option<Arc<WorkspaceRoots>>,
+    /// The resident process-service handles (background shell + process tool), shared node-wide.
+    pub(crate) procs: crate::profiles::dress::ProcessToolkit,
 }
 
 impl SessionFactoryCtx {
@@ -56,7 +58,11 @@ impl SessionFactoryCtx {
         overlay.apply_to(&mut spec);
         let spec = &spec;
         let provider = (self.resolver)(spec);
-        let mut registry = session_tool_registry(&self.extra_tools, spec.tool_allowlist.as_deref());
+        let mut registry = session_tool_registry(
+            &self.extra_tools,
+            spec.tool_allowlist.as_deref(),
+            &self.procs,
+        );
         let skills_index = self.resolve_skills_into_registry(spec, &mut registry);
         let persona = if spec.system_prompt.trim().is_empty() {
             "interactive session".to_string()
@@ -341,6 +347,13 @@ mod tests {
             prompt_sources: Vec::new(),
             skills_resolver: None,
             workspace_roots: None,
+            procs: crate::profiles::dress::ProcessToolkit {
+                registry: Arc::new(daemon_processes::ProcessRegistry::new(
+                    daemon_processes::RegistryConfig::default(),
+                    Arc::new(daemon_processes::RealClock::new()),
+                )),
+                shell: daemon_processes::ShellConfig::default(),
+            },
         };
 
         let base = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");

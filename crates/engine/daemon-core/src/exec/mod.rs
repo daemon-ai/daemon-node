@@ -28,6 +28,9 @@ pub struct Command {
     pub program: String,
     /// Its arguments.
     pub args: Vec<String>,
+    /// The working directory to run in, resolved against (and contained within) the environment's
+    /// root. `None` runs at the root itself (the historical behavior).
+    pub cwd: Option<PathBuf>,
 }
 
 impl Command {
@@ -36,6 +39,7 @@ impl Command {
         Self {
             program: program.into(),
             args: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -52,6 +56,12 @@ impl Command {
         S: Into<String>,
     {
         self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Run in `dir` (workspace-relative or absolute-within-root; the environment contains it).
+    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
         self
     }
 }

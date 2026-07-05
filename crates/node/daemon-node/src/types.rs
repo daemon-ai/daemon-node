@@ -153,6 +153,11 @@ pub struct NodeAssembly {
     /// `fs_read` attaches a `BlobRef` to untruncated reads. `None` leaves the content surface
     /// unbound (the ops resolve to `ApiError::Unsupported`).
     pub blob_root: Option<PathBuf>,
+    /// The background-process service policy (`[processes]` registry limits + `[shell]` tool
+    /// limits). The default carries the hermes-parity limits (200 KB ring, 64 tracked, 30 min TTL,
+    /// 180 s/600 s foreground timeouts, watch rate limits), so tests just pass
+    /// `Default::default()`.
+    pub processes: daemon_processes::ProcessesConfig,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.
@@ -166,4 +171,8 @@ pub struct AssembledNode {
     /// The node's verifiable-journal signer — its verifying key is published so auditors can verify
     /// sealed history (`ControlApi::verifying_key`).
     pub signer: Arc<TraceSigner>,
+    /// The resident background-process registry. The shutdown path calls
+    /// [`ProcessRegistry::shutdown`](daemon_processes::ProcessRegistry::shutdown) so no spawned
+    /// process group outlives the daemon.
+    pub processes: Arc<daemon_processes::ProcessRegistry>,
 }
