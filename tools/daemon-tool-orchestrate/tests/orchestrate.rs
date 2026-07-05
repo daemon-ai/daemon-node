@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! Orchestrate-tool v2 coverage: the `spawn` verb plumbs the agent's task/lifetime/profile into the
+//! delegation payload (fixing the static-label-only behavior), `send` queues input into an owned
+//! child (and only an owned child), `status` reports per-child durable state, validation errors
+//! surface as failed results, and the per-verb concurrency/mutation classes hold.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use daemon_common::{Budget, PartitionId, SessionId, SnapshotBlob, UnitId};
+use daemon_core::events::EventSink;
+use daemon_core::exec::LocalEnvironment;
+use daemon_core::{Effect, Tool, ToolCall, ToolConcurrency, ToolOutcome, TurnCx};
+use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
+use daemon_protocol::{
+    DelegationInput, DelegationLifetime, HostRequest, HostRequestHandler, HostRequestKind,
+    HostResponse, HostResponseBody, UserMsg,
+};
+use daemon_store::{InMemoryStore, SessionMeta, SessionRole, SessionStore};
+use daemon_supervision::{DelegationSpec, ManagedUnit};
+use daemon_tool_orchestrate::OrchestrateTool;
+
+/// The tool never drives the legacy synchronous placement path in these tests; the seam only has
+/// to exist for `FleetRuntime` construction.
+struct UnusedSpawner;
+
+#[async_trait]
+impl ChildSpawner for UnusedSpawner {
+    async fn spawn(&self, _id: UnitId, _spec: &DelegationSpec) -> Arc<dyn ManagedUnit> {
+        panic!("the orchestrate tool tests never spawn through the legacy sync path")
+    }
+}
+
+/// A host that answers every `Delegate` with a fixed durable job id.
+struct DelegatingHost;
+
+#[async_trait]
+impl HostRequestHandler for DelegatingHost {
+    async fn request(&self, req: HostRequest) -> HostResponse {
+        let body = match req.kind {
+            HostRequestKind::Delegate { .. } => {
+                HostResponseBody::Delegated(daemon_common::JobId::new("job-1"))
+            }
+            _ => HostResponseBody::Approved(true),
+        };
+        HostResponse {
+            request_id: req.request_id,
+            body,
+        }
+    }
+}
+
+fn fleet(store: Arc<InMemoryStore>) -> FleetRuntime {
+    FleetRuntime::new(
+        store,
+        PartitionId::DEFAULT,
+        Arc::new(UnusedSpawner),
+        Arc::new(DefaultAnswerPolicy),
+        None,
+    )
+}
+
+async fn run_as(tool: &dyn Tool, session: &str, args: &str) -> ToolOutcome {
+    let events = EventSink::discarding();
+    let exec = LocalEnvironment::sandbox("orchestrate-test");
+    let host = DelegatingHost;
+    let cx = TurnCx {
+        cancel: tokio_util::sync::CancellationToken::new(),
+        events: &events,
+        host: &host,
+        session_id: SessionId::new(session),
+        profile: None,
+        budget: Budget::unlimited(),
+        exec: &exec,
+        tool_result_budget: 0,
+        approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
+        pre_approved: false,
+        checkpoints: None,
+        tool_timeout: None,
+    };
+    let call = ToolCall {
+        call_id: "c1".into(),
+        name: "orchestrate".into(),
+        args: args.into(),
+    };
+    tool.run(&call, &cx).await
+}
+
+/// The delegation payload carried on `Effect::Delegate`, decoded.
+fn delegation_payload(out: &ToolOutcome) -> DelegationInput {
+    let Some(Effect::Delegate { payload, .. }) = out.effects.first() else {
+        panic!("expected an Effect::Delegate, got ok={}", out.result.ok);
+    };
+    DelegationInput::decode(payload)
+}
+
+#[tokio::test]
+async fn spawn_plumbs_task_lifetime_and_profile_into_the_payload() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store));
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","task":"summarize the repo","lifetime":"ephemeral","profile":"opus","attachments":["notes.md"]}"#,
+    )
+    .await;
+    assert!(out.result.ok);
+    assert!(out.result.content.starts_with("spawned:"));
+    let input = delegation_payload(&out);
+    assert_eq!(input.task, "summarize the repo");
+    assert_eq!(input.lifetime, DelegationLifetime::Ephemeral);
+    assert_eq!(input.profile.as_deref(), Some("opus"));
+    assert_eq!(input.attachments, vec!["notes.md".to_string()]);
+}
+
+#[tokio::test]
+async fn bare_args_spawn_with_label_fallback_and_defaults() {
+    // The mock provider emits `{}`; the legacy `delegate` alias and bare words behave the same:
+    // a spawn seeded from the tool's static label with default lifetime/profile.
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::with_label(fleet(store), "background-work");
+    for args in ["{}", r#"{"verb":"delegate"}"#, "go"] {
+        let out = run_as(&tool, "parent", args).await;
+        assert!(out.result.ok, "args {args:?} should spawn");
+        let input = delegation_payload(&out);
+        assert_eq!(input.task, "background-work");
+        assert_eq!(input.lifetime, DelegationLifetime::Persistent);
+        assert!(input.profile.is_none());
+    }
+}
+
+#[tokio::test]
+async fn depth_guard_still_caps_nested_spawns() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store)).with_max_depth(2);
+    let out = run_as(&tool, "top/c1/c2", r#"{"verb":"spawn","task":"deeper"}"#).await;
+    assert!(out.result.ok);
+    assert_eq!(out.result.content, "depth-limit:2");
+    assert!(out.effects.is_empty(), "no delegation past the cap");
+}
+
+#[tokio::test]
+async fn invalid_calls_fail_with_reasons() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store));
+    for (args, needle) in [
+        (r#"{"verb":"bogus"}"#, "unknown verb"),
+        (
+            r#"{"verb":"spawn","lifetime":"forever"}"#,
+            "unknown lifetime",
+        ),
+        (r#"{"verb":"send","task":"hi"}"#, "requires a `target`"),
+        (r#"{"verb":"send","target":"parent/c1"}"#, "message text"),
+        (r#"{"verb":"cancel"}"#, "requires a `target`"),
+    ] {
+        let out = run_as(&tool, "parent", args).await;
+        assert!(!out.result.ok, "args {args:?} must fail");
+        assert!(
+            out.result.content.contains(needle),
+            "args {args:?} => {}",
+            out.result.content
+        );
+    }
+}
+
+/// Seed a durable child row + meta under `parent` so send/status have a real target.
+async fn seed_child(
+    store: &Arc<InMemoryStore>,
+    parent: &str,
+    child: &str,
+    role: SessionRole,
+    title: &str,
+) {
+    let id = SessionId::new(child);
+    store
+        .create_session(id.clone(), PartitionId::DEFAULT, SnapshotBlob::default())
+        .await
+        .unwrap();
+    let meta = SessionMeta {
+        role: Some(role),
+        parent: Some(SessionId::new(parent)),
+        title: Some(title.into()),
+        bound_profile: Some(daemon_common::ProfileRef::new("opus")),
+        ..SessionMeta::default()
+    };
+    store.set_session_meta(&id, meta).await.unwrap();
+}
+
+#[tokio::test]
+async fn send_queues_input_and_wakes_an_owned_child() {
+    let store = Arc::new(InMemoryStore::new());
+    seed_child(
+        &store,
+        "parent",
+        "parent/c1",
+        SessionRole::ManagedChild,
+        "t",
+    )
+    .await;
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
+
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"send","target":"parent/c1","task":"also check the docs"}"#,
+    )
+    .await;
+    assert!(out.result.ok, "{}", out.result.content);
+    assert_eq!(out.result.content, "sent:parent/c1");
+
+    // The message landed on the durable pending-input queue (a CBOR UserMsg)...
+    let child = SessionId::new("parent/c1");
+    let queued = store.take_session_inputs(&child).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(UserMsg::decode(&queued[0]).text, "also check the docs");
+    // ...and a wake was enqueued so the next dispatch activates the child.
+    assert_eq!(store.dequeue_wake().await, Some(child));
+}
+
+#[tokio::test]
+async fn send_rejects_targets_outside_the_callers_subtree() {
+    let store = Arc::new(InMemoryStore::new());
+    // A child of a DIFFERENT parent.
+    seed_child(&store, "other", "other/c1", SessionRole::ManagedChild, "t").await;
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
+
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"send","target":"other/c1","task":"pssst"}"#,
+    )
+    .await;
+    assert!(!out.result.ok);
+    assert!(out.result.content.contains("not a child"));
+    assert!(
+        store
+            .take_session_inputs(&SessionId::new("other/c1"))
+            .await
+            .is_empty(),
+        "nothing may be queued on a foreign session"
+    );
+}
+
+#[tokio::test]
+async fn send_authorizes_via_the_durable_parent_link_when_ids_do_not_nest() {
+    let store = Arc::new(InMemoryStore::new());
+    // The child's id does NOT prefix-match the caller, but its durable meta parent chain does.
+    seed_child(
+        &store,
+        "parent",
+        "detached-child",
+        SessionRole::ManagedChild,
+        "t",
+    )
+    .await;
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
+
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"send","target":"detached-child","task":"hello"}"#,
+    )
+    .await;
+    assert!(out.result.ok, "{}", out.result.content);
+}
+
+#[tokio::test]
+async fn send_to_an_unknown_child_fails() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store);
+    // Prefix-authorized but no such session row.
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"send","target":"parent/c9","task":"hi"}"#,
+    )
+    .await;
+    assert!(!out.result.ok);
+    assert!(out.result.content.contains("unknown child"));
+}
+
+#[tokio::test]
+async fn status_reports_per_child_state_from_the_durable_graph() {
+    let store = Arc::new(InMemoryStore::new());
+    let parent = SessionId::new("parent");
+    // Two durable children bound to the parent via the delegation edge the tree walks.
+    for (child, role, title) in [
+        ("parent/c1", SessionRole::ManagedChild, "index the code"),
+        ("parent/c2", SessionRole::EphemeralSubagent, "quick check"),
+    ] {
+        seed_child(&store, "parent", child, role, title).await;
+        store
+            .bind_delegation(
+                SessionId::new(child),
+                daemon_store::JobCommand {
+                    job_id: daemon_common::JobId::new(format!("{child}:job")),
+                    session_id: parent.clone(),
+                    epoch: daemon_common::Epoch(1),
+                    payload: Vec::new(),
+                    lifetime: daemon_store::ChildLifetime::Persistent,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
+
+    let out = run_as(&tool, "parent", r#"{"verb":"status"}"#).await;
+    assert!(out.result.ok);
+    let content = &out.result.content;
+    assert!(content.contains("children: 2"), "{content}");
+    assert!(
+        content.contains("parent/c1 [managed] ready profile=opus — index the code"),
+        "{content}"
+    );
+    assert!(
+        content.contains("parent/c2 [ephemeral] ready profile=opus — quick check"),
+        "{content}"
+    );
+
+    // A target filter narrows to one child; an unknown target errors.
+    let one = run_as(&tool, "parent", r#"{"verb":"status","target":"parent/c2"}"#).await;
+    assert!(one.result.ok);
+    assert!(one.result.content.contains("children: 1"));
+    assert!(!one.result.content.contains("parent/c1 "));
+    let missing = run_as(&tool, "parent", r#"{"verb":"status","target":"nope"}"#).await;
+    assert!(!missing.result.ok);
+}
+
+#[tokio::test]
+async fn status_without_children_or_store_still_answers() {
+    let store = Arc::new(InMemoryStore::new());
+    let with_store = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
+    let out = run_as(&with_store, "parent", "status").await;
+    assert!(out.result.ok);
+    assert_eq!(out.result.content, "no children");
+
+    // No store wired: the legacy fleet-wide counts.
+    let legacy = OrchestrateTool::new(fleet(store));
+    let out = run_as(&legacy, "parent", "status").await;
+    assert!(out.result.ok);
+    assert!(out.result.content.starts_with("fleet: 0 children"));
+}
+
+#[tokio::test]
+async fn cancel_reports_unknown_children_as_false() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store));
+    let out = run_as(&tool, "parent", "cancel:ghost").await;
+    assert!(out.result.ok);
+    assert_eq!(out.result.content, "cancel:ghost:false");
+}
+
+#[test]
+fn per_verb_concurrency_and_mutation_classes() {
+    let call = |args: &str| ToolCall {
+        call_id: "c".into(),
+        name: "orchestrate".into(),
+        args: args.into(),
+    };
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store));
+    // status: read-only, batch-parallel.
+    assert_eq!(
+        tool.concurrency_for(&call(r#"{"verb":"status"}"#)),
+        ToolConcurrency::Parallel
+    );
+    assert!(!tool.mutates_for(&call(r#"{"verb":"status"}"#)));
+    // spawn/send/cancel (and the bare legacy forms): exclusive + mutating.
+    for args in [
+        "{}",
+        r#"{"verb":"spawn","task":"t"}"#,
+        r#"{"verb":"send","target":"parent/c1","task":"t"}"#,
+        "cancel:parent/c1",
+    ] {
+        assert_eq!(
+            tool.concurrency_for(&call(args)),
+            ToolConcurrency::Exclusive,
+            "{args}"
+        );
+        assert!(tool.mutates_for(&call(args)), "{args}");
+    }
+}

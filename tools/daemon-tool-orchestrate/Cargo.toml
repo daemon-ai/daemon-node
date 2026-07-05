@@ -10,9 +10,17 @@ daemon-core = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
+# The durable session graph backing the `send` (pending-input + wake) and per-child `status` verbs.
+daemon-store = { workspace = true }
 async-trait = { workspace = true }
 # Parse the optional `attachments` arg (paths to hand down) from a JSON tool call.
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# The tool tests stub the fleet's placement seam (`ChildSpawner` -> `ManagedUnit`).
+daemon-supervision = { workspace = true }
 
 [lints]
 workspace = true
