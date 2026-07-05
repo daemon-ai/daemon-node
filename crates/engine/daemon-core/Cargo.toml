@@ -21,6 +21,12 @@ serde_json = { workspace = true }
 # so they are logged rather than propagated). The only logging dep in the otherwise log-free core.
 tracing = { workspace = true }
 
+# Interim symlink/TOCTOU guard (Cluster C, `exec::open_read_guarded`/`open_write_guarded`): the
+# `O_NOFOLLOW` open flag. Unix-only so the non-unix build falls back to `symlink_metadata` and never
+# links libc.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 # OFF by default. Gates recording the OpenTelemetry GenAI attributes (incl. full prompt/completion/
 # tool content) onto the engine's turn/model/tool spans. When off, the spans are unchanged and no

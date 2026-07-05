@@ -154,6 +154,109 @@ fn escape_error(requested: &Path) -> std::io::Error {
     )
 }
 
+// --- Interim symlink / TOCTOU guard (Cluster C stopgap) -------------------------------------------
+//
+// [`contain`] is lexical: it proves a path *string* stays under `root`, but the subsequent open
+// re-walks that path and follows symlinks. Between the `contain` check and the open, or via a
+// symlink already present at check time, the final component can redirect the open outside `root`.
+// These helpers re-verify at the open that FOLLOWS `contain`, so a symlinked final component (or a
+// final component swapped for a symlink) is rejected rather than followed.
+//
+// COVERAGE (be honest — this is an interim guard, superseded by the Phase 3 cap-std/openat2
+// `ContainedRoot`):
+//   - CLOSED: a symlinked FINAL component on a file open is refused. On unix this is ATOMIC
+//     (`O_NOFOLLOW` on the open itself — no check-then-open window on that component).
+//   - NOT CLOSED: intermediate-component symlinks (a symlink at a PARENT directory in the path) are
+//     still followed; directory / metadata opens and the whole non-unix fallback re-verify by an
+//     `lstat` that precedes the use, so a residual check-then-use TOCTOU window remains. Phase 3
+//     (`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` over an open root fd) eliminates the class.
+
+/// The error returned when a contained path's final component is a symlink we refuse to traverse.
+fn symlink_escape_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing to follow symlink at workspace path: {}",
+            path.display()
+        ),
+    )
+}
+
+/// Open a contained file for reading, refusing a symlinked final component.
+///
+/// On unix the open carries `O_NOFOLLOW`, so a symlinked final component fails atomically (`ELOOP`)
+/// with no check-then-open window. On other platforms an `lstat` pre-check rejects a symlink first
+/// (leaving a small residual TOCTOU window; see the module note above).
+pub async fn open_read_guarded(path: &Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        // `custom_flags` is tokio's inherent unix method on `OpenOptions` (no trait import needed).
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await
+    }
+    #[cfg(not(unix))]
+    {
+        reject_symlink_final(path).await?;
+        tokio::fs::File::open(path).await
+    }
+}
+
+/// Open a contained file for writing (create + truncate), refusing a symlinked final component.
+///
+/// With `O_NOFOLLOW` on unix: an existing symlink final component is refused (`ELOOP`), an existing
+/// regular file is truncated, and a missing file is created as a regular file — matching
+/// `tokio::fs::write` semantics for a real target while never following a link. The caller creates
+/// parent directories first (as before); only the final open is guarded here.
+pub async fn open_write_guarded(path: &Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        // `custom_flags` is tokio's inherent unix method on `OpenOptions` (no trait import needed).
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await
+    }
+    #[cfg(not(unix))]
+    {
+        reject_symlink_final(path).await?;
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .await
+    }
+}
+
+/// Reject a path whose FINAL component is a symlink, for directory / metadata opens where an
+/// `O_NOFOLLOW` file open does not apply (`read_dir`, and the `cwd` a child runs in). Uses `lstat`,
+/// so a non-existent path is allowed (the create case) and this re-verify precedes the use — a
+/// residual check-then-use window remains (Phase 3 closes it).
+pub async fn reject_symlink_final(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_symlink() => Err(symlink_escape_error(path)),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// As [`reject_symlink_final`], but never rejects the trusted `root` itself — an operator may
+/// legitimately bind a workspace onto a symlinked directory (and macOS `/tmp` -> `/private/tmp`).
+/// Only components strictly below `root` are guarded. Used by directory ops (list / watch / cwd).
+pub async fn reject_symlink_final_below(root: &Path, path: &Path) -> std::io::Result<()> {
+    if path == root {
+        return Ok(());
+    }
+    reject_symlink_final(path).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

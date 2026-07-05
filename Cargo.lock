@@ -2286,6 +2286,7 @@ dependencies = [
  "daemon-common",
  "daemon-protocol",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "strsim 0.11.1",
