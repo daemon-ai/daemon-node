@@ -2099,18 +2099,21 @@ dependencies = [
  "daemon-tool-execute-code",
  "daemon-tool-fs",
  "daemon-tool-metta",
+ "daemon-tool-semantic-search",
  "daemon-tool-session-search",
  "daemon-tool-skill",
  "daemon-tool-todo",
  "daemon-tool-vision",
  "daemon-tool-web",
  "daemon-transport",
+ "daemon-workspace-index",
  "figment",
  "nix 0.31.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2237,7 +2240,9 @@ dependencies = [
  "daemon-telemetry",
  "daemon-tool-fs",
  "daemon-tool-orchestrate",
+ "daemon-tool-semantic-search",
  "daemon-tool-web",
+ "daemon-workspace-index",
  "futures",
  "rcgen",
  "reqwest 0.12.28",
@@ -2922,6 +2927,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-tool-semantic-search"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
+ "daemon-workspace-index",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "daemon-tool-session-search"
 version = "0.0.1"
 dependencies = [
@@ -3042,6 +3063,23 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "daemon-workspace-index"
+version = "0.0.1"
+dependencies = [
+ "daemon-core",
+ "daemon-tool-fs",
+ "ignore",
+ "rusqlite",
+ "rusqlite_migration",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 

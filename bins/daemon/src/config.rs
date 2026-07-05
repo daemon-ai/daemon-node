@@ -626,6 +626,53 @@ impl Default for SessionsConfig {
     }
 }
 
+/// Tuning for the `semantic_search` workspace index. `[workspace_index]` / `DAEMON_WORKSPACE_INDEX__*`.
+/// The tool is only wired when this is enabled AND an embedder is configured (`[embed]`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceIndexConfig {
+    /// Whether the workspace index + `semantic_search` tool are active (still requires an embedder).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub enable: bool,
+    /// Files larger than this (bytes) are not indexed.
+    pub max_file_bytes: u64,
+    /// The fixed-window height (lines) for chunking regions without a semantic anchor.
+    pub chunk_lines: usize,
+    /// How many lines consecutive chunk windows share.
+    pub chunk_overlap: usize,
+    /// The provider embed-call batch size.
+    pub batch: usize,
+    /// How often the background reconcile sweep re-walks the workspace.
+    #[serde(rename = "reconcile_interval_ms", with = "duration_ms")]
+    pub reconcile_interval: Duration,
+}
+
+impl Default for WorkspaceIndexConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            max_file_bytes: 1024 * 1024,
+            chunk_lines: 60,
+            chunk_overlap: 10,
+            batch: 64,
+            reconcile_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+impl From<WorkspaceIndexConfig> for daemon_workspace_index::WorkspaceIndexConfig {
+    fn from(c: WorkspaceIndexConfig) -> Self {
+        Self {
+            enable: c.enable,
+            max_file_bytes: c.max_file_bytes,
+            chunk_lines: c.chunk_lines,
+            chunk_overlap: c.chunk_overlap,
+            batch: c.batch,
+            reconcile_interval: c.reconcile_interval,
+        }
+    }
+}
+
 /// Tuning for the embeddings backend. `[embed]` / `DAEMON_EMBED__*`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -1159,6 +1206,9 @@ pub struct NodeConfig {
     pub fs: daemon_tool_fs::FsConfig,
     /// Session search/title tuning (`[sessions]`): boot-time FTS backfill + title generation.
     pub sessions: SessionsConfig,
+    /// `semantic_search` workspace-index tuning (`[workspace_index]`): enabled by default but only
+    /// wired when an embedder is also configured (`[embed]`).
+    pub workspace_index: WorkspaceIndexConfig,
     /// LCM context-engine tuning (injected into the context-engine template).
     pub lcm: LcmOpts,
     /// Mnemosyne recall + multi-agent identity knobs (injected into the memory provider template).
@@ -1225,6 +1275,7 @@ impl Default for NodeConfig {
             skills: SkillsConfig::default(),
             fs: daemon_tool_fs::FsConfig::default(),
             sessions: SessionsConfig::default(),
+            workspace_index: WorkspaceIndexConfig::default(),
             lcm: LcmOpts::default(),
             mnemosyne: MnemosyneOpts::default(),
             credential_key: String::new(),

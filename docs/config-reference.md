@@ -209,4 +209,10 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `web.local_fallback` | `DAEMON_WEB__LOCAL_FALLBACK` | bool | `true` |
 | `web.root` | `DAEMON_WEB__ROOT` | optional | _(unset)_ |
 | `web.tavily_key_id` | `DAEMON_WEB__TAVILY_KEY_ID` | string | `tavily` |
+| `workspace_index.batch` | `DAEMON_WORKSPACE_INDEX__BATCH` | number | `64` |
+| `workspace_index.chunk_lines` | `DAEMON_WORKSPACE_INDEX__CHUNK_LINES` | number | `60` |
+| `workspace_index.chunk_overlap` | `DAEMON_WORKSPACE_INDEX__CHUNK_OVERLAP` | number | `10` |
+| `workspace_index.enable` | `DAEMON_WORKSPACE_INDEX__ENABLE` | bool | `true` |
+| `workspace_index.max_file_bytes` | `DAEMON_WORKSPACE_INDEX__MAX_FILE_BYTES` | number | `1048576` |
+| `workspace_index.reconcile_interval_ms` | `DAEMON_WORKSPACE_INDEX__RECONCILE_INTERVAL_MS` | number | `30000` |
 | `workspace_root` | `DAEMON_WORKSPACE_ROOT` | optional | _(unset)_ |
