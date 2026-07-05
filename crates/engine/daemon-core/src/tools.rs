@@ -14,7 +14,9 @@ use crate::turn::{Effect, TurnCx};
 use daemon_common::{JobId, ReqId};
 use daemon_protocol::{HostRequest, HostRequestKind, HostResponseBody, ToolDetail};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The outcome of running one tool: its result slot plus the effects it produced (§12).
 pub struct ToolOutcome {
@@ -120,6 +122,33 @@ pub trait Tool: Send + Sync {
         ToolConcurrency::Exclusive
     }
 
+    /// The **per-call** batch-concurrency class (§12): the argument-aware refinement of
+    /// [`concurrency`](Tool::concurrency). A tool whose safety depends on its *arguments* — e.g. an
+    /// `fs` tool that is [`Parallel`](ToolConcurrency::Parallel) for a `read`/`grep`/`glob` op but
+    /// [`Exclusive`](ToolConcurrency::Exclusive) for a `write`/`edit` — overrides this. Defaults to
+    /// the call-independent [`concurrency`](Tool::concurrency), so existing tools are unchanged.
+    fn concurrency_for(&self, _call: &ToolCall) -> ToolConcurrency {
+        self.concurrency()
+    }
+
+    /// The workspace paths this call reads/writes, for the batch path-overlap gate (hermes
+    /// `_should_parallelize_tool_batch` parity). `None` = no declared path scope (a read-only tool
+    /// like `web_search`: freely parallel). `Some(paths)` = path-scoped: the engine serializes the
+    /// call against any other path-scoped call whose paths overlap (prefix-subtree). Defaults to
+    /// `None`, so a tool that does not opt in is treated as unscoped (today's all-or-nothing rule).
+    fn parallel_scope_paths(&self, _call: &ToolCall) -> Option<Vec<PathBuf>> {
+        None
+    }
+
+    /// The **per-call** effective wall-clock timeout for the §12 pipeline's timeout stage. Receives
+    /// the engine's configured `default` (`None` when the timeout is disabled) and returns the
+    /// timeout to apply, or `None` to opt out entirely. A self-limiting tool (a `shell` foreground
+    /// command, a long `execute_code` run) overrides this to `None` so it manages its own deadline.
+    /// Defaults to the engine `default`, so no tool is affected until the host sets a default.
+    fn call_timeout(&self, _call: &ToolCall, default: Option<Duration>) -> Option<Duration> {
+        default
+    }
+
     /// Whether this tool belongs to the **deferrable** (dynamic / long-tail) set rather than the
     /// always-offered core. Deferrable tools (MCP + Python proxies) are hidden behind the
     /// `tool_search` bridge once their summed schema exceeds the engine's threshold, so a large
@@ -135,6 +164,16 @@ pub trait Tool: Send + Sync {
     /// about batch parallelism.
     fn mutates(&self) -> bool {
         false
+    }
+
+    /// The **per-call** mutation predicate: the argument-aware refinement of
+    /// [`mutates`](Tool::mutates). An `fs` tool that mutates on `write`/`edit`/`delete` but not on
+    /// `read`/`grep`/`glob` overrides this so the §12 checkpoint stage only fires for the mutating
+    /// ops; the per-turn guardrail also uses it to classify a call as idempotent (read-only) vs
+    /// mutating. Defaults to the call-independent [`mutates`](Tool::mutates), so behaviour is
+    /// byte-identical until a tool opts in.
+    fn mutates_for(&self, _call: &ToolCall) -> bool {
+        self.mutates()
     }
 }
 

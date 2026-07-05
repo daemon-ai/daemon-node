@@ -901,6 +901,7 @@ impl Engine {
             let checkpoints = self.checkpoints.clone();
             let registry = self.registry.clone();
             let tool_result_budget = self.config.tool_result_budget;
+            let tool_timeout = timeout_from_ms(self.config.tool_timeout_ms);
             let effective_policy = self.effective_policy();
             let mut rounds_left = self.config.max_iterations;
             // Accumulated usage across every model call this turn makes (each round + the final summary
@@ -917,6 +918,10 @@ impl Engine {
             // same results is looping; we end the turn before it burns the whole iteration budget.
             let mut last_round_sig: Option<u64> = None;
             let mut repeated_rounds: u32 = 0;
+            // §12 per-call loop guardrail (hermes `tool_guardrails.py` parity): tracks each
+            // `(name, args)` signature across the whole turn and escalates warn→block/halt. One
+            // controller per turn = hermes' `reset_for_turn` semantics (fresh `run_turn` call).
+            let mut guardrail = crate::guardrail::ToolGuardrail::new(self.config.guardrail);
 
             let cancel = control.cancel_token();
             loop {
@@ -984,6 +989,7 @@ impl Engine {
                     approval_policy: effective_policy,
                     pre_approved: false,
                     checkpoints: checkpoints.as_deref(),
+                    tool_timeout,
                 };
 
                 // Count this tool-executing round and note skill/memory tool use for the review nudges.
@@ -1007,6 +1013,7 @@ impl Engine {
                             control,
                             events,
                         },
+                        &mut guardrail,
                     )
                     .await;
 
@@ -1065,6 +1072,18 @@ impl Engine {
                     self.notify_session_switch(SwitchReason::Handoff).await;
                     self.snapshot.waiting_for.push(job_id.clone());
                     return Ok(self.suspend(Handoff { job_id, payload }, events, true));
+                }
+
+                // §12 per-call guardrail hard stop: a repeated identical failure/no-progress call hit
+                // the block/halt threshold this turn (only when `hard_stop_enabled`). End the turn the
+                // same way as the round-level no-progress guard — one final toolless summary, then
+                // `EndReason::NoProgress` (reused deliberately; no new wire variant).
+                if let Some(decision) = guardrail.halt_decision() {
+                    let code = decision.code;
+                    self.after_turn_memory().await;
+                    self.context.after_response(&out.usage);
+                    tracing::debug!(guardrail_code = code, "engine.react_round.guardrail_halt");
+                    return Ok(self.finish_no_progress(events, &cancel, turn_usage).await);
                 }
 
                 // §4.2 no-progress guard: a tool round whose calls + results are byte-identical to the
@@ -1250,18 +1269,29 @@ impl Engine {
     /// Run the model's tool batch through the §12 pipeline, collecting result slots, effects, and
     /// structured detail for the rich §17 transcript views; returns `(calls, effects, interrupted)`.
     ///
-    /// A batch runs **concurrently** only when it has more than one call and *every* call resolves to
-    /// a tool that declares itself [`ToolConcurrency::Parallel`](crate::tools::ToolConcurrency)
-    /// (all-or-nothing; any exclusive/mutating call serializes the batch). Strict §17 event ordering
-    /// is preserved: per-call `ToolStarted`→`ToolFinished` in call order (the parallel branch emits
-    /// every start in order, runs the batch, then drains every finish in order). The read-only steer
-    /// boundary is evaluated once after a parallel batch settles, but after *each* serial tool (an
-    /// interrupt stops further serial execution). Takes `&self` and the pre-cloned `cx`/`registry`
-    /// handles (so no `&mut self` is held across a tool await — the `resolve_approvals` pattern).
+    /// A batch runs **concurrently** only when it has more than one call, *every* call resolves to a
+    /// tool whose per-call class is [`ToolConcurrency::Parallel`](crate::tools::ToolConcurrency), and
+    /// no two path-scoped calls overlap ([`batch_is_parallelizable`], hermes
+    /// `_should_parallelize_tool_batch` parity). Any exclusive/mutating call, or an overlapping pair,
+    /// serializes the whole batch. The parallel branch bounds in-flight work to
+    /// [`Config::max_parallel_tools`](crate::config::Config) (index-ordered `join_all` chunks of
+    /// `cap`), so a huge batch never spawns unbounded concurrency.
+    ///
+    /// The per-turn [`ToolGuardrail`](crate::guardrail::ToolGuardrail) is consulted for every call:
+    /// `before_call` may **block** a repeated call (a synthetic error result is substituted and the
+    /// tool never runs — the guardrail latches a halt the turn loop acts on); `after_call` appends
+    /// warn/halt guidance to the result the model sees. Blocked calls are filtered out before the
+    /// concurrent stream is built, and their synthetic results are emitted in call order.
+    ///
+    /// Strict §17 event ordering is preserved: per-call `ToolStarted`→`ToolFinished` in call order.
+    /// The read-only steer boundary is evaluated once after a parallel batch settles, but after
+    /// *each* serial tool (an interrupt stops further serial execution). Takes `&self` and the
+    /// pre-cloned `cx`/`registry` handles (so no `&mut self` is held across a tool await).
     async fn execute_tool_batch(
         &self,
         tool_calls: &[crate::conversation::ToolCall],
         batch: BatchCtx<'_, '_>,
+        guardrail: &mut crate::guardrail::ToolGuardrail,
     ) -> (
         Vec<(
             crate::conversation::ToolCall,
@@ -1270,6 +1300,8 @@ impl Engine {
         Vec<Effect>,
         bool,
     ) {
+        use crate::conversation::ToolResult;
+        use crate::guardrail::{append_guidance, block_result_content};
         let BatchCtx {
             cx,
             registry,
@@ -1280,45 +1312,82 @@ impl Engine {
         let mut effects: Vec<Effect> = Vec::new();
         let mut interrupted = false;
 
-        let parallel = tool_calls.len() > 1
-            && tool_calls.iter().all(|c| {
-                registry
-                    .get(&c.name)
-                    .map(|t| t.concurrency() == crate::tools::ToolConcurrency::Parallel)
-                    .unwrap_or(false)
-            });
+        // Per-call classification + guardrail preflight (hermes runs `before_call` for every call).
+        // `idempotent` is derived structurally (coordinator Q4): a call is idempotent iff it does not
+        // mutate AND its per-call class is Parallel (read-only, side-effect-free) — no name list.
+        // `blocked` holds a `before_call` block decision; a blocked call gets a synthetic result and
+        // is skipped. An unresolved tool is treated as non-idempotent and unblocked (its "unknown
+        // tool" result surfaces from `run_tool`).
+        let mut idempotent: Vec<bool> = Vec::with_capacity(tool_calls.len());
+        let mut blocked: Vec<Option<crate::guardrail::GuardrailDecision>> =
+            Vec::with_capacity(tool_calls.len());
+        for call in tool_calls {
+            let idem = registry
+                .get(&call.name)
+                .map(|t| {
+                    !t.mutates_for(call)
+                        && t.concurrency_for(call) == crate::tools::ToolConcurrency::Parallel
+                })
+                .unwrap_or(false);
+            let decision = guardrail.before_call(&call.name, &call.args, idem);
+            idempotent.push(idem);
+            blocked.push((!decision.allows_execution()).then_some(decision));
+        }
+
+        let parallel = tool_calls.len() > 1 && batch_is_parallelizable(tool_calls, registry);
 
         if parallel {
-            // Emit all starts in call order, run the batch concurrently, then drain results in
-            // call order. Read-only parallel tools have no ordered side effects, so the boundary
-            // is evaluated once after the whole batch settles.
+            // Emit all starts in call order, run the *runnable* (non-blocked) calls concurrently but
+            // bounded, then drain results in call order (blocked → synthetic, runnable → outcome).
             for call in tool_calls {
                 let view = tool_call_view(call);
                 events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
             }
-            let outcomes = futures::future::join_all(
-                tool_calls
-                    .iter()
-                    .map(|call| async { (call.clone(), run_tool(call, registry, cx).await) }),
-            )
-            .await;
-            for (call, outcome) in outcomes {
-                let result_view = tool_result_view(&outcome);
-                events.emit(|seq| AgentEvent::ToolFinished {
-                    seq,
-                    result: result_view,
+            // Bound concurrency to the worker cap. `.buffered` (a stream) would be the idiomatic
+            // continuous-in-flight form, but under `tokio::spawn` its `Buffered`/`FuturesOrdered`
+            // combinator trips rustc's "Send is not general enough" HRTB limitation on the borrowed
+            // `TurnCx` handles, whereas `join_all` (already used elsewhere here) is Send-clean. So we
+            // run the runnable calls in index-ordered chunks of `cap` via `join_all` — at most `cap`
+            // tools execute concurrently, and results are collected by original index for the drain.
+            let cap = self.config.max_parallel_tools.max(1) as usize;
+            let runnable_idx: Vec<usize> = (0..tool_calls.len())
+                .filter(|i| blocked[*i].is_none())
+                .collect();
+            let mut ran_by_idx: std::collections::HashMap<usize, crate::tools::ToolOutcome> =
+                std::collections::HashMap::new();
+            for chunk in runnable_idx.chunks(cap) {
+                let outcomes =
+                    futures::future::join_all(chunk.iter().map(|&i| async move {
+                        (i, run_tool(&tool_calls[i], registry, cx).await)
+                    }))
+                    .await;
+                for (i, outcome) in outcomes {
+                    ran_by_idx.insert(i, outcome);
+                }
+            }
+            for (i, call) in tool_calls.iter().enumerate() {
+                if let Some(decision) = &blocked[i] {
+                    let result = ToolResult {
+                        call_id: call.call_id.clone(),
+                        ok: false,
+                        content: block_result_content(decision),
+                    };
+                    let view = tool_result_view_of(&result);
+                    events.emit(|seq| AgentEvent::ToolFinished { seq, result: view });
+                    calls.push((call.clone(), result));
+                    continue;
+                }
+                let mut outcome = ran_by_idx.remove(&i).unwrap_or_else(|| {
+                    crate::tools::ToolOutcome::text(
+                        call.call_id.clone(),
+                        false,
+                        "missing tool outcome",
+                    )
                 });
-                calls.push((call, outcome.result));
-                effects.extend(outcome.effects);
-            }
-            if self.boundary_readonly(control, events) {
-                interrupted = true;
-            }
-        } else {
-            for call in tool_calls {
-                let view = tool_call_view(call);
-                events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
-                let outcome = run_tool(call, registry, cx).await;
+                let decision =
+                    guardrail.after_call(&call.name, &call.args, &outcome.result, idempotent[i]);
+                let content = std::mem::take(&mut outcome.result.content);
+                outcome.result.content = append_guidance(content, &decision);
                 let result_view = tool_result_view(&outcome);
                 events.emit(|seq| AgentEvent::ToolFinished {
                     seq,
@@ -1326,6 +1395,45 @@ impl Engine {
                 });
                 calls.push((call.clone(), outcome.result));
                 effects.extend(outcome.effects);
+            }
+            if self.boundary_readonly(control, events) {
+                interrupted = true;
+            }
+        } else {
+            for (i, call) in tool_calls.iter().enumerate() {
+                let view = tool_call_view(call);
+                events.emit(|seq| AgentEvent::ToolStarted { seq, call: view });
+                if let Some(decision) = &blocked[i] {
+                    // Guardrail-blocked: substitute a synthetic error result; the tool never runs.
+                    let result = ToolResult {
+                        call_id: call.call_id.clone(),
+                        ok: false,
+                        content: block_result_content(decision),
+                    };
+                    let result_view = tool_result_view_of(&result);
+                    events.emit(|seq| AgentEvent::ToolFinished {
+                        seq,
+                        result: result_view,
+                    });
+                    calls.push((call.clone(), result));
+                } else {
+                    let mut outcome = run_tool(call, registry, cx).await;
+                    let decision = guardrail.after_call(
+                        &call.name,
+                        &call.args,
+                        &outcome.result,
+                        idempotent[i],
+                    );
+                    let content = std::mem::take(&mut outcome.result.content);
+                    outcome.result.content = append_guidance(content, &decision);
+                    let result_view = tool_result_view(&outcome);
+                    events.emit(|seq| AgentEvent::ToolFinished {
+                        seq,
+                        result: result_view,
+                    });
+                    calls.push((call.clone(), outcome.result));
+                    effects.extend(outcome.effects);
+                }
                 // Boundary after each tool: an interrupt stops further tool execution.
                 if self.boundary_readonly(control, events) {
                     interrupted = true;
@@ -1353,6 +1461,7 @@ impl Engine {
         let registry = self.registry.clone();
         let budget = self.budget;
         let tool_result_budget = self.config.tool_result_budget;
+        let tool_timeout = timeout_from_ms(self.config.tool_timeout_ms);
         let policy = self.effective_policy();
         let session_id = self.snapshot.session_id.clone();
         let subsystem_profile = self.subsystem_profile.clone();
@@ -1383,6 +1492,7 @@ impl Engine {
                             approval_policy: policy,
                             pre_approved: true,
                             checkpoints: checkpoints.as_deref(),
+                            tool_timeout,
                         };
                         let outcome = run_tool(&approval.call, &registry, &cx).await;
                         (outcome.result.ok, outcome.result.content)
@@ -1483,8 +1593,9 @@ mod builder;
 mod rewind;
 mod views;
 use views::{
-    failure_kind, partition_tool_effects, recovery_step_kind, round_signature, tool_call_view,
-    tool_result_view, PartitionedEffects,
+    batch_is_parallelizable, failure_kind, partition_tool_effects, recovery_step_kind,
+    round_signature, timeout_from_ms, tool_call_view, tool_result_view, tool_result_view_of,
+    PartitionedEffects,
 };
 
 #[cfg(test)]

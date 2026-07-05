@@ -85,6 +85,7 @@ async fn dispatch(registry: &ToolRegistry, name: &str, args: &str) -> daemon_cor
         approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
         pre_approved: false,
         checkpoints: None,
+        tool_timeout: None,
     };
     let call = ToolCall {
         call_id: "c1".into(),

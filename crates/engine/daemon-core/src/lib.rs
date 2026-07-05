@@ -36,6 +36,7 @@ pub mod events;
 pub mod exec;
 #[cfg(feature = "otel")]
 pub mod genai_telemetry;
+pub mod guardrail;
 pub mod memory;
 pub mod profile;
 pub mod provider;
