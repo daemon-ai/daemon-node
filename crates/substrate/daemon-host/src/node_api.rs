@@ -531,6 +531,7 @@ impl NodeApiImpl {
 
 mod access;
 mod assembly;
+mod authorized;
 mod builtins;
 mod control;
 mod cred_auth;
@@ -557,6 +558,7 @@ pub use provisioning::{AccountProvisioning, ProvisionedAccount};
 
 // Crate-internal re-exports so the sibling sub-modules (each `use super::*;`) resolve the helpers
 // that live in another concern module.
+pub(crate) use authorized::{AuthorizedFor, Session};
 pub(crate) use builtins::command_err_to_api;
 pub(crate) use internals::{apply_rewind_side_effects, LiveSessions, RewindSideEffects};
 pub(crate) use messaging::participant_label;

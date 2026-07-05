@@ -166,11 +166,13 @@ impl ControlApi for NodeApiImpl {
             return None;
         }
         let meta = self.store.session_meta(&session).await.unwrap_or_default();
-        // Auth 4 (read-of-one): a peer cannot inspect another user's session — return `None` (behave
-        // as not-found, no existence oracle) unless the caller owns it or holds `SessionSeeAll`.
-        if !owner_visible(&current_principal(), &meta.owner) {
+        // Auth 4 (read-of-one): mint the ownership proof (own-or-`SessionSeeAll`); behave as
+        // not-found for a session the caller may not see (no existence oracle). The proof is also
+        // what the guarded `delivery_targets` read below requires — so the compile-time gate and the
+        // visibility gate are one and the same here.
+        let Ok(auth) = self.require_session_access(&session, false).await else {
             return None;
-        }
+        };
         let lifecycle = if status.is_some() {
             ApiLifecycle::Durable
         } else {
@@ -185,7 +187,7 @@ impl ControlApi for NodeApiImpl {
         );
         let overlay = (!meta.overlay.is_empty()).then(|| decode_overlay(&meta.overlay));
         let model = self.session_models.get(&session).map(|m| m.clone());
-        let delivery_targets = self.live.delivery_targets(&session);
+        let delivery_targets = self.live.delivery_targets(&auth);
         let children = self.store.children_of(&session).await;
         let checkpoints = match &self.checkpoints {
             Some(store) => store.list(Some(session.as_str())).await.len() as u32,
@@ -368,12 +370,12 @@ impl ControlApi for NodeApiImpl {
 
     async fn cancel(&self, session: SessionId) -> Result<(), ApiError> {
         // Auth 4: only the owner (or a `SessionControlAny` operator) may cancel a session.
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         // Best-effort: cancel a matching fleet child and interrupt a matching live session.
         if let Some(fleet) = &self.fleet {
             fleet.cancel(&UnitId::new(session.as_str())).await;
         }
-        self.live.interrupt(&session).await;
+        self.live.interrupt(&auth).await;
         // Release the lifecycle claim so the id can be reused by either surface.
         self.owners.remove(&session);
         Ok(())
@@ -1331,7 +1333,7 @@ impl ControlApi for NodeApiImpl {
         point: daemon_api::RewindPoint,
     ) -> Result<(), ApiError> {
         // Auth 4: only the owner (or a `SessionControlAny` operator) may rewind a session.
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         // The unified rewind (conversation-rewind spec): truncate the transcript at `point.anchor`
         // and, when `point.restore_workspace`, roll the workspace back to the matching checkpoint —
         // sealing the journal on the way out. A resident session rewinds its in-process engine
@@ -1341,7 +1343,7 @@ impl ControlApi for NodeApiImpl {
         if self.live.is_resident(&session) {
             return self
                 .live
-                .rewind_resident(&session, point.anchor, point.restore_workspace)
+                .rewind_resident(&auth, point.anchor, point.restore_workspace)
                 .await;
         }
         // A durable (non-resident) session has no live engine to truncate: its transcript is the

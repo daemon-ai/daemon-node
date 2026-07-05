@@ -11,9 +11,9 @@ impl SessionApi for NodeApiImpl {
         // Auth 4: own-or-`SessionControlAny`. An `Absent` (brand-new) session passes here, then
         // `note_activity` stamps the caller as owner — checked BEFORE `note_activity` so a foreign
         // caller never mutates last-activity / the FTS index.
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
-        self.live.submit(session, command).await
+        self.live.submit(&auth, command).await
     }
 
     async fn submit_from(
@@ -23,9 +23,9 @@ impl SessionApi for NodeApiImpl {
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         self.claim(&session, Lifecycle::Live)?;
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
-        self.live.submit_from(session, origin, command).await
+        self.live.submit_from(&auth, origin, command).await
     }
 
     async fn session_create(
@@ -90,7 +90,7 @@ impl SessionApi for NodeApiImpl {
             profile,
         } = args;
         self.claim(&session, Lifecycle::Live)?;
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         // Bind the explicit profile sticky-on-first-open (the same `ensure` seam `submit_routed`
         // uses), so a GUI can "open this chat as agent X" before the first turn submits.
         if profile.is_some() {
@@ -98,8 +98,8 @@ impl SessionApi for NodeApiImpl {
         }
         self.note_activity(&session, &command).await;
         match origin {
-            Some(origin) => self.live.submit_from(session, origin, command).await,
-            None => self.live.submit(session, command).await,
+            Some(origin) => self.live.submit_from(&auth, origin, command).await,
+            None => self.live.submit(&auth, command).await,
         }
     }
 
@@ -115,7 +115,7 @@ impl SessionApi for NodeApiImpl {
         self.claim(&resolved.session, Lifecycle::Live)?;
         // Auth 4: own-or-`SessionControlAny` on the resolved session (new sessions pass and are
         // stamped by `note_activity`).
-        self.require_session_access(&resolved.session, true).await?;
+        let auth = self.require_session_access(&resolved.session, true).await?;
         // For session-opening commands, bind the resolved profile (sticky on first `ensure`) and seed
         // the resolved `Primary` before submitting, so routing owns agent-selection + delivery. Other
         // commands act on an already-open session whose profile/Primary were bound when it opened.
@@ -132,21 +132,19 @@ impl SessionApi for NodeApiImpl {
                 .seed_primary_target(&resolved.session, resolved.delivery.clone());
         }
         self.note_activity(&resolved.session, &command).await;
-        self.live
-            .submit_from(resolved.session.clone(), origin, command)
-            .await?;
+        self.live.submit_from(&auth, origin, command).await?;
         Ok(resolved.session)
     }
 
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
         // Auth 4: own-or-`SessionControlAny` (the task's named control ops include `poll`).
-        self.require_session_access(&session, true).await?;
-        self.live.poll(&session, max)
+        let auth = self.require_session_access(&session, true).await?;
+        self.live.poll(&auth, max)
     }
 
     async fn respond(&self, session: SessionId, response: HostResponse) -> Result<(), ApiError> {
-        self.require_session_access(&session, true).await?;
-        self.live.respond(&session, response)
+        let auth = self.require_session_access(&session, true).await?;
+        self.live.respond(&auth, response)
     }
 
     async fn session_history(
@@ -175,33 +173,33 @@ impl SessionApi for NodeApiImpl {
         // ownership check as the streaming `subscribe` below (both are `control = true`, so the
         // `Call` and `Open` forms of one op deny identically). Previously unguarded — the gap that
         // let a non-owner read another user's live transcript.
-        self.require_session_access(&session, true).await?;
-        Ok(self.live.log_after(&session, after_seq, max))
+        let auth = self.require_session_access(&session, true).await?;
+        Ok(self.live.log_after(&auth, after_seq, max))
     }
 
     async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
         // Auth 4: own-or-`SessionControlAny` (a live subscription is a session-interaction op).
-        self.require_session_access(&session, true).await?;
-        Ok(self.live.subscribe(&session, after_seq))
+        let auth = self.require_session_access(&session, true).await?;
+        Ok(self.live.subscribe(&auth, after_seq))
     }
 
     async fn log_epoch(&self, session: SessionId) -> u64 {
         // Auth 4 (read-of-one, non-fallible): deny → 0. Not wire-reachable on its own (the mux pump
         // reads it before `subscribe`, which now enforces ownership under the same bound principal),
         // so this is defense-in-depth for any future caller.
-        if self.require_session_access(&session, false).await.is_err() {
+        let Ok(auth) = self.require_session_access(&session, false).await else {
             return 0;
-        }
-        self.live.log_epoch(&session)
+        };
+        self.live.log_epoch(&auth)
     }
 
     async fn delivery_targets(&self, session: SessionId) -> Vec<DeliveryTarget> {
         // Auth 4 (read-of-one, non-fallible): a peer must not read another user's reply-routing —
         // deny → empty (no existence oracle). Previously unguarded.
-        if self.require_session_access(&session, false).await.is_err() {
+        let Ok(auth) = self.require_session_access(&session, false).await else {
             return Vec::new();
-        }
-        self.live.delivery_targets(&session)
+        };
+        self.live.delivery_targets(&auth)
     }
 
     async fn delivery_sessions(
@@ -220,14 +218,14 @@ impl SessionApi for NodeApiImpl {
 
     async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
-        self.require_session_access(&session, true).await?;
-        self.live.handover(&session, target)
+        let auth = self.require_session_access(&session, true).await?;
+        self.live.handover(&auth, target)
     }
 
     async fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny` (writes into the session's live log).
-        self.require_session_access(&args.session, true).await?;
-        self.live.record_meta(args)
+        let auth = self.require_session_access(&args.session, true).await?;
+        self.live.record_meta(&auth, args)
     }
 
     async fn set_session_model(
