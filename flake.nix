@@ -271,7 +271,7 @@
         # installer to bundle. Deliberately separate outputs — never part of the default gate.
         # The flake's nixpkgs tracks the logos-co `mingw-integration` fork, so `pkgsCross.mingwW64`
         # carries the MinGW fixes this lane relies on. The engine worker lanes (llama/mistralrs)
-        # are OUT OF SCOPE for windows v1; only the stub-worker daemon + the operator CLI cross.
+        # cross too — see the `daemon-infer-*-windows` outputs and `llamaCppWindows` further below.
         pkgsWindows = pkgs.pkgsCross.mingwW64;
         windowsTriple = "x86_64-pc-windows-gnu";
         mingwCc = pkgsWindows.stdenv.cc;
@@ -342,6 +342,317 @@
         daemon-windows = buildWindowsPackage "daemon";
         daemon-cli-windows = buildWindowsPackage "daemon-cli";
 
+        # ------------------------------------------------------------------------------------
+        # Windows inference-engine worker lanes (x86_64-pc-windows-gnu): the `daemon-infer` worker
+        # built with the llama.cpp and mistral.rs engines for the NSIS installer to bundle. Like
+        # the daemon/daemon-cli windows lanes these are deliberately separate outputs, never part
+        # of the default gate.
+        #
+        # Windows llama.cpp rides upstream's dynamic-backend model (`GGML_BACKEND_DL`): the worker
+        # links ONLY the core libraries (llama/ggml/ggml-base/mtmd) while the compute backends are
+        # runtime-loadable modules (`ggml-cpu.dll`, `ggml-vulkan.dll`) that `ggml_backend_load_all()`
+        # — called from `llama_backend_init()` inside libllama — discovers beside the exe. On a
+        # GPU-less machine `ggml-vulkan.dll` (or its `vulkan-1.dll` dependency) simply fails to load
+        # and ggml falls back to the always-present CPU backend. The crate's from-source Vulkan path
+        # is NOT used here (its `find_vulkan_sdk_windows()` wants an MSVC SDK layout and hard-links
+        # `vulkan-1`) — the `vulkan` cargo feature must never be enabled on windows.
+        #
+        # Import contract (enforced by the objdump guards in the llama lane's postInstall):
+        #   daemon-infer.exe imports llama/ggml/ggml-base(/mtmd) — NOT ggml-vulkan, NOT vulkan-1.
+        #   ggml-vulkan.dll ships beside the exe and imports vulkan-1.dll (runtime GPU backend).
+
+        # Host (build-platform) toolchain file for ggml-vulkan's `vulkan-shaders-gen`: that helper
+        # is compiled and RUN during the build to emit the SPIR-V shader headers, so it must target
+        # the build machine, not the mingw target. This is upstream's documented cross escape hatch
+        # (`GGML_VULKAN_SHADERS_GEN_TOOLCHAIN` in ggml/src/ggml-vulkan/CMakeLists.txt).
+        llamaVulkanShaderHostToolchain = pkgs.writeText "llama-vulkan-shader-host-toolchain.cmake" ''
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_C_COMPILER ${pkgs.stdenv.cc}/bin/cc)
+          set(CMAKE_CXX_COMPILER ${pkgs.stdenv.cc}/bin/c++)
+          set(CMAKE_AR ${pkgs.binutils}/bin/ar)
+          set(CMAKE_RANLIB ${pkgs.binutils}/bin/ranlib)
+          set(CMAKE_FIND_ROOT_PATH "")
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE NEVER)
+        '';
+
+        # Mingw target C++ compiler + objdump (the latter inspects the produced PE import tables).
+        mingwCxx = "${mingwCc}/bin/${mingwCc.targetPrefix}c++";
+        mingwObjdump = "${mingwCc.bintools}/bin/${mingwCc.targetPrefix}objdump";
+
+        # The mingw C++/gcc runtime DLLs the llama.cpp DLLs dynamically depend on (a fully-`-static`
+        # DLL build hits `_Unwind_Resume` multiple-definition across the interdependent ggml DLLs).
+        # The thread runtime (libmcfgthread-2.dll — this fork's model, not winpthread) and the vulkan
+        # loader (vulkan-1.dll) are added automatically by the nixpkgs mingw DLL-fixup phase. The
+        # worker exe itself is statically linked and does not import any of these.
+        mingwRuntimeDlls = [
+          "${mingwCc.cc.lib}/x86_64-w64-mingw32/lib/libgcc_s_seh-1.dll"
+          "${mingwCc.cc.lib}/x86_64-w64-mingw32/lib/libstdc++-6.dll"
+        ];
+
+        # The nixpkgs mingw gcc ships no `libgomp` for the windows target, yet llama-cpp-sys-4's
+        # prebuilt path unconditionally emits `cargo:rustc-link-lib=gomp` for windows-gnu (the
+        # `openmp` cargo feature is forced on `llama-cpp-4` in the workspace Cargo.toml, and cannot
+        # be turned off per-consumer). Because the llama.cpp DLLs are built `GGML_OPENMP=OFF`, no
+        # OpenMP symbol is ever referenced, so an EMPTY `libgomp.a` satisfies `-lgomp` with zero
+        # runtime effect (the worker gains no libgomp DLL dependency).
+        mingwGompStub = pkgs.runCommandLocal "mingw-libgomp-stub" { } ''
+          mkdir -p "$out/lib"
+          "${mingwCc.bintools}/bin/${mingwCc.targetPrefix}ar" crs "$out/lib/libgomp.a"
+        '';
+
+        # From-source, shared-lib, DL-backend build of the pinned llama.cpp commit for windows-gnu.
+        # cmake is cross-configured by the mingw stdenv automatically. The compute backends build as
+        # MODULE libraries (upstream `ggml_add_backend_library` under `GGML_BACKEND_DL`), so they
+        # emit a `.dll` with NO import lib and install to bin — they are physically un-linkable and
+        # can only be loaded at runtime, which is exactly the model we want. All DLLs land in
+        # `$out/bin` (the set shipped beside the exe) and, mirrored, `$out/prebuilt/bin`; headers in
+        # `$out/prebuilt/include`; and the core import libs (llama/ggml/ggml-base/mtmd) in
+        # `$out/prebuilt/lib` with any *vulkan* import lib stripped as a belt-and-suspenders guard.
+        llamaCppWindows = pkgsWindows.stdenv.mkDerivation {
+          pname = "llama-cpp-windows-prebuilt";
+          version = "b9496";
+          src = llama-cpp-src;
+          strictDeps = true;
+          # Host build tools: cmake/ninja drive the cross build; shaderc's `glslc` and the host gcc
+          # (via the toolchain file above) build+run the SPIR-V shader generator on the build host.
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config pkgs.shaderc ];
+          # Target (windows) libraries the vulkan backend links/finds.
+          buildInputs = [ pkgsWindows.vulkan-loader pkgsWindows.vulkan-headers pkgsWindows.spirv-headers ];
+          cmakeFlags = [
+            "-DBUILD_SHARED_LIBS=ON"
+            "-DGGML_BACKEND_DL=ON"
+            "-DGGML_VULKAN=ON"
+            "-DGGML_OPENMP=OFF"
+            "-DGGML_NATIVE=OFF"
+            "-DLLAMA_BUILD_COMMON=ON"
+            "-DLLAMA_BUILD_TOOLS=ON" # mtmd lives under tools/
+            "-DLLAMA_BUILD_APP=OFF"
+            "-DLLAMA_BUILD_TESTS=OFF"
+            "-DLLAMA_BUILD_EXAMPLES=OFF"
+            "-DLLAMA_BUILD_SERVER=OFF"
+            "-DLLAMA_CURL=OFF"
+            "-DMTMD_VIDEO=OFF" # avoid the optional ffmpeg dependency
+            "-DVulkan_INCLUDE_DIR=${pkgsWindows.vulkan-headers}/include"
+            "-DVulkan_LIBRARY=${pkgsWindows.vulkan-loader}/lib/libvulkan-1.dll.a"
+            "-DVulkan_GLSLC_EXECUTABLE=${pkgs.shaderc.bin}/bin/glslc"
+            "-DSPIRV-Headers_DIR=${pkgsWindows.spirv-headers}/share/cmake/SPIRV-Headers"
+            "-DGGML_VULKAN_SHADERS_GEN_TOOLCHAIN=${llamaVulkanShaderHostToolchain}"
+          ];
+          # Runtime linkage is intentionally the mingw default (dynamic libgcc/libstdc++/mcfgthread):
+          # a `-static` DLL build makes each interdependent ggml DLL statically embed AND auto-export
+          # libgcc's exception-unwinding symbols, which then collide (multiple definition of
+          # `_Unwind_Resume`) when a downstream DLL links an upstream one. Instead the mingw runtime
+          # DLLs ship in the runtime set (see postInstall) and `vulkan-1.dll` stays a dynamic import.
+          postInstall = ''
+            mkdir -p "$out/prebuilt/bin" "$out/prebuilt/lib" "$out/prebuilt/include"
+
+            # The mingw C++/gcc/winpthread runtime DLLs the llama.cpp DLLs depend on.
+            for rt in ${lib.concatStringsSep " " mingwRuntimeDlls}; do
+              cp -f "$rt" "$out/bin/"
+            done
+
+            # Public headers for bindgen (the crate's build.rs also -I's the vendored source, so
+            # this is a convenience mirror, not strictly required).
+            if [ -d "$out/include" ]; then
+              cp -r "$out/include/." "$out/prebuilt/include/"
+            fi
+
+            # Runtime DLLs: the installed set in $out/bin (core libs + DL backend modules). Belt and
+            # suspenders: pull in any DLL from the build tree that install() may have missed.
+            for dll in $(find "$PWD" "$out" -name '*.dll' -type f); do
+              bn="$(basename "$dll")"
+              if [ ! -e "$out/bin/$bn" ]; then
+                cp "$dll" "$out/bin/$bn"
+              fi
+            done
+            cp "$out/bin/"*.dll "$out/prebuilt/bin/"
+
+            # Import libs for the crate's link step: ONLY the core shared libs the worker links
+            # against (llama/ggml/ggml-base/mtmd). The crate's prebuilt mode globs *.a in this dir
+            # and links EVERY one, so the LLAMA_BUILD_TOOLS impl import libs (llama-bench-impl, ...)
+            # and any *vulkan* import lib must be kept out — otherwise the worker would bind tool /
+            # GPU DLLs at link time. The DL backends (ggml-cpu/ggml-vulkan) are MODULE libs with no
+            # import lib and load purely at runtime. Import-lib names carry the mingw `lib` prefix
+            # (libggml.dll.a) even where the DLL does not (ggml.dll); accept either form.
+            for base in llama ggml ggml-base mtmd; do
+              for cand in "$out/lib/lib$base.dll.a" "$out/lib/$base.dll.a"; do
+                if [ -e "$cand" ]; then cp "$cand" "$out/prebuilt/lib/"; fi
+              done
+            done
+
+            # Guards: the DL backend + core DLLs must exist; no vulkan import lib may remain. DLL
+            # names may or may not carry the mingw `lib` prefix (ggml libs drop it, llama/mtmd keep
+            # it), so accept either form. Use `find` (not glob-in-`ls`) because nix builders enable
+            # `nullglob`, under which an unmatched `ls *pat*` would list the cwd and false-fire.
+            have_dll() { [ -e "$out/bin/$1.dll" ] || [ -e "$out/bin/lib$1.dll" ]; }
+            for core in ggml ggml-base ggml-cpu ggml-vulkan llama mtmd; do
+              have_dll "$core" || { echo "FATAL: core/backend DLL '$core' missing from \$out/bin"; ls -la "$out/bin"; exit 1; }
+            done
+            if [ -n "$(find "$out/prebuilt/lib" -iname '*vulkan*' 2>/dev/null)" ]; then
+              echo "FATAL: a vulkan import lib leaked into prebuilt/lib"; ls -la "$out/prebuilt/lib"; exit 1
+            fi
+            { [ -e "$out/prebuilt/lib/llama.dll.a" ] || [ -e "$out/prebuilt/lib/libllama.dll.a" ]; } \
+              || { echo "FATAL: llama import lib missing from prebuilt/lib"; ls -la "$out/prebuilt/lib"; exit 1; }
+            echo "== llamaCppWindows: \$out/prebuilt/lib (link-time whitelist) =="; ls -la "$out/prebuilt/lib"
+
+            echo "== llamaCppWindows: \$out/bin =="; ls -la "$out/bin"
+            echo "== llamaCppWindows: \$out/prebuilt/lib =="; ls -la "$out/prebuilt/lib"
+          '';
+        };
+
+        # Convenience references to the prebuilt tree (single-output derivation, so its store path
+        # is `${llamaCppWindows}`). Consumed as `LLAMA_PREBUILT_DIR` + the runtime DLL source.
+        llamaCppWindowsPrebuiltDir = "${llamaCppWindows}/prebuilt";
+        llamaCppWindowsRuntimeDir = "${llamaCppWindows}/bin";
+
+        # Clang args for bindgen when it cross-targets windows-gnu with the HOST libclang: point it
+        # at the mingw C runtime headers and the mingw libstdc++ headers (clang supplies its own
+        # stddef/stdint builtins). Shared by every engine lane that runs bindgen (llama-cpp-sys-4,
+        # onig_sys). The llama lane appends the prebuilt include dir on top of this.
+        windowsBindgenClangArgs = lib.concatStringsSep " " [
+          "--target=x86_64-w64-windows-gnu"
+          "-isystem ${mingwCc.cc}/include/c++/${mingwCc.cc.version}"
+          "-isystem ${mingwCc.cc}/include/c++/${mingwCc.cc.version}/x86_64-w64-mingw32"
+          "-isystem ${mingwCc.cc}/include/c++/${mingwCc.cc.version}/backward"
+          "-isystem ${mingwCc.libc.dev}/include"
+          # This fork's libstdc++ uses the mcfgthread threading model; its <bits/gthr-default.h>
+          # includes <mcfgthread/gthr.h>, which lives in the mcfgthread dev headers.
+          "-isystem ${pkgsWindows.windows.mcfgthreads.dev}/include"
+        ];
+
+        # Shared cross env for the engine worker lanes: the base windows cross args plus bindgen
+        # (host libclang), the mtp_shim C++ compiler (cc-rs), and the empty-libgomp `-L` so the
+        # forced `-lgomp` resolves. Target-scoped compiler vars are preferred over global CC/CXX so
+        # host build scripts keep using the native toolchain.
+        windowsEngineCommonArgs = windowsCommonArgs // {
+          nativeBuildInputs = (windowsCommonArgs.nativeBuildInputs or [ ]) ++ [
+            pkgs.ninja
+            pkgs.pkg-config
+            pkgs.llvmPackages.libclang.lib
+          ];
+          # mtp_shim is C++ (compiled by cc-rs); onig_sys / ring / etc. are C (TARGET_CC already set
+          # in windowsCommonArgs). Scope C++ to the target triple; leave host CXX alone.
+          TARGET_CXX = mingwCxx;
+          "CC_x86_64_pc_windows_gnu" = mingwTargetCc;
+          "CXX_x86_64_pc_windows_gnu" = mingwCxx;
+          LIBCLANG_PATH = libclangPath;
+          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu" = windowsBindgenClangArgs;
+          # Extend the base static RUSTFLAGS (winpthread -L from windowsCommonArgs) with:
+          #  * the empty-libgomp stub dir (resolves the forced `-lgomp`);
+          #  * the mingw gcc target lib dir, so rustc can find `libstdc++.a` for the prebuilt path's
+          #    `cargo:rustc-link-lib=static=stdc++` (rustc validates `static=` libs against its own
+          #    -L set, unlike the gcc driver's implicit search dirs).
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS =
+            windowsCommonArgs.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS
+            + " -L ${mingwGompStub}/lib"
+            + " -L ${mingwCc.cc}/x86_64-w64-mingw32/lib";
+        };
+
+        # The llama lane needs the prebuilt shared llama.cpp (skips cmake in build.rs) and the
+        # prebuilt include dir on bindgen's search path.
+        windowsLlamaEngineArgs = windowsEngineCommonArgs // {
+          LLAMA_PREBUILT_DIR = llamaCppWindowsPrebuiltDir;
+          LLAMA_PREBUILT_SHARED = "1";
+          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu" =
+            windowsBindgenClangArgs + " -I${llamaCppWindowsPrebuiltDir}/include";
+        };
+
+        daemonInferLlamaWindowsDeps = craneLibWindows.buildDepsOnly (
+          windowsLlamaEngineArgs
+          // {
+            pname = "daemon-infer-llama-windows-deps";
+            # `default` features are empty; match the native lane's convention (no
+            # --no-default-features). The target comes from CARGO_BUILD_TARGET.
+            cargoExtraArgs = "-p daemon-infer --features llama,mtmd";
+          }
+        );
+
+        daemon-infer-llama-windows = craneLibWindows.buildPackage (
+          windowsLlamaEngineArgs
+          // {
+            pname = "daemon-infer-llama-windows";
+            version = baseVersion;
+            cargoArtifacts = daemonInferLlamaWindowsDeps;
+            cargoExtraArgs = "-p daemon-infer --features llama,mtmd";
+            DAEMON_BUILD_ID = buildId;
+            postInstall = ''
+              # Ship the worker's runtime DLL closure beside the exe: the core libs + DL backends
+              # (incl. ggml-vulkan.dll) + mingw/mcfgthread runtime + vulkan-1.dll. Skip the
+              # LLAMA_BUILD_TOOLS byproducts (`*-impl.dll`, `libllama-common.dll`) — nothing the
+              # worker loads imports them (verified via objdump). `llama-cpp-windows` keeps the full
+              # set; only the shipped worker set is trimmed.
+              for dll in ${llamaCppWindowsRuntimeDir}/*.dll; do
+                bn="$(basename "$dll")"
+                case "$bn" in
+                  *-impl.dll | libllama-common.dll) continue ;;
+                esac
+                cp "$dll" "$out/bin/"
+              done
+
+              objdump="${mingwObjdump}"
+              exe="$out/bin/daemon-infer.exe"
+              test -e "$exe" || { echo "FATAL: daemon-infer.exe not installed"; ls -la "$out/bin"; exit 1; }
+
+              echo "== daemon-infer.exe imports =="
+              "$objdump" -p "$exe" | grep -i 'DLL Name:' || true
+
+              # Guard 1: the worker imports NEITHER vulkan-1.dll NOR any ggml-vulkan dll.
+              if "$objdump" -p "$exe" | grep -qi 'vulkan-1\.dll'; then
+                echo "FATAL: daemon-infer.exe imports vulkan-1.dll (must be runtime-DL only)"; exit 1
+              fi
+              if "$objdump" -p "$exe" | grep -qi 'ggml-vulkan'; then
+                echo "FATAL: daemon-infer.exe imports a ggml-vulkan dll (must be runtime-DL only)"; exit 1
+              fi
+
+              # Guard 2: the ggml-vulkan backend DLL must ship AND import vulkan-1.dll (the GPU
+              # backend; on a GPU-less host it just fails to load -> CPU fallback). Name may or may
+              # not carry the mingw `lib` prefix.
+              vk="$(find "$out/bin" -iname '*ggml-vulkan*.dll' 2>/dev/null | head -1)"
+              [ -n "$vk" ] || { echo "FATAL: ggml-vulkan backend DLL missing from \$out/bin"; ls -la "$out/bin"; exit 1; }
+              if ! "$objdump" -p "$vk" | grep -qi 'vulkan-1\.dll'; then
+                echo "FATAL: $(basename "$vk") does not import vulkan-1.dll"; "$objdump" -p "$vk" | grep -i 'DLL Name:'; exit 1
+              fi
+
+              # Guard 3: the core runtime DLLs are present beside the exe (prefix-agnostic).
+              have_dll() { [ -e "$out/bin/$1.dll" ] || [ -e "$out/bin/lib$1.dll" ]; }
+              for core in ggml ggml-base ggml-cpu ggml-vulkan llama mtmd; do
+                have_dll "$core" || { echo "FATAL: core DLL '$core' missing"; ls -la "$out/bin"; exit 1; }
+              done
+
+              echo "== per-DLL imports (runtime dependency map for packaging) =="
+              for d in "$out/bin/"*.dll; do
+                echo "--- $(basename "$d") ---"
+                "$objdump" -p "$d" | grep -i 'DLL Name:' || true
+              done
+              echo "import-contract guards passed"
+            '';
+          }
+        );
+
+        # mistral.rs on windows is CPU-only (candle has no vulkan backend). Its only new native dep
+        # is `onig_sys` (C, covered by TARGET_CC + the bindgen clang args). No prebuilt env.
+        daemonInferMistralrsWindowsDeps = craneLibWindows.buildDepsOnly (
+          windowsEngineCommonArgs
+          // {
+            pname = "daemon-infer-mistralrs-windows-deps";
+            cargoExtraArgs = "-p daemon-infer --features mistralrs";
+          }
+        );
+
+        daemon-infer-mistralrs-windows = craneLibWindows.buildPackage (
+          windowsEngineCommonArgs
+          // {
+            pname = "daemon-infer-mistralrs-windows";
+            version = baseVersion;
+            cargoArtifacts = daemonInferMistralrsWindowsDeps;
+            cargoExtraArgs = "-p daemon-infer --features mistralrs";
+            DAEMON_BUILD_ID = buildId;
+          }
+        );
+
         # The MeTTa symbolic-coprocessor worker, built WITH the real engine (`--features hyperon`).
         # This is a deliberately separate output, NOT part of the default workspace gate: the default
         # `daemon-metta` (fallback engine) and every other crate never link `hyperon`. The hyperon
@@ -372,10 +683,15 @@
             daemon-metta
             daemon-windows
             daemon-cli-windows
+            daemon-infer-llama-windows
+            daemon-infer-mistralrs-windows
             ;
           # Prebuilt llama.cpp (shared, CPU + Vulkan) matching the crate's vendored commit; consumed
           # by the dev shells via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
           llama-cpp = llamaCpp;
+          # Prebuilt shared llama.cpp for windows-gnu (DL backends: CPU + Vulkan). Consumed by the
+          # `daemon-infer-llama-windows` lane and available for the superproject's NSIS bundling.
+          llama-cpp-windows = llamaCppWindows;
           default = daemon;
         };
 
