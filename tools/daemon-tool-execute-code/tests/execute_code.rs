@@ -128,7 +128,7 @@ async fn run_in(
 async fn run_plain(root: &Path, args: &str) -> ToolOutcome {
     run_in(
         root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -142,6 +142,15 @@ fn detail_sandboxed(out: &ToolOutcome) -> Option<bool> {
     let detail = out.detail.as_ref()?;
     let v: serde_json::Value = serde_json::from_slice(&detail.body).ok()?;
     v.get("sandboxed").and_then(|b| b.as_bool())
+}
+
+/// Parse the `backend` label (`bwrap`/`landlock`/`sandbox-exec`/`plain`) out of the detail body.
+fn detail_backend(out: &ToolOutcome) -> Option<String> {
+    let detail = out.detail.as_ref()?;
+    let v: serde_json::Value = serde_json::from_slice(&detail.body).ok()?;
+    v.get("backend")
+        .and_then(|b| b.as_str())
+        .map(str::to_string)
 }
 
 // --- Test 1: argument parsing (no python needed) ---------------------------------------------
@@ -166,7 +175,7 @@ async fn deny_policy_refuses_without_running() {
     let root = temp_root("deny");
     let out = run_in(
         &root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::Deny,
         &NoopHost,
         CancellationToken::new(),
@@ -185,7 +194,7 @@ async fn ask_policy_defers_durably_with_await_effect() {
     let root = temp_root("defer");
     let out = run_in(
         &root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::Ask,
         &DeferHost,
         CancellationToken::new(),
@@ -247,7 +256,7 @@ async fn large_stdout_is_truncated_head_tail() {
         return;
     }
     let root = temp_root("cap");
-    let mut s = settings(SandboxPolicy::None);
+    let mut s = settings(SandboxPolicy::Plain);
     s.max_stdout_bytes = 200;
     let out = run_in(
         &root,
@@ -275,7 +284,7 @@ async fn timeout_kills_and_reports() {
         return;
     }
     let root = temp_root("timeout");
-    let mut s = settings(SandboxPolicy::None);
+    let mut s = settings(SandboxPolicy::Plain);
     s.timeout = Duration::from_secs(1);
     let out = run_in(
         &root,
@@ -324,7 +333,7 @@ async fn cancel_interrupts_running_script() {
         name: "execute_code".into(),
         args: args("import time; time.sleep(60)"),
     };
-    let tool = ExecuteCodeTool::new(settings(SandboxPolicy::None));
+    let tool = ExecuteCodeTool::new(settings(SandboxPolicy::Plain));
     let run_fut = tool.run(&call, &cx);
     let cancel_fut = async {
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -353,7 +362,7 @@ async fn project_and_strict_modes_use_expected_cwd() {
     // Strict mode: CWD is the isolated staging dir under the workspace.
     let strict = run_in(
         &root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -399,7 +408,7 @@ async fn bwrap_blocks_out_of_workspace_write() {
 
     let out = run_in(
         &ws,
-        settings(SandboxPolicy::Bwrap),
+        settings(SandboxPolicy::Require),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -440,6 +449,8 @@ async fn none_policy_runs_unsandboxed() {
     let out = run_plain(&root, &args("print('plain')")).await;
     assert!(out.result.ok, "expected success: {}", out.result.content);
     assert_eq!(detail_sandboxed(&out), Some(false));
+    // `Plain` is the explicit unconfined backend.
+    assert_eq!(detail_backend(&out).as_deref(), Some("plain"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -454,7 +465,7 @@ async fn required_bwrap_either_sandboxes_or_reports_unavailable() {
     let root = temp_root("reqbwrap");
     let out = run_in(
         &root,
-        settings(SandboxPolicy::Bwrap),
+        settings(SandboxPolicy::Require),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -462,11 +473,20 @@ async fn required_bwrap_either_sandboxes_or_reports_unavailable() {
     )
     .await;
     if out.result.ok {
-        // bwrap usable here → the run was actually sandboxed.
+        // A kernel backend was usable → the run was actually confined (bwrap on this host, or the
+        // Landlock+seccomp fallback where userns is off).
         assert_eq!(detail_sandboxed(&out), Some(true));
+        assert!(
+            matches!(
+                detail_backend(&out).as_deref(),
+                Some("bwrap") | Some("landlock")
+            ),
+            "Require must resolve to a kernel backend, got {:?}",
+            detail_backend(&out)
+        );
         assert!(out.result.content.contains("probe"));
     } else {
-        // bwrap unusable → a clear setup error, never a silent unsandboxed run.
+        // No backend usable → a clear setup error, never a silent unsandboxed run (fail closed).
         assert!(out.result.content.contains("unavailable"));
     }
     let _ = std::fs::remove_dir_all(&root);

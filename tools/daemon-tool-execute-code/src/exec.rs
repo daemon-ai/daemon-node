@@ -65,6 +65,12 @@ pub(crate) struct RunOutcome {
 }
 
 /// Spawn `argv` in `cwd` and run it to completion, honoring `timeout` and `cancel`.
+///
+/// When `confine` is `Some`, the in-process (Linux Landlock+seccomp) sandbox is installed on the
+/// child at spawn (a no-op off Linux); `TMPDIR` is redirected under the working dir so the child's
+/// temp files stay inside the sandbox's writable scope. Argv-wrapper backends (bwrap, `sandbox-exec`)
+/// carry their confinement in `argv` and pass `confine = None`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_subprocess(
     argv: &[OsString],
     cwd: &Path,
@@ -72,6 +78,7 @@ pub(crate) async fn run_subprocess(
     tz: Option<String>,
     timeout: Duration,
     caps: OutputCaps,
+    confine: Option<daemon_sandbox::SandboxSpec>,
     cancel: &CancellationToken,
 ) -> std::io::Result<RunOutcome> {
     let mut cmd = Command::new(&argv[0]);
@@ -86,6 +93,12 @@ pub(crate) async fn run_subprocess(
         .kill_on_drop(true);
     if let Some(tz) = &tz {
         cmd.env("TZ", tz);
+    }
+    if let Some(spec) = &confine {
+        // Keep the child's temp files inside the sandbox's writable scope (Landlock cannot grant a
+        // private /tmp), then install the in-process confinement before spawn.
+        cmd.env("TMPDIR", cwd);
+        daemon_sandbox::confine_command(&mut cmd, spec)?;
     }
     // A fresh process group so the timeout/cancel path can signal the whole tree (the child plus any
     // grandchildren it spawns), not just the direct child.

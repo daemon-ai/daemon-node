@@ -70,18 +70,23 @@ impl Mode {
     }
 }
 
-/// The OS-sandbox policy for the child process.
+/// The OS-sandbox posture for the child process. Selects among the per-platform kernel backends
+/// (Linux bwrap → Landlock+seccomp; macOS `sandbox-exec`) behind one policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxPolicy {
-    /// Use bubblewrap when it is present *and* usable (user namespaces work), else a plain
-    /// subprocess. The default.
+    /// Use the strongest available kernel backend for this platform; if none is usable, run a plain
+    /// (unconfined) subprocess after logging a warning. The default.
     #[default]
     Auto,
-    /// Require bubblewrap: fail the call if it is absent or unusable (no silent unsandboxed run).
-    Bwrap,
-    /// Never sandbox — always a plain subprocess.
-    None,
+    /// Require a kernel backend: fail the call if none is usable (no silent unsandboxed run). The
+    /// legacy `bwrap` label still parses to this posture.
+    #[serde(alias = "bwrap")]
+    Require,
+    /// Never sandbox — an explicit, high-friction operator choice for an unconfined subprocess. The
+    /// legacy `none` label still parses to this posture.
+    #[serde(alias = "none")]
+    Plain,
 }
 
 /// The child's network policy (only enforced under the bwrap sandbox).
@@ -157,6 +162,8 @@ struct ExecDetail<'a> {
     status: &'a str,
     mode: &'a str,
     sandboxed: bool,
+    /// The chosen backend label (`bwrap`/`landlock`/`sandbox-exec`/`plain`).
+    backend: &'a str,
     exit_code: i32,
     duration_seconds: f64,
     stdout_len: usize,
@@ -176,10 +183,10 @@ struct ResultJson {
     error: Option<String>,
 }
 
-/// The internal outcome of a completed run plus the sandbox flag (for the detail envelope).
+/// The internal outcome of a completed run plus the chosen sandbox backend (for the detail envelope).
 struct Executed {
     outcome: RunOutcome,
-    sandboxed: bool,
+    kind: sandbox::SandboxKind,
     mode: Mode,
 }
 
@@ -293,7 +300,6 @@ impl ExecuteCodeTool {
             Mode::Strict => staging.clone(),
         };
 
-        let sandboxed = matches!(kind, sandbox::SandboxKind::Bwrap);
         let run = self
             .run_staged(&staging, &interpreter, &cwd, kind, code, cancel)
             .await;
@@ -302,7 +308,7 @@ impl ExecuteCodeTool {
 
         run.map(|outcome| Executed {
             outcome,
-            sandboxed,
+            kind,
             mode,
         })
     }
@@ -331,6 +337,10 @@ impl ExecuteCodeTool {
             &path_env,
             tz.as_deref(),
         );
+        // The in-process (Landlock+seccomp) backend is applied at spawn; the argv-wrapper backends
+        // (bwrap, sandbox-exec) carry their confinement in `argv` and pass no in-process spec.
+        let confine = (kind == sandbox::SandboxKind::Landlock)
+            .then(|| sandbox::landlock_spec(cwd, interpreter, self.settings.network));
         let caps = OutputCaps {
             stdout: self.settings.max_stdout_bytes,
             stderr: self.settings.max_stderr_bytes,
@@ -342,6 +352,7 @@ impl ExecuteCodeTool {
             tz,
             self.settings.timeout,
             caps,
+            confine,
             cancel,
         )
         .await
@@ -404,7 +415,8 @@ impl ExecuteCodeTool {
         let detail = ExecDetail {
             status: status_label,
             mode: exec.mode.as_str(),
-            sandboxed: exec.sandboxed,
+            sandboxed: exec.kind.is_confined(),
+            backend: exec.kind.label(),
             exit_code,
             duration_seconds: secs,
             stdout_len,
