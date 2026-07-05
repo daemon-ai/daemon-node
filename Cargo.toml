@@ -46,6 +46,11 @@ thiserror = "2"
 anyhow = "1"
 futures = "0.3"
 strsim = "0.11"
+# UTS#46 IDNA/punycode host normalization for the `check_url` SSRF gate (safety/url.rs): fold a
+# unicode/punycode host to the canonical ASCII form the resolver uses, so an alternate-separator /
+# fullwidth-digit host cannot slip an IP-literal or `localhost` past the denylist. Already resolved
+# in-tree transitively (reqwest -> url -> idna), so this adds no new crate/license (deny stays green).
+idna = "1"
 # SASL state machine for the node authentication handshake (SCRAM-SHA-256 / PLAIN / EXTERNAL). v2+
 # is dual Apache-2.0/MIT. default-features off drops gssapi (native libgssapi) + the SSO mechanisms;
 # we enable only what the node serves. Isolated to `daemon-host` (the transport crate).

@@ -91,7 +91,7 @@ pub use repair::{
     repair_tool_args, repair_tool_call, repair_tool_name, sanitize_tool_error, scrub_content,
     wrap_untrusted_tool_result, ArgRepair, NameRepairError, ScrubChunk, StreamingThinkScrubber,
 };
-pub use safety::{check_url, CheckedUrl, UrlReject};
+pub use safety::{check_url, check_url_resolved, check_url_resolved_with, CheckedUrl, UrlReject};
 pub use snapshot::{PendingApproval, ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;
 pub use tools::{

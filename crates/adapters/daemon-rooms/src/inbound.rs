@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use daemon_api::NodeApi;
 use daemon_common::{ReqId, SessionId};
-use daemon_protocol::{AgentCommand, Origin, OriginScope, RoomId, RoomMember, UserMsg};
+use daemon_protocol::{AgentCommand, Origin, OriginScope, RoomId, RoomMember, SenderId, UserMsg};
 
 /// The in-memory membership table for the rooms this router owns: `room_id -> members`. Loaded from
 /// the store (`room_members`) at bring-up and mutated by the `room_add_member`/`room_remove_member`
@@ -122,7 +122,7 @@ impl RoomInbound {
     pub async fn fan_out<F>(
         &self,
         room: &RoomId,
-        sender: &str,
+        sender: &SenderId,
         text: &str,
         members: &[RoomMember],
         addressed: F,
@@ -130,9 +130,9 @@ impl RoomInbound {
         F: Fn(&RoomMember) -> bool,
     {
         let origin = Self::origin(room);
-        let attributed = format!("{sender}: {text}");
+        let attributed = format!("{}: {}", sender.as_str(), text);
         for member in members {
-            if member.member == sender {
+            if member.member == sender.as_str() {
                 continue;
             }
             let input = UserMsg::new(attributed.clone());

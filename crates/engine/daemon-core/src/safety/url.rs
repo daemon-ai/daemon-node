@@ -28,6 +28,11 @@ pub enum UrlReject {
     /// a name (`localhost`) that conventionally does.
     #[error("host not allowed (private/loopback/link-local): {0}")]
     PrivateHost(String),
+    /// The host is a registered name that **resolved** to a private/loopback/link-local/metadata
+    /// address (a DNS-rebinding attempt). Only produced by [`check_url_resolved`] /
+    /// [`check_url_resolved_with`]; plain [`check_url`] never resolves.
+    #[error("host resolves to a non-public address (rebinding): {0}")]
+    ResolvedPrivate(String),
 }
 
 /// A URL that passed [`check_url`]: its (lowercased) scheme and host, plus the original string the
@@ -62,7 +67,7 @@ pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlReject> {
         .rsplit_once('@')
         .map(|(_, h)| h)
         .unwrap_or(authority);
-    let host = strip_port(host_port).to_ascii_lowercase();
+    let host = normalize_host(strip_port(host_port));
     if host.is_empty() {
         return Err(UrlReject::EmptyHost);
     }
@@ -74,6 +79,28 @@ pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlReject> {
         host,
         url: trimmed.to_string(),
     })
+}
+
+/// Normalize a host to the canonical form the resolver will actually use, closing two bypass classes
+/// **unconditionally** (every caller inherits this):
+/// - **trailing FQDN dot** — `localhost.` / `127.0.0.1.` are still localhost / loopback;
+/// - **IDNA/punycode** — a unicode/punycode host (e.g. alternate label separators `127。0。0。1`,
+///   fullwidth digits) is folded through UTS#46 ToASCII so it cannot smuggle an IP literal or
+///   `localhost` past the blocklist that the HTTP stack (reqwest → url → idna) would later resolve.
+///
+/// Bracketed IPv6 literals are returned lowercased as-is (UTS#46 does not apply). On IDNA failure the
+/// trimmed host is kept (no regression; the standard `idna` crate is the same normalizer the HTTP
+/// stack uses, so divergence is unlikely).
+fn normalize_host(host_port_stripped: &str) -> String {
+    let lowered = host_port_stripped.to_ascii_lowercase();
+    if lowered.starts_with('[') {
+        return lowered;
+    }
+    let trimmed = lowered.trim_end_matches('.');
+    match idna::domain_to_ascii(trimmed) {
+        Ok(ascii) => ascii.trim_end_matches('.').to_string(),
+        Err(_) => trimmed.to_string(),
+    }
 }
 
 /// Strip a trailing `:port` from a host, leaving bracketed IPv6 literals (`[::1]`) intact.
@@ -104,12 +131,72 @@ fn is_blocked_host(host: &str) -> bool {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     match ip_str.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => is_blocked_v4(v4),
-        Ok(IpAddr::V6(v6)) => is_blocked_v6(v6),
-        // A registered name we cannot classify without DNS — allow it (resolution-time guard is a
-        // separate layer); the http(s) + literal checks above cover the common SSRF vectors.
+        Ok(ip) => ip_is_blocked(ip),
+        // A registered name we cannot classify without DNS — allow it (the opt-in
+        // [`check_url_resolved`] adds the resolution-time guard); the http(s) + literal + IDNA checks
+        // above cover the common SSRF vectors.
         Err(_) => false,
     }
+}
+
+/// Classify a resolved/literal [`IpAddr`] against the loopback / unspecified / private / link-local /
+/// CGNAT / metadata denylist. Shared by the literal-host path ([`check_url`]) and the resolved-IP
+/// path ([`check_url_resolved_with`]) so both key on one denylist.
+fn ip_is_blocked(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_v4(v4),
+        IpAddr::V6(v6) => is_blocked_v6(v6),
+    }
+}
+
+/// Like [`check_url`], plus a **connect-time resolved-IP check** (DNS-rebinding defense): after the
+/// string checks pass, a host that is a registered name (not already an IP literal) is resolved and
+/// rejected with [`UrlReject::ResolvedPrivate`] if **any** resolved address is on the
+/// private/loopback/link-local/metadata denylist.
+///
+/// This is the **surfaced opt-in** — plain [`check_url`] never resolves, so callers that legitimately
+/// target private hosts (an operator-configured peer) are unaffected. It uses the blocking system
+/// resolver; from async code call it inside a blocking context (e.g. `tokio::task::spawn_blocking`).
+///
+/// Note: this is resolve-then-check, not a pinned connector, so a strict rebind between this check and
+/// the HTTP client's own resolution is still theoretically possible; closing that fully needs a
+/// connector that pins the validated IP (a follow-on).
+pub fn check_url_resolved(raw: &str) -> Result<CheckedUrl, UrlReject> {
+    check_url_resolved_with(raw, resolve_system)
+}
+
+/// [`check_url_resolved`] with an **injectable resolver** — the seam that lets tests exercise the
+/// rebinding path deterministically and offline (no live DNS). `resolve` maps a host name to its
+/// addresses; a resolver `Err` is treated as "unresolvable" and passed through (the request would
+/// fail at connect time anyway) rather than newly rejecting a name.
+pub fn check_url_resolved_with<R>(raw: &str, resolve: R) -> Result<CheckedUrl, UrlReject>
+where
+    R: FnOnce(&str) -> std::io::Result<Vec<IpAddr>>,
+{
+    let checked = check_url(raw)?;
+    // An IP literal was already classified by `check_url` — no DNS needed.
+    let literal = checked
+        .host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&checked.host)
+        .parse::<IpAddr>();
+    if literal.is_ok() {
+        return Ok(checked);
+    }
+    if let Ok(addrs) = resolve(&checked.host) {
+        if addrs.into_iter().any(ip_is_blocked) {
+            return Err(UrlReject::ResolvedPrivate(checked.host));
+        }
+    }
+    Ok(checked)
+}
+
+/// The default system resolver used by [`check_url_resolved`]: resolve `host:0` and collect the
+/// candidate addresses.
+fn resolve_system(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, 0u16).to_socket_addrs()?.map(|sa| sa.ip()).collect())
 }
 
 /// Loopback / unspecified / private (RFC-1918) / link-local / CGNAT / benchmarking IPv4.
@@ -199,6 +286,104 @@ mod tests {
                 "expected {u} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_trailing_dot_hostnames() {
+        // A trailing FQDN dot must not bypass the blocklist: `localhost.` is still localhost, and
+        // `127.0.0.1.` is still loopback (the resolver treats the trailing dot as the root label).
+        for u in [
+            "http://localhost./",
+            "http://127.0.0.1./",
+            "http://169.254.169.254./latest/meta-data/",
+            "http://10.0.0.5./",
+            "http://api.localhost./",
+        ] {
+            assert!(
+                matches!(check_url(u), Err(UrlReject::PrivateHost(_))),
+                "expected {u} to be rejected (trailing-dot bypass)"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_idna_and_punycode_bypass() {
+        // Non-ASCII label separators that UTS#46 maps to '.', yielding the loopback IP literal
+        // `127.0.0.1` — which the resolver (reqwest -> url -> idna) would connect to. Without IDNA
+        // normalization `check_url` sees an unclassifiable name and (pre-fix) allows it.
+        for u in [
+            "http://127\u{3002}0\u{3002}0\u{3002}1/", // U+3002 ideographic full stop
+            "http://127\u{ff0e}0\u{ff0e}0\u{ff0e}1/", // U+FF0E fullwidth full stop
+            "http://127\u{ff61}0\u{ff61}0\u{ff61}1/", // U+FF61 halfwidth ideographic full stop
+        ] {
+            assert!(
+                matches!(check_url(u), Err(UrlReject::PrivateHost(_))),
+                "expected {u:?} to normalize to loopback and be rejected"
+            );
+        }
+        // A legitimate internationalized public domain must still pass (no over-blocking): it
+        // normalizes to its punycode ASCII form, which is not on the denylist.
+        assert!(
+            check_url("https://m\u{fc}nchen.de/").is_ok(),
+            "münchen.de should normalize to xn--mnchen-3ya.de and pass"
+        );
+    }
+
+    #[test]
+    fn resolved_ip_check_rejects_rebinding_when_enabled() {
+        // A public-looking name that (via the injected resolver) resolves to a private/loopback/
+        // metadata address is rejected — the DNS-rebinding case. Deterministic + offline.
+        for blocked in [
+            [127, 0, 0, 1],
+            [169, 254, 169, 254],
+            [10, 0, 0, 5],
+            [192, 168, 1, 1],
+        ] {
+            let resolve = move |_host: &str| Ok(vec![IpAddr::from(blocked)]);
+            assert!(
+                matches!(
+                    check_url_resolved_with("https://rebind.example/x", resolve),
+                    Err(UrlReject::ResolvedPrivate(_))
+                ),
+                "expected rebind to {blocked:?} to be rejected"
+            );
+        }
+        // Even one blocked address among several rejects (a mixed A-record rebind).
+        let mixed = |_host: &str| {
+            Ok(vec![
+                IpAddr::from([93, 184, 216, 34]),
+                IpAddr::from([127, 0, 0, 1]),
+            ])
+        };
+        assert!(matches!(
+            check_url_resolved_with("https://mixed.example/", mixed),
+            Err(UrlReject::ResolvedPrivate(_))
+        ));
+    }
+
+    #[test]
+    fn resolved_ip_check_allows_public_and_defers_to_string_checks() {
+        // A name resolving only to public addresses passes.
+        let public = |_host: &str| Ok(vec![IpAddr::from([93, 184, 216, 34])]);
+        assert!(check_url_resolved_with("https://example.com/", public).is_ok());
+        // An unresolvable name is passed through (the request fails at connect time) — not newly
+        // rejected by the resolver step.
+        let unresolvable = |_host: &str| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "nxdomain",
+            ))
+        };
+        assert!(check_url_resolved_with("https://example.com/", unresolvable).is_ok());
+        // The string checks still run first: a literal loopback is rejected before any resolution,
+        // and the resolver must not even be consulted for an IP literal.
+        let must_not_call = |_host: &str| -> std::io::Result<Vec<IpAddr>> {
+            panic!("resolver must not be called for an IP literal");
+        };
+        assert!(matches!(
+            check_url_resolved_with("http://127.0.0.1/", must_not_call),
+            Err(UrlReject::PrivateHost(_))
+        ));
     }
 
     #[test]

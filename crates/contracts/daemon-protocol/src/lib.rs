@@ -815,6 +815,49 @@ impl From<String> for TransportId {
     }
 }
 
+/// An **immutable, platform-assigned sender identity** — a Matrix MXID (`@user:hs`), a Telegram user
+/// id, etc. NEVER a display name or any user/operator-mutable text.
+///
+/// Sender allow-listing (the ingest `SenderPolicy`) and attribution key on this, so it must be the
+/// stable identifier the platform guarantees, **supplied by the adapter** — never re-derived from a
+/// message body or display text (the OpenClaw display-name `allowFrom` substrate). It is deliberately
+/// off the wire in this iteration (enforced at the ingest boundary via `Reception`); carrying it onto
+/// `Origin`/the log is a separate follow-on.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SenderId(pub String);
+
+impl SenderId {
+    /// Construct a sender id from its stable, immutable platform identifier.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The sender id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The reserved identity for a node-internal **loopback** origin that has no external sender
+    /// (e.g. a Rooms operator post). A typed, documented constant so no ingest path re-derives a
+    /// sender from free text — the whole point of the newtype.
+    pub fn local_loopback() -> Self {
+        Self("local:loopback".to_string())
+    }
+}
+
+impl From<&str> for SenderId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for SenderId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// The conversational scope an inbound item belongs to — the single input (with the transport) to
 /// deterministic session-id derivation, and the per-event attribution carried on the log. This is
 /// the daemon analogue of hermes's `build_session_key` input, but carried explicitly (never via
