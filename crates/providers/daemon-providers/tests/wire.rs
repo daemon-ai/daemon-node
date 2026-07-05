@@ -32,6 +32,8 @@ fn req() -> Request {
         auth: Some("sk-test".into()),
         constraint: None,
         cache_system: false,
+        params: Default::default(),
+        task: None,
     }
 }
 

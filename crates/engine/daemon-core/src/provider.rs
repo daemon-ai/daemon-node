@@ -71,6 +71,15 @@ pub struct Request {
     /// prefix on their own (mistral.rs prefix cache; the llama worker's persistent context) and also
     /// ignore the hint.
     pub cache_system: bool,
+    /// Per-call sampling overrides for this request. The `Default` (all `None`) preserves the
+    /// provider's own defaults — the behavior of every main turn. Aux/LCM/title/vision call sites set
+    /// the subset they need ([`Request::with_params`]); a provider maps what it supports and ignores
+    /// the rest (e.g. genai has no `top_k`; local honors all of them).
+    pub params: RequestParams,
+    /// A coarse task label (`"extraction"`/`"compression"`/`"title_generation"`/`"vision"`…) for
+    /// telemetry/routing. Never affects control flow; providers may surface it as a `gen_ai.*`
+    /// attribute. `None` for ordinary main turns.
+    pub task: Option<String>,
 }
 
 /// An engine-agnostic grammar constraint carried on a [`Request`]. It holds both grammar dialects so
@@ -101,6 +110,19 @@ impl Request {
         self.constraint = Some(constraint);
         self
     }
+
+    /// Set the per-call sampling overrides ([`Request::params`]). A provider maps the subset it
+    /// supports and ignores the rest.
+    pub fn with_params(mut self, params: RequestParams) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Set the coarse task label ([`Request::task`]) for telemetry/routing.
+    pub fn with_task(mut self, task: impl Into<String>) -> Self {
+        self.task = Some(task.into());
+        self
+    }
 }
 
 /// One flattened message in a [`Request`].
@@ -124,6 +146,35 @@ pub struct RequestMsg {
     /// explicit-breakpoint hint (Anthropic `cache_control`); providers that cache automatically or
     /// reuse the KV prefix themselves (OpenAI/DeepSeek, local engines) ignore it.
     pub cache_breakpoint: bool,
+    /// Multimodal image parts for a `user` message (the vision aux path). Empty for a text-only
+    /// message. A provider that supports vision emits these alongside the text; a provider without an
+    /// image input channel (local inference) ignores them.
+    pub images: Vec<RequestImage>,
+}
+
+/// One image attached to a user [`RequestMsg`] for a multimodal request (the vision aux path).
+///
+/// The provider surface carries only *resolved* bytes: workspace-path / URL / `data:` resolution,
+/// containment, SSRF checks, MIME sniffing and resizing all happen tool-side (the `vision_analyze`
+/// tool), so this engine-agnostic type stays a pure transport and the engine never does filesystem
+/// or network I/O for it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RequestImage {
+    /// The image MIME type, e.g. `image/png` / `image/jpeg`.
+    pub mime: String,
+    /// The base64-encoded image bytes (no `data:` prefix).
+    pub data_base64: String,
+}
+
+/// A blob-eliding [`std::fmt::Debug`]: the base64 payload can be megabytes, so print only the MIME
+/// type and byte count rather than dumping the encoded bytes into logs.
+impl std::fmt::Debug for RequestImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestImage")
+            .field("mime", &self.mime)
+            .field("data_base64_len", &self.data_base64.len())
+            .finish()
+    }
 }
 
 /// The effective sampling/request parameters a provider applied for one model call (observability
@@ -412,6 +463,8 @@ pub fn build_context(conv: &Conversation, tools: &[ToolDef]) -> Request {
         auth: None,
         constraint: None,
         cache_system: false,
+        params: RequestParams::default(),
+        task: None,
     };
     mark_cache_breakpoints(&mut req);
     req
@@ -754,6 +807,8 @@ mod cache_tests {
             auth: None,
             constraint: None,
             cache_system: false,
+            params: RequestParams::default(),
+            task: None,
         };
         let err = provider.chat(req).await.expect_err("must not complete");
         match err {
@@ -763,5 +818,71 @@ mod cache_tests {
             ),
             other => panic!("expected Failure::Provider, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_default_has_no_params_task_or_images() {
+        let req = Request::default();
+        assert_eq!(req.params, RequestParams::default());
+        assert!(req.task.is_none());
+        assert!(req.messages.is_empty());
+    }
+
+    #[test]
+    fn with_params_and_with_task_are_additive() {
+        let req = Request::default()
+            .with_params(RequestParams {
+                temperature: Some(0.2),
+                max_tokens: Some(500),
+                ..Default::default()
+            })
+            .with_task("extraction");
+        assert_eq!(req.params.temperature, Some(0.2));
+        assert_eq!(req.params.max_tokens, Some(500));
+        assert_eq!(req.task.as_deref(), Some("extraction"));
+    }
+
+    #[test]
+    fn build_context_leaves_params_and_task_at_default() {
+        // Main turns must keep the provider's own sampling defaults (no per-call overrides).
+        let mut conv = Conversation::new(SystemPrompt::new("sys"));
+        conv.push_user(UserMsg::new("hello"));
+        let req = build_context(&conv, &[]);
+        assert_eq!(req.params, RequestParams::default());
+        assert!(req.task.is_none());
+    }
+
+    #[test]
+    fn request_image_debug_elides_the_base64_blob() {
+        let img = RequestImage {
+            mime: "image/png".into(),
+            data_base64: "AAAA".repeat(1000),
+        };
+        let rendered = format!("{img:?}");
+        assert!(rendered.contains("image/png"));
+        assert!(rendered.contains("data_base64_len"));
+        // The raw payload must never appear in the debug output.
+        assert!(!rendered.contains("AAAAAAAA"));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_ignores_params_and_images() {
+        // Providers that cannot honor per-call params/images must complete unchanged.
+        let provider = MockProvider::completing("done");
+        let mut req = Request::default().with_params(RequestParams {
+            temperature: Some(0.9),
+            ..Default::default()
+        });
+        req.messages.push(RequestMsg {
+            role: "user".into(),
+            content: "look".into(),
+            images: vec![RequestImage {
+                mime: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+            ..Default::default()
+        });
+        let out = provider.chat(req).await.expect("mock completes");
+        assert_eq!(out.text, "done");
     }
 }

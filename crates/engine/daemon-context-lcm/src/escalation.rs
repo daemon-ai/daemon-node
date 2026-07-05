@@ -248,9 +248,7 @@ async fn call_summary_llm(
             ..Default::default()
         }],
         tools: Vec::new(),
-        auth: None,
-        constraint: None,
-        cache_system: false,
+        ..Default::default()
     };
     match tokio::time::timeout(timeout, aux.chat(request)).await {
         Ok(Ok(out)) => Ok(out.text),

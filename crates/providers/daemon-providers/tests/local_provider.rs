@@ -55,6 +55,8 @@ fn user_request(text: &str) -> Request {
         auth: None,
         constraint: None,
         cache_system: false,
+        params: Default::default(),
+        task: None,
     }
 }
 
