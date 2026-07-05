@@ -69,6 +69,7 @@ use daemon_tool_clarify::ClarifyTool;
 use daemon_tool_execute_code::{ExecuteCodeSettings, ExecuteCodeTool};
 use daemon_tool_metta::MettaTool;
 use daemon_tool_todo::TodoTool;
+use daemon_tool_vision::{VisionAnalyzeTool, VisionToolConfig};
 use daemon_tool_web::{
     FirecrawlFetch, LocalFetch, SecretSource, TavilySearch, WebExtractTool, WebFetchBackend,
     WebSearchTool,
@@ -77,7 +78,7 @@ use daemon_transport::RemoteHost;
 
 use config::{
     ContextEngineKind, EmbedKind, MemoryProviderKind, NodeConfig, ProviderKind, RoutingConfig,
-    StoreBackend,
+    StoreBackend, VisionKind,
 };
 
 /// `daemon` — the role-by-config host node. With no subcommand it runs the host role, loading the
@@ -1173,6 +1174,53 @@ fn build_web_tools(cfg: &NodeConfig, credentials: Arc<dyn CredentialStore>) -> V
     ]
 }
 
+/// Resolve the aux provider the `vision_analyze` tool describes images through (`[vision]`, `off`
+/// by default). `main` resolves the launch profile's builder — the same resolution as `lcm_aux` —
+/// so the tool rides whatever provider the node chats with (which must itself accept image input);
+/// `genai` builds a dedicated vision-capable model. `None` keeps the tool unregistered.
+fn build_vision_provider(
+    cfg: &NodeConfig,
+    providers: &ProviderRegistry,
+    cred_profile: &ProfileRef,
+) -> Option<Arc<dyn Provider>> {
+    match cfg.vision.kind {
+        VisionKind::Off => None,
+        VisionKind::Main => providers.builder_for(cred_profile).map(|b| b()),
+        VisionKind::Genai => {
+            if cfg.vision.model.is_empty() {
+                tracing::warn!(
+                    "vision provider=genai but [vision].model is unset; vision_analyze off"
+                );
+                return None;
+            }
+            let mut provider = GenAiProvider::for_model(cfg.vision.model.clone());
+            if let Some(base) = &cfg.vision.base_url {
+                provider = provider.with_endpoint(base.clone());
+            }
+            Some(Arc::new(provider) as Arc<dyn Provider>)
+        }
+    }
+}
+
+/// Build the `vision_analyze` tool when a vision aux provider resolves ([`build_vision_provider`]).
+/// The optional `[vision].credential_key` bearer threads into each aux call's `Request::auth`;
+/// absent, the provider's environment credential applies (the `lcm_aux` behavior).
+fn build_vision_tool(
+    cfg: &NodeConfig,
+    providers: &ProviderRegistry,
+    cred_profile: &ProfileRef,
+) -> Option<Arc<dyn Tool>> {
+    let aux = build_vision_provider(cfg, providers, cred_profile)?;
+    let tool_cfg = VisionToolConfig {
+        auth: cfg.vision.credential_key.clone(),
+        call_timeout: cfg.vision.timeout,
+        max_download_bytes: cfg.vision.max_download_mb * 1024 * 1024,
+        max_base64_bytes: cfg.vision.max_base64_mb * 1024 * 1024,
+    };
+    tracing::info!(provider = ?cfg.vision.kind, "vision_analyze tool enabled");
+    Some(Arc::new(VisionAnalyzeTool::new(aux, tool_cfg)) as Arc<dyn Tool>)
+}
+
 /// Discover + register Python tools from the `daemon_pytool` worker when enabled. Like the metta
 /// coprocessor the worker runs out-of-process over a length-framed cut; one `PyToolHost` backs a
 /// proxy [`Tool`] per discovered Python tool and respawns the worker lazily after a crash. Discovery
@@ -2071,6 +2119,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // The optional web tools (`web_search`/`web_extract`, opt-in). Keys are read live from the
     // credential store, so a GUI-set Tavily/Firecrawl key applies without a restart.
     extra_tools.extend(build_web_tools(&cfg, credential_store.clone()));
+
+    // The optional `vision_analyze` tool (`[vision]`, off by default): images are described by a
+    // vision-capable aux provider — the launch profile's own provider (`main`, the `lcm_aux`
+    // resolution) or a dedicated genai model (`genai`).
+    if let Some(vision_tool) = build_vision_tool(&cfg, &providers, &cred_profile) {
+        extra_tools.push(vision_tool);
+    }
 
     // The optional Python tools (opt-in, `daemon_pytool` worker). Discovered up-front so each Python
     // tool joins the registry by name; the worker process itself is (re)spawned lazily on first call.

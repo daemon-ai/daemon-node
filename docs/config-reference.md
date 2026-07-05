@@ -191,6 +191,13 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
 | `store` | `DAEMON_STORE` | string | `memory` |
 | `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |
+| `vision.base_url` | `DAEMON_VISION__BASE_URL` | optional | _(unset)_ |
+| `vision.credential_key` | `DAEMON_VISION__CREDENTIAL_KEY` | optional | _(unset)_ |
+| `vision.max_base64_mb` | `DAEMON_VISION__MAX_BASE64_MB` | number | `20` |
+| `vision.max_download_mb` | `DAEMON_VISION__MAX_DOWNLOAD_MB` | number | `50` |
+| `vision.model` | `DAEMON_VISION__MODEL` | string | `""` |
+| `vision.provider` | `DAEMON_VISION__PROVIDER` | string | `off` |
+| `vision.timeout_ms` | `DAEMON_VISION__TIMEOUT_MS` | number | `120000` |
 | `web.addr` | `DAEMON_WEB__ADDR` | optional | _(unset)_ |
 | `web.enable` | `DAEMON_WEB__ENABLE` | bool | `false` |
 | `web.firecrawl_key_id` | `DAEMON_WEB__FIRECRAWL_KEY_ID` | string | `firecrawl` |
