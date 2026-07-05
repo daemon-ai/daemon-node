@@ -1,3 +1,4 @@
+CREATE INDEX completion_notices_parent ON completion_notices (parent_session);
 CREATE INDEX cron_jobs_due ON cron_jobs (paused, next_fire_unix);
 CREATE INDEX cron_runs_job ON cron_runs (job_id, rowseq);
 CREATE INDEX journal_seals_stream ON journal_seals (stream, id);
@@ -27,6 +28,17 @@ CREATE TABLE completion_inbox (
     job_id     TEXT NOT NULL,
     payload    BLOB NOT NULL,
     UNIQUE(session_id, epoch, job_id)
+);
+CREATE TABLE completion_notice_outbox (
+rowseq         INTEGER PRIMARY KEY AUTOINCREMENT,
+parent_session TEXT NOT NULL,
+child          TEXT NOT NULL,
+payload        BLOB NOT NULL
+);
+CREATE TABLE completion_notices (
+child          TEXT PRIMARY KEY,
+parent_session TEXT NOT NULL,
+notified       INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE cron_jobs (
     id             TEXT PRIMARY KEY,
@@ -68,6 +80,10 @@ CREATE TABLE delegations (
     job_id         TEXT NOT NULL,
     payload        BLOB NOT NULL
 );
+CREATE TABLE detached_seq (
+parent_session TEXT PRIMARY KEY,
+n              INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE enqueued_jobs (
     job_id TEXT PRIMARY KEY
 );
@@ -78,7 +94,7 @@ CREATE TABLE job_outbox (
     epoch      INTEGER NOT NULL,
     payload    BLOB NOT NULL,
     lifetime   TEXT
-);
+, child TEXT);
 CREATE TABLE journal_entries (
     cursor       INTEGER PRIMARY KEY AUTOINCREMENT,
     stream       TEXT NOT NULL,

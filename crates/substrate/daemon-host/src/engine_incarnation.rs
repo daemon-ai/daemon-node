@@ -554,6 +554,7 @@ impl Incarnation for CoreIncarnation {
                         epoch: suspension.epoch,
                         payload: suspension.payload,
                         lifetime,
+                        child: None,
                     },
                 })
             }
@@ -803,6 +804,7 @@ mod tests {
             attachments: Vec::new(),
             lifetime: daemon_protocol::DelegationLifetime::Ephemeral,
             profile: None,
+            detached: false,
         }
         .encode();
         assert_eq!(

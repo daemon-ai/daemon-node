@@ -276,6 +276,14 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         .registry
         .set_notifier(Arc::new(NodeProcessNotifier { node: node.clone() }));
 
+    // The detached-delegation notice worker (W9): drains the durable completion-notice outbox for
+    // `spawn wait:false` children and injects each terminal outcome into its parent through the same
+    // one lifecycle-aware `inject_session_input` seam the process notifier uses. Detached like the
+    // reaper/fleet-change bridge; ticks at the wake/job dispatch cadence (no new config field — W10
+    // executes in parallel and must not conflict on `NodeAssembly`).
+    crate::fleet::NoticeWorker::new(a.store.clone(), node.clone())
+        .spawn(a.host_config.dispatch_interval);
+
     AssembledNode {
         node,
         handle,

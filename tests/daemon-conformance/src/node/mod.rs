@@ -17,6 +17,7 @@ mod bootstrap_wiring;
 mod cron;
 mod daemon_cloud_e2e;
 mod delivery_memory;
+mod detached_delegation;
 mod events_transport;
 mod fs_content;
 mod harness;

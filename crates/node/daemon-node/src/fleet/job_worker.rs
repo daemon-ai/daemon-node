@@ -161,14 +161,17 @@ fn map_store_role(role: daemon_store::SessionRole) -> daemon_api::SessionRole {
 impl JobWorker for FleetJobWorker {
     async fn process_jobs_once(&self) -> Result<(), ServiceError> {
         while let Some(job) = self.store.dequeue_job().await {
-            let child = Self::child_id(&job);
+            // Decode the structured delegation (task + attachment paths + detached flag), falling back
+            // to a legacy plain-text task for pre-upgrade jobs.
+            let input = daemon_protocol::DelegationInput::decode(&job.payload);
+            // A detached job carries a store-pre-minted `{parent}/dN` child id; a joining delegation
+            // derives `{parent}/c{epoch}`.
+            let child = job.child.clone().unwrap_or_else(|| Self::child_id(&job));
             // Create-if-absent: a fresh durable child session seeded with the delegated work as its
             // first turn (recovery-idempotent — a re-processed job finds the child already present).
             if self.store.status(&child).await.is_none() {
-                // Decode the structured delegation (task + attachment paths), falling back to a
-                // legacy plain-text task for pre-upgrade jobs. Seed the child with the real task and
-                // materialize any attachments into its inbox/ before the first turn.
-                let input = daemon_protocol::DelegationInput::decode(&job.payload);
+                // Seed the child with the real task and materialize any attachments into its inbox/
+                // before the first turn.
                 self.materialize_attachments(&job.session_id, &child, &input.attachments)
                     .await;
                 // Captured before the task moves into the seed turn: the child's roster/tree title.
@@ -217,12 +220,21 @@ impl JobWorker for FleetJobWorker {
                 self.emit_spawn(&job.session_id, &child, map_store_role(child_role))
                     .await;
             }
-            // Durable tree edge: the child's terminal completion fulfills this job and wakes the
-            // parent (in the store's mark_completed transaction). Idempotent.
-            self.store
-                .bind_delegation(child.clone(), job.clone())
-                .await
-                .map_err(ServiceError::new)?;
+            // Durable tree edge (idempotent). A DETACHED child binds a completion-notice edge: its
+            // terminal completion delivers a notice to the parent (a fresh reactive turn), NOT a job
+            // completion — the parent never suspended. A joining delegation binds the parent job, so
+            // the child's terminal completion fulfills it and wakes the suspended parent.
+            if input.detached {
+                self.store
+                    .bind_completion_notice(&child, &job.session_id)
+                    .await
+                    .map_err(ServiceError::new)?;
+            } else {
+                self.store
+                    .bind_delegation(child.clone(), job.clone())
+                    .await
+                    .map_err(ServiceError::new)?;
+            }
             // Kick the child into its first turn via the shared wake dispatcher.
             self.store.enqueue_wake(child).await;
         }
@@ -306,6 +318,7 @@ mod tests {
             attachments: Vec::new(),
             lifetime: daemon_protocol::DelegationLifetime::Ephemeral,
             profile: Some("opus".into()),
+            detached: false,
         }
         .encode();
         let job = JobCommand {
@@ -314,6 +327,7 @@ mod tests {
             epoch: Epoch(1),
             payload,
             lifetime: daemon_store::ChildLifetime::Ephemeral,
+            child: None,
         };
         store
             .checkpoint_and_enqueue(
@@ -349,5 +363,83 @@ mod tests {
             "the task titles the child for status/tree views"
         );
         assert_eq!(meta.parent, Some(parent));
+    }
+
+    /// A detached (`spawn wait:false`) job materializes the child at the store-pre-minted `{parent}/dN`
+    /// id and binds a completion-notice edge (NOT a delegation edge): the child is tree-visible, and
+    /// its terminal `mark_completed` pushes a `CompletionNotice` rather than a job completion.
+    #[tokio::test]
+    async fn worker_materializes_a_detached_child_with_a_notice_edge() {
+        use daemon_common::{Epoch, JobId, SnapshotBlob};
+        use daemon_store::{Checkpoint, JobCommand};
+
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("x")) as Arc<dyn daemon_core::Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("t"),
+        );
+        let worker = FleetJobWorker::new(store.clone(), PartitionId::DEFAULT, profile);
+
+        let parent = SessionId::new("parent");
+        let payload = daemon_protocol::DelegationInput {
+            task: "background work".into(),
+            attachments: Vec::new(),
+            lifetime: daemon_protocol::DelegationLifetime::Persistent,
+            profile: None,
+            detached: true,
+        }
+        .encode();
+        // The store mints the `{parent}/d1` child and stamps it onto the bare job.
+        let child = store
+            .enqueue_detached_job(JobCommand {
+                job_id: JobId::new("parent:detached"),
+                session_id: parent.clone(),
+                epoch: Epoch::ZERO,
+                payload,
+                lifetime: daemon_store::ChildLifetime::Persistent,
+                child: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(child.as_str(), "parent/d1");
+
+        worker.process_jobs_once().await.unwrap();
+
+        // The child materialized at the pre-minted id and is tree-visible under the parent.
+        assert!(
+            store.status(&child).await.is_some(),
+            "child materialized at the pre-minted detached id"
+        );
+        assert!(store.children_of(&parent).await.contains(&child));
+
+        // The notice edge (not a delegation edge): the child's terminal completion pushes a
+        // CompletionNotice — a delegation edge would instead record a parent completion + wake.
+        let fence = store.acquire_activation_lease(&child).await.unwrap();
+        store
+            .mark_completed(
+                Checkpoint::new(child.clone(), Epoch(1), SnapshotBlob::default()),
+                fence,
+            )
+            .await
+            .unwrap();
+        let notice = store
+            .dequeue_completion_notice()
+            .await
+            .expect("a detached child fires a completion notice");
+        assert_eq!(notice.parent, parent);
+        assert_eq!(notice.child, child);
+        // A joining delegation would have woken the parent; a notice edge must not.
+        let mut woke_parent = false;
+        while let Some(id) = store.dequeue_wake().await {
+            if id == parent {
+                woke_parent = true;
+            }
+        }
+        assert!(
+            !woke_parent,
+            "a detached child never wakes its parent through the wake outbox"
+        );
     }
 }

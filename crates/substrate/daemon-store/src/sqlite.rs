@@ -15,9 +15,9 @@
 //! transaction / before any post-commit fault fires, so a crash boundary leaves consistent state.
 
 use crate::{
-    AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, FaultPoint,
-    JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval, Room,
-    RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
+    AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, CompletionNotice,
+    FaultPoint, JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval,
+    Room, RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
     StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion, TraceEntry,
     TraceSegment, CRON_RUN_RETENTION,
 };
@@ -296,6 +296,32 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // `mark_completed` in the same transaction as the status flip — the ephemeral-subagent
         // reaper's grace timer. NULL on legacy/non-terminal rows (never reaped).
         M::up("ALTER TABLE session_meta ADD COLUMN terminal_ms INTEGER;"),
+        // M5 (detached delegation — W9 `spawn wait:false`): the completion-notice seam. A detached
+        // child carries a `completion_notices` edge (not a `delegations` edge) so its terminal
+        // `mark_completed` pushes a `CompletionNotice` onto `completion_notice_outbox` (delivered to
+        // the parent as a fresh reactive turn) instead of fulfilling a parent job. The `notified` flag
+        // makes the push idempotent per child while keeping the row for tree visibility. `job_outbox`
+        // gains a nullable `child` column: the pre-minted `{parent}/dN` id a detached job materializes
+        // at (NULL for an ordinary joining delegation, which derives `{parent}/c{epoch}`).
+        M::up(
+            "CREATE TABLE completion_notices (\n\
+                 child          TEXT PRIMARY KEY,\n\
+                 parent_session TEXT NOT NULL,\n\
+                 notified       INTEGER NOT NULL DEFAULT 0\n\
+             );\n\
+             CREATE INDEX completion_notices_parent ON completion_notices (parent_session);\n\
+             CREATE TABLE completion_notice_outbox (\n\
+                 rowseq         INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 parent_session TEXT NOT NULL,\n\
+                 child          TEXT NOT NULL,\n\
+                 payload        BLOB NOT NULL\n\
+             );\n\
+             CREATE TABLE detached_seq (\n\
+                 parent_session TEXT PRIMARY KEY,\n\
+                 n              INTEGER NOT NULL DEFAULT 0\n\
+             );\n\
+             ALTER TABLE job_outbox ADD COLUMN child TEXT;",
+        ),
     ])
 });
 
@@ -684,6 +710,35 @@ impl SessionStore for SqliteStore {
                 .map_err(sql_err)?;
             }
         }
+        // Detached child: if a completion-notice edge exists, push a `CompletionNotice` (delivered to
+        // the parent as a fresh reactive turn) in the SAME transaction — never a `completion_inbox`
+        // entry or a wake (there is no parent job). The `notified` flag makes it idempotent per child
+        // while keeping the row for tree visibility (`children_of`).
+        let notice_parent: Option<String> = tx
+            .query_row(
+                "SELECT parent_session FROM completion_notices WHERE child = ?1 AND notified = 0",
+                params![checkpoint.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if let Some(notice_parent) = notice_parent {
+            let payload = checkpoint
+                .completion_payload
+                .clone()
+                .unwrap_or_else(|| format!("child:{}", checkpoint.session_id).into_bytes());
+            tx.execute(
+                "UPDATE completion_notices SET notified = 1 WHERE child = ?1",
+                params![checkpoint.session_id.as_str()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "INSERT INTO completion_notice_outbox (parent_session, child, payload) \
+                 VALUES (?1, ?2, ?3)",
+                params![notice_parent, checkpoint.session_id.as_str(), payload],
+            )
+            .map_err(sql_err)?;
+        }
         tx.commit().map_err(sql_err)?;
         Ok(())
     }
@@ -723,6 +778,90 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn enqueue_detached_job(&self, mut job: JobCommand) -> Result<SessionId, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let parent = job.session_id.clone();
+        let tx = conn.transaction().map_err(sql_err)?;
+        // Mint a unique per-parent `{parent}/dN` id via the monotonic sequence (so a turn-retry
+        // re-enqueue produces a distinct child rather than colliding).
+        tx.execute(
+            "INSERT INTO detached_seq (parent_session, n) VALUES (?1, 1) \
+             ON CONFLICT(parent_session) DO UPDATE SET n = n + 1",
+            params![parent.as_str()],
+        )
+        .map_err(sql_err)?;
+        let n: i64 = tx
+            .query_row(
+                "SELECT n FROM detached_seq WHERE parent_session = ?1",
+                params![parent.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let child = SessionId::new(format!("{}/d{}", parent, n));
+        job.child = Some(child.clone());
+        // A detached job is bare (no checkpoint, no suspension, no `enqueued_jobs` dedupe).
+        tx.execute(
+            "INSERT INTO job_outbox (job_id, session_id, epoch, payload, lifetime, child) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                job.job_id.as_str(),
+                job.session_id.as_str(),
+                job.epoch.0 as i64,
+                job.payload,
+                lifetime_to_str(job.lifetime),
+                child.as_str(),
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(child)
+    }
+
+    async fn bind_completion_notice(
+        &self,
+        child: &SessionId,
+        parent: &SessionId,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Idempotent tree edge (read by `children_of`), but NOT a `delegations` row: `mark_completed`
+        // binds no job and instead pushes a `CompletionNotice` (the child self-closes with a notice).
+        conn.execute(
+            "INSERT OR IGNORE INTO completion_notices (child, parent_session) VALUES (?1, ?2)",
+            params![child.as_str(), parent.as_str()],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn dequeue_completion_notice(&self) -> Option<CompletionNotice> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT rowseq, parent_session, child, payload FROM completion_notice_outbox \
+                 ORDER BY rowseq LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        CompletionNotice {
+                            parent: SessionId::new(row.get::<_, String>(1)?),
+                            child: SessionId::new(row.get::<_, String>(2)?),
+                            payload: row.get::<_, Vec<u8>>(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .ok()??;
+        let (rowseq, notice) = row;
+        conn.execute(
+            "DELETE FROM completion_notice_outbox WHERE rowseq = ?1",
+            params![rowseq],
+        )
+        .ok()?;
+        Some(notice)
+    }
+
     async fn children_of(&self, parent: &SessionId) -> Vec<SessionId> {
         let conn = self.conn.lock().unwrap();
         // Both edge families are tree-visible (audit): delegation children (delegation order) then
@@ -742,6 +881,11 @@ impl SessionStore for SqliteStore {
             read("SELECT child FROM delegations WHERE parent_session = ?1 ORDER BY rowseq");
         children.extend(read(
             "SELECT child FROM background_edges WHERE parent_session = ?1 ORDER BY rowseq",
+        ));
+        // Detached children (completion-notice edge): tree-visible for audit, but only the notice
+        // (not a job completion) flows back to the parent — see `mark_completed`.
+        children.extend(read(
+            "SELECT child FROM completion_notices WHERE parent_session = ?1 ORDER BY child",
         ));
         children
     }
@@ -1120,7 +1264,7 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT rowseq, job_id, session_id, epoch, payload, lifetime FROM job_outbox \
+                "SELECT rowseq, job_id, session_id, epoch, payload, lifetime, child FROM job_outbox \
                  ORDER BY rowseq LIMIT 1",
                 [],
                 |row| {
@@ -1132,6 +1276,7 @@ impl SessionStore for SqliteStore {
                             epoch: Epoch(row.get::<_, i64>(3)? as u64),
                             payload: row.get::<_, Vec<u8>>(4)?,
                             lifetime: lifetime_from_str(row.get::<_, Option<String>>(5)?),
+                            child: row.get::<_, Option<String>>(6)?.map(SessionId::new),
                         },
                     ))
                 },
@@ -1936,8 +2081,8 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (4: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, and
-    /// the terminal clock).
+    /// `user_version` (5: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// terminal clock, and the detached-delegation completion-notice seam).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -1948,7 +2093,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 5, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {
