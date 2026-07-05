@@ -188,6 +188,8 @@ impl CredentialProvider for EmbeddedCredentialPool {
             scope: issued,
             mode: CredMode::Native,
             expires_at_ms: now_ms() + self.ttl_ms,
+            // The standalone L1 pool is its own authority with no remote revocation epoch.
+            epoch: 0,
             secret: Some(LeaseSecret::new(secret)),
             signature: Vec::new(),
         })

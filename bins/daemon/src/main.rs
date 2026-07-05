@@ -2499,7 +2499,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             .clone()
             .with_auth_store(auth_store.clone())
             .with_auth_audit(auth_audit.clone())
-            .with_revocations(revocations.clone()),
+            .with_revocations(revocations.clone())
+            // Cluster F (Part B): the same per-profile broker the engine leases through, so
+            // credential_remove/credential_set bump the profile authority's lease epoch.
+            .with_credential_revoker(owner_broker.clone()),
     );
     // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
     // keeps its own reference for the auth check.

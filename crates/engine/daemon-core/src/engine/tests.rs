@@ -186,6 +186,7 @@ impl crate::credentials::CredentialProvider for TwoProfileCreds {
             scope: scope.clone(),
             mode: daemon_common::CredMode::Native,
             expires_at_ms: crate::credentials::now_ms() + 60_000,
+            epoch: 0,
             secret: Some(daemon_common::LeaseSecret::new(format!("sk-{profile}"))),
             signature: Vec::new(),
         })
