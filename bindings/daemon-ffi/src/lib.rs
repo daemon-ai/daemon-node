@@ -226,6 +226,7 @@ fn build_node(cfg: &HostFfiConfig) -> Result<AssembledNode, String> {
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     }))
 }
 

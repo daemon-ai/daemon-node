@@ -189,6 +189,15 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         background,
     };
 
+    // The ephemeral-subagent reaper (host background sweep): archives `EphemeralSubagent` sessions
+    // a grace period after their terminal state, so transient-child churn ages out of the default
+    // roster/tree scopes on its own. Detached like the fleet-change bridge; inert when disabled.
+    if a.reaper.enabled {
+        crate::fleet::EphemeralReaper::new(a.store.clone(), a.reaper.grace)
+            .with_events(shared.node_events.clone())
+            .spawn(a.reaper.interval);
+    }
+
     // The one per-session resolution context, shared by the live session builder and the durable
     // rehydration resolver so both paths resolve a session's engine identically (bound profile +
     // overlay). Present only when the node carries a profile store + provider resolver; otherwise
@@ -372,7 +381,10 @@ fn build_orchestrator_profile(
         core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs, procs);
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
-            .with_max_depth(a.nesting_depth + 1),
+            .with_max_depth(a.nesting_depth + 1)
+            // The durable session graph backs the tool's `send` (pending-input + wake) and
+            // per-child `status` verbs.
+            .with_store(a.store.clone()),
     ));
     registry.register(cron_tool.clone());
     root_profile(

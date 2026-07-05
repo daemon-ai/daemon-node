@@ -167,6 +167,11 @@ pub struct NodeAssembly {
     /// best-effort `task = "title_generation"` call replaces the truncation-seeded roster title.
     /// `None` keeps seeded titles only (tests / nodes without an aux provider).
     pub title_aux: Option<Arc<dyn daemon_core::Provider>>,
+    /// The ephemeral-subagent reaper policy ([`EphemeralReaper`](crate::fleet::EphemeralReaper)):
+    /// archive `EphemeralSubagent` sessions `grace` after their terminal state, swept every
+    /// `interval`. The default is enabled (300s grace / 60s interval); the first sweep runs one
+    /// interval after start, so short-lived test nodes never observe one.
+    pub reaper: crate::fleet::ReaperConfig,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.

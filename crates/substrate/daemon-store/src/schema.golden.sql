@@ -154,7 +154,7 @@ CREATE TABLE session_meta (
     archived         INTEGER NOT NULL DEFAULT 0,
     scheduled_job    TEXT,
     activation_epoch INTEGER NOT NULL DEFAULT 0
-, owner TEXT);
+, owner TEXT, terminal_ms INTEGER);
 CREATE TABLE session_record (
     session_id  TEXT PRIMARY KEY,
     partition   INTEGER NOT NULL,

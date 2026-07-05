@@ -122,6 +122,12 @@ pub struct SessionMeta {
     /// user. The store treats it as an opaque key (the host enforces the ownership policy).
     #[serde(default)]
     pub owner: Option<String>,
+    /// Unix-millis this session reached a terminal state, stamped by
+    /// [`SessionStore::mark_completed`] in the same transaction as the status flip (re-stamped if a
+    /// resumed session completes again). The ephemeral-subagent reaper's grace clock. `None` for
+    /// non-terminal sessions and legacy rows (which are therefore never reaped — forward-looking).
+    #[serde(default)]
+    pub terminal_ms: Option<u64>,
 }
 
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
@@ -506,6 +512,14 @@ pub struct SessionSearchHit {
     pub snippet: String,
 }
 
+/// Unix-millis now — the store's terminal-state clock ([`SessionMeta::terminal_ms`]).
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Build a highlighted excerpt of `body` around the first occurrence of `needle` (lowercased), with
 /// the match wrapped in `[`…`]` and `…` elision — the in-memory analogue of SQLite FTS5 `snippet()`.
 fn snippet_around(body: &str, needle: &str) -> String {
@@ -727,17 +741,19 @@ pub trait SessionStore: Send + Sync {
     /// Append a durable **pending input** for `id` — an opaque payload (a CBOR `UserMsg`) the host
     /// wants folded into the session's conversation the next time it activates. This is the durable
     /// inbound-input seam for sessions on the *activation* lifecycle (which `SessionApi::submit`
-    /// cannot reach): a background process-exit notification, a message to a delegated child, etc.
-    /// The durable incarnation drains these at hydrate ([`take_session_inputs`]); pair with
-    /// [`enqueue_wake`](Self::enqueue_wake) so the wake dispatcher runs the turn. FIFO per session.
-    /// Default: no-op (a non-authoritative proxy store).
+    /// cannot reach): a background process-exit notification, a message to a delegated child (the
+    /// orchestrate tool's `send` verb), etc. The durable incarnation drains these at hydrate
+    /// ([`take_session_inputs`]); pair with [`enqueue_wake`](Self::enqueue_wake) so the wake
+    /// dispatcher runs the turn. FIFO per session. Default: no-op (a non-authoritative proxy
+    /// store).
     ///
     /// [`take_session_inputs`]: Self::take_session_inputs
     async fn enqueue_session_input(&self, _id: &SessionId, _input: Vec<u8>) {}
 
     /// Drain (return and delete) every pending input for `id`, in enqueue (FIFO) order. Called by
-    /// the durable incarnation at hydrate, before the turn runs. Default: empty (a store without
-    /// the pending-input seam / a non-authoritative proxy store).
+    /// the durable incarnation at hydrate, before the turn runs, so a queued message lands in
+    /// exactly one incarnation. Default: empty (a store without the pending-input seam / a
+    /// non-authoritative proxy store).
     async fn take_session_inputs(&self, _id: &SessionId) -> Vec<Vec<u8>> {
         Vec::new()
     }
@@ -1090,6 +1106,10 @@ struct Inner {
     wake_outbox: VecDeque<SessionId>,
     /// child session -> the parent job its terminal completion fulfills (the durable tree edge).
     delegations: HashMap<SessionId, JobCommand>,
+    /// Per-session pending inbound inputs (opaque bytes), FIFO — the durable `send` seam drained by
+    /// the next activation's hydrate (the in-memory analogue of the SQLite `pending_session_input`
+    /// table).
+    pending_inputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
     /// Per-session parked §12 edit-approval requests, in park order. An unanswered row keeps the
     /// session dormant; [`SessionStore::answer_approval`] stamps its decision and wakes the session.
     pending_approvals: HashMap<SessionId, Vec<ParkedApproval>>,
@@ -1107,9 +1127,6 @@ struct Inner {
     /// Per-session host-level metadata: bound profile + opaque overlay blob (the in-memory analogue
     /// of the SQLite `session_meta` table).
     session_meta: HashMap<SessionId, SessionMeta>,
-    /// Per-session durable pending inputs (FIFO), drained at hydrate (the in-memory analogue of the
-    /// SQLite `pending_session_input` table).
-    pending_inputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
     /// Durable chat→session routing pins, keyed by canonical origin key (§5.9; the in-memory analogue
     /// of the SQLite `chat_routes` table).
     chat_routes: HashMap<String, ChatRoute>,
@@ -1298,6 +1315,13 @@ impl SessionStore for InMemoryStore {
         rec.snapshot = checkpoint.snapshot;
         rec.epoch = checkpoint.epoch;
         rec.status = SessionStatus::Completed;
+        // Stamp the terminal clock on the session's host meta (the reaper's grace timer). Same
+        // transaction (the held lock); re-stamped if a resumed session completes again.
+        inner
+            .session_meta
+            .entry(checkpoint.session_id.clone())
+            .or_default()
+            .terminal_ms = Some(now_ms());
         // If this session was delegated by a parent, fulfill that parent's job and wake it in the
         // *same* transaction (under the held lock). The binding is durable, so this is recovery-safe:
         // a child marked terminal always wakes its delegator, at any nesting depth.
@@ -2140,7 +2164,49 @@ mod session_meta_tests {
             scheduled_job: Some(JobId::from("cron-7")),
             activation_epoch: 3,
             owner: Some("user-alice".into()),
+            terminal_ms: Some(1_700_000_000_500),
         }
+    }
+
+    /// `mark_completed` stamps the terminal clock ([`SessionMeta::terminal_ms`]) in the same
+    /// transaction as the status flip — the reaper's grace timer, proven on both backends.
+    async fn terminal_stamp_behaviour(store: &dyn SessionStore) {
+        let id = SessionId::new("stamped");
+        store
+            .create_session(id.clone(), PartitionId::DEFAULT, SnapshotBlob::default())
+            .await
+            .unwrap();
+        let fence = store.acquire_activation_lease(&id).await.unwrap();
+        assert!(
+            store
+                .session_meta(&id)
+                .await
+                .is_none_or(|m| m.terminal_ms.is_none()),
+            "no terminal stamp before completion"
+        );
+        store
+            .mark_completed(
+                Checkpoint::new(id.clone(), Epoch(1), SnapshotBlob::default()),
+                fence,
+            )
+            .await
+            .unwrap();
+        let meta = store.session_meta(&id).await.expect("meta after terminal");
+        assert!(
+            meta.terminal_ms.is_some_and(|t| t > 0),
+            "mark_completed stamps terminal_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_mark_completed_stamps_terminal_ms() {
+        terminal_stamp_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_mark_completed_stamps_terminal_ms() {
+        terminal_stamp_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2352,6 +2418,43 @@ mod session_meta_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_pending_inputs_round_trip() {
+        pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+}
+
+#[cfg(test)]
+mod pending_input_tests {
+    //! The pending-input seam (the durable `send` path), proven against both backends: FIFO order,
+    //! destructive drain-once, and per-session isolation.
+
+    use super::*;
+
+    async fn pending_input_behaviour(store: &dyn SessionStore) {
+        let a = SessionId::new("s-a");
+        let b = SessionId::new("s-b");
+        // Empty until enqueued.
+        assert!(store.take_session_inputs(&a).await.is_empty());
+
+        store.enqueue_session_input(&a, b"first".to_vec()).await;
+        store.enqueue_session_input(&a, b"second".to_vec()).await;
+        store.enqueue_session_input(&b, b"other".to_vec()).await;
+
+        // FIFO, scoped to the session.
+        let drained = store.take_session_inputs(&a).await;
+        assert_eq!(drained, vec![b"first".to_vec(), b"second".to_vec()]);
+        // Destructive: a second drain is empty; the sibling queue is untouched.
+        assert!(store.take_session_inputs(&a).await.is_empty());
+        assert_eq!(store.take_session_inputs(&b).await, vec![b"other".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_pending_inputs_drain_fifo_once() {
+        pending_input_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pending_inputs_drain_fifo_once() {
         pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }
