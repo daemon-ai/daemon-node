@@ -291,6 +291,7 @@ fn build_child_profile(
                 Arc::new(core_tool_registry_with_skills(
                     &a.extra_tools,
                     launch_skill_tools,
+                    &a.fs,
                 )),
                 SystemPrompt::new("fleet child"),
             ),
@@ -313,7 +314,7 @@ fn build_orchestrator_profile(
     autonomous_config: Config,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
 ) -> EngineProfile {
-    let mut registry = core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools);
+    let mut registry = core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs);
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
             .with_max_depth(a.nesting_depth + 1),
@@ -420,6 +421,7 @@ fn build_session_ctx(
                 prompt_sources: a.prompt_sources.clone(),
                 skills_resolver: a.skills_resolver.clone(),
                 workspace_roots: shared.workspace_roots.clone(),
+                fs_config: a.fs.clone(),
             });
             Some((store, ctx))
         }
@@ -498,7 +500,8 @@ fn build_session_profile(
     cron_tool: &Arc<dyn Tool>,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
 ) -> EngineProfile {
-    let mut session_registry = core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools);
+    let mut session_registry =
+        core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs);
     session_registry.register(cron_tool.clone());
     root_profile(
         dress(

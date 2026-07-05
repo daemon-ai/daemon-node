@@ -161,6 +161,7 @@ async fn routed_submit_resolves_profile_and_delivery_per_origin() {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
     });
 
     // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -385,6 +386,7 @@ async fn bound_accounts_derive_instance_profile_binding() {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
     });
 
     let text_a = route_text(&node, origin("@a:hs")).await;
@@ -449,6 +451,7 @@ async fn bound_accounts_derive_instance_profile_binding() {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
     });
     let text_override = route_text(&node, origin("@a:hs")).await;
     assert!(
@@ -574,6 +577,7 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
         auth_factories: vec![Arc::new(StubFactory)],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
     });
 
     // (1) discovery: the stub family is listed.
@@ -746,6 +750,7 @@ async fn account_provisioning_enumerates_resolves_and_refreshes() {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
     });
 
     // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.

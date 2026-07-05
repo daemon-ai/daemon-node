@@ -153,6 +153,10 @@ pub struct NodeAssembly {
     /// `fs_read` attaches a `BlobRef` to untruncated reads. `None` leaves the content surface
     /// unbound (the ops resolve to `ApiError::Unsupported`).
     pub blob_root: Option<PathBuf>,
+    /// The `[fs]` tool configuration (read caps, search caps, deny paths, post-edit lint) applied
+    /// to every `fs` tool this node registers — the role registries and each per-session registry
+    /// alike. `Default::default()` keeps the tool's built-in caps (tests).
+    pub fs: daemon_tool_fs::FsConfig,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.

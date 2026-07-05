@@ -45,6 +45,9 @@ daemon-pytool-client = { workspace = true }
 daemon-mcp-client = { workspace = true }
 # The web tools (`web_search`/`web_extract`); opt-in at runtime via `[web].enable`.
 daemon-tool-web = { workspace = true }
+# The `[fs]` config table (`FsConfig`) embedded in NodeConfig; the tool itself is registered by
+# daemon-node's role/session registries.
+daemon-tool-fs = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.
 daemon-tool-todo = { workspace = true }
 daemon-tool-clarify = { workspace = true }
