@@ -290,6 +290,10 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              );\n\
              CREATE INDEX pending_session_input_session ON pending_session_input (session_id, rowseq);",
         ),
+        // M4 (terminal clock): unix-millis a session reached a terminal state, stamped by
+        // `mark_completed` in the same transaction as the status flip — the ephemeral-subagent
+        // reaper's grace timer. NULL on legacy/non-terminal rows (never reaped).
+        M::up("ALTER TABLE session_meta ADD COLUMN terminal_ms INTEGER;"),
     ])
 });
 
@@ -625,6 +629,19 @@ impl SessionStore for SqliteStore {
                 checkpoint.session_id.as_str(),
                 checkpoint.snapshot.as_bytes(),
                 checkpoint.epoch.0 as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        // Stamp the terminal clock on the session's host meta (the reaper's grace timer), in the
+        // same transaction. The upsert supplies an empty overlay so a row created here still reads
+        // back through `session_meta` (which extracts `overlay` as non-NULL bytes).
+        tx.execute(
+            "INSERT INTO session_meta (session_id, overlay, terminal_ms) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(session_id) DO UPDATE SET terminal_ms = ?3",
+            params![
+                checkpoint.session_id.as_str(),
+                Vec::<u8>::new(),
+                crate::now_ms() as i64,
             ],
         )
         .map_err(sql_err)?;
@@ -1168,11 +1185,11 @@ impl SessionStore for SqliteStore {
         let last_activity = meta.last_activity_ms.map(|v| v as i64);
         let scheduled_job = meta.scheduled_job.as_ref().map(|j| j.as_str());
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
              ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
              last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10, \
-             activation_epoch = ?11, owner = ?12",
+             activation_epoch = ?11, owner = ?12, terminal_ms = ?13",
             params![
                 id.as_str(),
                 bound,
@@ -1186,6 +1203,7 @@ impl SessionStore for SqliteStore {
                 scheduled_job,
                 meta.activation_epoch as i64,
                 meta.owner,
+                meta.terminal_ms.map(|v| v as i64),
             ],
         )
         .map_err(sql_err)?;
@@ -1195,7 +1213,7 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner \
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms \
              FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
@@ -1210,6 +1228,7 @@ impl SessionStore for SqliteStore {
                 let scheduled_job: Option<String> = row.get(8)?;
                 let activation_epoch: i64 = row.get(9)?;
                 let owner: Option<String> = row.get(10)?;
+                let terminal_ms: Option<i64> = row.get(11)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
@@ -1222,6 +1241,7 @@ impl SessionStore for SqliteStore {
                     scheduled_job: scheduled_job.map(JobId::from),
                     activation_epoch: activation_epoch as u64,
                     owner,
+                    terminal_ms: terminal_ms.map(|v| v as u64),
                 })
             },
         )
@@ -1877,7 +1897,8 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (3: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, and the pending-input queue).
+    /// `user_version` (4: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input queue, and
+    /// the terminal clock).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -1888,7 +1909,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 4, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {
