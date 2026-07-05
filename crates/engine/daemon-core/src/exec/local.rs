@@ -42,11 +42,21 @@ impl LocalEnvironment {
 impl ExecutionEnvironment for LocalEnvironment {
     async fn run(&self, cmd: Command, cx: &ExecCx<'_>) -> std::io::Result<ExecResult> {
         self.ensure_root().await?;
+        // A per-command working directory resolves against — and must stay within — the root
+        // (`shell(workdir=...)`); it is created on demand like the root itself.
+        let dir = match &cmd.cwd {
+            Some(requested) => {
+                let resolved = contain(&self.root, requested)?;
+                tokio::fs::create_dir_all(&resolved).await?;
+                resolved
+            }
+            None => self.root.clone(),
+        };
         // Scrubbed child env: nothing inherited (no host secrets leak into a tool's subprocess).
         let mut command = tokio::process::Command::new(&cmd.program);
         command
             .args(&cmd.args)
-            .current_dir(&self.root)
+            .current_dir(&dir)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .stdin(std::process::Stdio::null())
@@ -116,5 +126,56 @@ impl ExecutionEnvironment for LocalEnvironment {
 
     fn cwd(&self) -> &Path {
         &self.root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("daemon-exec-local-{tag}-{nanos}"))
+    }
+
+    #[tokio::test]
+    async fn command_cwd_runs_in_the_contained_subdir() {
+        let root = temp_root("cwd");
+        let env = LocalEnvironment::new(&root);
+        let cancel = CancellationToken::new();
+        let result = env
+            .run(
+                Command::new("pwd").cwd("nested/dir"),
+                &ExecCx { cancel: &cancel },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.stdout.trim().ends_with("nested/dir"),
+            "ran in the requested subdir: {}",
+            result.stdout
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn command_cwd_escaping_the_root_is_rejected() {
+        let root = temp_root("cwd-escape");
+        let env = LocalEnvironment::new(&root);
+        let cancel = CancellationToken::new();
+        let err = env
+            .run(
+                Command::new("pwd").cwd("../outside"),
+                &ExecCx { cancel: &cancel },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

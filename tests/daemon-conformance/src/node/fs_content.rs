@@ -45,6 +45,7 @@ async fn filesystem_surface_round_trips_and_gates() {
         workspace_root: Some(ws.clone()),
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     // The node advertises at least the writable workspace root.
@@ -160,6 +161,7 @@ async fn fs_list_pages_over_the_wire() {
         workspace_root: Some(ws.clone()),
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);
@@ -254,6 +256,7 @@ async fn content_store_round_trips_and_materializes() {
         workspace_root: Some(ws.clone()),
         blob_root: Some(blobs.clone()),
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     // put -> get round-trip.
@@ -365,6 +368,7 @@ async fn inbound_attachment_materializes_into_session_inbox() {
         workspace_root: Some(ws.clone()),
         blob_root: Some(blobs.clone()),
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     // The client stages the attachment in the content store, then names it on the turn.

@@ -78,6 +78,7 @@ fn assemble_core_tools(store: Arc<dyn SessionStore>) -> AssembledNode {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     })
 }
 
@@ -267,6 +268,7 @@ fn assemble_core_approval(store: Arc<dyn SessionStore>) -> AssembledNode {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     })
 }
 

@@ -1035,6 +1035,12 @@ pub struct NodeConfig {
     pub rooms: daemon_rooms::RoomsConfig,
     /// The `[api]` transport surface: the networked TLS/TCP listener + identity-store path.
     pub api: ApiConfig,
+    /// Shell-tool limits (`[shell]` / `DAEMON_SHELL__*`): foreground timeouts, output truncation,
+    /// per-session cwd persistence.
+    pub shell: daemon_processes::ShellConfig,
+    /// Background-process registry limits (`[processes]` / `DAEMON_PROCESSES__*`): output ring,
+    /// tracked cap + TTL, PTY size, watch rate limits.
+    pub processes: daemon_processes::RegistryConfig,
 }
 
 impl Default for NodeConfig {
@@ -1078,6 +1084,8 @@ impl Default for NodeConfig {
             matrix: daemon_matrix::MatrixConfig::default(),
             rooms: daemon_rooms::RoomsConfig::default(),
             api: ApiConfig::default(),
+            shell: daemon_processes::ShellConfig::default(),
+            processes: daemon_processes::RegistryConfig::default(),
         }
     }
 }

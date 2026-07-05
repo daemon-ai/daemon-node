@@ -27,6 +27,7 @@ mod messaging;
 mod negative_auth;
 mod ownership;
 mod positive_e2e;
+mod process_notify;
 mod profiles_skills;
 mod provider_discovery;
 mod routing_auth;

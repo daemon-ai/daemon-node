@@ -519,6 +519,7 @@ async fn session_overlay_persists_and_restores_on_respawn() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     let origin = Origin::new(

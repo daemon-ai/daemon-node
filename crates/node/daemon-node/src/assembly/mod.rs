@@ -33,8 +33,8 @@ use crate::fleet::job_worker::FleetJobWorker;
 use crate::fleet::spawner::ProfileChildSpawner;
 use crate::fleet::view::FleetViewImpl;
 use crate::profiles::dress::{
-    core_tool_registry_with_skills, dress, provider_for, root_profile, CHILD_PROFILE,
-    ORCHESTRATOR_PROFILE,
+    core_tool_registry_with_skills, dress, provider_for, root_profile, ProcessToolkit,
+    CHILD_PROFILE, ORCHESTRATOR_PROFILE,
 };
 use crate::profiles::registry::background_registry;
 use crate::profiles::resolve::SessionFactoryCtx;
@@ -112,6 +112,18 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let workspace_roots = build_workspace_roots(&a);
     let blob_store = build_blob_store(&a);
 
+    // The resident background-process registry: host-owned (never engine-owned — a background
+    // process outlives the turn that spawned it), constructed before the role profiles so every
+    // tool registry captures the SAME instance. Its notifier is late-bound onto the NodeApi below,
+    // mirroring the cron delivery handle.
+    let procs = ProcessToolkit {
+        registry: Arc::new(daemon_processes::ProcessRegistry::new(
+            a.processes.registry,
+            Arc::new(daemon_processes::RealClock::new()),
+        )),
+        shell: a.processes.shell,
+    };
+
     // The fleet child: one shared profile, driven as the real job worker so every child gets the same
     // provider + brokered credentials. Each child journals into the shared store keyed by its UnitId.
     let child_profile = build_child_profile(
@@ -120,6 +132,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         launch_index,
         autonomous_config,
         &workspace_roots,
+        &procs,
     );
     // The legacy synchronous placement seam (in-process live engine children + foreign agents). The
     // durable Core delegation path no longer uses this — it materializes children as durable
@@ -154,6 +167,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &cron.cron_tool,
         autonomous_config,
         &workspace_roots,
+        &procs,
     );
     // The §4.3 background-review spawner: shared by the durable factory (so a review child raised
     // mid-turn resolves its constrained profile during hydrate) and the live surface (so a `Spawn`
@@ -179,7 +193,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // rehydration resolver so both paths resolve a session's engine identically (bound profile +
     // overlay). Present only when the node carries a profile store + provider resolver; otherwise
     // sessions fall back to the single fixed `session_profile` (legacy single-profile behavior).
-    let session_ctx = build_session_ctx(&a, &shared, &cron.cron_tool);
+    let session_ctx = build_session_ctx(&a, &shared, &cron.cron_tool, &procs);
 
     // The durable path journals too, and (when per-session resolution is available) re-resolves a
     // durable session's engine from its recorded bound profile + overlay on rehydration.
@@ -206,6 +220,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         launch_index,
         &cron.cron_tool,
         &shared.workspace_roots,
+        &procs,
     );
     let session_builder = build_session_builder(&session_ctx, session_profile, a.store.clone());
 
@@ -240,12 +255,38 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // through the same outbound path live replies use.
     cron.cron_worker
         .set_delivery(node.clone() as Arc<dyn daemon_host::CronDelivery>);
+    // Late-bind the process exit/watch notifier the same way: notifications inject into the owning
+    // session through `inject_session_input` — a live `StartTurn` for actor sessions, the durable
+    // pending-input + wake for activation-lifecycle sessions (drained at hydrate).
+    procs
+        .registry
+        .set_notifier(Arc::new(NodeProcessNotifier { node: node.clone() }));
 
     AssembledNode {
         node,
         handle,
         fleet,
         signer: shared.signer,
+        processes: procs.registry,
+    }
+}
+
+/// The process-notification adapter: routes a formatted `[IMPORTANT: ...]` message into the owning
+/// session through the assembled node's one lifecycle-aware inject seam.
+struct NodeProcessNotifier {
+    node: Arc<NodeApiImpl>,
+}
+
+#[async_trait::async_trait]
+impl daemon_processes::ProcessNotifier for NodeProcessNotifier {
+    async fn notify(&self, owner: &SessionId, text: String) {
+        if let Err(e) = self.node.inject_session_input(owner, text).await {
+            tracing::warn!(
+                owner = %owner,
+                error = %e,
+                "background-process notification could not be injected"
+            );
+        }
     }
 }
 
@@ -283,6 +324,7 @@ fn build_child_profile(
     launch_index: Option<&Arc<dyn StablePromptSource>>,
     autonomous_config: Config,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
+    procs: &ProcessToolkit,
 ) -> EngineProfile {
     root_profile(
         dress(
@@ -292,6 +334,7 @@ fn build_child_profile(
                     &a.extra_tools,
                     launch_skill_tools,
                     &a.fs,
+                    procs,
                 )),
                 SystemPrompt::new("fleet child"),
             ),
@@ -305,6 +348,11 @@ fn build_child_profile(
 
 /// Build the orchestrator-capable engine shape: the core toolset *plus* the orchestrate tool (depth
 /// guard `nesting_depth + 1`) *plus* the `cron` scheduling tool, dressed + forced autonomous.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the assemble() phase helpers thread the shared single-instance handles positionally; \
+              keeping the signature flat keeps the wiring diff minimal across workstreams"
+)]
 fn build_orchestrator_profile(
     a: &NodeAssembly,
     fleet: &FleetRuntime,
@@ -313,8 +361,10 @@ fn build_orchestrator_profile(
     cron_tool: &Arc<dyn Tool>,
     autonomous_config: Config,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
+    procs: &ProcessToolkit,
 ) -> EngineProfile {
-    let mut registry = core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs);
+    let mut registry =
+        core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs, procs);
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
             .with_max_depth(a.nesting_depth + 1),
@@ -401,6 +451,7 @@ fn build_session_ctx(
     a: &NodeAssembly,
     shared: &Shared,
     cron_tool: &Arc<dyn Tool>,
+    procs: &ProcessToolkit,
 ) -> Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)> {
     match (a.profiles.clone(), a.provider_resolver.clone()) {
         (Some(store), Some(resolver)) => {
@@ -422,6 +473,7 @@ fn build_session_ctx(
                 skills_resolver: a.skills_resolver.clone(),
                 workspace_roots: shared.workspace_roots.clone(),
                 fs_config: a.fs.clone(),
+                procs: procs.clone(),
             });
             Some((store, ctx))
         }
@@ -499,9 +551,10 @@ fn build_session_profile(
     launch_index: Option<&Arc<dyn StablePromptSource>>,
     cron_tool: &Arc<dyn Tool>,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
+    procs: &ProcessToolkit,
 ) -> EngineProfile {
     let mut session_registry =
-        core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs);
+        core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs, procs);
     session_registry.register(cron_tool.clone());
     root_profile(
         dress(

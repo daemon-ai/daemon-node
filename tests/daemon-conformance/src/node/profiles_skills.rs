@@ -63,6 +63,7 @@ fn assemble_versioning(
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
     (node, handle, skills)
 }

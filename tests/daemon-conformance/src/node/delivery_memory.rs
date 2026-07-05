@@ -97,6 +97,7 @@ async fn delivery_sink_push_honors_handover() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     // Register two in-process sinks: the matrix account and a GUI surface.
@@ -301,6 +302,7 @@ async fn delivery_sessions_discovery_and_pull_subscriber() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     async fn drive_turn(node: &Arc<NodeApiImpl>, origin: Origin, req: u64) -> SessionId {
@@ -520,6 +522,7 @@ async fn routed_profiles_get_isolated_memory_banks() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
 
     async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {

@@ -78,6 +78,7 @@ fn assemble_acp_node() -> (
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
     (node, resolver_called, handle)
 }

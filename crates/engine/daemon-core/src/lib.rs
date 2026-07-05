@@ -71,7 +71,7 @@ pub use engine::{
     APPROVAL_SUSPEND_PAYLOAD,
 };
 pub use events::{EventSink, SessionLog};
-pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+pub use exec::{contain, Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
 #[cfg(feature = "otel")]
 pub use genai_telemetry::set_genai_capture;
 pub use memory::{

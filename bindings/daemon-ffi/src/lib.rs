@@ -224,6 +224,7 @@ fn build_node(cfg: &HostFfiConfig) -> Result<AssembledNode, String> {
         workspace_root: cfg.workspace_root.clone().map(PathBuf::from),
         blob_root: cfg.blob_root.clone().map(PathBuf::from),
         fs: Default::default(),
+        processes: Default::default(),
     }))
 }
 

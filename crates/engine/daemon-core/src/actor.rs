@@ -669,6 +669,46 @@ mod tests {
         handle.shutdown().await;
     }
 
+    /// Observe while **idle** folds context into the conversation but drives NO turn (W3 spike,
+    /// event-io §5.9): the notification seam for host-originated input must therefore use
+    /// `StartTurn` — an `Observe`d process-exit note would sit unseen until the user next speaks.
+    #[tokio::test]
+    async fn observe_when_idle_folds_context_but_opens_no_turn() {
+        let handle = spawn_agent_session(completing_engine("observe-idle"), Arc::new(NoopHost));
+        let mut rx = handle.subscribe();
+        handle
+            .observe(ReqId(7), UserMsg::new("[ambient] build finished"))
+            .await;
+        // The observed text is in the conversation (visible via a snapshot) and every event up to
+        // that snapshot is turn-free — the observe drove nothing.
+        handle.snapshot(ReqId(8)).await;
+        let ev = recv_until(&mut rx, |e| {
+            assert!(
+                !matches!(e, AgentEvent::TurnStarted { .. }),
+                "an idle Observe must not open a turn"
+            );
+            matches!(e, AgentEvent::Snapshot { .. })
+        })
+        .await;
+        let AgentEvent::Snapshot { view, .. } = ev else {
+            unreachable!()
+        };
+        assert!(view
+            .turns
+            .iter()
+            .any(|t| format!("{t:?}").contains("[ambient] build finished")));
+        // A real StartTurn afterwards runs a turn that carries the folded context.
+        let driver = handle.clone();
+        tokio::spawn(async move {
+            let _ = driver.start_turn(UserMsg::new("go")).await;
+        });
+        recv_until(&mut rx, |e| {
+            matches!(e, AgentEvent::TurnStarted { trigger, .. } if *trigger == TurnTrigger::User)
+        })
+        .await;
+        handle.shutdown().await;
+    }
+
     /// A steer while idle opens a fresh turn with `TurnTrigger::Steer`, acked via `Steered`.
     #[tokio::test]
     async fn steer_when_idle_opens_steer_turn() {

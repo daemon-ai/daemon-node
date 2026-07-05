@@ -203,6 +203,7 @@ async fn observe_appends_context_without_starting_a_turn() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
     let busy = SessionId::new("obs-busy");
 
@@ -492,6 +493,7 @@ async fn ingest_gate_queues_addressed_while_busy_then_flushes() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
     let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
     let origin = Origin::new(
@@ -637,6 +639,7 @@ async fn ingest_gate_routes_distinct_origins_to_bound_profiles() {
         workspace_root: None,
         blob_root: None,
         fs: Default::default(),
+        processes: Default::default(),
     });
     let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
 

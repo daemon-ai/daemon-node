@@ -2129,6 +2129,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         node,
         handle,
         signer,
+        processes,
         ..
     } = assemble(NodeAssembly {
         store: store.clone(),
@@ -2160,6 +2161,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         workspace_root: Some(cfg.workspace_root()),
         blob_root: Some(cfg.blob_root()),
         fs: cfg.fs.clone(),
+        processes: daemon_processes::ProcessesConfig {
+            registry: cfg.processes,
+            shell: cfg.shell,
+        },
     });
     // Build the daemon-authoritative command catalog (`command_list`/`command_invoke`): the built-in
     // node-op commands unified with the provider commands the context engine (`/lcm`) and memory
@@ -2442,6 +2447,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         task.abort();
     }
     cred_audit_drain.abort();
+    // SIGTERM every tracked background process group so nothing spawned via
+    // `shell(background=true)` outlives the daemon as an orphan.
+    processes.shutdown();
     handle.shutdown().await;
     // Clear the socket file this run bound (windows never bound one).
     #[cfg(unix)]
