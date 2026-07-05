@@ -162,6 +162,9 @@ async fn drive_tool_results(
 /// under ITS OWN workspace subtree — and never a file from a sibling session's subtree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn semantic_search_returns_ranked_hits_scoped_to_the_session() {
+    as_system(semantic_search_returns_ranked_hits_scoped_to_the_session_impl()).await;
+}
+async fn semantic_search_returns_ranked_hits_scoped_to_the_session_impl() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     // The session id is all-alphanumeric so the sandbox segment == the id (no sanitization surprise).
@@ -210,6 +213,9 @@ async fn semantic_search_returns_ranked_hits_scoped_to_the_session() {
 /// `bins/daemon`), the model's call resolves to an `unknown tool` result rather than any hits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn semantic_search_absent_without_the_tool() {
+    as_system(semantic_search_absent_without_the_tool_impl()).await;
+}
+async fn semantic_search_absent_without_the_tool_impl() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let session = SessionId::new("semidx2");

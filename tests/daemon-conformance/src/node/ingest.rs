@@ -9,6 +9,9 @@ use super::harness::*;
 /// its own and lands in the conversation (drained at the phase boundary) for the following turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observe_appends_context_without_starting_a_turn() {
+    as_system(observe_appends_context_without_starting_a_turn_impl()).await;
+}
+async fn observe_appends_context_without_starting_a_turn_impl() {
     use async_trait::async_trait;
     use daemon_api::{Outbound, SessionApi};
     use daemon_common::ReqId;
@@ -279,6 +282,9 @@ async fn observe_appends_context_without_starting_a_turn() {
 /// addressed text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingest_gate_folds_ambient_then_addressed_turns() {
+    as_system(ingest_gate_folds_ambient_then_addressed_turns_impl()).await;
+}
+async fn ingest_gate_folds_ambient_then_addressed_turns_impl() {
     use daemon_api::{NodeApi, Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_ingest::{Ingestor, Reception};
@@ -407,6 +413,9 @@ async fn ingest_gate_folds_ambient_then_addressed_turns() {
 /// the queued message runs no turn until the first finishes, then opens its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingest_gate_queues_addressed_while_busy_then_flushes() {
+    as_system(ingest_gate_queues_addressed_while_busy_then_flushes_impl()).await;
+}
+async fn ingest_gate_queues_addressed_while_busy_then_flushes_impl() {
     use async_trait::async_trait;
     use daemon_api::{NodeApi, Outbound, SessionApi};
     use daemon_common::ReqId;
@@ -585,6 +594,9 @@ async fn ingest_gate_queues_addressed_while_busy_then_flushes() {
 /// sessions, each run by the right profile (the echoing resolver reveals which).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingest_gate_routes_distinct_origins_to_bound_profiles() {
+    as_system(ingest_gate_routes_distinct_origins_to_bound_profiles_impl()).await;
+}
+async fn ingest_gate_routes_distinct_origins_to_bound_profiles_impl() {
     use daemon_api::{BoundAccount, NodeApi, Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_host::{MemProfileStore, ProfileStore};
     use daemon_ingest::{Ingestor, Reception};

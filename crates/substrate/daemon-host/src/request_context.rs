@@ -23,9 +23,11 @@ tokio::task_local! {
     static REQUEST_CONTEXT: RequestContext;
 }
 
-/// The reserved username of the local-trust [`RequestContext::system`] principal. Never a
-/// real network identity (the `daemon-auth` store mints human users; `"system"` is synthetic).
-pub const SYSTEM_USERNAME: &str = "system";
+/// The reserved usernames of the two synthetic in-process principals — [`RequestContext::system`]
+/// (`"system"`) and [`RequestContext::internal`] (`"internal"`). Re-exported from `daemon-auth`,
+/// which owns the reservation and rejects creating a real store user with either name (so neither
+/// synthetic identity can be forged by a network user whose ownership stamp would then collide).
+pub use daemon_auth::{INTERNAL_USERNAME, SYSTEM_USERNAME};
 
 /// How the principal bound to the current request proved its identity. Advisory — carried for
 /// audit/telemetry only; the capability gate keys off [`Principal::capabilities`], not this.
@@ -87,6 +89,26 @@ impl RequestContext {
     pub fn system() -> Self {
         Self {
             principal: Principal::from_roles("system", SYSTEM_USERNAME, vec![Role::Admin]),
+            origin: None,
+            conn_id: None,
+            auth_method: Some(AuthMethod::LocalTrust),
+        }
+    }
+
+    /// The in-process **embedded-caller** marker: trusted node internals that legitimately cross
+    /// session ownership without a request principal — the mux/HTTP stream pumps, chat ingest
+    /// ([`daemon-ingest`]), outbound delivery, and background input injection. Constructed ONLY here
+    /// (never derivable from wire input), so after the ownership layer flips `None` from allow to
+    /// deny, these paths carry an explicit identity instead of the old "no principal ⇒ full trust".
+    ///
+    /// Distinct from [`system`](Self::system): `internal` holds exactly the operator-tier session
+    /// overrides ([`Role::Operator`] ⇒ `SessionSeeAll` + `SessionControlAny`) — enough to read/drive
+    /// any session for delivery/ingest — but NOT `AccessAdmin`, and it stamps ownership as the
+    /// reserved user id/username `"internal"` (see [`INTERNAL_USERNAME`]) so audit and roster reads
+    /// can tell it apart from `system` and from real operators.
+    pub fn internal() -> Self {
+        Self {
+            principal: Principal::from_roles("internal", INTERNAL_USERNAME, vec![Role::Operator]),
             origin: None,
             conn_id: None,
             auth_method: Some(AuthMethod::LocalTrust),

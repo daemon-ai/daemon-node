@@ -37,6 +37,7 @@ use daemon_api::{
 };
 use daemon_common::{JournalStreamId, SessionId, UnitId};
 use daemon_host::journal::JournalSink;
+use daemon_host::{with_request_context, RequestContext};
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
     AgentEvent, RoomId, RoomMember, RoomPolicy, SessionPayload, TranscriptBlock, TranscriptRole,
@@ -181,40 +182,47 @@ impl RoomRuntime {
         let Some(this) = self.me.upgrade() else {
             return;
         };
-        tokio::spawn(async move {
-            let mut stream = match this.api.subscribe(session.clone(), 0).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, session = %session.as_str(), "rooms: subscribe failed");
-                    this.subscribed.lock().unwrap().remove(&session);
-                    return;
-                }
-            };
-            while let Some(item) = stream.next().await {
-                // Best-effort-skip a lossy lag (turn-lifecycle notes may be missed; the durable
-                // conv journal remains the record). Re-baseline is future work.
-                let entry = match item {
-                    daemon_api::LogStreamItem::Entry(e) => e,
-                    daemon_api::LogStreamItem::Lagged => continue,
-                };
-                match &entry.payload {
-                    SessionPayload::Event(AgentEvent::TurnStarted { .. }) => {
-                        this.ingestor.note_turn_started(&session);
+        // Bind the in-process `internal` principal for the detached subscription task: a spawned task
+        // inherits no request context, so the now-ownership-gated `subscribe` and the ingestor's
+        // `submit`/`submit_routed` (via `note_turn_finished` / `reinject_reply`) would run with `None`
+        // (deny). `internal` is the trusted embedded-caller identity for these fan-out sessions.
+        tokio::spawn(with_request_context(
+            RequestContext::internal(),
+            async move {
+                let mut stream = match this.api.subscribe(session.clone(), 0).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, session = %session.as_str(), "rooms: subscribe failed");
+                        this.subscribed.lock().unwrap().remove(&session);
+                        return;
                     }
-                    SessionPayload::Event(AgentEvent::TurnFinished { summary, .. }) => {
-                        if let Some(text) = &summary.final_text {
-                            if !text.is_empty() {
-                                this.reinject_reply(&session, text.clone()).await;
+                };
+                while let Some(item) = stream.next().await {
+                    // Best-effort-skip a lossy lag (turn-lifecycle notes may be missed; the durable
+                    // conv journal remains the record). Re-baseline is future work.
+                    let entry = match item {
+                        daemon_api::LogStreamItem::Entry(e) => e,
+                        daemon_api::LogStreamItem::Lagged => continue,
+                    };
+                    match &entry.payload {
+                        SessionPayload::Event(AgentEvent::TurnStarted { .. }) => {
+                            this.ingestor.note_turn_started(&session);
+                        }
+                        SessionPayload::Event(AgentEvent::TurnFinished { summary, .. }) => {
+                            if let Some(text) = &summary.final_text {
+                                if !text.is_empty() {
+                                    this.reinject_reply(&session, text.clone()).await;
+                                }
+                            }
+                            if let Err(e) = this.ingestor.note_turn_finished(&session).await {
+                                tracing::warn!(error = %e, "rooms: gate flush failed");
                             }
                         }
-                        if let Err(e) = this.ingestor.note_turn_finished(&session).await {
-                            tracing::warn!(error = %e, "rooms: gate flush failed");
-                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        });
+            },
+        ));
     }
 
     /// The (lazily opened, cached) transcript writer for `room`.
@@ -514,7 +522,14 @@ impl TransportAdapter for RoomsAdapter {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 RoomCommand::Post { room, sender, text } => {
-                    runtime.external_post(room, sender, text).await;
+                    // The serve loop runs with no request context; an external post fans out via the
+                    // ownership-gated `submit_from`, so bind the trusted `internal` embedded-caller
+                    // identity for the fan-out.
+                    with_request_context(
+                        RequestContext::internal(),
+                        runtime.external_post(room, sender, text),
+                    )
+                    .await;
                 }
             }
         }

@@ -230,6 +230,9 @@ async fn snapshot_turns(node: &Arc<NodeApiImpl>, session: &SessionId) -> Vec<Con
 /// second `TurnFinished` runs with no user submit, and the notice text lands in the conversation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_notice_drives_a_reactive_turn_on_a_live_parent() {
+    as_system(detached_notice_drives_a_reactive_turn_on_a_live_parent_impl()).await;
+}
+async fn detached_notice_drives_a_reactive_turn_on_a_live_parent_impl() {
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
     let AssembledNode { node, handle, .. } =
         assemble_over(store.clone(), 0, [0x91; 32], fast_host_config());
@@ -350,6 +353,9 @@ async fn detached_notice_reaches_a_parked_durable_parent() {
 /// (`{parent}/d1..d3`), each self-closing to `Completed` — no duplicate ids, no grandchildren.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_fanout_materializes_distinct_children() {
+    as_system(detached_fanout_materializes_distinct_children_impl()).await;
+}
+async fn detached_fanout_materializes_distinct_children_impl() {
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
     let orchestrator: daemon_core::ProviderBuilder =
         Arc::new(|| Arc::new(DetachedFanoutProvider { spawns: 3 }) as Arc<dyn Provider>);
@@ -406,6 +412,9 @@ async fn detached_fanout_materializes_distinct_children() {
 /// resurrecting the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notice_to_a_settled_parent_is_cleanly_dropped() {
+    as_system(notice_to_a_settled_parent_is_cleanly_dropped_impl()).await;
+}
+async fn notice_to_a_settled_parent_is_cleanly_dropped_impl() {
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
     let AssembledNode { node, handle, .. } =
         assemble_over(store.clone(), 0, [0x94; 32], fast_host_config());
@@ -452,6 +461,9 @@ async fn notice_to_a_settled_parent_is_cleanly_dropped() {
 /// (deterministic reactive-turn delivery) so the assertion turns purely on the failed child's notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_detached_child_still_notifies_its_parent() {
+    as_system(a_failed_detached_child_still_notifies_its_parent_impl()).await;
+}
+async fn a_failed_detached_child_still_notifies_its_parent_impl() {
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
     let orchestrator: daemon_core::ProviderBuilder =
         Arc::new(|| Arc::new(FailingChildProvider) as Arc<dyn Provider>);

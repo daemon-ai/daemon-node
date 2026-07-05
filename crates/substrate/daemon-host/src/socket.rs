@@ -665,10 +665,19 @@ where
                         let ctx = RequestContext::authenticated(principal.clone(), None)
                             .with_conn_id(conn_id)
                             .with_auth_method(*method);
-                        let allowed = with_request_context(ctx, async { authorize(&req) }).await;
+                        let allowed =
+                            with_request_context(ctx.clone(), async { authorize(&req) }).await;
                         match allowed {
                             Ok(()) => {
-                                streams.insert(id, spawn_stream(api.clone(), tx.clone(), id, req));
+                                // Bind the connection's authenticated principal into the detached
+                                // pump task: a `tokio::spawn`ed task does NOT inherit the task-local,
+                                // so the pump would otherwise run with `None` principal and the Auth 4
+                                // ownership check inside `subscribe` would see no identity. Passing
+                                // `ctx` closes the cross-owner mux transcript read.
+                                streams.insert(
+                                    id,
+                                    spawn_stream(api.clone(), tx.clone(), id, req, ctx),
+                                );
                             }
                             Err(e) => {
                                 if let Some(a) = &audit {
@@ -725,24 +734,33 @@ pub(crate) fn spawn_stream(
     tx: mpsc::Sender<WireS2C>,
     id: u64,
     req: ApiRequest,
+    ctx: RequestContext,
 ) -> AbortHandle {
     let task = tokio::spawn(async move {
-        match req {
-            ApiRequest::Subscribe {
-                session, after_seq, ..
-            } => pump_session_log(api, tx, id, session, after_seq).await,
-            ApiRequest::EventsSince { cursor, .. } => pump_node_events(api, tx, id, cursor).await,
-            _ => {
-                let _ = tx
-                    .send(WireS2C::End {
-                        id,
-                        error: Some(ApiError::Unsupported(
-                            "non-streaming request on the stream path".into(),
-                        )),
-                    })
-                    .await;
+        // Re-establish the connection's request context inside the spawned task (the task-local is
+        // NOT inherited across `spawn`), so the pump's api calls — notably `subscribe`'s Auth 4
+        // ownership check — run under the authenticated principal, not `None`.
+        with_request_context(ctx, async move {
+            match req {
+                ApiRequest::Subscribe {
+                    session, after_seq, ..
+                } => pump_session_log(api, tx, id, session, after_seq).await,
+                ApiRequest::EventsSince { cursor, .. } => {
+                    pump_node_events(api, tx, id, cursor).await
+                }
+                _ => {
+                    let _ = tx
+                        .send(WireS2C::End {
+                            id,
+                            error: Some(ApiError::Unsupported(
+                                "non-streaming request on the stream path".into(),
+                            )),
+                        })
+                        .await;
+                }
             }
-        }
+        })
+        .await;
     });
     task.abort_handle()
 }
@@ -1108,6 +1126,14 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    // Cluster F: reject an oversize declared length BEFORE allocating the receive buffer, so a
+    // hostile/corrupt prefix cannot force a multi-gigabyte allocation pre-decode / pre-auth.
+    if len > daemon_common::MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(Some(buf))
@@ -1182,5 +1208,39 @@ mod tests {
             windows_pipe_path("/tmp/daemon-api.sock"),
             r"\\.\pipe\daemon-api-_tmp_daemon-api.sock"
         );
+    }
+
+    /// Cluster F: an oversize length prefix is rejected with `InvalidData` BEFORE the receive
+    /// buffer is allocated. The frame declares `MAX_FRAME_BYTES + 1` and supplies NO body — so a
+    /// guard that fires pre-allocation returns `InvalidData`, whereas the unguarded path would
+    /// allocate the (huge) buffer and then hit `UnexpectedEof` reading the absent body. Asserting
+    /// `InvalidData` (not `UnexpectedEof`) proves the rejection is pre-allocation.
+    #[tokio::test]
+    async fn read_frame_rejects_oversize_length_before_allocating() {
+        let over = (daemon_common::MAX_FRAME_BYTES as u64 + 1) as u32;
+        let framed = over.to_be_bytes();
+        let mut reader: &[u8] = &framed;
+        let err = read_frame(&mut reader)
+            .await
+            .expect_err("an oversize frame length must be rejected");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "oversize must be rejected pre-allocation (InvalidData), not read as UnexpectedEof"
+        );
+    }
+
+    /// An in-bounds frame still round-trips unchanged (the cap does not perturb normal traffic).
+    #[tokio::test]
+    async fn read_frame_accepts_in_bounds_frame() {
+        let payload = b"in-bounds";
+        let mut framed = (payload.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(payload);
+        let mut reader: &[u8] = &framed;
+        let got = read_frame(&mut reader)
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(got, payload);
     }
 }

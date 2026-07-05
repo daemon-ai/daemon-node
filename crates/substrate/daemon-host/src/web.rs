@@ -60,7 +60,7 @@ use tokio_tungstenite::tungstenite::http::header::HOST;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::authn::Authenticator;
-use crate::ws::{apply_upgrade_policy, serve_mux_over_ws};
+use crate::ws::{apply_upgrade_policy, serve_mux_over_ws, ws_config};
 
 /// The bundle's entry page, served for `/` (the Qt wasm installer's flat layout).
 const INDEX_FILE: &str = "daemon-app.html";
@@ -670,13 +670,17 @@ async fn accept_web_ws<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
-        let mut effective = allowed_origins.to_vec();
-        if let Some(own) = self_origin(req) {
-            effective.push(own);
-        }
-        apply_upgrade_policy(req, resp, &effective)
-    })
+    tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        |req: &Request, resp: Response| {
+            let mut effective = allowed_origins.to_vec();
+            if let Some(own) = self_origin(req) {
+                effective.push(own);
+            }
+            apply_upgrade_policy(req, resp, &effective)
+        },
+        Some(ws_config()),
+    )
     .await
 }
 

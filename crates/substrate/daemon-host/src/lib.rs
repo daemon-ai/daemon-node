@@ -123,7 +123,7 @@ pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use request_context::{
     current_context, current_principal, with_request_context, AuthMethod, RequestContext,
-    SYSTEM_USERNAME,
+    INTERNAL_USERNAME, SYSTEM_USERNAME,
 };
 pub use revision::FileRevisionLog;
 pub use routing::{

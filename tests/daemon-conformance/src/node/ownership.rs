@@ -13,7 +13,7 @@ use daemon_api::{ApiError, SessionApi, SessionQuery, SessionScope};
 use daemon_auth::{Principal, Role};
 use daemon_common::ReqId;
 use daemon_host::{with_request_context, RequestContext};
-use daemon_protocol::{AgentCommand, UserMsg};
+use daemon_protocol::{AgentCommand, DeliveryTarget, SinkKind, UserMsg};
 
 /// Assemble a node retaining its shared durable store so a test can assert the stamped `owner`.
 fn assemble_with_store() -> (
@@ -199,28 +199,39 @@ async fn roster_get_search_are_owner_scoped() {
     handle.shutdown().await;
 }
 
-/// A legacy `owner IS NULL` session (created with no bound principal — the trusted in-process path)
-/// is hidden from a non-operator peer and reachable only via the operator overrides.
+/// A legacy `owner IS NULL` durable row (a pre-Auth-4 session, before ownership stamping existed)
+/// is hidden from a non-operator peer on the enumeration surfaces and reachable only via the
+/// operator `SessionSeeAll` override. Such a row can no longer be minted through the API — a
+/// principal-less submit is now DENIED (fail-closed) and every stamping path records an owner — so
+/// the legacy scenario is seeded directly in the durable store, exactly as a migrated pre-Auth-4
+/// row would look.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_null_owner_hidden_from_peer_visible_to_operator() {
+    use daemon_core::Snapshot;
+
     let (node, handle, store) = assemble_with_store();
     let session = SessionId::new("s-legacy");
 
-    // No request context: trusted local caller, owner stays NULL.
-    node.submit(session.clone(), start_turn("legacy"))
+    // Seed a durable row with no owner stamp (the pre-Auth-4 shape) straight through the store.
+    store
+        .create_session(
+            session.clone(),
+            PARTITION,
+            Snapshot::fresh(session.clone()).encode().expect("encode"),
+        )
         .await
-        .expect("trusted in-process submit opens an unowned session");
+        .expect("seed a legacy durable session");
     assert_eq!(
         owner_of(&store, &session).await,
         None,
-        "a principal-less submit leaves the session unowned (legacy NULL)"
+        "the seeded legacy row carries no owner (NULL)"
     );
 
     let all = SessionQuery {
         scope: SessionScope::All,
         ..Default::default()
     };
-    // A peer cannot see or control it.
+    // A peer can neither enumerate nor inspect it.
     let alice_roster = with_request_context(ctx("alice", Role::User), async {
         node.sessions_query(all.clone()).await
     })
@@ -229,23 +240,83 @@ async fn legacy_null_owner_hidden_from_peer_visible_to_operator() {
         !alice_roster.sessions.iter().any(|i| i.session == session),
         "a legacy NULL-owner session is hidden from a non-operator peer"
     );
-    let alice_poll = with_request_context(ctx("alice", Role::User), async {
-        node.poll(session.clone(), 0).await
+    let alice_get = with_request_context(ctx("alice", Role::User), async {
+        node.session_get(session.clone()).await
     })
     .await;
-    assert!(matches!(alice_poll, Err(ApiError::Forbidden(_))));
+    assert!(
+        alice_get.is_none(),
+        "a peer cannot inspect a legacy NULL-owner session (no existence oracle)"
+    );
 
-    // An operator sees and controls it.
+    // An operator (`SessionSeeAll`) sees it on both the roster and the read-of-one.
     let op_roster = with_request_context(ctx("op", Role::Operator), async {
         node.sessions_query(all).await
     })
     .await;
     assert!(op_roster.sessions.iter().any(|i| i.session == session));
-    with_request_context(ctx("op", Role::Operator), async {
-        node.poll(session.clone(), 0).await
+    assert!(
+        with_request_context(ctx("op", Role::Operator), async {
+            node.session_get(session.clone()).await
+        })
+        .await
+        .is_some(),
+        "an operator sees a legacy session via SessionSeeAll"
+    );
+
+    handle.shutdown().await;
+}
+
+/// `delivery_targets` (the session's reply-routing sinks) is owner-scoped: a peer sees an empty
+/// list (deny → empty, no fallible return), while the owner and an operator see the seeded target.
+/// Before the fix `delivery_targets` had no ownership check, so a peer could read another user's
+/// reply-routing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_targets_is_owner_scoped() {
+    let (node, handle, _store) = assemble_with_store();
+    let session = SessionId::new("s-dt");
+
+    // Alice opens the session (owner = alice) and seeds a Primary reply target on it.
+    with_request_context(ctx("alice", Role::User), async {
+        node.submit(session.clone(), start_turn("dt")).await
     })
     .await
-    .expect("an operator controls a legacy session");
+    .expect("alice opens her session");
+    with_request_context(ctx("alice", Role::User), async {
+        node.handover(
+            session.clone(),
+            DeliveryTarget::new("matrix/acct", "!room:server", SinkKind::Primary),
+        )
+        .await
+    })
+    .await
+    .expect("alice seeds a delivery target on her session");
+
+    // The owner and an operator see the target; a peer sees nothing.
+    let alice_dt = with_request_context(ctx("alice", Role::User), async {
+        node.delivery_targets(session.clone()).await
+    })
+    .await;
+    assert!(
+        !alice_dt.is_empty(),
+        "the owner must see her session's delivery targets"
+    );
+    let bob_dt = with_request_context(ctx("bob", Role::User), async {
+        node.delivery_targets(session.clone()).await
+    })
+    .await;
+    assert!(
+        bob_dt.is_empty(),
+        "a peer must not read another user's delivery targets, got {bob_dt:?}"
+    );
+    let op_dt = with_request_context(ctx("op", Role::Operator), async {
+        node.delivery_targets(session.clone()).await
+    })
+    .await;
+    assert!(
+        !op_dt.is_empty(),
+        "an operator (SessionSeeAll) sees any session's delivery targets"
+    );
 
     handle.shutdown().await;
 }

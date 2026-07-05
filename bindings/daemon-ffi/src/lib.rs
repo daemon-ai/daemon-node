@@ -652,7 +652,13 @@ mod dispatch_tests {
             origin: None,
             profile: None,
         };
-        let resp = host.rt.block_on(dispatch(host.node.as_ref(), submit));
+        // Drive the raw dispatcher under `system` exactly as the C ABI `daemon_host_call` does
+        // (the in-process embedder is full local trust): after the Auth 4 flip an unscoped call is
+        // denied, so a direct `dispatch` in a test must bind the same context the FFI binds.
+        let resp = host.rt.block_on(with_request_context(
+            RequestContext::system(),
+            dispatch(host.node.as_ref(), submit),
+        ));
         assert!(
             !matches!(resp, ApiResponse::Error(_)),
             "submit should be accepted: {resp:?}"
@@ -665,9 +671,10 @@ mod dispatch_tests {
                 session: session.clone(),
                 max: 16,
             };
-            if let ApiResponse::Drained(items) =
-                host.rt.block_on(dispatch(host.node.as_ref(), poll))
-            {
+            if let ApiResponse::Drained(items) = host.rt.block_on(with_request_context(
+                RequestContext::system(),
+                dispatch(host.node.as_ref(), poll),
+            )) {
                 if items
                     .iter()
                     .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))

@@ -334,6 +334,9 @@ async fn content_store_round_trips_and_materializes() {
 /// agent's filesystem surface (and tools) can read it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_attachment_materializes_into_session_inbox() {
+    as_system(inbound_attachment_materializes_into_session_inbox_impl()).await;
+}
+async fn inbound_attachment_materializes_into_session_inbox_impl() {
     use daemon_api::{ControlApi, FsRootId, SessionApi};
     use daemon_common::{BlobRef, ReqId};
     use daemon_protocol::{AgentCommand, UserMsg};

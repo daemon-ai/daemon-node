@@ -15,6 +15,29 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// The reserved username of the local-trust full-trust [`Principal`] (the in-process / FFI /
+/// local-Unix `system()` admin). Synthetic — never a real network identity.
+pub const SYSTEM_USERNAME: &str = "system";
+
+/// The reserved username of the in-process embedded-caller marker (`internal()`): trusted node
+/// internals (delivery pumps, chat ingest, background input injection) that legitimately cross
+/// session ownership. Constructed only in-process, never derivable from wire input; its username
+/// also becomes an ownership stamp, so a real store user must never be able to claim it.
+pub const INTERNAL_USERNAME: &str = "internal";
+
+/// The usernames reserved for the two synthetic in-process principals. A real user may not be
+/// created with any of these (see [`is_reserved_username`]) — otherwise a network user could mint
+/// an identity whose ownership stamp collides with a trusted internal caller.
+pub const RESERVED_USERNAMES: [&str; 2] = [SYSTEM_USERNAME, INTERNAL_USERNAME];
+
+/// Whether `name` is one of the [`RESERVED_USERNAMES`], compared ASCII-case-insensitively so a
+/// mixed-case spelling (`System`, `INTERNAL`) cannot slip past the reservation.
+pub fn is_reserved_username(name: &str) -> bool {
+    RESERVED_USERNAMES
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(name))
+}
+
 /// A single coarse permission over one API operation category. `Read` variants gate the listing /
 /// inspection ops; `Write` variants gate the mutating ops. Two ownership overrides
 /// (`Session{SeeAll,ControlAny}`) let an operator transcend per-user session ownership.
