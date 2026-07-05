@@ -206,12 +206,17 @@ impl SessionFactoryCtx {
             let roots = roots.clone();
             let binding = overlay.workspace.clone();
             profile = profile.with_exec(Arc::new(move |id: &SessionId| {
-                let root = match &binding {
-                    Some(WorkspaceBinding::Bound(p)) => p.clone(),
-                    _ => roots.isolated_root(id.as_str()),
+                // A `Bound` root is an operator-specified external directory whose contents may be
+                // attacker-influenced — mark it UNTRUSTED so workspace-discovered artifacts (a
+                // planted `.venv` interpreter) are not auto-trusted (Cluster E). The isolated
+                // per-session sandbox is node-managed and trusted.
+                let (root, trusted) = match &binding {
+                    Some(WorkspaceBinding::Bound(p)) => (p.clone(), false),
+                    _ => (roots.isolated_root(id.as_str()), true),
                 };
                 roots.record(id.as_str(), root.clone());
-                Arc::new(LocalEnvironment::new(root)) as Arc<dyn ExecutionEnvironment>
+                Arc::new(LocalEnvironment::with_trust(root, trusted))
+                    as Arc<dyn ExecutionEnvironment>
             }));
         }
         profile

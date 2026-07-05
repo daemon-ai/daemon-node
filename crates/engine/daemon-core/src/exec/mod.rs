@@ -107,6 +107,15 @@ pub trait ExecutionEnvironment: Send + Sync {
     async fn list(&self, path: &Path) -> std::io::Result<Vec<String>>;
     /// The environment's working directory (its containment root).
     fn cwd(&self) -> &Path;
+    /// Whether this environment's root is *trusted*: a node-managed isolated per-session sandbox
+    /// (`true`, the default) vs. an operator-bound external directory whose contents may be
+    /// attacker-influenced (`false`). Tools use this to refuse auto-trusting workspace-discovered
+    /// artifacts — e.g. `execute_code` will not auto-execute a `.venv` interpreter found under an
+    /// untrusted root (Cluster E policy partition). Defaulted `true` so a backend that is inherently
+    /// contained/managed need not override it.
+    fn workspace_trusted(&self) -> bool {
+        true
+    }
 }
 
 /// Resolve `requested` against `root` and assert workspace containment.

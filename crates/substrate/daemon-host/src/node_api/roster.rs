@@ -186,6 +186,26 @@ impl NodeApiImpl {
         }
     }
 
+    /// The operator-tier gate for **security-widening** mutations (Cluster E policy partition):
+    /// widening a session overlay's autonomy/tool-surface (`approval_mode` -> `AcceptEdits`/
+    /// `AutoAllow`, or `ToolsOverride::FullToolset`) and setting cron `workdir`/`enabled_toolsets`.
+    /// Requires [`SessionControlAny`](daemon_auth::Capability::SessionControlAny) — held only by
+    /// `Role::Operator`/`Admin` (and the synthetic `system`/`internal` in-process principals), never
+    /// by `User`/`Viewer`. Fail-closed: a `None` request principal is DENIED, matching the ownership
+    /// layer. This is enforced *beneath* the coarse `SessionWrite`/`CronWrite` capability gate — it
+    /// partitions the security-relevant subset of an otherwise user-tier write.
+    pub(crate) fn require_operator(&self, what: &str) -> Result<(), ApiError> {
+        match crate::request_context::current_principal() {
+            Some(p) if p.has(daemon_auth::Capability::SessionControlAny) => Ok(()),
+            Some(_) => Err(ApiError::Forbidden(format!(
+                "{what} requires an operator-tier capability"
+            ))),
+            None => Err(ApiError::Unauthenticated(
+                "no authenticated principal bound to this request".into(),
+            )),
+        }
+    }
+
     /// The orchestration tree projected for `principal` (Auth 4). A `SessionSeeAll` holder sees the
     /// whole tree; any other principal sees only the subtrees it owns (children inherit the parent's
     /// owner, so a node is retained iff its backing session is owner-visible, and a dropped parent's

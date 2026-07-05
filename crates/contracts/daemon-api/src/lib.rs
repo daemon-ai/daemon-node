@@ -118,6 +118,15 @@ impl ApprovalMode {
         }
     }
 
+    /// Whether this mode *widens* autonomy — auto-approves gated actions (`AcceptEdits` auto-allows
+    /// workspace edits; `AutoAllow` auto-allows nearly everything) — vs. the safe directions (`Ask`,
+    /// the default that prompts; `Deny`, the strictest that blocks). Widening a live session's
+    /// autonomy is an operator-tier act (Cluster E): a non-operator may narrow (`Ask`/`Deny`) or
+    /// switch model/provider on its own session, but not widen its approval posture.
+    pub fn widens_autonomy(self) -> bool {
+        matches!(self, ApprovalMode::AcceptEdits | ApprovalMode::AutoAllow)
+    }
+
     /// The full set of advertisable modes (for a GUI mode picker / session-state advertisement).
     pub const ALL: [ApprovalMode; 4] = [
         ApprovalMode::Ask,

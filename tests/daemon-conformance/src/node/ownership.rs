@@ -441,3 +441,156 @@ async fn cron_session_inherits_cron_creator_owner() {
 
     handle.shutdown().await;
 }
+
+/// Cluster E (policy partition): a non-operator (own-session `SessionWrite`) principal may NOT widen
+/// its own session's security posture — `approval_mode` -> `AcceptEdits`/`AutoAllow` or
+/// `ToolsOverride::FullToolset` require an operator-tier capability (`SessionControlAny`). Narrowing
+/// (`Ask`/`Deny`), an explicit `Allowlist`, and a model switch stay owner-allowed; an operator may
+/// widen. This closes the gap where a user could auto-allow its own session or widen its tool surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_operator_cannot_widen_session_policy() {
+    use daemon_api::{ApprovalMode, SessionOverlay, ToolsOverride};
+    let (node, handle, _store) = assemble_with_store();
+    let s = SessionId::new("s-clusterE");
+    // Alice owns the session (create stamps her as owner; no turn needed).
+    with_request_context(ctx("alice", Role::User), async {
+        node.session_create(Some(s.clone()), None).await
+    })
+    .await
+    .expect("alice creates her session");
+
+    // Widening the approval mode is refused for the owner (non-operator).
+    for mode in [ApprovalMode::AutoAllow, ApprovalMode::AcceptEdits] {
+        let r = with_request_context(ctx("alice", Role::User), async {
+            node.set_session_mode(s.clone(), mode).await
+        })
+        .await;
+        assert!(
+            matches!(r, Err(ApiError::Forbidden(_))),
+            "owner must not widen approval to {mode:?}, got {r:?}"
+        );
+    }
+    // Overriding to the full node toolset is refused for the owner.
+    let full = SessionOverlay {
+        tool_allowlist: ToolsOverride::FullToolset,
+        ..SessionOverlay::default()
+    };
+    let r = with_request_context(ctx("alice", Role::User), async {
+        node.set_session_overlay(s.clone(), full).await
+    })
+    .await;
+    assert!(
+        matches!(r, Err(ApiError::Forbidden(_))),
+        "owner must not override to FullToolset, got {r:?}"
+    );
+
+    // Non-widening changes stay owner-allowed: narrow to Ask/Deny and set an explicit allowlist.
+    for mode in [ApprovalMode::Ask, ApprovalMode::Deny] {
+        with_request_context(ctx("alice", Role::User), async {
+            node.set_session_mode(s.clone(), mode).await
+        })
+        .await
+        .unwrap_or_else(|e| panic!("owner may narrow approval to {mode:?}: {e:?}"));
+    }
+    with_request_context(ctx("alice", Role::User), async {
+        node.set_session_overlay(
+            s.clone(),
+            SessionOverlay {
+                tool_allowlist: ToolsOverride::Allowlist(vec!["fs".into()]),
+                ..SessionOverlay::default()
+            },
+        )
+        .await
+    })
+    .await
+    .expect("owner may set an explicit (narrowing) allowlist");
+    // A model switch is not part of the security subset — it must never be operator-gated (it may be
+    // Unsupported when no model factory is wired, but it is never Forbidden).
+    let model = with_request_context(ctx("alice", Role::User), async {
+        node.set_session_model(s.clone(), "model-x".into(), None)
+            .await
+    })
+    .await;
+    assert!(
+        !matches!(model, Err(ApiError::Forbidden(_))),
+        "a model switch must not be operator-gated, got {model:?}"
+    );
+
+    // An operator (SessionControlAny) may widen both.
+    with_request_context(ctx("op", Role::Operator), async {
+        node.set_session_mode(s.clone(), ApprovalMode::AutoAllow)
+            .await
+    })
+    .await
+    .expect("operator may widen approval");
+    with_request_context(ctx("op", Role::Operator), async {
+        node.set_session_overlay(
+            s.clone(),
+            SessionOverlay {
+                tool_allowlist: ToolsOverride::FullToolset,
+                ..SessionOverlay::default()
+            },
+        )
+        .await
+    })
+    .await
+    .expect("operator may override to FullToolset");
+
+    handle.shutdown().await;
+}
+
+/// Cluster E: cron `workdir` (-> a Bound workspace = per-session sandbox escape) and
+/// `enabled_toolsets` (pins an unattended run's tool surface) are operator-tier on the shared
+/// `CronOps::create` path. A non-operator is denied; an operator is allowed; a plain job with neither
+/// field stays user-creatable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_operator_cannot_set_cron_workdir_or_toolset() {
+    let (node, handle, _store) = assemble_with_store();
+    let spec = |mutate: fn(&mut daemon_api::CronSpec)| {
+        let mut s = daemon_api::CronSpec {
+            name: "j".into(),
+            schedule: "0 9 * * *".into(),
+            payload: b"go".to_vec(),
+            enabled: true,
+            ..daemon_api::CronSpec::default()
+        };
+        mutate(&mut s);
+        s
+    };
+
+    // A non-operator setting workdir is refused.
+    let r = with_request_context(ctx("alice", Role::User), async {
+        node.cron_create(spec(|s| s.workdir = Some("/srv/p".into())))
+            .await
+    })
+    .await;
+    assert!(
+        matches!(r, Err(ApiError::Forbidden(_))),
+        "user must not set cron workdir, got {r:?}"
+    );
+    // A non-operator setting enabled_toolsets is refused.
+    let r = with_request_context(ctx("alice", Role::User), async {
+        node.cron_create(spec(|s| s.enabled_toolsets = Some(vec!["fs".into()])))
+            .await
+    })
+    .await;
+    assert!(
+        matches!(r, Err(ApiError::Forbidden(_))),
+        "user must not set cron toolset, got {r:?}"
+    );
+    // An operator may set them.
+    with_request_context(ctx("op", Role::Operator), async {
+        node.cron_create(spec(|s| s.workdir = Some("/srv/p".into())))
+            .await
+    })
+    .await
+    .expect("operator may set cron workdir");
+    // A plain job (no security field) stays user-creatable.
+    with_request_context(ctx("alice", Role::User), async {
+        node.cron_create(spec(|_| {})).await
+    })
+    .await
+    .expect("user may create a plain cron job");
+
+    handle.shutdown().await;
+}
