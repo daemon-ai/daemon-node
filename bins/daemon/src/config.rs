@@ -219,6 +219,21 @@ pub enum EmbedKind {
     Local,
 }
 
+/// Which aux provider the `vision_analyze` tool describes images through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionKind {
+    /// No vision backend — the tool is not registered (the zero-config default).
+    #[serde(alias = "none")]
+    Off,
+    /// A dedicated vision-capable model via `genai` (`[vision].model` selects it).
+    #[serde(rename = "genai", alias = "remote")]
+    Genai,
+    /// Reuse the launch profile's default provider (the same resolution as `lcm_aux`). The main
+    /// model must itself accept image input, or every call surfaces a capability error.
+    Main,
+}
+
 /// The durable store backend selector (the config surface; `store` + `store_path`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -574,6 +589,43 @@ impl Default for EmbedConfig {
             dims: 0,
             base_url: None,
             engine: "llama".to_string(),
+        }
+    }
+}
+
+/// Tuning for the `vision_analyze` tool. `[vision]` / `DAEMON_VISION__*`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionConfig {
+    /// Which aux backend to use (off|genai|main). TOML/env key `provider`.
+    #[serde(rename = "provider")]
+    pub kind: VisionKind,
+    /// The vision model (`genai` kind only): a `genai` model name, e.g. `gemini-2.5-flash`.
+    pub model: String,
+    /// The OpenAI-compatible API base URL override (`None` = provider default; `genai` kind only).
+    pub base_url: Option<String>,
+    /// An optional bearer threaded into each aux call (`Request::auth`). `None` (the default)
+    /// falls back to the provider's environment credential.
+    pub credential_key: Option<String>,
+    /// The aux vision-call deadline.
+    #[serde(rename = "timeout_ms", with = "duration_ms")]
+    pub timeout: Duration,
+    /// The hard cap on downloaded / inline image bytes, in MB.
+    pub max_download_mb: u64,
+    /// The hard cap on the base64 payload handed to the provider, in MB.
+    pub max_base64_mb: usize,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            kind: VisionKind::Off,
+            model: String::new(),
+            base_url: None,
+            credential_key: None,
+            timeout: Duration::from_secs(120),
+            max_download_mb: 50,
+            max_base64_mb: 20,
         }
     }
 }
@@ -997,6 +1049,8 @@ pub struct NodeConfig {
     pub models: ModelsConfig,
     /// Embeddings backend tuning (Mnemosyne vector recall; `Off` by default).
     pub embed: EmbedConfig,
+    /// Vision-tool tuning (`vision_analyze` aux backend; `Off` by default).
+    pub vision: VisionConfig,
     /// MeTTa symbolic-coprocessor tuning (`enable = false` by default).
     pub metta: MettaConfig,
     /// Python-tools tuning (`enable = false` by default).
@@ -1057,6 +1111,7 @@ impl Default for NodeConfig {
             infer: LocalConfig::default(),
             models: ModelsConfig::default(),
             embed: EmbedConfig::default(),
+            vision: VisionConfig::default(),
             metta: MettaConfig::default(),
             python: PythonToolsConfig::default(),
             mcp: McpConfig::default(),
