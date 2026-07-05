@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use daemon_core::{approve_command, Effect, Gate, Tool, ToolCall, ToolOutcome, TurnCx};
+use daemon_core::{
+    approve_command, ContainedRoot, Effect, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
+};
 use daemon_protocol::ToolDetail;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -293,18 +295,36 @@ impl ExecuteCodeTool {
             })?;
         let kind = sandbox::resolve(self.settings.sandbox).await?;
 
-        let staging = ws_root.join(".execute_code").join(new_run_id());
-        tokio::fs::create_dir_all(&staging).await?;
+        // Stage inside the workspace through `ContainedRoot` (openat2 RESOLVE_BENEATH |
+        // RESOLVE_NO_SYMLINKS): the `.execute_code/<run_id>` dir and its `script.py` are created
+        // fd-relative to the workspace root, so a symlinked `.execute_code` (or any symlinked
+        // staging component) is refused rather than followed out of the workspace. `open` also
+        // creates the root if missing (the historical lazy `ensure_root`).
+        let rel_stage = Path::new(".execute_code").join(new_run_id());
+        let rel_script = rel_stage.join("script.py");
+        let root = ContainedRoot::open(ws_root)?;
+        root.create_dir_all(&rel_stage).await?;
+        root.write(&rel_script, code.as_bytes()).await?;
+
+        // Absolute paths for the *child* (its argv + cwd) — resolved by the OS at spawn; the
+        // daemon-side opens above are the containment-sensitive ones and never touch raw `fs`.
+        let staging = ws_root.join(&rel_stage);
+        let script = ws_root.join(&rel_script);
         let cwd = match mode {
             Mode::Project => ws_root.to_path_buf(),
-            Mode::Strict => staging.clone(),
+            Mode::Strict => staging,
         };
 
         let run = self
-            .run_staged(&staging, &interpreter, &cwd, kind, code, cancel)
+            .run_staged(&script, &interpreter, &cwd, kind, cancel)
             .await;
-        // Best-effort cleanup regardless of outcome — the staging dir is ours and disposable.
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        // Best-effort contained cleanup: `remove_dir_all_sync` unlinks a symlinked entry as the link
+        // (never follows it out of root). Run off the reactor (blocking recursive remove).
+        let ws = ws_root.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            ContainedRoot::open(&ws).and_then(|r| r.remove_dir_all_sync(&rel_stage))
+        })
+        .await;
 
         run.map(|outcome| Executed {
             outcome,
@@ -313,19 +333,15 @@ impl ExecuteCodeTool {
         })
     }
 
-    /// Write `script.py` into `staging`, build the argv, and run it to completion.
+    /// Build the argv for the pre-staged `script` and run it to completion.
     async fn run_staged(
         &self,
-        staging: &Path,
+        script: &Path,
         interpreter: &Path,
         cwd: &Path,
         kind: sandbox::SandboxKind,
-        code: &str,
         cancel: &CancellationToken,
     ) -> std::io::Result<RunOutcome> {
-        let script = staging.join("script.py");
-        tokio::fs::write(&script, code).await?;
-
         let path_env = std::env::var_os("PATH").unwrap_or_default();
         let tz = std::env::var("TZ").ok().filter(|s| !s.is_empty());
         let argv = sandbox::argv(
@@ -333,7 +349,7 @@ impl ExecuteCodeTool {
             self.settings.network,
             cwd,
             interpreter,
-            &script,
+            script,
             &path_env,
             tz.as_deref(),
         );

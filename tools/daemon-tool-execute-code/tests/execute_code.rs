@@ -491,3 +491,49 @@ async fn required_bwrap_either_sandboxes_or_reports_unavailable() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- Test 11: staging-open containment (Cluster C, host-side) ---------------------------------
+
+// The staging lifecycle (`.execute_code/<run_id>` create, `script.py` write, cleanup) runs in the
+// DAEMON, so the child-process sandbox does not cover it. Routed through `ContainedRoot`
+// (openat2 RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS), a symlinked `.execute_code` planted in the
+// workspace is refused rather than followed: staging fails, the run never starts, and the
+// out-of-workspace target is untouched. With the pre-guard raw `tokio::fs` staging, the same setup
+// would have created `<run_id>/script.py` inside the symlink target.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_symlink_is_not_followed_out_of_workspace() {
+    if !python_available() {
+        eprintln!("skipping staging_symlink_is_not_followed_out_of_workspace: no usable python3");
+        return;
+    }
+    use std::os::unix::fs::symlink;
+    let base = temp_root("staging-symlink");
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    // Plant `.execute_code` as a symlink pointing OUT of the workspace.
+    symlink(&outside, ws.join(".execute_code")).unwrap();
+
+    let out = run_plain(&ws, &args("print('should-not-run')")).await;
+
+    // The staging open through the symlink is refused → a setup error, and no process ran.
+    assert!(
+        !out.result.ok,
+        "staging that escapes via a symlink must fail: {}",
+        out.result.content
+    );
+    // Nothing was created through the symlink into the out-of-workspace target.
+    let leaked: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "staging must not create anything in the out-of-workspace target, found {leaked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
