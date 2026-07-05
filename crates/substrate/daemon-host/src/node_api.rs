@@ -28,7 +28,7 @@ use crate::credstore::CredentialStore;
 use crate::engine_incarnation::JournalConfig;
 use crate::journal::{JournalFeeder, JournalSink};
 use crate::profiles::ProfileStore;
-use crate::request_context::current_principal;
+use crate::request_context::{current_principal, with_request_context, RequestContext};
 use crate::routing::RoutingRegistry;
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
@@ -497,12 +497,19 @@ impl NodeApiImpl {
             self.store.enqueue_wake(session.clone()).await;
             return Ok(());
         }
-        self.submit(
-            session.clone(),
-            AgentCommand::StartTurn {
-                input: UserMsg::new(text),
-                request_id: daemon_common::ReqId(0),
-            },
+        // `self.submit` is the `SessionApi` trait method (Auth 4 ownership-gated). This seam is
+        // driven by background workers (the process notifier, the delegation notice worker) that
+        // carry no request context, so bind the trusted in-process `internal` principal — otherwise
+        // the ownership check would see `None` (now deny) and drop the injection.
+        with_request_context(
+            RequestContext::internal(),
+            self.submit(
+                session.clone(),
+                AgentCommand::StartTurn {
+                    input: UserMsg::new(text),
+                    request_id: daemon_common::ReqId(0),
+                },
+            ),
         )
         .await
     }

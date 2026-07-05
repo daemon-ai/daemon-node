@@ -9,6 +9,9 @@ use super::harness::*;
 /// `routing_unbind_chat` clears it — all without a restart (the hot-reload seam).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routing_pin_resolves_to_bound_session() {
+    as_system(routing_pin_resolves_to_bound_session_impl()).await;
+}
+async fn routing_pin_resolves_to_bound_session_impl() {
     use daemon_api::SessionApi;
     use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId, UserMsg};
 
@@ -81,6 +84,9 @@ async fn routing_pin_resolves_to_bound_session() {
 /// leaves the right account, and (4) `handover` demotes the prior `Primary` to `Spectator`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_submit_resolves_profile_and_delivery_per_origin() {
+    as_system(routed_submit_resolves_profile_and_delivery_per_origin_impl()).await;
+}
+async fn routed_submit_resolves_profile_and_delivery_per_origin_impl() {
     use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_common::ReqId;
     use daemon_host::{
@@ -287,6 +293,9 @@ async fn routed_submit_resolves_profile_and_delivery_per_origin() {
 /// lists back redacted, the secret never returned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bound_accounts_derive_instance_profile_binding() {
+    as_system(bound_accounts_derive_instance_profile_binding_impl()).await;
+}
+async fn bound_accounts_derive_instance_profile_binding_impl() {
     use daemon_api::{
         BoundAccount, CredentialApi, Outbound, ProfileSpec, ProviderSelector, SessionApi,
     };

@@ -24,6 +24,7 @@ use futures::StreamExt;
 use daemon_api::{NodeApi, SessionLogEntry};
 use daemon_common::SessionId;
 use daemon_delivery::Projector;
+use daemon_host::{with_request_context, RequestContext};
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
     AgentEvent, HostRequest, HostRequestKind, SessionPayload, SinkKind, TransportId,
@@ -171,29 +172,36 @@ impl DeliveryManager {
             }
         }
         let me = self.clone();
-        tokio::spawn(async move {
-            let mut stream = match me.api.subscribe(session.clone(), 0).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "matrix: delivery subscribe failed");
-                    me.active.lock().unwrap().remove(&session);
-                    return;
-                }
-            };
-            while let Some(item) = stream.next().await {
-                // Best-effort-skip a lossy lag (the prior silent-drop behavior); durable delivery
-                // re-baseline is future work.
-                let entry = match item {
-                    daemon_api::LogStreamItem::Entry(e) => e,
-                    daemon_api::LogStreamItem::Lagged => continue,
+        // Bind the in-process `internal` principal for the whole detached delivery task: a spawned
+        // task inherits no request context, so the now-ownership-gated `subscribe` / `delivery_targets`
+        // (and the projector's `submit` on turn-finish) would otherwise run with `None` (deny). The
+        // `internal` marker (operator-tier session overrides) is the trusted embedded-caller identity.
+        tokio::spawn(with_request_context(
+            RequestContext::internal(),
+            async move {
+                let mut stream = match me.api.subscribe(session.clone(), 0).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "matrix: delivery subscribe failed");
+                        me.active.lock().unwrap().remove(&session);
+                        return;
+                    }
                 };
-                if !still_owns(&me.api, &session, &transport).await {
-                    break;
+                while let Some(item) = stream.next().await {
+                    // Best-effort-skip a lossy lag (the prior silent-drop behavior); durable delivery
+                    // re-baseline is future work.
+                    let entry = match item {
+                        daemon_api::LogStreamItem::Entry(e) => e,
+                        daemon_api::LogStreamItem::Lagged => continue,
+                    };
+                    if !still_owns(&me.api, &session, &transport).await {
+                        break;
+                    }
+                    me.projector.project(session.clone(), entry).await;
                 }
-                me.projector.project(session.clone(), entry).await;
-            }
-            me.active.lock().unwrap().remove(&session);
-        });
+                me.active.lock().unwrap().remove(&session);
+            },
+        ));
     }
 
     /// The number of sessions currently being delivered (test/observability helper).

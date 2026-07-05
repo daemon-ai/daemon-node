@@ -34,6 +34,9 @@ fn scan_node_events(
 /// from the durable journal instead of misapplying a fresh log onto a stale cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_log_epoch_bumps_on_reactivation() {
+    as_system(live_log_epoch_bumps_on_reactivation_impl()).await;
+}
+async fn live_log_epoch_bumps_on_reactivation_impl() {
     use daemon_api::SessionApi;
     use daemon_common::ReqId;
     use daemon_protocol::{AgentCommand, UserMsg};
@@ -317,6 +320,9 @@ async fn events_since_feed_streams_node_events_and_resyncs() {
 /// whole retained ring in one response), and the `next_cursor` loop reads the rest to completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn events_since_one_shot_is_bounded_at_the_wire_page_max() {
+    as_system(events_since_one_shot_is_bounded_at_the_wire_page_max_impl()).await;
+}
+async fn events_since_one_shot_is_bounded_at_the_wire_page_max_impl() {
     use daemon_api::{dispatch, SessionApi, WIRE_PAGE_MAX};
 
     let (node, handle) = assemble();

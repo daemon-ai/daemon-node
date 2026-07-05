@@ -170,6 +170,12 @@ impl SessionApi for NodeApiImpl {
         after_seq: u64,
         max: u32,
     ) -> Result<LogPageView, ApiError> {
+        // Auth 4: own-or-`SessionControlAny`. This is the one-shot / long-poll form of the live
+        // `Subscribe` op (the wire `Subscribe` `Call` routes here); it must enforce the SAME
+        // ownership check as the streaming `subscribe` below (both are `control = true`, so the
+        // `Call` and `Open` forms of one op deny identically). Previously unguarded — the gap that
+        // let a non-owner read another user's live transcript.
+        self.require_session_access(&session, true).await?;
         Ok(self.live.log_after(&session, after_seq, max))
     }
 
@@ -180,10 +186,21 @@ impl SessionApi for NodeApiImpl {
     }
 
     async fn log_epoch(&self, session: SessionId) -> u64 {
+        // Auth 4 (read-of-one, non-fallible): deny → 0. Not wire-reachable on its own (the mux pump
+        // reads it before `subscribe`, which now enforces ownership under the same bound principal),
+        // so this is defense-in-depth for any future caller.
+        if self.require_session_access(&session, false).await.is_err() {
+            return 0;
+        }
         self.live.log_epoch(&session)
     }
 
     async fn delivery_targets(&self, session: SessionId) -> Vec<DeliveryTarget> {
+        // Auth 4 (read-of-one, non-fallible): a peer must not read another user's reply-routing —
+        // deny → empty (no existence oracle). Previously unguarded.
+        if self.require_session_access(&session, false).await.is_err() {
+            return Vec::new();
+        }
         self.live.delivery_targets(&session)
     }
 

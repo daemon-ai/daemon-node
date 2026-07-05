@@ -44,14 +44,27 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+use daemon_common::MAX_FRAME_BYTES;
 
 use crate::authn::{Authenticator, TlsState};
 use crate::socket::{next_conn_id, serve_mux, AuthMode};
 
 /// The WebSocket subprotocol name of the mux carrier, negotiated during the upgrade handshake.
 pub const WS_SUBPROTOCOL: &str = "daemon-mux";
+
+/// The WebSocket carrier's protocol config: cap the max message + frame size at [`MAX_FRAME_BYTES`]
+/// (Cluster F), so tungstenite rejects an oversize message at the protocol layer before it is
+/// buffered — the WS analogue of the length-prefix cap in `socket.rs`/`remote.rs`. Shared by the
+/// standalone `[api].ws_addr` listener and the single-origin web front so both apply the same bound.
+pub(crate) fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
+}
 
 /// Serve the node api surface over plain WebSocket until the listener errors. Every connection is
 /// mux-only and **must authenticate** (a browser-reachable listener is never local-trusted): after
@@ -120,9 +133,11 @@ async fn accept_mux_upgrade(
     stream: TcpStream,
     allowed_origins: &[String],
 ) -> Result<WebSocketStream<TcpStream>, tokio_tungstenite::tungstenite::Error> {
-    tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
-        apply_upgrade_policy(req, resp, allowed_origins)
-    })
+    tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        |req: &Request, resp: Response| apply_upgrade_policy(req, resp, allowed_origins),
+        Some(ws_config()),
+    )
     .await
 }
 
@@ -278,6 +293,16 @@ where
             }
             match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
                 Some(Ok(Message::Binary(payload))) => {
+                    // Defense-in-depth: tungstenite already rejects a message over `MAX_FRAME_BYTES`
+                    // at the protocol layer (see `ws_config`), but re-check here so an oversize
+                    // payload is refused even if a caller forgets the accept-time config, and never
+                    // exceeds the u32 length prefix the mux framing uses.
+                    if payload.len() > MAX_FRAME_BYTES {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ws message exceeds the frame size limit",
+                        )));
+                    }
                     let Ok(len) = u32::try_from(payload.len()) else {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -494,6 +519,15 @@ mod tests {
             Err((StatusCode::FORBIDDEN, "origin not allowed"))
         );
         assert_eq!(negotiate_upgrade(None, &[], &[]), Ok(None));
+    }
+
+    /// Cluster F: the carrier config caps both the max message and max frame size at the shared
+    /// `MAX_FRAME_BYTES`, so tungstenite rejects an oversize message before buffering it.
+    #[test]
+    fn ws_config_caps_message_and_frame_size() {
+        let cfg = ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_FRAME_BYTES));
     }
 
     /// Subprotocol negotiation: `daemon-mux` is echoed, none is tolerated, foreign-only refused.

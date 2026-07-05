@@ -130,6 +130,14 @@ where
         Err(e) => return Err(e),
     }
     let n = u32::from_be_bytes(len) as usize;
+    // Cluster F: reject an oversize declared length BEFORE allocating the receive buffer (a corrupt
+    // or hostile prefix would otherwise force a multi-gigabyte allocation pre-decode).
+    if n > daemon_common::MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
     let frame = ciborium::from_reader(&buf[..])
@@ -398,5 +406,29 @@ impl RemoteClient {
             Resp::Status(s) => Ok(s),
             _ => Err(TransportError::Protocol),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cluster F: the `remote` transport rejects an oversize length prefix with `InvalidData`
+    /// BEFORE allocating the receive buffer. The frame declares `MAX_FRAME_BYTES + 1` and supplies
+    /// no body; a pre-allocation guard returns `InvalidData`, while the unguarded path would
+    /// allocate the huge buffer and then read the absent body as `UnexpectedEof`.
+    #[tokio::test]
+    async fn read_frame_rejects_oversize_length_before_allocating() {
+        let over = (daemon_common::MAX_FRAME_BYTES as u64 + 1) as u32;
+        let framed = over.to_be_bytes();
+        let mut reader: &[u8] = &framed;
+        let err = read_frame::<_, Resp>(&mut reader)
+            .await
+            .expect_err("an oversize frame length must be rejected");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "oversize must be rejected pre-allocation (InvalidData), not read as UnexpectedEof"
+        );
     }
 }

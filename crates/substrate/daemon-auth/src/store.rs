@@ -230,14 +230,26 @@ impl AuthStore {
 
     // --- users ------------------------------------------------------------------------------
 
-    /// Create a user with a password and an initial role set. Fails if the username is taken.
+    /// Create a user with a password and an initial role set. Fails if the username is taken, or if
+    /// the username is [reserved](crate::is_reserved_username) for a synthetic in-process principal
+    /// (`system` / `internal`) — a real user must never be able to claim an identity whose
+    /// ownership stamp collides with a trusted internal caller.
     pub fn create_user(
         &self,
         username: &str,
         password: &str,
         roles: &[Role],
     ) -> Result<UserRecord> {
+        if crate::is_reserved_username(username) {
+            return Err(Error::ReservedUsername);
+        }
         let id = random_hex()?;
+        // Ids are 32 bytes of CSPRNG hex, so a collision with a short reserved word is
+        // astronomically impossible; reject anyway (defense-in-depth) so the invariant "no real row
+        // carries a reserved id/username" holds unconditionally.
+        if crate::is_reserved_username(&id) {
+            return Err(Error::ReservedUsername);
+        }
         let phc = password_auth::generate_hash(password.as_bytes());
         let created_at = now_secs();
         let conn = self.lock();
@@ -682,6 +694,25 @@ mod tests {
 
     fn store() -> AuthStore {
         AuthStore::open_in_memory().expect("open")
+    }
+
+    /// The synthetic in-process usernames (`system` / `internal`) are reserved: a real store user
+    /// cannot be created with them (any case), so a network identity can never forge an ownership
+    /// stamp that collides with a trusted internal caller. A normal username still succeeds.
+    #[test]
+    fn reserved_usernames_cannot_be_created() {
+        let s = store();
+        for reserved in ["system", "internal", "System", "INTERNAL"] {
+            assert!(
+                matches!(
+                    s.create_user(reserved, "pw", &[Role::User]),
+                    Err(Error::ReservedUsername)
+                ),
+                "creating reserved username {reserved:?} must fail"
+            );
+        }
+        // A normal username is unaffected.
+        assert!(s.create_user("alice", "pw", &[Role::User]).is_ok());
     }
 
     #[test]

@@ -20,6 +20,11 @@ pub mod cursored;
 /// (`DAEMON_*__ENABLE=1`, auto-typed to an integer by figment) or a `=on` string both parse.
 pub mod flex_bool;
 
+/// Shared ingress size bounds ([`MAX_FRAME_BYTES`]): the pre-allocation frame cap every
+/// length-framed transport enforces before allocating a receive buffer.
+pub mod limits;
+pub use limits::MAX_FRAME_BYTES;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;

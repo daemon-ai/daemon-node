@@ -33,4 +33,8 @@ pub enum Error {
     /// The mutation would remove the last enabled administrator (last-admin lockout guard).
     #[error("refusing to remove the last administrator")]
     LastAdmin,
+    /// The requested username (or minted id) is reserved for a synthetic in-process principal
+    /// (`system` / `internal`) and may not name a real store user.
+    #[error("username is reserved")]
+    ReservedUsername,
 }

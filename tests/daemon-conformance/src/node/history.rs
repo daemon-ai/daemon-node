@@ -11,6 +11,9 @@ use super::harness::*;
 /// non-destructive (a second read returns the same page).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_reads_back_verified_session_history() {
+    as_system(reconnect_reads_back_verified_session_history_impl()).await;
+}
+async fn reconnect_reads_back_verified_session_history_impl() {
     use daemon_api::{ControlApi, JournalRecordPayload, Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{AgentCommand, AgentEvent, TranscriptBlock, UserMsg};
@@ -95,6 +98,9 @@ async fn reconnect_reads_back_verified_session_history() {
 /// truncation and no duplicates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_history_pages_past_the_wire_bound() {
+    as_system(session_history_pages_past_the_wire_bound_impl()).await;
+}
+async fn session_history_pages_past_the_wire_bound_impl() {
     use daemon_api::{SessionApi, WIRE_PAGE_MAX};
     use daemon_common::JournalStreamId;
     use daemon_host::JournalSink;
@@ -154,6 +160,9 @@ async fn session_history_pages_past_the_wire_bound() {
 /// the seal (`JournalPageView::sealed_after`), and a follow-up `StartTurn` re-runs from the anchor.
 #[tokio::test]
 async fn rewind_to_seals_history_and_reruns_over_node() {
+    as_system(rewind_to_seals_history_and_reruns_over_node_impl()).await;
+}
+async fn rewind_to_seals_history_and_reruns_over_node_impl() {
     use daemon_api::{ControlApi, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{AgentCommand, AgentEvent, Outbound, RewindAnchor, UserMsg};

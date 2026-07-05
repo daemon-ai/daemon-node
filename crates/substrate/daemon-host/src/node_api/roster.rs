@@ -150,18 +150,23 @@ impl NodeApiImpl {
     /// read-of-one (`control = false`). An `Absent` session passes so the create/`NotFound` flow runs
     /// downstream; a `LegacyUnowned` (owner-NULL) session is reachable only via the override.
     ///
-    /// `None` principal is the trusted in-process / local-embedding path (see [`owner_visible`]): the
-    /// transport gate (`authorize`) has already denied any unauthenticated *network* request before
-    /// dispatch, so a missing principal here is the privileged local caller and passes.
+    /// **Fail-closed on a missing principal.** A `None` principal (no request context bound) is
+    /// DENIED, not allowed: every legitimate in-process caller now enters an explicit
+    /// [`RequestContext::system`](crate::RequestContext::system) or
+    /// [`RequestContext::internal`](crate::RequestContext::internal) scope, so an unscoped call here
+    /// is a bug — never implicit full trust. (This closed the cross-owner reads that reached ungated
+    /// handlers and detached stream pumps with no principal bound.)
     pub(crate) async fn require_session_access(
         &self,
         session: &SessionId,
         control: bool,
     ) -> Result<(), ApiError> {
-        // Trusted in-process caller (no transport principal bound): the network gate guarantees a
-        // principal upstream, so `None` is the local embedding / Unix-socket `system` path.
+        // Fail-closed: an unscoped call (no bound principal) is DENIED. Every legitimate in-process
+        // caller enters an explicit `system()` / `internal()` scope; a missing principal is a bug.
         let Some(principal) = crate::request_context::current_principal() else {
-            return Ok(());
+            return Err(ApiError::Unauthenticated(
+                "no authenticated principal bound to this request".into(),
+            ));
         };
         let override_cap = if control {
             daemon_auth::Capability::SessionControlAny
@@ -334,14 +339,14 @@ fn now_ms() -> u64 {
 const DEFAULT_ROSTER_PAGE: usize = 50;
 
 /// Whether `owner` is visible to `principal` under the Auth 4 enumeration policy:
-/// - a `SessionSeeAll` holder (operator) sees everything, including legacy `owner IS NULL` rows;
+/// - a `SessionSeeAll` holder (operator, and the synthetic `system`/`internal` principals which are
+///   operator-or-above) sees everything, including legacy `owner IS NULL` rows;
 /// - any other authenticated principal sees only rows it owns (a peer never sees another's session,
 ///   and a legacy/unowned row is hidden — deny-closed on an *unknown owner*);
-/// - `None` is a **trusted in-process caller** and sees everything. By the time any read reaches
-///   this point a network request has already been bound to a principal by the transport gate
-///   (`authorize`, which denies an unauthenticated request *before* dispatch), so `None` can only be
-///   the local/embedding path (the Unix socket binds the `system` principal, FFI/direct calls are
-///   in-process trust). The "deny-closed with no principal" invariant is enforced at that gate.
+/// - `None` (no bound principal) is DENIED — **fail-closed**. Every legitimate in-process caller now
+///   enters an explicit [`system`](crate::RequestContext::system) /
+///   [`internal`](crate::RequestContext::internal) scope, so an unscoped read is a bug, not implicit
+///   trust; it must reveal nothing.
 ///
 /// Used by every read/enumeration surface (roster, `session_get`, `session_search`, the tree).
 pub(crate) fn owner_visible(
@@ -349,7 +354,7 @@ pub(crate) fn owner_visible(
     owner: &Option<String>,
 ) -> bool {
     match principal {
-        None => true,
+        None => false,
         Some(p) if p.has(daemon_auth::Capability::SessionSeeAll) => true,
         Some(p) => owner.as_deref() == Some(p.user_id.as_str()),
     }
@@ -541,10 +546,22 @@ mod owner_visible_tests {
     }
 
     #[test]
-    fn no_principal_is_trusted_in_process_and_sees_all() {
-        // The transport gate denies an unauthenticated network request before dispatch, so a `None`
-        // principal at this layer is the trusted local/embedding caller.
-        assert!(owner_visible(&None, &Some("alice".to_string())));
-        assert!(owner_visible(&None, &None));
+    fn no_principal_is_denied_fail_closed() {
+        // Fail-closed: an unscoped read (no bound principal) reveals nothing. Every legitimate
+        // in-process caller now enters an explicit `system()` / `internal()` scope instead.
+        assert!(!owner_visible(&None, &Some("alice".to_string())));
+        assert!(!owner_visible(&None, &None));
+    }
+
+    #[test]
+    fn internal_marker_sees_all_like_an_operator() {
+        // The synthetic in-process `internal` principal (Operator ⇒ SessionSeeAll) crosses ownership
+        // for the legitimate embedded callers (delivery pumps, ingest, injection).
+        let internal = crate::request_context::RequestContext::internal().principal;
+        assert!(owner_visible(
+            &Some(internal.clone()),
+            &Some("alice".to_string())
+        ));
+        assert!(owner_visible(&Some(internal), &None));
     }
 }

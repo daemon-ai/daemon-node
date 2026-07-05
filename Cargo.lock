@@ -2225,6 +2225,7 @@ dependencies = [
  "daemon-credentials",
  "daemon-delivery",
  "daemon-host",
+ "daemon-http",
  "daemon-ingest",
  "daemon-matrix",
  "daemon-models",
