@@ -99,6 +99,13 @@ pub struct PendingApproval {
     /// The target path for an fs edit (used for the sensitive-path carve-out + display), if any.
     #[serde(default)]
     pub path: Option<String>,
+    /// The §12 exec-approval fingerprint (Cluster B): a hash of the fully-resolved command tuple
+    /// `(abs-binary, argv, env-delta, cwd, exec-surface)` the operator approved. On the durable
+    /// re-run the engine recomputes the tuple and refuses if it no longer matches (the approve-then-swap
+    /// TOCTOU gate). `None` for non-command approvals (fs edits) and for pre-existing snapshots
+    /// (`#[serde(default)]` keeps them decodable); a `None` fingerprint runs verbatim as before.
+    #[serde(default)]
+    pub fingerprint: Option<crate::exec::CommandFingerprint>,
 }
 
 impl Snapshot {

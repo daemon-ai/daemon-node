@@ -1045,7 +1045,7 @@ impl Engine {
                     persists,
                     delegated,
                     spawns,
-                    awaiting,
+                    mut awaiting,
                 } = partition_tool_effects(effects);
                 for turn in persists {
                     self.snapshot.conversation.turns.push(turn);
@@ -1062,6 +1062,17 @@ impl Engine {
                 }
 
                 if !awaiting.is_empty() {
+                    // Cluster B: bind each parked approval to the fingerprint of its fully-resolved
+                    // command `(abs-binary, argv, env-delta, cwd, exec-surface)`, so the pre-approved
+                    // re-run (`resolve_approvals`) can refuse if the resolved command later differs —
+                    // the approve-then-swap TOCTOU gate. Computed here (not in the pure effect router)
+                    // because it needs the tool registry + turn context. A tool that does not exec
+                    // returns `None` (fs edits, `execute_code`) and is stored unbound (runs verbatim).
+                    for a in awaiting.iter_mut() {
+                        if let Some(tool) = registry.get(&a.call.name) {
+                            a.fingerprint = tool.resolved_fingerprint(&a.call, &cx).await;
+                        }
+                    }
                     // A gated tool needs a durable operator decision (§12 HITL): record the parked
                     // approvals on the snapshot and suspend, waiting on the operator's answer (delivered
                     // as a wake completion). Mirrors delegation suspension, but the wake source is an
@@ -1503,8 +1514,37 @@ impl Engine {
                             checkpoints: checkpoints.as_deref(),
                             tool_timeout,
                         };
-                        let outcome = run_tool(&approval.call, &registry, &cx).await;
-                        (outcome.result.ok, outcome.result.content)
+                        // Cluster B fingerprint gate: refuse to run if the command that would run now
+                        // no longer matches what the operator approved (the approve-then-swap TOCTOU).
+                        // Only enforced when the parked approval carries a fingerprint (a command tool
+                        // like `shell`); `None` (fs edits, `execute_code`, legacy snapshots) runs
+                        // verbatim as before. An unresolvable command (`None` now — e.g. the binary
+                        // vanished) also refuses, fail-closed.
+                        let verified = match &approval.fingerprint {
+                            None => true,
+                            Some(expected) => match registry.get(&approval.call.name) {
+                                Some(tool) => {
+                                    tool.resolved_fingerprint(&approval.call, &cx)
+                                        .await
+                                        .as_ref()
+                                        == Some(expected)
+                                }
+                                None => false,
+                            },
+                        };
+                        if verified {
+                            let outcome = run_tool(&approval.call, &registry, &cx).await;
+                            (outcome.result.ok, outcome.result.content)
+                        } else {
+                            (
+                                false,
+                                format!(
+                                    "refused: the resolved command no longer matches what was \
+                                     approved (request {})",
+                                    approval.job_id
+                                ),
+                            )
+                        }
                     } else {
                         (
                             false,

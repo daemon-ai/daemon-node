@@ -168,6 +168,23 @@ pub async fn approve_command(cx: &TurnCx<'_>, prompt: String) -> Gate {
     }
 }
 
+/// Run the §12 approval gate for the **raw shell-string surface** (background `sh -c` / pty) — a
+/// DISTINCT, higher-friction capability separate from ordinary foreground argv exec (Cluster B). Any
+/// shell string is arbitrary code (pipes, redirects, subshells, `curl … | sh`) and is the persistence
+/// / exfil vector in the OpenClaw CVE class, so it ALWAYS asks — it never rides the `AutoAllow` fast
+/// path that benign foreground argv may. Only a hard `Deny` policy denies outright, and a
+/// `pre_approved` re-run (operator already said yes) proceeds.
+pub async fn approve_shell_command(cx: &TurnCx<'_>, prompt: String) -> Gate {
+    if cx.pre_approved {
+        return Gate::Proceed;
+    }
+    match cx.approval_policy {
+        ApprovalPolicy::Deny => Gate::Reject("denied by approval policy".to_string()),
+        // Ask / AcceptEdits / AutoAllow all ask for a raw shell string (no auto-allow).
+        _ => ask_host(cx, prompt).await,
+    }
+}
+
 /// Raise a blocking [`HostRequestKind::Approval`] and map the host's reply onto a [`Gate`]: the live
 /// host answers inline ([`HostResponseBody::Approved`]); the headless/durable host parks it
 /// ([`HostResponseBody::Deferred`]).

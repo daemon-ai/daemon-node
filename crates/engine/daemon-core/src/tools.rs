@@ -175,6 +175,21 @@ pub trait Tool: Send + Sync {
     fn mutates_for(&self, _call: &ToolCall) -> bool {
         self.mutates()
     }
+
+    /// The §12 exec-approval fingerprint (Cluster B) of the command this call would run — a hash of the
+    /// fully-resolved `(abs-binary, argv, env-delta, cwd, exec-surface)` tuple. The engine computes this
+    /// when a call parks for a durable approval (binding the operator's decision to the resolved
+    /// command) and recomputes it on the pre-approved re-run, refusing if the two differ (the
+    /// approve-then-swap TOCTOU gate). Defaults to `None` — a tool that does not exec (or whose
+    /// approvals need no such binding, e.g. an fs edit or `execute_code`) is unaffected and its parked
+    /// approvals run verbatim as before. `shell` overrides this.
+    async fn resolved_fingerprint(
+        &self,
+        _call: &ToolCall,
+        _cx: &TurnCx<'_>,
+    ) -> Option<crate::exec::CommandFingerprint> {
+        None
+    }
 }
 
 /// A boxed, thread-safe error from a [`ToolProvider`] (kept opaque so `daemon-core` stays free of
