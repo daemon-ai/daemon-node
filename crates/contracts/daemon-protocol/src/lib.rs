@@ -47,6 +47,39 @@ impl UserMsg {
         self.attachments = attachments;
         self
     }
+
+    /// CBOR-encode for an opaque byte channel (e.g. the durable pending-input queue the
+    /// orchestrate tool's `send` verb feeds). The wire shape is unchanged — this is the same serde
+    /// form the §17 command surface carries, just framed as standalone bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("encode UserMsg");
+        buf
+    }
+
+    /// Decode bytes from an opaque byte channel, falling back to treating raw bytes as plain UTF-8
+    /// text (so a producer that queues bare text — or a legacy payload — still resolves to a
+    /// message rather than an error).
+    pub fn decode(bytes: &[u8]) -> Self {
+        ciborium::from_reader(bytes)
+            .unwrap_or_else(|_| Self::new(String::from_utf8_lossy(bytes).into_owned()))
+    }
+}
+
+/// The lifetime a parent declares for a delegated child — the protocol-level mirror of the store's
+/// `ChildLifetime`, carried inside the opaque delegation payload so the contract crates stay
+/// decoupled (`daemon-protocol` depends only on `daemon-common`; the store enum lives in
+/// `daemon-store`). The host maps this onto the durable `JobCommand.lifetime` at the suspension
+/// boundary, which in turn derives the child's roster/tree `SessionRole`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DelegationLifetime {
+    /// A long-lived child the parent manages (the default): survives after completion.
+    #[default]
+    Persistent,
+    /// A transient subagent spun up for a bounded task: the host's reaper may archive it after it
+    /// reaches a terminal state.
+    Ephemeral,
 }
 
 /// The structured input a parent hands a delegated child (daemon-content-transfer-spec.md Phase 2a):
@@ -61,14 +94,26 @@ pub struct DelegationInput {
     /// Parent-workspace-relative paths to materialize into the child's `inbox/`.
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// The lifetime the parent declares for the child: a long-lived managed child (default) vs a
+    /// transient subagent the host may reap after completion. `serde(default)` keeps pre-upgrade
+    /// payloads decoding as `Persistent`.
+    #[serde(default)]
+    pub lifetime: DelegationLifetime,
+    /// The named profile the child's engine resolves from (`None` = the node's default engine
+    /// shape). The node-side worker binds it as the child's `bound_profile`; an unknown name falls
+    /// back to the default shape at resolve time.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl DelegationInput {
-    /// A bare delegation with no attachments.
+    /// A bare delegation with no attachments (default lifetime + profile).
     pub fn task(task: impl Into<String>) -> Self {
         Self {
             task: task.into(),
             attachments: Vec::new(),
+            lifetime: DelegationLifetime::default(),
+            profile: None,
         }
     }
 
@@ -85,6 +130,8 @@ impl DelegationInput {
         ciborium::from_reader(bytes).unwrap_or_else(|_| Self {
             task: String::from_utf8_lossy(bytes).into_owned(),
             attachments: Vec::new(),
+            lifetime: DelegationLifetime::default(),
+            profile: None,
         })
     }
 }
@@ -1440,10 +1487,12 @@ mod tests {
 
     #[test]
     fn delegation_payloads_round_trip_and_fall_back() {
-        // Structured round-trip.
+        // Structured round-trip, including the v2 lifetime + profile fields.
         let input = DelegationInput {
             task: "do the thing".into(),
             attachments: vec!["src/a.rs".into(), "notes.md".into()],
+            lifetime: DelegationLifetime::Ephemeral,
+            profile: Some("opus".into()),
         };
         assert_eq!(DelegationInput::decode(&input.encode()), input);
 
@@ -1454,14 +1503,52 @@ mod tests {
         };
         assert_eq!(DelegationResult::decode(&result.encode()), result);
 
-        // Legacy plain-text payloads (pre-upgrade) decode via the fallback path.
+        // Legacy plain-text payloads (pre-upgrade) decode via the fallback path with defaults.
         let legacy_in = DelegationInput::decode(b"delegated-work");
         assert_eq!(legacy_in.task, "delegated-work");
         assert!(legacy_in.attachments.is_empty());
+        assert_eq!(legacy_in.lifetime, DelegationLifetime::Persistent);
+        assert!(legacy_in.profile.is_none());
 
         let legacy_out = DelegationResult::decode(b"child:parent/c1");
         assert_eq!(legacy_out.summary, "child:parent/c1");
         assert!(legacy_out.artifacts.is_empty());
+    }
+
+    #[test]
+    fn delegation_input_pre_upgrade_cbor_defaults_new_fields() {
+        // A payload encoded by the pre-v2 shape (task + attachments only) must decode with the new
+        // fields at their defaults — jobs enqueued before the upgrade still resolve.
+        #[derive(Serialize)]
+        struct V1 {
+            task: String,
+            attachments: Vec<String>,
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &V1 {
+                task: "old job".into(),
+                attachments: vec!["a.txt".into()],
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = DelegationInput::decode(&buf);
+        assert_eq!(decoded.task, "old job");
+        assert_eq!(decoded.attachments, vec!["a.txt".to_string()]);
+        assert_eq!(decoded.lifetime, DelegationLifetime::Persistent);
+        assert!(decoded.profile.is_none());
+    }
+
+    #[test]
+    fn user_msg_bytes_round_trip_and_fall_back() {
+        // CBOR round-trip through the opaque pending-input channel.
+        let msg = UserMsg::new("status update please");
+        assert_eq!(UserMsg::decode(&msg.encode()), msg);
+        // A producer that queued bare text still resolves via the fallback.
+        let text = UserMsg::decode(b"plain text input");
+        assert_eq!(text.text, "plain text input");
+        assert!(text.attachments.is_empty());
     }
 
     fn cbor_round_trip<T>(value: &T) -> T

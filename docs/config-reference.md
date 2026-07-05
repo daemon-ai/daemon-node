@@ -152,6 +152,9 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `models.endpoint` | `DAEMON_MODELS__ENDPOINT` | optional | _(unset)_ |
 | `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
 | `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
+| `orchestrate.reaper_enabled` | `DAEMON_ORCHESTRATE__REAPER_ENABLED` | bool | `true` |
+| `orchestrate.reaper_grace_ms` | `DAEMON_ORCHESTRATE__REAPER_GRACE_MS` | number | `300000` |
+| `orchestrate.reaper_interval_ms` | `DAEMON_ORCHESTRATE__REAPER_INTERVAL_MS` | number | `60000` |
 | `partition` | `DAEMON_PARTITION` | number | `0` |
 | `processes.finished_ttl_secs` | `DAEMON_PROCESSES__FINISHED_TTL_SECS` | number | `1800` |
 | `processes.max_output_bytes` | `DAEMON_PROCESSES__MAX_OUTPUT_BYTES` | number | `200000` |

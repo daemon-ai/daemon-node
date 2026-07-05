@@ -1056,6 +1056,32 @@ pub struct MnemosyneOpts {
     pub channel_id: Option<String>,
 }
 
+/// Orchestration-fleet tuning (`[orchestrate]` / `DAEMON_ORCHESTRATE__*`): the ephemeral-subagent
+/// reaper policy (archive `EphemeralSubagent` sessions after they reach a terminal state).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestrateConfig {
+    /// Whether the reaper sweep runs (`true` by default).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub reaper_enabled: bool,
+    /// How long after a terminal state an ephemeral subagent is archived (default 300s).
+    #[serde(rename = "reaper_grace_ms", with = "duration_ms")]
+    pub reaper_grace: Duration,
+    /// The sweep cadence (default 60s; the first sweep runs one interval after start).
+    #[serde(rename = "reaper_interval_ms", with = "duration_ms")]
+    pub reaper_interval: Duration,
+}
+
+impl Default for OrchestrateConfig {
+    fn default() -> Self {
+        Self {
+            reaper_enabled: true,
+            reaper_grace: Duration::from_secs(300),
+            reaper_interval: Duration::from_secs(60),
+        }
+    }
+}
+
 // --- the node configuration -------------------------------------------------------------------
 
 /// The node configuration: the single source of truth, deserialized by [`figment`] from
@@ -1147,6 +1173,8 @@ pub struct NodeConfig {
     pub journal_seed: Option<[u8; 32]>,
     /// How many orchestrator levels the top fleet materializes before its engine leaves (`0` flat).
     pub nesting_depth: usize,
+    /// Orchestration-fleet tuning: the ephemeral-subagent reaper policy (`[orchestrate]`).
+    pub orchestrate: OrchestrateConfig,
     /// The general host routing table (§5.9). Empty by default.
     pub routing: RoutingConfig,
     /// The Matrix chat transport config (`enabled = false` by default).
@@ -1203,6 +1231,7 @@ impl Default for NodeConfig {
             engine: daemon_core::Config::default(),
             journal_seed: None,
             nesting_depth: 0,
+            orchestrate: OrchestrateConfig::default(),
             routing: RoutingConfig::default(),
             matrix: daemon_matrix::MatrixConfig::default(),
             rooms: daemon_rooms::RoomsConfig::default(),

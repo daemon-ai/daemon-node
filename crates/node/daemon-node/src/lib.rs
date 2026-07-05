@@ -32,7 +32,7 @@ pub mod types;
 pub use assembly::assemble;
 pub use cron::{CronSkillLoader, CronWorker};
 pub use fleet::{
-    AgentBackend, FleetJobWorker, FleetViewImpl, ForeignProtocol, LaunchProfile,
-    ProfileChildSpawner,
+    AgentBackend, EphemeralReaper, FleetJobWorker, FleetViewImpl, ForeignProtocol, LaunchProfile,
+    ProfileChildSpawner, ReaperConfig,
 };
 pub use types::{AssembledNode, NodeAssembly, ProviderResolver, ResolvedSkills, SkillsResolver};

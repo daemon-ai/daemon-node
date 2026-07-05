@@ -65,6 +65,7 @@ fn assemble_versioning(
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     });
     (node, handle, skills)
 }

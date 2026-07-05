@@ -164,6 +164,7 @@ async fn routed_submit_resolves_profile_and_delivery_per_origin() {
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     });
 
     // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -391,6 +392,7 @@ async fn bound_accounts_derive_instance_profile_binding() {
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     });
 
     let text_a = route_text(&node, origin("@a:hs")).await;
@@ -458,6 +460,7 @@ async fn bound_accounts_derive_instance_profile_binding() {
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     });
     let text_override = route_text(&node, origin("@a:hs")).await;
     assert!(
@@ -586,6 +589,7 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     });
 
     // (1) discovery: the stub family is listed.
@@ -761,6 +765,7 @@ async fn account_provisioning_enumerates_resolves_and_refreshes() {
         fs: Default::default(),
         processes: Default::default(),
         title_aux: None,
+        reaper: Default::default(),
     });
 
     // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.

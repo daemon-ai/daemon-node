@@ -2385,6 +2385,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             shell: cfg.shell,
         },
         title_aux,
+        reaper: daemon_node::ReaperConfig {
+            enabled: cfg.orchestrate.reaper_enabled,
+            grace: cfg.orchestrate.reaper_grace,
+            interval: cfg.orchestrate.reaper_interval,
+        },
     });
     // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
     // conversations are readable through the tool (the node did not exist when the tool was built).
