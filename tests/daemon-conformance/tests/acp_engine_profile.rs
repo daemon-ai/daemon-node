@@ -77,6 +77,7 @@ fn assemble_acp_node() -> (
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        reaper: Default::default(),
     });
     (node, resolver_called, handle)
 }

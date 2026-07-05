@@ -280,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn worker_stamps_role_profile_and_title_from_the_delegation() {
         use daemon_common::{Epoch, FenceToken, JobId};
-        use daemon_store::{Checkpoint, JobCommand, SessionStore as _};
+        use daemon_store::{Checkpoint, JobCommand};
 
         let store: Arc<dyn daemon_store::SessionStore> =
             Arc::new(daemon_store::InMemoryStore::new());

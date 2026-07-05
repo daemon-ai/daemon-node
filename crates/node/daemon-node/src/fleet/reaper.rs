@@ -126,7 +126,7 @@ impl EphemeralReaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daemon_common::{Epoch, FenceToken, PartitionId, SessionId, SnapshotBlob};
+    use daemon_common::{Epoch, PartitionId, SessionId, SnapshotBlob};
     use daemon_store::{Checkpoint, InMemoryStore, SessionMeta};
 
     /// Seed one durable session in the given terminal/role/clock shape.

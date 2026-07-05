@@ -62,6 +62,7 @@ fn assemble_versioning(
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        reaper: Default::default(),
     });
     (node, handle, skills)
 }
