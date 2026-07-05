@@ -2339,6 +2339,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-egress"
+version = "0.0.1"
+dependencies = [
+ "daemon-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "daemon-ffi"
 version = "0.0.1"
 dependencies = [
@@ -2529,6 +2542,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "daemon-core",
+ "daemon-egress",
  "flate2",
  "regex",
  "reqwest 0.12.28",
@@ -2544,6 +2558,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "wiremock",
 ]
 
 [[package]]
@@ -3038,6 +3053,7 @@ dependencies = [
  "async-trait",
  "daemon-common",
  "daemon-core",
+ "daemon-egress",
  "daemon-protocol",
  "dom_smoothie",
  "reqwest 0.12.28",

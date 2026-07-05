@@ -46,6 +46,7 @@ use crate::engine::{Engine, RememberArgs};
 use crate::error::{Error, Result};
 use crate::util;
 use base64::Engine as _;
+use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -911,6 +912,12 @@ impl<'e> SyncEngine<'e> {
 
     /// POST JSON to a sync server endpoint; never raises (`sync_adapter.py` `_http_post`).
     /// HTTP-error bodies pass through when they parse as JSON, else an error shape returns.
+    ///
+    /// Uses the shared [`EgressClient`] with [`Redirects::None`]: the sync peer is an
+    /// operator-configured, trusted endpoint (and may legitimately be a private/LAN/loopback host),
+    /// so it is deliberately **not** run through `check_url`'s public-host gate — but the client
+    /// refuses to follow redirects at all, which prevents the bearer token from ever crossing to
+    /// another origin and blocks redirect-based SSRF.
     pub async fn http_post(
         remote_url: &str,
         path: &str,
@@ -918,18 +925,21 @@ impl<'e> SyncEngine<'e> {
         api_key: Option<&str>,
     ) -> Value {
         let url = format!("{}{path}", remote_url.trim_end_matches('/'));
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
+        let client = match EgressClient::new(EgressConfig {
+            user_agent: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        }) {
             Ok(c) => c,
             Err(e) => return json!({"status": "error", "error": e.to_string()}),
         };
-        let mut req = client.post(&url).json(body);
+        let mut req = match EgressRequest::post_json(&url, body) {
+            Ok(r) => r,
+            Err(e) => return json!({"status": "error", "error": e.to_string()}),
+        };
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
-        match req.send().await {
+        match client.execute(req, Redirects::None).await {
             Ok(resp) => {
                 let status = resp.status();
                 match resp.json::<Value>().await {

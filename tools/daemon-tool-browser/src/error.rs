@@ -12,6 +12,11 @@ pub enum BrowserError {
     /// A CDP command/transport fault during an operation (the session is torn down + respawned).
     #[error("browser operation failed: {0}")]
     Cdp(String),
+    /// A navigated/redirected URL was rejected by the egress policy (SSRF guard) — a
+    /// private/loopback/link-local host reached via the initial URL, a server redirect, or a
+    /// sub-resource.
+    #[error("browser egress blocked: {0}")]
+    Ssrf(String),
     /// A filesystem error (e.g. writing a screenshot).
     #[error("browser io error: {0}")]
     Io(String),

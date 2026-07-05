@@ -7,11 +7,14 @@ license.workspace = true
 
 [dependencies]
 daemon-core = { workspace = true }
+daemon-egress = { workspace = true }
 daemon-protocol = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# reqwest is still used directly by the Firecrawl backend (POST to a fixed trusted endpoint); the
+# local fetch backend now goes through daemon-egress.
 reqwest = { workspace = true }
 dom_smoothie = { workspace = true }
 

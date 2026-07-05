@@ -775,6 +775,68 @@ async fn sync_tools_report_missing_remote_and_bad_key() {
     );
 }
 
+/// Bug repro: `http_post` must NOT follow a redirect, so a hostile/misconfigured sync server that
+/// `302`s to another origin can never bounce the bearer token (or the request) to that origin.
+/// With `Redirects::None` the redirect target server records zero requests.
+#[tokio::test]
+async fn http_post_does_not_follow_redirects_so_token_never_crosses_origin() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Origin B — the redirect target. It must never receive a request (and thus never the token).
+    let sink = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&sink)
+        .await;
+
+    // Origin A — the configured remote, which 302s to origin B.
+    let redirector = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/sink", sink.uri())),
+        )
+        .mount(&redirector)
+        .await;
+
+    // Never raises: a 302 body is not JSON, so the "unparseable response" error shape returns —
+    // the point of the test is what does NOT happen on the wire.
+    let resp = SyncEngine::http_post(
+        &redirector.uri(),
+        "/sync/push",
+        &json!({"x": 1}),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(resp["status"], "error", "302 body is not JSON: {resp:?}");
+
+    // The bearer token (and the request) never crossed to origin B.
+    let sink_reqs = sink
+        .received_requests()
+        .await
+        .expect("request recording enabled");
+    assert!(
+        sink_reqs.is_empty(),
+        "redirect target must never be requested (token-leak / SSRF): {sink_reqs:?}"
+    );
+
+    // Sanity: origin A did receive exactly one request, carrying the bearer — proving the call
+    // happened and the token went only to the configured origin.
+    let a_reqs = redirector
+        .received_requests()
+        .await
+        .expect("request recording enabled");
+    assert_eq!(a_reqs.len(), 1, "one request to the configured origin");
+    assert_eq!(
+        a_reqs[0]
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer secret"),
+        "token sent to origin A only"
+    );
+}
+
 #[test]
 fn wire_event_tolerates_python_shapes() {
     // Array-typed parent_event_ids, missing importance, unknown keys.

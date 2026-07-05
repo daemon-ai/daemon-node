@@ -10,11 +10,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused, FailRequestParams,
+};
+use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
 };
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Browser, BrowserConfig, Page};
+use daemon_core::check_url;
 use dom_smoothie::{Config as ReadCfg, Readability, TextMode};
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -63,13 +68,16 @@ impl Default for BrowserSettings {
 /// How many consecutive failed launches trip the crash-loop breaker.
 const MAX_LAUNCH_FAILURES: u32 = 3;
 
-/// A live browser + its single working page, plus the background tasks that drive the CDP socket and
-/// dialog handling. Dropping it closes the browser.
+/// A live browser + its single working page, plus the background tasks that drive the CDP socket,
+/// the per-request egress guard, and dialog handling. Dropping it closes the browser.
 struct Session {
     browser: Browser,
     page: Page,
     _handler: JoinHandle<()>,
     _dialog: Option<JoinHandle<()>>,
+    /// Re-validates every request the page makes (incl. server redirects) against the egress
+    /// policy; dropped with the session.
+    _egress: JoinHandle<()>,
 }
 
 /// The supervised browser. One active page; CDP ops are serialized behind the async mutex.
@@ -107,6 +115,14 @@ impl BrowserSupervisor {
                     .await
                     .map_err(|e| BrowserError::Cdp(e.to_string()))?
                     .unwrap_or_default();
+                // Defense-in-depth: re-validate the final resolved URL. The per-request Fetch
+                // guard already blocks a redirect hop into private space mid-chain (navigation then
+                // fails above), but this catches any http(s) landing URL that slipped through.
+                if !current.is_empty() && should_block_egress(&current) {
+                    return Err(BrowserError::Ssrf(format!(
+                        "navigation resolved to a blocked host: {current}"
+                    )));
+                }
                 Ok(current)
             })
         })
@@ -351,6 +367,10 @@ impl BrowserSupervisor {
             .new_page("about:blank")
             .await
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        // Install the per-request egress guard BEFORE any navigation. If it cannot be wired we fail
+        // the launch rather than run an unguarded browser (fail-closed) — an unguarded page would
+        // follow a redirect into loopback/link-local/private space with no re-check.
+        let egress_task = spawn_egress_guard(&page).await?;
         let dialog_task = if self.settings.auto_dismiss_dialogs {
             spawn_dialog_dismisser(&page).await
         } else {
@@ -361,8 +381,57 @@ impl BrowserSupervisor {
             page,
             _handler: handler_task,
             _dialog: dialog_task,
+            _egress: egress_task,
         })
     }
+}
+
+/// Whether a request URL must be blocked by the egress guard: an `http(s)` request to a
+/// private/loopback/link-local/otherwise-disallowed host (per [`check_url`]). Non-`http(s)` schemes
+/// (`data:`, `blob:`, `about:`, …) are not host egress and are always allowed — blocking them would
+/// break legitimate rendering without closing any SSRF vector.
+fn should_block_egress(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let is_http = lower.starts_with("http://") || lower.starts_with("https://");
+    is_http && check_url(url).is_err()
+}
+
+/// Enable the CDP Fetch domain and spawn a task that re-validates **every** request the page makes
+/// — including server-driven redirect hops, which Chromium follows in its own network stack — against
+/// the egress policy, failing (`BlockedByClient`) any that resolves to a disallowed host. This is
+/// the browser-native equivalent of the HTTP tools' manual, per-hop `check_url` redirect loop: the
+/// reqwest egress client cannot see Chromium's redirects, so the guard lives at the interception
+/// point. Fails closed — a setup error aborts the launch.
+async fn spawn_egress_guard(page: &Page) -> Result<JoinHandle<()>, BrowserError> {
+    // Subscribe BEFORE enabling so no paused request is missed (a missed pause hangs the page).
+    let mut paused = page
+        .event_listener::<EventRequestPaused>()
+        .await
+        .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+    // No patterns => every request pauses at the Request stage until we continue/fail it.
+    page.execute(FetchEnableParams::default())
+        .await
+        .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+    let page = page.clone();
+    Ok(tokio::spawn(async move {
+        while let Some(ev) = paused.next().await {
+            let request_id = ev.request_id.clone();
+            let result = if should_block_egress(&ev.request.url) {
+                page.execute(FailRequestParams::new(
+                    request_id,
+                    ErrorReason::BlockedByClient,
+                ))
+                .await
+                .map(|_| ())
+            } else {
+                page.execute(ContinueRequestParams::new(request_id))
+                    .await
+                    .map(|_| ())
+            };
+            // A continue/fail can race a page teardown; that is benign (the session is gone).
+            let _ = result;
+        }
+    }))
 }
 
 /// Evaluate `js` and return its result as a string (objects are JSON-encoded).
@@ -415,4 +484,39 @@ async fn spawn_dialog_dismisser(page: &Page) -> Option<JoinHandle<()>> {
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Fetch-interceptor predicate: block only `http(s)` requests to disallowed hosts; let
+    /// non-host schemes through. This is the decision the per-request guard makes on every hop,
+    /// including a server redirect — so a `302` into link-local/loopback/private space is failed
+    /// mid-navigation. Exercised without a live Chromium (pure function).
+    #[test]
+    fn egress_guard_blocks_only_disallowed_http_hosts() {
+        // Public http(s): allowed.
+        assert!(!should_block_egress("https://example.com/a"));
+        assert!(!should_block_egress("http://1.1.1.1/"));
+
+        // Private / loopback / link-local / metadata http(s): blocked (this is the redirect-SSRF
+        // fix — a hop resolving here is failed).
+        for u in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/x",
+            "http://localhost/x",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/x",
+            "http://[::1]/x",
+            "http://[fc00::1]/x",
+        ] {
+            assert!(should_block_egress(u), "expected {u} to be blocked");
+        }
+
+        // Non-http(s) schemes are not host egress and must pass (or rendering breaks).
+        assert!(!should_block_egress("data:image/png;base64,iVBORw0KGgo="));
+        assert!(!should_block_egress("about:blank"));
+        assert!(!should_block_egress("blob:https://example.com/uuid"));
+    }
 }

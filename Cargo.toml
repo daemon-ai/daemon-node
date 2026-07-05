@@ -237,6 +237,7 @@ daemon-protocol = { path = "crates/contracts/daemon-protocol" }
 daemon-supervision = { path = "crates/contracts/daemon-supervision" }
 daemon-api = { path = "crates/contracts/daemon-api" }
 daemon-core = { path = "crates/engine/daemon-core" }
+daemon-egress = { path = "crates/engine/daemon-egress" }
 daemon-context-lcm = { path = "crates/engine/daemon-context-lcm" }
 daemon-mnemosyne = { path = "crates/memory/daemon-mnemosyne" }
 daemon-providers = { path = "crates/providers/daemon-providers" }
