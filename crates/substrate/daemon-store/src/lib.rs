@@ -724,6 +724,24 @@ pub trait SessionStore: Send + Sync {
     /// non-authoritative proxy store relies on its authoritative peer's dispatcher).
     async fn enqueue_wake(&self, _id: SessionId) {}
 
+    /// Enqueue an opaque inbound input for a **durable** session's next activation — the
+    /// pending-input seam a producer (the orchestrate tool's `send` verb, a host notify path) uses
+    /// to deliver a message into a dehydrated session. The bytes are a CBOR `UserMsg` by convention
+    /// (plain UTF-8 text also resolves on the consumer's fallback); the store never parses them.
+    /// Drained FIFO by the next incarnation's hydrate ([`take_session_inputs`]) and folded into the
+    /// conversation before the turn runs. Pair with [`enqueue_wake`](Self::enqueue_wake) so the
+    /// input is consumed promptly. Default: no-op (a non-authoritative proxy store).
+    ///
+    /// [`take_session_inputs`]: Self::take_session_inputs
+    async fn enqueue_session_input(&self, _id: &SessionId, _input: Vec<u8>) {}
+
+    /// Drain (destructively, FIFO) every pending input enqueued for `id` — called by the durable
+    /// activation path at hydrate, before the turn runs, so a queued message lands in exactly one
+    /// incarnation. Default: empty (a store without a pending-input queue).
+    async fn take_session_inputs(&self, _id: &SessionId) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Atomically checkpoint a session suspended on a §12 edit-approval decision and durably record
     /// its parked approval row(s) — **without** enqueuing a runnable background job (unlike
     /// [`checkpoint_and_enqueue`]). The session goes `Suspended` on the first approval's `job_id` and
@@ -1065,6 +1083,10 @@ struct Inner {
     wake_outbox: VecDeque<SessionId>,
     /// child session -> the parent job its terminal completion fulfills (the durable tree edge).
     delegations: HashMap<SessionId, JobCommand>,
+    /// Per-session pending inbound inputs (opaque bytes), FIFO — the durable `send` seam drained by
+    /// the next activation's hydrate (the in-memory analogue of the SQLite `pending_session_input`
+    /// table).
+    pending_inputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
     /// Per-session parked §12 edit-approval requests, in park order. An unanswered row keeps the
     /// session dormant; [`SessionStore::answer_approval`] stamps its decision and wakes the session.
     pending_approvals: HashMap<SessionId, Vec<ParkedApproval>>,
@@ -1349,6 +1371,26 @@ impl SessionStore for InMemoryStore {
 
     async fn enqueue_wake(&self, id: SessionId) {
         self.inner.lock().unwrap().wake_outbox.push_back(id);
+    }
+
+    async fn enqueue_session_input(&self, id: &SessionId, input: Vec<u8>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_inputs
+            .entry(id.clone())
+            .or_default()
+            .push_back(input);
+    }
+
+    async fn take_session_inputs(&self, id: &SessionId) -> Vec<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_inputs
+            .remove(id)
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default()
     }
 
     async fn park_approval(
@@ -2231,5 +2273,42 @@ mod session_meta_tests {
     #[tokio::test]
     async fn sqlite_cron_round_trips() {
         cron_store_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+}
+
+#[cfg(test)]
+mod pending_input_tests {
+    //! The pending-input seam (the durable `send` path), proven against both backends: FIFO order,
+    //! destructive drain-once, and per-session isolation.
+
+    use super::*;
+
+    async fn pending_input_behaviour(store: &dyn SessionStore) {
+        let a = SessionId::new("s-a");
+        let b = SessionId::new("s-b");
+        // Empty until enqueued.
+        assert!(store.take_session_inputs(&a).await.is_empty());
+
+        store.enqueue_session_input(&a, b"first".to_vec()).await;
+        store.enqueue_session_input(&a, b"second".to_vec()).await;
+        store.enqueue_session_input(&b, b"other".to_vec()).await;
+
+        // FIFO, scoped to the session.
+        let drained = store.take_session_inputs(&a).await;
+        assert_eq!(drained, vec![b"first".to_vec(), b"second".to_vec()]);
+        // Destructive: a second drain is empty; the sibling queue is untouched.
+        assert!(store.take_session_inputs(&a).await.is_empty());
+        assert_eq!(store.take_session_inputs(&b).await, vec![b"other".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_pending_inputs_drain_fifo_once() {
+        pending_input_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pending_inputs_drain_fifo_once() {
+        pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }

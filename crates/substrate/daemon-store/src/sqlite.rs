@@ -279,6 +279,17 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
             "ALTER TABLE session_meta ADD COLUMN owner TEXT;\n\
              ALTER TABLE cron_jobs ADD COLUMN owner TEXT;",
         ),
+        // M3 (pending-input seam): opaque inbound inputs queued for a durable session's next
+        // activation, drained FIFO at hydrate (the durable `send` path). Its own queue table
+        // (mirroring `wake_outbox`), not a `session_meta` column — it is a FIFO, not a property.
+        M::up(
+            "CREATE TABLE pending_session_input (\n\
+                 rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 session_id TEXT NOT NULL,\n\
+                 payload    BLOB NOT NULL\n\
+             );\n\
+             CREATE INDEX pending_session_input_session ON pending_session_input (session_id, rowseq);",
+        ),
     ])
 });
 
@@ -722,6 +733,39 @@ impl SessionStore for SqliteStore {
             "INSERT INTO wake_outbox (session_id) VALUES (?1)",
             params![id.as_str()],
         );
+    }
+
+    async fn enqueue_session_input(&self, id: &SessionId, input: Vec<u8>) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO pending_session_input (session_id, payload) VALUES (?1, ?2)",
+            params![id.as_str(), input],
+        );
+    }
+
+    async fn take_session_inputs(&self, id: &SessionId) -> Vec<Vec<u8>> {
+        // Drain-and-delete under the held connection lock: select FIFO, then clear the session's
+        // queue. No interleaving is possible (one connection behind the Mutex), so this is atomic
+        // with respect to every other store op.
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT payload FROM pending_session_input WHERE session_id = ?1 ORDER BY rowseq",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let inputs: Vec<Vec<u8>> = stmt
+            .query_map(params![id.as_str()], |row| row.get::<_, Vec<u8>>(0))
+            .and_then(|rows| rows.collect())
+            .unwrap_or_default();
+        drop(stmt);
+        if !inputs.is_empty() {
+            let _ = conn.execute(
+                "DELETE FROM pending_session_input WHERE session_id = ?1",
+                params![id.as_str()],
+            );
+        }
+        inputs
     }
 
     async fn park_approval(
@@ -1833,7 +1877,7 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (2: `M1 = SCHEMA` plus the Auth 4 ownership ALTERs).
+    /// `user_version` (3: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, and the pending-input queue).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -1844,7 +1888,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 3, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

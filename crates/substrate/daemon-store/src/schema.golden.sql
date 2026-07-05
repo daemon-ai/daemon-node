@@ -1,6 +1,7 @@
 CREATE INDEX cron_jobs_due ON cron_jobs (paused, next_fire_unix);
 CREATE INDEX cron_runs_job ON cron_runs (job_id, rowseq);
 CREATE INDEX journal_seals_stream ON journal_seals (stream, id);
+CREATE INDEX pending_session_input_session ON pending_session_input (session_id, rowseq);
 CREATE INDEX room_members_room ON room_members (room_id);
 CREATE TABLE acp_catalog (
     name  TEXT PRIMARY KEY,
@@ -111,6 +112,11 @@ CREATE TABLE pending_approvals (
     path       TEXT,
     decision   INTEGER,
     UNIQUE(session_id, job_id)
+);
+CREATE TABLE pending_session_input (
+rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
+session_id TEXT NOT NULL,
+payload    BLOB NOT NULL
 );
 CREATE TABLE room_members (
     room_id    TEXT NOT NULL,
