@@ -48,11 +48,93 @@ pub const DEFAULT_MODEL_STREAM_WATCHDOG_MS: u64 = 180_000;
 /// that a handful of dynamic tools stay inline; a large MCP fleet collapses behind search.
 pub const DEFAULT_TOOL_SEARCH_THRESHOLD_BYTES: usize = 16 * 1024;
 
+/// The default worker cap for a **parallel** tool batch: how many of a round's parallel-safe tool
+/// calls run concurrently at once (the rest queue behind them). Mirrors hermes' `_MAX_TOOL_WORKERS`
+/// (`run_agent.py`). Bounds resource use so a model emitting a huge parallel batch cannot spawn
+/// unbounded concurrent work. Clamped to at least `1` at use.
+pub const DEFAULT_MAX_PARALLEL_TOOLS: u32 = 8;
+
+/// The default per-tool wall-clock timeout (ms) for the §12 pipeline timeout stage. `0` **disables**
+/// the stage (the conservative default): a tool runs to completion unless it observes cancellation.
+/// The host opts in with a positive value; self-limiting tools (`shell` foreground, `execute_code`)
+/// override [`Tool::call_timeout`](crate::tools::Tool::call_timeout) to `None` to manage their own.
+pub const DEFAULT_TOOL_TIMEOUT_MS: u64 = 0;
+
 /// The default post-turn background-review nudge interval: `0` disables the engine-native trigger,
 /// the conservative core default (the host opts in, e.g. hermes' `creation_nudge_interval` of 10).
 /// When enabled, the engine emits an [`Effect::Spawn`](crate::turn::Effect::Spawn) for the matching
 /// background-review `kind` and resets the counter (cf. hermes `turn_finalizer.py:375-401`).
 pub const DEFAULT_REVIEW_NUDGE_INTERVAL: u32 = 0;
+
+/// Whether the per-turn tool-call guardrail (§12) emits **warning** guidance by default. Warnings
+/// never prevent a tool from running — they append a one-line nudge to the result so the model sees
+/// the loop. Mirrors hermes `ToolCallGuardrailConfig.warnings_enabled` (default on).
+pub const DEFAULT_GUARDRAIL_WARNINGS_ENABLED: bool = true;
+
+/// Whether the per-turn tool-call guardrail (§12) may **hard-stop** (block a repeated call and end
+/// the turn `NoProgress`) by default. Off by default (warn-only) so interactive sessions get a
+/// gentle nudge; autonomous hosts opt in. Mirrors hermes `ToolCallGuardrailConfig.hard_stop_enabled`.
+pub const DEFAULT_GUARDRAIL_HARD_STOP_ENABLED: bool = false;
+
+/// Guardrail: warn after this many identical **failing** `(name, args)` calls in a turn (hermes
+/// `exact_failure_warn_after`, 2).
+pub const DEFAULT_EXACT_FAILURE_WARN_AFTER: u32 = 2;
+/// Guardrail: block after this many identical **failing** `(name, args)` calls in a turn, when
+/// hard-stop is enabled (hermes `exact_failure_block_after`, 5).
+pub const DEFAULT_EXACT_FAILURE_BLOCK_AFTER: u32 = 5;
+/// Guardrail: warn after this many **failures** of the same tool name (any args) in a turn (hermes
+/// `same_tool_failure_warn_after`, 3).
+pub const DEFAULT_SAME_TOOL_FAILURE_WARN_AFTER: u32 = 3;
+/// Guardrail: halt after this many **failures** of the same tool name in a turn, when hard-stop is
+/// enabled (hermes `same_tool_failure_halt_after`, 8).
+pub const DEFAULT_SAME_TOOL_FAILURE_HALT_AFTER: u32 = 8;
+/// Guardrail: warn after an **idempotent** (read-only) `(name, args)` call returns the same result
+/// this many times in a turn (hermes `no_progress_warn_after`, 2).
+pub const DEFAULT_NO_PROGRESS_WARN_AFTER: u32 = 2;
+/// Guardrail: block after an **idempotent** `(name, args)` call returns the same result this many
+/// times in a turn, when hard-stop is enabled (hermes `no_progress_block_after`, 5).
+pub const DEFAULT_NO_PROGRESS_BLOCK_AFTER: u32 = 5;
+
+/// Per-turn tool-call loop guardrail thresholds (§12), a port of hermes
+/// [`ToolCallGuardrailConfig`](tool_guardrails.py). Distinct from the round-level no-progress guard
+/// ([`Config::max_repeated_rounds`]): this tracks each `(name, args)` signature across the *whole*
+/// turn (not just consecutive rounds) and escalates warn→block/halt with separate thresholds for
+/// repeated-identical-failure, same-tool-failure, and idempotent-no-progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardrailConfig {
+    /// Emit warning guidance on the result (never blocks execution).
+    pub warnings_enabled: bool,
+    /// Allow hard stops (block a call + end the turn `NoProgress`). Off ⇒ warn-only.
+    pub hard_stop_enabled: bool,
+    /// Warn after N identical failing `(name, args)` calls.
+    pub exact_failure_warn_after: u32,
+    /// Block after N identical failing `(name, args)` calls (hard-stop only).
+    pub exact_failure_block_after: u32,
+    /// Warn after N failures of the same tool name (any args).
+    pub same_tool_failure_warn_after: u32,
+    /// Halt after N failures of the same tool name (hard-stop only).
+    pub same_tool_failure_halt_after: u32,
+    /// Warn after an idempotent call returns the same result N times.
+    pub no_progress_warn_after: u32,
+    /// Block after an idempotent call returns the same result N times (hard-stop only).
+    pub no_progress_block_after: u32,
+}
+
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        Self {
+            warnings_enabled: DEFAULT_GUARDRAIL_WARNINGS_ENABLED,
+            hard_stop_enabled: DEFAULT_GUARDRAIL_HARD_STOP_ENABLED,
+            exact_failure_warn_after: DEFAULT_EXACT_FAILURE_WARN_AFTER,
+            exact_failure_block_after: DEFAULT_EXACT_FAILURE_BLOCK_AFTER,
+            same_tool_failure_warn_after: DEFAULT_SAME_TOOL_FAILURE_WARN_AFTER,
+            same_tool_failure_halt_after: DEFAULT_SAME_TOOL_FAILURE_HALT_AFTER,
+            no_progress_warn_after: DEFAULT_NO_PROGRESS_WARN_AFTER,
+            no_progress_block_after: DEFAULT_NO_PROGRESS_BLOCK_AFTER,
+        }
+    }
+}
 
 /// Engine tunables governing one engine's turns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +160,14 @@ pub struct Config {
     pub max_repeated_rounds: u32,
     /// The per-tool result-byte budget (?12 sanitize+budget); `0` disables truncation.
     pub tool_result_budget: usize,
+    /// The worker cap for a **parallel** tool batch (§12): at most this many parallel-safe calls in
+    /// one round run concurrently (via `.buffered`), the rest queue. Clamped to at least `1`.
+    pub max_parallel_tools: u32,
+    /// The per-tool wall-clock timeout (ms) for the §12 pipeline timeout stage. `0` disables it (the
+    /// default); a self-limiting tool opts out via [`Tool::call_timeout`](crate::tools::Tool::call_timeout).
+    pub tool_timeout_ms: u64,
+    /// The per-turn tool-call loop guardrail thresholds (§12), a port of hermes `tool_guardrails.py`.
+    pub guardrail: GuardrailConfig,
     /// The tool-search activation threshold (bytes of deferrable tool schema). When the summed
     /// deferrable schema exceeds this, the engine offers the `tool_search`/`tool_describe`/`tool_call`
     /// bridge in place of every deferrable schema. `0` disables collapsing (offer all tools always).
@@ -119,6 +209,9 @@ impl Default for Config {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_repeated_rounds: DEFAULT_MAX_REPEATED_ROUNDS,
             tool_result_budget: DEFAULT_TOOL_RESULT_BUDGET,
+            max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            tool_timeout_ms: DEFAULT_TOOL_TIMEOUT_MS,
+            guardrail: GuardrailConfig::default(), /* hermes tool_guardrails.py parity */
             tool_search_threshold_bytes: DEFAULT_TOOL_SEARCH_THRESHOLD_BYTES,
             model_max_retries: DEFAULT_MODEL_MAX_RETRIES,
             model_backoff_base_ms: DEFAULT_MODEL_BACKOFF_BASE_MS,

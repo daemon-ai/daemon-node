@@ -214,6 +214,7 @@ mod tests {
             approval_policy: ApprovalPolicy::Ask,
             pre_approved: false,
             checkpoints: None,
+            tool_timeout: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),

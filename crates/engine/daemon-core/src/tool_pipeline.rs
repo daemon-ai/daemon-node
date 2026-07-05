@@ -10,18 +10,61 @@
 //! never blow the model context.
 //!
 //! Stage 2 (validate/repair args) reuses the §9 [`repair_tool_args`] pass so a tool always receives
-//! canonical JSON even when the model emitted fenced/trailing-comma/truncated arguments.
+//! canonical JSON even when the model emitted fenced/trailing-comma/truncated arguments. Stage 2.5
+//! records a checkpoint before a [`mutates_for`](crate::tools::Tool::mutates_for) call. Stage 3 runs
+//! the tool under an optional per-call wall-clock timeout ([`Tool::call_timeout`](crate::tools::Tool::call_timeout)),
+//! aborting just that tool via a child cancel token on elapse.
 //!
-//! Deferred (later slices, noted so the seam is explicit): the checkpoint-if-mutating stage (needs
-//! the store/git), untrusted-output wrapping for web/MCP sources (the §9 [`wrap_untrusted_tool_result`](crate::repair::wrap_untrusted_tool_result)
-//! helper exists; tools opt in once a source is flagged untrusted), and parallel tool batching
-//! (tools run sequentially here). An unknown tool surfaces a failed result, never a panic.
+//! Parallel tool batching lives one level up in [`Engine::execute_tool_batch`](crate::engine): a
+//! round whose calls are all [`ToolConcurrency::Parallel`](crate::tools::ToolConcurrency) (with no
+//! path overlap) runs concurrently under a worker cap, and each such call still flows through this
+//! same `run_tool` pipeline. Untrusted-output wrapping for web/MCP sources is applied here when a
+//! tool flags its result untrusted. An unknown tool surfaces a failed result, never a panic.
 
 use crate::conversation::{ToolCall, ToolResult};
 use crate::repair::{repair_tool_args, wrap_untrusted_tool_result};
-use crate::tools::{ToolOutcome, ToolRegistry, TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH};
+use crate::tools::{Tool, ToolOutcome, ToolRegistry, TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH};
 use crate::turn::TurnCx;
+use std::time::Duration;
 use tracing::Instrument;
+
+/// Run one tool, optionally under a per-call wall-clock timeout (§12 stage 3). With `timeout == None`
+/// the tool runs to completion against the ambient `cx`. With a timeout, the tool runs against a
+/// per-call context carrying a **child** cancel token so that, on elapse, cancelling that token
+/// aborts just this tool (its subprocess) without cancelling the whole turn; a failed "timed out"
+/// result is returned. A tool that observes cancellation cooperatively stops promptly; the dropped
+/// future also releases any `kill_on_drop` subprocess handle.
+async fn run_with_timeout(
+    tool: &dyn Tool,
+    call: &ToolCall,
+    cx: &TurnCx<'_>,
+    timeout: Option<Duration>,
+) -> ToolOutcome {
+    let Some(dur) = timeout else {
+        return tool.run(call, cx).await;
+    };
+    let (call_cx, call_cancel) = cx.child_for_call();
+    match tokio::time::timeout(dur, tool.run(call, &call_cx)).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            call_cancel.cancel();
+            tracing::debug!(
+                tool = %call.name,
+                timeout_ms = dur.as_millis() as u64,
+                "engine.tool.timeout"
+            );
+            ToolOutcome::text(
+                call.call_id.clone(),
+                false,
+                format!(
+                    "tool `{}` timed out after {:.1}s",
+                    call.name,
+                    dur.as_secs_f64()
+                ),
+            )
+        }
+    }
+}
 
 /// Run one tool call through the pipeline (§12): resolve -> validate/repair args -> execute ->
 /// wrap-untrusted -> sanitize + budget. The `tool_search`/`tool_describe`/`tool_call` bridge names
@@ -67,8 +110,11 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
 
         // Stage 2.5 (§12 checkpoint): before a *mutating* tool touches the workspace, record a
         // best-effort checkpoint so an operator can rewind. Never fails the turn (capture logs + skips).
+        // Uses the per-call `mutates_for` so a tool that mutates only on some ops (e.g. `fs` write/edit
+        // but not read/grep/glob) skips the checkpoint on its read-only calls; the default delegates to
+        // `mutates()`, keeping today's behaviour byte-identical.
         if let (Some(store), Some(tool)) = (cx.checkpoints, &resolved) {
-            if tool.mutates() {
+            if tool.mutates_for(&call) {
                 if let Some(record) = store
                     .capture(cx.session_id.as_str(), &call.call_id, &call.name, cx.exec)
                     .await
@@ -82,8 +128,15 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
             }
         }
 
+        // Stage 3 (§12 execute + per-tool timeout): run the tool, optionally under a wall-clock
+        // deadline. `call_timeout` receives the engine default (`None` disables the stage) and may
+        // opt out (a self-limiting tool like a `shell` foreground command). On timeout the tool's
+        // child cancel token is fired (best-effort subprocess abort) and a failed result is returned.
         let mut outcome = match resolved {
-            Some(tool) => tool.run(&call, cx).await,
+            Some(tool) => {
+                let timeout = tool.call_timeout(&call, cx.default_tool_timeout());
+                run_with_timeout(tool.as_ref(), &call, cx, timeout).await
+            }
             None => {
                 tracing::debug!(tool = %call.name, "engine.tool.unknown");
                 ToolOutcome::text(
@@ -305,6 +358,7 @@ mod tests {
                 approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
                 pre_approved: false,
                 checkpoints: None,
+                tool_timeout: None,
             };
             $body
         }};
@@ -345,6 +399,7 @@ mod tests {
             approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
             pre_approved: false,
             checkpoints: None,
+            tool_timeout: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -535,6 +590,7 @@ mod tests {
             approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
             pre_approved: false,
             checkpoints: Some(store.as_ref()),
+            tool_timeout: None,
         };
         let call = ToolCall {
             call_id: "call-1".into(),
@@ -566,5 +622,130 @@ mod tests {
         };
         budget_result(&mut result, 51);
         assert!(result.content.contains("truncated"));
+    }
+
+    /// A tool that sleeps `delay` before returning ok. `opt_out` overrides `call_timeout` to `None`
+    /// so the pipeline timeout stage does not apply to it.
+    struct SlowTool {
+        delay: std::time::Duration,
+        opt_out: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn schema(&self) -> &str {
+            "{}"
+        }
+        fn call_timeout(
+            &self,
+            _call: &ToolCall,
+            default: Option<std::time::Duration>,
+        ) -> Option<std::time::Duration> {
+            if self.opt_out {
+                None
+            } else {
+                default
+            }
+        }
+        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {
+            tokio::time::sleep(self.delay).await;
+            ToolOutcome::text(call.call_id.clone(), true, "slept")
+        }
+    }
+
+    /// Build a `TurnCx` with an explicit `tool_timeout`, run one call, return the outcome.
+    async fn run_with_timeout_cx(
+        tool: std::sync::Arc<dyn Tool>,
+        timeout: Option<std::time::Duration>,
+    ) -> ToolResult {
+        use crate::events::EventSink;
+        use crate::exec::LocalEnvironment;
+        use daemon_common::{Budget, SessionId};
+        use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+
+        struct NoopHost;
+        #[async_trait::async_trait]
+        impl HostRequestHandler for NoopHost {
+            async fn request(&self, req: HostRequest) -> HostResponse {
+                HostResponse {
+                    request_id: req.request_id,
+                    body: HostResponseBody::Approved(true),
+                }
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        let name = tool.name().to_string();
+        registry.register(tool);
+        let events = EventSink::discarding();
+        let exec = LocalEnvironment::sandbox("timeout-test");
+        let cx = TurnCx {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            events: &events,
+            host: &NoopHost,
+            session_id: SessionId::new("s"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: &exec,
+            tool_result_budget: 0,
+            approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
+            pre_approved: false,
+            checkpoints: None,
+            tool_timeout: timeout,
+        };
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name,
+            args: "{}".into(),
+        };
+        run_tool(&call, &registry, &cx).await.result
+    }
+
+    #[tokio::test]
+    async fn slow_tool_times_out() {
+        let tool = std::sync::Arc::new(SlowTool {
+            delay: std::time::Duration::from_secs(30),
+            opt_out: false,
+        });
+        let result = run_with_timeout_cx(tool, Some(std::time::Duration::from_millis(50))).await;
+        assert!(!result.ok);
+        assert!(result.content.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn fast_tool_under_timeout_completes() {
+        let tool = std::sync::Arc::new(SlowTool {
+            delay: std::time::Duration::from_millis(1),
+            opt_out: false,
+        });
+        let result = run_with_timeout_cx(tool, Some(std::time::Duration::from_secs(30))).await;
+        assert!(result.ok);
+        assert_eq!(result.content, "slept");
+    }
+
+    #[tokio::test]
+    async fn disabled_timeout_never_fires() {
+        // tool_timeout = None disables the stage entirely.
+        let tool = std::sync::Arc::new(SlowTool {
+            delay: std::time::Duration::from_millis(20),
+            opt_out: false,
+        });
+        let result = run_with_timeout_cx(tool, None).await;
+        assert!(result.ok);
+    }
+
+    #[tokio::test]
+    async fn tool_can_opt_out_of_timeout() {
+        // A short default timeout is set, but the tool overrides call_timeout -> None.
+        let tool = std::sync::Arc::new(SlowTool {
+            delay: std::time::Duration::from_millis(120),
+            opt_out: true,
+        });
+        let result = run_with_timeout_cx(tool, Some(std::time::Duration::from_millis(20))).await;
+        assert!(result.ok);
+        assert_eq!(result.content, "slept");
     }
 }

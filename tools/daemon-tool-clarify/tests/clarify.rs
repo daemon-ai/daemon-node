@@ -57,6 +57,7 @@ async fn run(tool: &dyn Tool, host: &dyn HostRequestHandler, args: &str) -> Tool
         approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
         pre_approved: false,
         checkpoints: None,
+        tool_timeout: None,
     };
     let call = ToolCall {
         call_id: "c1".into(),

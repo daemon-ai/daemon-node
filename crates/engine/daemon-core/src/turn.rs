@@ -17,6 +17,7 @@ use daemon_common::{Budget, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponseBody, SpawnSpec,
 };
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// The ambient context handed to phases and tools during a turn (§4.2).
@@ -52,6 +53,40 @@ pub struct TurnCx<'a> {
     /// before a [`mutates`](crate::tools::Tool::mutates) tool runs, so an operator can rewind. `None`
     /// disables checkpointing (the default for engines the host did not wire one into).
     pub checkpoints: Option<&'a dyn crate::checkpoint::CheckpointStore>,
+    /// The default per-tool wall-clock timeout for the §12 pipeline timeout stage. `None` disables
+    /// the stage (a tool runs to completion). The pipeline offers this to
+    /// [`Tool::call_timeout`](crate::tools::Tool::call_timeout), which returns the effective per-call
+    /// timeout (or `None` to opt out).
+    pub tool_timeout: Option<Duration>,
+}
+
+impl<'a> TurnCx<'a> {
+    /// Build a per-call context that shares every ambient handle but carries a **child** cancel
+    /// token, plus that token. The §12 timeout stage runs one tool against the child cx so a
+    /// per-tool timeout can abort just that tool (cancel the child) without cancelling the turn.
+    pub(crate) fn child_for_call(&self) -> (TurnCx<'a>, CancellationToken) {
+        let token = self.cancel.child_token();
+        let cx = TurnCx {
+            cancel: token.clone(),
+            events: self.events,
+            host: self.host,
+            session_id: self.session_id.clone(),
+            profile: self.profile.clone(),
+            budget: self.budget,
+            exec: self.exec,
+            tool_result_budget: self.tool_result_budget,
+            approval_policy: self.approval_policy,
+            pre_approved: self.pre_approved,
+            checkpoints: self.checkpoints,
+            tool_timeout: self.tool_timeout,
+        };
+        (cx, token)
+    }
+
+    /// The configured default per-tool timeout offered to [`Tool::call_timeout`](crate::tools::Tool::call_timeout).
+    pub(crate) fn default_tool_timeout(&self) -> Option<Duration> {
+        self.tool_timeout
+    }
 }
 
 /// An effect a turn phase or tool produces; the single-owner applier orders and applies them

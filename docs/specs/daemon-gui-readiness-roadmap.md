@@ -269,8 +269,8 @@ Tables list the consequential rows per domain with anchors. Status as of this au
 | Capability | Hermes anchor | Daemon state + gap |
 |---|---|---|
 | Tool registry + dispatch | `tools/registry.py`; `model_tools.py:876` | DONE — `ToolRegistry` + `run_tool` ([tools.rs:60-108](../../crates/engine/daemon-core/src/tools.rs)). |
-| Tool executor (sequential / parallel) | `agent/tool_executor.py:243,770` | PARTIAL — sequential only; parallel batch deferred ([tool_pipeline.rs:12-15](../../crates/engine/daemon-core/src/tool_pipeline.rs)). P1. |
-| Loop guardrails | `agent/tool_guardrails.py:224` | MISSING — no duplicate-call guardrail. |
+| Tool executor (sequential / parallel) | `agent/tool_executor.py:243,770` | DONE — sequential + bounded-parallel batch: per-call `Tool::concurrency_for` classification, path-overlap gate, worker cap (`Config::max_parallel_tools`, default 8, `.buffered`), and an opt-in per-tool timeout stage ([engine.rs](../../crates/engine/daemon-core/src/engine.rs) `execute_tool_batch`; [tool_pipeline.rs](../../crates/engine/daemon-core/src/tool_pipeline.rs) `run_with_timeout`). |
+| Loop guardrails | `agent/tool_guardrails.py:224` | DONE — per-turn per-call warn-then-block guardrail (exact-failure / same-tool-failure / idempotent-no-progress; hard-stop opt-in) reusing `EndReason::NoProgress` ([guardrail.rs](../../crates/engine/daemon-core/src/guardrail.rs)), complementing the round-level no-progress guard. |
 | Core tools (fs/shell) | `tools/file_tools.py`; `tools/terminal_tool.py` | DONE — `fs`/`shell` with workspace containment ([daemon-tool-fs](../../tools/daemon-tool-fs/src/lib.rs):71-161; [daemon-tool-shell](../../tools/daemon-tool-shell/src/lib.rs):74-151). |
 | Web / browser / vision / todo / clarify | `tools/web_tools.py`, `browser_tool.py`, `vision_tools.py`, `todo_tool.py`, `clarify_tool.py` | **MOSTLY DONE** — `web_search`/`web_extract` ([daemon-tool-web](../../tools/daemon-tool-web/src/lib.rs)), `browser` ([daemon-tool-browser](../../tools/daemon-tool-browser/src/lib.rs)), `todo` ([daemon-tool-todo](../../tools/daemon-tool-todo/src/lib.rs)), `clarify` ([daemon-tool-clarify](../../tools/daemon-tool-clarify/src/lib.rs)). Remaining: vision tools; `tkx` now has an explicit status-only tool while the tracker backend remains deferred ([daemon-tool-tkx](../../tools/daemon-tool-tkx/src/lib.rs)). P1–P3. |
 | Approval + checkpoints + tool-search | `tools/approval.py`; `tools/checkpoint_manager.py`; `tools/tool_search.py` | DONE — shell + fs edit approval (policy-gated, durable HITL park→decide→resume); **checkpoints/rewind** (`Tool::mutates()` hint, git-first/snapshot-fallback `CheckpointStore` over the exec root, `run_tool` checkpoint stage, `Checkpoint{List,Rewind}` `ControlApi` family + ledger, wire v9 — [checkpoint.rs](../../crates/engine/daemon-core/src/checkpoint.rs)); **tool-search** progressive disclosure (`ToolRegistry` core/deferrable split + `tool_search`/`tool_describe`/`tool_call` bridge tools, byte-threshold collapse in `Engine::tool_defs` — [tools.rs](../../crates/engine/daemon-core/src/tools.rs), [tool_pipeline.rs](../../crates/engine/daemon-core/src/tool_pipeline.rs)). |
@@ -533,12 +533,13 @@ the parity-map. Use this as the long-horizon backlog after the D0 demo.
 **P0 — production survival** (mostly DONE in `daemon-core`):
 - ReAct loop, effects, recovery/retry, failure taxonomy, shell approval, path safety, result-byte
   budget — DONE ([daemon-core-spec](../../crates/engine/daemon-core/docs/daemon-core-spec.md) §22 "Landed so far", line 1671).
-- Message-sequence repair (Domain B), tool loop guardrails (Domain E) — PARTIAL/MISSING.
+- Message-sequence repair (Domain B) — PARTIAL. Tool loop guardrails (Domain E) — DONE (per-call
+  warn-then-block guardrail + round-level no-progress guard).
 
 **P1 — long-session coding:**
 - SQLite session store with FTS (Domain H) — DONE; dedicated token columns — PARTIAL.
 - Anthropic prompt caching (Domain B) — PARTIAL.
-- Parallel tool batch (Domain E) — MISSING.
+- Parallel tool batch (Domain E) — DONE (bounded worker cap 8, per-call concurrency + path-overlap gate).
 - Cost + analytics and context-fill HUD event (Domain D, §5.3) — DONE on the daemon wire; GUI
   rendering remains.
 - Web/todo/clarify/browser tools (Domain E) — DONE.
