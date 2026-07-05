@@ -16,6 +16,14 @@ yanked = "deny"
 ignore = [
   "RUSTSEC-2024-0436", # paste: unmaintained; unconditional build-dep of bc-envelope 0.43 (latest)
   "RUSTSEC-2026-0173", # proc-macro-error2: unmaintained; via matrix-sdk 0.18 (latest) -> aquamarine
+  # ttf-parser: unmaintained-status advisory only (no CVE). Unconditional dep of lopdf 0.42
+  # (latest) via pdf-extract 0.12 (latest) — the `fs` tool's PDF text extraction. Unlike the two
+  # above it does parse input at runtime, but the exposure is bounded: input is workspace-contained
+  # document bytes, capped at 50 MB, parsed on an isolated blocking task whose panic is contained
+  # and reported as an extraction failure (never a crash), and PDF extraction is behind the
+  # `extract` cargo feature. Re-evaluate when pdf-extract/lopdf move off ttf-parser (upstream
+  # suggests `skrifa`).
+  "RUSTSEC-2026-0192",
 ]
 
 [bans]

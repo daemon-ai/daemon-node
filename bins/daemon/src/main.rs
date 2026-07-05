@@ -2159,6 +2159,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         auth_factories,
         workspace_root: Some(cfg.workspace_root()),
         blob_root: Some(cfg.blob_root()),
+        fs: cfg.fs.clone(),
     });
     // Build the daemon-authoritative command catalog (`command_list`/`command_invoke`): the built-in
     // node-op commands unified with the provider commands the context engine (`/lcm`) and memory

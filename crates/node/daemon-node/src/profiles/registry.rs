@@ -156,14 +156,16 @@ pub(crate) fn merged_config(base: Config, t: &EngineTunables) -> Config {
 }
 
 /// Build the interactive tool registry for a session: the core fs + shell toolset plus node-level
-/// `extra` tools, optionally narrowed to an allowlist of tool names.
+/// `extra` tools, optionally narrowed to an allowlist of tool names. `fs` is the node's `[fs]`
+/// tool configuration (caps / deny paths / lint).
 pub(crate) fn session_tool_registry(
     extra: &[Arc<dyn Tool>],
     allowlist: Option<&[String]>,
+    fs: &daemon_tool_fs::FsConfig,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     let mut candidates: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(daemon_tool_fs::FsTool::new()) as Arc<dyn Tool>,
+        Arc::new(daemon_tool_fs::FsTool::with_config(fs.clone())) as Arc<dyn Tool>,
         Arc::new(daemon_tool_shell::ShellTool::new()) as Arc<dyn Tool>,
     ];
     candidates.extend(extra.iter().cloned());

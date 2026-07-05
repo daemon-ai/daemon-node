@@ -1009,6 +1009,10 @@ pub struct NodeConfig {
     pub browser: BrowserConfig,
     /// Skills-subsystem tuning (`enable = true` by default).
     pub skills: SkillsConfig,
+    /// The `fs` tool tuning (`[fs]` / `DAEMON_FS__*`): read caps, search caps, extra write-deny
+    /// prefixes, and the post-edit `[fs.lint]` command runner. Embedded from the tool crate so
+    /// the config surface and the tool cannot drift.
+    pub fs: daemon_tool_fs::FsConfig,
     /// LCM context-engine tuning (injected into the context-engine template).
     pub lcm: LcmOpts,
     /// Mnemosyne recall + multi-agent identity knobs (injected into the memory provider template).
@@ -1063,6 +1067,7 @@ impl Default for NodeConfig {
             web: WebConfig::default(),
             browser: BrowserConfig::default(),
             skills: SkillsConfig::default(),
+            fs: daemon_tool_fs::FsConfig::default(),
             lcm: LcmOpts::default(),
             mnemosyne: MnemosyneOpts::default(),
             credential_key: String::new(),
