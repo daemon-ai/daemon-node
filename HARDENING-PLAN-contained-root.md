@@ -100,9 +100,19 @@ All async methods do the fd resolution + byte I/O inside `spawn_blocking`.
 | `symlink_metadata(rel) -> FileMeta` | `fstatat(.., AT_SYMLINK_NOFOLLOW)` after `RESOLVE_BENEATH\|NO_SYMLINKS` parent open | workspace_fs `stat`/`revision`, tool-fs op_delete kind, atomic_write perm-preserve |
 | `create_dir_all(rel)` | `mkdirat` walk (each segment `RESOLVE_BENEATH\|NO_SYMLINKS`) | local.rs `run` cwd + `write` parent, workspace_fs `write` parent, tool-fs `atomic_write` parent |
 | `remove_file(rel)` / `remove_dir(rel)` | `unlinkat` (+`AT_REMOVEDIR`) | tool-fs op_delete |
+| `remove_dir_all_sync(rel)` | recursive `read_dir` (openat2, non-following) + `unlinkat` bottom-up; a symlinked entry is unlinked as the LINK (never followed) | **exec-os-sandbox**: `execute_code` staging cleanup (`.execute_code/<run_id>`) instead of raw `tokio::fs::remove_dir_all` |
 | `rename(from_rel, to_rel)` | `renameat` (both beneath root) | tool-fs `atomic_write` swap |
+| `write_sync(rel, bytes) -> io::Result<()>` | `O_WRONLY\|O_CREAT\|O_TRUNC` (wraps `open_write_file` + `write_all`) | **exec-os-sandbox**: `execute_code` script staging (sync convenience) |
 | `verify_dir(rel) -> PathBuf` | `O_DIRECTORY`, resolve then return spawn/walk-safe path | grep/glob root, tool-shell cwd, cron/seed script, child cwd |
 | `resolve_display(rel) -> io::Result<PathBuf>` | lexical join of `root_abs` + normalized rel; **no fs** | policy-only path for `write_denied` (documented: never used to open) |
+
+> **exec-os-sandbox consumer contract (as shipped).** The staging-dir lifecycle
+> (`<ws_root>/.execute_code/<run_id>`: create → write script → remove on cleanup) is fully covered by
+> the exported *sync* surface — `create_dir_all_sync` (create), `write_sync` / `open_write_file`
+> (write), `remove_dir_all_sync` (contained recursive cleanup). No raw `std::fs`/`tokio::fs` is needed,
+> so the Phase 4 raw-fs lint stays satisfiable and cleanup keeps its symlink-traversal containment.
+> Both the unix (openat2) and non-unix (lexical floor + `symlink_metadata` refusal) impls expose the
+> same symmetric surface.
 
 `FileMeta` / `DirEntryLite` are tiny local structs (mtime_ms, size, kind) so callers do not need the
 `OwnedFd` and the blocking closure stays `'static`.

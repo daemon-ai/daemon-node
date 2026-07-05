@@ -159,7 +159,7 @@ mod imp {
             let this = self.clone();
             let rel = rel.to_path_buf();
             let bytes = bytes.to_vec();
-            blocking(move || this.write_sync(&rel, &bytes)).await
+            blocking(move || this.write_meta_sync(&rel, &bytes)).await
         }
 
         /// List a contained directory's children with non-following metadata (sorted by name).
@@ -265,7 +265,7 @@ mod imp {
             Ok((bytes, meta, truncated))
         }
 
-        fn write_sync(&self, rel: &Path, bytes: &[u8]) -> io::Result<Meta> {
+        fn write_meta_sync(&self, rel: &Path, bytes: &[u8]) -> io::Result<Meta> {
             use std::io::Write as _;
             if let Some(parent) = rel.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -281,6 +281,35 @@ mod imp {
             file.write_all(bytes)?;
             let meta = meta_from_std(&file.metadata()?);
             Ok(meta)
+        }
+
+        /// Write bytes to a contained file (create + truncate), creating parent dirs — a sync
+        /// convenience over [`Self::open_write_file`] for callers already in a blocking context (e.g.
+        /// the exec-os-sandbox track staging a script under `.execute_code/<run_id>`).
+        pub fn write_sync(&self, rel: &Path, bytes: &[u8]) -> io::Result<()> {
+            use std::io::Write as _;
+            let mut file = self.open_write_file(rel)?;
+            file.write_all(bytes)
+        }
+
+        /// Recursively remove `rel` and its contents, staying fd-contained: each level is read via
+        /// [`Self::read_dir_sync`] (openat2, non-following) and each entry is unlinked from its
+        /// contained parent, so a symlinked entry is removed as the LINK itself and never followed to
+        /// delete outside the root. Bottom-up; `rel` itself is removed last (it must be a directory
+        /// below the root — removing the root is refused). Mirrors `remove_dir_all` semantics.
+        pub fn remove_dir_all_sync(&self, rel: &Path) -> io::Result<()> {
+            for child in self.read_dir_sync(rel)? {
+                let child_rel = rel.join(&child.name);
+                if child.meta.is_symlink {
+                    // Unlink the symlink itself — never descend into / follow it out of the root.
+                    self.remove_file_sync(&child_rel)?;
+                } else if child.meta.is_dir {
+                    self.remove_dir_all_sync(&child_rel)?;
+                } else {
+                    self.remove_file_sync(&child_rel)?;
+                }
+            }
+            self.remove_dir_sync(rel)
         }
 
         /// Open a contained file for writing (create + truncate) and hand back the raw fd as a
@@ -751,6 +780,14 @@ mod imp {
                 .open(&abs)
         }
 
+        /// Write bytes to a contained file (create + truncate), creating parent dirs — a sync
+        /// convenience over [`Self::open_write_file`] (symmetric with the unix impl).
+        pub fn write_sync(&self, rel: &Path, bytes: &[u8]) -> io::Result<()> {
+            use std::io::Write as _;
+            let mut file = self.open_write_file(rel)?;
+            file.write_all(bytes)
+        }
+
         pub async fn read_dir(&self, rel: &Path) -> io::Result<Vec<DirEntryLite>> {
             self.read_dir_sync(rel)
         }
@@ -798,6 +835,15 @@ mod imp {
             tokio::fs::remove_dir(self.contained(rel)?).await
         }
 
+        /// Recursively remove `rel` and its contents (best-effort on this lane): the lexical floor
+        /// contains `rel`, then the walk refuses to follow a symlinked entry — a symlink is unlinked
+        /// as the LINK itself, never followed to delete outside the root. Residual check-then-use
+        /// window per the non-unix stub note. Symmetric with the unix impl.
+        pub fn remove_dir_all_sync(&self, rel: &Path) -> io::Result<()> {
+            let abs = self.contained(rel)?;
+            remove_dir_all_guarded(&abs)
+        }
+
         pub async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             let from = self.contained(from)?;
             let to = super::super::contain(&self.root_abs, to)?;
@@ -835,6 +881,24 @@ mod imp {
         }
     }
 
+    /// Recursively remove a directory, unlinking a symlinked entry as the link itself (never
+    /// descending into / following it out of the root). Bottom-up.
+    fn remove_dir_all_guarded(dir: &Path) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() {
+                std::fs::remove_file(&path)?;
+            } else if meta.is_dir() {
+                remove_dir_all_guarded(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        std::fs::remove_dir(dir)
+    }
+
     fn meta_of(m: &std::fs::Metadata) -> Meta {
         let mtime_ms = m
             .modified()
@@ -854,3 +918,73 @@ mod imp {
 }
 
 pub use imp::ContainedRoot;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::ContainedRoot;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("daemon-contained-{tag}-{nanos}"))
+    }
+
+    // `remove_dir_all_sync` must never follow a symlinked entry to delete outside the root: a symlink
+    // placed inside the staging dir (pointing at an outside target) is unlinked as the LINK itself,
+    // so the outside target — and its contents — survive. This is the cleanup-time containment the
+    // exec-os-sandbox track relies on instead of a raw `tokio::fs::remove_dir_all`.
+    #[test]
+    fn remove_dir_all_does_not_follow_symlink_out_of_root() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("rmall-sym");
+        let outside = temp_root("rmall-sym-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let survivor = outside.join("survivor.txt");
+        std::fs::write(&survivor, b"KEEP ME").unwrap();
+
+        let cr = ContainedRoot::open(&root).unwrap();
+        cr.create_dir_all_sync(Path::new("staging/nested")).unwrap();
+        cr.write_sync(Path::new("staging/nested/a.txt"), b"x")
+            .unwrap();
+        // A symlink INSIDE the staging dir pointing OUTSIDE the root.
+        symlink(&outside, root.join("staging").join("escape")).unwrap();
+
+        cr.remove_dir_all_sync(Path::new("staging")).unwrap();
+
+        // The staging dir is gone...
+        assert!(
+            !root.join("staging").exists(),
+            "staging dir should be fully removed"
+        );
+        // ...but the outside target and its file survive — the symlink was not followed.
+        assert!(
+            survivor.exists(),
+            "remove_dir_all followed a symlink out of the root"
+        );
+        assert_eq!(std::fs::read(&survivor).unwrap(), b"KEEP ME");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // A normal nested directory tree is fully removed.
+    #[test]
+    fn remove_dir_all_removes_nested_tree() {
+        let root = temp_root("rmall-nested");
+        let cr = ContainedRoot::open(&root).unwrap();
+        cr.create_dir_all_sync(Path::new("t/a/b/c")).unwrap();
+        cr.write_sync(Path::new("t/a/b/c/deep.txt"), b"1").unwrap();
+        cr.write_sync(Path::new("t/a/top.txt"), b"2").unwrap();
+
+        cr.remove_dir_all_sync(Path::new("t")).unwrap();
+        assert!(
+            !root.join("t").exists(),
+            "the nested tree was not fully removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
