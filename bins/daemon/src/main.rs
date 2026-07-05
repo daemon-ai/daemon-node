@@ -2489,16 +2489,25 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // reassigning `node` before any listener spawn. The audit shares the node's durable `store` +
     // journal `signer` so its records land on — and verify against — the node's own journal.
     let auth_audit = daemon_host::AuthAudit::shared(store.clone(), signer.clone());
+    // Cluster F (Part A): the shared per-principal revocation registry. Wired into BOTH the node
+    // (admin ops bump it) and the transport authenticator (connections capture their principal's
+    // epoch), so a `session_revoke`/`user_disable`/role/password change synchronously tears down the
+    // affected principal's already-open mux connections and their live stream pumps.
+    let revocations = daemon_host::SessionRevocations::new();
     let node = Arc::new(
         (*node)
             .clone()
             .with_auth_store(auth_store.clone())
-            .with_auth_audit(auth_audit.clone()),
+            .with_auth_audit(auth_audit.clone())
+            .with_revocations(revocations.clone()),
     );
     // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
     // keeps its own reference for the auth check.
-    let authenticator =
-        Arc::new(daemon_host::Authenticator::new(auth_store.clone()).with_audit(auth_audit));
+    let authenticator = Arc::new(
+        daemon_host::Authenticator::new(auth_store.clone())
+            .with_audit(auth_audit)
+            .with_revocations(revocations),
+    );
     // B5: `[api].local_trust` defaults to `system` — the Unix socket / FFI / in-process HTTP run as
     // the deliberate full-trust principal. Disable it to require SCRAM on the Unix socket and fully
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.

@@ -33,6 +33,7 @@ mod positive_e2e;
 mod process_notify;
 mod profiles_skills;
 mod provider_discovery;
+mod revocation_transport;
 mod routing_auth;
 mod semantic_search;
 mod session_recall;
