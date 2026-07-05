@@ -138,9 +138,18 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 # public API is SAFE (it wraps the raw syscalls), so `daemon-core`'s `#![forbid(unsafe_code)]` is
 # preserved. Already resolved in-tree transitively (rustix 1.1.4), so promoting it to a direct dep of
 # `daemon-core` adds zero crates to the graph. Unix-only — the non-unix build falls back to the
-# lexical `contain()` + `symlink_metadata` stub and never links rustix. `libc` is still pulled
-# transitively (by rustix, nix, …) but is no longer a direct dep of any workspace crate.
+# lexical `contain()` + `symlink_metadata` stub and never links rustix.
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+# Low-level syscall constants/wrappers for the `daemon-sandbox` Linux exec sandbox: `prctl`
+# (NO_NEW_PRIVS), `AF_INET`/`AF_INET6`, and `SYS_socket` for the seccomp filter. Consumed only by
+# `daemon-sandbox` under `[target.'cfg(target_os="linux")']` (else pulled transitively by rustix/nix).
+libc = "0.2"
+# Kernel-enforced exec sandbox (Cluster B/C) for the `execute_code` plain fallback, isolated to the
+# `daemon-sandbox` crate under `[target.'cfg(target_os="linux")']`: Landlock scopes the child's
+# filesystem, seccomp denies INET/INET6 sockets — the case bwrap can't cover (userns unavailable).
+# landlock: MIT OR Apache-2.0; seccompiler: Apache-2.0 OR BSD-3-Clause (both permissive, deny-clean).
+landlock = "0.4.5"
+seccompiler = "0.5.0"
 # Cross-platform pseudo-terminal (wezterm's pty layer) for interactive background CLIs
 # (`shell(pty=true)` → `daemon-processes`). MIT; pins some older transitives (bitflags 1, nix 0.28)
 # — duplicate-version warnings only (deny.toml multiple-versions = "warn").
@@ -259,6 +268,7 @@ daemon-auth = { path = "crates/substrate/daemon-auth" }
 daemon-store = { path = "crates/substrate/daemon-store" }
 daemon-workspace-index = { path = "crates/substrate/daemon-workspace-index" }
 daemon-processes = { path = "crates/substrate/daemon-processes" }
+daemon-sandbox = { path = "crates/substrate/daemon-sandbox" }
 daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
 daemon-provision = { path = "crates/substrate/daemon-provision" }

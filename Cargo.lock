@@ -2746,6 +2746,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-sandbox"
+version = "0.0.1"
+dependencies = [
+ "landlock",
+ "libc",
+ "seccompiler",
+ "tokio",
+]
+
+[[package]]
 name = "daemon-schedule"
 version = "0.0.1"
 dependencies = [
@@ -2869,11 +2879,13 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-protocol",
+ "daemon-sandbox",
  "nix 0.31.3",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -5706,6 +5718,17 @@ checksum = "f660d5f887e3562f9ab6f4a14988795b694099d66b4f5dedc02d197ba9becb1d"
 dependencies = [
  "const_panic",
  "typewit",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -9154,6 +9177,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

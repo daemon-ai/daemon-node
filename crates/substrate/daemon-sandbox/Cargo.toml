@@ -1,0 +1,23 @@
+[package]
+name = "daemon-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# `confine_command` installs the child sandbox on a not-yet-spawned tokio child via `pre_exec`
+# (unix); this crate owns the one `unsafe` so its consumers can keep `#![forbid(unsafe_code)]`.
+tokio = { workspace = true }
+
+# Linux kernel exec sandbox for the execute_code child (Cluster B/C): Landlock scopes the child's
+# filesystem, seccomp denies INET/INET6 sockets. No user namespaces required — this is the case
+# bubblewrap cannot cover (userns disabled). Linux-only: the macOS/Windows builds never see them.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }
+
+[lints]
+workspace = true

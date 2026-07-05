@@ -562,7 +562,8 @@ pub struct ExecuteCodeConfig {
     pub max_stdout_bytes: usize,
     /// The stderr byte cap (head-only).
     pub max_stderr_bytes: usize,
-    /// The OS-sandbox policy: `auto` (bwrap when usable, else plain), `bwrap` (required), `none`.
+    /// The OS-sandbox posture: `auto` (strongest usable backend, else plain+warn), `require` (a
+    /// kernel backend or fail closed; legacy `bwrap` alias), `plain` (unconfined; legacy `none`).
     pub sandbox: daemon_tool_execute_code::SandboxPolicy,
     /// The child network policy under the sandbox: `off` (`--unshare-net`) or `shared`.
     pub network: daemon_tool_execute_code::NetworkPolicy,
