@@ -771,19 +771,21 @@ impl LiveSessions {
 
     pub(crate) async fn submit(
         &self,
-        session: SessionId,
+        auth: &AuthorizedFor<Session>,
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         // No external attribution supplied: default to the generic `api` origin.
-        self.submit_from(session, api_origin(), command).await
+        self.submit_from(auth, api_origin(), command).await
     }
 
     pub(crate) async fn submit_from(
         &self,
-        session: SessionId,
+        auth: &AuthorizedFor<Session>,
         origin: Origin,
         command: AgentCommand,
     ) -> Result<(), ApiError> {
+        // The target is derived from the ownership proof, never a caller-supplied id (Cluster A).
+        let session = auth.session().clone();
         match command {
             AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
@@ -998,10 +1000,11 @@ impl LiveSessions {
     /// FOREIGN session is refused explicitly (ACP has no truncate-at-anchor primitive).
     pub(crate) async fn rewind_resident(
         &self,
-        session: &SessionId,
+        auth: &AuthorizedFor<Session>,
         anchor: daemon_protocol::RewindAnchor,
         restore_workspace: bool,
     ) -> Result<(), ApiError> {
+        let session = auth.session();
         if self.resident_is_foreign(session) == Some(true) {
             return Err(ApiError::Unsupported(
                 "conversation rewind is not supported for a foreign-engine (ACP) session".into(),
@@ -1030,16 +1033,22 @@ impl LiveSessions {
     /// Record an observability-only transport/meta event (`Disposition::Transport`) on the merged log
     /// — the "GUI attached" / presence / receipt channel. It lands on the live log + broadcast only
     /// (never the engine, never the journal), so it is cache-safe by construction.
-    pub(crate) fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {
+    pub(crate) fn record_meta(
+        &self,
+        auth: &AuthorizedFor<Session>,
+        args: RecordMetaArgs,
+    ) -> Result<(), ApiError> {
+        // The proof is the authority for the target session; `args.session` is ignored.
+        let session = auth.session();
         let RecordMetaArgs {
-            session,
+            session: _,
             origin,
             kind,
             body,
         } = args;
         let s = self
             .sessions
-            .get(&session)
+            .get(session)
             .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
         s.log.lock().unwrap().append(
             Direction::Inbound,
@@ -1074,7 +1083,8 @@ impl LiveSessions {
     }
 
     /// The session's current delivery targets (empty if the session is gone).
-    pub(crate) fn delivery_targets(&self, session: &SessionId) -> Vec<DeliveryTarget> {
+    pub(crate) fn delivery_targets(&self, auth: &AuthorizedFor<Session>) -> Vec<DeliveryTarget> {
+        let session = auth.session();
         match self.sessions.get(session) {
             Some(s) => s.delivery.lock().unwrap().clone(),
             None => Vec::new(),
@@ -1151,9 +1161,10 @@ impl LiveSessions {
     /// new `Primary`.
     pub(crate) fn handover(
         &self,
-        session: &SessionId,
+        auth: &AuthorizedFor<Session>,
         target: DeliveryTarget,
     ) -> Result<(), ApiError> {
+        let session = auth.session();
         let s = self
             .sessions
             .get(session)
@@ -1174,7 +1185,13 @@ impl LiveSessions {
     }
 
     /// Non-destructive cursor page of a live session's merged log (empty if the session is gone).
-    pub(crate) fn log_after(&self, session: &SessionId, after_seq: u64, max: u32) -> LogPageView {
+    pub(crate) fn log_after(
+        &self,
+        auth: &AuthorizedFor<Session>,
+        after_seq: u64,
+        max: u32,
+    ) -> LogPageView {
+        let session = auth.session();
         match self.sessions.get(session) {
             Some(s) => s.log.lock().unwrap().page(after_seq, max),
             None => LogPageView::default(),
@@ -1182,7 +1199,8 @@ impl LiveSessions {
     }
 
     /// A live push subscription to a session's merged log (empty stream if the session is gone).
-    pub(crate) fn subscribe(&self, session: &SessionId, after_seq: u64) -> LogStream {
+    pub(crate) fn subscribe(&self, auth: &AuthorizedFor<Session>, after_seq: u64) -> LogStream {
+        let session = auth.session();
         match self.sessions.get(session) {
             Some(s) => s.log.lock().unwrap().subscribe(after_seq),
             None => stream::empty().boxed(),
@@ -1190,7 +1208,8 @@ impl LiveSessions {
     }
 
     /// The activation epoch of a live session's merged log (0 if the session is not resident).
-    pub(crate) fn log_epoch(&self, session: &SessionId) -> u64 {
+    pub(crate) fn log_epoch(&self, auth: &AuthorizedFor<Session>) -> u64 {
+        let session = auth.session();
         match self.sessions.get(session) {
             Some(s) => s.log.lock().unwrap().epoch,
             None => 0,
@@ -1204,7 +1223,12 @@ impl LiveSessions {
             .ok_or_else(|| ApiError::UnknownSession(session.to_string()))
     }
 
-    pub(crate) fn poll(&self, session: &SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
+    pub(crate) fn poll(
+        &self,
+        auth: &AuthorizedFor<Session>,
+        max: u32,
+    ) -> Result<Vec<Outbound>, ApiError> {
+        let session = auth.session();
         let s = self
             .sessions
             .get(session)
@@ -1220,9 +1244,10 @@ impl LiveSessions {
 
     pub(crate) fn respond(
         &self,
-        session: &SessionId,
+        auth: &AuthorizedFor<Session>,
         response: HostResponse,
     ) -> Result<(), ApiError> {
+        let session = auth.session();
         let s = self
             .sessions
             .get(session)
@@ -1249,7 +1274,8 @@ impl LiveSessions {
         }
     }
 
-    pub(crate) async fn interrupt(&self, session: &SessionId) -> bool {
+    pub(crate) async fn interrupt(&self, auth: &AuthorizedFor<Session>) -> bool {
+        let session = auth.session();
         let Some(handle) = self.sessions.get(session).map(|s| s.handle.clone()) else {
             return false;
         };

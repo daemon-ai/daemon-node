@@ -143,49 +143,6 @@ impl NodeApiImpl {
         }
     }
 
-    /// The per-resource ownership gate (Auth 4), enforced *beneath* Auth 2's coarse capability gate.
-    /// The caller must own `session`, or hold the relevant override capability:
-    /// [`SessionControlAny`](daemon_auth::Capability::SessionControlAny) for an interaction op
-    /// (`control = true`) or [`SessionSeeAll`](daemon_auth::Capability::SessionSeeAll) for a
-    /// read-of-one (`control = false`). An `Absent` session passes so the create/`NotFound` flow runs
-    /// downstream; a `LegacyUnowned` (owner-NULL) session is reachable only via the override.
-    ///
-    /// **Fail-closed on a missing principal.** A `None` principal (no request context bound) is
-    /// DENIED, not allowed: every legitimate in-process caller now enters an explicit
-    /// [`RequestContext::system`](crate::RequestContext::system) or
-    /// [`RequestContext::internal`](crate::RequestContext::internal) scope, so an unscoped call here
-    /// is a bug — never implicit full trust. (This closed the cross-owner reads that reached ungated
-    /// handlers and detached stream pumps with no principal bound.)
-    pub(crate) async fn require_session_access(
-        &self,
-        session: &SessionId,
-        control: bool,
-    ) -> Result<(), ApiError> {
-        // Fail-closed: an unscoped call (no bound principal) is DENIED. Every legitimate in-process
-        // caller enters an explicit `system()` / `internal()` scope; a missing principal is a bug.
-        let Some(principal) = crate::request_context::current_principal() else {
-            return Err(ApiError::Unauthenticated(
-                "no authenticated principal bound to this request".into(),
-            ));
-        };
-        let override_cap = if control {
-            daemon_auth::Capability::SessionControlAny
-        } else {
-            daemon_auth::Capability::SessionSeeAll
-        };
-        if principal.has(override_cap) {
-            return Ok(());
-        }
-        match self.session_ownership(session).await {
-            // No such session yet: let the normal create / not-found path handle it.
-            SessionOwnership::Absent => Ok(()),
-            SessionOwnership::Owned(owner) if owner == principal.user_id => Ok(()),
-            _ => Err(ApiError::Forbidden(format!(
-                "session {session} is not owned by the caller"
-            ))),
-        }
-    }
-
     /// The operator-tier gate for **security-widening** mutations (Cluster E policy partition):
     /// widening a session overlay's autonomy/tool-surface (`approval_mode` -> `AcceptEdits`/
     /// `AutoAllow`, or `ToolsOverride::FullToolset`) and setting cron `workdir`/`enabled_toolsets`.
