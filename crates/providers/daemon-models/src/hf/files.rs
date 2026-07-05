@@ -31,6 +31,10 @@ struct RawTreeItem {
 struct RawLfs {
     #[serde(default)]
     size: u64,
+    /// The git-LFS object id — for LFS blobs this is the file's sha256 (lowercase hex). Used as the
+    /// Hub-declared expected hash to verify a download against (Phase 3 / Cluster E, L1).
+    #[serde(default)]
+    oid: Option<String>,
 }
 
 /// The maximum number of tree pages to follow (guards against a pathological repo).
@@ -43,10 +47,34 @@ pub async fn list_files(
     revision: &str,
     engine: ModelEngine,
 ) -> Result<Vec<ModelFile>> {
+    Ok(list_files_with_oids(client, repo, revision, engine)
+        .await?
+        .0)
+}
+
+/// Like [`list_files`] but also returns a `path -> git-LFS oid (sha256)` map for the repo's LFS
+/// blobs (from a single tree fetch), so the acquisition planner can pin an expected download hash
+/// without a second round-trip (Phase 3 / Cluster E). Non-LFS files (no `lfs.oid`) are absent.
+pub(crate) async fn list_files_with_oids(
+    client: &HfClient,
+    repo: &str,
+    revision: &str,
+    engine: ModelEngine,
+) -> Result<(Vec<ModelFile>, std::collections::HashMap<String, String>)> {
     if repo.trim().is_empty() {
         return Err(ModelError::Invalid("empty repo id".into()));
     }
     let items = fetch_tree(client, repo, revision).await?;
+    let oids: std::collections::HashMap<String, String> = items
+        .iter()
+        .filter(|it| it.kind == "file")
+        .filter_map(|it| {
+            it.lfs
+                .as_ref()
+                .and_then(|l| l.oid.clone())
+                .map(|oid| (it.path.clone(), oid))
+        })
+        .collect();
     let mut files: Vec<ModelFile> = items
         .into_iter()
         .filter(|it| it.kind == "file")
@@ -55,7 +83,7 @@ pub async fn list_files(
         .collect();
     // Stable, useful ordering: GGUF/weight files first, then by path.
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
+    Ok((files, oids))
 }
 
 /// Every file in `repo` at `revision` as `(path, size_bytes)` — no engine filter. Used by the
