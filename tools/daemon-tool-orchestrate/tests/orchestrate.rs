@@ -300,6 +300,7 @@ async fn status_reports_per_child_state_from_the_durable_graph() {
                     epoch: daemon_common::Epoch(1),
                     payload: Vec::new(),
                     lifetime: daemon_store::ChildLifetime::Persistent,
+                    child: None,
                 },
             )
             .await
@@ -351,6 +352,145 @@ async fn cancel_reports_unknown_children_as_false() {
     let out = run_as(&tool, "parent", "cancel:ghost").await;
     assert!(out.result.ok);
     assert_eq!(out.result.content, "cancel:ghost:false");
+}
+
+#[tokio::test]
+async fn detached_spawn_enqueues_a_bare_job_and_notice_edge_without_an_effect() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","wait":false,"task":"bg work","lifetime":"ephemeral","profile":"opus"}"#,
+    )
+    .await;
+    assert!(out.result.ok, "{}", out.result.content);
+    assert_eq!(out.result.content, "spawned-detached:parent/d1");
+    assert!(
+        out.effects.is_empty(),
+        "a detached spawn never emits Effect::Delegate (the parent does not suspend)"
+    );
+
+    // The bare job landed on the durable outbox with the store-minted child and detached payload.
+    let job = store
+        .dequeue_job()
+        .await
+        .expect("a detached job on the outbox");
+    assert_eq!(job.child.as_ref().map(|c| c.as_str()), Some("parent/d1"));
+    let input = DelegationInput::decode(&job.payload);
+    assert_eq!(input.task, "bg work");
+    assert!(input.detached, "the payload carries detached=true");
+    assert_eq!(input.lifetime, DelegationLifetime::Ephemeral);
+    assert_eq!(input.profile.as_deref(), Some("opus"));
+
+    // The completion-notice edge makes the child tree-visible under the parent (not a delegation).
+    assert!(
+        store
+            .children_of(&SessionId::new("parent"))
+            .await
+            .contains(&SessionId::new("parent/d1")),
+        "the detached child shows up in the parent's child index"
+    );
+}
+
+#[tokio::test]
+async fn wait_true_and_bare_and_alias_stay_joining_delegations() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::with_label(fleet(store), "bg");
+    // Explicit wait:true, the bare `{}`, the string "true", and the `delegate` alias all emit a
+    // joining Effect::Delegate with a non-detached payload.
+    for args in [
+        r#"{"verb":"spawn","wait":true,"task":"t"}"#,
+        r#"{"verb":"spawn","wait":"true","task":"t"}"#,
+        "{}",
+        r#"{"verb":"delegate"}"#,
+    ] {
+        let out = run_as(&tool, "parent", args).await;
+        assert!(out.result.ok, "args {args:?}: {}", out.result.content);
+        assert!(
+            out.result.content.starts_with("spawned:"),
+            "args {args:?} => {}",
+            out.result.content
+        );
+        assert!(
+            matches!(out.effects.first(), Some(Effect::Delegate { .. })),
+            "args {args:?} must still delegate"
+        );
+        assert!(
+            !delegation_payload(&out).detached,
+            "args {args:?} payload must be joining"
+        );
+    }
+}
+
+#[tokio::test]
+async fn detached_spawn_accepts_the_string_false_form() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store);
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","wait":"false","task":"t"}"#,
+    )
+    .await;
+    assert!(out.result.ok, "{}", out.result.content);
+    assert_eq!(out.result.content, "spawned-detached:parent/d1");
+}
+
+#[tokio::test]
+async fn detached_spawn_requires_a_durable_store() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store)); // no store wired
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","wait":false,"task":"t"}"#,
+    )
+    .await;
+    assert!(!out.result.ok);
+    assert!(
+        out.result
+            .content
+            .contains("detached spawn requires a durable session store"),
+        "{}",
+        out.result.content
+    );
+}
+
+#[tokio::test]
+async fn detached_fanout_cap_declines_at_the_limit() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store.clone()))
+        .with_store(store.clone())
+        .with_max_fanout(2);
+    // The first two detached spawns succeed (they count as active children even before materializing).
+    for i in 1..=2 {
+        let out = run_as(
+            &tool,
+            "parent",
+            r#"{"verb":"spawn","wait":false,"task":"x"}"#,
+        )
+        .await;
+        assert!(out.result.ok);
+        assert_eq!(out.result.content, format!("spawned-detached:parent/d{i}"));
+    }
+    // The third is declined at the cap (mirroring the depth guard: ok result, no job).
+    let capped = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","wait":false,"task":"x"}"#,
+    )
+    .await;
+    assert!(capped.result.ok);
+    assert_eq!(capped.result.content, "fanout-limit:2");
+    assert!(capped.effects.is_empty());
+    // Only two jobs were enqueued.
+    assert!(store.dequeue_job().await.is_some());
+    assert!(store.dequeue_job().await.is_some());
+    assert!(
+        store.dequeue_job().await.is_none(),
+        "the capped spawn enqueued nothing"
+    );
 }
 
 #[test]

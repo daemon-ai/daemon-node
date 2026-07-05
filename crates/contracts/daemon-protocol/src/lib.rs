@@ -104,6 +104,15 @@ pub struct DelegationInput {
     /// back to the default shape at resolve time.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Whether this is a **detached** (non-suspending) delegation — the orchestrate `spawn wait:false`
+    /// mode. `false` (the default) is the ordinary joining delegation: the parent suspends and the
+    /// child's terminal completion wakes it. `true` runs the child in the background: the parent's
+    /// turn continues, and the child's terminal completion is delivered as a fresh reactive turn (a
+    /// completion *notice*), never a job completion — so the node-side worker binds a completion-notice
+    /// edge instead of a delegation edge. `serde(default)` keeps pre-upgrade payloads decoding as
+    /// joining delegations.
+    #[serde(default)]
+    pub detached: bool,
 }
 
 impl DelegationInput {
@@ -114,6 +123,7 @@ impl DelegationInput {
             attachments: Vec::new(),
             lifetime: DelegationLifetime::default(),
             profile: None,
+            detached: false,
         }
     }
 
@@ -132,6 +142,7 @@ impl DelegationInput {
             attachments: Vec::new(),
             lifetime: DelegationLifetime::default(),
             profile: None,
+            detached: false,
         })
     }
 }
@@ -1493,8 +1504,10 @@ mod tests {
             attachments: vec!["src/a.rs".into(), "notes.md".into()],
             lifetime: DelegationLifetime::Ephemeral,
             profile: Some("opus".into()),
+            detached: true,
         };
         assert_eq!(DelegationInput::decode(&input.encode()), input);
+        assert!(DelegationInput::decode(&input.encode()).detached);
 
         let hash = daemon_common::ContentHash::new([3u8; 32]);
         let result = DelegationResult {
@@ -1509,6 +1522,7 @@ mod tests {
         assert!(legacy_in.attachments.is_empty());
         assert_eq!(legacy_in.lifetime, DelegationLifetime::Persistent);
         assert!(legacy_in.profile.is_none());
+        assert!(!legacy_in.detached, "legacy payloads decode as joining");
 
         let legacy_out = DelegationResult::decode(b"child:parent/c1");
         assert_eq!(legacy_out.summary, "child:parent/c1");
@@ -1538,6 +1552,7 @@ mod tests {
         assert_eq!(decoded.attachments, vec!["a.txt".to_string()]);
         assert_eq!(decoded.lifetime, DelegationLifetime::Persistent);
         assert!(decoded.profile.is_none());
+        assert!(!decoded.detached, "pre-upgrade payloads default to joining");
     }
 
     #[test]

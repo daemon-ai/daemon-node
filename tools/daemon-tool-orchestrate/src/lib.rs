@@ -31,6 +31,18 @@ use daemon_orchestration::FleetRuntime;
 use daemon_protocol::{
     DelegationLifetime, HostRequest, HostRequestKind, HostResponseBody, UserMsg,
 };
+use daemon_store::{ChildLifetime, SessionStatus};
+
+/// Map the protocol-level [`DelegationLifetime`] onto the store's [`ChildLifetime`] (the source of
+/// truth for the materialized child's [`SessionRole`](daemon_store::SessionRole)). Kept local so the
+/// tool constructs the detached [`JobCommand`](daemon_store::JobCommand) directly (bypassing the host
+/// port, which the joining path uses for the `JobId`).
+fn map_lifetime(lifetime: DelegationLifetime) -> ChildLifetime {
+    match lifetime {
+        DelegationLifetime::Persistent => ChildLifetime::Persistent,
+        DelegationLifetime::Ephemeral => ChildLifetime::Ephemeral,
+    }
+}
 
 /// The verbs the agent can invoke through the orchestrate tool.
 enum Verb {
@@ -45,6 +57,11 @@ enum Verb {
         profile: Option<String>,
         /// Parent-workspace-relative paths to hand down into the child's `inbox/`.
         attachments: Vec<String>,
+        /// Whether this turn **blocks** on the child (`true`, the default — the joining
+        /// `Effect::Delegate` path that suspends the parent until the child finishes and returns its
+        /// result inline) or runs the child **detached** in the background (`false` — the parent's
+        /// turn continues and a completion notice arrives later as a fresh reactive turn).
+        wait: bool,
     },
     /// Deliver a follow-up message into an existing child session (Steer-equivalent).
     Send {
@@ -99,11 +116,24 @@ fn parse_args(args: &str) -> Result<Verb, String> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // `wait` defaults to true (the joining, current behavior). Accept a JSON bool, or a
+            // "true"/"false" string defensively (a model that stringifies the flag).
+            let wait = match map.get("wait") {
+                None => true,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(serde_json::Value::String(s)) => match s.trim().to_lowercase().as_str() {
+                    "false" => false,
+                    "true" => true,
+                    other => return Err(format!("wait must be a boolean (got `{other}`)")),
+                },
+                Some(other) => return Err(format!("wait must be a boolean (got `{other}`)")),
+            };
             Ok(Verb::Spawn {
                 task: str_field("task"),
                 lifetime,
                 profile: str_field("profile"),
                 attachments,
+                wait,
             })
         }
         "send" => {
@@ -138,6 +168,7 @@ fn parse_word(args: &str) -> Verb {
             lifetime: DelegationLifetime::Persistent,
             profile: None,
             attachments: Vec::new(),
+            wait: true,
         }
     }
 }
@@ -154,11 +185,20 @@ const DEFAULT_MAX_DEPTH: usize = 8;
 /// case without any walk).
 const MAX_LINEAGE_WALK: usize = 16;
 
+/// The default ceiling on a parent's concurrently-active **detached** children (`spawn wait:false`).
+/// Detached spawns do not suspend the parent, so — unlike joining delegation, which is naturally
+/// serialized by the parent's suspension — a fan-out loop could otherwise mint unbounded background
+/// children. At the cap the tool declines with `fanout-limit:<n>` (mirroring the depth guard),
+/// counting active children via the durable child index.
+const DEFAULT_MAX_FANOUT: usize = 8;
+
 /// The agent's handle onto a node's [`FleetRuntime`] (+ optionally the durable session graph).
 pub struct OrchestrateTool {
     fleet: FleetRuntime,
     label: String,
     max_depth: usize,
+    /// The ceiling on a parent's concurrently-active detached (`spawn wait:false`) children.
+    max_fanout: usize,
     /// The durable session store backing the `send` + per-child `status` verbs. `None` (tests /
     /// legacy assemblies) keeps `status` on the fleet-wide counts and makes `send` unavailable.
     store: Option<Arc<dyn daemon_store::SessionStore>>,
@@ -177,6 +217,7 @@ impl OrchestrateTool {
             fleet,
             label: "orchestrated-work".into(),
             max_depth: DEFAULT_MAX_DEPTH,
+            max_fanout: DEFAULT_MAX_FANOUT,
             store: None,
         }
     }
@@ -187,6 +228,7 @@ impl OrchestrateTool {
             fleet,
             label: label.into(),
             max_depth: DEFAULT_MAX_DEPTH,
+            max_fanout: DEFAULT_MAX_FANOUT,
             store: None,
         }
     }
@@ -196,6 +238,30 @@ impl OrchestrateTool {
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
         self
+    }
+
+    /// Cap a parent's concurrently-active detached (`spawn wait:false`) children at `max_fanout`.
+    pub fn with_max_fanout(mut self, max_fanout: usize) -> Self {
+        self.max_fanout = max_fanout;
+        self
+    }
+
+    /// The count of a parent's currently-active children (any not-yet-`Completed` child in the
+    /// durable child index) — the fan-out guard's measure. A just-enqueued detached child (no session
+    /// row yet, so `status` is `None`) counts as active, so a within-turn fan-out loop is bounded; a
+    /// `Completed` child does not, so a parent may spawn again once earlier children finish. `0` when
+    /// no store is wired.
+    async fn active_child_count(&self, parent: &SessionId) -> usize {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let mut active = 0usize;
+        for child in store.children_of(parent).await {
+            if store.status(&child).await != Some(SessionStatus::Completed) {
+                active += 1;
+            }
+        }
+        active
     }
 
     /// Give the tool the durable session store so `status` reports per-child state from the durable
@@ -296,7 +362,7 @@ impl Tool for OrchestrateTool {
     }
 
     fn schema(&self) -> &str {
-        r#"{"type":"object","properties":{"verb":{"type":"string","enum":["spawn","send","status","cancel"],"description":"spawn a child (default), send a follow-up message to one, report per-child status, or cancel one"},"task":{"type":"string","description":"spawn: the instruction seeding the child's first turn. send: the message text to deliver."},"lifetime":{"type":"string","enum":["persistent","ephemeral"],"description":"spawn: persistent = long-lived managed child (default); ephemeral = transient subagent, archived after it completes"},"profile":{"type":"string","description":"spawn: named profile the child runs under (omit for the default engine shape)"},"attachments":{"type":"array","items":{"type":"string"},"description":"spawn: parent-workspace-relative paths handed to the child's inbox/"},"target":{"type":"string","description":"send/cancel: the child id (required). status: optional filter to one child."}}}"#
+        r#"{"type":"object","properties":{"verb":{"type":"string","enum":["spawn","send","status","cancel"],"description":"spawn a child (default), send a follow-up message to one, report per-child status, or cancel one"},"task":{"type":"string","description":"spawn: the instruction seeding the child's first turn. send: the message text to deliver."},"lifetime":{"type":"string","enum":["persistent","ephemeral"],"description":"spawn: persistent = long-lived managed child (default); ephemeral = transient subagent, archived after it completes"},"profile":{"type":"string","description":"spawn: named profile the child runs under (omit for the default engine shape)"},"attachments":{"type":"array","items":{"type":"string"},"description":"spawn: parent-workspace-relative paths handed to the child's inbox/"},"wait":{"type":"boolean","description":"spawn: true (default) blocks this turn until the child finishes and returns its result inline; false runs the child in the background and delivers a completion notification later, letting this turn continue and fan out more subagents"},"target":{"type":"string","description":"send/cancel: the child id (required). status: optional filter to one child."}}}"#
     }
 
     /// Per-call batch-concurrency class: `status` is a read-only projection and may run alongside
@@ -325,14 +391,15 @@ impl Tool for OrchestrateTool {
             Verb::Spawn { .. } if session_depth(cx.session_id.as_str()) >= self.max_depth => {
                 Self::ok(call, format!("depth-limit:{}", self.max_depth), Vec::new())
             }
-            // DOWN edge: record the delegation through the host port; the fleet worker spawns the
-            // child when the resulting durable job is processed. Emitting Effect::Delegate suspends
-            // the parent until the child's completion wakes it (lifecycle §3.1).
+            // DOWN edge (joining): record the delegation through the host port; the fleet worker
+            // spawns the child when the resulting durable job is processed. Emitting Effect::Delegate
+            // suspends the parent until the child's completion wakes it (lifecycle §3.1).
             Verb::Spawn {
                 task,
                 lifetime,
                 profile,
                 attachments,
+                wait: true,
             } => {
                 // The agent's task instruction; the tool's static label is the back-compat
                 // fallback for callers that pass none (the mock provider's bare `{}`).
@@ -358,6 +425,7 @@ impl Tool for OrchestrateTool {
                     attachments,
                     lifetime,
                     profile,
+                    detached: false,
                 }
                 .encode();
                 Self::ok(
@@ -368,6 +436,63 @@ impl Tool for OrchestrateTool {
                         payload,
                     }],
                 )
+            }
+            // DETACHED (non-joining): enqueue the child directly onto the durable job outbox — no
+            // Effect::Delegate, so the parent's turn does NOT suspend and keeps running. The child's
+            // terminal completion arrives later as a fresh reactive turn (a completion notice). This
+            // is Cursor's `run_in_background: true` subagent analogue.
+            Verb::Spawn {
+                task,
+                lifetime,
+                profile,
+                attachments,
+                wait: false,
+            } => {
+                let Some(store) = &self.store else {
+                    return Self::err(
+                        call,
+                        "detached spawn requires a durable session store".into(),
+                    );
+                };
+                // Fan-out cap: a detached spawn does not suspend the parent, so a fan-out loop could
+                // mint unbounded background children. Decline at the cap (mirroring the depth guard).
+                let active = self.active_child_count(&cx.session_id).await;
+                if active >= self.max_fanout {
+                    return Self::ok(
+                        call,
+                        format!("fanout-limit:{}", self.max_fanout),
+                        Vec::new(),
+                    );
+                }
+                let task = task.unwrap_or_else(|| self.label.clone());
+                let payload = daemon_protocol::DelegationInput {
+                    task,
+                    attachments,
+                    lifetime,
+                    profile,
+                    detached: true,
+                }
+                .encode();
+                // The store mints the unique `{parent}/dN` child id, stamps it onto the bare job, and
+                // enqueues it (no checkpoint/suspension). Then record the completion-notice edge so
+                // the child's terminal `mark_completed` delivers a notice to this parent (and the
+                // child shows up in `status`/tree immediately).
+                let job = daemon_store::JobCommand {
+                    job_id: JobId::new(format!("{}:detached", cx.session_id)),
+                    session_id: cx.session_id.clone(),
+                    epoch: daemon_common::Epoch::ZERO,
+                    payload,
+                    lifetime: map_lifetime(lifetime),
+                    child: None,
+                };
+                let child = match store.enqueue_detached_job(job).await {
+                    Ok(child) => child,
+                    Err(e) => return Self::err(call, format!("detached spawn failed: {e}")),
+                };
+                if let Err(e) = store.bind_completion_notice(&child, &cx.session_id).await {
+                    return Self::err(call, format!("detached spawn failed: {e}"));
+                }
+                Self::ok(call, format!("spawned-detached:{child}"), Vec::new())
             }
             Verb::Send { target, text } => {
                 let Some(store) = &self.store else {

@@ -331,6 +331,11 @@ pub struct JobCommand {
     /// managed children); the ephemeral-subagent producer is forward-looking.
     #[serde(default)]
     pub lifetime: ChildLifetime,
+    /// The pre-minted child session id for a **detached** (`enqueue_detached_job`) job, so the fleet
+    /// worker materializes the child at a store-chosen unique `{parent}/d{n}` id rather than deriving
+    /// `{parent}/c{epoch}`. `None` for an ordinary joining delegation (the worker derives the id).
+    #[serde(default)]
+    pub child: Option<SessionId>,
 }
 
 /// A durable background-job completion, applied idempotently per `(session, epoch, job)`.
@@ -343,6 +348,24 @@ pub struct JobCompletion {
     /// The job that completed.
     pub job_id: JobId,
     /// Opaque completion payload.
+    pub payload: Vec<u8>,
+}
+
+/// A durable **completion notice** for a detached (`enqueue_detached_job`) child: unlike a
+/// [`JobCompletion`] it never fulfills a parent job (there is no `waiting_for`/`completion_inbox`
+/// entry to satisfy). It is drained off the notice outbox by the node's notice worker, which decodes
+/// the opaque `payload` (a CBOR [`DelegationResult`](daemon_protocol) — the child's summary + any
+/// artifacts) and injects a `[subagent {child} completed] {summary}` reactive turn into the parent.
+/// Pushed by [`SessionStore::mark_completed`] in the terminal transaction when the child carries a
+/// completion-notice edge ([`SessionStore::bind_completion_notice`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionNotice {
+    /// The parent session the notice is delivered to (as a fresh reactive turn).
+    pub parent: SessionId,
+    /// The detached child that reached a terminal state.
+    pub child: SessionId,
+    /// The opaque completion payload (a CBOR `DelegationResult`; the legacy `child:{id}` marker for a
+    /// child that produced no structured result).
     pub payload: Vec<u8>,
 }
 
@@ -708,6 +731,41 @@ pub trait SessionStore: Send + Sync {
     /// recursive and recovery-safe at any depth. Default: a no-op (a non-authoritative proxy store).
     async fn bind_delegation(&self, _child: SessionId, _job: JobCommand) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// Enqueue a **detached** background job onto the durable job outbox *without* a checkpoint or a
+    /// suspension — the seam behind the orchestrate `spawn wait:false` mode. Unlike
+    /// [`checkpoint_and_enqueue`](Self::checkpoint_and_enqueue) the delegating parent is neither
+    /// snapshotted nor moved to `Suspended`: its turn keeps running. The store mints a **unique**
+    /// child id `{parent}/d{n}` via a per-parent monotonic sequence (so a turn-retry re-enqueue
+    /// produces a distinct child rather than colliding), stamps it onto the job's
+    /// [`JobCommand::child`], enqueues the job, and returns the minted id. Pair with
+    /// [`bind_completion_notice`](Self::bind_completion_notice) so the child's terminal completion is
+    /// delivered to the parent as a notice. Default: a no-op returning `job.session_id` (a
+    /// non-authoritative proxy store).
+    async fn enqueue_detached_job(&self, job: JobCommand) -> Result<SessionId, StoreError> {
+        Ok(job.session_id)
+    }
+
+    /// Record a **completion-notice** edge: `child` is a detached background child of `parent` whose
+    /// terminal completion must be delivered to the parent as a fresh reactive turn (a notice), NOT
+    /// as a job completion. This ALSO records the child under `parent` in the tree/child index (so
+    /// `status`/tree see it) but — unlike [`bind_delegation`](Self::bind_delegation) — binds no
+    /// parent job, so [`mark_completed`](Self::mark_completed) never records a `completion_inbox`
+    /// entry or wakes the parent through the `waiting_for` rail; it pushes a [`CompletionNotice`]
+    /// instead. Idempotent. Default: a no-op (a non-authoritative proxy store).
+    async fn bind_completion_notice(
+        &self,
+        _child: &SessionId,
+        _parent: &SessionId,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Pop the next pending [`CompletionNotice`], if any (the node's notice-worker side). Default:
+    /// `None` (a non-authoritative proxy store / a store without the notice seam).
+    async fn dequeue_completion_notice(&self) -> Option<CompletionNotice> {
+        None
     }
 
     /// Record an **attached, non-joining** parent->child edge for audit (§4.3): the child appears
@@ -1106,6 +1164,18 @@ struct Inner {
     wake_outbox: VecDeque<SessionId>,
     /// child session -> the parent job its terminal completion fulfills (the durable tree edge).
     delegations: HashMap<SessionId, JobCommand>,
+    /// Detached child session -> its parent (the completion-notice edge). Persistent (drives tree
+    /// visibility via `child_index` + the notice firing in `mark_completed`); the in-memory analogue
+    /// of the SQLite `completion_notices` table.
+    completion_notices: HashMap<SessionId, SessionId>,
+    /// Detached children whose terminal notice has already been pushed onto `notice_outbox`, so a
+    /// re-completion (a resumed detached child) fires the notice at most once (idempotency).
+    notices_fired: HashSet<SessionId>,
+    /// Pending completion notices for detached children, drained by the node's notice worker (the
+    /// in-memory analogue of the SQLite `completion_notice_outbox` table).
+    notice_outbox: VecDeque<CompletionNotice>,
+    /// Per-parent monotonic counter minting the unique `{parent}/d{n}` detached child ids.
+    detached_seq: HashMap<SessionId, u64>,
     /// Per-session pending inbound inputs (opaque bytes), FIFO — the durable `send` seam drained by
     /// the next activation's hydrate (the in-memory analogue of the SQLite `pending_session_input`
     /// table).
@@ -1341,6 +1411,27 @@ impl SessionStore for InMemoryStore {
                 inner.wake_outbox.push_back(completion.session_id);
             }
         }
+        // If this session is a detached child with a completion-notice edge, push a CompletionNotice
+        // (delivered to the parent as a fresh reactive turn) in the SAME transaction as the terminal
+        // flip — NEVER a `completion_inbox` entry or a `wake_outbox` wake (there is no parent job to
+        // fulfill). Idempotent per child (a resumed child that completes again fires once).
+        if let Some(parent) = inner
+            .completion_notices
+            .get(&checkpoint.session_id)
+            .cloned()
+        {
+            if inner.notices_fired.insert(checkpoint.session_id.clone()) {
+                let payload = checkpoint
+                    .completion_payload
+                    .clone()
+                    .unwrap_or_else(|| format!("child:{}", checkpoint.session_id).into_bytes());
+                inner.notice_outbox.push_back(CompletionNotice {
+                    parent,
+                    child: checkpoint.session_id.clone(),
+                    payload,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1369,6 +1460,42 @@ impl SessionStore for InMemoryStore {
             .push(child.clone());
         inner.delegations.insert(child, job);
         Ok(())
+    }
+
+    async fn enqueue_detached_job(&self, mut job: JobCommand) -> Result<SessionId, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let parent = job.session_id.clone();
+        let seq = inner.detached_seq.entry(parent.clone()).or_insert(0);
+        *seq += 1;
+        let child = SessionId::new(format!("{}/d{}", parent, *seq));
+        // A detached job is bare (no checkpoint, no suspension, no `enqueued_jobs` dedupe): the parent
+        // keeps running. The pre-minted child id rides on the job so the fleet worker materializes the
+        // child at exactly this id.
+        job.child = Some(child.clone());
+        inner.job_outbox.push_back(job);
+        Ok(child)
+    }
+
+    async fn bind_completion_notice(
+        &self,
+        child: &SessionId,
+        parent: &SessionId,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Idempotent tree edge: record the child under the parent for `children_of`/tree, but not in
+        // `delegations` (so `mark_completed` binds no job — the child self-closes with a notice).
+        let siblings = inner.child_index.entry(parent.clone()).or_default();
+        if !siblings.contains(child) {
+            siblings.push(child.clone());
+        }
+        inner
+            .completion_notices
+            .insert(child.clone(), parent.clone());
+        Ok(())
+    }
+
+    async fn dequeue_completion_notice(&self) -> Option<CompletionNotice> {
+        self.inner.lock().unwrap().notice_outbox.pop_front()
     }
 
     async fn record_child_edge(
@@ -2456,5 +2583,161 @@ mod pending_input_tests {
     #[tokio::test]
     async fn sqlite_pending_inputs_drain_fifo_once() {
         pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+}
+
+#[cfg(test)]
+mod detached_delegation_tests {
+    //! The detached-delegation (W9 `spawn wait:false`) store seam, proven against both backends:
+    //! `enqueue_detached_job` mints unique `{parent}/dN` children and stamps them onto the bare job;
+    //! `bind_completion_notice` makes the child tree-visible without a delegation edge; and a detached
+    //! child's terminal `mark_completed` pushes exactly one `CompletionNotice` (idempotent), stamps
+    //! `terminal_ms`, and NEVER touches the `completion_inbox`/`wake_outbox` rails.
+
+    use super::*;
+
+    fn detached_job(parent: &SessionId) -> JobCommand {
+        JobCommand {
+            job_id: JobId::new(format!("{parent}:detached")),
+            session_id: parent.clone(),
+            epoch: Epoch::ZERO,
+            payload: Vec::new(),
+            lifetime: ChildLifetime::Persistent,
+            child: None,
+        }
+    }
+
+    /// `enqueue_detached_job` mints a unique `{parent}/dN` id per call (monotonic), stamps it onto the
+    /// enqueued job, and isolates the sequence per parent.
+    async fn fanout_mint_behaviour(store: &dyn SessionStore) {
+        let a = SessionId::new("pa");
+        let b = SessionId::new("pb");
+        let a1 = store.enqueue_detached_job(detached_job(&a)).await.unwrap();
+        let a2 = store.enqueue_detached_job(detached_job(&a)).await.unwrap();
+        let b1 = store.enqueue_detached_job(detached_job(&b)).await.unwrap();
+        assert_eq!(a1.as_str(), "pa/d1");
+        assert_eq!(a2.as_str(), "pa/d2");
+        assert_eq!(b1.as_str(), "pb/d1", "the sequence is per-parent");
+        assert_ne!(a1, a2);
+
+        // Each job carries its pre-minted child id (FIFO order).
+        let j1 = store.dequeue_job().await.expect("job 1");
+        assert_eq!(j1.child, Some(a1));
+        let j2 = store.dequeue_job().await.expect("job 2");
+        assert_eq!(j2.child, Some(a2));
+        let j3 = store.dequeue_job().await.expect("job 3");
+        assert_eq!(j3.child, Some(b1));
+    }
+
+    #[tokio::test]
+    async fn in_memory_fanout_mints_unique_children() {
+        fanout_mint_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_fanout_mints_unique_children() {
+        fanout_mint_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    /// A detached child's terminal completion pushes exactly one `CompletionNotice` (idempotent on
+    /// re-completion), stamps `terminal_ms`, keeps the child tree-visible, and touches neither the
+    /// parent's `completion_inbox` (unapplied) nor the `wake_outbox`.
+    async fn notice_branch_behaviour(store: &dyn SessionStore) {
+        let parent = SessionId::new("parent");
+        let child = SessionId::new("parent/d1");
+        // A parent row so we can assert its completion inbox stays empty (no job was fulfilled).
+        store
+            .create_session(
+                parent.clone(),
+                PartitionId::DEFAULT,
+                SnapshotBlob::default(),
+            )
+            .await
+            .unwrap();
+        let parent_fence = store.acquire_activation_lease(&parent).await.unwrap();
+
+        store.bind_completion_notice(&child, &parent).await.unwrap();
+        // The child is tree-visible under the parent even before it materializes.
+        assert!(
+            store.children_of(&parent).await.contains(&child),
+            "the detached child shows up in the parent's tree/child index"
+        );
+
+        store
+            .create_session(child.clone(), PartitionId::DEFAULT, SnapshotBlob::default())
+            .await
+            .unwrap();
+        let fence = store.acquire_activation_lease(&child).await.unwrap();
+        store
+            .mark_completed(
+                Checkpoint::new(child.clone(), Epoch(1), SnapshotBlob::default())
+                    .with_completion_payload(Some(b"did the thing".to_vec())),
+                fence,
+            )
+            .await
+            .unwrap();
+
+        // Exactly one notice, carrying the structured payload, addressed parent<-child.
+        let notice = store
+            .dequeue_completion_notice()
+            .await
+            .expect("one completion notice");
+        assert_eq!(notice.parent, parent);
+        assert_eq!(notice.child, child);
+        assert_eq!(notice.payload, b"did the thing".to_vec());
+        assert!(
+            store.dequeue_completion_notice().await.is_none(),
+            "exactly one notice per terminal child"
+        );
+
+        // The notice branch never touches the job-completion rails: no wake, no parent completion.
+        assert!(
+            store.dequeue_wake().await.is_none(),
+            "a detached child never wakes its parent through the wake outbox"
+        );
+        let parent_activation = store
+            .load_for_activation(&parent, parent_fence)
+            .await
+            .unwrap();
+        assert!(
+            parent_activation.unapplied.is_empty(),
+            "a detached child records no completion_inbox entry for the parent"
+        );
+
+        // terminal_ms stamped (same transaction as the flip).
+        assert!(
+            store
+                .session_meta(&child)
+                .await
+                .and_then(|m| m.terminal_ms)
+                .is_some(),
+            "mark_completed stamps the terminal clock on a detached child too"
+        );
+
+        // Re-completion (a resumed child) fires the notice at most once (idempotent).
+        let fence2 = store.acquire_activation_lease(&child).await.unwrap();
+        store
+            .mark_completed(
+                Checkpoint::new(child.clone(), Epoch(2), SnapshotBlob::default()),
+                fence2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.dequeue_completion_notice().await.is_none(),
+            "a re-completed detached child does not fire a second notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_notice_branch_fires_once() {
+        notice_branch_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_notice_branch_fires_once() {
+        notice_branch_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }
