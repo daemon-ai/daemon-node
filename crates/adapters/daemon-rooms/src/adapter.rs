@@ -40,8 +40,8 @@ use daemon_host::journal::JournalSink;
 use daemon_host::{with_request_context, RequestContext};
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
-    AgentEvent, RoomId, RoomMember, RoomPolicy, SessionPayload, TranscriptBlock, TranscriptRole,
-    TransportId,
+    AgentEvent, RoomId, RoomMember, RoomPolicy, SenderId, SessionPayload, TranscriptBlock,
+    TranscriptRole, TransportId,
 };
 use daemon_store::{Room, RoomMember as StoreRoomMember, SessionStore};
 use daemon_telemetry::TraceSigner;
@@ -81,7 +81,9 @@ enum RoomCommand {
     /// Fan a `from`-attributed external post out to a room's members (floor-gated; transcribed).
     Post {
         room: RoomId,
-        sender: String,
+        /// The immutable sender identity (an agent/contact handle, or [`SenderId::local_loopback`]
+        /// for an operator post) — never re-derived from display text.
+        sender: SenderId,
         text: String,
     },
 }
@@ -120,7 +122,7 @@ struct RoomRuntimeParts {
 /// cascade (`reset_budget`).
 struct RoomPost {
     room: RoomId,
-    sender: String,
+    sender: SenderId,
     text: String,
     role: TranscriptRole,
     reset_budget: bool,
@@ -266,7 +268,7 @@ impl RoomRuntime {
         let sink = self.transcript_sink(&room);
         let block = TranscriptBlock::Message {
             role,
-            text: format!("{sender}: {text}"),
+            text: format!("{}: {}", sender.as_str(), text),
         };
         if let Err(e) = sink.record_block(&block).await {
             tracing::warn!(error = %e, "rooms: transcript record failed");
@@ -290,7 +292,7 @@ impl RoomRuntime {
             if reset_budget {
                 fc.begin_post();
             }
-            fc.decide(&members, &sender, &text)
+            fc.decide(&members, sender.as_str(), &text)
         };
 
         // 4. Fan out (creates member sessions on first `StartTurn`).
@@ -309,7 +311,7 @@ impl RoomRuntime {
     }
 
     /// An external/operator `ConvSend` post (starts a fresh cascade).
-    async fn external_post(&self, room: RoomId, sender: String, text: String) {
+    async fn external_post(&self, room: RoomId, sender: SenderId, text: String) {
         self.post(RoomPost {
             room,
             sender,
@@ -326,7 +328,8 @@ impl RoomRuntime {
         if let Some((room, member)) = resolved {
             self.post(RoomPost {
                 room,
-                sender: member,
+                // The member handle is a structured identity (from the membership table), not text.
+                sender: SenderId::new(member),
                 text,
                 role: TranscriptRole::Assistant,
                 reset_budget: false,
@@ -675,9 +678,11 @@ impl SupportsConversations for RoomsAdapter {
             return Err(ApiError::Other(format!("room {conv} not found")));
         }
         let sender = match from {
-            Some(Participant::Agent { member, .. }) => member,
-            Some(Participant::Contact(c)) => c.id,
-            None => "operator".to_string(),
+            Some(Participant::Agent { member, .. }) => SenderId::new(member),
+            Some(Participant::Contact(c)) => SenderId::new(c.id),
+            // No external participant: a node/operator loopback post — a typed, documented identity
+            // rather than a re-derivable "operator" string.
+            None => SenderId::local_loopback(),
         };
         self.cmd_tx
             .send(RoomCommand::Post {

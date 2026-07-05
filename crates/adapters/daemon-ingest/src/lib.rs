@@ -29,13 +29,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use daemon_api::{ApiError, NodeApi};
 use daemon_common::{ReqId, SessionId};
-use daemon_protocol::{session_id_for, AgentCommand, IsolationPolicy, Origin, UserMsg};
+use daemon_protocol::{session_id_for, AgentCommand, IsolationPolicy, Origin, SenderId, UserMsg};
 
 /// What to do with an **addressed** message that arrives while the session's engine is mid-turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,10 +64,37 @@ pub enum AmbientPolicy {
     Fold,
 }
 
+/// Who may open/steer/observe a turn through this gate, keyed on the **immutable** [`SenderId`] the
+/// adapter supplies (never display text). Evaluated first in [`Ingestor::receive`], before any
+/// command is derived or submitted.
+#[derive(Clone, Debug, Default)]
+pub enum SenderPolicy {
+    /// No sender restriction (the default — preserves today's open behavior). The structural
+    /// guarantee (a required, immutable `Reception.sender`) still holds; this only governs
+    /// allow-listing.
+    #[default]
+    AllowAll,
+    /// Only these immutable sender ids are admitted; any other sender is rejected with
+    /// [`ApiError::Forbidden`] at the ingest boundary. Because the id is the adapter-supplied
+    /// platform identity (not parsed from the body), a forged `"@allowed: …"` message body cannot
+    /// bypass the list.
+    AllowList(HashSet<SenderId>),
+}
+
+impl SenderPolicy {
+    /// Whether `sender` is permitted under this policy.
+    fn allows(&self, sender: &SenderId) -> bool {
+        match self {
+            SenderPolicy::AllowAll => true,
+            SenderPolicy::AllowList(set) => set.contains(sender),
+        }
+    }
+}
+
 /// How an [`Ingestor`] gates inbound messages. `Default` is the recommended shape: queue addressed
-/// messages while busy, surface ambient ones via `Observe`, a ~32-entry cap, and `PerThread`
-/// isolation (matching `submit_routed`'s own default id derivation).
-#[derive(Clone, Copy, Debug)]
+/// messages while busy, surface ambient ones via `Observe`, a ~32-entry cap, `PerThread` isolation
+/// (matching `submit_routed`'s own default id derivation), and no sender allow-list.
+#[derive(Clone, Debug)]
 pub struct IngestPolicy {
     /// Disposition of an addressed message that arrives mid-turn.
     pub busy: BusyPolicy,
@@ -80,6 +107,8 @@ pub struct IngestPolicy {
     /// the gate's id matches the one `submit_routed` resolves for the common (no per-row override)
     /// case.
     pub isolation: IsolationPolicy,
+    /// Which immutable senders may drive a turn (default [`SenderPolicy::AllowAll`]).
+    pub sender: SenderPolicy,
 }
 
 impl Default for IngestPolicy {
@@ -89,6 +118,17 @@ impl Default for IngestPolicy {
             ambient: AmbientPolicy::default(),
             queue_cap: 32,
             isolation: IsolationPolicy::PerThread,
+            sender: SenderPolicy::default(),
+        }
+    }
+}
+
+impl IngestPolicy {
+    /// The default policy, but restricted to a specific set of allowed [`SenderId`]s.
+    pub fn allow_only(senders: impl IntoIterator<Item = SenderId>) -> Self {
+        Self {
+            sender: SenderPolicy::AllowList(senders.into_iter().collect()),
+            ..Self::default()
         }
     }
 }
@@ -99,7 +139,12 @@ impl Default for IngestPolicy {
 pub struct Reception {
     /// Where it came from (the routing key + reply address).
     pub origin: Origin,
-    /// The message body (attribution — who spoke — rides inside the text, adapter-formatted).
+    /// The **immutable** platform identity of who sent it (Matrix MXID, etc.) — supplied by the
+    /// adapter, never parsed from the body. Required, so a new adapter cannot compile without one and
+    /// can never substitute mutable display text; the [`SenderPolicy`] gate keys on it.
+    pub sender: SenderId,
+    /// The message body (human-readable attribution may ride inside the text, adapter-formatted; the
+    /// authoritative sender is [`Reception::sender`], not this string).
     pub input: UserMsg,
     /// Whether this message addresses the agent (mention / DM / `!command`): `true` may open or
     /// steer a turn; `false` is ambient context only.
@@ -173,6 +218,14 @@ impl Ingestor {
     /// Buffer-only outcomes (ambient in `Fold` mode; addressed-while-busy in `Queue` mode) submit
     /// nothing and return the derived id.
     pub async fn receive(&self, r: Reception) -> Result<SessionId, ApiError> {
+        // Sender gate FIRST: reject a non-allow-listed sender before deriving a session or submitting
+        // anything. Keys on the immutable, adapter-supplied `SenderId` — a forged body cannot bypass.
+        if !self.policy.sender.allows(&r.sender) {
+            return Err(ApiError::Forbidden(format!(
+                "sender not allowed: {}",
+                r.sender.as_str()
+            )));
+        }
         let session = session_id_for(&r.origin, self.policy.isolation);
         // Phase 1: decide + mutate gate state under the lock, collecting commands to submit (the
         // std Mutex must not be held across an await).

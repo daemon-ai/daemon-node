@@ -288,7 +288,9 @@ async fn ingest_gate_folds_ambient_then_addressed_turns_impl() {
     use daemon_api::{NodeApi, Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_ingest::{Ingestor, Reception};
-    use daemon_protocol::{AgentCommand, AgentEvent, ConvView, Origin, OriginScope, UserMsg};
+    use daemon_protocol::{
+        AgentCommand, AgentEvent, ConvView, Origin, OriginScope, SenderId, UserMsg,
+    };
 
     async fn drain_until(
         node: &Arc<NodeApiImpl>,
@@ -325,6 +327,7 @@ async fn ingest_gate_folds_ambient_then_addressed_turns_impl() {
     let session = ing
         .receive(Reception {
             origin: origin.clone(),
+            sender: SenderId::new("@alice:hs"),
             input: UserMsg::new("[alice] the launch code is 4242"),
             addressed: false,
         })
@@ -349,6 +352,7 @@ async fn ingest_gate_folds_ambient_then_addressed_turns_impl() {
     let s2 = ing
         .receive(Reception {
             origin: origin.clone(),
+            sender: SenderId::new("@alice:hs"),
             input: UserMsg::new("what is the code?"),
             addressed: true,
         })
@@ -421,7 +425,9 @@ async fn ingest_gate_queues_addressed_while_busy_then_flushes_impl() {
     use daemon_common::ReqId;
     use daemon_core::{Tool, ToolCall, ToolOutcome, TurnCx};
     use daemon_ingest::{Ingestor, Reception};
-    use daemon_protocol::{AgentCommand, AgentEvent, ConvView, Origin, OriginScope, UserMsg};
+    use daemon_protocol::{
+        AgentCommand, AgentEvent, ConvView, Origin, OriginScope, SenderId, UserMsg,
+    };
 
     struct GateTool {
         release: Arc<tokio::sync::Notify>,
@@ -521,6 +527,7 @@ async fn ingest_gate_queues_addressed_while_busy_then_flushes_impl() {
     let session = ing
         .receive(Reception {
             origin: origin.clone(),
+            sender: SenderId::new("@alice:hs"),
             input: UserMsg::new("first"),
             addressed: true,
         })
@@ -533,6 +540,7 @@ async fn ingest_gate_queues_addressed_while_busy_then_flushes_impl() {
     // An addressed message arrives mid-turn: queued, not yet submitted.
     ing.receive(Reception {
         origin: origin.clone(),
+        sender: SenderId::new("@alice:hs"),
         input: UserMsg::new("second"),
         addressed: true,
     })
@@ -600,7 +608,7 @@ async fn ingest_gate_routes_distinct_origins_to_bound_profiles_impl() {
     use daemon_api::{BoundAccount, NodeApi, Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_host::{MemProfileStore, ProfileStore};
     use daemon_ingest::{Ingestor, Reception};
-    use daemon_protocol::{AgentEvent, Origin, OriginScope, UserMsg};
+    use daemon_protocol::{AgentEvent, Origin, OriginScope, SenderId, UserMsg};
 
     let store = Arc::new(MemProfileStore::new());
     store
@@ -682,6 +690,7 @@ async fn ingest_gate_routes_distinct_origins_to_bound_profiles_impl() {
                 thread: None,
             },
         ),
+        sender: SenderId::new("@u:hs"),
         input: UserMsg::new("hi"),
         addressed: true,
     };

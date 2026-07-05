@@ -2288,6 +2288,7 @@ dependencies = [
  "daemon-common",
  "daemon-protocol",
  "futures",
+ "idna",
  "libc",
  "serde",
  "serde_json",

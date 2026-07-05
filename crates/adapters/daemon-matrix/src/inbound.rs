@@ -20,7 +20,7 @@ use matrix_sdk::Room;
 
 use daemon_host::{with_request_context, RequestContext};
 use daemon_ingest::{Ingestor, Reception};
-use daemon_protocol::{Origin, OriginScope, TransportId, UserMsg};
+use daemon_protocol::{Origin, OriginScope, SenderId, TransportId, UserMsg};
 
 use crate::config::{self, MatrixRoute};
 use crate::outbound::DeliveryManager;
@@ -99,6 +99,10 @@ pub async fn on_room_message(ev: OriginalSyncRoomMessageEvent, room: Room, ctx: 
     let attributed = format!("{}: {}", ev.sender, body);
     let reception = Reception {
         origin,
+        // The immutable platform identity: the Matrix MXID (`@user:hs`), never the room display name.
+        // This is what the ingest `SenderPolicy` gate keys on — supplied structurally, never parsed
+        // back out of `attributed`.
+        sender: SenderId::new(ev.sender.as_str()),
         input: UserMsg::new(attributed),
         addressed,
     };
