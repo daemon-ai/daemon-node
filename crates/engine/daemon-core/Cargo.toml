@@ -26,11 +26,13 @@ sha2 = { workspace = true }
 # so they are logged rather than propagated). The only logging dep in the otherwise log-free core.
 tracing = { workspace = true }
 
-# Interim symlink/TOCTOU guard (Cluster C, `exec::open_read_guarded`/`open_write_guarded`): the
-# `O_NOFOLLOW` open flag. Unix-only so the non-unix build falls back to `symlink_metadata` and never
-# links libc.
+# The Phase 3 `ContainedRoot` capability (Cluster C, `exec::contained`): `openat2`
+# (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | NO_MAGICLINKS) on Linux + the `openat`/`fstatat`/
+# `mkdirat`/`unlinkat`/`renameat` family for the cross-unix fd-relative fallback. rustix's public API
+# is safe, so `#![forbid(unsafe_code)]` (lib.rs) is preserved — no `unsafe` is written here. Unix-only;
+# the non-unix build uses the lexical `contain()` + `symlink_metadata` stub and never links rustix.
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+rustix = { workspace = true }
 
 [features]
 # OFF by default. Gates recording the OpenTelemetry GenAI attributes (incl. full prompt/completion/

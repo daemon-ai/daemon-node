@@ -48,3 +48,4 @@ alikes = "alikes"
 [default.extend-identifiers]
 ratatui = "ratatui"         # the Rust TUI crate
 Ratatui = "Ratatui"
+WRONLY = "WRONLY"           # rustix/POSIX open flag OFlags::WRONLY (write-only)

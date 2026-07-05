@@ -72,8 +72,8 @@ pub use engine::{
 };
 pub use events::{EventSink, SessionLog};
 pub use exec::{
-    contain, resolve_program_abs, Command, CommandFingerprint, ExecCx, ExecResult,
-    ExecutionEnvironment, LocalEnvironment,
+    contain, resolve_program_abs, ChildCwd, Command, CommandFingerprint, ContainedRoot,
+    DirEntryLite, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment, Meta,
 };
 #[cfg(feature = "otel")]
 pub use genai_telemetry::set_genai_capture;

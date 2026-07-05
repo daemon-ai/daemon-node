@@ -19,16 +19,12 @@ use daemon_common::cursored::CursoredRing;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use daemon_api::{
     clamp_page_max, ApiError, FsChange, FsChangeKind, FsContent, FsEntry, FsEntryKind, FsListPage,
     FsRevision, FsRootId, FsSearchHit, FsSearchPage, FsSearchQuery, FsWatchPageView, WIRE_PAGE_MAX,
 };
-use daemon_core::exec::{
-    contain, open_read_guarded, open_write_guarded, reject_symlink_final_below,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use daemon_core::exec::{ContainedRoot, Meta};
 
 /// Default `fs_read` cap when the caller passes `max_bytes == 0`.
 const DEFAULT_MAX_READ: u64 = 1024 * 1024;
@@ -61,18 +57,11 @@ fn is_ignored_name(name: &str) -> bool {
     IGNORED_NAMES.contains(&name)
 }
 
-fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn entry_kind(meta: &std::fs::Metadata) -> FsEntryKind {
-    if meta.file_type().is_symlink() {
+/// The wire entry-kind for a [`ContainedRoot`] entry's non-following metadata.
+fn entry_kind(meta: &Meta) -> FsEntryKind {
+    if meta.is_symlink {
         FsEntryKind::Symlink
-    } else if meta.is_dir() {
+    } else if meta.is_dir {
         FsEntryKind::Dir
     } else {
         FsEntryKind::File
@@ -244,9 +233,11 @@ impl WorkspaceFs {
         }
     }
 
-    /// Contain a root-relative path against the resolved base (rejects `..`/absolute escapes).
-    fn contained(base: &Path, rel: &str) -> Result<PathBuf, ApiError> {
-        contain(base, Path::new(rel)).map_err(|e| ApiError::Other(format!("path not allowed: {e}")))
+    /// Open the resolved base as a [`ContainedRoot`] — every subsequent path op resolves via
+    /// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` from that root fd, so no relative path (at any
+    /// component) can escape the root via a symlink or `..`, with no check-then-open TOCTOU.
+    fn open_contained(base: &Path) -> Result<ContainedRoot, ApiError> {
+        ContainedRoot::open(base).map_err(|e| ApiError::Other(format!("open root: {e}")))
     }
 
     /// List one directory's children (root-relative `dir`, "" = the root), paged at
@@ -262,36 +253,27 @@ impl WorkspaceFs {
         after: Option<&str>,
     ) -> Result<FsListPage, ApiError> {
         let (base, _) = self.resolve(root)?;
-        let abs = Self::contained(&base, dir)?;
-        // Interim Cluster C guard: refuse a symlinked directory final component (the root itself may
-        // legitimately be a symlink); the per-entry listing below already uses non-following lstat.
-        reject_symlink_final_below(&base, &abs)
-            .await
-            .map_err(|e| ApiError::Other(format!("path not allowed: {e}")))?;
-        let mut rd = tokio::fs::read_dir(&abs)
+        let cr = Self::open_contained(&base)?;
+        // Contained, no-follow directory read: the directory is opened openat2-relative (a symlinked
+        // component anywhere in `dir` is rejected) and each child's metadata is a non-following lstat.
+        let children = cr
+            .read_dir(Path::new(dir))
             .await
             .map_err(|e| ApiError::Other(format!("read_dir {dir:?}: {e}")))?;
         let mut entries = Vec::new();
-        while let Some(item) = rd
-            .next_entry()
-            .await
-            .map_err(|e| ApiError::Other(format!("read_dir: {e}")))?
-        {
-            let name = item.file_name().to_string_lossy().to_string();
+        for child in children {
+            let name = child.name;
             let ignored = is_ignored_name(&name);
             if ignored && !show_ignored {
                 continue;
             }
-            let meta = match item.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let meta = child.meta;
             entries.push(FsEntry {
                 path: join_rel(dir, &name),
                 name,
                 kind: entry_kind(&meta),
-                size: if meta.is_dir() { 0 } else { meta.len() },
-                mtime_ms: mtime_ms(&meta),
+                size: if meta.is_dir { 0 } else { meta.size },
+                mtime_ms: meta.mtime_ms,
                 ignored,
             });
         }
@@ -333,10 +315,10 @@ impl WorkspaceFs {
     /// One entry's metadata.
     pub async fn stat(&self, root: &FsRootId, path: &str) -> Result<FsEntry, ApiError> {
         let (base, _) = self.resolve(root)?;
-        let abs = Self::contained(&base, path)?;
-        // Interim Cluster C guard: lstat (do not follow), so a symlinked final component is reported
-        // as a link rather than leaking the target it points at outside the root.
-        let meta = tokio::fs::symlink_metadata(&abs)
+        // Non-following lstat on the final component, with the parent chain proven symlink-free
+        // (openat2): a symlinked final component is reported as a link, never followed out of root.
+        let meta = Self::open_contained(&base)?
+            .symlink_metadata(Path::new(path))
             .await
             .map_err(|e| ApiError::Other(format!("stat {path:?}: {e}")))?;
         let name = Path::new(path)
@@ -348,8 +330,8 @@ impl WorkspaceFs {
             name,
             path: path.to_string(),
             kind: entry_kind(&meta),
-            size: if meta.is_dir() { 0 } else { meta.len() },
-            mtime_ms: mtime_ms(&meta),
+            size: if meta.is_dir { 0 } else { meta.size },
+            mtime_ms: meta.mtime_ms,
         })
     }
 
@@ -361,37 +343,23 @@ impl WorkspaceFs {
         max_bytes: u64,
     ) -> Result<FsContent, ApiError> {
         let (base, _) = self.resolve(root)?;
-        let abs = Self::contained(&base, path)?;
-        // Interim Cluster C guard: open with O_NOFOLLOW (unix) so a symlinked final component is
-        // refused rather than followed out of the root, and take the revision metadata from the
-        // opened fd so there is no stat-then-read TOCTOU on the file.
-        let mut file = open_read_guarded(&abs)
-            .await
-            .map_err(|e| ApiError::Other(format!("read {path:?}: {e}")))?;
-        let meta = file
-            .metadata()
-            .await
-            .map_err(|e| ApiError::Other(format!("stat {path:?}: {e}")))?;
         let cap = if max_bytes == 0 {
             DEFAULT_MAX_READ
         } else {
             max_bytes
         };
-        let mut full = Vec::new();
-        file.read_to_end(&mut full)
+        // openat2-relative read (a symlinked component anywhere is rejected); the revision metadata is
+        // taken from the opened fd, so there is no stat-then-read TOCTOU. `meta.size` is the full file
+        // size (the etag basis), independent of the returned/truncated byte count.
+        let (bytes, meta, truncated) = Self::open_contained(&base)?
+            .read_capped(Path::new(path), cap)
             .await
             .map_err(|e| ApiError::Other(format!("read {path:?}: {e}")))?;
-        let truncated = full.len() as u64 > cap;
-        let bytes = if truncated {
-            full[..cap as usize].to_vec()
-        } else {
-            full
-        };
         Ok(FsContent {
             bytes,
             revision: FsRevision {
-                mtime_ms: mtime_ms(&meta),
-                size: meta.len(),
+                mtime_ms: meta.mtime_ms,
+                size: meta.size,
             },
             truncated,
             // Populated by the node layer (NodeApiImpl::fs_read) when a content store is bound.
@@ -406,13 +374,14 @@ impl WorkspaceFs {
         path: &str,
     ) -> Result<Option<FsRevision>, ApiError> {
         let (base, _) = self.resolve(root)?;
-        let abs = Self::contained(&base, path)?;
-        // Interim Cluster C guard: lstat (do not follow) so a symlinked final component reports the
-        // link's own revision, not the outside target's.
-        match tokio::fs::symlink_metadata(&abs).await {
+        // Non-following lstat with a symlink-free parent chain; any escape/not-found yields None.
+        match Self::open_contained(&base)?
+            .symlink_metadata(Path::new(path))
+            .await
+        {
             Ok(meta) => Ok(Some(FsRevision {
-                mtime_ms: mtime_ms(&meta),
-                size: meta.len(),
+                mtime_ms: meta.mtime_ms,
+                size: meta.size,
             })),
             Err(_) => Ok(None),
         }
@@ -440,13 +409,13 @@ impl WorkspaceFs {
                 "host browse roots are read-only".into(),
             ));
         }
-        let abs = Self::contained(&base, path)?;
+        let cr = Self::open_contained(&base)?;
         if let Some(expected) = base_revision {
-            // lstat (do not follow) — a symlinked final component is rejected on open below anyway.
-            if let Ok(meta) = tokio::fs::symlink_metadata(&abs).await {
+            // Non-following lstat (a symlinked final component is rejected on the write open anyway).
+            if let Ok(meta) = cr.symlink_metadata(Path::new(path)).await {
                 let current = FsRevision {
-                    mtime_ms: mtime_ms(&meta),
-                    size: meta.len(),
+                    mtime_ms: meta.mtime_ms,
+                    size: meta.size,
                 };
                 if current != expected {
                     return Err(ApiError::Conflict(format!(
@@ -455,27 +424,16 @@ impl WorkspaceFs {
                 }
             }
         }
-        if let Some(parent) = abs.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ApiError::Other(format!("mkdir for {path:?}: {e}")))?;
-        }
-        // Interim Cluster C guard: O_NOFOLLOW create/truncate refuses a symlinked final component,
-        // so a write cannot clobber a file outside the root through a link; take the post-write
-        // revision from the opened fd.
-        let mut file = open_write_guarded(&abs)
+        // Parent dirs are created contained (each component O_NOFOLLOW) and the file is opened
+        // openat2-relative, so a write can never clobber a file outside the root via a symlink; the
+        // post-write revision is taken from the opened fd.
+        let meta = cr
+            .write(Path::new(path), bytes)
             .await
             .map_err(|e| ApiError::Other(format!("write {path:?}: {e}")))?;
-        file.write_all(bytes)
-            .await
-            .map_err(|e| ApiError::Other(format!("write {path:?}: {e}")))?;
-        let meta = file
-            .metadata()
-            .await
-            .map_err(|e| ApiError::Other(format!("stat after write {path:?}: {e}")))?;
         Ok(FsRevision {
-            mtime_ms: mtime_ms(&meta),
-            size: meta.len(),
+            mtime_ms: meta.mtime_ms,
+            size: meta.size,
         })
     }
 
@@ -507,38 +465,42 @@ impl WorkspaceFs {
         let limit = clamp_page_max(query.max_results) as usize;
         let skip = (query.page as usize).saturating_mul(limit);
         let case_sensitive = query.case_sensitive;
-        // Synchronous walk in a blocking task (small workspaces; bounded by SEARCH_FILE_BUDGET).
+        let cr = Self::open_contained(&base)?;
+        // Synchronous fd-contained walk in a blocking task (small workspaces; bounded by
+        // SEARCH_FILE_BUDGET). Every directory read and file read resolves openat2-relative from the
+        // root fd, so a symlinked component anywhere is rejected; symlink entries are additionally
+        // skipped so the walk never descends into or reads through a link out of the root.
         let result = tokio::task::spawn_blocking(move || {
             let mut hits: Vec<FsSearchHit> = Vec::new();
             let mut visited = 0usize;
-            let mut stack: Vec<PathBuf> = vec![base.clone()];
+            let mut stack: Vec<String> = vec![String::new()]; // "" = the root itself
             let mut overflow = false;
-            'walk: while let Some(dir) = stack.pop() {
-                let rd = match std::fs::read_dir(&dir) {
-                    Ok(rd) => rd,
+            'walk: while let Some(dir_rel) = stack.pop() {
+                let children = match cr.read_dir_sync(Path::new(&dir_rel)) {
+                    Ok(c) => c,
                     Err(_) => continue,
                 };
-                for item in rd.flatten() {
-                    let name = item.file_name().to_string_lossy().to_string();
+                for child in children {
+                    let name = child.name;
                     if is_ignored_name(&name) {
                         continue;
                     }
-                    // `DirEntry::metadata` is a non-following lstat, so a symlink is detectable here.
-                    let meta = match item.metadata() {
-                        Ok(m) => m,
-                        Err(_) => continue,
+                    let meta = child.meta;
+                    // Skip symlink entries entirely — never recurse into a symlinked directory nor
+                    // read through a symlinked file out of the root.
+                    if meta.is_symlink {
+                        continue;
+                    }
+                    let child_rel = if dir_rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{dir_rel}/{name}")
                     };
-                    // Interim Cluster C guard: skip symlink entries entirely — never recurse into a
-                    // symlinked directory nor read through a symlinked file out of the root.
-                    if meta.file_type().is_symlink() {
+                    if meta.is_dir {
+                        stack.push(child_rel);
                         continue;
                     }
-                    let abs = item.path();
-                    if meta.is_dir() {
-                        stack.push(abs);
-                        continue;
-                    }
-                    if meta.len() > SEARCH_FILE_CAP {
+                    if meta.size > SEARCH_FILE_CAP {
                         continue;
                     }
                     visited += 1;
@@ -546,15 +508,14 @@ impl WorkspaceFs {
                         overflow = true;
                         break 'walk;
                     }
-                    let text = match std::fs::read_to_string(&abs) {
-                        Ok(t) => t,
-                        Err(_) => continue, // binary / non-utf8
+                    let text = match cr.read_sync(Path::new(&child_rel)) {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(t) => t,
+                            Err(_) => continue, // binary / non-utf8
+                        },
+                        Err(_) => continue,
                     };
-                    let rel = abs
-                        .strip_prefix(&base)
-                        .ok()
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_default();
+                    let rel = child_rel.replace('\\', "/");
                     for (lineno, line) in text.lines().enumerate() {
                         let col = match &regex {
                             Some(re) => re.find(line).map(|m| m.start()),
@@ -599,26 +560,19 @@ impl WorkspaceFs {
         max: u32,
     ) -> Result<FsWatchPageView, ApiError> {
         let (base, _) = self.resolve(root)?;
-        let abs = Self::contained(&base, dir)?;
-        // Interim Cluster C guard: refuse a symlinked watched-directory final component (the root
-        // itself may legitimately be a symlink).
-        reject_symlink_final_below(&base, &abs)
-            .await
-            .map_err(|e| ApiError::Other(format!("path not allowed: {e}")))?;
-        // Snapshot the directory's current entries (name -> (mtime, size)).
+        // Contained, no-follow snapshot of the watched directory's current entries (a symlinked
+        // component anywhere in `dir` is rejected; per-entry metadata is a non-following lstat).
         let mut current: HashMap<String, (u64, u64)> = HashMap::new();
-        if let Ok(mut rd) = tokio::fs::read_dir(&abs).await {
-            while let Ok(Some(item)) = rd.next_entry().await {
-                let name = item.file_name().to_string_lossy().to_string();
-                if is_ignored_name(&name) {
+        if let Ok(children) = Self::open_contained(&base)?.read_dir(Path::new(dir)).await {
+            for child in children {
+                if is_ignored_name(&child.name) {
                     continue;
                 }
-                if let Ok(meta) = item.metadata().await {
-                    current.insert(
-                        name,
-                        (mtime_ms(&meta), if meta.is_dir() { 0 } else { meta.len() }),
-                    );
-                }
+                let meta = child.meta;
+                current.insert(
+                    child.name,
+                    (meta.mtime_ms, if meta.is_dir { 0 } else { meta.size }),
+                );
             }
         }
         let key = (Self::root_key(root), dir.to_string());
@@ -1039,5 +993,49 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_dir_all(&wsbase);
+    }
+
+    // Phase 3 (ContainedRoot): the case the interim guard did NOT close — an INTERMEDIATE path
+    // component is a symlink out of the root. The interim only re-verified the FINAL component, so a
+    // read/list through a symlinked PARENT dir followed the link out of the root. `openat2`
+    // (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS) rejects a symlink at any component. FAILS on the
+    // interim tree (escape succeeds), passes after the fix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_intermediate_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("isym-read");
+        let outside = temp_base("isym-read-secret");
+        std::fs::write(outside.join("secret.txt"), b"TOP SECRET").unwrap();
+        symlink(&outside, base.join("sub")).unwrap();
+
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let res = fs.read(&FsRootId::Workspace, "sub/secret.txt", 0).await;
+        assert!(
+            res.is_err(),
+            "reading through an intermediate symlinked dir must be rejected, got {res:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_rejects_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("isym-list");
+        let outside = temp_base("isym-list-target");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("inner").join("hidden.txt"), b"x").unwrap();
+        symlink(&outside, base.join("sub")).unwrap();
+
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let res = fs.list(&FsRootId::Workspace, "sub/inner", true, None).await;
+        assert!(
+            res.is_err(),
+            "listing through an intermediate symlinked dir must be rejected, got {res:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
