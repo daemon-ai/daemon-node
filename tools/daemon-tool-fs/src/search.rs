@@ -114,6 +114,10 @@ fn walker(root: &Path) -> ignore::Walk {
         // Respect .gitignore/.ignore even when the workspace is not a git repo (session
         // sandboxes usually are not).
         .require_git(false)
+        // Never traverse a symlink out of the (openat2-verified) search root — the walk stays within
+        // the workspace even though it is path-based (Cluster C: the entry point is fd-verified, the
+        // walk is non-following). This is the `ignore` default, made an explicit declared choice.
+        .follow_links(false)
         .sort_by_file_path(std::cmp::Ord::cmp)
         .build()
 }

@@ -211,7 +211,7 @@ impl SessionFactoryCtx {
                 // planted `.venv` interpreter) are not auto-trusted (Cluster E). The isolated
                 // per-session sandbox is node-managed and trusted.
                 let (root, trusted) = match &binding {
-                    Some(WorkspaceBinding::Bound(p)) => (p.clone(), false),
+                    Some(WorkspaceBinding::Bound(p)) => (canonicalize_bound(p), false),
                     _ => (roots.isolated_root(id.as_str()), true),
                 };
                 roots.record(id.as_str(), root.clone());
@@ -221,6 +221,19 @@ impl SessionFactoryCtx {
         }
         profile
     }
+}
+
+/// Canonicalize an operator-`Bound` workspace root at bind time (Cluster C): create it if missing,
+/// then resolve symlinks/`.`/`..` in the root's own prefix to a stable absolute real path. The
+/// resulting path is what the engine roots at and records to the FS surface, so the `ContainedRoot`'s
+/// root fd opens a stable target and `RESOLVE_BENEATH` is well-defined regardless of symlinks in the
+/// bound path's prefix. We deliberately do NOT require `Bound` to live under the node root — `Bound`
+/// is by design the external "work on my repo" directory, and the operator-tier capability that gates
+/// setting it (Phase 2) is the "explicitly allowed" condition. Falls back to the raw path when the
+/// directory cannot be created/canonicalized (e.g. a not-yet-existent mount), preserving prior behavior.
+fn canonicalize_bound(p: &std::path::Path) -> std::path::PathBuf {
+    let _ = std::fs::create_dir_all(p);
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Map a wire-level [`ApprovalMode`] onto the engine's [`ApprovalPolicy`] (the §12 session mode),

@@ -34,7 +34,7 @@ pub mod read;
 pub mod search;
 
 use async_trait::async_trait;
-use daemon_core::exec::contain;
+use daemon_core::exec::{contain, ContainedRoot};
 use daemon_core::{
     approve_path, Effect, Gate, Tool, ToolCall, ToolConcurrency, ToolOutcome, TurnCx,
 };
@@ -310,34 +310,61 @@ impl FsTool {
     /// crash mid-write can never leave a half-written target (hermes `_atomic_write` parity,
     /// tool-level per the approved design).
     async fn atomic_write(workspace: &Path, path: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        let resolved = contain(workspace, Path::new(path))?;
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        // All fs access is fd-contained (openat2 RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS): a symlink at
+        // any component of `path` — or of the same-dir temp — is rejected, never followed out of root.
+        let cr = ContainedRoot::open(workspace)?;
+        let rel = Path::new(path);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let file_name = resolved
+        let file_name = rel
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let tmp = resolved
-            .parent()
-            .unwrap_or(workspace)
-            .join(format!(".daemon-fs-tmp.{nanos}.{file_name}"));
-        tokio::fs::write(&tmp, bytes).await?;
+        let tmp_rel = match rel.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                parent.join(format!(".daemon-fs-tmp.{nanos}.{file_name}"))
+            }
+            _ => PathBuf::from(format!(".daemon-fs-tmp.{nanos}.{file_name}")),
+        };
         // Preserve an existing target's permissions across the swap (best-effort).
-        if let Ok(meta) = tokio::fs::metadata(&resolved).await {
-            let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
+        let existing_mode = cr.symlink_metadata(rel).await.ok().map(|m| m.mode);
+        // Content lands in a same-directory temp file first, then an atomic rename swaps it into
+        // place — a crash mid-write can never leave a half-written target (both ops fd-contained).
+        cr.write(&tmp_rel, bytes).await?;
+        if let Some(mode) = existing_mode {
+            let _ = cr.set_mode(&tmp_rel, mode).await;
         }
-        match tokio::fs::rename(&tmp, &resolved).await {
-            Ok(()) => Ok(resolved),
+        match cr.rename(&tmp_rel, rel).await {
+            Ok(()) => cr.resolve_display(rel),
             Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
+                let _ = cr.remove_file(&tmp_rel).await;
                 Err(e)
             }
         }
+    }
+
+    /// Verify a grep/glob search root is contained (no symlink escape at any component) and return
+    /// its absolute path for the `ignore` walker (which runs with `follow_links(false)`). A symlinked
+    /// root is refused; a not-yet-existing path is tolerated so the caller reports "not found".
+    async fn verify_search_root(workspace: &Path, path: &str) -> std::io::Result<PathBuf> {
+        let cr = ContainedRoot::open(workspace)?;
+        let rel = Path::new(path);
+        match cr.symlink_metadata(rel).await {
+            Ok(meta) if meta.is_symlink => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to search through a symlink",
+                ))
+            }
+            Ok(_) => {}
+            // A containment/symlink violation in the parent chain surfaces as PermissionDenied —
+            // propagate it; a missing final component is fine (grep/glob report "not found").
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(e),
+            Err(_) => {}
+        }
+        cr.resolve_display(rel)
     }
 
     /// Best-effort pre-edit content capture for the lint delta (only when a lint rule matches).
@@ -642,8 +669,17 @@ impl FsTool {
         if let Err(out) = Self::gate(call, cx, &path, prompt).await {
             return out;
         }
-        let result = match tokio::fs::metadata(&resolved).await {
-            Ok(meta) if meta.is_dir() => tokio::fs::remove_dir(&resolved).await.map_err(|e| {
+        // fd-contained metadata + unlink (a symlinked component anywhere in `path` is rejected; a
+        // symlinked entry is removed as the link itself, never followed out of the workspace).
+        let cr = match ContainedRoot::open(&workspace) {
+            Ok(cr) => cr,
+            Err(e) => {
+                return ToolOutcome::text(call.call_id.clone(), false, format!("fs delete: {e}"))
+            }
+        };
+        let rel = Path::new(&path);
+        let result = match cr.symlink_metadata(rel).await {
+            Ok(meta) if meta.is_dir => cr.remove_dir(rel).await.map_err(|e| {
                 if e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
                     std::io::Error::new(
                         e.kind(),
@@ -653,7 +689,7 @@ impl FsTool {
                     e
                 }
             }),
-            Ok(_) => tokio::fs::remove_file(&resolved).await,
+            Ok(_) => cr.remove_file(rel).await,
             Err(e) => Err(e),
         };
         match result {
@@ -807,7 +843,9 @@ impl Tool for FsTool {
                 search_offset,
             } => {
                 let workspace = cx.exec.cwd().to_path_buf();
-                let root = match contain(&workspace, Path::new(&path)) {
+                // openat2-verified entry point: proves no symlink escape to the subtree root. The
+                // walker itself is `follow_links(false)`, so it never traverses a symlink thereafter.
+                let root = match Self::verify_search_root(&workspace, &path).await {
                     Ok(root) => root,
                     Err(e) => {
                         return ToolOutcome::text(
@@ -837,7 +875,7 @@ impl Tool for FsTool {
                 search_offset,
             } => {
                 let workspace = cx.exec.cwd().to_path_buf();
-                let root = match contain(&workspace, Path::new(&path)) {
+                let root = match Self::verify_search_root(&workspace, &path).await {
                     Ok(root) => root,
                     Err(e) => {
                         return ToolOutcome::text(

@@ -2289,7 +2289,7 @@ dependencies = [
  "daemon-protocol",
  "futures",
  "idna",
- "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

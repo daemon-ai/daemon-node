@@ -35,7 +35,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use daemon_core::{
     approve_command, approve_shell_command, contain, resolve_program_abs, Command,
-    CommandFingerprint, Effect, ExecCx, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
+    CommandFingerprint, ContainedRoot, Effect, ExecCx, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
 };
 use daemon_processes::{truncate_head_tail, ProcessRegistry, ShellConfig, SpawnRequest};
 use daemon_protocol::ToolDetail;
@@ -132,6 +132,12 @@ fn resolve_cwd(
     workdir: Option<&str>,
 ) -> std::io::Result<PathBuf> {
     match workdir {
+        // Lexical containment only: this runs at approval time (read-only, before the dir may exist)
+        // and feeds the approval fingerprint/display. The real fd-based (openat2) containment of the
+        // cwd is enforced at exec: foreground goes through `LocalEnvironment::run` (which resolves the
+        // cwd via `ContainedRoot::child_cwd`), and the background/PTY spawn cwd is verified on the
+        // process-sandbox seam (exec-os-sandbox track). The persisted sticky cwd is openat2-verified
+        // in `run_cd` before it is ever reused here.
         Some(dir) => contain(root, Path::new(dir)),
         None => Ok(sticky.unwrap_or_else(|| root.to_path_buf())),
     }
@@ -452,19 +458,27 @@ impl ShellTool {
         } else {
             base.join(target)
         };
-        let resolved = match contain(root, &requested) {
-            Ok(dir) => dir,
+        // Lexically normalize + contain (handles `..` and absolute targets), then openat2-verify the
+        // result is a real, contained DIRECTORY (no symlink escape at any component) before it becomes
+        // the persisted sticky cwd — this replaces the old lexical contain() + separate is_dir()
+        // check and closes the intermediate-symlink escape on `cd`.
+        let abs = match contain(root, &requested) {
+            Ok(abs) => abs,
             Err(e) => {
                 return ToolOutcome::text(call.call_id.clone(), false, format!("shell: cd: {e}"))
             }
         };
-        if !resolved.is_dir() {
-            return ToolOutcome::text(
-                call.call_id.clone(),
-                false,
-                format!("shell: cd: no such directory: {}", resolved.display()),
-            );
-        }
+        let rel = abs.strip_prefix(root).unwrap_or(Path::new(""));
+        let resolved = match ContainedRoot::open(root).and_then(|cr| cr.verify_dir_sync(rel)) {
+            Ok(dir) => dir,
+            Err(_) => {
+                return ToolOutcome::text(
+                    call.call_id.clone(),
+                    false,
+                    format!("shell: cd: no such directory: {}", abs.display()),
+                )
+            }
+        };
         procs.set_cwd(&cx.session_id, resolved.clone());
         ToolOutcome::text(
             call.call_id.clone(),

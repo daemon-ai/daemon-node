@@ -7,12 +7,9 @@
 //! paths are resolved against that root and contained ([`super::contain`]); child commands inherit a
 //! scrubbed environment (no inherited secrets) so a tool's exec never leaks the host's credentials.
 
-use super::{
-    contain, open_read_guarded, open_write_guarded, reject_symlink_final_below, Command, ExecCx,
-    ExecResult, ExecutionEnvironment,
-};
+use super::{Command, ContainedRoot, ExecCx, ExecResult, ExecutionEnvironment};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 /// The local execution environment: a contained per-session workspace on the host filesystem.
 pub struct LocalEnvironment {
@@ -65,24 +62,28 @@ impl ExecutionEnvironment for LocalEnvironment {
     async fn run(&self, cmd: Command, cx: &ExecCx<'_>) -> std::io::Result<ExecResult> {
         self.ensure_root().await?;
         // A per-command working directory resolves against — and must stay within — the root
-        // (`shell(workdir=...)`); it is created on demand like the root itself.
-        let dir = match &cmd.cwd {
-            Some(requested) => {
-                let resolved = contain(&self.root, requested)?;
-                // Interim Cluster C guard: refuse a symlinked final component so a `cwd` cannot
-                // redirect the child outside the workspace (checked before create; the root itself
-                // may legitimately be a symlink).
-                reject_symlink_final_below(&self.root, &resolved).await?;
-                tokio::fs::create_dir_all(&resolved).await?;
-                resolved
-            }
-            None => self.root.clone(),
+        // (`shell(workdir=...)`), created on demand. `ContainedRoot::child_cwd` proves containment
+        // via openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS) and hands back a spawn-safe cwd — on
+        // Linux `/proc/self/fd/N`, so the kernel resolves the *verified* fd at spawn with no path
+        // re-resolution (no symlink escape, no verify→spawn TOCTOU). The guard keeps that fd alive
+        // until after the child is spawned. (Spawn mechanics below are the exec-os-sandbox seam.)
+        let cwd_guard = match &cmd.cwd {
+            Some(requested) => Some(
+                ContainedRoot::open(&self.root)?
+                    .child_cwd(requested)
+                    .await?,
+            ),
+            None => None,
         };
+        let dir: &Path = cwd_guard
+            .as_ref()
+            .map(|g| g.path.as_path())
+            .unwrap_or(&self.root);
         // Scrubbed child env: nothing inherited (no host secrets leak into a tool's subprocess).
         let mut command = tokio::process::Command::new(&cmd.program);
         command
             .args(&cmd.args)
-            .current_dir(&dir)
+            .current_dir(dir)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .stdin(std::process::Stdio::null())
@@ -127,38 +128,21 @@ impl ExecutionEnvironment for LocalEnvironment {
     }
 
     async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        let resolved = contain(&self.root, path)?;
-        // Interim Cluster C guard: open with O_NOFOLLOW (unix) so a symlinked final component is
-        // refused atomically rather than followed out of the workspace.
-        let mut file = open_read_guarded(&resolved).await?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).await?;
-        Ok(buf)
+        // ContainedRoot resolves via openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS): a symlink at ANY
+        // component (intermediate or final) is rejected atomically — no follow, no check-then-open.
+        ContainedRoot::open(&self.root)?.read(path).await
     }
 
     async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        let resolved = contain(&self.root, path)?;
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Interim Cluster C guard: O_NOFOLLOW create/truncate refuses a symlinked final component,
-        // so a write cannot clobber a file outside the workspace through a link.
-        let mut file = open_write_guarded(&resolved).await?;
-        file.write_all(bytes).await
+        // Parent dirs are created contained (each component O_NOFOLLOW) and the file is opened
+        // openat2-relative, so a write can never clobber a file outside the workspace via a symlink.
+        ContainedRoot::open(&self.root)?.write(path, bytes).await?;
+        Ok(())
     }
 
     async fn list(&self, path: &Path) -> std::io::Result<Vec<String>> {
-        let resolved = contain(&self.root, path)?;
-        // Interim Cluster C guard: a symlinked directory final component is refused (lstat-based;
-        // the root itself may legitimately be a symlink).
-        reject_symlink_final_below(&self.root, &resolved).await?;
-        let mut entries = Vec::new();
-        let mut dir = tokio::fs::read_dir(resolved).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            entries.push(entry.file_name().to_string_lossy().into_owned());
-        }
-        entries.sort();
-        Ok(entries)
+        let entries = ContainedRoot::open(&self.root)?.read_dir(path).await?;
+        Ok(entries.into_iter().map(|e| e.name).collect())
     }
 
     fn cwd(&self) -> &Path {
@@ -318,6 +302,86 @@ mod tests {
         let err = env
             .run(
                 Command::new("pwd").cwd("cwdlink"),
+                &ExecCx { cancel: &cancel },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // Phase 3 (ContainedRoot): the case the interim guard did NOT close — an INTERMEDIATE path
+    // component is a symlink out of the workspace. The interim only guarded the FINAL component, so
+    // `sub/secret.txt` (final = an ordinary file) was followed through the symlinked parent `sub`.
+    // `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` rejects a symlink at ANY component. These
+    // tests FAIL on the interim tree (the read/write/run succeeds = escape) and pass after the fix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("isym-read");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp_root("isym-read-secret");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"TOP SECRET").unwrap();
+        // `sub` is an intermediate component that is a symlink to the outside dir.
+        symlink(&outside, root.join("sub")).unwrap();
+
+        let env = LocalEnvironment::new(&root);
+        let result = env.read(Path::new("sub/secret.txt")).await;
+        assert!(
+            result.is_err(),
+            "reading through an intermediate symlinked dir must be rejected, got {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_rejects_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("isym-write");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp_root("isym-write-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target.txt"), b"ORIGINAL").unwrap();
+        symlink(&outside, root.join("sub")).unwrap();
+
+        let env = LocalEnvironment::new(&root);
+        let result = env.write(Path::new("sub/target.txt"), b"OVERWRITTEN").await;
+        assert!(
+            result.is_err(),
+            "writing through an intermediate symlinked dir must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("target.txt")).unwrap(),
+            b"ORIGINAL",
+            "the outside target must not be written through the intermediate symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_cwd_rejects_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("isym-cwd");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp_root("isym-cwd-target");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        symlink(&outside, root.join("sub")).unwrap();
+
+        let env = LocalEnvironment::new(&root);
+        let cancel = CancellationToken::new();
+        let err = env
+            .run(
+                Command::new("pwd").cwd("sub/inner"),
                 &ExecCx { cancel: &cancel },
             )
             .await
