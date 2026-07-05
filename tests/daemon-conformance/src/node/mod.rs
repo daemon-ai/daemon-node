@@ -24,6 +24,7 @@ mod harness;
 mod history;
 mod http_ownership;
 mod ingest;
+mod ingress_governor;
 mod live_agent_e2e;
 mod messaging;
 mod negative_auth;

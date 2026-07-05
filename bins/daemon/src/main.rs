@@ -2516,6 +2516,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
     let local_trust = cfg.api.local_trust.is_some();
 
+    // Cluster F: one secure-by-default ingress governor, shared by the networked carriers (TLS/TCP,
+    // WebSocket, web front). Bounds max frame/decoded size, per-peer new-connection rate, and live
+    // connection concurrency (fail-closed). The local-trust Unix socket / named pipe carriers build
+    // their own secure-default limits internally and are exempt from rate + concurrency (§1.6), so a
+    // networked flood cannot starve the operator CLI.
+    let ingress_governor = daemon_common::IngressGovernor::new(cfg.api.ingress_limits());
+
     // Bind the api socket (fresh) and serve the unified surface over it. A managed/user launch may
     // target a nested runtime path (e.g. under $XDG_RUNTIME_DIR) whose parent dir does not exist
     // yet, so ensure the parent exists (and clear any stale socket) before binding.
@@ -2592,6 +2599,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 server_config,
                 node.clone(),
                 authenticator.clone(),
+                ingress_governor.clone(),
             )))
         }
         (Some(_), _, _) => {
@@ -2617,6 +2625,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 node.clone(),
                 authenticator.clone(),
                 cfg.api.ws_allowed_origins.clone(),
+                ingress_governor.clone(),
             )))
         }
         None => None,
@@ -2691,6 +2700,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 authenticator.clone(),
                 cfg.api.ws_allowed_origins.clone(),
                 health,
+                ingress_governor.clone(),
             )))
         }
         None => None,

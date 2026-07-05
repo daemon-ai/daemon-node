@@ -48,7 +48,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use daemon_common::MAX_FRAME_BYTES;
+use daemon_common::{IngressGovernor, IngressLimits, PeerKey};
 
 use crate::authn::{Authenticator, TlsState};
 use crate::socket::{next_conn_id, serve_mux, AuthMode};
@@ -56,14 +56,18 @@ use crate::socket::{next_conn_id, serve_mux, AuthMode};
 /// The WebSocket subprotocol name of the mux carrier, negotiated during the upgrade handshake.
 pub const WS_SUBPROTOCOL: &str = "daemon-mux";
 
-/// The WebSocket carrier's protocol config: cap the max message + frame size at [`MAX_FRAME_BYTES`]
-/// (Cluster F), so tungstenite rejects an oversize message at the protocol layer before it is
-/// buffered — the WS analogue of the length-prefix cap in `socket.rs`/`remote.rs`. Shared by the
-/// standalone `[api].ws_addr` listener and the single-origin web front so both apply the same bound.
-pub(crate) fn ws_config() -> WebSocketConfig {
+/// The WebSocket carrier's protocol config, derived from the ingress governor's [`IngressLimits`]
+/// (Cluster F). Both the max message size (the whole, **post-inflate** binary message — the point a
+/// future compressed WS transport enforces its whole-message bound) and the max frame size are the
+/// governor's `max_frame_bytes`: for the WS carrier one binary message == one mux frame, so this is
+/// the exact analogue of the length-prefix cap in `socket.rs`/`remote.rs`, rejected at the protocol
+/// layer before buffering. The `max_decoded_bytes` *payload* cap is a distinct, application-level
+/// bound enforced at the request boundary ([`IngressLimits::check_decoded_len`] on a decoded blob),
+/// NOT here — conflating the two would let a small payload cap reject an in-envelope control frame.
+pub(crate) fn ws_config(limits: &IngressLimits) -> WebSocketConfig {
     WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME_BYTES))
-        .max_frame_size(Some(MAX_FRAME_BYTES))
+        .max_message_size(Some(limits.max_frame_bytes))
+        .max_frame_size(Some(limits.max_frame_bytes))
 }
 
 /// Serve the node api surface over plain WebSocket until the listener errors. Every connection is
@@ -76,18 +80,31 @@ pub async fn serve_mux_ws(
     api: Arc<dyn NodeApi>,
     auth: Arc<Authenticator>,
     allowed_origins: Vec<String>,
+    governor: Arc<IngressGovernor>,
 ) {
     let allowed = Arc::new(allowed_origins);
+    let limits = governor.limits();
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // Cluster F: per-peer rate + global concurrency (fail-closed) before the upgrade.
+                let peer = PeerKey::ip(addr.ip());
+                if let Err(e) = governor.check_peer(&peer) {
+                    tracing::debug!(%addr, "ws connection refused: {e}");
+                    continue;
+                }
+                let Some(permit) = governor.admit_connection() else {
+                    tracing::debug!(%addr, "ws connection refused: connection cap reached");
+                    continue;
+                };
                 let api = api.clone();
                 let auth = auth.clone();
                 let allowed = allowed.clone();
                 tokio::spawn(async move {
-                    match accept_mux_upgrade(stream, &allowed).await {
+                    let _permit = permit; // held for the connection; RAII-released on close.
+                    match accept_mux_upgrade(stream, &allowed, limits).await {
                         Ok(ws) => {
-                            if let Err(e) = serve_mux_over_ws(ws, api, auth).await {
+                            if let Err(e) = serve_mux_over_ws(ws, api, auth, limits).await {
                                 tracing::debug!("ws api connection ended: {e}");
                             }
                         }
@@ -113,6 +130,7 @@ pub(crate) async fn serve_mux_over_ws<S>(
     ws: WebSocketStream<S>,
     api: Arc<dyn NodeApi>,
     auth: Arc<Authenticator>,
+    limits: IngressLimits,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -121,8 +139,8 @@ where
         auth,
         tls_state: TlsState::plaintext(),
     });
-    let (wr, rd) = split_frames(ws);
-    serve_mux(rd, wr, api, mode, None, next_conn_id()).await
+    let (wr, rd) = split_frames(ws, limits);
+    serve_mux(rd, wr, api, mode, None, next_conn_id(), limits).await
 }
 
 /// Run the WebSocket server handshake with the mux upgrade gate applied: the policy callback
@@ -132,11 +150,12 @@ where
 async fn accept_mux_upgrade(
     stream: TcpStream,
     allowed_origins: &[String],
+    limits: IngressLimits,
 ) -> Result<WebSocketStream<TcpStream>, tokio_tungstenite::tungstenite::Error> {
     tokio_tungstenite::accept_hdr_async_with_config(
         stream,
         |req: &Request, resp: Response| apply_upgrade_policy(req, resp, allowed_origins),
-        Some(ws_config()),
+        Some(ws_config(&limits)),
     )
     .await
 }
@@ -240,7 +259,10 @@ fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
 /// Split a WebSocket into the byte-stream halves [`serve_mux`] consumes: reads re-add the u32
 /// big-endian length prefix over each binary message, writes strip it and send one binary message
 /// per mux frame.
-fn split_frames<S>(ws: WebSocketStream<S>) -> (WsFrameWriter<S>, WsFrameReader<S>)
+fn split_frames<S>(
+    ws: WebSocketStream<S>,
+    limits: IngressLimits,
+) -> (WsFrameWriter<S>, WsFrameReader<S>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -254,6 +276,7 @@ where
             inner: stream,
             buf: Vec::new(),
             pos: 0,
+            limits,
         },
     )
 }
@@ -267,6 +290,8 @@ struct WsFrameReader<S> {
     /// The current frame (length prefix + payload), partially consumed.
     buf: Vec<u8>,
     pos: usize,
+    /// The ingress governor's caps (the frame-size bound applied to each binary message).
+    limits: IngressLimits,
 }
 
 impl<S> AsyncRead for WsFrameReader<S>
@@ -293,11 +318,12 @@ where
             }
             match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
                 Some(Ok(Message::Binary(payload))) => {
-                    // Defense-in-depth: tungstenite already rejects a message over `MAX_FRAME_BYTES`
-                    // at the protocol layer (see `ws_config`), but re-check here so an oversize
-                    // payload is refused even if a caller forgets the accept-time config, and never
-                    // exceeds the u32 length prefix the mux framing uses.
-                    if payload.len() > MAX_FRAME_BYTES {
+                    // Defense-in-depth: tungstenite already rejects a message over the governor's
+                    // cap at the protocol layer (see `ws_config`), but re-check here through the same
+                    // `IngressLimits::check_frame_len` so an oversize payload is refused even if a
+                    // caller forgets the accept-time config, and never exceeds the u32 length prefix
+                    // the mux framing uses.
+                    if this.limits.check_frame_len(payload.len()).is_err() {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "ws message exceeds the frame size limit",
@@ -424,13 +450,16 @@ mod tests {
     #[tokio::test]
     async fn binary_messages_round_trip_as_mux_frames() {
         let (server, mut client) = ws_pair().await;
-        let (mut wr, mut rd) = split_frames(server);
+        let (mut wr, mut rd) = split_frames(server, IngressLimits::default());
 
         client
             .send(Message::binary(b"client-frame".to_vec()))
             .await
             .expect("client send");
-        let got = read_frame(&mut rd).await.expect("read").expect("frame");
+        let got = read_frame(&mut rd, &IngressLimits::default())
+            .await
+            .expect("read")
+            .expect("frame");
         assert_eq!(got, b"client-frame", "reads must re-add exactly one prefix");
 
         write_frame(&mut wr, b"server-frame").await.expect("write");
@@ -448,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn text_frames_are_ignored() {
         let (server, mut client) = ws_pair().await;
-        let (_wr, mut rd) = split_frames(server);
+        let (_wr, mut rd) = split_frames(server, IngressLimits::default());
 
         client
             .send(Message::text("not-cbor"))
@@ -458,7 +487,10 @@ mod tests {
             .send(Message::binary(b"after-text".to_vec()))
             .await
             .expect("send binary");
-        let got = read_frame(&mut rd).await.expect("read").expect("frame");
+        let got = read_frame(&mut rd, &IngressLimits::default())
+            .await
+            .expect("read")
+            .expect("frame");
         assert_eq!(got, b"after-text");
     }
 
@@ -467,11 +499,14 @@ mod tests {
     #[tokio::test]
     async fn client_close_is_a_clean_eof() {
         let (server, mut client) = ws_pair().await;
-        let (_wr, mut rd) = split_frames(server);
+        let (_wr, mut rd) = split_frames(server, IngressLimits::default());
 
         client.close(None).await.expect("client close");
         assert!(
-            read_frame(&mut rd).await.expect("read").is_none(),
+            read_frame(&mut rd, &IngressLimits::default())
+                .await
+                .expect("read")
+                .is_none(),
             "a websocket close must surface as a clean frame-boundary EOF"
         );
     }
@@ -480,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn each_frame_becomes_its_own_message() {
         let (server, mut client) = ws_pair().await;
-        let (mut wr, _rd) = split_frames(server);
+        let (mut wr, _rd) = split_frames(server, IngressLimits::default());
 
         write_frame(&mut wr, b"one").await.expect("write one");
         write_frame(&mut wr, b"two").await.expect("write two");
@@ -525,9 +560,11 @@ mod tests {
     /// `MAX_FRAME_BYTES`, so tungstenite rejects an oversize message before buffering it.
     #[test]
     fn ws_config_caps_message_and_frame_size() {
-        let cfg = ws_config();
-        assert_eq!(cfg.max_message_size, Some(MAX_FRAME_BYTES));
-        assert_eq!(cfg.max_frame_size, Some(MAX_FRAME_BYTES));
+        // With the secure-default limits (decoded == frame == MAX_FRAME_BYTES) both caps equal the
+        // shared frame ceiling — the pre-Phase-4 behavior, now sourced from the governor policy.
+        let cfg = ws_config(&IngressLimits::default());
+        assert_eq!(cfg.max_message_size, Some(daemon_common::MAX_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(daemon_common::MAX_FRAME_BYTES));
     }
 
     /// Subprotocol negotiation: `daemon-mux` is echoed, none is tolerated, foreign-only refused.

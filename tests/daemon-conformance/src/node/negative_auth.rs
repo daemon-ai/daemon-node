@@ -468,6 +468,7 @@ async fn tls_tcp_requires_auth_and_scram_unlocks() {
         tls,
         f.node.clone(),
         f.auth.clone(),
+        daemon_common::IngressGovernor::secure_default(),
     ));
 
     // A client that trusts the CA.

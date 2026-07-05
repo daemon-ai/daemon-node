@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use daemon_api::NodeApi;
+use daemon_common::{IngressGovernor, PeerKey};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
@@ -153,15 +154,31 @@ pub async fn serve_api_tls_tcp(
     tls: Arc<ServerConfig>,
     api: Arc<dyn NodeApi>,
     auth: Arc<Authenticator>,
+    governor: Arc<IngressGovernor>,
 ) {
     let acceptor = TlsAcceptor::from(tls);
+    let limits = governor.limits();
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // Cluster F: per-peer connection rate + global concurrency, both fail-closed, BEFORE
+                // the (costly) TLS handshake is spawned. A refused connection is dropped cleanly.
+                let peer = PeerKey::ip(addr.ip());
+                if let Err(e) = governor.check_peer(&peer) {
+                    tracing::debug!(%addr, "tls connection refused: {e}");
+                    continue;
+                }
+                let Some(permit) = governor.admit_connection() else {
+                    tracing::debug!(%addr, "tls connection refused: connection cap reached");
+                    continue;
+                };
                 let acceptor = acceptor.clone();
                 let api = api.clone();
                 let auth = auth.clone();
                 tokio::spawn(async move {
+                    // Hold the connection permit for the whole connection; RAII-dropped on return
+                    // (incl. the secret-epoch revocation teardown path), releasing the slot.
+                    let _permit = permit;
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
                             let tls_state = TlsState {
@@ -170,7 +187,8 @@ pub async fn serve_api_tls_tcp(
                             };
                             let mode = Arc::new(AuthMode::Required { auth, tls_state });
                             let (rd, wr) = tokio::io::split(tls_stream);
-                            if let Err(e) = serve_mux(rd, wr, api, mode, None, next_conn_id()).await
+                            if let Err(e) =
+                                serve_mux(rd, wr, api, mode, None, next_conn_id(), limits).await
                             {
                                 tracing::debug!("tls api connection ended: {e}");
                             }

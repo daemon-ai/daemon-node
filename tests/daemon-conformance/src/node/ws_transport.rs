@@ -51,6 +51,7 @@ async fn serve_ws(
         node,
         auth,
         allowed_origins.iter().map(|s| s.to_string()).collect(),
+        daemon_common::IngressGovernor::secure_default(),
     ));
     (addr, server, handle)
 }

@@ -30,6 +30,15 @@ pub mod flex_bool;
 pub mod limits;
 pub use limits::MAX_FRAME_BYTES;
 
+/// The central ingress governor (OpenClaw Cluster F, Phase 4): one fail-closed policy
+/// ([`IngressLimits`]) — max frame/decoded size, per-peer connection rate, connection concurrency —
+/// that every networked carrier funnels through. The pure policy is always compiled; the runtime
+/// enforcer ([`IngressGovernor`]) is behind the `governor` feature.
+pub mod ingress;
+#[cfg(feature = "governor")]
+pub use ingress::{ConnectionPermit, IngressGovernor};
+pub use ingress::{IngressLimits, IngressReject, PeerKey, RateSpec};
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
