@@ -18,6 +18,10 @@ arbitrary = ["dep:arbitrary"]
 # `EnvPolicy::apply` (the sanctioned child-env application helper) needs `tokio::process`; gated so
 # non-spawning consumers of this contracts crate stay runtime-free. Spawning crates enable it.
 process = ["dep:tokio"]
+# `IngressGovernor` (the Cluster-F ingress enforcer) needs `tokio::sync::Semaphore`; gated so the
+# pure `IngressLimits` policy stays runtime-free for non-networked consumers. Networked carriers
+# (daemon-host, daemon-transport) enable it.
+governor = ["dep:tokio"]
 
 [lints]
 workspace = true

@@ -87,6 +87,7 @@ async fn serve_root_with_health(
         auth,
         allowed_origins.iter().map(|s| s.to_string()).collect(),
         health,
+        daemon_common::IngressGovernor::secure_default(),
     ));
     (addr, server, handle)
 }

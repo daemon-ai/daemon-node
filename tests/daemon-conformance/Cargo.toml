@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["governor"] }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }

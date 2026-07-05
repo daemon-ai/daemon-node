@@ -18,7 +18,7 @@ browser = ["dep:daemon-tool-browser", "daemon-tool-browser/cdp"]
 otel = ["daemon-telemetry/otel", "daemon-core/otel"]
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["governor"] }
 daemon-core = { workspace = true }
 # The default context engine (LCM) and memory provider (Mnemosyne) the host wires in as defaults.
 daemon-context-lcm = { workspace = true }

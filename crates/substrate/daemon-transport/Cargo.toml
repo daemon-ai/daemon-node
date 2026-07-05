@@ -10,7 +10,7 @@ default = ["remote"]
 remote = []
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["governor"] }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-store = { workspace = true }

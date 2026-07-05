@@ -25,6 +25,7 @@ use daemon_api::{
     WIRE_VERSION,
 };
 use daemon_auth::Principal;
+use daemon_common::{IngressGovernor, IngressLimits};
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -86,7 +87,16 @@ impl AuthMode {
 /// `local_trust`) use [`serve_api_unix_authenticated`]. Runs forever; spawn it as a background task.
 #[cfg(unix)]
 pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
-    accept_unix(listener, api, Arc::new(AuthMode::LocalSystem)).await;
+    // Local-trust carrier (Cluster F): exempt from per-peer rate + connection concurrency (§1.6) —
+    // a networked flood must never starve the operator CLI — so it enforces only the secure-default
+    // frame/decoded caps via the governor's limits.
+    accept_unix(
+        listener,
+        api,
+        Arc::new(AuthMode::LocalSystem),
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 /// As [`serve_api_unix`], but the Unix socket **requires** a SASL exchange (no local trust): the
@@ -102,18 +112,29 @@ pub async fn serve_api_unix_authenticated(
         auth,
         tls_state: TlsState::plaintext(),
     });
-    accept_unix(listener, api, mode).await;
+    accept_unix(
+        listener,
+        api,
+        mode,
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 #[cfg(unix)]
-async fn accept_unix(listener: UnixListener, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
+async fn accept_unix(
+    listener: UnixListener,
+    api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
+    limits: IngressLimits,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let api = api.clone();
                 let mode = mode.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_conn(stream, api, mode).await {
+                    if let Err(e) = serve_conn(stream, api, mode, limits).await {
                         tracing::debug!("api socket connection ended: {e}");
                     }
                 });
@@ -131,9 +152,10 @@ async fn serve_conn(
     stream: UnixStream,
     api: Arc<dyn NodeApi>,
     mode: Arc<AuthMode>,
+    limits: IngressLimits,
 ) -> std::io::Result<()> {
     let (rd, wr) = stream.into_split();
-    serve_conn_split(rd, wr, api, mode, next_conn_id()).await
+    serve_conn_split(rd, wr, api, mode, next_conn_id(), limits).await
 }
 
 /// First-frame mode-select over any split byte stream — the shared per-connection entry point for
@@ -148,18 +170,19 @@ async fn serve_conn_split<R, W>(
     api: Arc<dyn NodeApi>,
     mode: Arc<AuthMode>,
     conn_id: u64,
+    limits: IngressLimits,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let first = match read_frame(&mut rd).await? {
+    let first = match read_frame(&mut rd, &limits).await? {
         Some(bytes) => bytes,
         None => return Ok(()),
     };
     match from_cbor::<WireC2S>(&first) {
-        Ok(frame) => serve_mux(rd, wr, api, mode, Some(frame), conn_id).await,
-        Err(_) => serve_legacy(rd, wr, api, mode, first, conn_id).await,
+        Ok(frame) => serve_mux(rd, wr, api, mode, Some(frame), conn_id, limits).await,
+        Err(_) => serve_legacy(rd, wr, api, mode, first, conn_id, limits).await,
     }
 }
 
@@ -170,7 +193,14 @@ where
 /// Runs forever; spawn it as a background task.
 #[cfg(windows)]
 pub async fn serve_api_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>) {
-    accept_windows_pipe(pipe_name, api, Arc::new(AuthMode::LocalSystem)).await;
+    // Local-trust carrier (Cluster F): rate/concurrency-exempt (§1.6); frame/decoded caps only.
+    accept_windows_pipe(
+        pipe_name,
+        api,
+        Arc::new(AuthMode::LocalSystem),
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 /// As [`serve_api_windows_pipe`], but the pipe **requires** a SASL exchange (no local trust): a
@@ -186,7 +216,13 @@ pub async fn serve_api_windows_pipe_authenticated(
         auth,
         tls_state: TlsState::plaintext(),
     });
-    accept_windows_pipe(pipe_name, api, mode).await;
+    accept_windows_pipe(
+        pipe_name,
+        api,
+        mode,
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 /// The windows named-pipe accept loop (peer of [`accept_unix`]). Uses the standard tokio pattern:
@@ -194,7 +230,12 @@ pub async fn serve_api_windows_pipe_authenticated(
 /// while the next instance is created ahead of it, so there is never a window where a connecting
 /// client finds no server listening.
 #[cfg(windows)]
-async fn accept_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
+async fn accept_windows_pipe(
+    pipe_name: String,
+    api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
+    limits: IngressLimits,
+) {
     use tokio::net::windows::named_pipe::ServerOptions;
     let mut server = match ServerOptions::new()
         .first_pipe_instance(true)
@@ -224,7 +265,7 @@ async fn accept_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>, mode: Arc
         tokio::spawn(async move {
             let conn_id = next_conn_id();
             let (rd, wr) = tokio::io::split(connected);
-            if let Err(e) = serve_conn_split(rd, wr, api, mode, conn_id).await {
+            if let Err(e) = serve_conn_split(rd, wr, api, mode, conn_id, limits).await {
                 tracing::debug!("named pipe connection ended: {e}");
             }
         });
@@ -245,6 +286,7 @@ async fn serve_legacy<R, W>(
     mode: Arc<AuthMode>,
     first: Vec<u8>,
     conn_id: u64,
+    limits: IngressLimits,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -260,6 +302,12 @@ where
             async {
                 match from_cbor::<ApiRequest>(&bytes) {
                     Ok(request) => {
+                        // Cluster F: reject an oversize decoded inline payload (blob put) before it
+                        // is dispatched — the post-decode ingress cap, measured O(1) from the
+                        // already-decoded request.
+                        if let Err(e) = limits.check_decoded_len(request.ingress_payload_len()) {
+                            return ApiResponse::Error(ApiError::Other(e.to_string()));
+                        }
                         tracing::debug!(
                             trace_id = %trace,
                             api_variant = ?std::mem::discriminant(&request),
@@ -284,7 +332,7 @@ where
         )
         .await;
         write_frame(&mut wr, &to_cbor(&response)).await?;
-        match read_frame(&mut rd).await? {
+        match read_frame(&mut rd, &limits).await? {
             Some(b) => bytes = b,
             None => return Ok(()),
         }
@@ -470,6 +518,7 @@ pub(crate) async fn serve_mux<R, W>(
     mode: Arc<AuthMode>,
     first: Option<WireC2S>,
     conn_id: u64,
+    limits: IngressLimits,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -516,7 +565,7 @@ where
                 // down the connection's live stream pumps and close the connection instead of
                 // serving on with the revoked identity. Local-trust / unauthenticated connections
                 // carry no guard and simply read.
-                let read = read_frame(&mut rd);
+                let read = read_frame(&mut rd, &limits);
                 let bytes = match conn_guard(&conn) {
                     Some(g) => {
                         tokio::select! {
@@ -721,6 +770,17 @@ where
                             .await;
                         teardown_streams(&mut streams);
                         break;
+                    }
+                    // Cluster F: reject an oversize decoded inline payload (blob put) before it is
+                    // dispatched — the post-decode ingress cap, measured O(1) from the decoded req.
+                    if let Err(e) = limits.check_decoded_len(req.ingress_payload_len()) {
+                        let _ = tx
+                            .send(WireS2C::Reply {
+                                id,
+                                res: ApiResponse::Error(ApiError::Other(e.to_string())),
+                            })
+                            .await;
+                        continue;
                     }
                     let api = api.clone();
                     let tx = tx.clone();
@@ -1037,7 +1097,7 @@ impl ApiClient {
         write_frame(&mut stream, &to_cbor(&request))
             .await
             .map_err(|e| ApiError::Other(format!("send: {e}")))?;
-        let bytes = read_frame(&mut stream)
+        let bytes = read_frame(&mut stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv: {e}")))?
             .ok_or_else(|| ApiError::Other("connection closed before a response".into()))?;
@@ -1070,7 +1130,7 @@ impl ApiClient {
         write_frame(&mut stream, &to_cbor(&request))
             .await
             .map_err(|e| ApiError::Other(format!("send: {e}")))?;
-        let bytes = read_frame(&mut stream)
+        let bytes = read_frame(&mut stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv: {e}")))?
             .ok_or_else(|| ApiError::Other("connection closed before a response".into()))?;
@@ -1142,7 +1202,7 @@ impl MuxApiClient {
         write_frame(&mut stream, &to_cbor(&hello))
             .await
             .map_err(|e| ApiError::Other(format!("send hello: {e}")))?;
-        let bytes = read_frame(&mut stream)
+        let bytes = read_frame(&mut stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv hello: {e}")))?
             .ok_or_else(|| ApiError::Other("closed before hello ack".into()))?;
@@ -1248,7 +1308,7 @@ impl MuxApiClient {
 
     /// Read the next server frame.
     pub async fn next(&mut self) -> Result<WireS2C, ApiError> {
-        let bytes = read_frame(&mut self.stream)
+        let bytes = read_frame(&mut self.stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv: {e}")))?
             .ok_or_else(|| ApiError::Other("connection closed".into()))?;
@@ -1263,8 +1323,14 @@ impl MuxApiClient {
 }
 
 /// Read one length-framed message. Returns `Ok(None)` on a clean EOF at a frame boundary.
+///
+/// Cluster F (Phase 4): the oversize-length rejection is now the ingress governor's single frame cap
+/// ([`IngressLimits::check_frame_len`]) rather than a per-call-site inline constant — the check fires
+/// BEFORE the receive buffer is allocated, so a hostile/corrupt prefix cannot force a huge allocation
+/// pre-decode / pre-auth.
 pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
+    limits: &IngressLimits,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
@@ -1273,14 +1339,7 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    // Cluster F: reject an oversize declared length BEFORE allocating the receive buffer, so a
-    // hostile/corrupt prefix cannot force a multi-gigabyte allocation pre-decode / pre-auth.
-    if len > daemon_common::MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
-    }
+    limits.check_frame_len(len).map_err(|e| e.as_io_error())?;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(Some(buf))
@@ -1367,7 +1426,7 @@ mod tests {
         let over = (daemon_common::MAX_FRAME_BYTES as u64 + 1) as u32;
         let framed = over.to_be_bytes();
         let mut reader: &[u8] = &framed;
-        let err = read_frame(&mut reader)
+        let err = read_frame(&mut reader, &IngressLimits::default())
             .await
             .expect_err("an oversize frame length must be rejected");
         assert_eq!(
@@ -1384,7 +1443,7 @@ mod tests {
         let mut framed = (payload.len() as u32).to_be_bytes().to_vec();
         framed.extend_from_slice(payload);
         let mut reader: &[u8] = &framed;
-        let got = read_frame(&mut reader)
+        let got = read_frame(&mut reader, &IngressLimits::default())
             .await
             .expect("read")
             .expect("a frame");

@@ -1417,6 +1417,20 @@ pub fn is_streaming(req: &ApiRequest) -> bool {
     )
 }
 
+impl ApiRequest {
+    /// The size, in bytes, of any inline byte payload this decoded request carries — used by the
+    /// Cluster-F ingress governor's post-decode ("max decoded size") check. O(1): it reads the
+    /// length of a `Vec<u8>` already decoded in place, never re-encoding or re-allocating. Only
+    /// [`ApiRequest::BlobPut`] carries inline bytes today (a `serde_bytes` byte string); every other
+    /// variant carries no bulk inline payload and returns `0`.
+    pub fn ingress_payload_len(&self) -> usize {
+        match self {
+            ApiRequest::BlobPut { bytes } => bytes.len(),
+            _ => 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem / workspace surface DTOs (daemon-fs-surface-spec.md)
 // ---------------------------------------------------------------------------
