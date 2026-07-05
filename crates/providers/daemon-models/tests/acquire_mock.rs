@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: integration test crate; raw fs/reqwest/Command are expected in tests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! Acquisition-path tests against an in-process `wiremock` Hub (no live network): companion
 //! (mmproj) plan expansion + cataloging, the size-integrity gate, the local pairing scan, and the

@@ -16,6 +16,8 @@
 //! `reload`/`back`/`close`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 #[cfg(feature = "cdp")]
 mod error;

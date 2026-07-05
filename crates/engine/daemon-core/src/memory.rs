@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here reads a daemon-internal memory snapshot path (not attacker-influenced); raw fs
+// allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! The memory provider seam (§11) — recall + persistent prompt blocks across turns/sessions.
 //!
 //! Memory is modeled as a *set* of providers the engine consults at fixed hook points in the turn

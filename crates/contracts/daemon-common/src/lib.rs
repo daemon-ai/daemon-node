@@ -10,6 +10,9 @@
 //! See `docs/daemon-workspace-layout.md` and `docs/specs/`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command (e.g. the EnvPolicy::apply tests spawn `env`);
+// the --lib pass still guards production. `EnvPolicy::apply` itself carries a scoped production anchor.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 /// The shared cursored-ring primitive (`CursoredRing`/`CursoredItem`) backing the daemon's live
 /// streams (merged log, node-event feed, fs-watch). Pure + sync.

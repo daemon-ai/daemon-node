@@ -258,6 +258,8 @@ async fn bwrap_usable() -> bool {
 /// Probe bwrap by running a trivial sandbox that unshares user + net; a non-zero exit (or a missing
 /// binary) means bwrap is unusable here and we must fall back to a plain subprocess.
 async fn probe_bwrap() -> bool {
+    // Spawns the fixed `bwrap` sandbox probe (argv-only, no shell) to test namespace availability.
+    #[allow(clippy::disallowed_methods)]
     let fut = tokio::process::Command::new("bwrap")
         .args([
             "--unshare-user",

@@ -20,6 +20,8 @@
 //! provider's diagnostic [`label`](ToolProvider::label) keeps the human-readable `mcp:{server}` form.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,6 +137,8 @@ impl McpClient {
     async fn connect(&self) -> Result<RunningService<RoleClient, ()>, McpClientError> {
         match &self.config.transport {
             McpTransport::Stdio { command, args, env } => {
+                // Spawns the operator-configured MCP stdio server program (argv-only, no shell).
+                #[allow(clippy::disallowed_methods)]
                 let mut cmd = tokio::process::Command::new(command);
                 cmd.args(args);
                 // Declared env policy (Cluster E): `InheritFull` — MCP stdio servers are launched

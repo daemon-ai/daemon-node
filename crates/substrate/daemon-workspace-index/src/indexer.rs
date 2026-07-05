@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use daemon_core::EmbeddingProvider;
+use daemon_core::{ContainedRoot, EmbeddingProvider};
 use daemon_tool_fs::read::{has_binary_extension, looks_binary};
 use sha2::{Digest, Sha256};
 
@@ -27,6 +27,14 @@ pub(crate) async fn sweep(
     cfg: &WorkspaceIndexConfig,
 ) -> Result<(), IndexError> {
     let mut present: HashSet<String> = HashSet::new();
+
+    // Read workspace file contents through the ContainedRoot fs capability (openat2
+    // RESOLVE_BENEATH|NO_SYMLINKS): a symlink anywhere under the workspace can no longer be followed
+    // out of the root when we read it (a plain `std::fs::read` on the walked path would follow it).
+    // If the root cannot be opened there is nothing to index this sweep.
+    let Ok(root_fs) = ContainedRoot::open(root) else {
+        return Ok(());
+    };
 
     for path in walk_files(root) {
         let Some(rel) = rel_path(root, &path) else {
@@ -57,7 +65,8 @@ pub(crate) async fn sweep(
             }
         }
 
-        let Ok(bytes) = std::fs::read(&path) else {
+        // Contained, symlink-hardened read (rejects a symlinked component -> file is skipped).
+        let Ok(bytes) = root_fs.read_sync(Path::new(&rel)) else {
             continue;
         };
         // Binary-by-content (extension-less binaries): skip and drop any stale row.

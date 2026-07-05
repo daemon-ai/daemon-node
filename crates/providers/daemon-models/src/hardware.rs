@@ -50,6 +50,8 @@ fn detect_ram_bytes() -> u64 {
 /// Best-effort dedicated VRAM in bytes: the largest single GPU reported by `nvidia-smi`. A model
 /// load targets one device, so we budget against the biggest GPU rather than the sum.
 fn detect_vram_bytes() -> Option<u64> {
+    // Spawns the fixed `nvidia-smi` probe (argv-only, no shell) for VRAM sizing. Not agent-reachable.
+    #[allow(clippy::disallowed_methods)]
     let output = Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nobytes"])
         .output()

@@ -47,6 +47,9 @@ fn build_suffix() -> String {
 }
 
 fn git_describe() -> Option<String> {
+    // Build-time only: spawns `git describe` (fixed binary, argv-only) to derive the version suffix.
+    // Not a runtime surface; developer/CI-controlled.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new("git")
         .args([
             "describe", "--tags", "--match", "v[0-9]*", "--dirty", "--always",

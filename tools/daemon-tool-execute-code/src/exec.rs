@@ -81,6 +81,9 @@ pub(crate) async fn run_subprocess(
     confine: Option<daemon_sandbox::SandboxSpec>,
     cancel: &CancellationToken,
 ) -> std::io::Result<RunOutcome> {
+    // Spawns the resolved interpreter (argv[0]) with an argv vector (no shell); env is scrubbed
+    // below. Runs inside the execute_code kernel sandbox where applicable.
+    #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)

@@ -20,6 +20,9 @@
 //! See `crates/engine/daemon-core/docs/` for the engine spec family.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production. (The
+// ContainedRoot module + exec spawn sites carry their own tight production anchors.)
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 pub mod actor;
 pub mod approval;

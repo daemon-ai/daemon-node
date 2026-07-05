@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here opens a resolved model artifact under the daemon-controlled cache for hashing,
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Artifact content hashing for provenance pinning (Phase 3 / Cluster E).
 //!
 //! A model artifact is pinned to the sha256 of its bytes: the pin is recorded at install (verified

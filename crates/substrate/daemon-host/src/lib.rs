@@ -31,6 +31,9 @@
 //! See `docs/specs/daemon-host-spec.md`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+// (workspace_fs.rs production is ContainedRoot-only and stays guarded; trusted stores are file-anchored.)
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 pub mod adapters;
 pub mod agent_session;

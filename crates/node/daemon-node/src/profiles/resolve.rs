@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the fs here creates the daemon-internal profile/data dir (operator-configured node root),
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Per-session engine resolution: the one [`resolve_effective`](SessionFactoryCtx::resolve_effective)
 //! path shared by the live session surface and the durable rehydration resolver — a session's
 //! engine is materialized from its bound [`ProfileSpec`] overlaid with its [`SessionOverlay`].

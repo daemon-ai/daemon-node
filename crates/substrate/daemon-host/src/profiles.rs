@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here is the daemon-internal profile store dir under the node data root
+// (not attacker-influenced); raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Profile persistence: the durable store backing the node's `ProfileApi` surface.
 //!
 //! A [`ProfileStore`] holds the set of [`ProfileSpec`] bundles a node knows about plus which one is

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here touches the shared HF cache under the node data root (daemon-controlled path),
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Acquisition: download a [`ModelRef`]'s files into the shared HF cache via `hf-hub`, tracking
 //! per-job progress and supporting pause / resume / cancel.
 //!

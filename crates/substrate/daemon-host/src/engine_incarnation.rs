@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here is the daemon-internal engine inbox/outbox IPC dirs under the node data root
+// (not attacker-influenced); raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! The engine ⇄ activation-seam adapter (host-spec §3.1).
 //!
 //! `daemon-core` is deliberately free of the durable substrate (it depends only on

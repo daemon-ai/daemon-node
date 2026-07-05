@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here serves the static web bundle. The request path is only a KEY into a startup-scanned
+// allow-map (`WebRoot::lookup`); `file_path` is a pre-enumerated bundle file, never concatenated from
+// the request -- so no path traversal, and ContainedRoot is not required. Raw fs allowed file-wide.
+#![allow(clippy::disallowed_methods)]
+
 //! The single-origin web front for the browser GUI: ONE plain-HTTP listener that serves the Qt
 //! WASM app bundle as static files AND hosts the same mux-over-WebSocket carrier ([`crate::ws`])
 //! on `GET /ws` — so a browser loads the GUI *from the daemon* and connects back to the very

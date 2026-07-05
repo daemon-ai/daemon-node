@@ -15,6 +15,8 @@
 // matrix-sdk's deeply-nested instrumented async futures (e.g. `Client::sync`) overflow the default
 // auto-trait (`Send`) evaluation recursion limit when spawned; raise it (matrix-sdk's own guidance).
 #![recursion_limit = "512"]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 mod account;
 pub mod adapter;

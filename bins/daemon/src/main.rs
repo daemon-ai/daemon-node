@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the node bootstrap fs (config path, socket path, ws_root) is operator/daemon-controlled,
+// not attacker-influenced; raw fs allowed file-wide. This file spawns no processes.
+#![allow(clippy::disallowed_methods)]
+
 //! `daemon` — the host binary that assembles an engine, its host, tools, and orchestration.
 //!
 //! It is the role-by-config node (workspace-layout §6):
@@ -314,7 +318,17 @@ struct GatewayModel {
 /// `author/slug` so they feed `ProfileSpec.model` verbatim.
 async fn daemon_cloud_gateway_models(base: &str) -> Vec<ModelDescriptor> {
     let url = format!("{}models", NodeConfig::ensure_trailing_slash(base));
-    let resp = match reqwest::Client::new().get(&url).send().await {
+    // Route through the SSRF-safe egress client. `base` is the operator-configured Daemon Cloud
+    // gateway (config-influenced), so `Redirects::None` is used: it may legitimately be a private/
+    // self-hosted host, and a `/models` probe never needs to follow a redirect.
+    let client = match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon cloud gateway egress client init");
+            return Vec::new();
+        }
+    };
+    let resp = match client.get(&url, daemon_egress::Redirects::None).await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::debug!(status = %r.status(), "daemon cloud gateway /models non-success");

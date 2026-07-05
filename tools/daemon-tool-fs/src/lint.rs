@@ -92,6 +92,8 @@ impl FsLintConfig {
 fn render_command(template: &str, rel_path: &str) -> Option<Command> {
     let mut parts = template.split_whitespace();
     let program = parts.next()?.replace("{file}", rel_path);
+    // Spawns an operator-configured linter template (argv-only, whitespace-split, no shell/quoting).
+    #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(program);
     for part in parts {
         cmd = cmd.arg(part.replace("{file}", rel_path));

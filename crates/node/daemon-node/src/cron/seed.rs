@@ -111,6 +111,9 @@ impl CronWorker {
         let Ok(path) = cr.resolve_display(rel_path) else {
             return (false, format!("script path escapes scripts dir: {rel}"));
         };
+        // Spawns a cron seed script resolved (ContainedRoot) to an absolute path under the scripts
+        // dir (argv-only, no shell); the path was contained above via `cr.resolve_display`.
+        #[allow(clippy::disallowed_methods)]
         let out =
             tokio::task::spawn_blocking(move || std::process::Command::new(&path).output()).await;
         match out {

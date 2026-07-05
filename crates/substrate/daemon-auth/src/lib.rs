@@ -21,6 +21,9 @@
 //!   reserved extension (`resource_grants`).
 
 #![forbid(unsafe_code)]
+// Phase 4: auth fs is daemon-internal (identity store dir under the node data root), not
+// attacker-influenced; raw fs allowed crate-wide. No process spawns in this crate.
+#![allow(clippy::disallowed_methods)]
 
 pub mod bootstrap;
 pub mod capability;

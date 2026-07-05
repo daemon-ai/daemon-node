@@ -21,6 +21,8 @@
 //!   environment fallback applies.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 mod error;
 mod input;
@@ -101,6 +103,10 @@ impl Default for VisionToolConfig {
 /// vision-capable aux provider.
 pub struct VisionAnalyzeTool {
     aux: Arc<dyn Provider>,
+    // Straggler (scoped): vision predates and mirrors daemon-egress -- it is the *proven*
+    // self-contained SSRF-safe pattern (Policy::none() + per-hop check_url via `next_hop`,
+    // MAX_REDIRECT_HOPS). Kept as-is; dedupe into daemon-egress is a follow-up.
+    #[allow(clippy::disallowed_types)]
     http: reqwest::Client,
     auth: Option<String>,
     call_timeout: Duration,
@@ -111,6 +117,7 @@ pub struct VisionAnalyzeTool {
 impl VisionAnalyzeTool {
     /// A vision tool over the given aux provider. The shared HTTP client follows **no** redirects
     /// on its own — the fetch loop follows them manually so every hop passes the egress check.
+    #[allow(clippy::disallowed_types)] // scoped straggler: self-contained SSRF-safe client (see struct)
     pub fn new(aux: Arc<dyn Provider>, cfg: VisionToolConfig) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)

@@ -277,8 +277,14 @@ impl BrowserSupervisor {
                 })
             })
             .await?;
-        std::fs::create_dir_all(&dir).map_err(|e| BrowserError::Io(e.to_string()))?;
-        std::fs::write(&path2, &bytes).map_err(|e| BrowserError::Io(e.to_string()))?;
+        // Scoped: the screenshot dir is the fixed, daemon-controlled artifact dir (default
+        // `$TMPDIR/daemon_browser_screenshots`) and the filename is daemon-generated (`shot_<ts>_<seq>.png`)
+        // -- no workspace/session/agent-supplied path component, so ContainedRoot is not required here.
+        #[allow(clippy::disallowed_methods)]
+        {
+            std::fs::create_dir_all(&dir).map_err(|e| BrowserError::Io(e.to_string()))?;
+            std::fs::write(&path2, &bytes).map_err(|e| BrowserError::Io(e.to_string()))?;
+        }
         Ok(path)
     }
 

@@ -19,6 +19,11 @@
 // The only `unsafe` in the crate is the sqlite-vec auto-extension registration (one transmute,
 // behind `vec-ext`); the default build is fully safe.
 #![cfg_attr(not(feature = "vec-ext"), forbid(unsafe_code))]
+// Phase 4: mnemosyne fs is all daemon-internal (per-bank SQLite files, backup/checkpoint dirs under
+// the node data root) -- not attacker-influenced, so raw fs is allowed crate-wide rather than routed
+// through ContainedRoot. This crate spawns no processes. Test-only reqwest (sync tests) is carved out.
+#![allow(clippy::disallowed_methods)]
+#![cfg_attr(test, allow(clippy::disallowed_types))]
 
 pub mod aaak;
 pub mod banks;

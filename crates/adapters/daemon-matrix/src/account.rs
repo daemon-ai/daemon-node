@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the fs here creates the daemon-internal Matrix E2EE crypto/state store dir under the node
+// data root (not attacker-influenced); raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Per-account bring-up: the credential-store session blob, the on-disk E2EE client, and the
 //! refresh write-back.
 //!
