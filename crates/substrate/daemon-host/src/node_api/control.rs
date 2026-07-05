@@ -284,18 +284,28 @@ impl ControlApi for NodeApiImpl {
         session: Option<SessionId>,
         after: Option<String>,
     ) -> daemon_api::WirePage<ApprovalInfo> {
-        let mut approvals: Vec<ApprovalInfo> = self
-            .store
-            .pending_approvals_of(session.as_ref())
-            .await
-            .into_iter()
-            .map(|p| ApprovalInfo {
+        let raw = self.store.pending_approvals_of(session.as_ref()).await;
+        // Auth 4 (read-of-one/many): scope to the request principal — a peer must not read another
+        // owner's parked-approval prompts/paths (own sessions only unless `SessionSeeAll`). Owner is
+        // read per row; the pending set is small/capped. Mirrors `session_search`'s per-hit filter.
+        let principal = current_principal();
+        let mut approvals: Vec<ApprovalInfo> = Vec::with_capacity(raw.len());
+        for p in raw {
+            let owner = self
+                .store
+                .session_meta(&p.session_id)
+                .await
+                .and_then(|m| m.owner);
+            if !owner_visible(&principal, &owner) {
+                continue;
+            }
+            approvals.push(ApprovalInfo {
                 session: p.session_id,
                 request_id: p.job_id.as_str().to_string(),
                 prompt: p.prompt,
                 path: p.path,
-            })
-            .collect();
+            });
+        }
         // The store lists in rowseq (arrival) order; the cursor is the request_id, so sort by it
         // before slicing — the pending set is small and a deterministic id order keeps the cursor
         // stable across pages even as decisions land in between.
@@ -1092,21 +1102,32 @@ impl ControlApi for NodeApiImpl {
             return daemon_api::WirePage::default();
         };
         let filter = session.as_ref().map(|s| s.to_string());
-        let mut checkpoints: Vec<daemon_api::CheckpointInfo> = store
-            .list(filter.as_deref())
-            .await
-            .into_iter()
-            .map(|r| daemon_api::CheckpointInfo {
+        // Auth 4 (read-of-one/many): scope to the request principal — a peer must not read another
+        // owner's checkpoint metadata (own sessions only unless `SessionSeeAll`). Owner is read per
+        // record; the listed set is small/capped. Mirrors `approvals_pending`'s per-row filter.
+        let principal = current_principal();
+        let mut checkpoints: Vec<daemon_api::CheckpointInfo> = Vec::new();
+        for r in store.list(filter.as_deref()).await {
+            let session = SessionId::new(r.session);
+            let owner = self
+                .store
+                .session_meta(&session)
+                .await
+                .and_then(|m| m.owner);
+            if !owner_visible(&principal, &owner) {
+                continue;
+            }
+            checkpoints.push(daemon_api::CheckpointInfo {
                 id: r.id,
-                session: SessionId::new(r.session),
+                session,
                 tool: r.tool,
                 created_unix: r.created_unix,
                 // The turn/cursor correlation is not yet recorded on the checkpoint ledger; the wire
                 // fields exist (rewind-unify foundation) and fill in when the ledger carries them.
                 turn_ordinal: None,
                 cursor: None,
-            })
-            .collect();
+            });
+        }
         // The uniform ascending-by-key page order (the cursor is the checkpoint id). The store's
         // newest-first order was an internal convenience with no wire consumers; a client wanting
         // newest-first re-sorts by `created_unix` after collecting its pages.
@@ -1169,8 +1190,15 @@ impl ControlApi for NodeApiImpl {
             kind: FsRootKind::Workspace,
             session: None,
         });
-        // Opened (live) session sandboxes.
+        // Opened (live) session sandboxes — Auth 4 (F2): only the caller's own (or, for a
+        // `SessionSeeAll` operator, every) live session is advertised, so the enumeration never
+        // reveals another owner's session ids/sandboxes.
+        let principal = current_principal();
         for sid in self.live.live_ids() {
+            let owner = self.store.session_meta(&sid).await.and_then(|m| m.owner);
+            if !owner_visible(&principal, &owner) {
+                continue;
+            }
             roots.push(FsRoot {
                 id: FsRootId::Session(sid.clone()),
                 label: sid.as_str().to_string(),
@@ -1188,6 +1216,8 @@ impl ControlApi for NodeApiImpl {
         show_ignored: bool,
         after: Option<String>,
     ) -> Result<FsListPage, ApiError> {
+        // Auth 4 (F2): a `Session` root is owner-gated (read).
+        self.require_fs_root_access(&root, false).await?;
         let ws = self
             .workspace
             .as_ref()
@@ -1196,6 +1226,8 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn fs_stat(&self, root: FsRootId, path: String) -> Result<FsEntry, ApiError> {
+        // Auth 4 (F2): a `Session` root is owner-gated (read).
+        self.require_fs_root_access(&root, false).await?;
         let ws = self
             .workspace
             .as_ref()
@@ -1209,6 +1241,8 @@ impl ControlApi for NodeApiImpl {
         path: String,
         max_bytes: u64,
     ) -> Result<FsContent, ApiError> {
+        // Auth 4 (F2): a `Session` root is owner-gated (read).
+        self.require_fs_root_access(&root, false).await?;
         let ws = self
             .workspace
             .as_ref()
@@ -1238,6 +1272,9 @@ impl ControlApi for NodeApiImpl {
             base_revision,
             force,
         } = args;
+        // Auth 4 (F2): a `Session` root is that session's sandbox — gate BEFORE the blob fetch so a
+        // non-owner is denied `Forbidden` (not a blob/Unsupported error) and `write_gated` re-checks.
+        self.require_fs_root_access(&root, true).await?;
         let blobs = self
             .blobs
             .as_ref()
@@ -1306,6 +1343,8 @@ impl ControlApi for NodeApiImpl {
         root: FsRootId,
         query: FsSearchQuery,
     ) -> Result<FsSearchPage, ApiError> {
+        // Auth 4 (F2): a `Session` root is owner-gated (read).
+        self.require_fs_root_access(&root, false).await?;
         let ws = self
             .workspace
             .as_ref()
@@ -1320,6 +1359,8 @@ impl ControlApi for NodeApiImpl {
             after_seq,
             max,
         } = args;
+        // Auth 4 (F2): a `Session` root is owner-gated (read).
+        self.require_fs_root_access(&root, false).await?;
         let ws = self
             .workspace
             .as_ref()
@@ -1417,6 +1458,21 @@ impl ControlApi for NodeApiImpl {
 }
 
 impl NodeApiImpl {
+    /// Auth 4 for the filesystem surface (Cluster A, F2): a [`FsRootId::Session`] root addresses that
+    /// session's workspace sandbox, so reading/writing it is a per-session op and must carry the same
+    /// ownership proof as the session log/history — own-or-[`SessionSeeAll`](daemon_auth::Capability::SessionSeeAll)
+    /// for a read (`control = false`), own-or-[`SessionControlAny`](daemon_auth::Capability::SessionControlAny)
+    /// for a write (`control = true`). `Host`/`Workspace` roots are node-level (not per-owner) and
+    /// pass through. Checked at each fs handler's entry, BEFORE the workspace unwrap, so a non-owner
+    /// is denied `Forbidden` regardless of whether a workspace is wired. The minted token is unused
+    /// (the fs op addresses the root directly); only success/denial matters here.
+    async fn require_fs_root_access(&self, root: &FsRootId, control: bool) -> Result<(), ApiError> {
+        if let FsRootId::Session(sid) = root {
+            self.require_session_access(sid, control).await?;
+        }
+        Ok(())
+    }
+
     /// The gated workspace write shared by `fs_write` and `fs_write_from_blob`: `Workspace`/`Session`
     /// roots only, sensitive-path + per-session `Deny` gate (overridable by `force`), a pre-mutation
     /// checkpoint for session roots, and the `Conflict`-on-stale-`base_revision` guard inside
@@ -1429,6 +1485,8 @@ impl NodeApiImpl {
             base_revision,
             force,
         } = args;
+        // Auth 4: a `Session` root is that session's sandbox — a write requires session control.
+        self.require_fs_root_access(&root, true).await?;
         let ws = self
             .workspace
             .as_ref()

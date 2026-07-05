@@ -133,14 +133,24 @@ fn authorize_ownership(
     if principal.has(override_cap) {
         return Ok(AuthorizedFor::mint(session.clone()));
     }
+    // Exhaustive over every `SessionOwnership` variant — NO `_` arm (the ownership-layer
+    // no-wildcard discipline): a future variant forces a compile-time decision here rather than
+    // silently folding into a catch-all. Both non-owner arms remain fail-closed (`Forbidden`).
     match ownership {
         // No such session yet: let the normal create / not-found path handle it downstream.
         SessionOwnership::Absent => Ok(AuthorizedFor::mint(session.clone())),
+        // Owned by the caller: authorized.
         SessionOwnership::Owned(owner) if owner == principal.user_id => {
             Ok(AuthorizedFor::mint(session.clone()))
         }
-        _ => Err(ApiError::Forbidden(format!(
+        // Owned by someone else: a non-override principal never crosses ownership.
+        SessionOwnership::Owned(_) => Err(ApiError::Forbidden(format!(
             "session {session} is not owned by the caller"
+        ))),
+        // Legacy owner-NULL row: reachable only via the override cap (decided above); a
+        // non-override principal is denied — deny-closed on an unknown owner.
+        SessionOwnership::LegacyUnowned => Err(ApiError::Forbidden(format!(
+            "session {session} has no owner and is reachable only via an operator override"
         ))),
     }
 }

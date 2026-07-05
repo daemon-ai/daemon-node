@@ -28,6 +28,7 @@ mod live_agent_e2e;
 mod messaging;
 mod negative_auth;
 mod ownership;
+mod ownership_matrix;
 mod ownership_transport;
 mod positive_e2e;
 mod process_notify;
