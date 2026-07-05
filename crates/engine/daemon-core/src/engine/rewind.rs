@@ -63,6 +63,13 @@ impl Engine {
         // Cadence counters are relative to the dropped tail; reset so the rewound point starts clean.
         self.snapshot.iters_since_skill = 0;
         self.snapshot.turns_since_memory = 0;
+        // A rewind to the conversation root is a full context clear — the daemon's `/new` analog.
+        // Notify the §10 context engine so a stateful engine resets its per-session state in step
+        // with the emptied conversation (LCM: retained-DAG prune + ingest-cursor/counter reset).
+        // Partial rewinds are not resets: the engine re-measures the shortened body next turn.
+        if retained == 0 {
+            self.context.on_session_reset(&self.snapshot.session_id);
+        }
 
         // Bump the incarnation epoch so any in-flight commit/event from the interrupted turn that
         // arrives late is fenced and dropped (mirrors the suspension epoch bump).

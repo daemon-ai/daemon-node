@@ -613,9 +613,18 @@ impl Engine {
     }
 
     /// End the session: notify the §10 context engine and §11 memory providers so they can flush /
-    /// consolidate. A host calls this on incarnation teardown (terminal deactivation). The context
-    /// engine sees the final conversation; memory providers get `on_session_switch(End)`.
+    /// consolidate. Fired on incarnation teardown (terminal deactivation): the in-process actor
+    /// calls it when its command loop drains, and the durable activation path calls it when a turn
+    /// reaches the terminal `Completed` step. The context engine sees the final conversation;
+    /// memory providers get `on_session_switch(End)`.
+    ///
+    /// Balanced with `ensure_session_started`: a session that never started is not ended, and a
+    /// second call is a no-op (the flag re-arms, so a hypothetical later turn re-opens cleanly).
     pub async fn end_session(&mut self) {
+        if !self.lifecycle_started {
+            return;
+        }
+        self.lifecycle_started = false;
         self.context
             .on_session_end(&self.snapshot.session_id, &self.snapshot.conversation);
         self.notify_session_switch(SwitchReason::End).await;

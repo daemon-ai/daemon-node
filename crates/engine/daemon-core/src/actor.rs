@@ -580,6 +580,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
             // Fresh cancellation token for the next turn.
             control.reset();
         }
+        // Terminal teardown (§10/§11): the loop drained (Shutdown, or every handle dropped), so no
+        // further turns can run on this incarnation — flush the context engine + memory providers
+        // (a no-op if no turn ever started the session lifecycle).
+        engine.end_session().await;
     });
 
     AgentHandle {
@@ -652,6 +656,59 @@ mod tests {
             Arc::new(MockProvider::completing("done")),
             Arc::new(ToolRegistry::new()),
         )
+    }
+
+    /// A §10 spy that records whether `on_session_end` fired (the actor teardown contract).
+    struct EndSpyContext {
+        ended: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::ContextEngine for EndSpyContext {
+        fn before_turn(
+            &self,
+            conv: &mut crate::conversation::Conversation,
+            budget: Option<usize>,
+        ) -> crate::context::Pressure {
+            crate::context::Pressure {
+                used_tokens: crate::context::estimate_tokens(conv),
+                budget_tokens: budget,
+            }
+        }
+        async fn compact(
+            &self,
+            conv: crate::conversation::Conversation,
+            _budget: usize,
+        ) -> crate::conversation::Conversation {
+            conv
+        }
+        fn on_session_end(&self, _session: &SessionId, _conv: &crate::conversation::Conversation) {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Draining the actor (Shutdown) is terminal teardown: the §10 context engine's
+    /// `on_session_end` fires once the loop exits, without the host calling `end_session` itself.
+    #[tokio::test]
+    async fn shutdown_fires_session_end_teardown() {
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = completing_engine("teardown").with_context_engine(Arc::new(EndSpyContext {
+            ended: ended.clone(),
+        }));
+        let handle = spawn_agent_session(engine, Arc::new(NoopHost));
+        handle
+            .start_turn(UserMsg::new("hi"))
+            .await
+            .expect("turn completes");
+        handle.shutdown().await;
+        // The teardown runs on the actor task after the loop breaks; poll briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ended.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session_end did not fire after shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A snapshot request while idle is answered immediately on the event stream.

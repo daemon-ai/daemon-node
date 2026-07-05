@@ -175,6 +175,28 @@ pub trait ContextEngine: Send + Sync {
     /// conversation so the engine can flush a closing summary.
     fn on_session_end(&self, _session: &SessionId, _conv: &Conversation) {}
 
+    /// A `/new`-style in-place reset of `session`'s context state (default no-op). The engine fires
+    /// it when the conversation is cleared back to its root (a full-clear
+    /// [`rewind_to`](crate::Engine::rewind_to)), so a stateful engine can reset its per-session
+    /// state in step (LCM: retained-DAG prune by `new_session_retain_depth`, counters, ingest
+    /// cursor) without the host having to remember an engine-specific inherent call.
+    fn on_session_reset(&self, _session: &SessionId) {}
+
+    /// An old → new session rollover (default no-op): finalize `old` (flushing `old_conv` when
+    /// given), bind `new`, and — when `carry_over` — carry retained context across the boundary.
+    /// The seam for LCM's ordered end→reset→start→carry-over (`rollover_session`,
+    /// `LCM:engine.py:2240-2305`). No host trigger exists yet (a session-creation intent carrying
+    /// the previous session id is a later workstream); the hook lands so engines stop exposing
+    /// this as a host-must-remember inherent method.
+    fn rollover_session(
+        &self,
+        _old: &SessionId,
+        _new: &SessionId,
+        _old_conv: Option<&Conversation>,
+        _carry_over: bool,
+    ) {
+    }
+
     /// The advisory names of the context-management tools this engine owns (registered separately
     /// through the §12 [`ToolRegistry`](crate::tools)); empty by default.
     fn tools(&self) -> Vec<String> {

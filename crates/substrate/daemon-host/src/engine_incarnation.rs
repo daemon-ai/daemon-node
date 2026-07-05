@@ -485,6 +485,10 @@ impl Incarnation for CoreIncarnation {
 
         match outcome {
             TurnOutcome::Completed(_) => {
+                // Terminal deactivation (§10/§11): `Step::Completed` marks the session `Completed`
+                // in the store (never re-activated), so flush the context engine + memory providers
+                // (LCM final ingest + lifecycle finalize) before the final checkpoint is taken.
+                engine.end_session().await;
                 // Terminal: capture this child's `outbox/` artifacts into the content store as the
                 // structured completion payload (the parent materializes them on its wake). `None`
                 // when content transfer is unwired or no artifacts were produced (legacy marker).

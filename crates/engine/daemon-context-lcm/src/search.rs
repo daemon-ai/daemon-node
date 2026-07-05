@@ -129,7 +129,9 @@ pub fn search_messages(
     let safe_query = sanitize_fts5_query(query);
     let terms = extract_search_terms(&safe_query);
     let phrases = extract_quoted_phrases(&safe_query);
-    if requires_like_fallback(query) {
+    // A low-disk-degraded store has no FTS index at all (the rebuild dropped it) — route every
+    // query straight to the substring scan until a later repair pass re-enables FTS.
+    if requires_like_fallback(query) || store.is_degraded() {
         return search_messages_like(store, query, sort, filter, limit);
     }
 
@@ -230,7 +232,8 @@ pub fn search_nodes(
     let safe_query = sanitize_fts5_query(query);
     let terms = extract_search_terms(&safe_query);
     let phrases = extract_quoted_phrases(&safe_query);
-    if requires_like_fallback(query) {
+    // Degraded store (no FTS index): LIKE-only, as in the transcript search above.
+    if requires_like_fallback(query) || store.is_degraded() {
         return search_nodes_like(store, query, session, sort, source, limit);
     }
 
