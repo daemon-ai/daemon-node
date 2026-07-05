@@ -529,6 +529,44 @@ impl Default for BrowserConfig {
     }
 }
 
+/// Tuning for the `execute_code` tool (sandboxed one-shot Python). `[execute_code]` /
+/// `DAEMON_EXECUTE_CODE__*`. Opt-in (`enable = false`) like the other optional tools; arbitrary code
+/// is additionally governed by the session's [`ApprovalPolicy`](daemon_core::ApprovalPolicy).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecuteCodeConfig {
+    /// Whether to register the `execute_code` tool.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub enable: bool,
+    /// The default mode when a call omits it: `project` (venv-aware, workspace CWD) or `strict`
+    /// (system python, isolated staging dir).
+    pub mode: daemon_tool_execute_code::Mode,
+    /// The self-managed wall-clock timeout (ms) before the script is killed.
+    pub timeout_ms: u64,
+    /// The stdout byte cap (head 40 % / tail 60 %).
+    pub max_stdout_bytes: usize,
+    /// The stderr byte cap (head-only).
+    pub max_stderr_bytes: usize,
+    /// The OS-sandbox policy: `auto` (bwrap when usable, else plain), `bwrap` (required), `none`.
+    pub sandbox: daemon_tool_execute_code::SandboxPolicy,
+    /// The child network policy under the sandbox: `off` (`--unshare-net`) or `shared`.
+    pub network: daemon_tool_execute_code::NetworkPolicy,
+}
+
+impl Default for ExecuteCodeConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            mode: daemon_tool_execute_code::Mode::Project,
+            timeout_ms: 300_000,
+            max_stdout_bytes: 50_000,
+            max_stderr_bytes: 10_000,
+            sandbox: daemon_tool_execute_code::SandboxPolicy::Auto,
+            network: daemon_tool_execute_code::NetworkPolicy::Off,
+        }
+    }
+}
+
 /// Tuning for the skills subsystem. `[skills]` / `DAEMON_SKILLS__*`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -1007,6 +1045,8 @@ pub struct NodeConfig {
     pub web: WebConfig,
     /// Browser-tool tuning (`enable = false` by default).
     pub browser: BrowserConfig,
+    /// `execute_code`-tool tuning (`enable = false` by default).
+    pub execute_code: ExecuteCodeConfig,
     /// Skills-subsystem tuning (`enable = true` by default).
     pub skills: SkillsConfig,
     /// The `fs` tool tuning (`[fs]` / `DAEMON_FS__*`): read caps, search caps, extra write-deny
@@ -1072,6 +1112,7 @@ impl Default for NodeConfig {
             mcp: McpConfig::default(),
             web: WebConfig::default(),
             browser: BrowserConfig::default(),
+            execute_code: ExecuteCodeConfig::default(),
             skills: SkillsConfig::default(),
             fs: daemon_tool_fs::FsConfig::default(),
             lcm: LcmOpts::default(),

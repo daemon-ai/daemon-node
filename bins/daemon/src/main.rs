@@ -66,6 +66,7 @@ use daemon_pytool_client::{PyToolConfig, PyToolProvider};
 use daemon_store::{InMemoryStore, SessionStore};
 use daemon_supervision::ManagedUnit;
 use daemon_tool_clarify::ClarifyTool;
+use daemon_tool_execute_code::{ExecuteCodeSettings, ExecuteCodeTool};
 use daemon_tool_metta::MettaTool;
 use daemon_tool_todo::TodoTool;
 use daemon_tool_web::{
@@ -1111,6 +1112,31 @@ fn build_metta_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
     Some(Arc::new(tool) as Arc<dyn Tool>)
 }
 
+/// Build the `execute_code` tool when enabled (`[execute_code].enable`). Runs a one-shot Python
+/// subprocess in the session workspace, sandboxed with bubblewrap when usable. Opt-in and, at call
+/// time, governed by the session's approval policy like a dangerous shell command.
+fn build_execute_code_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
+    if !cfg.execute_code.enable {
+        return None;
+    }
+    let ec = &cfg.execute_code;
+    let settings = ExecuteCodeSettings {
+        default_mode: ec.mode,
+        timeout: std::time::Duration::from_millis(ec.timeout_ms),
+        max_stdout_bytes: ec.max_stdout_bytes,
+        max_stderr_bytes: ec.max_stderr_bytes,
+        sandbox: ec.sandbox,
+        network: ec.network,
+    };
+    tracing::info!(
+        mode = ec.mode.as_str(),
+        sandbox = ?ec.sandbox,
+        network = ?ec.network,
+        "execute_code tool enabled"
+    );
+    Some(Arc::new(ExecuteCodeTool::new(settings)) as Arc<dyn Tool>)
+}
+
 /// Adapts the host's [`CredentialStore`] to the web tools' [`SecretSource`] seam so the heavy
 /// substrate type never enters the tool crate. Reads happen at call time, so a key set later via
 /// `CredentialApi` takes effect immediately.
@@ -2060,6 +2086,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // feature (which compiles chromiumoxide); a no-op otherwise.
     if let Some(browser_tool) = build_browser_tool(&cfg) {
         extra_tools.push(browser_tool);
+    }
+
+    // The optional `execute_code` tool (sandboxed one-shot Python), opt-in via `[execute_code]`.
+    if let Some(execute_code_tool) = build_execute_code_tool(&cfg) {
+        extra_tools.push(execute_code_tool);
     }
 
     let host_config = HostConfig {

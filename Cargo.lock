@@ -2096,6 +2096,7 @@ dependencies = [
  "daemon-telemetry",
  "daemon-tool-browser",
  "daemon-tool-clarify",
+ "daemon-tool-execute-code",
  "daemon-tool-fs",
  "daemon-tool-metta",
  "daemon-tool-skill",
@@ -2831,6 +2832,21 @@ dependencies = [
  "daemon-store",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "daemon-tool-execute-code"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
