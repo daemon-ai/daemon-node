@@ -55,6 +55,7 @@ pub mod process_agent;
 pub mod profiles;
 pub mod request_context;
 pub mod revision;
+pub mod revocation;
 pub mod routing;
 pub mod services;
 pub mod session_index;
@@ -126,6 +127,7 @@ pub use request_context::{
     INTERNAL_USERNAME, SYSTEM_USERNAME,
 };
 pub use revision::FileRevisionLog;
+pub use revocation::{CredentialRevoker, RevocationGuard, SessionRevocations};
 pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
     TransportPattern,

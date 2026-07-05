@@ -17,6 +17,7 @@ use crate::auth_audit::AuthAudit;
 use crate::authn::{AuthExchange, AuthSuccess, Authenticator, BeginOutcome, StepOutcome, TlsState};
 use crate::authz::authorize;
 use crate::request_context::{with_request_context, AuthMethod, RequestContext};
+use crate::revocation::RevocationGuard;
 use daemon_api::{
     dispatch, from_cbor, is_streaming, to_cbor, wire_feature_api, ApiError, ApiRequest,
     ApiResponse, EventsPage, LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C,
@@ -300,7 +301,48 @@ enum ConnAuth {
     Authenticated {
         principal: Principal,
         method: AuthMethod,
+        /// The captured per-principal revocation epoch (Cluster F, Part A). `Some` for a
+        /// network-authenticated connection when the authenticator carries a revocation registry;
+        /// `None` for local trust (deliberately non-revocable) or a node without the registry. When
+        /// the guard reads revoked, the connection (and its live pumps) are torn down.
+        guard: Option<RevocationGuard>,
     },
+}
+
+/// Capture the revocation guard for a freshly-authenticated `user_id` on this connection: `Some`
+/// only under [`AuthMode::Required`] with a registry-carrying authenticator. Local trust and a
+/// registry-less node yield `None` (non-revocable).
+fn capture_guard(mode: &AuthMode, user_id: &str) -> Option<RevocationGuard> {
+    match mode {
+        AuthMode::Required { auth, .. } => auth.revocations().map(|r| r.guard(user_id)),
+        AuthMode::LocalSystem => None,
+    }
+}
+
+/// This connection's live revocation guard, if it is authenticated and revocable (Cluster F).
+fn conn_guard(conn: &ConnAuth) -> Option<RevocationGuard> {
+    match conn {
+        ConnAuth::Authenticated { guard, .. } => guard.clone(),
+        _ => None,
+    }
+}
+
+/// Abort every live stream pump on this connection (Cluster F teardown, and normal connection
+/// close). `AbortHandle::abort` is non-blocking; a pump already finished is a no-op.
+fn teardown_streams(streams: &mut HashMap<u64, AbortHandle>) {
+    for (_, handle) in streams.drain() {
+        handle.abort();
+    }
+}
+
+/// Resolve when the connection's principal is revoked; never resolves for a non-revocable
+/// connection (local trust / no registry). Lets a stream pump add a uniform revocation `select!`
+/// arm regardless of whether a guard is present (Cluster F, Part A pump self-teardown).
+async fn revoked_or_never(guard: &Option<RevocationGuard>) {
+    match guard {
+        Some(g) => g.revoked().await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Map a SASL mechanism name to its [`AuthMethod`] (audit/telemetry tag).
@@ -444,10 +486,12 @@ where
     });
 
     // Local trust pre-binds the system principal; an auth-required transport starts unelevated.
+    // Local trust is deliberately non-revocable, so it carries no guard.
     let mut conn = if mode.is_local_system() {
         ConnAuth::Authenticated {
             principal: RequestContext::system().principal,
             method: AuthMethod::LocalTrust,
+            guard: None,
         }
     } else {
         ConnAuth::Unauthenticated
@@ -466,14 +510,34 @@ where
     loop {
         let frame = match pending.take() {
             Some(f) => f,
-            None => match read_frame(&mut rd).await? {
-                Some(bytes) => match from_cbor::<WireC2S>(&bytes) {
-                    Ok(f) => f,
-                    // A frame we cannot decode is dropped rather than killing the connection.
-                    Err(_) => continue,
-                },
-                None => break,
-            },
+            None => {
+                // Cluster F (Part A): while idle-waiting for the next client frame, race the read
+                // against a revocation of this connection's principal. On revoke, synchronously tear
+                // down the connection's live stream pumps and close the connection instead of
+                // serving on with the revoked identity. Local-trust / unauthenticated connections
+                // carry no guard and simply read.
+                let read = read_frame(&mut rd);
+                let bytes = match conn_guard(&conn) {
+                    Some(g) => {
+                        tokio::select! {
+                            r = read => r?,
+                            _ = g.revoked() => {
+                                teardown_streams(&mut streams);
+                                break;
+                            }
+                        }
+                    }
+                    None => read.await?,
+                };
+                match bytes {
+                    Some(bytes) => match from_cbor::<WireC2S>(&bytes) {
+                        Ok(f) => f,
+                        // A frame we cannot decode is dropped rather than killing the connection.
+                        Err(_) => continue,
+                    },
+                    None => break,
+                }
+            }
         };
         match frame {
             WireC2S::Hello { .. } => {
@@ -513,7 +577,12 @@ where
                                 let principal = complete_auth(&tx, final_data, success).await;
                                 auth.audit_login_ok(&principal.user_id, method_label(method))
                                     .await;
-                                ConnAuth::Authenticated { principal, method }
+                                let guard = capture_guard(&mode, &principal.user_id);
+                                ConnAuth::Authenticated {
+                                    principal,
+                                    method,
+                                    guard,
+                                }
                             }
                             BeginOutcome::Failed(reject) => {
                                 auth.audit_login_fail(&mechanism, None).await;
@@ -553,7 +622,12 @@ where
                                 if let Some(a) = &audit {
                                     a.login_ok(&principal.user_id, method_label(method)).await;
                                 }
-                                ConnAuth::Authenticated { principal, method }
+                                let guard = capture_guard(&mode, &principal.user_id);
+                                ConnAuth::Authenticated {
+                                    principal,
+                                    method,
+                                    guard,
+                                }
                             }
                             StepOutcome::Failed(reject) => {
                                 if let Some(a) = &audit {
@@ -599,9 +673,11 @@ where
                                     method_label(AuthMethod::Token),
                                 )
                                 .await;
+                                let guard = capture_guard(&mode, &principal.user_id);
                                 ConnAuth::Authenticated {
                                     principal,
                                     method: AuthMethod::Token,
+                                    guard,
                                 }
                             }
                             BeginOutcome::Failed(reject) => {
@@ -626,7 +702,26 @@ where
                 }
             },
             WireC2S::Call { id, req } => {
-                if let ConnAuth::Authenticated { principal, method } = &conn {
+                if let ConnAuth::Authenticated {
+                    principal,
+                    method,
+                    guard,
+                } = &conn
+                {
+                    // Cluster F: a frame that arrived just as the principal was revoked (racing the
+                    // idle read above) must not dispatch — refuse it and close the connection.
+                    if guard.as_ref().is_some_and(|g| g.is_revoked()) {
+                        let _ = tx
+                            .send(WireS2C::Reply {
+                                id,
+                                res: ApiResponse::Error(ApiError::Unauthenticated(
+                                    "credentials revoked; re-authenticate".into(),
+                                )),
+                            })
+                            .await;
+                        teardown_streams(&mut streams);
+                        break;
+                    }
                     let api = api.clone();
                     let tx = tx.clone();
                     let audit = audit.clone();
@@ -658,7 +753,25 @@ where
                 }
             }
             WireC2S::Open { id, req } => {
-                if let ConnAuth::Authenticated { principal, method } = &conn {
+                if let ConnAuth::Authenticated {
+                    principal,
+                    method,
+                    guard,
+                } = &conn
+                {
+                    // Cluster F: refuse a stream open on a just-revoked connection and close it.
+                    if guard.as_ref().is_some_and(|g| g.is_revoked()) {
+                        let _ = tx
+                            .send(WireS2C::End {
+                                id,
+                                error: Some(ApiError::Unauthenticated(
+                                    "credentials revoked; re-authenticate".into(),
+                                )),
+                            })
+                            .await;
+                        teardown_streams(&mut streams);
+                        break;
+                    }
                     if is_streaming(&req) {
                         // Gate the stream at open time under the request context (the pump itself
                         // does not re-dispatch). On allow, spawn the stream; else End{error}.
@@ -673,10 +786,19 @@ where
                                 // pump task: a `tokio::spawn`ed task does NOT inherit the task-local,
                                 // so the pump would otherwise run with `None` principal and the Auth 4
                                 // ownership check inside `subscribe` would see no identity. Passing
-                                // `ctx` closes the cross-owner mux transcript read.
+                                // `ctx` closes the cross-owner mux transcript read. The revocation
+                                // guard clone lets the pump self-terminate on revoke (belt-and-
+                                // suspenders with the serve-loop teardown above).
                                 streams.insert(
                                     id,
-                                    spawn_stream(api.clone(), tx.clone(), id, req, ctx),
+                                    spawn_stream(
+                                        api.clone(),
+                                        tx.clone(),
+                                        id,
+                                        req,
+                                        ctx,
+                                        guard.clone(),
+                                    ),
                                 );
                             }
                             Err(e) => {
@@ -735,6 +857,7 @@ pub(crate) fn spawn_stream(
     id: u64,
     req: ApiRequest,
     ctx: RequestContext,
+    guard: Option<RevocationGuard>,
 ) -> AbortHandle {
     let task = tokio::spawn(async move {
         // Re-establish the connection's request context inside the spawned task (the task-local is
@@ -744,9 +867,9 @@ pub(crate) fn spawn_stream(
             match req {
                 ApiRequest::Subscribe {
                     session, after_seq, ..
-                } => pump_session_log(api, tx, id, session, after_seq).await,
+                } => pump_session_log(api, tx, id, session, after_seq, guard).await,
                 ApiRequest::EventsSince { cursor, .. } => {
-                    pump_node_events(api, tx, id, cursor).await
+                    pump_node_events(api, tx, id, cursor, guard).await
                 }
                 _ => {
                     let _ = tx
@@ -775,6 +898,7 @@ async fn pump_session_log(
     id: u64,
     session: daemon_common::SessionId,
     after_seq: u64,
+    guard: Option<RevocationGuard>,
 ) {
     // The activation epoch is constant for this log generation; read it once and stamp every
     // page + any Reset with it.
@@ -791,6 +915,15 @@ async fn pump_session_log(
     let mut last_seq = after_seq;
     loop {
         tokio::select! {
+            // Cluster F: if this connection's principal is revoked, end the live pump immediately
+            // rather than keep streaming another generation's transcript.
+            _ = revoked_or_never(&guard) => {
+                let _ = tx.send(WireS2C::End {
+                    id,
+                    error: Some(ApiError::Unauthenticated("credentials revoked".into())),
+                }).await;
+                break;
+            }
             item = stream.next() => match item {
                 Some(LogStreamItem::Entry(entry)) => {
                     last_seq = entry.seq;
@@ -830,7 +963,13 @@ async fn pump_session_log(
 /// frames. The feed itself surfaces an aged-out cursor / a broadcast lag as a `ResyncNeeded` event
 /// *inside* a page (the client re-baselines), so this pump just forwards pages; idle ticks send an
 /// empty keepalive page; the stream ends with `End`.
-async fn pump_node_events(api: Arc<dyn NodeApi>, tx: mpsc::Sender<WireS2C>, id: u64, cursor: u64) {
+async fn pump_node_events(
+    api: Arc<dyn NodeApi>,
+    tx: mpsc::Sender<WireS2C>,
+    id: u64,
+    cursor: u64,
+    guard: Option<RevocationGuard>,
+) {
     let mut stream = match api.events_subscribe(cursor).await {
         Ok(s) => s,
         Err(e) => {
@@ -843,6 +982,14 @@ async fn pump_node_events(api: Arc<dyn NodeApi>, tx: mpsc::Sender<WireS2C>, id: 
     let mut last_cursor = cursor;
     loop {
         tokio::select! {
+            // Cluster F: end the live pump immediately when the connection's principal is revoked.
+            _ = revoked_or_never(&guard) => {
+                let _ = tx.send(WireS2C::End {
+                    id,
+                    error: Some(ApiError::Unauthenticated("credentials revoked".into())),
+                }).await;
+                break;
+            }
             item = stream.next() => match item {
                 Some(page) => {
                     if page.next_cursor > last_cursor {

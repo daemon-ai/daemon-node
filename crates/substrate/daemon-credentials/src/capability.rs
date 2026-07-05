@@ -5,10 +5,11 @@
 //! trace journal).
 //!
 //! A [`CapabilityLease`]'s signature is an ed25519 signature over the **digest of a deterministic
-//! Gordian Envelope** of its fields (`cap_id`, `profile`, `mode`, `expires_at`, a scope fingerprint,
-//! and the embedded secret). Because the digest covers the secret and the scope, editing either —
-//! or the expiry — invalidates the signature; a holder several cuts down can therefore verify a
-//! capability minted by the owner without trusting the intermediates that relayed it.
+//! Gordian Envelope** of its fields (`cap_id`, `profile`, `mode`, `expires_at`, the revocation
+//! `epoch`, a scope fingerprint, and the embedded secret). Because the digest covers the secret,
+//! the scope, the expiry, and the epoch, editing any of them invalidates the signature; a holder
+//! several cuts down can therefore verify a capability minted by the owner without trusting the
+//! intermediates that relayed it (and cannot re-stamp a stale epoch onto a lease).
 
 use bc_components::{
     PrivateKeyBase, Signature, Signer, SigningPrivateKey, SigningPublicKey, Verifier,
@@ -50,6 +51,7 @@ fn capability_digest(lease: &CapabilityLease) -> [u8; 32] {
         .add_assertion("profile", lease.profile.as_str())
         .add_assertion("mode", mode_tag(lease.mode))
         .add_assertion("expires", lease.expires_at_ms)
+        .add_assertion("epoch", lease.epoch)
         .add_assertion("scope", scope_fingerprint(&lease.scope))
         .add_assertion("secret", secret);
     digest_to_32(&env.digest())

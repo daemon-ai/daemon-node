@@ -891,6 +891,12 @@ pub struct CapabilityLease {
     pub mode: CredMode,
     /// Wall-clock expiry, in milliseconds since the Unix epoch.
     pub expires_at_ms: u64,
+    /// The minting authority's revocation epoch at issue time (Cluster F, Part B). A credential
+    /// mutation (`credential_remove`/`credential_set`) bumps the authority's epoch; `use_capability`
+    /// refuses any lease whose `epoch` no longer matches, so an outstanding lease minted against the
+    /// removed/replaced material is invalidated at use. Covered by the `signature`, so an
+    /// intermediate relay cannot re-stamp it. `0` for the standalone L1 pool (no remote authority).
+    pub epoch: u64,
     /// The short-lived token, present only in `Native` mode.
     pub secret: Option<LeaseSecret>,
     /// The authority's detached signature over the canonical capability bytes.

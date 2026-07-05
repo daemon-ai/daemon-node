@@ -69,6 +69,10 @@ pub struct CredentialAuthority {
     next_cap: AtomicU64,
     proxied: Mutex<HashMap<CredId, String>>,
     revoked: Mutex<HashSet<CredId>>,
+    /// The current revocation epoch (Cluster F, Part B). Stamped onto every minted lease; bumped by
+    /// [`CredentialAuthority::revoke_all`] so a lease minted before the bump is refused at
+    /// [`CredentialAuthority::use_capability`].
+    epoch: AtomicU64,
     governance: Mutex<Governance>,
     audit: Mutex<Vec<CredentialAuditEvent>>,
 }
@@ -93,6 +97,7 @@ impl CredentialAuthority {
             next_cap: AtomicU64::new(0),
             proxied: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashSet::new()),
+            epoch: AtomicU64::new(0),
             governance: Mutex::new(Governance {
                 spent_tokens: 0,
                 ceiling: None,
@@ -178,6 +183,7 @@ impl CredentialAuthority {
             scope: issued.clone(),
             mode: self.mode,
             expires_at_ms: now_ms() + self.ttl_ms,
+            epoch: self.epoch.load(Ordering::Acquire),
             secret,
             signature: Vec::new(),
         };
@@ -201,6 +207,11 @@ impl CredentialAuthority {
         lease: &CapabilityLease,
     ) -> Result<LeaseSecret, CredError> {
         self.verify(lease)?;
+        // Cluster F (Part B): a lease minted before the authority's last `revoke_all` (credential
+        // removed/replaced) is refused, even though its signature + expiry still check out.
+        if lease.epoch != self.epoch.load(Ordering::Acquire) {
+            return Err(CredError::Unavailable(lease.profile.to_string()));
+        }
         if self.revoked.lock().unwrap().contains(&lease.cap_id) {
             return Err(CredError::Unavailable(lease.profile.to_string()));
         }
@@ -250,6 +261,26 @@ impl CredentialAuthority {
             CredScope::nothing(),
             ctx,
             String::new(),
+        );
+    }
+
+    /// Revoke **every** outstanding lease this authority has minted (Cluster F, Part B): bump the
+    /// revocation epoch (so a lease minted before now fails [`use_capability`]'s epoch check) and
+    /// drop all retained `Proxied` keys (so a proxied handle can no longer be resolved). Records a
+    /// single `Revoke` audit entry with an empty scope. Called when the profile's credential is
+    /// removed or replaced, so an already-minted lease against the old material cannot keep resolving.
+    ///
+    /// Concurrency: bumps the epoch atomic, then clears `proxied` in its own lock scope, then records
+    /// audit under the `audit` lock — no lock is held across another (mirrors [`revoke`]).
+    pub fn revoke_all(&self, ctx: &AcquireCtx) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.proxied.lock().unwrap().clear();
+        self.push_audit(
+            CredAuditKind::Revoke,
+            None,
+            CredScope::nothing(),
+            ctx,
+            "revoke_all (credential removed/replaced)".into(),
         );
     }
 
@@ -313,5 +344,95 @@ impl CredentialAuthority {
             detail,
             timestamp_ms: now_ms(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::CapabilitySigner;
+    use crate::source::StubCredentialSource;
+
+    fn authority(mode: CredMode) -> CredentialAuthority {
+        let signer = Arc::new(CapabilitySigner::generate());
+        let source = Arc::new(StubCredentialSource::new("openai", "sk-configured"));
+        CredentialAuthority::new(
+            CredScope::new(["openai"], ["chat"], Some(1_000)),
+            mode,
+            60_000,
+            signer,
+            source,
+        )
+    }
+
+    fn scope() -> CredScope {
+        CredScope::new(["openai"], ["chat"], Some(1_000))
+    }
+
+    /// Cluster F (Part B): a `Bearer` lease minted before `revoke_all` must be refused at
+    /// `use_capability` afterwards. This is the epoch-check discriminator — `Bearer` returns the
+    /// embedded secret, so ONLY the epoch check (not the proxied-key clear) can stop it.
+    #[test]
+    fn bearer_lease_use_fails_after_revoke_all() {
+        let auth = authority(CredMode::Bearer);
+        let ctx = AcquireCtx::default();
+        let lease = auth
+            .acquire(&ctx, &ProfileRef::new("openai"), &scope())
+            .expect("acquire");
+        // Usable before revocation.
+        auth.use_capability(&ctx, &lease)
+            .expect("a fresh Bearer lease resolves");
+        // Revoke every outstanding lease (credential removed/replaced).
+        auth.revoke_all(&ctx);
+        let err = auth
+            .use_capability(&ctx, &lease)
+            .expect_err("a lease minted before revoke_all must be refused");
+        assert!(
+            matches!(err, CredError::Unavailable(_)),
+            "a stale-epoch lease must be Unavailable, got {err:?}"
+        );
+        // A freshly-minted lease (under the new epoch) works again.
+        let fresh = auth
+            .acquire(&ctx, &ProfileRef::new("openai"), &scope())
+            .expect("re-acquire under new epoch");
+        auth.use_capability(&ctx, &fresh)
+            .expect("a lease minted after revoke_all resolves");
+    }
+
+    /// `revoke_all` drops retained `Proxied` keys, so a proxied handle can no longer resolve.
+    #[test]
+    fn proxied_key_dropped_on_revoke_all() {
+        let auth = authority(CredMode::Proxied);
+        let ctx = AcquireCtx::default();
+        let lease = auth
+            .acquire(&ctx, &ProfileRef::new("openai"), &scope())
+            .expect("acquire");
+        assert!(lease.secret.is_none(), "Proxied hands over only a handle");
+        auth.use_capability(&ctx, &lease)
+            .expect("a fresh proxied handle resolves at the owner");
+        auth.revoke_all(&ctx);
+        let err = auth
+            .use_capability(&ctx, &lease)
+            .expect_err("a revoked proxied handle must not resolve");
+        assert!(matches!(err, CredError::Unavailable(_)), "got {err:?}");
+    }
+
+    /// The epoch is covered by the signature: editing it on a minted lease breaks verification, so a
+    /// relay cannot re-stamp a stale epoch to a current one.
+    #[test]
+    fn epoch_is_signed() {
+        let auth = authority(CredMode::Bearer);
+        let ctx = AcquireCtx::default();
+        let mut lease = auth
+            .acquire(&ctx, &ProfileRef::new("openai"), &scope())
+            .expect("acquire");
+        auth.verify(&lease)
+            .expect("a freshly minted lease verifies");
+        lease.epoch = lease.epoch.wrapping_add(1);
+        assert_eq!(
+            auth.verify(&lease).unwrap_err(),
+            CredError::BadSignature,
+            "tampering the epoch must invalidate the signature"
+        );
     }
 }

@@ -12,7 +12,13 @@ impl CredentialApi for NodeApiImpl {
             .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
         store
             .set(&profile, &secret)
-            .map_err(|e| ApiError::Other(format!("credential set: {e}")))
+            .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;
+        // Cluster F (Part B): replacing the profile's credential must invalidate leases minted
+        // against the OLD material — bump the authority's lease epoch after the store write.
+        if let Some(revoker) = &self.credential_revoker {
+            revoker.revoke_profile(&profile);
+        }
+        Ok(())
     }
 
     async fn credential_list(&self) -> Vec<CredentialInfo> {
@@ -29,7 +35,14 @@ impl CredentialApi for NodeApiImpl {
             .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
         store
             .remove(&profile)
-            .map_err(|e| ApiError::Other(format!("credential remove: {e}")))
+            .map_err(|e| ApiError::Other(format!("credential remove: {e}")))?;
+        // Cluster F (Part B): removing the profile's credential must invalidate any outstanding
+        // lease minted against it — bump the authority's lease epoch (and drop retained proxied
+        // keys) after the store delete.
+        if let Some(revoker) = &self.credential_revoker {
+            revoker.revoke_profile(&profile);
+        }
+        Ok(())
     }
 }
 
