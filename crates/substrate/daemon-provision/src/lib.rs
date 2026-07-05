@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use daemon_common::env_policy::EnvPolicy;
 use daemon_common::SessionId;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -299,9 +300,11 @@ impl ProcessProvisioner {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        for (key, value) in &spec.env {
-            command.env(key, value);
-        }
+        // Declared env policy (Cluster E): `InheritFull` — a placed worker is a trusted node
+        // component (a cut of the daemon itself) that needs the daemon's ambient environment
+        // (provider keys, PATH, locale) by design. `spec.env` extras layer on top exactly as
+        // before; only the *declaration* is new.
+        EnvPolicy::InheritFull.apply(&mut command, &spec.env);
 
         let mut child = command.spawn().map_err(|e| ProvErr::Spawn(e.to_string()))?;
         let stdin = child

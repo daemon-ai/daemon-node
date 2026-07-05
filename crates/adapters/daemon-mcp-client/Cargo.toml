@@ -12,7 +12,8 @@ path = "src/lib.rs"
 # The `Tool`/`ToolProvider` trait the proxy + provider implement, and the `ToolOutcome` it maps
 # MCP results onto. No rmcp type leaks across this boundary — the host sees only `daemon_core`.
 daemon-core = { workspace = true }
-daemon-common = { workspace = true }
+# `process` gives `EnvPolicy::apply`, the sanctioned child-env application at the stdio spawn.
+daemon-common = { workspace = true, features = ["process"] }
 # The official MCP SDK (client only: stdio child-process + streamable-HTTP transports).
 rmcp = { workspace = true }
 async-trait = { workspace = true }

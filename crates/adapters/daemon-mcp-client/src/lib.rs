@@ -137,9 +137,12 @@ impl McpClient {
             McpTransport::Stdio { command, args, env } => {
                 let mut cmd = tokio::process::Command::new(command);
                 cmd.args(args);
-                for (k, v) in env {
-                    cmd.env(k, v);
-                }
+                // Declared env policy (Cluster E): `InheritFull` — MCP stdio servers are launched
+                // as trusted node components today and inherit the daemon env by design. NOTE:
+                // server configs can originate from less-trusted sources; if per-entry trust
+                // lands, flip such entries to `EnvPolicy::Clean { allowlist }`. Behavior is
+                // unchanged for now — the config `env` extras layer on top exactly as before.
+                daemon_common::env_policy::EnvPolicy::InheritFull.apply(&mut cmd, env);
                 let transport = TokioChildProcess::new(cmd)
                     .map_err(|e| McpClientError::Connect(e.to_string()))?;
                 ().serve(transport)
