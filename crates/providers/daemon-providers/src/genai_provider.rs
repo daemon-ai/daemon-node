@@ -7,8 +7,8 @@ use crate::{classify_genai_error, finalize_output, RawToolCall};
 use async_trait::async_trait;
 use daemon_common::{Pricing, UsageDelta};
 use daemon_core::{
-    Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestMsg,
-    RequestParams, ResponseMeta, StreamEvent, ToolCallFormat,
+    Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestImage,
+    RequestMsg, RequestParams, ResponseMeta, StreamEvent, ToolCallFormat,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -113,18 +113,37 @@ impl GenAiProvider {
         Self::new(AdapterKind::Anthropic, model)
     }
 
+    /// The output-token cap actually applied to `req`: the per-call [`RequestParams::max_tokens`]
+    /// override when set, else the provider's model cap. Also surfaced on [`ResponseMeta::params`].
+    fn effective_max_tokens(&self, req: &Request) -> u32 {
+        req.params.max_tokens.unwrap_or(self.max_tokens)
+    }
+
     fn options(&self, req: &Request) -> ChatOptions {
-        ChatOptions::default()
+        let mut opts = ChatOptions::default()
             .with_capture_usage(true)
             .with_capture_content(true)
             .with_capture_reasoning_content(true)
             .with_capture_tool_calls(true)
             .with_normalize_reasoning_content(true)
-            .with_max_tokens(self.max_tokens)
+            .with_max_tokens(self.effective_max_tokens(req))
             // A conversation-stable cache key derived from the stable prefix (system + tools). Used
             // by OpenAI to keep a conversation's requests routed to the same backend so its automatic
             // prefix cache stays warm; ignored by adapters that do not honor it.
-            .with_prompt_cache_key(prompt_cache_key(req))
+            .with_prompt_cache_key(prompt_cache_key(req));
+        // Per-call sampling overrides ([`Request::params`]); applied only when set so the default
+        // request leaves genai's own defaults untouched. genai 0.6 has no `top_k` setter, so
+        // `params.top_k` is ignored here (the local worker honors it).
+        if let Some(temperature) = req.params.temperature {
+            opts = opts.with_temperature(temperature);
+        }
+        if let Some(top_p) = req.params.top_p {
+            opts = opts.with_top_p(top_p);
+        }
+        if let Some(seed) = req.params.seed {
+            opts = opts.with_seed(seed);
+        }
+        opts
     }
 
     fn chat_request(&self, req: &Request) -> ChatRequest {
@@ -445,6 +464,17 @@ fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
             ChatMessage::assistant(MessageContent::from_parts(parts))
         }
         "assistant" => ChatMessage::assistant(msg.content.clone()),
+        _ if !msg.images.is_empty() => {
+            // A multimodal user message: the text (when present) followed by one image part each.
+            let mut parts: Vec<ContentPart> = Vec::new();
+            if !msg.content.is_empty() {
+                parts.push(ContentPart::from_text(msg.content.clone()));
+            }
+            for img in &msg.images {
+                parts.push(to_image_part(img));
+            }
+            ChatMessage::user(MessageContent::from_parts(parts))
+        }
         _ => ChatMessage::user(msg.content.clone()),
     };
     if msg.cache_breakpoint {
@@ -452,6 +482,13 @@ fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
     } else {
         chat_msg
     }
+}
+
+/// Map a resolved [`RequestImage`] onto a genai binary [`ContentPart`]. The tool layer has already
+/// produced base64 bytes + MIME (path/URL/`data:` resolution and SSRF checks live there), so this is
+/// a pure re-wrap; providers that do not accept images ignore the part.
+fn to_image_part(img: &RequestImage) -> ContentPart {
+    ContentPart::from_binary_base64(img.mime.clone(), img.data_base64.clone(), None)
 }
 
 /// The published **output**-token cap for a well-known cloud chat model (the max a single generation
@@ -688,7 +725,7 @@ impl Provider for GenAiProvider {
             resp,
             &valid,
             self.pricing.as_ref(),
-            self.max_tokens,
+            self.effective_max_tokens(&req),
         ))
     }
 
@@ -702,7 +739,7 @@ impl Provider for GenAiProvider {
         let opts = self.options(&req);
         let valid = req.tool_names();
         let pricing = self.pricing;
-        let max_tokens = self.max_tokens;
+        let max_tokens = self.effective_max_tokens(&req);
         let (tx, rx) = futures::channel::mpsc::unbounded();
 
         tokio::spawn(async move {
@@ -817,5 +854,76 @@ mod tests {
     fn with_max_tokens_overrides_the_sourced_cap() {
         let p = GenAiProvider::for_model("claude-sonnet-4").with_max_tokens(123);
         assert_eq!(p.max_tokens, 123);
+    }
+
+    #[test]
+    fn options_apply_per_call_params_when_set() {
+        let p = GenAiProvider::for_model("gpt-4o").with_max_tokens(1000);
+        let req = Request::default().with_params(RequestParams {
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            max_tokens: Some(500),
+            seed: Some(7),
+            // genai 0.6 has no top_k setter; it is silently ignored.
+            top_k: Some(40),
+        });
+        let opts = p.options(&req);
+        assert_eq!(opts.temperature, Some(0.2));
+        assert_eq!(opts.top_p, Some(0.9));
+        assert_eq!(opts.seed, Some(7));
+        // The per-call cap overrides the model cap.
+        assert_eq!(opts.max_tokens, Some(500));
+    }
+
+    #[test]
+    fn options_default_params_leave_sampling_unset_and_use_model_cap() {
+        let p = GenAiProvider::for_model("gpt-4o").with_max_tokens(1000);
+        let opts = p.options(&Request::default());
+        assert_eq!(opts.temperature, None);
+        assert_eq!(opts.top_p, None);
+        assert_eq!(opts.seed, None);
+        assert_eq!(opts.max_tokens, Some(1000));
+    }
+
+    #[test]
+    fn effective_max_tokens_prefers_per_call_override() {
+        let p = GenAiProvider::for_model("gpt-4o").with_max_tokens(1000);
+        assert_eq!(p.effective_max_tokens(&Request::default()), 1000);
+        let req = Request::default().with_params(RequestParams {
+            max_tokens: Some(42),
+            ..Default::default()
+        });
+        assert_eq!(p.effective_max_tokens(&req), 42);
+    }
+
+    #[test]
+    fn to_chat_message_maps_images_into_binary_parts() {
+        let msg = RequestMsg {
+            role: "user".into(),
+            content: "describe this".into(),
+            images: vec![RequestImage {
+                mime: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+            ..Default::default()
+        };
+        let chat = to_chat_message(&msg);
+        let parts = chat.content.parts();
+        assert!(parts.iter().any(|p| p.is_text()), "keeps the text part");
+        assert!(
+            parts.iter().any(|p| p.is_image()),
+            "emits an image binary part"
+        );
+    }
+
+    #[test]
+    fn to_chat_message_text_only_user_has_no_image_part() {
+        let msg = RequestMsg {
+            role: "user".into(),
+            content: "no image".into(),
+            ..Default::default()
+        };
+        let chat = to_chat_message(&msg);
+        assert!(!chat.content.parts().iter().any(|p| p.is_image()));
     }
 }

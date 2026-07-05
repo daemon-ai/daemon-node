@@ -231,9 +231,7 @@ impl Extractor {
                 ..Default::default()
             }],
             tools: Vec::new(),
-            auth: None,
-            constraint: None,
-            cache_system: false,
+            ..Default::default()
         };
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let out = match tokio::time::timeout(timeout, provider.chat(request)).await {
@@ -291,9 +289,7 @@ impl Extractor {
                 ..Default::default()
             }],
             tools: Vec::new(),
-            auth: None,
-            constraint: None,
-            cache_system: false,
+            ..Default::default()
         };
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let out = match tokio::time::timeout(timeout, provider.chat(request)).await {
@@ -336,9 +332,7 @@ impl Extractor {
                 ..Default::default()
             }],
             tools: Vec::new(),
-            auth: None,
-            constraint: None,
-            cache_system: false,
+            ..Default::default()
         };
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
         match tokio::time::timeout(timeout, provider.chat(request)).await {

@@ -80,6 +80,8 @@ async fn local_provider_chats_on_vulkan() {
         auth: None,
         constraint: None,
         cache_system: false,
+        params: Default::default(),
+        task: None,
     };
     let out = provider.chat(req).await.expect("chat ok");
     eprintln!(
