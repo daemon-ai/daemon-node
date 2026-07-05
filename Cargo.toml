@@ -86,6 +86,26 @@ matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "bundle
 # readability/HTML->markdown extraction for the key-less `web_extract` fallback (Mozilla readability
 # port). Isolated to the `daemon-tool-web` crate; no network I/O of its own.
 dom_smoothie = "0.18"
+# fs-tool search stack (isolated to `daemon-tool-fs`): gitignore-respecting workspace walking
+# (`ignore` + its `globset`) and native line searching with context (`grep-searcher`/`grep-regex`)
+# — the same pure-Rust crates ripgrep is built from, so the `fs` grep/glob ops need no rg binary.
+ignore = "0.4"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+# text diffing/similarity for the fs tool's fuzzy edit (ratio scoring for the block-anchor /
+# context-aware strategies, hermes `fuzzy_match.py` parity) and its unified-diff edit results.
+similar = "2"
+# document auto-extraction on `fs` read (feature `extract`, isolated to `daemon-tool-fs`):
+# PDF text via pdf-extract (+ lopdf), DOCX/XLSX via zip + quick-xml (a direct port of hermes'
+# stdlib zipfile+ElementTree extraction; calamine was evaluated and rejected because its latest
+# release pins quick-xml 0.39, which carries RUSTSEC-2026-0194/0195) — all pure Rust, no
+# C/system deps. `zip` is default-features = false: reading OOXML needs only `deflate`; the
+# default aes/bzip2/zstd/xz stack would drag in far heavier transitive trees. quick-xml >= 0.41
+# is load-bearing: it fixes the two RUSTSEC DoS advisories above.
+pdf-extract = "0.12"
+zip = { version = "7", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
 # headless-browser control over the Chrome DevTools Protocol for the `browser` tool. tokio-native;
 # isolated to the `daemon-tool-browser` crate behind the `browser` feature (slow first compile: the
 # CDP bindings are ~60K generated LOC), so the default workspace build never pays for it.
@@ -103,10 +123,17 @@ encoding_rs = "0.8"
 mistralrs = { version = "0.8", default-features = false }
 # in-process mock HTTP server for provider wire tests (no live network in the suite).
 wiremock = "0.6"
-# (dev) raw signal delivery for the graceful-shutdown launch gate: SIGTERM/SIGINT sent to the real
-# spawned binary exactly the way a container runtime stops it. Already resolved in the tree
-# (transitively); test-only, never compiled into a shipped artifact.
+# Raw signal delivery: `daemon-processes` SIGTERMs whole background process groups (`killpg`), and
+# the graceful-shutdown launch gate (dev) sends SIGTERM/SIGINT to the real spawned binary exactly
+# the way a container runtime stops it.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
+# Cross-platform pseudo-terminal (wezterm's pty layer) for interactive background CLIs
+# (`shell(pty=true)` → `daemon-processes`). MIT; pins some older transitives (bitflags 1, nix 0.28)
+# — duplicate-version warnings only (deny.toml multiple-versions = "warn").
+portable-pty = "0.9"
+# Concurrent wait+kill on one std child (the piped background backend: reader thread waits, the
+# kill path signals). Isolated to `daemon-processes`.
+shared_child = "1"
 # Hugging Face Hub client for model acquisition into the shared cache (async tokio API + rustls).
 # Same crate (and cache layout) mistral.rs uses, so a warmed cache is read by the mistralrs engine.
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
@@ -215,6 +242,7 @@ daemon-infer = { path = "crates/providers/daemon-infer", default-features = fals
 daemon-models = { path = "crates/providers/daemon-models" }
 daemon-auth = { path = "crates/substrate/daemon-auth" }
 daemon-store = { path = "crates/substrate/daemon-store" }
+daemon-processes = { path = "crates/substrate/daemon-processes" }
 daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
 daemon-provision = { path = "crates/substrate/daemon-provision" }
@@ -239,14 +267,18 @@ daemon-pytool = { path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { path = "tools/daemon-tool-metta" }
 daemon-tool-shell = { path = "tools/daemon-tool-shell" }
+daemon-tool-process = { path = "tools/daemon-tool-process" }
 daemon-tool-fs = { path = "tools/daemon-tool-fs" }
 daemon-tool-tkx = { path = "tools/daemon-tool-tkx" }
 daemon-tool-orchestrate = { path = "tools/daemon-tool-orchestrate" }
 daemon-tool-cron = { path = "tools/daemon-tool-cron" }
 daemon-tool-web = { path = "tools/daemon-tool-web" }
+daemon-tool-vision = { path = "tools/daemon-tool-vision" }
 daemon-tool-browser = { path = "tools/daemon-tool-browser" }
 daemon-tool-todo = { path = "tools/daemon-tool-todo" }
 daemon-tool-clarify = { path = "tools/daemon-tool-clarify" }
+daemon-tool-execute-code = { path = "tools/daemon-tool-execute-code" }
+daemon-tool-session-search = { path = "tools/daemon-tool-session-search" }
 daemon-skills = { path = "crates/skills/daemon-skills" }
 daemon-tool-skill = { path = "tools/daemon-tool-skill" }
 

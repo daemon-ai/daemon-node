@@ -415,6 +415,7 @@ async fn drive_generation(
     let request_id = worker.next_request_id;
     worker.next_request_id += 1;
 
+    let (sampling, max_tokens) = effective_sampling(cfg, req);
     let cmd = Command::Generate {
         request_id,
         system: req.system.clone(),
@@ -427,8 +428,8 @@ async fn drive_generation(
                 schema: t.schema.clone(),
             })
             .collect(),
-        sampling: cfg.sampling,
-        max_tokens: effective_max_output(cfg),
+        sampling,
+        max_tokens,
         constraint: req.constraint.as_ref().map(|c| protocol::Constraint {
             lark: c.lark.clone(),
             gbnf: c.gbnf.clone(),
@@ -526,15 +527,40 @@ async fn drive_generation(
     out.meta = Some(Box::new(ResponseMeta {
         provider_name: Some(provider_name_otel(cfg.engine).to_string()),
         params: Some(RequestParams {
-            temperature: Some(cfg.sampling.temperature as f64),
-            top_p: Some(cfg.sampling.top_p as f64),
-            top_k: Some(cfg.sampling.top_k),
-            max_tokens: Some(effective_max_output(cfg)),
-            seed: Some(cfg.sampling.seed),
+            temperature: Some(sampling.temperature as f64),
+            top_p: Some(sampling.top_p as f64),
+            top_k: Some(sampling.top_k),
+            max_tokens: Some(max_tokens),
+            seed: Some(sampling.seed),
         }),
         ..Default::default()
     }));
     Ok(out)
+}
+
+/// Merge the per-call [`RequestParams`] over the worker's configured [`Sampling`] + output cap: an
+/// unset field keeps the worker default, a set field overrides it. Unlike the genai path, the local
+/// worker protocol carries `top_k`, so it is honored here. Image parts on the request have no worker
+/// input channel and are dropped by [`to_proto_msg`] (the vision aux path targets a cloud provider).
+fn effective_sampling(cfg: &WorkerConfig, req: &Request) -> (Sampling, u32) {
+    let mut sampling = cfg.sampling;
+    if let Some(temperature) = req.params.temperature {
+        sampling.temperature = temperature as f32;
+    }
+    if let Some(top_p) = req.params.top_p {
+        sampling.top_p = top_p as f32;
+    }
+    if let Some(top_k) = req.params.top_k {
+        sampling.top_k = top_k;
+    }
+    if let Some(seed) = req.params.seed {
+        sampling.seed = seed;
+    }
+    let max_tokens = req
+        .params
+        .max_tokens
+        .unwrap_or_else(|| effective_max_output(cfg));
+    (sampling, max_tokens)
 }
 
 /// The OpenTelemetry `gen_ai.provider.name` value for a local engine. `mistral_ai` is the closest
@@ -565,7 +591,9 @@ fn effective_max_output(cfg: &WorkerConfig) -> u32 {
     }
 }
 
-/// Map one engine [`RequestMsg`] onto the worker protocol's [`protocol::Msg`].
+/// Map one engine [`RequestMsg`] onto the worker protocol's [`protocol::Msg`]. Any `images` on the
+/// message are intentionally dropped: the worker protocol has no image input channel, so local
+/// inference is text-only (the vision aux path targets a cloud provider — see [`effective_sampling`]).
 fn to_proto_msg(msg: &RequestMsg) -> protocol::Msg {
     protocol::Msg {
         role: msg.role.clone(),
@@ -798,5 +826,33 @@ mod tests {
         c.max_tokens = 0;
         c.params.n_ctx = 2000;
         assert_eq!(effective_max_output(&c), 2000);
+    }
+
+    #[test]
+    fn per_call_params_override_worker_sampling_and_cap() {
+        let mut c = cfg();
+        c.max_tokens = 4096;
+        let req = Request::default().with_params(RequestParams {
+            temperature: Some(0.2),
+            top_p: Some(0.5),
+            top_k: Some(10),
+            max_tokens: Some(123),
+            seed: Some(99),
+        });
+        let (sampling, max_tokens) = effective_sampling(&c, &req);
+        assert_eq!(sampling.temperature, 0.2_f32);
+        assert_eq!(sampling.top_p, 0.5_f32);
+        assert_eq!(sampling.top_k, 10);
+        assert_eq!(sampling.seed, 99);
+        assert_eq!(max_tokens, 123);
+    }
+
+    #[test]
+    fn default_params_keep_worker_sampling_and_effective_cap() {
+        let mut c = cfg();
+        c.max_tokens = 4096;
+        let (sampling, max_tokens) = effective_sampling(&c, &Request::default());
+        assert_eq!(sampling, c.sampling);
+        assert_eq!(max_tokens, effective_max_output(&c));
     }
 }

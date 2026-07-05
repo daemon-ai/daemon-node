@@ -9,9 +9,13 @@ license.workspace = true
 daemon-core = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-common = { workspace = true }
+# Background/PTY spawn + per-session sticky cwd live in the host-owned process registry.
+daemon-processes = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

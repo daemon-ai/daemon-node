@@ -1,0 +1,30 @@
+[package]
+name = "daemon-processes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+daemon-common = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# ANSI escape stripping on every model-facing output read (poll/log/wait/notify tails).
+regex = { workspace = true }
+# Cross-platform pseudo-terminal for interactive background CLIs (`shell(pty=true)`).
+portable-pty = { workspace = true }
+# Concurrent wait+kill on one child (the piped background backend's reader thread vs kill path).
+shared_child = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Process-group SIGTERM (`killpg`) so a kill reaches the whole `setsid`/`process_group` tree.
+nix = { workspace = true }
+
+[lints]
+workspace = true

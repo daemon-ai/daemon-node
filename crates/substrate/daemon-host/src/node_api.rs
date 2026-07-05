@@ -151,9 +151,9 @@ use daemon_core::{
 };
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
-    AgentCommand, AgentEvent, DeliveryTarget, Direction, Disposition, HostRequest,
+    AgentCommand, AgentEvent, ConvView, DeliveryTarget, Direction, Disposition, HostRequest,
     HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin,
-    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId,
+    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId, UserMsg,
 };
 use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
 use daemon_telemetry::{
@@ -451,6 +451,61 @@ impl NodeApiImpl {
             }
         }
     }
+
+    /// Inject host-originated input (a background process-exit notification, a watch-pattern match,
+    /// a message to a managed child) into `session`'s conversation, driving a reactive turn — the
+    /// one seam that works across **both** session lifecycles:
+    ///
+    /// - a **live** (actor-resident) session takes a real [`AgentCommand::StartTurn`] through the
+    ///   normal submit path (Observe-while-idle only folds context and drives no turn, so a
+    ///   notification would otherwise sit unseen until the user next speaks);
+    /// - a **durable** (activation-lifecycle) session — which `submit` must reject under the
+    ///   one-lifecycle-owner guard-rail — gets a durable pending input
+    ///   ([`SessionStore::enqueue_session_input`]) plus a wake; the incarnation drains it into the
+    ///   conversation at hydrate and the woken turn runs with it.
+    ///
+    /// An **unclaimed** id (the in-memory owner map is empty after a restart) routes by durable
+    /// evidence: a session with a durable activation row takes the store seam (never spawning a
+    /// divergent live engine over durable state); anything else opens the live path, exactly like
+    /// an inbound message would. A `Completed` durable session drops the input (its owner is gone).
+    pub async fn inject_session_input(
+        &self,
+        session: &SessionId,
+        text: String,
+    ) -> Result<(), ApiError> {
+        let owner = self.owners.get(session).map(|o| *o.value());
+        let durable = match owner {
+            Some(Lifecycle::Live) => false,
+            Some(Lifecycle::Durable) => true,
+            None => self.store.status(session).await.is_some(),
+        };
+        if durable {
+            match self.store.status(session).await {
+                Some(SessionStatus::Completed) | None => {
+                    tracing::debug!(
+                        session = %session,
+                        "dropping injected input for a settled durable session"
+                    );
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+            let mut payload = Vec::new();
+            ciborium::into_writer(&UserMsg::new(text), &mut payload)
+                .map_err(|e| ApiError::Other(format!("encode injected input: {e}")))?;
+            self.store.enqueue_session_input(session, payload).await;
+            self.store.enqueue_wake(session.clone()).await;
+            return Ok(());
+        }
+        self.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new(text),
+                request_id: daemon_common::ReqId(0),
+            },
+        )
+        .await
+    }
 }
 
 mod access;
@@ -487,7 +542,7 @@ pub(crate) use messaging::participant_label;
 pub(crate) use overlay::approval_mode_to_policy;
 pub(crate) use profile::profile_err;
 pub(crate) use roster::{
-    filtered_tree, forward_event, owner_visible, paginate_roster, session_in_scope,
+    filtered_tree, forward_event, owner_visible, paginate_roster, seed_title, session_in_scope,
     session_info_from,
 };
 pub(crate) use routing::{

@@ -17,6 +17,7 @@ use rusqlite::{params, params_from_iter, Connection, Row};
 use rusqlite_migration::{Migrations, M};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 /// The schema-migration ladder, gated by `PRAGMA user_version` (rusqlite_migration). `M1` is the
@@ -207,6 +208,9 @@ pub struct FtsRepair {
     pub rebuilt: bool,
     /// Whether any sync trigger was missing and recreated.
     pub triggers_recreated: bool,
+    /// Whether the rebuild hit a disk-space-class write error and the index was dropped instead
+    /// (search degrades to LIKE-only until a later repair succeeds — `LCM:db_bootstrap.py:533-545`).
+    pub degraded: bool,
 }
 
 /// One table's verdict from the read-only `/lcm doctor repair` scan (`_scan_fts_repair`,
@@ -430,6 +434,11 @@ pub struct Store {
     /// time, negative never deep-checks) — injected from
     /// [`LcmConfig::fts_integrity_check_interval_hours`](crate::config::LcmConfig).
     fts_check_interval_hours: f64,
+    /// Whether an FTS rebuild hit a disk-space-class write error and dropped the index instead
+    /// (low-disk degradation, `LCM:db_bootstrap.py:533-545`): search routes to LIKE-only while
+    /// set. Cleared when a later repair pass (next open, or a forced `/lcm doctor repair apply`)
+    /// rebuilds cleanly.
+    degraded: AtomicBool,
 }
 
 impl Store {
@@ -483,15 +492,26 @@ impl Store {
         )?;
         // Startup FTS hygiene (`ensure_external_content_fts`, `LCM:db_bootstrap.py:572-577`):
         // structurally verify + (throttled) deep-check each external-content index, rebuilding a
-        // broken one from its content table so a corrupted index heals on open.
+        // broken one from its content table so a corrupted index heals on open. A rebuild that
+        // hits a full disk degrades that index to LIKE-only search instead of failing the open.
         let now = unix_now();
+        let mut degraded = false;
         for spec in [&schema::MESSAGES_FTS, &schema::NODES_FTS] {
-            repair_fts_locked(&conn, spec, now, Some(fts_check_interval_hours))?;
+            degraded |=
+                repair_fts_locked(&conn, spec, now, Some(fts_check_interval_hours))?.degraded;
         }
         Ok(Self {
             conn: Mutex::new(conn),
             fts_check_interval_hours,
+            degraded: AtomicBool::new(degraded),
         })
+    }
+
+    /// Whether FTS is currently degraded to LIKE-only search (a rebuild hit a disk-space-class
+    /// write error and the index was dropped). Recovers when a later repair pass — the next
+    /// [`Store::open`], or a forced [`Store::repair_fts`] — rebuilds cleanly.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
     }
 
     // ---- MessageStore (§4.2) ---------------------------------------------------------------
@@ -2034,6 +2054,11 @@ impl Store {
         for spec in [&schema::MESSAGES_FTS, &schema::NODES_FTS] {
             out.push(repair_fts_locked(&conn, spec, now, throttle)?);
         }
+        // A repair pass is authoritative for the low-disk degradation flag: a degraded index
+        // enters (or stays in) LIKE-only mode; a pass with every index verified/rebuilt cleanly
+        // re-enables FTS (recovery after disk space is freed).
+        self.degraded
+            .store(out.iter().any(|o| o.degraded), Ordering::Relaxed);
         Ok(out)
     }
 
@@ -2373,9 +2398,13 @@ fn fts_missing_triggers(conn: &Connection, spec: &schema::FtsSpec) -> rusqlite::
 }
 
 /// Rebuild a broken index from its content table and recreate any missing sync trigger
-/// (`repair_external_content_fts`, `LCM:db_bootstrap.py:524-569`). Deviation: Python degrades to
-/// LIKE-only search (dropping the index) when free disk is low; `std` exposes no free-space probe,
-/// so the rebuild always proceeds and a genuinely full disk surfaces as the SQLite write error.
+/// (`repair_external_content_fts`, `LCM:db_bootstrap.py:524-569`).
+///
+/// Low-disk degradation (`LCM:db_bootstrap.py:533-545`): a rebuild that hits a disk-space-class
+/// write error drops the index's artifacts (triggers included, so base-table writes keep working)
+/// and reports `degraded` instead of failing — the store falls back to LIKE-only search. Python
+/// probes free space up front (`_check_disk_space`, statvfs); here the *write error itself* is the
+/// probe, so degradation triggers on the actual failure with no platform dependency.
 fn repair_fts_locked(
     conn: &Connection,
     spec: &schema::FtsSpec,
@@ -2384,20 +2413,23 @@ fn repair_fts_locked(
 ) -> Result<FtsRepair> {
     let mut rebuilt = false;
     if fts_needs_rebuild(conn, spec, now, throttle) {
-        // Drop the virtual table (which owns its shadows), then sweep orphaned shadows left by a
-        // half-broken index; recreate with the byte-identical schema DDL and reindex.
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\";", spec.table))?;
-        for shadow in fts_shadow_names(spec) {
-            conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{shadow}\";"))?;
+        if let Err(e) = rebuild_fts(conn, spec) {
+            if is_disk_full(&e) {
+                drop_fts_artifacts(conn, spec);
+                tracing::warn!(
+                    table = spec.table,
+                    error = %e,
+                    "lcm: FTS rebuild hit a full disk; degrading to LIKE-only search"
+                );
+                return Ok(FtsRepair {
+                    table: spec.table.to_string(),
+                    rebuilt: false,
+                    triggers_recreated: false,
+                    degraded: true,
+                });
+            }
+            return Err(e.into());
         }
-        conn.execute_batch(spec.create_sql)?;
-        conn.execute(
-            &format!(
-                "INSERT INTO \"{t}\"(\"{t}\") VALUES('rebuild')",
-                t = spec.table
-            ),
-            [],
-        )?;
         tracing::warn!(
             table = spec.table,
             "lcm: rebuilt broken FTS index from content table"
@@ -2416,7 +2448,56 @@ fn repair_fts_locked(
         table: spec.table.to_string(),
         rebuilt,
         triggers_recreated: triggers_were_missing,
+        degraded: false,
     })
+}
+
+/// The write half of the repair: drop the virtual table (which owns its shadows), sweep orphaned
+/// shadows left by a half-broken index, recreate with the byte-identical schema DDL, and reindex
+/// from the content table.
+fn rebuild_fts(conn: &Connection, spec: &schema::FtsSpec) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\";", spec.table))?;
+    for shadow in fts_shadow_names(spec) {
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{shadow}\";"))?;
+    }
+    conn.execute_batch(spec.create_sql)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO \"{t}\"(\"{t}\") VALUES('rebuild')",
+            t = spec.table
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+/// Whether a SQLite failure is a disk-space-class write error (`SQLITE_FULL` / `SQLITE_IOERR`) —
+/// the class where degrading to LIKE-only search beats failing the open.
+fn is_disk_full(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::SystemIoFailure
+            )
+    )
+}
+
+/// Best-effort removal of one index's FTS artifacts — sync triggers first (so base-table writes
+/// stop touching the missing index), then the virtual table + orphaned shadows
+/// (`_drop_fts_artifacts`, `LCM:db_bootstrap.py:466-492`). Errors are ignored: this runs on an
+/// already-degraded (full) disk and drops only free pages.
+fn drop_fts_artifacts(conn: &Connection, spec: &schema::FtsSpec) {
+    for sql in spec.trigger_sqls {
+        if let Some(name) = fts_trigger_name(sql) {
+            let _ = conn.execute_batch(&format!("DROP TRIGGER IF EXISTS \"{name}\";"));
+        }
+    }
+    let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\";", spec.table));
+    for shadow in fts_shadow_names(spec) {
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{shadow}\";"));
+    }
 }
 
 /// Column list shared by every `summary_nodes` SELECT (keeps `map_node` indices stable).
@@ -3201,6 +3282,124 @@ mod tests {
             1
         );
         drop(healed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disk-space-class SQLite failures (and only those) select the degraded path.
+    #[test]
+    fn disk_full_error_classification() {
+        let failure = |code: std::os::raw::c_int| {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+        };
+        assert!(is_disk_full(&failure(rusqlite::ffi::SQLITE_FULL)));
+        assert!(is_disk_full(&failure(rusqlite::ffi::SQLITE_IOERR)));
+        assert!(!is_disk_full(&failure(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(!is_disk_full(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    /// Low-disk degradation end-to-end (`repair_external_content_fts`,
+    /// `LCM:db_bootstrap.py:533-545`): a rebuild that hits `SQLITE_FULL` (forced here by clamping
+    /// `max_page_count`) drops the index + triggers and flags the store degraded — search routes
+    /// to LIKE-only, base-table writes keep working — and a later repair with space available
+    /// rebuilds the index and re-enables FTS.
+    #[test]
+    fn full_disk_rebuild_degrades_to_like_only_and_recovers() {
+        let dir = std::env::temp_dir().join(format!("lcm-fts-degrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("lcm.db");
+        let store = Store::open(&path).expect("open");
+        assert!(!store.is_degraded());
+        store
+            .append_batch(
+                "s1",
+                &[NewMessage {
+                    role: "user".into(),
+                    content: Some("indexed needle before the squeeze".into()),
+                    token_estimate: 5,
+                    ..Default::default()
+                }],
+                10.0,
+            )
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            // Desync the index (drop the sync trigger, write rows past it) with enough content
+            // that reindexing must allocate pages beyond the clamped budget.
+            conn.execute_batch("DROP TRIGGER msg_fts_insert;").unwrap();
+            let filler = format!("needle {}", "expandable content ".repeat(60));
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO messages (session_id, source, role, content, timestamp) \
+                         VALUES ('s1', 'cli', 'user', ?1, 11.0)",
+                    )
+                    .unwrap();
+                for _ in 0..300 {
+                    stmt.execute([&filler]).unwrap();
+                }
+            }
+            let pages: i64 = conn
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap();
+            conn.execute_batch(&format!("PRAGMA max_page_count = {pages}"))
+                .unwrap();
+        }
+
+        // The forced repair detects the desync, attempts the rebuild, hits SQLITE_FULL, and
+        // degrades instead of erroring.
+        let outcomes = store.repair_fts(true).expect("degrades, does not error");
+        assert!(
+            outcomes.iter().any(|o| o.degraded && !o.rebuilt),
+            "a degraded outcome was reported: {outcomes:?}"
+        );
+        assert!(store.is_degraded());
+
+        // Restore disk headroom: writes keep working (the sync triggers are gone, so no insert
+        // touches the missing index), and search routes to the LIKE fallback.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA max_page_count = 1073741823")
+            .unwrap();
+        store
+            .append_batch(
+                "s1",
+                &[NewMessage {
+                    role: "user".into(),
+                    content: Some("written while degraded".into()),
+                    token_estimate: 3,
+                    ..Default::default()
+                }],
+                12.0,
+            )
+            .expect("writes work while degraded");
+        let filter = MessageFilter {
+            session: Some("s1"),
+            role: None,
+            source: None,
+            time_from: None,
+            time_to: None,
+        };
+        let like_hits =
+            crate::search::search_messages(&store, "needle", SortMode::Recency, &filter, 10)
+                .expect("degraded search stays available");
+        assert!(!like_hits.is_empty(), "LIKE-only search finds content");
+
+        // Recovery: a later repair pass rebuilds cleanly, re-enables FTS, and covers the rows
+        // written while degraded.
+        let outcomes = store.repair_fts(true).unwrap();
+        assert!(outcomes.iter().any(|o| o.rebuilt), "index rebuilt");
+        assert!(!store.is_degraded(), "degradation cleared");
+        assert_eq!(
+            store
+                .search_messages("s1", "written while degraded", 10)
+                .unwrap()
+                .len(),
+            1,
+            "FTS covers rows written during degradation"
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

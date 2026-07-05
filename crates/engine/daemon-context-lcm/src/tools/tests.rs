@@ -432,6 +432,62 @@ async fn expand_query_requires_prompt_and_selector() {
     assert_eq!(no_selector["error"], "Provide either query or node_ids");
 }
 
+/// The synthesis call carries the tool's answer budget as the output cap plus the `"compression"`
+/// task label (`LCM:tools.py:609-618`); temperature stays at the provider default.
+#[tokio::test]
+async fn expand_query_synthesis_carries_answer_budget_and_task() {
+    use daemon_core::provider::{Capabilities, Failure, ModelOutput, Request, ToolCallFormat};
+    use daemon_core::Provider;
+
+    struct CapturingAux {
+        request: std::sync::Mutex<Option<Request>>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for CapturingAux {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: false,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+            *self.request.lock().unwrap() = Some(req);
+            Ok(ModelOutput {
+                text: "an answer".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    let fx = Fixture::new("unused");
+    let capture = CapturingAux {
+        request: std::sync::Mutex::new(None),
+    };
+    let cx = ToolCx {
+        aux: &capture,
+        ..fx.cx()
+    };
+    let out = dispatch(
+        &cx,
+        "lcm_expand_query",
+        json!({"prompt": "what rollout strategy?", "query": "rollout", "max_tokens": 777}),
+    )
+    .await;
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["answer"], "an answer");
+    let req = capture
+        .request
+        .lock()
+        .unwrap()
+        .take()
+        .expect("synthesis called the aux provider");
+    assert_eq!(req.params.max_tokens, Some(777));
+    assert_eq!(req.params.temperature, None, "provider default temperature");
+    assert_eq!(req.task.as_deref(), Some("compression"));
+}
+
 // ---- lcm_status -----------------------------------------------------------------------------------
 
 #[tokio::test]

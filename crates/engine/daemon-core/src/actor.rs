@@ -580,6 +580,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
             // Fresh cancellation token for the next turn.
             control.reset();
         }
+        // Terminal teardown (§10/§11): the loop drained (Shutdown, or every handle dropped), so no
+        // further turns can run on this incarnation — flush the context engine + memory providers
+        // (a no-op if no turn ever started the session lifecycle).
+        engine.end_session().await;
     });
 
     AgentHandle {
@@ -654,6 +658,59 @@ mod tests {
         )
     }
 
+    /// A §10 spy that records whether `on_session_end` fired (the actor teardown contract).
+    struct EndSpyContext {
+        ended: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::ContextEngine for EndSpyContext {
+        fn before_turn(
+            &self,
+            conv: &mut crate::conversation::Conversation,
+            budget: Option<usize>,
+        ) -> crate::context::Pressure {
+            crate::context::Pressure {
+                used_tokens: crate::context::estimate_tokens(conv),
+                budget_tokens: budget,
+            }
+        }
+        async fn compact(
+            &self,
+            conv: crate::conversation::Conversation,
+            _budget: usize,
+        ) -> crate::conversation::Conversation {
+            conv
+        }
+        fn on_session_end(&self, _session: &SessionId, _conv: &crate::conversation::Conversation) {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Draining the actor (Shutdown) is terminal teardown: the §10 context engine's
+    /// `on_session_end` fires once the loop exits, without the host calling `end_session` itself.
+    #[tokio::test]
+    async fn shutdown_fires_session_end_teardown() {
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = completing_engine("teardown").with_context_engine(Arc::new(EndSpyContext {
+            ended: ended.clone(),
+        }));
+        let handle = spawn_agent_session(engine, Arc::new(NoopHost));
+        handle
+            .start_turn(UserMsg::new("hi"))
+            .await
+            .expect("turn completes");
+        handle.shutdown().await;
+        // The teardown runs on the actor task after the loop breaks; poll briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ended.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session_end did not fire after shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// A snapshot request while idle is answered immediately on the event stream.
     #[tokio::test]
     async fn snapshot_when_idle_emits_snapshot_event() {
@@ -666,6 +723,46 @@ mod tests {
         )
         .await;
         assert!(matches!(ev, AgentEvent::Snapshot { .. }));
+        handle.shutdown().await;
+    }
+
+    /// Observe while **idle** folds context into the conversation but drives NO turn (W3 spike,
+    /// event-io §5.9): the notification seam for host-originated input must therefore use
+    /// `StartTurn` — an `Observe`d process-exit note would sit unseen until the user next speaks.
+    #[tokio::test]
+    async fn observe_when_idle_folds_context_but_opens_no_turn() {
+        let handle = spawn_agent_session(completing_engine("observe-idle"), Arc::new(NoopHost));
+        let mut rx = handle.subscribe();
+        handle
+            .observe(ReqId(7), UserMsg::new("[ambient] build finished"))
+            .await;
+        // The observed text is in the conversation (visible via a snapshot) and every event up to
+        // that snapshot is turn-free — the observe drove nothing.
+        handle.snapshot(ReqId(8)).await;
+        let ev = recv_until(&mut rx, |e| {
+            assert!(
+                !matches!(e, AgentEvent::TurnStarted { .. }),
+                "an idle Observe must not open a turn"
+            );
+            matches!(e, AgentEvent::Snapshot { .. })
+        })
+        .await;
+        let AgentEvent::Snapshot { view, .. } = ev else {
+            unreachable!()
+        };
+        assert!(view
+            .turns
+            .iter()
+            .any(|t| format!("{t:?}").contains("[ambient] build finished")));
+        // A real StartTurn afterwards runs a turn that carries the folded context.
+        let driver = handle.clone();
+        tokio::spawn(async move {
+            let _ = driver.start_turn(UserMsg::new("go")).await;
+        });
+        recv_until(&mut rx, |e| {
+            matches!(e, AgentEvent::TurnStarted { trigger, .. } if *trigger == TurnTrigger::User)
+        })
+        .await;
         handle.shutdown().await;
     }
 

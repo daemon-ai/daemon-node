@@ -724,6 +724,24 @@ pub trait SessionStore: Send + Sync {
     /// non-authoritative proxy store relies on its authoritative peer's dispatcher).
     async fn enqueue_wake(&self, _id: SessionId) {}
 
+    /// Append a durable **pending input** for `id` — an opaque payload (a CBOR `UserMsg`) the host
+    /// wants folded into the session's conversation the next time it activates. This is the durable
+    /// inbound-input seam for sessions on the *activation* lifecycle (which `SessionApi::submit`
+    /// cannot reach): a background process-exit notification, a message to a delegated child, etc.
+    /// The durable incarnation drains these at hydrate ([`take_session_inputs`]); pair with
+    /// [`enqueue_wake`](Self::enqueue_wake) so the wake dispatcher runs the turn. FIFO per session.
+    /// Default: no-op (a non-authoritative proxy store).
+    ///
+    /// [`take_session_inputs`]: Self::take_session_inputs
+    async fn enqueue_session_input(&self, _id: &SessionId, _input: Vec<u8>) {}
+
+    /// Drain (return and delete) every pending input for `id`, in enqueue (FIFO) order. Called by
+    /// the durable incarnation at hydrate, before the turn runs. Default: empty (a store without
+    /// the pending-input seam / a non-authoritative proxy store).
+    async fn take_session_inputs(&self, _id: &SessionId) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Atomically checkpoint a session suspended on a §12 edit-approval decision and durably record
     /// its parked approval row(s) — **without** enqueuing a runnable background job (unlike
     /// [`checkpoint_and_enqueue`]). The session goes `Suspended` on the first approval's `job_id` and
@@ -826,6 +844,13 @@ pub trait SessionStore: Send + Sync {
     /// Read a session's host-level [`SessionMeta`] (`None` if none recorded). Default: `None`.
     async fn session_meta(&self, _id: &SessionId) -> Option<SessionMeta> {
         None
+    }
+
+    /// List every session's host-level [`SessionMeta`] row (unordered) — the enumeration behind the
+    /// recent-sessions browse of the `session_search` agent tool, which covers live-only sessions a
+    /// `session_record`-based listing would miss. Default: empty (a non-authoritative proxy store).
+    async fn session_meta_list(&self) -> Vec<(SessionId, SessionMeta)> {
+        Vec::new()
     }
 
     /// List every durable chat→session routing pin (§5.9). The host loads these into the live routing
@@ -1082,6 +1107,9 @@ struct Inner {
     /// Per-session host-level metadata: bound profile + opaque overlay blob (the in-memory analogue
     /// of the SQLite `session_meta` table).
     session_meta: HashMap<SessionId, SessionMeta>,
+    /// Per-session durable pending inputs (FIFO), drained at hydrate (the in-memory analogue of the
+    /// SQLite `pending_session_input` table).
+    pending_inputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
     /// Durable chat→session routing pins, keyed by canonical origin key (§5.9; the in-memory analogue
     /// of the SQLite `chat_routes` table).
     chat_routes: HashMap<String, ChatRoute>,
@@ -1351,6 +1379,26 @@ impl SessionStore for InMemoryStore {
         self.inner.lock().unwrap().wake_outbox.push_back(id);
     }
 
+    async fn enqueue_session_input(&self, id: &SessionId, input: Vec<u8>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_inputs
+            .entry(id.clone())
+            .or_default()
+            .push_back(input);
+    }
+
+    async fn take_session_inputs(&self, id: &SessionId) -> Vec<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_inputs
+            .remove(id)
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default()
+    }
+
     async fn park_approval(
         &self,
         checkpoint: Checkpoint,
@@ -1547,6 +1595,16 @@ impl SessionStore for InMemoryStore {
 
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         self.inner.lock().unwrap().session_meta.get(id).cloned()
+    }
+
+    async fn session_meta_list(&self) -> Vec<(SessionId, SessionMeta)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .session_meta
+            .iter()
+            .map(|(id, meta)| (id.clone(), meta.clone()))
+            .collect()
     }
 
     async fn routing_list(&self) -> Vec<ChatRoute> {
@@ -2120,6 +2178,38 @@ mod session_meta_tests {
         assert_eq!(store.session_meta(&id).await.unwrap(), updated);
     }
 
+    /// `session_meta_list` enumerates every recorded meta row with full field fidelity — the
+    /// browse surface behind the `session_search` tool (covers live-only sessions that have no
+    /// `session_record`). Proven against both backends.
+    async fn meta_list_behaviour(store: &dyn SessionStore) {
+        assert!(store.session_meta_list().await.is_empty());
+        store
+            .set_session_meta(&SessionId::new("m1"), sample())
+            .await
+            .unwrap();
+        store
+            .set_session_meta(&SessionId::new("m2"), SessionMeta::default())
+            .await
+            .unwrap();
+        let mut rows = store.session_meta_list().await;
+        rows.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, SessionId::new("m1"));
+        assert_eq!(rows[0].1, sample());
+        assert_eq!(rows[1].1, SessionMeta::default());
+    }
+
+    #[tokio::test]
+    async fn in_memory_meta_list_round_trips() {
+        meta_list_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_meta_list_round_trips() {
+        meta_list_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
     fn sample_job(id: &str, next_fire: Option<u64>) -> StoredCronJob {
         StoredCronJob {
             id: id.into(),
@@ -2231,5 +2321,37 @@ mod session_meta_tests {
     #[tokio::test]
     async fn sqlite_cron_round_trips() {
         cron_store_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    /// The durable pending-input seam: enqueue is FIFO per session, take drains-and-deletes (a
+    /// second take is empty), and sessions are isolated from each other.
+    async fn pending_input_behaviour(store: &dyn SessionStore) {
+        let a = SessionId::new("in-a");
+        let b = SessionId::new("in-b");
+        assert!(store.take_session_inputs(&a).await.is_empty());
+        store.enqueue_session_input(&a, vec![1]).await;
+        store.enqueue_session_input(&a, vec![2, 2]).await;
+        store.enqueue_session_input(&b, vec![9]).await;
+        assert_eq!(
+            store.take_session_inputs(&a).await,
+            vec![vec![1], vec![2, 2]],
+            "FIFO order per session"
+        );
+        assert!(
+            store.take_session_inputs(&a).await.is_empty(),
+            "take drains: a second take is empty"
+        );
+        assert_eq!(store.take_session_inputs(&b).await, vec![vec![9]]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_pending_inputs_round_trip() {
+        pending_input_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pending_inputs_round_trip() {
+        pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }

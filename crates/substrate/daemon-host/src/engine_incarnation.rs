@@ -375,6 +375,24 @@ impl Incarnation for CoreIncarnation {
             })
             .collect();
         engine.apply_completions(completions);
+        // Durable inbound-input seam: drain any host-enqueued pending inputs (a background
+        // process-exit notification, a message to a delegated child) into the conversation as user
+        // messages before the turn runs. This is how content reaches an activation-lifecycle session
+        // that `SessionApi::submit` cannot drive (the one-lifecycle-owner guard-rail); the enqueuer
+        // pairs it with `enqueue_wake` so this hydrate happens. Payloads are CBOR `UserMsg`s; an
+        // undecodable payload is dropped with a warning rather than failing the activation.
+        if let Some(store) = self.journal.as_ref().map(|cfg| &cfg.store) {
+            for payload in store.take_session_inputs(&session_id).await {
+                match ciborium::from_reader::<daemon_protocol::UserMsg, _>(payload.as_slice()) {
+                    Ok(msg) => engine.push_user(msg),
+                    Err(e) => tracing::warn!(
+                        session = %session_id,
+                        error = %e,
+                        "dropping undecodable pending session input"
+                    ),
+                }
+            }
+        }
         // I15: a cron-fired session carries `SessionMeta::scheduled_job` (read above). Arm the next
         // turn's trigger as `TurnTrigger::Scheduled { job }` so the fired turn reports its scheduled
         // origin instead of the durable wake path's default `User`. One-shot (consumed by `run_turn`).
@@ -465,8 +483,33 @@ impl Incarnation for CoreIncarnation {
             }
         }
 
+        // Re-index this session's searchable text at the turn boundary (the durable half of the
+        // `session_search` FTS surface; the live pump indexes interactive sessions): the coalesced
+        // full conversation (user + assistant text + tool names) replaces the prior row, so search
+        // reflects the whole conversation, not just the opening turn. Best-effort by construction
+        // (`index_session_text` swallows store errors).
+        if let Some(cfg) = &self.journal {
+            let title = cfg
+                .store
+                .session_meta(&session_id)
+                .await
+                .and_then(|m| m.title);
+            let turns =
+                crate::session_index::turns_from_conversation(&engine.snapshot().conversation);
+            let body = crate::session_index::coalesce_body(&turns);
+            if !body.trim().is_empty() {
+                cfg.store
+                    .index_session_text(&session_id, title, &body)
+                    .await;
+            }
+        }
+
         match outcome {
             TurnOutcome::Completed(_) => {
+                // Terminal deactivation (§10/§11): `Step::Completed` marks the session `Completed`
+                // in the store (never re-activated), so flush the context engine + memory providers
+                // (LCM final ingest + lifecycle finalize) before the final checkpoint is taken.
+                engine.end_session().await;
                 // Terminal: capture this child's `outbox/` artifacts into the content store as the
                 // structured completion payload (the parent materializes them on its wake). `None`
                 // when content transfer is unwired or no artifacts were produced (legacy marker).
@@ -669,5 +712,72 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&cas);
+    }
+
+    /// The durable inbound-input seam: pending inputs enqueued on the store
+    /// (`enqueue_session_input`) are drained at hydrate — decoded as `UserMsg`s and appended to the
+    /// conversation in FIFO order, before the turn runs — and the store side is emptied (a second
+    /// hydrate sees nothing). An undecodable payload is dropped without failing the activation.
+    #[tokio::test]
+    async fn hydrate_drains_pending_session_inputs_into_conversation() {
+        use daemon_store::{InMemoryStore, SessionStore};
+
+        let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+        let session = SessionId::new("notify-target");
+        let snapshot = daemon_core::Snapshot::fresh(session.clone());
+        store
+            .create_session(session.clone(), daemon_common::PartitionId::DEFAULT, {
+                snapshot.encode().unwrap()
+            })
+            .await
+            .unwrap();
+
+        // Two well-formed inputs (FIFO) plus one undecodable payload (dropped with a warning).
+        let encode = |text: &str| {
+            let mut buf = Vec::new();
+            ciborium::into_writer(&daemon_protocol::UserMsg::new(text), &mut buf).unwrap();
+            buf
+        };
+        store
+            .enqueue_session_input(&session, encode("[proc done] first"))
+            .await;
+        store
+            .enqueue_session_input(&session, b"not-cbor".to_vec())
+            .await;
+        store
+            .enqueue_session_input(&session, encode("[proc done] second"))
+            .await;
+
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("ok")) as Arc<dyn Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("test"),
+        );
+        let factory = CoreEngineFactory::from_profile(profile)
+            .with_journal(store.clone(), Arc::new(TraceSigner::generate()));
+        let mut inc = factory.create();
+        let blob = store.peek_snapshot(&session).await.unwrap();
+        inc.hydrate(blob, Vec::new()).await.unwrap();
+
+        // The checkpointed conversation carries both decoded inputs, in enqueue order.
+        let snap = Snapshot::decode(&inc.checkpoint().unwrap()).unwrap();
+        let users: Vec<String> = snap
+            .conversation
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                daemon_core::Turn::User(msg) => Some(msg.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users,
+            vec![
+                "[proc done] first".to_string(),
+                "[proc done] second".to_string()
+            ]
+        );
+        // Drained: a second hydrate sees no pending inputs.
+        assert!(store.take_session_inputs(&session).await.is_empty());
     }
 }

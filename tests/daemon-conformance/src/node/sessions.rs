@@ -518,6 +518,9 @@ async fn session_overlay_persists_and_restores_on_respawn() {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
     });
 
     let origin = Origin::new(

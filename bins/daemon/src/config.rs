@@ -219,6 +219,21 @@ pub enum EmbedKind {
     Local,
 }
 
+/// Which aux provider the `vision_analyze` tool describes images through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionKind {
+    /// No vision backend — the tool is not registered (the zero-config default).
+    #[serde(alias = "none")]
+    Off,
+    /// A dedicated vision-capable model via `genai` (`[vision].model` selects it).
+    #[serde(rename = "genai", alias = "remote")]
+    Genai,
+    /// Reuse the launch profile's default provider (the same resolution as `lcm_aux`). The main
+    /// model must itself accept image input, or every call surfaces a capability error.
+    Main,
+}
+
 /// The durable store backend selector (the config surface; `store` + `store_path`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -529,6 +544,44 @@ impl Default for BrowserConfig {
     }
 }
 
+/// Tuning for the `execute_code` tool (sandboxed one-shot Python). `[execute_code]` /
+/// `DAEMON_EXECUTE_CODE__*`. Opt-in (`enable = false`) like the other optional tools; arbitrary code
+/// is additionally governed by the session's [`ApprovalPolicy`](daemon_core::ApprovalPolicy).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecuteCodeConfig {
+    /// Whether to register the `execute_code` tool.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub enable: bool,
+    /// The default mode when a call omits it: `project` (venv-aware, workspace CWD) or `strict`
+    /// (system python, isolated staging dir).
+    pub mode: daemon_tool_execute_code::Mode,
+    /// The self-managed wall-clock timeout (ms) before the script is killed.
+    pub timeout_ms: u64,
+    /// The stdout byte cap (head 40 % / tail 60 %).
+    pub max_stdout_bytes: usize,
+    /// The stderr byte cap (head-only).
+    pub max_stderr_bytes: usize,
+    /// The OS-sandbox policy: `auto` (bwrap when usable, else plain), `bwrap` (required), `none`.
+    pub sandbox: daemon_tool_execute_code::SandboxPolicy,
+    /// The child network policy under the sandbox: `off` (`--unshare-net`) or `shared`.
+    pub network: daemon_tool_execute_code::NetworkPolicy,
+}
+
+impl Default for ExecuteCodeConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            mode: daemon_tool_execute_code::Mode::Project,
+            timeout_ms: 300_000,
+            max_stdout_bytes: 50_000,
+            max_stderr_bytes: 10_000,
+            sandbox: daemon_tool_execute_code::SandboxPolicy::Auto,
+            network: daemon_tool_execute_code::NetworkPolicy::Off,
+        }
+    }
+}
+
 /// Tuning for the skills subsystem. `[skills]` / `DAEMON_SKILLS__*`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -545,6 +598,30 @@ impl Default for SkillsConfig {
         Self {
             enable: true,
             dir: None,
+        }
+    }
+}
+
+/// Tuning for the session search/title surfaces. `[sessions]` / `DAEMON_SESSIONS__*`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Re-index every durable session's conversation into the full-text `session_search` surface
+    /// at boot (best-effort, background). Covers sessions recorded before FTS indexing existed —
+    /// and refreshes stale rows — at the cost of decoding each snapshot once per boot.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub backfill_index: bool,
+    /// Auto-generate a session title from the first exchange via the auxiliary provider (replacing
+    /// the truncation-seeded roster title). Requires a configured model provider; off leaves seeds.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub title_generation: bool,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            backfill_index: true,
+            title_generation: true,
         }
     }
 }
@@ -574,6 +651,43 @@ impl Default for EmbedConfig {
             dims: 0,
             base_url: None,
             engine: "llama".to_string(),
+        }
+    }
+}
+
+/// Tuning for the `vision_analyze` tool. `[vision]` / `DAEMON_VISION__*`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionConfig {
+    /// Which aux backend to use (off|genai|main). TOML/env key `provider`.
+    #[serde(rename = "provider")]
+    pub kind: VisionKind,
+    /// The vision model (`genai` kind only): a `genai` model name, e.g. `gemini-2.5-flash`.
+    pub model: String,
+    /// The OpenAI-compatible API base URL override (`None` = provider default; `genai` kind only).
+    pub base_url: Option<String>,
+    /// An optional bearer threaded into each aux call (`Request::auth`). `None` (the default)
+    /// falls back to the provider's environment credential.
+    pub credential_key: Option<String>,
+    /// The aux vision-call deadline.
+    #[serde(rename = "timeout_ms", with = "duration_ms")]
+    pub timeout: Duration,
+    /// The hard cap on downloaded / inline image bytes, in MB.
+    pub max_download_mb: u64,
+    /// The hard cap on the base64 payload handed to the provider, in MB.
+    pub max_base64_mb: usize,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            kind: VisionKind::Off,
+            model: String::new(),
+            base_url: None,
+            credential_key: None,
+            timeout: Duration::from_secs(120),
+            max_download_mb: 50,
+            max_base64_mb: 20,
         }
     }
 }
@@ -997,6 +1111,8 @@ pub struct NodeConfig {
     pub models: ModelsConfig,
     /// Embeddings backend tuning (Mnemosyne vector recall; `Off` by default).
     pub embed: EmbedConfig,
+    /// Vision-tool tuning (`vision_analyze` aux backend; `Off` by default).
+    pub vision: VisionConfig,
     /// MeTTa symbolic-coprocessor tuning (`enable = false` by default).
     pub metta: MettaConfig,
     /// Python-tools tuning (`enable = false` by default).
@@ -1007,8 +1123,16 @@ pub struct NodeConfig {
     pub web: WebConfig,
     /// Browser-tool tuning (`enable = false` by default).
     pub browser: BrowserConfig,
+    /// `execute_code`-tool tuning (`enable = false` by default).
+    pub execute_code: ExecuteCodeConfig,
     /// Skills-subsystem tuning (`enable = true` by default).
     pub skills: SkillsConfig,
+    /// The `fs` tool tuning (`[fs]` / `DAEMON_FS__*`): read caps, search caps, extra write-deny
+    /// prefixes, and the post-edit `[fs.lint]` command runner. Embedded from the tool crate so
+    /// the config surface and the tool cannot drift.
+    pub fs: daemon_tool_fs::FsConfig,
+    /// Session search/title tuning (`[sessions]`): boot-time FTS backfill + title generation.
+    pub sessions: SessionsConfig,
     /// LCM context-engine tuning (injected into the context-engine template).
     pub lcm: LcmOpts,
     /// Mnemosyne recall + multi-agent identity knobs (injected into the memory provider template).
@@ -1031,6 +1155,12 @@ pub struct NodeConfig {
     pub rooms: daemon_rooms::RoomsConfig,
     /// The `[api]` transport surface: the networked TLS/TCP listener + identity-store path.
     pub api: ApiConfig,
+    /// Shell-tool limits (`[shell]` / `DAEMON_SHELL__*`): foreground timeouts, output truncation,
+    /// per-session cwd persistence.
+    pub shell: daemon_processes::ShellConfig,
+    /// Background-process registry limits (`[processes]` / `DAEMON_PROCESSES__*`): output ring,
+    /// tracked cap + TTL, PTY size, watch rate limits.
+    pub processes: daemon_processes::RegistryConfig,
 }
 
 impl Default for NodeConfig {
@@ -1057,12 +1187,16 @@ impl Default for NodeConfig {
             infer: LocalConfig::default(),
             models: ModelsConfig::default(),
             embed: EmbedConfig::default(),
+            vision: VisionConfig::default(),
             metta: MettaConfig::default(),
             python: PythonToolsConfig::default(),
             mcp: McpConfig::default(),
             web: WebConfig::default(),
             browser: BrowserConfig::default(),
+            execute_code: ExecuteCodeConfig::default(),
             skills: SkillsConfig::default(),
+            fs: daemon_tool_fs::FsConfig::default(),
+            sessions: SessionsConfig::default(),
             lcm: LcmOpts::default(),
             mnemosyne: MnemosyneOpts::default(),
             credential_key: String::new(),
@@ -1073,6 +1207,8 @@ impl Default for NodeConfig {
             matrix: daemon_matrix::MatrixConfig::default(),
             rooms: daemon_rooms::RoomsConfig::default(),
             api: ApiConfig::default(),
+            shell: daemon_processes::ShellConfig::default(),
+            processes: daemon_processes::RegistryConfig::default(),
         }
     }
 }

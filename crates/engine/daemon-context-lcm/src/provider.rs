@@ -276,9 +276,9 @@ impl LcmContextEngine {
     /// reset boundary (finalized when the next session binds), stamp the lifecycle reset (clearing
     /// debt), reset the runtime state, and prune the bound session's retained DAG per
     /// `new_session_retain_depth` (`-1` keeps all, `0` deletes everything, `N` keeps depth >= N).
-    /// daemon-core has no reset hook on [`ContextEngine`], so the host calls this directly (spec
-    /// §15 deviation).
-    pub fn on_session_reset(&self) {
+    /// The [`ContextEngine::on_session_reset`] trait hook delegates here (the engine fires it on a
+    /// full-clear rewind), so a host no longer has to call this inherently.
+    pub fn reset_bound_session(&self) {
         let session_id = {
             let state = self.state.lock().expect("lcm state poisoned");
             state.session_id.clone()
@@ -340,8 +340,9 @@ impl LcmContextEngine {
     /// `LCM:engine.py:2240-2305`, the non-compression path): flush + finalize the old session,
     /// reset retained DAG state, bind the new session, and (optionally) carry retained summaries
     /// over. `conv` is the old session's final conversation for the last flush. Returns the number
-    /// of carried-over nodes.
-    pub fn rollover_session(
+    /// of carried-over nodes. The [`ContextEngine::rollover_session`] trait hook delegates here
+    /// (dropping the count); this inherent variant keeps it for callers that report it.
+    pub fn rollover_sessions(
         &self,
         old_session_id: &str,
         new_session_id: &str,
@@ -361,7 +362,7 @@ impl LcmContextEngine {
             let _ =
                 self.store
                     .finalize_session(old_session_id, old_session_id, frontier, Self::now());
-            self.on_session_reset();
+            self.reset_bound_session();
         } else if !old_session_id.is_empty() {
             tracing::warn!(
                 old = %old_session_id,
@@ -817,6 +818,38 @@ impl ContextEngine for LcmContextEngine {
                 .finalize_session(session.as_str(), session.as_str(), frontier, Self::now());
         let count = self.store.summary_count(session.as_str()).unwrap_or(0);
         tracing::debug!(session = %session, summaries = count, "lcm: session ended");
+    }
+
+    /// The `/new`-style reset hook (fired by the engine on a full-clear rewind): delegate to
+    /// [`Self::reset_bound_session`]. Defensive: this engine instance is per-session, so a reset
+    /// for a *different* session indicates a wiring bug — warn and skip rather than pruning the
+    /// wrong session's DAG. An unbound engine (no turn ran yet) has nothing to reset.
+    fn on_session_reset(&self, session: &SessionId) {
+        let bound = {
+            let state = self.state.lock().expect("lcm state poisoned");
+            state.session_id.clone()
+        };
+        if !bound.is_empty() && bound != session.as_str() {
+            tracing::warn!(
+                bound = %bound,
+                requested = %session,
+                "lcm: session reset for a session this engine is not bound to; skipping"
+            );
+            return;
+        }
+        self.reset_bound_session();
+    }
+
+    /// The old → new rollover hook: delegate to [`Self::rollover_sessions`] (which already guards
+    /// against an unbound/mismatched old session), dropping the carried-node count.
+    fn rollover_session(
+        &self,
+        old: &SessionId,
+        new: &SessionId,
+        old_conv: Option<&Conversation>,
+        carry_over: bool,
+    ) {
+        self.rollover_sessions(old.as_str(), new.as_str(), old_conv, carry_over);
     }
 
     /// Record provider-reported usage from the last model response (`update_from_response`,
@@ -1949,8 +1982,15 @@ mod tests {
         lcm.on_session_start(&SessionId::new("s1"));
         let compacted = lcm.compact(convo(50), 100).await;
         assert!(lcm.store().summary_count("s1").unwrap() >= 1);
-        let moved = lcm.rollover_session("s1", "s2", Some(&compacted), true);
-        assert_eq!(moved, 0, "retain_depth=0 leaves nothing to carry over");
+        // Drive the §10 trait hook (not the inherent variant) so the seam itself is exercised.
+        ContextEngine::rollover_session(
+            &lcm,
+            &SessionId::new("s1"),
+            &SessionId::new("s2"),
+            Some(&compacted),
+            true,
+        );
+        // retain_depth=0 leaves nothing to carry over.
         assert_eq!(lcm.store().summary_count("s1").unwrap(), 0);
         assert_eq!(lcm.store().summary_count("s2").unwrap(), 0);
         let row = lcm.store().get_lifecycle("s1").unwrap().unwrap();
@@ -1975,10 +2015,56 @@ mod tests {
         let compacted = lcm.compact(convo(50), 100).await;
         let nodes_before = lcm.store().summary_count("s1").unwrap();
         assert!(nodes_before >= 1);
-        let moved = lcm.rollover_session("s1", "s2", Some(&compacted), true);
+        let moved = lcm.rollover_sessions("s1", "s2", Some(&compacted), true);
         assert_eq!(moved as i64, nodes_before, "all retained nodes moved");
         assert_eq!(lcm.store().summary_count("s1").unwrap(), 0);
         assert_eq!(lcm.store().summary_count("s2").unwrap(), nodes_before);
+    }
+
+    /// The §10 `on_session_reset` trait hook (fired by the engine on a full-clear rewind) prunes
+    /// the bound session's retained DAG per `new_session_retain_depth` and stamps the lifecycle
+    /// reset — the `/new` semantics without a host-must-remember inherent call.
+    #[tokio::test]
+    async fn trait_reset_hook_prunes_retained_dag_and_stamps_lifecycle() {
+        let cfg = LcmConfig {
+            new_session_retain_depth: 0, // drop every retained node on reset
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(cfg, aux_with("summary")).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let _ = lcm.compact(convo(50), 100).await;
+        assert!(lcm.store().summary_count("s1").unwrap() >= 1);
+
+        ContextEngine::on_session_reset(&lcm, &SessionId::new("s1"));
+
+        assert_eq!(lcm.store().summary_count("s1").unwrap(), 0, "DAG pruned");
+        let row = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert!(row.last_reset_at.is_some(), "reset stamped");
+    }
+
+    /// A reset addressed to a session this per-session instance is not bound to is a wiring bug —
+    /// it must be skipped (never prune another session's DAG).
+    #[tokio::test]
+    async fn trait_reset_hook_skips_mismatched_session() {
+        let cfg = LcmConfig {
+            new_session_retain_depth: 0,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(cfg, aux_with("summary")).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let _ = lcm.compact(convo(50), 100).await;
+        let nodes = lcm.store().summary_count("s1").unwrap();
+        assert!(nodes >= 1);
+
+        ContextEngine::on_session_reset(&lcm, &SessionId::new("someone-else"));
+
+        assert_eq!(
+            lcm.store().summary_count("s1").unwrap(),
+            nodes,
+            "mismatched reset touched nothing"
+        );
     }
 
     #[tokio::test]

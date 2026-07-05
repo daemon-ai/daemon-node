@@ -1,0 +1,24 @@
+[package]
+name = "daemon-tool-execute-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# The turn's cooperative cancellation token type (`TurnCx.cancel`); already a workspace dependency.
+tokio-util = { workspace = true }
+
+# Unix process-group kill (SIGTERM/SIGKILL to the whole tree) for the timeout/cancel path.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[lints]
+workspace = true

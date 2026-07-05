@@ -169,11 +169,23 @@ async fn roster_get_search_are_owner_scoped() {
     .await
     .is_some());
 
-    // session_search is owner-scoped too.
-    let alice_hits = with_request_context(ctx("alice", Role::User), async {
-        node.session_search("alpha".into(), 10).await
-    })
-    .await;
+    // session_search is owner-scoped too. Indexing happens at the turn boundary (the live event
+    // pump snapshots the conversation after `TurnFinished`), so poll until alice's turn lands.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let alice_hits = loop {
+        let hits = with_request_context(ctx("alice", Role::User), async {
+            node.session_search("alpha".into(), 10).await
+        })
+        .await;
+        if hits.iter().any(|h| h.session == s_alice) {
+            break hits;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "alice's turn was never indexed for search, got {hits:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     assert!(alice_hits.iter().any(|h| h.session == s_alice));
     let bob_hits = with_request_context(ctx("bob", Role::User), async {
         node.session_search("alpha".into(), 10).await

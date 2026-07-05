@@ -930,6 +930,9 @@ impl ContextEngine for RecordingContext {
     fn on_session_end(&self, _session: &SessionId, _conv: &Conversation) {
         self.log.lock().unwrap().push("session_end");
     }
+    fn on_session_reset(&self, _session: &SessionId) {
+        self.log.lock().unwrap().push("session_reset");
+    }
 }
 
 struct RecordingMemory {
@@ -1015,6 +1018,43 @@ async fn memory_and_context_hooks_fire_in_spec_order() {
             "switch:end",
         ]
     );
+}
+
+/// `end_session` is balanced with `ensure_session_started`: a session that never started fires no
+/// teardown hooks, a started one fires them exactly once, and a repeat call is a no-op.
+#[tokio::test]
+async fn end_session_is_guarded_and_idempotent() {
+    let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let mut engine = Engine::fresh(
+        SessionId::new("end-guard"),
+        SystemPrompt::new("test"),
+        Arc::new(crate::provider::MockProvider::completing("done")),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_context_engine(Arc::new(RecordingContext { log: log.clone() }));
+
+    // Never started: teardown is a no-op.
+    engine.end_session().await;
+    assert!(
+        !log.lock().unwrap().contains(&"session_end"),
+        "no session_end before the lifecycle started"
+    );
+
+    engine.push_user(UserMsg::new("hello"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    engine.end_session().await;
+    engine.end_session().await; // idempotent: the second call is a no-op
+
+    let ends = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| **e == "session_end")
+        .count();
+    assert_eq!(ends, 1, "teardown fired exactly once");
 }
 
 // ---- conversation rewind (conversation-rewind spec) -----------------------------------------
@@ -1156,5 +1196,47 @@ async fn rewind_fences_late_completion() {
     assert!(
         engine.pending.is_empty(),
         "late completion fenced by rewind"
+    );
+}
+
+/// A full-clear rewind (retained == 0) is the daemon's `/new` analog: the §10 context engine gets
+/// `on_session_reset` so a stateful engine (LCM) resets in step with the emptied conversation.
+#[tokio::test]
+async fn rewind_to_root_fires_context_session_reset() {
+    let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let mut engine =
+        rewind_engine().with_context_engine(Arc::new(RecordingContext { log: log.clone() }));
+    let outcome = engine
+        .rewind_to(
+            &RewindAnchor::UserTurn { ordinal: 0 },
+            ReqId(1),
+            &EventSink::discarding(),
+        )
+        .expect("root rewind resolves");
+    assert_eq!(outcome.retained_turns, 0);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        ["session_reset"],
+        "a full clear fires exactly the reset hook"
+    );
+}
+
+/// A partial rewind is not a reset: the context engine re-measures the shortened body next turn.
+#[tokio::test]
+async fn partial_rewind_does_not_fire_session_reset() {
+    let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let mut engine =
+        rewind_engine().with_context_engine(Arc::new(RecordingContext { log: log.clone() }));
+    let outcome = engine
+        .rewind_to(
+            &RewindAnchor::UserTurn { ordinal: 2 },
+            ReqId(1),
+            &EventSink::discarding(),
+        )
+        .expect("partial rewind resolves");
+    assert_eq!(outcome.retained_turns, 2);
+    assert!(
+        !log.lock().unwrap().contains(&"session_reset"),
+        "no reset on a partial rewind"
     );
 }

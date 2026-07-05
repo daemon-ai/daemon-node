@@ -10,12 +10,12 @@
 //! `NOTHING_TO_EXTRACT` reply, or an empty reply is a silent no-op. Gated by `extraction_enabled`
 //! (default off) and an available extraction directory.
 //!
-//! Deviation (§7.4): `Provider::chat` has no per-call `temperature`/`max_tokens`/`task` kwargs, so
-//! the spec's `temperature=0.2, max_tokens=2000, task="extraction"` are not passed; the aux
-//! provider's fixed config governs.
+//! The call carries the hermes extraction params (`_call_extraction_llm`,
+//! `LCM:extraction.py:50-55`): `temperature 0.2`, `max_tokens 2000`, task `"extraction"`, via the
+//! per-call [`Request::params`]/[`Request::task`] surface.
 
 use crate::escalation::strip_reasoning_blocks;
-use daemon_core::{Provider, Request, RequestMsg};
+use daemon_core::{Provider, Request, RequestMsg, RequestParams};
 use regex::Regex;
 use std::fs;
 use std::io::Write;
@@ -83,9 +83,15 @@ pub async fn run_extraction(
             content: prompt,
             ..Default::default()
         }],
-        tools: Vec::new(),
         ..Default::default()
-    };
+    }
+    // The hermes extraction params (`LCM:extraction.py:50-55`).
+    .with_params(RequestParams {
+        temperature: Some(0.2),
+        max_tokens: Some(2000),
+        ..Default::default()
+    })
+    .with_task("extraction");
     let text = match tokio::time::timeout(timeout, aux.chat(request)).await {
         Ok(Ok(out)) => strip_reasoning_blocks(&out.text),
         Ok(Err(_)) | Err(_) => return ExtractionOutcome::Skipped,
@@ -281,5 +287,50 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, ExtractionOutcome::Skipped);
+    }
+
+    /// The extraction call carries the hermes params (`LCM:extraction.py:50-55`):
+    /// temperature 0.2, max_tokens 2000, task "extraction".
+    #[tokio::test]
+    async fn extraction_request_carries_params_and_task() {
+        struct CapturingAux {
+            request: std::sync::Mutex<Option<Request>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingAux {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    supports_native_tools: false,
+                    supports_streaming: false,
+                    tool_call_format: ToolCallFormat::Native,
+                    max_context: Some(8192),
+                }
+            }
+            async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+                *self.request.lock().unwrap() = Some(req);
+                Ok(ModelOutput {
+                    text: super::NOTHING_TO_EXTRACT.into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let aux = CapturingAux {
+            request: std::sync::Mutex::new(None),
+        };
+        let dir = tmp("params");
+        let _ = run_extraction(
+            &aux,
+            "a segment",
+            Some(dir.as_path()),
+            Duration::from_secs(5),
+            1_609_459_200.0,
+        )
+        .await;
+        let req = aux.request.lock().unwrap().take().expect("aux was called");
+        assert_eq!(req.params.temperature, Some(0.2));
+        assert_eq!(req.params.max_tokens, Some(2000));
+        assert_eq!(req.task.as_deref(), Some("extraction"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

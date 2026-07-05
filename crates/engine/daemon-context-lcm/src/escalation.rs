@@ -10,12 +10,14 @@
 //! reply is recorded as a route failure and the next route is tried. L2 runs even when the whole L1
 //! chain failed (`LCM:escalation.py:325-342`). A per-route [`SummaryCircuitBreaker`] (2 failures /
 //! 300s) skips a failing aux provider. The aux model is a `daemon-core` [`Provider`]; per-call model
-//! routing collapses to "the provider is the model" (§7.4), so escalation just builds a one-message
-//! [`Request`] and calls [`Provider::chat`] under a timeout.
+//! routing collapses to "the provider is the model" (§7.4), so escalation builds a one-message
+//! [`Request`] carrying the hermes compression params (`temperature 0.3`, `max_tokens = level
+//! budget * 2`, task `"compression"` — `LCM:escalation.py:103-107/313/332`) and calls
+//! [`Provider::chat`] under a timeout.
 
 use crate::tokens::Tokenizer;
 use daemon_core::provider::Failure;
-use daemon_core::{Provider, Request, RequestMsg};
+use daemon_core::{Provider, Request, RequestMsg, RequestParams};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -145,11 +147,14 @@ pub async fn summarize_with_escalation(
 ) -> Escalated {
     let accepts = |text: &str| tok.count_text(text) < req.source_tokens;
 
-    // L1 — detailed summary over the fallback chain.
+    // L1 — detailed summary over the fallback chain. The output cap is the level budget doubled
+    // (`max_tokens = token_budget * 2`, `LCM:escalation.py:311-313`): the prompt *targets* the
+    // budget while the cap leaves headroom so a near-budget summary is not clipped mid-sentence.
     let (l1, rw1) = call_summary_llm_chain(
         aux_chain,
         breakers,
         build_l1_prompt(&req),
+        output_cap(req.token_budget),
         timeout,
         &accepts,
     )
@@ -163,10 +168,18 @@ pub async fn summarize_with_escalation(
     }
 
     // L2 — aggressive bullets at the reduced budget, even when the whole L1 chain failed
-    // (`LCM:escalation.py:325-342`).
+    // (`LCM:escalation.py:325-342`); output cap = the halved budget doubled (`:330-332`).
     let l2_budget = (((req.token_budget as f64) * l2_budget_ratio) as usize).max(1);
     let l2_prompt = build_l2_prompt(&req, l2_budget);
-    let (l2, rw2) = call_summary_llm_chain(aux_chain, breakers, l2_prompt, timeout, &accepts).await;
+    let (l2, rw2) = call_summary_llm_chain(
+        aux_chain,
+        breakers,
+        l2_prompt,
+        output_cap(l2_budget),
+        timeout,
+        &accepts,
+    )
+    .await;
     if let Some(text) = l2 {
         return Escalated {
             text,
@@ -192,6 +205,7 @@ async fn call_summary_llm_chain(
     chain: &[Arc<dyn Provider>],
     breakers: &mut [SummaryCircuitBreaker],
     prompt: String,
+    max_tokens: u32,
     timeout: Duration,
     accepts: &(dyn Fn(&str) -> bool + Sync),
 ) -> (Option<String>, bool) {
@@ -203,7 +217,7 @@ async fn call_summary_llm_chain(
             tracing::warn!(route = i, "lcm: summary route skipped by open circuit");
             continue;
         }
-        match call_summary_llm(provider.as_ref(), prompt.clone(), timeout).await {
+        match call_summary_llm(provider.as_ref(), prompt.clone(), max_tokens, timeout).await {
             Ok(text) => {
                 let text = strip_reasoning_blocks(&text);
                 if !text.is_empty() && accepts(&text) {
@@ -232,12 +246,23 @@ async fn call_summary_llm_chain(
     (None, retry_worthy)
 }
 
+/// The doubled level budget as the provider output cap (`max_tokens = level_budget * 2`,
+/// `LCM:escalation.py:313/332`), clamped into the wire type.
+fn output_cap(level_budget: usize) -> u32 {
+    u32::try_from(level_budget.saturating_mul(2)).unwrap_or(u32::MAX)
+}
+
 /// Build the request to the aux provider and await its text under `timeout`. On failure returns
 /// `Err(retry_worthy)` — whether the failure is timeout/context-length class (the
 /// `_is_retry_worthy_leaf_summary_error` markers) and thus a candidate for the leaf-rescue ladder.
+///
+/// Carries the hermes-lcm compression call params (`_call_llm_for_summary`,
+/// `LCM:escalation.py:103-107`): `temperature 0.3`, the level's output cap, and the
+/// `"compression"` task label, via the per-call [`Request::params`]/[`Request::task`] surface.
 async fn call_summary_llm(
     aux: &dyn Provider,
     prompt: String,
+    max_tokens: u32,
     timeout: Duration,
 ) -> Result<String, bool> {
     let request = Request {
@@ -247,11 +272,14 @@ async fn call_summary_llm(
             content: prompt,
             ..Default::default()
         }],
-        tools: Vec::new(),
-        auth: None,
-        constraint: None,
-        cache_system: false,
-    };
+        ..Default::default()
+    }
+    .with_params(RequestParams {
+        temperature: Some(0.3),
+        max_tokens: Some(max_tokens),
+        ..Default::default()
+    })
+    .with_task("compression");
     match tokio::time::timeout(timeout, aux.chat(request)).await {
         Ok(Ok(out)) => Ok(out.text),
         Ok(Err(failure)) => Err(is_retry_worthy_failure(&failure)),
@@ -817,5 +845,76 @@ mod tests {
     fn strips_reasoning_blocks() {
         let s = "Keep this <think>drop me</think> and <REASONING_SCRATCHPAD>this too</REASONING_SCRATCHPAD> end.";
         assert_eq!(strip_reasoning_blocks(s), "Keep this  and  end.");
+    }
+
+    /// Every summarization call carries the hermes compression params
+    /// (`LCM:escalation.py:103-107/313/332`): temperature 0.3, `max_tokens = level budget * 2`
+    /// (L1: token_budget, L2: the halved budget), task `"compression"`.
+    #[tokio::test]
+    async fn escalation_requests_carry_compression_params() {
+        /// Records every request; replies verbosely so no level ever shrinks (L1 then L2 both run).
+        struct CapturingAux {
+            requests: std::sync::Mutex<Vec<Request>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingAux {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    supports_native_tools: false,
+                    supports_streaming: false,
+                    tool_call_format: ToolCallFormat::Native,
+                    max_context: Some(8192),
+                }
+            }
+            async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+                self.requests.lock().unwrap().push(req);
+                Ok(ModelOutput {
+                    text: "never shrinks ".repeat(400),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let capture = Arc::new(CapturingAux {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let aux: Vec<Arc<dyn Provider>> = vec![capture.clone()];
+        let tok = Tokenizer::heuristic();
+        let mut breakers = vec![SummaryCircuitBreaker::new()];
+        let out = summarize_with_escalation(
+            &aux,
+            &tok,
+            &mut breakers,
+            0.5,
+            64,
+            Duration::from_secs(5),
+            SummaryRequest {
+                text: "the source body",
+                source_tokens: 10,
+                token_budget: 100,
+                depth: 0,
+                focus_topic: "",
+                custom_instructions: "",
+            },
+        )
+        .await;
+        assert_eq!(out.level, Level::L3, "nothing shrank; L1+L2 both attempted");
+
+        let requests = capture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one L1 call + one L2 call");
+        for req in requests.iter() {
+            assert_eq!(req.params.temperature, Some(0.3));
+            assert_eq!(req.task.as_deref(), Some("compression"));
+        }
+        assert_eq!(
+            requests[0].params.max_tokens,
+            Some(200),
+            "L1 cap = token_budget * 2"
+        );
+        assert_eq!(
+            requests[1].params.max_tokens,
+            Some(100),
+            "L2 cap = halved budget * 2"
+        );
     }
 }

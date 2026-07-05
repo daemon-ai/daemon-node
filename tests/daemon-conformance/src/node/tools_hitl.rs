@@ -77,6 +77,9 @@ fn assemble_core_tools(store: Arc<dyn SessionStore>) -> AssembledNode {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
     })
 }
 
@@ -265,6 +268,9 @@ fn assemble_core_approval(store: Arc<dyn SessionStore>) -> AssembledNode {
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
     })
 }
 

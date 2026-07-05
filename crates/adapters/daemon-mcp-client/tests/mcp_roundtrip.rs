@@ -132,6 +132,7 @@ async fn mcp_discover_register_run_roundtrip() {
         approval_policy: ApprovalPolicy::AutoAllow,
         pre_approved: false,
         checkpoints: None,
+        tool_timeout: None,
     };
     let call = ToolCall {
         call_id: "c-echo".into(),

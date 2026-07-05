@@ -417,6 +417,16 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// A pure-local [`SessionRecap`] of one session's recent activity (no LLM call): scope counts,
+    /// top tools, recently-touched files, and the last ask/reply — the hermes `/recap` analogue,
+    /// computed node-side from the session's conversation. For a durable session the source is its
+    /// **last checkpointed snapshot** (a resident mid-turn session recaps its last durable state);
+    /// a resident live session is served from its live conversation view. `None` when the session
+    /// is unknown, not visible to the caller, or has no recoverable conversation. Default: `None`.
+    async fn session_recap(&self, _session: SessionId) -> Option<SessionRecap> {
+        None
+    }
+
     /// Apply a partial update to a session's roster metadata — the backend of daemon-app's "session
     /// actions" (rename, pin/reorder, archive). A read-modify-write of the session's
     /// `SessionMeta` that preserves the untouched fields (overlay/role/parent/bound profile) and
@@ -1887,6 +1897,34 @@ pub struct SessionSearchHit {
     pub title: String,
     /// A highlighted excerpt of the matching body text.
     pub snippet: String,
+}
+
+/// A pure-local recap of a session's recent activity ([`ControlApi::session_recap`]) — the
+/// hermes `build_recap` analogue, computed node-side from the session's conversation with **no LLM
+/// call**: scope counts, the most-used tools, recently-touched files, and the last ask/reply.
+///
+/// The counts are totals over the whole conversation; `top_tools` / `files_touched` / `last_ask` /
+/// `last_reply` are derived from the recent-activity window (the last 20 turns).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecap {
+    /// The session's roster title, when one is set.
+    pub title: Option<String>,
+    /// Total user turns in the conversation.
+    pub user_turns: u32,
+    /// Total assistant turns (including tool-calling turns).
+    pub assistant_turns: u32,
+    /// Total tool results recorded.
+    pub tool_results: u32,
+    /// The most-used tools in the recent window as `(name, count)`, descending, at most 5.
+    pub top_tools: Vec<(String, u32)>,
+    /// Distinct file paths recently touched by tools (from `path`/`file_path` args), newest first,
+    /// at most 5.
+    pub files_touched: Vec<String>,
+    /// The latest user prompt in the window, whitespace-collapsed and truncated (~140 chars).
+    pub last_ask: Option<String>,
+    /// The latest assistant text in the window, whitespace-collapsed and truncated (~200 chars).
+    pub last_reply: Option<String>,
 }
 
 /// A parked §12 edit-approval request awaiting an operator decision — the transport-stable mirror of
@@ -4016,6 +4054,9 @@ mod tests {
                 query: "build".into(),
                 limit: 10,
             },
+            ApiRequest::SessionRecap {
+                session: SessionId::new("s1"),
+            },
             ApiRequest::Rewind {
                 session: SessionId::new("s1"),
                 point: RewindPoint {
@@ -4064,6 +4105,17 @@ mod tests {
                 title: "hello".into(),
                 snippet: "…[hello]…".into(),
             }]),
+            ApiResponse::SessionRecap(Some(SessionRecap {
+                title: Some("build fixes".into()),
+                user_turns: 4,
+                assistant_turns: 5,
+                tool_results: 3,
+                top_tools: vec![("fs".into(), 2), ("shell".into(), 1)],
+                files_touched: vec!["src/lib.rs".into()],
+                last_ask: Some("fix the build".into()),
+                last_reply: Some("done".into()),
+            })),
+            ApiResponse::SessionRecap(None),
         ];
         for resp in resps {
             assert_eq!(resp, from_cbor::<ApiResponse>(&to_cbor(&resp)).unwrap());

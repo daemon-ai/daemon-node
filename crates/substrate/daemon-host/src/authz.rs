@@ -74,9 +74,11 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // Durable control-plane lifecycle is operator-level (Assign wakes a durable session).
         Assign { .. } => C::ControlWrite,
         // The roster reads are "one's own sessions"; SeeAll (Track C) widens them cross-owner.
-        Sessions | SessionsQuery { .. } | SessionGet { .. } | SessionSearch { .. } => {
-            C::SessionRead
-        }
+        Sessions
+        | SessionsQuery { .. }
+        | SessionGet { .. }
+        | SessionSearch { .. }
+        | SessionRecap { .. } => C::SessionRead,
         // A user may drive their OWN session's lifecycle (cancel/rewind/checkpoint-rewind/approve +
         // roster metadata); Track C scopes it to ownership, operators cross via SessionControlAny.
         Cancel { .. }

@@ -222,10 +222,11 @@ impl NodeApiImpl {
     }
 
     /// Record activity on `session` from an inbound `command`: stamp `last_activity_ms` to now
-    /// (roster sort key), seed a title from the first user turn when none is set, and index the
-    /// turn's user text into the durable FTS surface (`session_search`). Read-modify-writes the host
-    /// meta so the overlay/profile/role stay intact. Best-effort: a store error is swallowed (a
-    /// missed stamp/index must never fail a submit).
+    /// (roster sort key) and seed a title from the first user turn when none is set.
+    /// Read-modify-writes the host meta so the overlay/profile/role stay intact. Best-effort: a
+    /// store error is swallowed (a missed stamp must never fail a submit). FTS indexing happens at
+    /// the turn boundary instead (the live event pump / the durable incarnation), where the FULL
+    /// coalesced conversation replaces the row — not just this opening turn's text.
     pub(crate) async fn note_activity(&self, session: &SessionId, command: &AgentCommand) {
         let turn_text = match command {
             AgentCommand::StartTurn { input, .. } => Some(input.text.clone()),
@@ -241,18 +242,14 @@ impl NodeApiImpl {
             meta.owner = crate::request_context::current_principal().map(|p| p.user_id);
         }
         // Seed a roster title from the opening user turn (truncated) when the session has none yet;
-        // a real generated title can replace it later (the field is the foundation).
+        // the background title generator replaces the seed after the first exchange completes.
         if meta.title.is_none() {
             meta.title = seed_title(turn_text.as_deref());
         }
-        let title = meta.title.clone();
         let _ = self.store.set_session_meta(session, meta).await;
         // L3: a turn touched this session (recency + maybe a seeded title changed), so its roster row
         // is stale. Turn-level granularity (not per-delta — `SessionAdvanced` covers token growth).
         self.emit_session_meta_changed(session);
-        if let Some(text) = turn_text.filter(|t| !t.trim().is_empty()) {
-            self.store.index_session_text(session, title, &text).await;
-        }
         // Materialize any inbound message attachments into the session workspace `inbox/` before the
         // turn runs (daemon-content-transfer-spec.md Phase 2b), node-mediated: the client first
         // `blob_put`s the bytes, then submits the refs; the engine then sees the on-disk files.
@@ -426,8 +423,9 @@ fn title_from_text(text: &str) -> String {
 
 /// The roster title to seed from an inbound turn's text when the session has none yet: the first
 /// non-empty turn text, truncated by [`title_from_text`]. `None` leaves the existing title intact
-/// (no turn text, or whitespace-only).
-fn seed_title(turn_text: Option<&str>) -> Option<String> {
+/// (no turn text, or whitespace-only). `pub(crate)`: the live pump's title generator uses it to
+/// recognize a still-seeded (replaceable) title.
+pub(crate) fn seed_title(turn_text: Option<&str>) -> Option<String> {
     let trimmed = turn_text?.trim();
     if trimmed.is_empty() {
         return None;

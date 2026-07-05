@@ -36,6 +36,7 @@ pub mod events;
 pub mod exec;
 #[cfg(feature = "otel")]
 pub mod genai_telemetry;
+pub mod guardrail;
 pub mod memory;
 pub mod profile;
 pub mod provider;
@@ -70,7 +71,7 @@ pub use engine::{
     APPROVAL_SUSPEND_PAYLOAD,
 };
 pub use events::{EventSink, SessionLog};
-pub use exec::{Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+pub use exec::{contain, Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
 #[cfg(feature = "otel")]
 pub use genai_telemetry::set_genai_capture;
 pub use memory::{
@@ -82,8 +83,8 @@ pub use profile::{
 };
 pub use provider::{
     build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
-    Recovery, Request, RequestMsg, RequestParams, ResponseMeta, ScriptStep, ScriptedProvider,
-    StreamEvent, ToolCallFormat, UnconfiguredProvider,
+    Recovery, Request, RequestImage, RequestMsg, RequestParams, ResponseMeta, ScriptStep,
+    ScriptedProvider, StreamEvent, ToolCallFormat, UnconfiguredProvider,
 };
 pub use recovery::{classify_api_error, drive_model_call, ModelCallPolicy, RecoveryStep};
 pub use repair::{

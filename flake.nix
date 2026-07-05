@@ -452,6 +452,8 @@
                 pkgs.typos # source spell-checker
                 pkgs.nodejs # provides npx for jscpd (not packaged in nixpkgs)
                 pkgs.just # task runner: the justfile recipes (lint / deny / test / coverage)
+                pkgs.python3 # execute_code tool: the child interpreter for its subprocess tests
+                pkgs.bubblewrap # execute_code tool: the OS sandbox (bwrap); tests guard on usability
               ]
               ++ engineNativeInputs;
           };
