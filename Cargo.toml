@@ -25,6 +25,12 @@ unused = { level = "warn", priority = -1 }
 todo = "warn"
 unimplemented = "warn"
 dbg_macro = "warn"
+# Phase 4 hardening guardrails (config in clippy.toml): raw fs outside ContainedRoot, raw reqwest
+# clients outside daemon-egress, undeclared process spawns. `just lint`'s `-D warnings` makes these
+# hard errors. `disallowed_types` carries the reqwest ban decoupled from the fs `disallowed_methods`
+# allows, so an fs `#[allow]` can never silently re-open the egress hole.
+disallowed_methods = "warn"
+disallowed_types = "warn"
 
 [workspace.dependencies]
 # shared third-party deps (single source of truth)

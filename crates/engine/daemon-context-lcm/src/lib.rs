@@ -30,6 +30,9 @@
 //! their advisory names.
 
 #![forbid(unsafe_code)]
+// Phase 4: LCM fs is daemon-internal (per-session SQLite store + diagnostics under the node data
+// root), not attacker-influenced; raw fs allowed crate-wide. No process spawns in this crate.
+#![allow(clippy::disallowed_methods)]
 
 pub mod compaction;
 pub mod config;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: the conformance harness is entirely test scaffolding; raw fs/reqwest/Command are expected.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! `daemon-conformance` — the substrate + translation conformance harness.
 //!

@@ -24,6 +24,9 @@ use crate::auth::{sso_begin, sso_complete};
 
 /// Best-effort: open `url` in the operator's browser. Always prints the URL so a headless/SSH operator
 /// can open it manually.
+// Spawns the fixed OS URL-opener (`xdg-open`/`open`) with the SSO URL as an argv arg (no shell) so
+// the operator can complete Matrix SSO in a browser. Not agent-reachable (operator `matrix login`).
+#[allow(clippy::disallowed_methods)]
 fn open_browser(url: &str) {
     println!("\nMatrix SSO — open this URL in a browser to log in:\n  {url}\n");
     for opener in ["xdg-open", "open"] {

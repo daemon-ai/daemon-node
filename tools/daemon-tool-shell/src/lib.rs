@@ -27,6 +27,8 @@
 //! within the workspace.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -587,6 +589,10 @@ impl ShellTool {
 
         let line = resolved.line.as_str();
         let root = cx.exec.cwd();
+        // The agent shell tool's sanctioned exec: spawns a resolved ABSOLUTE program with an argv
+        // vector (no shell string). Approval/fingerprint gating is the Phase 2 exec path's job; this
+        // is argv-only by construction (`resolved.program_abs` + `resolved.argv`), never `sh -c`.
+        #[allow(clippy::disallowed_methods)]
         let mut cmd = Command::new(resolved.program_abs.to_string_lossy().into_owned())
             .args(resolved.argv.clone());
         // Only pass a cwd when it differs from the root (byte-identical legacy behavior otherwise).

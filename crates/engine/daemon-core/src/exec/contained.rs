@@ -81,6 +81,10 @@ pub struct ChildCwd {
 // unix implementation (Linux openat2 fast path + cross-unix openat component-walk fallback)
 // =================================================================================================
 #[cfg(unix)]
+// Phase 4 anchor: this module IS the sanctioned fs home. Every raw std/tokio fs call here is the
+// contained, symlink-hardened implementation the workspace-wide `disallowed_methods` ban points
+// callers toward; `std::fs::create_dir_all(root)` (root bootstrap) is followed ONCE by design.
+#[allow(clippy::disallowed_methods)]
 mod imp {
     use super::{ChildCwd, DirEntryLite, Meta};
     use std::io;
@@ -708,6 +712,9 @@ mod imp {
 // containment + a final-component symlink reject. Kept only so the crate builds on the cross target.
 // =================================================================================================
 #[cfg(not(unix))]
+// Phase 4 anchor: sanctioned fs home (Windows v1 stub lane). Best-effort lexical containment +
+// final-component symlink reject; the raw std/tokio fs here is the contained implementation.
+#[allow(clippy::disallowed_methods)]
 mod imp {
     use super::{ChildCwd, DirEntryLite, Meta};
     use std::io;

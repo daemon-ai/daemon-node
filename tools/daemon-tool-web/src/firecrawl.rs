@@ -19,6 +19,10 @@ pub const FIRECRAWL_ENDPOINT: &str = "https://api.firecrawl.dev/v1/scrape";
 /// `key_id` (default `"firecrawl"`); reports [`available`](WebFetchBackend::available) only when a
 /// key is present so the extract tool can fall through to the local backend.
 pub struct FirecrawlFetch {
+    // Straggler (scoped): a raw reqwest client to a fixed operator-keyed SaaS endpoint
+    // (api.firecrawl.dev); no agent-controlled URL and no redirect-follow, so not an SSRF surface.
+    // Dedupe into daemon-egress is a follow-up.
+    #[allow(clippy::disallowed_types)]
     http: reqwest::Client,
     secrets: Arc<dyn SecretSource>,
     key_id: String,
@@ -27,6 +31,7 @@ pub struct FirecrawlFetch {
 
 impl FirecrawlFetch {
     /// A Firecrawl backend reading its key from the `"firecrawl"` credential profile.
+    #[allow(clippy::disallowed_types)] // scoped straggler: fixed operator-keyed SaaS host (see struct)
     pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
         Self {
             http: reqwest::Client::new(),

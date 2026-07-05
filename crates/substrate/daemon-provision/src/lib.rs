@@ -293,6 +293,8 @@ impl ProcessProvisioner {
     async fn spawn_framed(spec: PlacementSpec, framing: Framing) -> Result<Placement, ProvErr> {
         use std::process::Stdio;
 
+        // Spawns a trusted node worker program (provisioner placement, argv-only, no shell).
+        #[allow(clippy::disallowed_methods)]
         let mut command = tokio::process::Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -334,9 +336,11 @@ impl Provisioner for ProcessProvisioner {
         spec: WorkspaceSpec,
     ) -> Result<WorkspaceRoot, ProvErr> {
         let root = spec.root.join(id.as_str());
-        tokio::fs::create_dir_all(&root)
-            .await
-            .map_err(|e| ProvErr::Workspace(e.to_string()))?;
+        // Creates the per-session workspace root under the daemon-configured workspace root (the id
+        // is a sanitized SessionId); not attacker-influenced.
+        #[allow(clippy::disallowed_methods)]
+        let mk = tokio::fs::create_dir_all(&root).await;
+        mk.map_err(|e| ProvErr::Workspace(e.to_string()))?;
         Ok(WorkspaceRoot(root))
     }
 

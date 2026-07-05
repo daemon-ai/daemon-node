@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: integration test crate; raw fs/reqwest/Command are expected in tests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! Vertical tests for the Matrix adapter over a wiremock-backed homeserver (`MatrixMockServer`) and
 //! a recording mock [`NodeApi`] (no real engine/host). They cover the three seams:

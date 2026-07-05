@@ -17,6 +17,9 @@ pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 /// A read-only Hugging Face Hub client.
 #[derive(Clone, Debug)]
 pub struct HfClient {
+    // Straggler (scoped): a raw reqwest client to the fixed Hugging Face Hub endpoint
+    // (huggingface.co, or a test mock); not an agent-controlled URL. Dedupe into daemon-egress later.
+    #[allow(clippy::disallowed_types)]
     client: reqwest::Client,
     endpoint: String,
     token: Option<String>,
@@ -37,6 +40,7 @@ impl HfClient {
     }
 
     /// A client against an explicit endpoint (used by tests to target a mock server).
+    #[allow(clippy::disallowed_types)] // scoped straggler: fixed Hub endpoint (see struct)
     pub fn with_endpoint(endpoint: impl Into<String>, token: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),

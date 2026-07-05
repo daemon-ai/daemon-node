@@ -19,6 +19,9 @@
 //! supervised client + the tool) depend on this crate with `default-features = false`.
 
 #![forbid(unsafe_code)]
+// Phase 4: metta fs is daemon-internal (coprocessor state dir + journal under the node data root),
+// not attacker-influenced; raw fs allowed crate-wide. No process spawns in this crate.
+#![allow(clippy::disallowed_methods)]
 
 pub mod engine;
 pub mod protocol;

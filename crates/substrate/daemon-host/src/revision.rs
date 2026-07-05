@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here is the daemon-internal revision store under the node data root (`<root>/<kind>/<id>/`,
+// content-addressed blobs; ids are sanitized profile/skill ids), not attacker-influenced. Raw fs
+// allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! A file-backed [`RevisionLog`]: the append-only, content-addressed version history backing the
 //! node's profile + skill versioning surface.
 //!

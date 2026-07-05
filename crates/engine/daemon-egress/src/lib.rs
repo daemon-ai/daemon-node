@@ -24,6 +24,10 @@
 //! Only redirect *hops* are re-validated.
 
 #![forbid(unsafe_code)]
+// Phase 4 anchor: this crate IS the one sanctioned home for a raw `reqwest::Client`. The
+// workspace-wide `disallowed_types` ban points every other crate here; the inner client is pinned
+// to `redirect::Policy::none()` so redirects are followed manually and re-validated per hop.
+#![allow(clippy::disallowed_types)]
 
 use std::time::Duration;
 

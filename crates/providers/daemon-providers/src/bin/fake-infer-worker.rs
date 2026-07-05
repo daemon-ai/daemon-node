@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: this is a test-fixture worker binary; its fs (a scripted counter file) is test-only and
+// daemon-controlled. Raw fs allowed file-wide. Also carve reqwest/types under test in case.
+#![allow(clippy::disallowed_methods)]
+
 //! A scripted fake `daemon-infer` worker for [`LocalProvider`] integration tests.
 //!
 //! It speaks the real [`daemon_infer::protocol`] over the same length-framed stdio cut as the

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here touches the model cache/registry under the node data root (paths derived from
+// sanitized model refs, not attacker-influenced); raw fs allowed file-wide. No process spawns here.
+#![allow(clippy::disallowed_methods)]
+
 //! [`ModelManager`] — the one facade the node surface (`ModelApi`) and the local provider wiring
 //! call. It owns the HF client, the acquisition engine, the installed-model catalog, the shared
 //! cache config, and the per-profile *active model* selection used for runtime model switching.

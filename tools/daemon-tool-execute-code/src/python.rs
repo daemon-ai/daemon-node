@@ -137,6 +137,9 @@ async fn is_usable_python(path: &Path) -> bool {
 
 /// Fork `<path> -c "…"` and report whether it exits 0 for Python >= 3.8 within [`PROBE_TIMEOUT`].
 async fn probe(path: &Path) -> bool {
+    // Spawns the candidate Python interpreter with `-c <version check>` (python -c, NOT a shell);
+    // argv-only version probe.
+    #[allow(clippy::disallowed_methods)]
     let fut = tokio::process::Command::new(path)
         .arg("-c")
         .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")

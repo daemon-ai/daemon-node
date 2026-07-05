@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here stats a resolved model artifact under the daemon-controlled cache, not
+// attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! GGUF metadata introspection via `gguf-rs`.
 //!
 //! Reads the header key-values of a GGUF file (architecture, name, file-type, context length, block

@@ -52,6 +52,9 @@ impl LocalEnvironment {
         Self::new(std::env::temp_dir().join(format!("daemon-ws-{safe}")))
     }
 
+    // Bootstraps the workspace root itself (the containment anchor); every path *under* it goes
+    // through ContainedRoot. Creating the root by path is intentional (mirrors ContainedRoot::open).
+    #[allow(clippy::disallowed_methods)]
     async fn ensure_root(&self) -> std::io::Result<()> {
         tokio::fs::create_dir_all(&self.root).await
     }
@@ -80,6 +83,9 @@ impl ExecutionEnvironment for LocalEnvironment {
             .map(|g| g.path.as_path())
             .unwrap_or(&self.root);
         // Scrubbed child env: nothing inherited (no host secrets leak into a tool's subprocess).
+        // The agent foreground exec: spawns the resolved program with an argv vector (no shell
+        // string); cwd is the ContainedRoot-verified `dir` above. Approval/fingerprint is Phase 2.
+        #[allow(clippy::disallowed_methods)]
         let mut command = tokio::process::Command::new(&cmd.program);
         command
             .args(&cmd.args)

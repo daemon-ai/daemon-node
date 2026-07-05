@@ -24,6 +24,10 @@
 //!   `sandbox-exec` argv wrapper by the caller (an argv prefix, not an in-process install), and the
 //!   Windows v1 lane is documented fail-closed (no kernel backend → `Require` errors in [`decide`]).
 
+// Phase 4: the sandbox test harness spawns `/bin/sh -c` and interpreters; those are test-only. The
+// --lib pass still guards production (which spawns nothing raw). No process spawns in production here.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
+
 use std::io;
 
 #[cfg(target_os = "linux")]

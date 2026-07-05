@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: xtask is dev/build tooling (codegen, CI helpers) run by maintainers, not a runtime
+// security surface. Its fs (build artifacts) and spawns (cbindgen/cc/bash build steps) are
+// developer-controlled; the hardening bans target the shipped node, so xtask is allowed crate-wide.
+#![allow(clippy::disallowed_methods)]
+
 //! `xtask` — repo automation (codegen, CI helpers).
 //!
 //! Subcommands:

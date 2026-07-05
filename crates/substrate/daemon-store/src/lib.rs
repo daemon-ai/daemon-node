@@ -17,6 +17,8 @@
 //! See `docs/specs/daemon-lifecycle-persistence.md`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 use async_trait::async_trait;
 use daemon_common::{

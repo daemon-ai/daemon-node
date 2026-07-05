@@ -21,6 +21,9 @@
 //! only on a write through this store, so the system prompt stays byte-stable across a conversation.
 
 #![forbid(unsafe_code)]
+// Phase 4: skills fs is daemon-internal (skill usage log under the node data root), not
+// attacker-influenced; raw fs allowed crate-wide. No process spawns in this crate.
+#![allow(clippy::disallowed_methods)]
 
 use daemon_common::{Author, RevisionKind, RevisionLog, SkillBundle, SkillCreator, SkillUsageLog};
 use daemon_core::StablePromptSource;

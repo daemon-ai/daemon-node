@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the fs here writes the daemon-internal engine inbox IPC dir under the node data root
+// (not attacker-influenced); raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Roster / session-meta projection: the unified durable+live session list, per-turn activity
 //! stamping, and the tree/roster change notifications pushed onto the fleet bus + L3 event feed.
 

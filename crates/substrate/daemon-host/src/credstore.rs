@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here is the daemon-internal credential store file under the node data root (0600),
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Persisted provider credentials: the durable store backing the node's `CredentialApi` surface,
 //! and the [`CredentialSource`] that feeds stored secrets into the credential authority.
 //!
