@@ -29,6 +29,7 @@ pub mod cache;
 pub mod error;
 pub mod gguf;
 pub mod hardware;
+pub mod hash;
 pub mod hf;
 pub mod inspect;
 pub mod manager;

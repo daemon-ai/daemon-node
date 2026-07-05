@@ -41,6 +41,10 @@ pub struct PlanFile {
     /// text-model plan — fetched in the same job but never the job's primary artifact. Always
     /// `false` for the requested file itself (even a standalone mmproj request).
     pub is_mmproj_companion: bool,
+    /// The Hub-declared expected sha256 (git-LFS `oid`), when the tree carried one. The download is
+    /// verified against it before the file is accepted (Phase 3 / Cluster E, L1); `None` skips the
+    /// source check (a TOFU pin is still recorded for the primary artifact).
+    pub expected_sha256: Option<String>,
 }
 
 /// What a job downloads: the repo coordinates plus the ordered file list.
@@ -73,6 +77,10 @@ pub struct ResolvedArtifact {
     /// The on-disk path of the vision-projector (mmproj) companion fetched with this job, when
     /// the plan carried one (llama text-model downloads with a paired repo projector).
     pub mmproj_path: Option<PathBuf>,
+    /// The primary single-file artifact's sha256 (lowercase hex), computed + verified during the
+    /// transfer. The node-local provenance pin recorded beside the artifact at catalog time. `None`
+    /// for directory (mistral.rs) artifacts, which are not pinned in this phase.
+    pub sha256: Option<String>,
 }
 
 /// Why a running download was stopped early.
@@ -389,6 +397,7 @@ async fn run_job(api: Api, _id: DownloadId, job: Arc<Job>) {
     let mut last_path: Option<PathBuf> = None;
     let mut primary_path: Option<PathBuf> = None;
     let mut mmproj_path: Option<PathBuf> = None;
+    let mut primary_sha256: Option<String> = None;
     let mut total_on_disk: u64 = 0;
     let total_bytes = job.plan.total_bytes();
 
@@ -460,6 +469,47 @@ async fn run_job(api: Api, _id: DownloadId, job: Arc<Job>) {
             .await;
             return;
         }
+        // Provenance: verify the downloaded bytes against the Hub-declared git-LFS oid (L1), and
+        // capture the primary single-file artifact's hash as the pin (L2). Hashing runs off the
+        // async runtime; a multi-GB GGUF is streamed, never buffered. Directory (mistral.rs)
+        // artifacts (`!single_file`) are not pinned in this phase, so only their oid-declared files
+        // are source-verified.
+        let need_pin = !file.is_mmproj_companion && job.plan.single_file;
+        if file.expected_sha256.is_some() || need_pin {
+            let hash_path = path.clone();
+            let computed =
+                match tokio::task::spawn_blocking(move || crate::hash::sha256_file(&hash_path))
+                    .await
+                {
+                    Ok(Ok(h)) => h,
+                    Ok(Err(e)) => {
+                        fail(&job, format!("{}: hashing failed: {e}", file.path)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        fail(&job, format!("{}: hashing task failed: {e}", file.path)).await;
+                        return;
+                    }
+                };
+            if let Some(expected) = &file.expected_sha256 {
+                if !computed.eq_ignore_ascii_case(expected) {
+                    fail(
+                        &job,
+                        format!(
+                            "{}: sha256 mismatch — the Hub declared {expected}, the download \
+                             hashes to {computed} (tampered or corrupted download)",
+                            file.path
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+            if need_pin {
+                primary_sha256 = Some(computed);
+            }
+        }
+
         total_on_disk += actual;
         job.counters.base.fetch_add(actual, Ordering::Relaxed);
         job.counters.current.store(0, Ordering::Relaxed);
@@ -490,6 +540,7 @@ async fn run_job(api: Api, _id: DownloadId, job: Arc<Job>) {
                 local_path,
                 size_bytes: total_on_disk,
                 mmproj_path,
+                sha256: primary_sha256,
             }
         }
         None => {
