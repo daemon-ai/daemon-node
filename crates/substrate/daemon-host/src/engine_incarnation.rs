@@ -223,6 +223,17 @@ fn map_failure(failure: Failure) -> EngineError {
     EngineError::Other(failure.to_string())
 }
 
+/// The store [`ChildLifetime`](daemon_store::ChildLifetime) a delegation suspension's opaque
+/// payload declares: decode the CBOR [`DelegationInput`](daemon_protocol::DelegationInput) and map
+/// its protocol-level lifetime onto the store's. Legacy / undecodable payloads (including the
+/// §12 approval-park marker) default to `Persistent`, the historical managed-child behaviour.
+fn lifetime_from_payload(payload: &[u8]) -> daemon_store::ChildLifetime {
+    match daemon_protocol::DelegationInput::decode(payload).lifetime {
+        daemon_protocol::DelegationLifetime::Ephemeral => daemon_store::ChildLifetime::Ephemeral,
+        daemon_protocol::DelegationLifetime::Persistent => daemon_store::ChildLifetime::Persistent,
+    }
+}
+
 impl CoreIncarnation {
     /// Re-resolve `session`'s effective [`EngineProfile`] from its host-level metadata (the bound
     /// profile plus the persisted overlay) via the injected resolver. Returns `None` when no
@@ -375,6 +386,15 @@ impl Incarnation for CoreIncarnation {
             })
             .collect();
         engine.apply_completions(completions);
+        // Drain any pending inputs queued for this session while it was dehydrated (the durable
+        // `send` seam): each decodes as a CBOR `UserMsg` (bare text falls back) and folds into the
+        // conversation before the turn runs, so the message lands in exactly this incarnation's
+        // turn (Steer-equivalent delivery into a dormant session).
+        if let Some(store) = self.journal.as_ref().map(|cfg| &cfg.store) {
+            for raw in store.take_session_inputs(&session_id).await {
+                engine.push_user(daemon_protocol::UserMsg::decode(&raw));
+            }
+        }
         // I15: a cron-fired session carries `SessionMeta::scheduled_job` (read above). Arm the next
         // turn's trigger as `TurnTrigger::Scheduled { job }` so the fired turn reports its scheduled
         // origin instead of the durable wake path's default `User`. One-shot (consumed by `run_turn`).
@@ -494,17 +514,21 @@ impl Incarnation for CoreIncarnation {
                     .collect();
                 Ok(Step::ParkApproval { approvals })
             }
-            TurnOutcome::Suspended(suspension) => Ok(Step::Suspended {
-                job: JobCommand {
-                    job_id: suspension.job_id,
-                    session_id,
-                    epoch: suspension.epoch,
-                    payload: suspension.payload,
-                    // The orchestrate path delegates long-lived managed children; the ephemeral
-                    // subagent producer is forward-looking, so default to `Persistent` here.
-                    lifetime: daemon_store::ChildLifetime::default(),
-                },
-            }),
+            TurnOutcome::Suspended(suspension) => {
+                // The delegating parent's declared child lifetime rides inside the opaque payload
+                // (a CBOR `DelegationInput`); surface it onto the durable job so the fleet worker
+                // derives the child's roster/tree role (managed vs ephemeral subagent).
+                let lifetime = lifetime_from_payload(&suspension.payload);
+                Ok(Step::Suspended {
+                    job: JobCommand {
+                        job_id: suspension.job_id,
+                        session_id,
+                        epoch: suspension.epoch,
+                        payload: suspension.payload,
+                        lifetime,
+                    },
+                })
+            }
         }
     }
 
@@ -669,5 +693,116 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&cas);
+    }
+
+    /// The suspension payload's declared lifetime is surfaced onto the durable `JobCommand`:
+    /// an ephemeral `DelegationInput` maps to `ChildLifetime::Ephemeral`; a persistent/legacy
+    /// payload keeps the historical managed-child default.
+    #[test]
+    fn lifetime_threads_from_delegation_payload() {
+        let ephemeral = daemon_protocol::DelegationInput {
+            task: "quick check".into(),
+            attachments: Vec::new(),
+            lifetime: daemon_protocol::DelegationLifetime::Ephemeral,
+            profile: None,
+        }
+        .encode();
+        assert_eq!(
+            lifetime_from_payload(&ephemeral),
+            daemon_store::ChildLifetime::Ephemeral
+        );
+
+        let persistent = daemon_protocol::DelegationInput::task("long-lived work").encode();
+        assert_eq!(
+            lifetime_from_payload(&persistent),
+            daemon_store::ChildLifetime::Persistent
+        );
+        // Legacy plain-text payloads (pre-upgrade jobs) stay managed children.
+        assert_eq!(
+            lifetime_from_payload(b"delegated-work"),
+            daemon_store::ChildLifetime::Persistent
+        );
+    }
+
+    /// Pending inputs queued while the session was dehydrated (the durable `send` seam) are drained
+    /// FIFO at hydrate and folded into the conversation — and the drain is destructive, so a second
+    /// hydrate sees nothing.
+    #[tokio::test]
+    async fn hydrate_drains_pending_inputs_into_conversation() {
+        let store: Arc<dyn SessionStore> = Arc::new(daemon_store::InMemoryStore::new());
+        let session = SessionId::new("dormant");
+        store
+            .enqueue_session_input(
+                &session,
+                daemon_protocol::UserMsg::new("first ping").encode(),
+            )
+            .await;
+        store
+            .enqueue_session_input(&session, b"bare text follow-up".to_vec())
+            .await;
+
+        let profile = EngineProfile::new(
+            Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("test"),
+        );
+        let mut inc = CoreIncarnation {
+            profile,
+            engine: None,
+            journal: Some(JournalConfig {
+                store: store.clone(),
+                signer: Arc::new(TraceSigner::generate()),
+            }),
+            background: None,
+            resolver: None,
+            content: None,
+            cron_profile: None,
+            completion_payload: None,
+        };
+        let blob = daemon_core::Snapshot::fresh(session.clone())
+            .encode()
+            .unwrap();
+        inc.hydrate(blob.clone(), Vec::new()).await.unwrap();
+
+        let turns = &inc.engine.as_ref().unwrap().snapshot().conversation.turns;
+        let texts: Vec<&str> = turns
+            .iter()
+            .filter_map(|t| match t {
+                daemon_core::Turn::User(msg) => Some(msg.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["first ping", "bare text follow-up"],
+            "both queued inputs fold into the conversation, FIFO"
+        );
+
+        // Destructive drain: a re-hydrate finds an empty queue.
+        let mut again = CoreIncarnation {
+            profile: EngineProfile::new(
+                Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
+                Arc::new(ToolRegistry::new()),
+                SystemPrompt::new("test"),
+            ),
+            engine: None,
+            journal: Some(JournalConfig {
+                store: store.clone(),
+                signer: Arc::new(TraceSigner::generate()),
+            }),
+            background: None,
+            resolver: None,
+            content: None,
+            cron_profile: None,
+            completion_payload: None,
+        };
+        again.hydrate(blob, Vec::new()).await.unwrap();
+        let turns = &again.engine.as_ref().unwrap().snapshot().conversation.turns;
+        assert!(
+            turns
+                .iter()
+                .all(|t| !matches!(t, daemon_core::Turn::User(_))),
+            "the queue drains exactly once"
+        );
     }
 }
