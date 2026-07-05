@@ -25,7 +25,10 @@ use daemon_api::{
     clamp_page_max, ApiError, FsChange, FsChangeKind, FsContent, FsEntry, FsEntryKind, FsListPage,
     FsRevision, FsRootId, FsSearchHit, FsSearchPage, FsSearchQuery, FsWatchPageView, WIRE_PAGE_MAX,
 };
-use daemon_core::exec::contain;
+use daemon_core::exec::{
+    contain, open_read_guarded, open_write_guarded, reject_symlink_final_below,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default `fs_read` cap when the caller passes `max_bytes == 0`.
 const DEFAULT_MAX_READ: u64 = 1024 * 1024;
@@ -260,6 +263,11 @@ impl WorkspaceFs {
     ) -> Result<FsListPage, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, dir)?;
+        // Interim Cluster C guard: refuse a symlinked directory final component (the root itself may
+        // legitimately be a symlink); the per-entry listing below already uses non-following lstat.
+        reject_symlink_final_below(&base, &abs)
+            .await
+            .map_err(|e| ApiError::Other(format!("path not allowed: {e}")))?;
         let mut rd = tokio::fs::read_dir(&abs)
             .await
             .map_err(|e| ApiError::Other(format!("read_dir {dir:?}: {e}")))?;
@@ -326,7 +334,9 @@ impl WorkspaceFs {
     pub async fn stat(&self, root: &FsRootId, path: &str) -> Result<FsEntry, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, path)?;
-        let meta = tokio::fs::metadata(&abs)
+        // Interim Cluster C guard: lstat (do not follow), so a symlinked final component is reported
+        // as a link rather than leaking the target it points at outside the root.
+        let meta = tokio::fs::symlink_metadata(&abs)
             .await
             .map_err(|e| ApiError::Other(format!("stat {path:?}: {e}")))?;
         let name = Path::new(path)
@@ -352,7 +362,14 @@ impl WorkspaceFs {
     ) -> Result<FsContent, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, path)?;
-        let meta = tokio::fs::metadata(&abs)
+        // Interim Cluster C guard: open with O_NOFOLLOW (unix) so a symlinked final component is
+        // refused rather than followed out of the root, and take the revision metadata from the
+        // opened fd so there is no stat-then-read TOCTOU on the file.
+        let mut file = open_read_guarded(&abs)
+            .await
+            .map_err(|e| ApiError::Other(format!("read {path:?}: {e}")))?;
+        let meta = file
+            .metadata()
             .await
             .map_err(|e| ApiError::Other(format!("stat {path:?}: {e}")))?;
         let cap = if max_bytes == 0 {
@@ -360,7 +377,8 @@ impl WorkspaceFs {
         } else {
             max_bytes
         };
-        let full = tokio::fs::read(&abs)
+        let mut full = Vec::new();
+        file.read_to_end(&mut full)
             .await
             .map_err(|e| ApiError::Other(format!("read {path:?}: {e}")))?;
         let truncated = full.len() as u64 > cap;
@@ -389,7 +407,9 @@ impl WorkspaceFs {
     ) -> Result<Option<FsRevision>, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, path)?;
-        match tokio::fs::metadata(&abs).await {
+        // Interim Cluster C guard: lstat (do not follow) so a symlinked final component reports the
+        // link's own revision, not the outside target's.
+        match tokio::fs::symlink_metadata(&abs).await {
             Ok(meta) => Ok(Some(FsRevision {
                 mtime_ms: mtime_ms(&meta),
                 size: meta.len(),
@@ -422,7 +442,8 @@ impl WorkspaceFs {
         }
         let abs = Self::contained(&base, path)?;
         if let Some(expected) = base_revision {
-            if let Ok(meta) = tokio::fs::metadata(&abs).await {
+            // lstat (do not follow) — a symlinked final component is rejected on open below anyway.
+            if let Ok(meta) = tokio::fs::symlink_metadata(&abs).await {
                 let current = FsRevision {
                     mtime_ms: mtime_ms(&meta),
                     size: meta.len(),
@@ -439,10 +460,17 @@ impl WorkspaceFs {
                 .await
                 .map_err(|e| ApiError::Other(format!("mkdir for {path:?}: {e}")))?;
         }
-        tokio::fs::write(&abs, bytes)
+        // Interim Cluster C guard: O_NOFOLLOW create/truncate refuses a symlinked final component,
+        // so a write cannot clobber a file outside the root through a link; take the post-write
+        // revision from the opened fd.
+        let mut file = open_write_guarded(&abs)
             .await
             .map_err(|e| ApiError::Other(format!("write {path:?}: {e}")))?;
-        let meta = tokio::fs::metadata(&abs)
+        file.write_all(bytes)
+            .await
+            .map_err(|e| ApiError::Other(format!("write {path:?}: {e}")))?;
+        let meta = file
+            .metadata()
             .await
             .map_err(|e| ApiError::Other(format!("stat after write {path:?}: {e}")))?;
         Ok(FsRevision {
@@ -495,10 +523,16 @@ impl WorkspaceFs {
                     if is_ignored_name(&name) {
                         continue;
                     }
+                    // `DirEntry::metadata` is a non-following lstat, so a symlink is detectable here.
                     let meta = match item.metadata() {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
+                    // Interim Cluster C guard: skip symlink entries entirely — never recurse into a
+                    // symlinked directory nor read through a symlinked file out of the root.
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
                     let abs = item.path();
                     if meta.is_dir() {
                         stack.push(abs);
@@ -566,6 +600,11 @@ impl WorkspaceFs {
     ) -> Result<FsWatchPageView, ApiError> {
         let (base, _) = self.resolve(root)?;
         let abs = Self::contained(&base, dir)?;
+        // Interim Cluster C guard: refuse a symlinked watched-directory final component (the root
+        // itself may legitimately be a symlink).
+        reject_symlink_final_below(&base, &abs)
+            .await
+            .map_err(|e| ApiError::Other(format!("path not allowed: {e}")))?;
         // Snapshot the directory's current entries (name -> (mtime, size)).
         let mut current: HashMap<String, (u64, u64)> = HashMap::new();
         if let Ok(mut rd) = tokio::fs::read_dir(&abs).await {
@@ -873,5 +912,132 @@ mod tests {
         let fresh = fs.watch_after(&root, "", page.head_seq, 0).await.unwrap();
         assert!(!fresh.reset);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Cluster C interim guard: a symlink inside the workspace pointing at a file OUTSIDE it is
+    // lexically contained, but the read must be refused (O_NOFOLLOW), not followed to the secret.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("sym-read");
+        let outside = temp_base("sym-read-secret");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").unwrap();
+        symlink(&secret, base.join("link.txt")).unwrap();
+
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let res = fs.read(&FsRootId::Workspace, "link.txt", 0).await;
+        assert!(
+            res.is_err(),
+            "reading through an escaping symlink must be rejected, got {res:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // The write must not clobber a file outside the root through a symlinked final component.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("sym-write");
+        let outside = temp_base("sym-write-target");
+        let target = outside.join("target.txt");
+        std::fs::write(&target, b"ORIGINAL").unwrap();
+        symlink(&target, base.join("link.txt")).unwrap();
+
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let res = fs
+            .write(&FsRootId::Workspace, "link.txt", b"OVERWRITTEN", None)
+            .await;
+        assert!(
+            res.is_err(),
+            "writing through an escaping symlink must be rejected, got {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"ORIGINAL",
+            "the outside target must not be written through the symlink"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // `search` must not read through a symlink to a file outside the root (no hit from the target).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_skips_symlinked_target() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("sym-search");
+        let outside = temp_base("sym-search-secret");
+        std::fs::write(outside.join("secret.txt"), b"NEEDLE_abc123").unwrap();
+        symlink(outside.join("secret.txt"), base.join("link.txt")).unwrap();
+        // A real in-root file WITHOUT the needle, to prove search itself works.
+        std::fs::write(base.join("real.txt"), b"nothing here").unwrap();
+
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let query = FsSearchQuery {
+            query: "NEEDLE_abc123".into(),
+            regex: false,
+            case_sensitive: true,
+            max_results: 0,
+            page: 0,
+        };
+        let page = fs.search(&FsRootId::Workspace, &query).await.unwrap();
+        assert!(
+            page.hits.is_empty(),
+            "search must not read through a symlink to an outside file, got {:?}",
+            page.hits
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // Listing a symlinked directory final component is refused, so it cannot enumerate an outside
+    // directory through a link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_rejects_symlinked_subdir() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("sym-list");
+        let outside = temp_base("sym-list-target");
+        std::fs::write(outside.join("hidden.txt"), b"x").unwrap();
+        symlink(&outside, base.join("sublink")).unwrap();
+
+        let fs = WorkspaceFs::new(std::sync::Arc::new(WorkspaceRoots::new(base.clone())));
+        let res = fs.list(&FsRootId::Workspace, "sublink", true, None).await;
+        assert!(
+            res.is_err(),
+            "listing a symlinked subdir must be rejected, got {res:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // No-regression: the guard exempts the trusted root, so a session bound onto a directory that is
+    // itself a symlink still lists (only components strictly BELOW the root are guarded).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_bound_root_still_lists() {
+        use std::os::unix::fs::symlink;
+        let real = temp_base("sym-boundroot-real");
+        std::fs::write(real.join("inside.txt"), b"hi").unwrap();
+        let wsbase = temp_base("sym-boundroot-ws");
+        // A symlink that will be recorded as session s1's root.
+        let link = wsbase.join("s1link");
+        symlink(&real, &link).unwrap();
+
+        let roots = std::sync::Arc::new(WorkspaceRoots::new(wsbase.clone()));
+        roots.record("s1", link.clone());
+        let fs = WorkspaceFs::new(roots);
+        let root = FsRootId::Session(daemon_common::SessionId::new("s1"));
+        let page = fs.list(&root, "", true, None).await.unwrap();
+        assert!(
+            page.items.iter().any(|e| e.name == "inside.txt"),
+            "a symlinked bound root must still list its contents"
+        );
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&wsbase);
     }
 }

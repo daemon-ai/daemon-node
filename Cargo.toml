@@ -127,6 +127,10 @@ wiremock = "0.6"
 # the graceful-shutdown launch gate (dev) sends SIGTERM/SIGINT to the real spawned binary exactly
 # the way a container runtime stops it.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
+# Interim symlink/TOCTOU guard (Cluster C): the `O_NOFOLLOW` open flag for the file opens that
+# follow `contain()`. Unix-only — consumers pull it under `[target.'cfg(unix)'.dependencies]` so the
+# non-unix build uses the `symlink_metadata` fallback and never links libc. Already resolved in-tree.
+libc = "0.2"
 # Cross-platform pseudo-terminal (wezterm's pty layer) for interactive background CLIs
 # (`shell(pty=true)` → `daemon-processes`). MIT; pins some older transitives (bitflags 1, nix 0.28)
 # — duplicate-version warnings only (deny.toml multiple-versions = "warn").
