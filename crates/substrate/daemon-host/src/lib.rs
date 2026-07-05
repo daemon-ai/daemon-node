@@ -129,10 +129,15 @@ pub use routing::{
     TransportPattern,
 };
 pub use socket::ApiClient;
-// The unix-socket transport itself does not exist on windows (tokio lacks AF_UNIX there); a
-// windows node serves the portable TLS/WS/HTTP surfaces only.
+// The pipe-name contract (portable so it is unit-testable off-windows; the daemon/CLI/Qt derive the
+// same name from `socket_path`).
+pub use socket::{windows_pipe_component, windows_pipe_path};
+// The unix-socket transport does not exist on windows (tokio lacks AF_UNIX there); windows serves
+// the same local-trust mux/legacy loops over a named pipe instead.
 #[cfg(unix)]
 pub use socket::{serve_api_unix, serve_api_unix_authenticated, MuxApiClient};
+#[cfg(windows)]
+pub use socket::{serve_api_windows_pipe, serve_api_windows_pipe_authenticated};
 pub use streamjson::StreamJsonCodec;
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,

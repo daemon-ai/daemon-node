@@ -2233,16 +2233,36 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             ))
         }
     };
-    // No unix-socket surface on windows: require at least one networked listener so a launch that
-    // would serve nothing fails loudly at boot instead of idling unreachable.
-    #[cfg(not(unix))]
+    // Windows has no AF_UNIX; the same local-trust mux/legacy loops are served over a named pipe
+    // whose name derives from `socket_path` (the pipe-name contract the Qt launcher + daemon-cli
+    // mirror). This makes `socket_path` a valid local listener on windows, so the "no api surface"
+    // branch below is only reached on exotic (non-unix, non-windows) targets.
+    #[cfg(windows)]
+    let pipe_server = {
+        let pipe_name = daemon_host::windows_pipe_path(&cfg.socket_path.to_string_lossy());
+        if local_trust {
+            tracing::info!(pipe = %pipe_name, "serving daemon-api over named pipe (local trust: system)");
+            tokio::spawn(daemon_host::serve_api_windows_pipe(pipe_name, node.clone()))
+        } else {
+            tracing::info!(pipe = %pipe_name, "serving daemon-api over named pipe (SCRAM required)");
+            tokio::spawn(daemon_host::serve_api_windows_pipe_authenticated(
+                pipe_name,
+                node.clone(),
+                authenticator.clone(),
+            ))
+        }
+    };
+    // Neither unix nor windows: no local transport exists, so require at least one networked
+    // listener so a launch that would serve nothing fails loudly at boot instead of idling
+    // unreachable.
+    #[cfg(not(any(unix, windows)))]
     if cfg.api.tls_addr.is_none()
         && cfg.api.ws_addr.is_none()
         && cfg.web.addr.is_none()
         && cfg.http_addr.is_none()
     {
         anyhow::bail!(
-            "no api surface configured: the unix-socket transport is unavailable on this \
+            "no api surface configured: no local transport is available on this \
              platform — set [api].ws_addr, [api].tls_addr, [web].addr, or http_addr"
         );
     }
@@ -2425,6 +2445,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     tracing::info!(signal, "shutdown signal received; shutting down");
     #[cfg(unix)]
     server.abort();
+    #[cfg(windows)]
+    pipe_server.abort();
     if let Some(tls_server) = tls_server {
         tls_server.abort();
     }

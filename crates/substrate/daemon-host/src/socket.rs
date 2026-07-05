@@ -56,10 +56,10 @@ pub(crate) fn next_conn_id() -> u64 {
 /// How a connection establishes the [`RequestContext`] every dispatch runs under.
 pub(crate) enum AuthMode {
     /// Local trust ([`api].local_trust`): bind [`RequestContext::system`] (full-trust admin) for
-    /// every request, advertise NO mechanisms, and run no SASL exchange. The Unix socket / FFI /
-    /// CLI default — the deliberate, audited unauthenticated-but-trusted path.
-    // Only the unix-socket entry points construct this; the TLS/WS carriers are always Required.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// every request, advertise NO mechanisms, and run no SASL exchange. The Unix socket / Windows
+    /// named pipe / FFI / CLI default — the deliberate, audited unauthenticated-but-trusted path.
+    // The unix-socket and windows named-pipe entry points construct this; the TLS/WS carriers are
+    // always Required.
     LocalSystem,
     /// Require a completed SASL exchange before any `Call`/`Open`. Advertises the authenticator's
     /// permitted mechanisms for the transport; binds the authenticated principal post-`AuthOk`.
@@ -131,18 +131,102 @@ async fn serve_conn(
     api: Arc<dyn NodeApi>,
     mode: Arc<AuthMode>,
 ) -> std::io::Result<()> {
-    let (mut rd, wr) = stream.into_split();
-    let conn_id = next_conn_id();
+    let (rd, wr) = stream.into_split();
+    serve_conn_split(rd, wr, api, mode, next_conn_id()).await
+}
+
+/// First-frame mode-select over any split byte stream — the shared per-connection entry point for
+/// the Unix socket and the Windows named pipe (both are local-trust carriers of the bare + mux
+/// protocols). A multiplexed client opens with a `WireC2S` frame; a legacy client sends a bare
+/// `ApiRequest`, whose externally-tagged variants are disjoint from `WireC2S`
+/// (`Hello`/`Call`/`Cancel`), so it never decodes as one.
+#[cfg(any(unix, windows))]
+async fn serve_conn_split<R, W>(
+    mut rd: R,
+    wr: W,
+    api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
+    conn_id: u64,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let first = match read_frame(&mut rd).await? {
         Some(bytes) => bytes,
         None => return Ok(()),
     };
-    // Mode select by the first frame: a multiplexed client opens with a `WireC2S` frame; a legacy
-    // client sends a bare `ApiRequest`, whose externally-tagged variants are disjoint from
-    // `WireC2S` (`Hello`/`Call`/`Cancel`), so it never decodes as one.
     match from_cbor::<WireC2S>(&first) {
         Ok(frame) => serve_mux(rd, wr, api, mode, Some(frame), conn_id).await,
         Err(_) => serve_legacy(rd, wr, api, mode, first, conn_id).await,
+    }
+}
+
+/// Serve the node surface over a Windows named pipe at `pipe_name` under **local trust** — the
+/// windows analog of [`serve_api_unix`]: every request runs as [`RequestContext::system`] and no
+/// SASL exchange is offered. This is the managed-daemon / FFI / CLI local path on windows (tokio
+/// has no AF_UNIX there). For an authenticated pipe use [`serve_api_windows_pipe_authenticated`].
+/// Runs forever; spawn it as a background task.
+#[cfg(windows)]
+pub async fn serve_api_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>) {
+    accept_windows_pipe(pipe_name, api, Arc::new(AuthMode::LocalSystem)).await;
+}
+
+/// As [`serve_api_windows_pipe`], but the pipe **requires** a SASL exchange (no local trust): a
+/// connection must authenticate via the [`Authenticator`] before any `Call`/`Open`. Used when
+/// `[api].local_trust` is disabled.
+#[cfg(windows)]
+pub async fn serve_api_windows_pipe_authenticated(
+    pipe_name: String,
+    api: Arc<dyn NodeApi>,
+    auth: Arc<Authenticator>,
+) {
+    let mode = Arc::new(AuthMode::Required {
+        auth,
+        tls_state: TlsState::plaintext(),
+    });
+    accept_windows_pipe(pipe_name, api, mode).await;
+}
+
+/// The windows named-pipe accept loop (peer of [`accept_unix`]). Uses the standard tokio pattern:
+/// the first instance claims the name, and each accepted client is handed to a per-connection task
+/// while the next instance is created ahead of it, so there is never a window where a connecting
+/// client finds no server listening.
+#[cfg(windows)]
+async fn accept_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let mut server = match ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(pipe = %pipe_name, "failed to create named pipe: {e}");
+            return;
+        }
+    };
+    loop {
+        if let Err(e) = server.connect().await {
+            tracing::warn!(pipe = %pipe_name, "named pipe connect failed: {e}");
+        }
+        // Take the connected instance and stand up the next one before serving this one.
+        let connected = server;
+        server = match ServerOptions::new().create(&pipe_name) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(pipe = %pipe_name, "failed to recreate named pipe: {e}");
+                return;
+            }
+        };
+        let api = api.clone();
+        let mode = mode.clone();
+        tokio::spawn(async move {
+            let conn_id = next_conn_id();
+            let (rd, wr) = tokio::io::split(connected);
+            if let Err(e) = serve_conn_split(rd, wr, api, mode, conn_id).await {
+                tracing::debug!("named pipe connection ended: {e}");
+            }
+        });
     }
 }
 
@@ -150,8 +234,9 @@ async fn serve_conn(
 /// The bare protocol carries no SASL handshake, so it is served only under [`AuthMode::LocalSystem`]
 /// (the FFI/CLI local-trust path); when auth is required this transport refuses with
 /// [`ApiError::Unauthenticated`] (a networked client must use the multiplexed SASL path).
-// unix-only because its sole caller is the unix-socket `serve_conn` (TLS/WS carriers are mux-only).
-#[cfg(unix)]
+// Served by `serve_conn_split` over the local-trust carriers (Unix socket + Windows named pipe);
+// the TLS/WS carriers are mux-only.
+#[cfg(any(unix, windows))]
 async fn serve_legacy<R, W>(
     mut rd: R,
     mut wr: W,
@@ -794,16 +879,72 @@ impl ApiClient {
         from_cbor::<ApiResponse>(&bytes)
     }
 
-    /// Non-unix: there is no local-trust transport (tokio has no AF_UNIX support on windows), so a
-    /// call fails explicitly instead of pretending — a windows node serves TLS/WS/HTTP only.
-    #[cfg(not(unix))]
+    /// Windows: connect over the named pipe derived from `path` ([`windows_pipe_path`]) and run the
+    /// same one-shot bare protocol the unix socket does — the operator CLI / managed-daemon local
+    /// path (tokio has no AF_UNIX on windows). Uses the pipe-name contract the daemon binds.
+    #[cfg(windows)]
+    pub async fn call(&self, request: ApiRequest) -> Result<ApiResponse, ApiError> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        // ERROR_PIPE_BUSY: every server instance is momentarily busy serving another client. The
+        // accept loop creates the next instance right after each connect, so a short retry wins.
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let name = windows_pipe_path(&self.path.to_string_lossy());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match ClientOptions::new().open(&name) {
+                Ok(c) => break c,
+                Err(e)
+                    if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(ApiError::Other(format!("connect {name}: {e}"))),
+            }
+        };
+        write_frame(&mut stream, &to_cbor(&request))
+            .await
+            .map_err(|e| ApiError::Other(format!("send: {e}")))?;
+        let bytes = read_frame(&mut stream)
+            .await
+            .map_err(|e| ApiError::Other(format!("recv: {e}")))?
+            .ok_or_else(|| ApiError::Other("connection closed before a response".into()))?;
+        from_cbor::<ApiResponse>(&bytes)
+    }
+
+    /// Neither unix nor windows: there is no local-trust transport, so a call fails explicitly
+    /// instead of pretending — connect over the node's TLS/WebSocket/HTTP surface instead.
+    #[cfg(not(any(unix, windows)))]
     pub async fn call(&self, _request: ApiRequest) -> Result<ApiResponse, ApiError> {
         Err(ApiError::Other(format!(
-            "the unix-socket transport ({}) is unavailable on this platform; connect over the \
-             node's TLS/WebSocket/HTTP surface instead",
+            "no local transport ({}) on this platform; connect over the node's \
+             TLS/WebSocket/HTTP surface instead",
             self.path.display()
         )))
     }
+}
+
+/// The machine-global pipe **name component** for a `socket_path` (no `\\.\pipe\` prefix): the
+/// shared contract with the Qt launcher, which passes this to `QLocalSocket::connectToServer` and
+/// lets Qt prepend `\\.\pipe\`. **This is the authority for the pipe-name contract** — the Qt side
+/// mirrors this rule byte-for-byte in `daemon-app/src/core/daemon/windows_pipe_name.h` (keep the two
+/// in lockstep). Pipe names share a single machine-global namespace, so the full socket path is
+/// folded in to keep distinct sockets on distinct pipes. Rule: the fixed prefix `daemon-api-`, then
+/// each UTF-8 byte of `socket_path` that is an ASCII alphanumeric or one of `.`/`_`/`-` is kept
+/// verbatim; every other byte maps to `_`.
+pub fn windows_pipe_component(socket_path: &str) -> String {
+    let mut name = String::from("daemon-api-");
+    for b in socket_path.bytes() {
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+        name.push(if keep { b as char } else { '_' });
+    }
+    name
+}
+
+/// The full `\\.\pipe\<component>` path the daemon binds and `daemon-cli` connects. See
+/// [`windows_pipe_component`] for the shared name-component contract with the Qt side.
+pub fn windows_pipe_path(socket_path: &str) -> String {
+    format!(r"\\.\pipe\{}", windows_pipe_component(socket_path))
 }
 
 /// A multiplexed client over the Unix-socket adapter: one connection, a `Hello` handshake, then
@@ -1019,5 +1160,27 @@ mod tests {
         let authed = hello_features(false, true);
         assert!(!authed.contains(&WIRE_FEATURE_VERSIONING.to_string()));
         assert!(authed.contains(&WIRE_FEATURE_AUTH.to_string()));
+    }
+
+    /// The Windows pipe-name contract is deterministic, path-scoped (distinct sockets => distinct
+    /// pipes), and folds every non-`[A-Za-z0-9._-]` byte to `_`. The Qt launcher mirrors this rule
+    /// byte-for-byte, so this pins the shared behavior on every platform (not just windows).
+    #[test]
+    fn windows_pipe_contract_is_deterministic_and_path_scoped() {
+        let a = windows_pipe_component("/tmp/daemon-api.sock");
+        assert_eq!(a, "daemon-api-_tmp_daemon-api.sock");
+        assert_eq!(a, windows_pipe_component("/tmp/daemon-api.sock")); // deterministic
+        assert_ne!(a, windows_pipe_component("/tmp/other/daemon-api.sock")); // path-scoped
+                                                                             // Separators / spaces / colons all collapse to '_'; the allowed classes survive verbatim.
+        assert_eq!(windows_pipe_component("/a b:c"), "daemon-api-_a_b_c");
+        assert_eq!(
+            windows_pipe_component(r"C:\Temp\daemon.sock"),
+            "daemon-api-C__Temp_daemon.sock"
+        );
+        // The full path is the component with the fixed `\\.\pipe\` prefix.
+        assert_eq!(
+            windows_pipe_path("/tmp/daemon-api.sock"),
+            r"\\.\pipe\daemon-api-_tmp_daemon-api.sock"
+        );
     }
 }
