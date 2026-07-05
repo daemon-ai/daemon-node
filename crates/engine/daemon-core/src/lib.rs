@@ -71,7 +71,10 @@ pub use engine::{
     APPROVAL_SUSPEND_PAYLOAD,
 };
 pub use events::{EventSink, SessionLog};
-pub use exec::{contain, Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+pub use exec::{
+    contain, resolve_program_abs, Command, CommandFingerprint, ExecCx, ExecResult,
+    ExecutionEnvironment, LocalEnvironment,
+};
 #[cfg(feature = "otel")]
 pub use genai_telemetry::set_genai_capture;
 pub use memory::{
@@ -98,4 +101,4 @@ pub use tools::{
     DelegateTool, Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError,
     ToolRegistry,
 };
-pub use turn::{approve_command, approve_path, Effect, Gate, TurnCx};
+pub use turn::{approve_command, approve_path, approve_shell_command, Effect, Gate, TurnCx};

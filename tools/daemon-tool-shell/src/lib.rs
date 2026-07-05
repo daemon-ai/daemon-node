@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use daemon_core::{
-    approve_command, contain, Command, Effect, ExecCx, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
+    approve_command, approve_shell_command, contain, resolve_program_abs, Command,
+    CommandFingerprint, Effect, ExecCx, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
 };
 use daemon_processes::{truncate_head_tail, ProcessRegistry, ShellConfig, SpawnRequest};
 use daemon_protocol::ToolDetail;
@@ -136,6 +137,79 @@ fn resolve_cwd(
     }
 }
 
+// --- Exec-approval fingerprinting (Cluster B) ----------------------------------------------------
+
+/// The exec-surface tier a command runs under — part of the fingerprint identity and the operator
+/// display, so a foreground argv command and a background shell-string with a coincidentally-equal
+/// textual line can never share a fingerprint.
+const SURFACE_ARGV: &str = "exec.argv";
+const SURFACE_SHELL: &str = "exec.shell";
+const SURFACE_PTY: &str = "exec.pty";
+
+/// The fully-resolved form of a shell-tool call: the exact tuple that will run, and the basis for
+/// both the operator-facing approval display and the [`CommandFingerprint`].
+struct ResolvedExec {
+    /// The exec-surface tier (`exec.argv` / `exec.shell` / `exec.pty`).
+    surface: &'static str,
+    /// The resolved **absolute** executable (foreground: the program; background/pty: `sh`).
+    program_abs: PathBuf,
+    /// The argument vector (foreground: the argv; background/pty: `["-c", line]`).
+    argv: Vec<String>,
+    /// The **explicit** environment set for the child (never the ambient `PATH`) — foreground sets
+    /// none; background/pty sets `PYTHONUNBUFFERED=1` (matching the process registry).
+    env_delta: Vec<(String, String)>,
+    /// The resolved absolute working directory.
+    cwd: PathBuf,
+    /// The human-readable command line (for display / detail).
+    line: String,
+}
+
+impl ResolvedExec {
+    /// The §12 approval fingerprint over this resolved tuple.
+    fn fingerprint(&self) -> CommandFingerprint {
+        CommandFingerprint::compute(
+            self.surface,
+            &self.program_abs,
+            &self.argv,
+            &self.env_delta,
+            &self.cwd,
+        )
+    }
+}
+
+/// Minimal display quoting so an argument containing whitespace or shell metacharacters is
+/// unambiguous in the approval prompt (the operator sees exactly what will run, not a lossy join).
+fn display_quote(s: &str) -> String {
+    if s.is_empty()
+        || s.chars()
+            .any(|c| c.is_whitespace() || "\"'\\$`|&;<>()".contains(c))
+    {
+        format!("{s:?}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// The operator-facing approval prompt: the resolved absolute binary, argv, cwd, exec-surface tier,
+/// and the short fingerprint digest — so the human approves exactly what will run (and the digest
+/// correlates with the enforced fingerprint).
+fn honest_prompt(re: &ResolvedExec, fp: &CommandFingerprint) -> String {
+    let argv = re
+        .argv
+        .iter()
+        .map(|a| display_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "approve {} command (fingerprint {}):\n  {} {}\n  cwd: {}",
+        re.surface,
+        fp.short(),
+        re.program_abs.display(),
+        argv,
+        re.cwd.display()
+    )
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -185,12 +259,61 @@ impl Tool for ShellTool {
             );
         }
 
-        // Tier 2 — dangerous: gate on the session's approval policy (§12), again in both paths.
-        // The live host answers inline; the headless/durable host parks the decision and the turn
-        // suspends.
-        if needs_approval(&parsed.command, &line) {
-            let prompt = format!("approve command: {line}");
-            match approve_command(cx, prompt.clone()).await {
+        let root = cx.exec.cwd().to_path_buf();
+        let sticky = self
+            .procs
+            .as_ref()
+            .filter(|_| self.config.persist_cwd)
+            .and_then(|p| p.cwd_for(&cx.session_id));
+
+        // `cd` builtin: persist the session working directory (there is no `cd` binary to exec, and
+        // it is never gated).
+        if parsed.command == "cd" && !parsed.background {
+            return self.run_cd(call, cx, &root, sticky, &parsed);
+        }
+        // `pty` is only meaningful for a managed background session (interactive stdin).
+        if parsed.pty && !parsed.background {
+            return ToolOutcome::text(
+                call.call_id.clone(),
+                false,
+                "shell: pty=true requires background=true (interactive sessions are managed \
+                 through the process tool)",
+            );
+        }
+
+        // Resolve the command to its ABSOLUTE binary + full tuple: the exact thing that will run,
+        // the basis for the fingerprint, and the honest operator display. Resolving here (not at
+        // exec) is what makes "what was approved" == "what runs".
+        let resolved = match self.resolve_exec(&parsed, &line, &root, sticky) {
+            Ok(r) => r,
+            Err(e) => {
+                // A workdir escape (contain → PermissionDenied) keeps its historical label; a
+                // missing/undecidable binary surfaces plainly.
+                let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    format!("shell: workdir: {e}")
+                } else {
+                    format!("shell: {e}")
+                };
+                return ToolOutcome::text(call.call_id.clone(), false, msg);
+            }
+        };
+
+        // Tier 2 — approval (§12), surface-aware:
+        //   * background/pty shell-string: a DISTINCT, always-gated capability (arbitrary code; the
+        //     OpenClaw persistence/exfil vector) — it never rides the auto-allow fast path.
+        //   * foreground argv: gated only on the dangerous-pattern heuristic (unchanged); benign
+        //     argv runs unattended as before.
+        // The approval decision + operator display are bound to the resolved command's fingerprint.
+        let gate_shell = parsed.background;
+        if gate_shell || needs_approval(&parsed.command, &line) {
+            let fingerprint = resolved.fingerprint();
+            let prompt = honest_prompt(&resolved, &fingerprint);
+            let gate = if gate_shell {
+                approve_shell_command(cx, prompt.clone()).await
+            } else {
+                approve_command(cx, prompt.clone()).await
+            };
+            match gate {
                 Gate::Proceed => {}
                 Gate::Reject(reason) => {
                     return ToolOutcome::text(
@@ -200,7 +323,9 @@ impl Tool for ShellTool {
                     )
                 }
                 Gate::Defer(job_id) => {
-                    // Durable HITL: suspend awaiting the operator's decision; do not run the command.
+                    // Durable HITL: suspend awaiting the operator's decision; do not run. The engine
+                    // stamps the fingerprint onto the parked approval (via `resolved_fingerprint`) and
+                    // refuses the re-run if the resolved command later differs.
                     return ToolOutcome::text(
                         call.call_id.clone(),
                         false,
@@ -216,46 +341,91 @@ impl Tool for ShellTool {
             }
         }
 
+        if parsed.background {
+            return self.run_background(call, cx, &resolved.line, resolved.cwd.clone(), &parsed);
+        }
+        self.run_foreground(call, cx, &resolved, &parsed).await
+    }
+
+    async fn resolved_fingerprint(
+        &self,
+        call: &ToolCall,
+        cx: &TurnCx<'_>,
+    ) -> Option<CommandFingerprint> {
+        let parsed: ShellArgs = serde_json::from_str(&call.args).ok()?;
+        // `cd` is a builtin, not an exec; there is nothing to fingerprint.
+        if parsed.command == "cd" && !parsed.background {
+            return None;
+        }
+        let line = if parsed.args.is_empty() {
+            parsed.command.clone()
+        } else {
+            format!("{} {}", parsed.command, parsed.args.join(" "))
+        };
         let root = cx.exec.cwd().to_path_buf();
         let sticky = self
             .procs
             .as_ref()
             .filter(|_| self.config.persist_cwd)
             .and_then(|p| p.cwd_for(&cx.session_id));
-
-        // `cd` builtin: persist the session working directory (there is no `cd` binary to exec).
-        if parsed.command == "cd" && !parsed.background {
-            return self.run_cd(call, cx, &root, sticky, &parsed);
-        }
-
-        let cwd = match resolve_cwd(&root, sticky, parsed.workdir.as_deref()) {
-            Ok(dir) => dir,
-            Err(e) => {
-                return ToolOutcome::text(
-                    call.call_id.clone(),
-                    false,
-                    format!("shell: workdir: {e}"),
-                )
-            }
-        };
-
-        if parsed.background {
-            return self.run_background(call, cx, &line, cwd, &parsed);
-        }
-        if parsed.pty {
-            return ToolOutcome::text(
-                call.call_id.clone(),
-                false,
-                "shell: pty=true requires background=true (interactive sessions are managed \
-                 through the process tool)",
-            );
-        }
-        self.run_foreground(call, cx, &line, &root, cwd, &parsed)
-            .await
+        // A binary/cwd that can no longer be resolved yields `None` → the engine fails closed.
+        let resolved = self.resolve_exec(&parsed, &line, &root, sticky).ok()?;
+        Some(resolved.fingerprint())
     }
 }
 
 impl ShellTool {
+    /// Resolve a parsed call into its [`ResolvedExec`] — the absolute binary, argv, env-delta, cwd,
+    /// and exec-surface that will actually run. Foreground resolves `parsed.command` on `PATH`;
+    /// background/pty resolve `sh` (the one approved shell-string interpreter). Read-only (no dir
+    /// creation), so it is safe to call at approval time, at park (fingerprint stamp), and on the
+    /// re-run recompute. `PATH` is taken from the same source the exec backends use.
+    fn resolve_exec(
+        &self,
+        parsed: &ShellArgs,
+        line: &str,
+        root: &Path,
+        sticky: Option<PathBuf>,
+    ) -> std::io::Result<ResolvedExec> {
+        // Only a cwd/workdir problem is fatal here (it must surface before any gate). Binary
+        // resolution FALLS BACK to the bare name when it cannot resolve (missing binary): the gate
+        // still runs and a fingerprint is still computed over the bare name — which then MISMATCHES
+        // (fail-closed) if the binary later resolves differently, and the exec fails naturally at
+        // runtime. When it does resolve, the fingerprint binds the absolute path (the goal).
+        let cwd = resolve_cwd(root, sticky, parsed.workdir.as_deref())?;
+        let path_env = std::env::var_os("PATH").unwrap_or_default();
+        if parsed.background {
+            let surface = if parsed.pty {
+                SURFACE_PTY
+            } else {
+                SURFACE_SHELL
+            };
+            let program_abs =
+                resolve_program_abs("sh", &cwd, &path_env).unwrap_or_else(|_| PathBuf::from("sh"));
+            Ok(ResolvedExec {
+                surface,
+                program_abs,
+                argv: vec!["-c".to_string(), line.to_string()],
+                // The registry spawns the shell with PYTHONUNBUFFERED=1 (plus the ambient PATH,
+                // which is excluded from the fingerprint by design).
+                env_delta: vec![("PYTHONUNBUFFERED".to_string(), "1".to_string())],
+                cwd,
+                line: line.to_string(),
+            })
+        } else {
+            let program_abs = resolve_program_abs(&parsed.command, &cwd, &path_env)
+                .unwrap_or_else(|_| PathBuf::from(&parsed.command));
+            Ok(ResolvedExec {
+                surface: SURFACE_ARGV,
+                program_abs,
+                argv: parsed.args.clone(),
+                env_delta: Vec::new(),
+                cwd,
+                line: line.to_string(),
+            })
+        }
+    }
+
     /// The `cd` builtin: contain the target, verify it exists (or can be created is NOT implied —
     /// `cd` into a missing directory is an error), persist it as the session's sticky cwd.
     fn run_cd(
@@ -374,14 +544,13 @@ impl ShellTool {
     }
 
     /// Run a transient foreground command under the self-managed timeout, truncating oversized
-    /// output 40% head / 60% tail.
+    /// output 40% head / 60% tail. Execs the **resolved absolute binary** (not the bare program
+    /// name), so exec-time `PATH` resolution cannot diverge from what was approved/displayed.
     async fn run_foreground(
         &self,
         call: &ToolCall,
         cx: &TurnCx<'_>,
-        line: &str,
-        root: &Path,
-        cwd: PathBuf,
+        resolved: &ResolvedExec,
         parsed: &ShellArgs,
     ) -> ToolOutcome {
         // Timeout policy (hermes): default when unset; a request above the hard cap is REJECTED
@@ -402,10 +571,13 @@ impl ShellTool {
             None => self.config.timeout_default_secs,
         };
 
-        let mut cmd = Command::new(parsed.command.clone()).args(parsed.args.clone());
+        let line = resolved.line.as_str();
+        let root = cx.exec.cwd();
+        let mut cmd = Command::new(resolved.program_abs.to_string_lossy().into_owned())
+            .args(resolved.argv.clone());
         // Only pass a cwd when it differs from the root (byte-identical legacy behavior otherwise).
-        if cwd != *root {
-            cmd = cmd.cwd(cwd);
+        if resolved.cwd != *root {
+            cmd = cmd.cwd(resolved.cwd.clone());
         }
 
         // Self-managed deadline: a child token the timer cancels — the environment kills the
@@ -484,6 +656,18 @@ mod tests {
             HostResponse {
                 request_id: req.request_id,
                 body: HostResponseBody::Approved(self.0),
+            }
+        }
+    }
+
+    /// A headless host that parks every approval durably (the durable HITL path).
+    struct DeferringHost;
+    #[async_trait]
+    impl HostRequestHandler for DeferringHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Deferred(daemon_common::JobId::new("job-x")),
             }
         }
     }
@@ -769,6 +953,65 @@ mod tests {
         .await;
         assert!(!out.result.ok);
         assert!(out.result.content.contains("no process registry"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cluster B: the raw shell-string surface (background `sh -c`) is a DISTINCT, always-gated
+    // capability — a benign line that would run unattended as foreground argv must still be approved.
+    // A denying host therefore refuses it. (Pre-fix: benign background was not gated and spawned.)
+    #[tokio::test]
+    async fn benign_background_is_a_gated_surface_and_denied_by_host() {
+        let root = temp_root("bg-benign-gate");
+        let env = LocalEnvironment::new(&root);
+        let tool = ShellTool::with_processes(registry(), ShellConfig::default());
+        let out = run_tool(
+            &tool,
+            &env,
+            &FixedHost(false),
+            r#"{"command":"echo","args":["hi"],"background":true}"#,
+        )
+        .await;
+        assert!(
+            !out.result.ok,
+            "background shell-string must be gated (denied by host), got ok: {}",
+            out.result.content
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cluster B: a durably-parked command carries an HONEST, fingerprinted approval prompt — the
+    // resolved absolute binary, exec-surface tier, cwd, and a short fingerprint digest — so the
+    // operator approves exactly what will run (not a lossy space-joined line).
+    #[tokio::test]
+    async fn parked_prompt_is_honest_and_fingerprinted() {
+        let root = temp_root("defer-prompt");
+        let env = LocalEnvironment::new(&root);
+        let tool = ShellTool::with_processes(registry(), ShellConfig::default());
+        let out = run_tool(
+            &tool,
+            &env,
+            &DeferringHost,
+            r#"{"command":"echo","args":["hi"],"background":true}"#,
+        )
+        .await;
+        let prompt = out
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::AwaitDecision { prompt, .. } => Some(prompt.clone()),
+                _ => None,
+            })
+            .expect("a background command parks an AwaitDecision");
+        assert!(
+            prompt.contains("exec.shell"),
+            "surface tier shown: {prompt}"
+        );
+        assert!(prompt.contains("fingerprint "), "digest shown: {prompt}");
+        assert!(prompt.contains("cwd:"), "resolved cwd shown: {prompt}");
+        assert!(
+            prompt.contains('/'),
+            "an absolute binary path shown: {prompt}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

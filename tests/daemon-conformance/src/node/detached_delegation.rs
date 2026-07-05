@@ -293,6 +293,7 @@ async fn detached_notice_reaches_a_parked_durable_parent() {
         },
         prompt: "approve write to gated.txt".into(),
         path: Some("gated.txt".into()),
+        fingerprint: None,
     }];
     store
         .create_session(

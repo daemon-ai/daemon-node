@@ -19,6 +19,9 @@ strsim = { workspace = true }
 serde_json = { workspace = true }
 # UTS#46 IDNA/punycode normalization for the `check_url` egress guard (safety/url.rs).
 idna = { workspace = true }
+# Command-fingerprint hashing (Cluster B exec-approval): SHA-256 over the resolved command tuple so an
+# approval decision is bound to what will actually run (the approve-then-swap TOCTOU gate).
+sha2 = { workspace = true }
 # best-effort observability for the §12 checkpoint stage (capture/restore failures never fail a turn,
 # so they are logged rather than propagated). The only logging dep in the otherwise log-free core.
 tracing = { workspace = true }

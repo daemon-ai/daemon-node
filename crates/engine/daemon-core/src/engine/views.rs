@@ -62,6 +62,11 @@ pub(super) fn partition_tool_effects(effects: Vec<Effect>) -> PartitionedEffects
                 call,
                 prompt,
                 path,
+                // The approval fingerprint (Cluster B) is stamped by the engine at park time via
+                // `Tool::resolved_fingerprint` (it needs the tool registry + cx, which this pure
+                // partitioner does not have). `Effect::AwaitDecision` stays unchanged so the shared
+                // variant does not force edits on other tools (e.g. execute_code).
+                fingerprint: None,
             }),
         }
     }

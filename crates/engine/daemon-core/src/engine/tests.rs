@@ -1240,3 +1240,173 @@ async fn partial_rewind_does_not_fire_session_reset() {
         "no reset on a partial rewind"
     );
 }
+
+// --- Cluster B: exec-approval fingerprint gate on the durable re-run ------------------------------
+
+/// A tool that records whether it ran and reports a fixed [`CommandFingerprint`] — lets the
+/// approval-resolve tests drive a match / mismatch against a stored fingerprint deterministically.
+struct FingerprintProbeTool {
+    ran: Arc<AtomicU64>,
+    resolved: crate::exec::CommandFingerprint,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for FingerprintProbeTool {
+    fn name(&self) -> &str {
+        "fp_probe"
+    }
+    fn schema(&self) -> &str {
+        "{}"
+    }
+    async fn run(
+        &self,
+        call: &crate::conversation::ToolCall,
+        _cx: &crate::turn::TurnCx<'_>,
+    ) -> crate::tools::ToolOutcome {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        crate::tools::ToolOutcome::text(call.call_id.clone(), true, "fp_probe RAN")
+    }
+    async fn resolved_fingerprint(
+        &self,
+        _call: &crate::conversation::ToolCall,
+        _cx: &crate::turn::TurnCx<'_>,
+    ) -> Option<crate::exec::CommandFingerprint> {
+        Some(self.resolved.clone())
+    }
+}
+
+/// Seed an engine with one parked approval for `fp_probe` (stored fingerprint = `stored`), an
+/// `awaiting-approval` marker slot in the conversation, and an `"allow"` completion. The probe tool
+/// reports `resolved` as its current fingerprint. Returns the engine + the run counter after
+/// `resolve_approvals`.
+async fn drive_approval_resolution(
+    stored: crate::exec::CommandFingerprint,
+    resolved: crate::exec::CommandFingerprint,
+) -> (Engine, Arc<AtomicU64>) {
+    use crate::conversation::{AssistantMsg, ToolCall, ToolResult, ToolTurn, Turn};
+
+    let ran = Arc::new(AtomicU64::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FingerprintProbeTool {
+        ran: ran.clone(),
+        resolved,
+    }));
+    let mut engine = test_engine("fp", Arc::new(TextProvider), registry);
+
+    let job = JobId::new("job-fp");
+    let call = ToolCall {
+        call_id: "call-fp".into(),
+        name: "fp_probe".into(),
+        args: "{}".into(),
+    };
+    // The parked tool left an `awaiting-approval:{job}` marker slot the resolver splices into.
+    engine
+        .snapshot
+        .conversation
+        .turns
+        .push(Turn::Tool(ToolTurn {
+            assistant: AssistantMsg::text(""),
+            calls: vec![(
+                call.clone(),
+                ToolResult {
+                    call_id: "call-fp".into(),
+                    ok: false,
+                    content: format!("awaiting-approval:{job}"),
+                },
+            )],
+        }));
+    engine
+        .snapshot
+        .pending_approvals
+        .push(crate::snapshot::PendingApproval {
+            job_id: job.clone(),
+            call,
+            prompt: "approve fp_probe".into(),
+            path: None,
+            fingerprint: Some(stored),
+        });
+    // The parked job must be awaited or the completion is fenced (rewind/epoch guard).
+    engine.snapshot.waiting_for.push(job.clone());
+    engine.apply_completions(vec![Completion {
+        job_id: job,
+        payload: b"allow".to_vec(),
+    }]);
+    engine
+        .resolve_approvals(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await;
+    (engine, ran)
+}
+
+/// The content spliced into the `fp_probe` result slot after resolution.
+fn spliced_result(engine: &Engine) -> (bool, String) {
+    for turn in &engine.snapshot.conversation.turns {
+        if let crate::conversation::Turn::Tool(tt) = turn {
+            for (_c, r) in &tt.calls {
+                if r.call_id == "call-fp" {
+                    return (r.ok, r.content.clone());
+                }
+            }
+        }
+    }
+    panic!("no fp_probe result slot found");
+}
+
+/// THE Cluster B TOCTOU gate: an operator-approved command whose resolved-at-exec fingerprint no
+/// longer matches what was approved is REFUSED — the tool never runs, and a refusal is spliced in.
+#[tokio::test]
+async fn approved_command_refused_when_fingerprint_changed() {
+    let stored = crate::exec::CommandFingerprint::compute(
+        "exec.argv",
+        std::path::Path::new("/usr/bin/approved"),
+        &[],
+        &[],
+        std::path::Path::new("/ws"),
+    );
+    // At re-run the command resolves to a DIFFERENT absolute binary (the approve-then-swap).
+    let resolved = crate::exec::CommandFingerprint::compute(
+        "exec.argv",
+        std::path::Path::new("/tmp/evil"),
+        &[],
+        &[],
+        std::path::Path::new("/ws"),
+    );
+    let (engine, ran) = drive_approval_resolution(stored, resolved).await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a fingerprint mismatch must NOT run the tool"
+    );
+    let (ok, content) = spliced_result(&engine);
+    assert!(!ok, "a refused approval is not ok");
+    assert!(
+        content.contains("refused") && !content.contains("RAN"),
+        "refusal spliced, command not run: {content}"
+    );
+}
+
+/// The matching case: when the resolved-at-exec fingerprint equals what was approved, the command
+/// runs as before (proves the gate does not refuse legitimate re-runs).
+#[tokio::test]
+async fn approved_command_runs_when_fingerprint_matches() {
+    let fp = crate::exec::CommandFingerprint::compute(
+        "exec.argv",
+        std::path::Path::new("/usr/bin/approved"),
+        &[],
+        &[],
+        std::path::Path::new("/ws"),
+    );
+    let (engine, ran) = drive_approval_resolution(fp.clone(), fp).await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "a matching fingerprint runs the approved command exactly once"
+    );
+    let (ok, content) = spliced_result(&engine);
+    assert!(ok, "the matched command's result is spliced in");
+    assert!(
+        content.contains("fp_probe RAN"),
+        "command output: {content}"
+    );
+}

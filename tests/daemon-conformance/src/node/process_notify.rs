@@ -101,6 +101,7 @@ async fn injected_input_reaches_a_parked_durable_session_via_the_store_seam() {
         },
         prompt: "approve write to gated.txt".into(),
         path: Some("gated.txt".into()),
+        fingerprint: None,
     }];
     store
         .create_session(
