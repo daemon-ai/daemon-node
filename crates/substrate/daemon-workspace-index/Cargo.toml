@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-workspace-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The embedding port (`EmbeddingProvider`, `cosine`) — shared with Mnemosyne recall.
+daemon-core = { workspace = true }
+# Binary-file detection reused from the fs tool (`has_binary_extension`, `looks_binary`).
+daemon-tool-fs = { workspace = true }
+# The gitignore-respecting, deterministic workspace walker.
+ignore = { workspace = true }
+# Content hashing for the mtime+size-gated reconcile sweep.
+sha2 = { workspace = true }
+# The embedding index store (its own DB, separate from daemon-store). `bundled` matches
+# daemon-store's pin so libsqlite3-sys is compiled once (no second amalgamation).
+rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite_migration = { workspace = true }
+# Background indexer task + query offload (spawn_blocking) + cooperative shutdown.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Isolated on-disk workspace fixtures for the indexer tests.
+tempfile = "3"
+
+[lints]
+workspace = true

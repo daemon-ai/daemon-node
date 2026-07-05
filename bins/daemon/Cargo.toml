@@ -59,6 +59,10 @@ daemon-tool-clarify = { workspace = true }
 daemon-tool-execute-code = { workspace = true }
 # Long-term conversation recall (`session_search`) over the node's session archive.
 daemon-tool-session-search = { workspace = true }
+# Embedding-based workspace search (`semantic_search`) + its backing index (Cursor SemanticSearch
+# parity); opt-in at runtime via `[workspace_index].enable` + a configured embedder.
+daemon-workspace-index = { workspace = true }
+daemon-tool-semantic-search = { workspace = true }
 # The skills subsystem: the store/index (`daemon-skills`) + the `skill_*` tools (`daemon-tool-skill`).
 daemon-skills = { workspace = true }
 daemon-tool-skill = { workspace = true }
@@ -85,6 +89,8 @@ daemon-supervision = { workspace = true }
 daemon-telemetry = { workspace = true }
 daemon-transport = { workspace = true }
 tokio = { workspace = true }
+# The workspace-index background task's cooperative-shutdown token.
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

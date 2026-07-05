@@ -31,6 +31,7 @@ mod process_notify;
 mod profiles_skills;
 mod provider_discovery;
 mod routing_auth;
+mod semantic_search;
 mod session_recall;
 mod sessions;
 mod tools_hitl;
