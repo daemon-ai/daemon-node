@@ -159,6 +159,9 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::SessionSearch { query, limit } => {
             ApiResponse::SessionSearch(api.session_search(query, limit).await)
         }
+        ApiRequest::SessionRecap { session } => {
+            ApiResponse::SessionRecap(api.session_recap(session).await)
+        }
         ApiRequest::SessionUpdateMeta { session, patch } => {
             unit_or_err(api.session_update_meta(session, patch).await)
         }

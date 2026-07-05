@@ -23,6 +23,24 @@ fn api_origin() -> Origin {
     }
 }
 
+/// The floor of the host-internal [`ReqId`] range: snapshot requests the host issues for its own
+/// bookkeeping (post-turn FTS indexing / title generation, `live_conv_view`) allocate ids above
+/// this, and the event pump swallows their [`AgentEvent::Snapshot`] replies so they never surface
+/// on the client drain/log. Client request ids live far below (they are small counters).
+const INTERNAL_REQ_BASE: u64 = 1 << 62;
+
+/// Allocate the next host-internal [`ReqId`] (monotonic above [`INTERNAL_REQ_BASE`]).
+fn next_internal_req() -> ReqId {
+    static NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(INTERNAL_REQ_BASE);
+    ReqId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether an event is the reply to a host-internal snapshot request (see [`INTERNAL_REQ_BASE`]).
+fn is_internal_snapshot(ev: &AgentEvent) -> bool {
+    matches!(ev, AgentEvent::Snapshot { request_id, .. } if request_id.0 >= INTERNAL_REQ_BASE)
+}
+
 // ---------------------------------------------------------------------------
 // Live interactive sessions (the §17 actor, exposed via the poll/drain model)
 // ---------------------------------------------------------------------------
@@ -378,6 +396,17 @@ impl LiveHandle {
         }
     }
 
+    /// Request a read-only snapshot; the reply rides the event stream as [`AgentEvent::Snapshot`]
+    /// with the echoed `request_id` (served immediately when idle, or at the next phase boundary).
+    async fn request_snapshot(&self, request_id: ReqId) {
+        match self {
+            LiveHandle::Core(handle) => handle.snapshot(request_id).await,
+            LiveHandle::Foreign(session) => {
+                session.submit(AgentCommand::Snapshot { request_id }).await;
+            }
+        }
+    }
+
     /// Whether this backend is a foreign engine (no in-process actor, not rewindable).
     fn is_foreign(&self) -> bool {
         matches!(self, LiveHandle::Foreign(_))
@@ -429,6 +458,13 @@ pub(crate) struct LiveSessions {
     /// `note_activity`/`ensure`, `ApprovalPending` in the live `ParkingHandler`) push onto it. `None`
     /// until `set_node_events` wires it (a node assembled without a feed leaves it unset).
     node_events: Mutex<Option<Arc<NodeEventFeed>>>,
+    /// The auxiliary provider for background session-title generation, when configured: the live
+    /// event pump fires one best-effort `generate_title` call after a session's first exchange and
+    /// persists the result over the truncation-seeded roster title. `None` keeps seeds only.
+    title_aux: Mutex<Option<Arc<dyn Provider>>>,
+    /// Sessions this residency already attempted title generation for (once-per-residency guard, so
+    /// a failed aux call is not retried on every subsequent turn).
+    titled: Arc<DashMap<SessionId, ()>>,
 }
 
 impl LiveSessions {
@@ -447,7 +483,14 @@ impl LiveSessions {
             modes,
             sinks: Arc::new(DashMap::new()),
             node_events: Mutex::new(None),
+            title_aux: Mutex::new(None),
+            titled: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Wire the auxiliary provider for background session-title generation.
+    pub(crate) fn set_title_aux(&self, aux: Arc<dyn Provider>) {
+        *self.title_aux.lock().unwrap() = Some(aux);
     }
 
     /// Wire the node-wide event feed so the emit hooks reach a real ring.
@@ -492,6 +535,35 @@ impl LiveSessions {
     /// sessions have no model provider to swap and are not rewindable.
     pub(crate) fn resident_is_foreign(&self, session: &SessionId) -> Option<bool> {
         self.sessions.get(session).map(|s| s.handle.is_foreign())
+    }
+
+    /// A resident session's read-only conversation view, obtained by round-tripping an internal
+    /// [`AgentCommand::Snapshot`] through the actor: subscribe first, request with a host-internal
+    /// [`ReqId`] (the pump swallows the reply from client surfaces), and await the echoed
+    /// [`AgentEvent::Snapshot`] under a short deadline. `None` when the session is not resident or
+    /// no reply arrives in time (e.g. a long-running mid-turn model call — snapshots are served at
+    /// phase boundaries).
+    pub(crate) async fn conv_view(&self, session: &SessionId) -> Option<ConvView> {
+        let handle = self.sessions.get(session).map(|s| s.handle.clone())?;
+        // Subscribe BEFORE requesting so the reply cannot be missed.
+        let mut rx = handle.subscribe();
+        let req = next_internal_req();
+        handle.request_snapshot(req).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+            loop {
+                match rx.recv().await {
+                    Ok(AgentEvent::Snapshot {
+                        request_id, view, ..
+                    }) if request_id == req => return Some(view),
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Spawn (or reuse) the backend for `session`, returning its handle. The `profile` selects
@@ -594,10 +666,46 @@ impl LiveSessions {
         // a target, so handover (a demoted `Primary`) silently stops one sink and starts the next.
         let pump_delivery = delivery.clone();
         let pump_sinks = self.sinks.clone();
+        // Clones for the turn-boundary bookkeeping (FTS indexing + title generation): on every
+        // `TurnFinished` the pump requests an internal snapshot from the actor; the reply's
+        // `ConvView` feeds `index_session_text` (the live half of the `session_search` surface) and
+        // — once, after the first exchange — the background title generator.
+        let pump_handle = handle.clone();
+        let pump_store = self.store.clone();
+        let pump_feed = self.node_feed();
+        let pump_aux = self.title_aux.lock().unwrap().clone();
+        let pump_titled = self.titled.clone();
+        let pump_session = session.clone();
         let pump = tokio::spawn(async move {
+            // The internal snapshot request this pump is awaiting a reply to, if any (the latest
+            // `TurnFinished` wins; a stale reply is still fresher than nothing and is used as-is).
+            let mut pending_index: Option<ReqId> = None;
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
+                        // Host-internal snapshot replies never reach clients: when it answers OUR
+                        // pending request, run the index/title bookkeeping off-path; either way
+                        // swallow it (a `live_conv_view` caller awaits it on its own subscription).
+                        if is_internal_snapshot(&ev) {
+                            if let AgentEvent::Snapshot {
+                                request_id, view, ..
+                            } = ev
+                            {
+                                if pending_index == Some(request_id) {
+                                    pending_index = None;
+                                    tokio::spawn(index_and_title_session(
+                                        pump_store.clone(),
+                                        pump_session.clone(),
+                                        view,
+                                        pump_aux.clone(),
+                                        pump_titled.clone(),
+                                        pump_feed.clone(),
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+                        let turn_finished = matches!(ev, AgentEvent::TurnFinished { .. });
                         // Stamp + record on the merged log, capturing the freshly-stamped entry so the
                         // push path delivers exactly what subscribers see (one seq, one shape).
                         let entry = pump_log.lock().unwrap().append(
@@ -632,6 +740,13 @@ impl LiveSessions {
                                 let sink = sink.clone();
                                 sink.deliver(target, entry.clone()).await;
                             }
+                        }
+                        // Turn boundary: ask the (now idle) actor for a consistent conversation
+                        // view; the internal reply above indexes it + maybe generates a title.
+                        if turn_finished {
+                            let req = next_internal_req();
+                            pending_index = Some(req);
+                            pump_handle.request_snapshot(req).await;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1279,6 +1394,106 @@ pub(crate) async fn apply_rewind_side_effects(fx: RewindSideEffects<'_>) {
     }
 }
 
+impl NodeApiImpl {
+    /// A resident live session's read-only conversation view (`None` when the session is not
+    /// resident on the live surface or the actor does not reply in time). The seam the
+    /// `session_search` agent tool's archive uses to read a live session's turns, and the recap
+    /// op's live fallback.
+    pub async fn live_conv_view(&self, session: &SessionId) -> Option<ConvView> {
+        self.live.conv_view(session).await
+    }
+}
+
+/// Whether a session's roster title is still replaceable by the background generator: unset, or
+/// exactly the truncation seed of the conversation's opening user text. A user rename or an earlier
+/// generated title differs from the seed and is never clobbered.
+fn title_replaceable(meta: &SessionMeta, first_user: &str) -> bool {
+    match &meta.title {
+        None => true,
+        Some(current) => seed_title(Some(first_user)).as_deref() == Some(current.as_str()),
+    }
+}
+
+/// The turn-boundary bookkeeping task the live event pump spawns with a fresh [`ConvView`]:
+///
+/// 1. **Index**: coalesce the conversation (user + assistant text + tool names) and replace the
+///    session's FTS row — the live half of the `session_search` surface (the durable incarnation
+///    indexes the managed path). Best-effort; the store swallows write errors.
+/// 2. **Title** (hermes `maybe_auto_title` parity): once per residency, after the first exchange
+///    (≤ 2 user turns), while the roster title is still unset/seeded — fire the auxiliary
+///    `generate_title` call and persist the cleaned result, then emit `SessionMetaChanged` so
+///    roster subscribers refresh, and refresh the FTS row's title column.
+///
+/// Runs entirely off the turn path; every failure leaves the seed/index as they were.
+async fn index_and_title_session(
+    store: Arc<dyn SessionStore>,
+    session: SessionId,
+    view: ConvView,
+    aux: Option<Arc<dyn Provider>>,
+    titled: Arc<DashMap<SessionId, ()>>,
+    feed: Option<Arc<NodeEventFeed>>,
+) {
+    use crate::session_index::{coalesce_body, turns_from_view, IndexRole};
+
+    let turns = turns_from_view(&view);
+    let body = coalesce_body(&turns);
+    let meta = store.session_meta(&session).await.unwrap_or_default();
+    if !body.trim().is_empty() {
+        store
+            .index_session_text(&session, meta.title.clone(), &body)
+            .await;
+    }
+
+    // Title generation: gated exactly like hermes — first exchange only (≤ 2 user turns), both
+    // sides present, title still replaceable — plus a once-per-residency guard so a failed aux
+    // call is not retried every turn.
+    let Some(aux) = aux else { return };
+    let user_turns = turns.iter().filter(|t| t.role == IndexRole::User).count();
+    if user_turns == 0 || user_turns > 2 {
+        return;
+    }
+    let first_user = turns
+        .iter()
+        .find(|t| t.role == IndexRole::User && !t.text.trim().is_empty())
+        .map(|t| t.text.clone());
+    let first_reply = turns
+        .iter()
+        .find(|t| t.role == IndexRole::Assistant && !t.text.trim().is_empty())
+        .map(|t| t.text.clone());
+    let (Some(first_user), Some(first_reply)) = (first_user, first_reply) else {
+        return;
+    };
+    if !title_replaceable(&meta, &first_user) {
+        return;
+    }
+    if titled.insert(session.clone(), ()).is_some() {
+        return;
+    }
+    let Some(title) =
+        crate::title_gen::generate_title(aux.as_ref(), &first_user, &first_reply).await
+    else {
+        return;
+    };
+    // Re-read before writing: a rename may have landed while the aux call ran — never clobber it.
+    let mut fresh = store.session_meta(&session).await.unwrap_or_default();
+    if !title_replaceable(&fresh, &first_user) {
+        return;
+    }
+    fresh.title = Some(title.clone());
+    if store.set_session_meta(&session, fresh).await.is_err() {
+        return;
+    }
+    // Refresh the FTS row so a search by the generated title's words hits immediately (the body is
+    // this turn's; a concurrently-finished turn re-replaces it at its own boundary).
+    if !body.trim().is_empty() {
+        store.index_session_text(&session, Some(title), &body).await;
+    }
+    if let Some(feed) = &feed {
+        let rev = feed.note_roster_change(&session);
+        feed.emit(NodeEvent::SessionMetaChanged { session, rev });
+    }
+}
+
 /// The session sub-surface's host handler: park each blocking §17 request into the drain queue and
 /// a pending table, await its `respond`. Events and parked requests thus ride one ordered queue
 /// (daemon-ffi-spec §3.3).
@@ -1497,5 +1712,29 @@ mod node_feed_tests {
             live.events.as_slice(),
             [NodeEvent::ApprovalPending { .. }]
         ));
+    }
+
+    /// The background title generator replaces only an unset or still-seeded title: a user rename
+    /// (or an earlier generated title) never gets clobbered.
+    #[test]
+    pub(crate) fn title_replaceable_guards_renames() {
+        let first_user = "please help me with docker networking setup on this host over there";
+        let unset = SessionMeta::default();
+        assert!(title_replaceable(&unset, first_user));
+        let seeded = SessionMeta {
+            title: seed_title(Some(first_user)),
+            ..SessionMeta::default()
+        };
+        assert!(title_replaceable(&seeded, first_user));
+        let renamed = SessionMeta {
+            title: Some("my own name".into()),
+            ..SessionMeta::default()
+        };
+        assert!(!title_replaceable(&renamed, first_user));
+        let generated = SessionMeta {
+            title: Some("Docker Networking Help".into()),
+            ..SessionMeta::default()
+        };
+        assert!(!title_replaceable(&generated, first_user));
     }
 }

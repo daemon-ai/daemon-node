@@ -62,6 +62,7 @@ fn assemble_versioning(
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        title_aux: None,
     });
     (node, handle, skills)
 }

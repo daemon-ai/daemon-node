@@ -588,6 +588,29 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             removed: Vec::new(),
         }),
     )?;
+    // W6: the pure-local session recap op (request + a populated response), so verify-codec proves
+    // the generated C decoder takes the new shapes end-to-end.
+    write_cbor(
+        &out,
+        "request-session-recap.cbor",
+        &ApiRequest::SessionRecap {
+            session: SessionId::new("fixture-session"),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-session-recap.cbor",
+        &ApiResponse::SessionRecap(Some(daemon_api::SessionRecap {
+            title: Some("Docker Networking Help".into()),
+            user_turns: 3,
+            assistant_turns: 4,
+            tool_results: 2,
+            top_tools: vec![("fs".into(), 2), ("web_search".into(), 1)],
+            files_touched: vec!["src/lib.rs".into()],
+            last_ask: Some("why does the bridge drop packets".into()),
+            last_reply: Some("the MTU mismatch was the culprit".into()),
+        })),
+    )?;
     write_cbor(
         &out,
         "response-log-page.cbor",

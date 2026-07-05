@@ -1186,6 +1186,43 @@ impl SessionStore for SqliteStore {
         .flatten()
     }
 
+    async fn session_meta_list(&self) -> Vec<(SessionId, SessionMeta)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT session_id, bound_profile, overlay, title, last_activity_ms, role, parent, \
+             pinned, archived, scheduled_job, activation_epoch, owner FROM session_meta",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            let id = SessionId::new(row.get::<_, String>(0)?);
+            let bound: Option<String> = row.get(1)?;
+            let role: Option<String> = row.get(5)?;
+            let parent: Option<String> = row.get(6)?;
+            Ok((
+                id,
+                SessionMeta {
+                    bound_profile: bound.map(ProfileRef::new),
+                    overlay: row.get::<_, Vec<u8>>(2)?,
+                    title: row.get::<_, Option<String>>(3)?,
+                    last_activity_ms: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    role: role.as_deref().and_then(role_from_str),
+                    parent: parent.map(SessionId::new),
+                    pinned: row.get::<_, i64>(7)? != 0,
+                    archived: row.get::<_, i64>(8)? != 0,
+                    scheduled_job: row.get::<_, Option<String>>(9)?.map(JobId::from),
+                    activation_epoch: row.get::<_, i64>(10)? as u64,
+                    owner: row.get::<_, Option<String>>(11)?,
+                },
+            ))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     async fn routing_list(&self) -> Vec<ChatRoute> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn

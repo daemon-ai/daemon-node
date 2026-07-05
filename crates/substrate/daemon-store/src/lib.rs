@@ -828,6 +828,13 @@ pub trait SessionStore: Send + Sync {
         None
     }
 
+    /// List every session's host-level [`SessionMeta`] row (unordered) — the enumeration behind the
+    /// recent-sessions browse of the `session_search` agent tool, which covers live-only sessions a
+    /// `session_record`-based listing would miss. Default: empty (a non-authoritative proxy store).
+    async fn session_meta_list(&self) -> Vec<(SessionId, SessionMeta)> {
+        Vec::new()
+    }
+
     /// List every durable chat→session routing pin (§5.9). The host loads these into the live routing
     /// registry's resolve-first pin map (via the hot-reload rebuild hook). Default: none (a store
     /// without durable routing — pins are then in-memory only for the process lifetime).
@@ -1549,6 +1556,16 @@ impl SessionStore for InMemoryStore {
         self.inner.lock().unwrap().session_meta.get(id).cloned()
     }
 
+    async fn session_meta_list(&self) -> Vec<(SessionId, SessionMeta)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .session_meta
+            .iter()
+            .map(|(id, meta)| (id.clone(), meta.clone()))
+            .collect()
+    }
+
     async fn routing_list(&self) -> Vec<ChatRoute> {
         self.inner
             .lock()
@@ -2118,6 +2135,38 @@ mod session_meta_tests {
         };
         store.set_session_meta(&id, updated.clone()).await.unwrap();
         assert_eq!(store.session_meta(&id).await.unwrap(), updated);
+    }
+
+    /// `session_meta_list` enumerates every recorded meta row with full field fidelity — the
+    /// browse surface behind the `session_search` tool (covers live-only sessions that have no
+    /// `session_record`). Proven against both backends.
+    async fn meta_list_behaviour(store: &dyn SessionStore) {
+        assert!(store.session_meta_list().await.is_empty());
+        store
+            .set_session_meta(&SessionId::new("m1"), sample())
+            .await
+            .unwrap();
+        store
+            .set_session_meta(&SessionId::new("m2"), SessionMeta::default())
+            .await
+            .unwrap();
+        let mut rows = store.session_meta_list().await;
+        rows.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, SessionId::new("m1"));
+        assert_eq!(rows[0].1, sample());
+        assert_eq!(rows[1].1, SessionMeta::default());
+    }
+
+    #[tokio::test]
+    async fn in_memory_meta_list_round_trips() {
+        meta_list_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_meta_list_round_trips() {
+        meta_list_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
 
     fn sample_job(id: &str, next_fire: Option<u64>) -> StoredCronJob {

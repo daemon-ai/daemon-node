@@ -272,6 +272,21 @@ session-detail = {
 
 session-search-hit = { "session": session-id, "title": tstr, "snippet": tstr }
 
+; A pure-local recap of a session's recent activity (SessionRecap; no LLM call): total scope
+; counts over the whole conversation, plus top tools / recent files / last ask+reply from the
+; recent-activity window (the node caps both lists at 5; wire-unbounded so the schema stays a
+; superset of every producer).
+session-recap = {
+  "title": (tstr / null),
+  "user_turns": uint,
+  "assistant_turns": uint,
+  "tool_results": uint,
+  "top_tools": [* [name: tstr, count: uint]],
+  "files_touched": [* tstr],
+  "last_ask": (tstr / null),
+  "last_reply": (tstr / null),
+}
+
 ; A recorded §12 tool checkpoint (rewind point). `turn_ordinal`/`cursor` correlate a workspace
 ; checkpoint with the conversation rewind anchor / merged-log position when the ledger carries them.
 checkpoint-info = {
@@ -1066,6 +1081,7 @@ request-checkpoint-rewind = { "CheckpointRewind": { "session": session-id, "chec
 request-sessions-query = { "SessionsQuery": { "query": session-query } }
 request-session-get = { "SessionGet": { "session": session-id } }
 request-session-search = { "SessionSearch": { "query": tstr, "limit": uint } }
+request-session-recap = { "SessionRecap": { "session": session-id } }
 request-session-update-meta = { "SessionUpdateMeta": { "session": session-id, "patch": session-meta-patch } }
 request-rewind = { "Rewind": { "session": session-id, "point": rewind-point } }
 request-acp-discover = "AcpDiscover"
@@ -1239,6 +1255,7 @@ api-request = request-submit
             / request-sessions-query
             / request-session-get
             / request-session-search
+            / request-session-recap
             / request-session-update-meta
             / request-rewind
             / request-acp-discover
@@ -1376,6 +1393,7 @@ response-checkpoints = { "Checkpoints": checkpoint-page }
 response-session-page = { "SessionPage": session-page }
 response-session-detail = { "SessionDetail": (session-detail / null) }
 response-session-search = { "SessionSearch": [* session-search-hit] }
+response-session-recap = { "SessionRecap": (session-recap / null) }
 response-acp-catalog = { "AcpCatalog": [* acp-agent-entry] }
 response-providers = { "Providers": [* provider-info] }
 response-tools = { "Tools": [* tool-info] }
@@ -1466,6 +1484,7 @@ api-response = response-ok
              / response-session-page
              / response-session-detail
              / response-session-search
+             / response-session-recap
              / response-acp-catalog
              / response-providers
              / response-tools

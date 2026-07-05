@@ -77,6 +77,7 @@ fn assemble_acp_node() -> (
         auth_factories: vec![],
         workspace_root: None,
         blob_root: None,
+        title_aux: None,
     });
     (node, resolver_called, handle)
 }

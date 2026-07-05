@@ -549,6 +549,30 @@ impl Default for SkillsConfig {
     }
 }
 
+/// Tuning for the session search/title surfaces. `[sessions]` / `DAEMON_SESSIONS__*`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Re-index every durable session's conversation into the full-text `session_search` surface
+    /// at boot (best-effort, background). Covers sessions recorded before FTS indexing existed —
+    /// and refreshes stale rows — at the cost of decoding each snapshot once per boot.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub backfill_index: bool,
+    /// Auto-generate a session title from the first exchange via the auxiliary provider (replacing
+    /// the truncation-seeded roster title). Requires a configured model provider; off leaves seeds.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub title_generation: bool,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            backfill_index: true,
+            title_generation: true,
+        }
+    }
+}
+
 /// Tuning for the embeddings backend. `[embed]` / `DAEMON_EMBED__*`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -1009,6 +1033,8 @@ pub struct NodeConfig {
     pub browser: BrowserConfig,
     /// Skills-subsystem tuning (`enable = true` by default).
     pub skills: SkillsConfig,
+    /// Session search/title tuning (`[sessions]`): boot-time FTS backfill + title generation.
+    pub sessions: SessionsConfig,
     /// LCM context-engine tuning (injected into the context-engine template).
     pub lcm: LcmOpts,
     /// Mnemosyne recall + multi-agent identity knobs (injected into the memory provider template).
@@ -1063,6 +1089,7 @@ impl Default for NodeConfig {
             web: WebConfig::default(),
             browser: BrowserConfig::default(),
             skills: SkillsConfig::default(),
+            sessions: SessionsConfig::default(),
             lcm: LcmOpts::default(),
             mnemosyne: MnemosyneOpts::default(),
             credential_key: String::new(),

@@ -153,6 +153,11 @@ pub struct NodeAssembly {
     /// `fs_read` attaches a `BlobRef` to untruncated reads. `None` leaves the content surface
     /// unbound (the ops resolve to `ApiError::Unsupported`).
     pub blob_root: Option<PathBuf>,
+    /// The auxiliary provider for background session-title generation (resolved by the binary the
+    /// same way as the LCM/Mnemosyne aux providers): after a live session's first exchange, one
+    /// best-effort `task = "title_generation"` call replaces the truncation-seeded roster title.
+    /// `None` keeps seeded titles only (tests / nodes without an aux provider).
+    pub title_aux: Option<Arc<dyn daemon_core::Provider>>,
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.

@@ -2075,6 +2075,7 @@ dependencies = [
  "daemon-tool-browser",
  "daemon-tool-clarify",
  "daemon-tool-metta",
+ "daemon-tool-session-search",
  "daemon-tool-skill",
  "daemon-tool-todo",
  "daemon-tool-web",
@@ -2830,6 +2831,20 @@ dependencies = [
  "daemon-orchestration",
  "daemon-protocol",
  "serde_json",
+]
+
+[[package]]
+name = "daemon-tool-session-search"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
