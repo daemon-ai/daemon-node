@@ -133,7 +133,11 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             session,
             request_id,
             allow,
-        } => unit_or_err(api.approval_decide(session, request_id, allow).await),
+            allow_permanent,
+        } => unit_or_err(
+            api.approval_decide(session, request_id, allow, allow_permanent)
+                .await,
+        ),
         ApiRequest::CheckpointList { session, after } => {
             ApiResponse::Checkpoints(api.checkpoints(session, after).await)
         }

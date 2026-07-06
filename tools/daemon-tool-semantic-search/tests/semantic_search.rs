@@ -83,6 +83,7 @@ async fn run_tool(index: Arc<WorkspaceIndex>, cwd: &Path, args: &str) -> (bool, 
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),

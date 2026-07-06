@@ -531,13 +531,17 @@ pub trait ControlApi: Send + Sync {
 
     /// Answer a parked §12 edit-approval request: record the operator's decision and wake the dormant
     /// session so it resumes (allow -> the gated tool runs; deny -> the tool returns an error). The
-    /// `request_id` is the opaque id from [`Self::approvals_pending`]. Idempotent (a redelivered
-    /// decision is a no-op). Default: unsupported (a transport with no durable approval store).
+    /// `request_id` is the opaque id from [`Self::approvals_pending`]. `allow_permanent` (Cluster B)
+    /// additionally remembers the approved command's fingerprint on the session allow-list when the
+    /// parked approval carries one (so an identical in-session re-request auto-approves); it degrades
+    /// to a single allow otherwise. Idempotent (a redelivered decision is a no-op). Default:
+    /// unsupported (a transport with no durable approval store).
     async fn approval_decide(
         &self,
         _session: SessionId,
         _request_id: String,
         _allow: bool,
+        _allow_permanent: bool,
     ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("approval_decide".into()))
     }

@@ -11,7 +11,7 @@
 use crate::approval::{ApprovalPolicy, Decision};
 use crate::conversation::{ToolCall, Turn};
 use crate::events::EventSink;
-use crate::exec::ExecutionEnvironment;
+use crate::exec::{CommandFingerprint, ExecutionEnvironment};
 use daemon_common::ReqId;
 use daemon_common::{Budget, JobId, ProfileRef, SessionId};
 use daemon_protocol::{
@@ -58,6 +58,14 @@ pub struct TurnCx<'a> {
     /// [`Tool::call_timeout`](crate::tools::Tool::call_timeout), which returns the effective per-call
     /// timeout (or `None` to opt out).
     pub tool_timeout: Option<Duration>,
+    /// The per-session "allow permanently" allow-list (Cluster B / `allow_permanent`): command
+    /// fingerprints the operator approved permanently this session. A read-only view seeded from the
+    /// durable [`Snapshot`](crate::snapshot::Snapshot) each round; [`ask_host`] short-circuits the gate
+    /// (auto-approves without contacting the host) when a gated command's fingerprint is a member.
+    /// Empty (`&[]`) = feature-off / fail-safe (never short-circuits). The *write* side (remembering a
+    /// new fingerprint) never happens through this borrow — it flows through the single-owner effect
+    /// applier ([`Effect::RememberApproval`]) so the snapshot stays the sole source of truth.
+    pub session_allow: &'a [CommandFingerprint],
 }
 
 impl<'a> TurnCx<'a> {
@@ -79,6 +87,7 @@ impl<'a> TurnCx<'a> {
             pre_approved: self.pre_approved,
             checkpoints: self.checkpoints,
             tool_timeout: self.tool_timeout,
+            session_allow: self.session_allow,
         };
         (cx, token)
     }
@@ -125,13 +134,24 @@ pub enum Effect {
         /// The fs edit's target path (sensitive-path carve-out + display), if any.
         path: Option<String>,
     },
+    /// Remember a command's [`CommandFingerprint`] on the session's `allow_permanent` allow-list
+    /// (Cluster B / inline path): the operator answered an inline approval with "Allow permanently",
+    /// so the single-owner applier records the fingerprint on the durable
+    /// [`Snapshot`](crate::snapshot::Snapshot) and every later gate for that exact resolved command
+    /// auto-approves for the rest of the session. Least-privilege: only the one approved fingerprint
+    /// is trusted, never a blanket approval-mode change. The durable (`ApprovalDecide`) path records
+    /// the fingerprint directly in `resolve_approvals`, so it does not emit this effect.
+    RememberApproval(CommandFingerprint),
 }
 
 /// The verdict of an edit-approval gate (§12) for a gated tool action — what a tool should do after
 /// consulting [`approve_path`] / [`approve_command`].
 pub enum Gate {
-    /// Perform the side effect.
-    Proceed,
+    /// Perform the side effect. `permanent` is set when the operator answered an inline approval with
+    /// "Allow permanently" AND the node offered it (a fingerprint exists to key on): the tool then
+    /// emits an [`Effect::RememberApproval`] so the exact command auto-approves for the rest of the
+    /// session. Always `false` on the auto-allow / policy fast paths and for non-command gates.
+    Proceed { permanent: bool },
     /// Reject without acting; the tool returns this reason as a failed result.
     Reject(String),
     /// The host parked the decision durably (headless HITL): the tool must NOT act and instead
@@ -147,24 +167,33 @@ pub enum Gate {
 /// A `pre_approved` re-run (operator already said yes) always proceeds.
 pub async fn approve_path(cx: &TurnCx<'_>, path: &str, prompt: String) -> Gate {
     if cx.pre_approved {
-        return Gate::Proceed;
+        return Gate::Proceed { permanent: false };
     }
     match cx.approval_policy.decide_edit(path) {
-        Decision::Allow => Gate::Proceed,
+        Decision::Allow => Gate::Proceed { permanent: false },
         Decision::Deny => Gate::Reject("denied by approval policy".to_string()),
-        Decision::Ask => ask_host(cx, prompt).await,
+        // An fs edit has no resolved-command fingerprint to key a permanent allow on, so it never
+        // offers permanence (`None`) — a durable allow-permanent on an edit degrades to a single allow.
+        Decision::Ask => ask_host(cx, prompt, None).await,
     }
 }
 
-/// Run the §12 approval gate for a non-path action (e.g. a dangerous shell command).
-pub async fn approve_command(cx: &TurnCx<'_>, prompt: String) -> Gate {
+/// Run the §12 approval gate for a non-path action (e.g. a dangerous shell command). `fingerprint` is
+/// the resolved-command [`CommandFingerprint`] when the caller can key a per-session permanent allow on
+/// it (a command surface) — the shell tool passes `Some`; callers without a fingerprint pass `None`
+/// (no "allow permanently" offer; a permanent decision degrades to a single allow).
+pub async fn approve_command(
+    cx: &TurnCx<'_>,
+    prompt: String,
+    fingerprint: Option<&CommandFingerprint>,
+) -> Gate {
     if cx.pre_approved {
-        return Gate::Proceed;
+        return Gate::Proceed { permanent: false };
     }
     match cx.approval_policy.decide_command() {
-        Decision::Allow => Gate::Proceed,
+        Decision::Allow => Gate::Proceed { permanent: false },
         Decision::Deny => Gate::Reject("denied by approval policy".to_string()),
-        Decision::Ask => ask_host(cx, prompt).await,
+        Decision::Ask => ask_host(cx, prompt, fingerprint).await,
     }
 }
 
@@ -174,31 +203,61 @@ pub async fn approve_command(cx: &TurnCx<'_>, prompt: String) -> Gate {
 /// / exfil vector in the OpenClaw CVE class, so it ALWAYS asks — it never rides the `AutoAllow` fast
 /// path that benign foreground argv may. Only a hard `Deny` policy denies outright, and a
 /// `pre_approved` re-run (operator already said yes) proceeds.
-pub async fn approve_shell_command(cx: &TurnCx<'_>, prompt: String) -> Gate {
+pub async fn approve_shell_command(
+    cx: &TurnCx<'_>,
+    prompt: String,
+    fingerprint: Option<&CommandFingerprint>,
+) -> Gate {
     if cx.pre_approved {
-        return Gate::Proceed;
+        return Gate::Proceed { permanent: false };
     }
     match cx.approval_policy {
         ApprovalPolicy::Deny => Gate::Reject("denied by approval policy".to_string()),
         // Ask / AcceptEdits / AutoAllow all ask for a raw shell string (no auto-allow).
-        _ => ask_host(cx, prompt).await,
+        _ => ask_host(cx, prompt, fingerprint).await,
     }
 }
 
 /// Raise a blocking [`HostRequestKind::Approval`] and map the host's reply onto a [`Gate`]: the live
 /// host answers inline ([`HostResponseBody::Approved`]); the headless/durable host parks it
 /// ([`HostResponseBody::Deferred`]).
-async fn ask_host(cx: &TurnCx<'_>, prompt: String) -> Gate {
+///
+/// Cluster B / `allow_permanent` (wired here per the plan, so it covers BOTH surfaces): when
+/// `fingerprint` is a member of the session's `allow_permanent` allow-list, the gate short-circuits to
+/// [`Gate::Proceed`] WITHOUT contacting the host — this is what auto-approves an identical in-session
+/// re-request and, on the durable path, avoids re-parking it (a park only happens if we ask). The
+/// `allow_permanent_offered` flag is set only where a `fingerprint` exists to key the allow-list on;
+/// a returned `permanent` is honored only if it was offered (defense in depth).
+async fn ask_host(
+    cx: &TurnCx<'_>,
+    prompt: String,
+    fingerprint: Option<&CommandFingerprint>,
+) -> Gate {
+    if let Some(fp) = fingerprint {
+        if cx.session_allow.contains(fp) {
+            return Gate::Proceed { permanent: false };
+        }
+    }
     let resp = cx
         .host
         .request(HostRequest {
             request_id: ReqId(0),
-            kind: HostRequestKind::Approval { prompt },
+            kind: HostRequestKind::Approval {
+                prompt,
+                allow_permanent_offered: fingerprint.is_some(),
+            },
         })
         .await;
     match resp.body {
-        HostResponseBody::Approved(true) => Gate::Proceed,
-        HostResponseBody::Approved(false) => Gate::Reject("denied by operator".to_string()),
+        HostResponseBody::Approved {
+            approved: true,
+            allow_permanent,
+        } => Gate::Proceed {
+            permanent: allow_permanent && fingerprint.is_some(),
+        },
+        HostResponseBody::Approved {
+            approved: false, ..
+        } => Gate::Reject("denied by operator".to_string()),
         HostResponseBody::Deferred(job_id) => Gate::Defer(job_id),
         _ => Gate::Reject("approval not granted".to_string()),
     }

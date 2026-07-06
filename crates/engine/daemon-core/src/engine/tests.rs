@@ -1284,6 +1284,18 @@ async fn drive_approval_resolution(
     stored: crate::exec::CommandFingerprint,
     resolved: crate::exec::CommandFingerprint,
 ) -> (Engine, Arc<AtomicU64>) {
+    drive_approval_resolution_payload(Some(stored), resolved, b"allow").await
+}
+
+/// As [`drive_approval_resolution`], but parametrized by the parked approval's stored fingerprint
+/// (`None` = a non-command approval / legacy row) and the operator completion `payload`
+/// (`allow` / `allow_permanent` / `deny`) — lets the `allow_permanent` tests drive the durable
+/// populate + fail-safe paths.
+async fn drive_approval_resolution_payload(
+    stored: Option<crate::exec::CommandFingerprint>,
+    resolved: crate::exec::CommandFingerprint,
+    payload: &[u8],
+) -> (Engine, Arc<AtomicU64>) {
     use crate::conversation::{AssistantMsg, ToolCall, ToolResult, ToolTurn, Turn};
 
     let ran = Arc::new(AtomicU64::new(0));
@@ -1324,13 +1336,13 @@ async fn drive_approval_resolution(
             call,
             prompt: "approve fp_probe".into(),
             path: None,
-            fingerprint: Some(stored),
+            fingerprint: stored,
         });
     // The parked job must be awaited or the completion is fenced (rewind/epoch guard).
     engine.snapshot.waiting_for.push(job.clone());
     engine.apply_completions(vec![Completion {
         job_id: job,
-        payload: b"allow".to_vec(),
+        payload: payload.to_vec(),
     }]);
     engine
         .resolve_approvals(&NoopHost, &EventSink::discarding(), &TurnControl::new())
@@ -1409,5 +1421,78 @@ async fn approved_command_runs_when_fingerprint_matches() {
     assert!(
         content.contains("fp_probe RAN"),
         "command output: {content}"
+    );
+}
+
+// --- Cluster B / allow_permanent: durable populate + fail-safe -----------------------------------
+
+fn fp_at(binary: &str) -> crate::exec::CommandFingerprint {
+    crate::exec::CommandFingerprint::compute(
+        "exec.argv",
+        std::path::Path::new(binary),
+        &[],
+        &[],
+        std::path::Path::new("/ws"),
+    )
+}
+
+/// Durable "allow permanently" (test #3/#5): a VERIFIED command answered with `allow_permanent` runs
+/// AND its fingerprint is remembered on the session allow-list, so an identical in-session re-request
+/// will short-circuit its gate.
+#[tokio::test]
+async fn durable_allow_permanent_remembers_verified_fingerprint() {
+    let fp = fp_at("/usr/bin/approved");
+    let (engine, ran) =
+        drive_approval_resolution_payload(Some(fp.clone()), fp.clone(), b"allow_permanent").await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "a verified permanent allow runs"
+    );
+    assert!(
+        engine.snapshot.session_allow_fingerprints.contains(&fp),
+        "a verified permanent allow records the command fingerprint on the session allow-list",
+    );
+}
+
+/// Fail-safe (test #4): `allow_permanent` on an approval with NO fingerprint (fs edit / execute_code /
+/// legacy row) degrades to a single allow — the command runs once but NOTHING is remembered, so it can
+/// never broaden into an auto-approve.
+#[tokio::test]
+async fn durable_allow_permanent_without_fingerprint_is_single_allow() {
+    let resolved = fp_at("/usr/bin/edit");
+    let (engine, ran) = drive_approval_resolution_payload(None, resolved, b"allow_permanent").await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "a no-fingerprint permanent allow still runs once (single allow)"
+    );
+    assert!(
+        engine.snapshot.session_allow_fingerprints.is_empty(),
+        "no fingerprint to key on ⇒ nothing is remembered (never broadens)",
+    );
+}
+
+/// Fail-safe (test): `allow_permanent` on a MISMATCH (the approve-then-swap TOCTOU) is refused by the
+/// Phase 2 gate — the command never runs and its fingerprint is NEVER remembered.
+#[tokio::test]
+async fn durable_allow_permanent_on_mismatch_remembers_nothing() {
+    let (engine, ran) = drive_approval_resolution_payload(
+        Some(fp_at("/usr/bin/approved")),
+        fp_at("/tmp/evil"),
+        b"allow_permanent",
+    )
+    .await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a fingerprint mismatch refuses the run"
+    );
+    assert!(
+        engine.snapshot.session_allow_fingerprints.is_empty(),
+        "a refused command is never remembered on the allow-list",
     );
 }

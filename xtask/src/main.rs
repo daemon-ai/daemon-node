@@ -308,6 +308,18 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             profile: Some(ProfileRef::new("default")),
         },
     )?;
+    // Cluster B / allow_permanent: a committed fixture exercising the additive optional field at v28,
+    // so the CDDL↔Rust agreement on `request-approval-decide` is proven on a real ciborium payload.
+    write_cbor(
+        &out,
+        "request-approval-decide.cbor",
+        &ApiRequest::ApprovalDecide {
+            session: SessionId::new("fixture-session"),
+            request_id: "fixture-request".into(),
+            allow: true,
+            allow_permanent: true,
+        },
+    )?;
     write_cbor(
         &out,
         "response-session-created.cbor",

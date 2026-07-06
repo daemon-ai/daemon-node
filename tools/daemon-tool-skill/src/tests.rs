@@ -17,7 +17,10 @@ impl HostRequestHandler for NoopHost {
     async fn request(&self, req: HostRequest) -> HostResponse {
         HostResponse {
             request_id: req.request_id,
-            body: HostResponseBody::Approved(true),
+            body: HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         }
     }
 }
@@ -40,6 +43,7 @@ async fn run(tool: &dyn Tool, args: &str) -> ToolOutcome {
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),

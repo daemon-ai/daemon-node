@@ -210,10 +210,11 @@ impl BrowserTool {
                     request_id: ReqId(0),
                     kind: HostRequestKind::Approval {
                         prompt: format!("approve browser navigation to {url}"),
+                        allow_permanent_offered: false,
                     },
                 })
                 .await;
-            let approved = matches!(resp.body, HostResponseBody::Approved(true));
+            let approved = matches!(resp.body, HostResponseBody::Approved { approved: true, .. });
             if !approved {
                 return ToolOutcome::text(
                     id.to_string(),

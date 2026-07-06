@@ -27,7 +27,10 @@ impl HostRequestHandler for NoopHost {
     async fn request(&self, req: HostRequest) -> HostResponse {
         HostResponse {
             request_id: req.request_id,
-            body: HostResponseBody::Approved(true),
+            body: HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         }
     }
 }

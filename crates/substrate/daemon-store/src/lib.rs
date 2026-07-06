@@ -843,7 +843,10 @@ pub trait SessionStore: Send + Sync {
 
     /// Record an operator's decision for a parked approval and wake the session in one transaction:
     /// stamp the parked row's `decision`, record a [`JobCompletion`] for its `job_id` (payload
-    /// `allow`/`deny`) so the rehydrated engine resolves the gated tool call, and publish a wake.
+    /// `allow`/`allow_permanent`/`deny`) so the rehydrated engine resolves the gated tool call, and
+    /// publish a wake. `allow_permanent` (Cluster B) carries the operator's "Allow permanently" choice
+    /// through to the engine via the completion payload (`allow_permanent`), where `resolve_approvals`
+    /// remembers the verified command fingerprint for the session; it is meaningful only when `allow`.
     /// Idempotent per `(session, epoch, job)` (a redelivered answer is a no-op). Returns `true` if a
     /// matching pending approval was found and answered. Default: `false` (no such row).
     async fn answer_approval(
@@ -851,6 +854,7 @@ pub trait SessionStore: Send + Sync {
         _session: &SessionId,
         _job_id: &JobId,
         _allow: bool,
+        _allow_permanent: bool,
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
@@ -1601,6 +1605,7 @@ impl SessionStore for InMemoryStore {
         session: &SessionId,
         job_id: &JobId,
         allow: bool,
+        allow_permanent: bool,
     ) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let epoch = match inner.pending_approvals.get_mut(session) {
@@ -1619,10 +1624,12 @@ impl SessionStore for InMemoryStore {
             session_id: session.clone(),
             epoch,
             job_id: job_id.clone(),
-            payload: if allow {
-                b"allow".to_vec()
-            } else {
-                b"deny".to_vec()
+            // `allow_permanent` still starts with "allow" (the engine's allow/deny split is unchanged);
+            // `resolve_approvals` reads the exact string to record the verified fingerprint.
+            payload: match (allow, allow_permanent) {
+                (true, true) => b"allow_permanent".to_vec(),
+                (true, false) => b"allow".to_vec(),
+                (false, _) => b"deny".to_vec(),
             },
         };
         // Completion durable + session Ready, then publish the wake (one transaction).

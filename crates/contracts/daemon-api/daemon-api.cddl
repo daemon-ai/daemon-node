@@ -146,7 +146,7 @@ rate-limit-snapshot = { "remaining": (uint64 / null), "limit": (uint64 / null), 
 budget = { "tokens": (uint64 / null), "wall_ms": (uint64 / null) }
 spawn-seed = "FromConversation"
 spawn-spec = { "kind": tstr, "seed": spawn-seed }
-host-request-kind-approval = { "Approval": { "prompt": tstr } }
+host-request-kind-approval = { "Approval": { "prompt": tstr, ? "allow_permanent_offered": bool } }
 host-request-kind-input = { "Input": { "prompt": tstr } }
 host-request-kind-choice = { "Choice": { "prompt": tstr, "options": [* tstr] } }
 host-request-kind-delegate = { "Delegate": { "label": tstr, "budget": budget } }
@@ -156,7 +156,7 @@ host-request-kind-t = host-request-kind-approval
                   / host-request-kind-choice
                   / host-request-kind-delegate
                   / host-request-kind-spawn
-host-response-body-approved = { "Approved": bool }
+host-response-body-approved = { "Approved": { "approved": bool, ? "allow_permanent": bool } }
 host-response-body-input = { "Input": tstr }
 host-response-body-chosen = { "Chosen": uint }
 host-response-body-delegated = { "Delegated": job-id }
@@ -1044,7 +1044,7 @@ request-set-session-model = { "SetSessionModel": { "session": session-id, "model
 request-set-session-mode = { "SetSessionMode": { "session": session-id, "mode": approval-mode } }
 request-set-session-overlay = { "SetSessionOverlay": { "session": session-id, "overlay": session-overlay } }
 request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null), ? "after": (tstr / null) } }
-request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool } }
+request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool, ? "allow_permanent": bool } }
 request-profile-list = "ProfileList"
 request-profile-get = { "ProfileGet": { "id": tstr } }
 request-profile-create = { "ProfileCreate": { "spec": profile-spec } }

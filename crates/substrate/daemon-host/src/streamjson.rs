@@ -185,7 +185,10 @@ impl Codec for StreamJsonCodec {
                     );
                     out.push(Outbound::Request(HostRequest {
                         request_id: ReqId(local),
-                        kind: HostRequestKind::Approval { prompt },
+                        kind: HostRequestKind::Approval {
+                            prompt,
+                            allow_permanent_offered: false,
+                        },
                     }));
                 }
             }
@@ -201,7 +204,8 @@ impl Codec for StreamJsonCodec {
             Inbound::Command(AgentCommand::Steer { text, .. }) => vec![user_line(&text)],
             Inbound::Response(resp) => match self.pending.remove(&resp.request_id.0) {
                 Some(orig) => {
-                    let allow = matches!(resp.body, HostResponseBody::Approved(true));
+                    let allow =
+                        matches!(resp.body, HostResponseBody::Approved { approved: true, .. });
                     vec![control_response_line(&orig, allow)]
                 }
                 // A reply with no recorded `control_request` (e.g. a non-permission response) has no
@@ -389,7 +393,10 @@ mod tests {
 
         let lines = codec.encode(Inbound::Response(HostResponse {
             request_id: req.request_id,
-            body: HostResponseBody::Approved(true),
+            body: HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         }));
         let line = String::from_utf8(lines[0].clone()).unwrap();
         assert!(line.contains("control_response"));

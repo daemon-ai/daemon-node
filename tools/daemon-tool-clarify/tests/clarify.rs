@@ -58,6 +58,7 @@ async fn run(tool: &dyn Tool, host: &dyn HostRequestHandler, args: &str) -> Tool
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),
@@ -101,7 +102,10 @@ async fn choice_question_resolves_option_text() {
 #[tokio::test]
 async fn declined_answer_is_not_ok() {
     let tool = ClarifyTool::new();
-    let host = ScriptedHost::new(HostResponseBody::Approved(false));
+    let host = ScriptedHost::new(HostResponseBody::Approved {
+        approved: false,
+        allow_permanent: false,
+    });
     let out = run(&tool, &host, r#"{"question":"proceed?"}"#).await;
     assert!(!out.result.ok);
     assert!(out.result.content.contains("no answer"));

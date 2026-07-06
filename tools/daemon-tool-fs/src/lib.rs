@@ -234,7 +234,8 @@ impl FsTool {
         prompt: String,
     ) -> Result<(), ToolOutcome> {
         match approve_path(cx, path, prompt.clone()).await {
-            Gate::Proceed => Ok(()),
+            // fs edits carry no command fingerprint, so permanence is never offered here.
+            Gate::Proceed { .. } => Ok(()),
             Gate::Reject(reason) => Err(ToolOutcome::text(
                 call.call_id.clone(),
                 false,
@@ -931,7 +932,10 @@ mod tests {
         async fn request(&self, req: HostRequest) -> HostResponse {
             HostResponse {
                 request_id: req.request_id,
-                body: HostResponseBody::Approved(self.0),
+                body: HostResponseBody::Approved {
+                    approved: self.0,
+                    allow_permanent: false,
+                },
             }
         }
     }
@@ -965,6 +969,7 @@ mod tests {
             pre_approved: false,
             checkpoints: None,
             tool_timeout: None,
+            session_allow: &[],
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -1211,6 +1216,7 @@ mod tests {
             pre_approved: false,
             checkpoints: None,
             tool_timeout: None,
+            session_allow: &[],
         };
         let call = ToolCall {
             call_id: "c1".into(),

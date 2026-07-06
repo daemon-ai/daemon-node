@@ -143,7 +143,10 @@ async fn drain_turn(node: &Arc<NodeApiImpl>, session: &daemon_common::SessionId)
                     session.clone(),
                     HostResponse {
                         request_id: req.request_id,
-                        body: HostResponseBody::Approved(true),
+                        body: HostResponseBody::Approved {
+                            approved: true,
+                            allow_permanent: false,
+                        },
                     },
                 )
                 .await

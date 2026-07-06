@@ -357,15 +357,23 @@ impl ControlApi for NodeApiImpl {
         session: SessionId,
         request_id: String,
         allow: bool,
+        allow_permanent: bool,
     ) -> Result<(), ApiError> {
         // Auth 4: only the owner (or a `SessionControlAny` operator) may decide a session's approval.
         self.require_session_access(&session, true).await?;
         // Record the decision + enqueue the wake durably (one transaction in the store), then nudge
         // the activation manager so the dormant session rehydrates promptly and resolves the gated
-        // tool call (allow -> runs it; deny -> injects a tool error). Idempotent in the store.
+        // tool call (allow -> runs it; deny -> injects a tool error). `allow_permanent` rides the
+        // completion payload so the engine's `resolve_approvals` remembers the verified fingerprint.
+        // Idempotent in the store.
         let answered = self
             .store
-            .answer_approval(&session, &JobId::new(request_id.clone()), allow)
+            .answer_approval(
+                &session,
+                &JobId::new(request_id.clone()),
+                allow,
+                allow_permanent,
+            )
             .await
             .map_err(|e| ApiError::Other(format!("answer approval: {e}")))?;
         if !answered {

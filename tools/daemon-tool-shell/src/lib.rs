@@ -313,16 +313,25 @@ impl Tool for ShellTool {
         //     argv runs unattended as before.
         // The approval decision + operator display are bound to the resolved command's fingerprint.
         let gate_shell = parsed.background;
+        // Set when the operator answered the inline approval with "Allow permanently": the resolved
+        // command's fingerprint to record on the session allow-list (via `Effect::RememberApproval`)
+        // so this exact command auto-approves for the rest of the session.
+        let mut remember: Option<CommandFingerprint> = None;
         if gate_shell || needs_approval(&parsed.command, &line) {
             let fingerprint = resolved.fingerprint();
             let prompt = honest_prompt(&resolved, &fingerprint);
+            // A command surface always keys permanence on its resolved fingerprint (`Some`).
             let gate = if gate_shell {
-                approve_shell_command(cx, prompt.clone()).await
+                approve_shell_command(cx, prompt.clone(), Some(&fingerprint)).await
             } else {
-                approve_command(cx, prompt.clone()).await
+                approve_command(cx, prompt.clone(), Some(&fingerprint)).await
             };
             match gate {
-                Gate::Proceed => {}
+                Gate::Proceed { permanent } => {
+                    if permanent {
+                        remember = Some(fingerprint);
+                    }
+                }
                 Gate::Reject(reason) => {
                     return ToolOutcome::text(
                         call.call_id.clone(),
@@ -333,7 +342,8 @@ impl Tool for ShellTool {
                 Gate::Defer(job_id) => {
                     // Durable HITL: suspend awaiting the operator's decision; do not run. The engine
                     // stamps the fingerprint onto the parked approval (via `resolved_fingerprint`) and
-                    // refuses the re-run if the resolved command later differs.
+                    // refuses the re-run if the resolved command later differs. A durable "allow
+                    // permanently" is recorded by the engine's `resolve_approvals`, not here.
                     return ToolOutcome::text(
                         call.call_id.clone(),
                         false,
@@ -349,10 +359,17 @@ impl Tool for ShellTool {
             }
         }
 
-        if parsed.background {
-            return self.run_background(call, cx, &resolved.line, resolved.cwd.clone(), &parsed);
+        let mut outcome = if parsed.background {
+            self.run_background(call, cx, &resolved.line, resolved.cwd.clone(), &parsed)
+        } else {
+            self.run_foreground(call, cx, &resolved, &parsed).await
+        };
+        // Inline "allow permanently": route the remember through the single-owner effect applier so
+        // the durable snapshot stays the sole source of truth (never an out-of-band write).
+        if let Some(fp) = remember {
+            outcome.effects.push(Effect::RememberApproval(fp));
         }
-        self.run_foreground(call, cx, &resolved, &parsed).await
+        outcome
     }
 
     async fn resolved_fingerprint(
@@ -664,9 +681,119 @@ mod tests {
     use daemon_common::{Budget, SessionId};
     use daemon_core::{ApprovalPolicy, EventSink, LocalEnvironment};
     use daemon_processes::{RealClock, RegistryConfig};
-    use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+    use daemon_protocol::{
+        HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody,
+    };
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+
+    /// A host that grants an inline "allow permanently" (`Approved { approved: true, allow_permanent:
+    /// true }`) — drives the inline populate path.
+    struct PermanentHost;
+    #[async_trait]
+    impl HostRequestHandler for PermanentHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved {
+                    approved: true,
+                    allow_permanent: true,
+                },
+            }
+        }
+    }
+
+    /// A host that records each approval's `allow_permanent_offered` flag (then allows, non-permanent).
+    struct CapturingHost {
+        offered: std::sync::Arc<Mutex<Vec<bool>>>,
+    }
+    #[async_trait]
+    impl HostRequestHandler for CapturingHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            if let HostRequestKind::Approval {
+                allow_permanent_offered,
+                ..
+            } = &req.kind
+            {
+                self.offered.lock().unwrap().push(*allow_permanent_offered);
+            }
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved {
+                    approved: true,
+                    allow_permanent: false,
+                },
+            }
+        }
+    }
+
+    /// Run a shell call with an explicit `allow_permanent` allow-list seeded on the `TurnCx`.
+    async fn run_with_allow(
+        tool: &ShellTool,
+        env: &LocalEnvironment,
+        host: &dyn HostRequestHandler,
+        allow: &[CommandFingerprint],
+        args: &str,
+    ) -> ToolOutcome {
+        let cancel = CancellationToken::new();
+        let events = EventSink::discarding();
+        let cx = TurnCx {
+            cancel,
+            events: &events,
+            host,
+            session_id: SessionId::new("t"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: env,
+            tool_result_budget: 0,
+            approval_policy: ApprovalPolicy::Ask,
+            pre_approved: false,
+            checkpoints: None,
+            tool_timeout: None,
+            session_allow: allow,
+        };
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "shell".into(),
+            args: args.into(),
+        };
+        tool.run(&call, &cx).await
+    }
+
+    /// The resolved-command fingerprint the shell tool would compute for `args` (empty allow-list).
+    async fn fingerprint_of(
+        tool: &ShellTool,
+        env: &LocalEnvironment,
+        args: &str,
+    ) -> CommandFingerprint {
+        let cancel = CancellationToken::new();
+        let events = EventSink::discarding();
+        let host = FixedHost(false);
+        let cx = TurnCx {
+            cancel,
+            events: &events,
+            host: &host,
+            session_id: SessionId::new("t"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: env,
+            tool_result_budget: 0,
+            approval_policy: ApprovalPolicy::Ask,
+            pre_approved: false,
+            checkpoints: None,
+            tool_timeout: None,
+            session_allow: &[],
+        };
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "shell".into(),
+            args: args.into(),
+        };
+        tool.resolved_fingerprint(&call, &cx)
+            .await
+            .expect("a shell command surface has a fingerprint")
+    }
 
     /// A host that answers every approval with a fixed decision.
     struct FixedHost(bool);
@@ -675,7 +802,10 @@ mod tests {
         async fn request(&self, req: HostRequest) -> HostResponse {
             HostResponse {
                 request_id: req.request_id,
-                body: HostResponseBody::Approved(self.0),
+                body: HostResponseBody::Approved {
+                    approved: self.0,
+                    allow_permanent: false,
+                },
             }
         }
     }
@@ -728,6 +858,7 @@ mod tests {
             pre_approved: false,
             checkpoints: None,
             tool_timeout: None,
+            session_allow: &[],
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -1047,6 +1178,148 @@ mod tests {
         .await;
         assert!(!out.result.ok);
         assert!(out.result.content.contains("requires background=true"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cluster B / allow_permanent (inline): a command whose fingerprint is on the session allow-list
+    // auto-approves WITHOUT contacting the host — an identical in-session re-request skips the gate.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_permanent_auto_approves_identical_in_session_command() {
+        let root = temp_root("allow-perm");
+        let env = LocalEnvironment::new(&root);
+        let tool = ShellTool::with_processes(registry(), ShellConfig::default());
+        let args = r#"{"command":"echo","args":["hi"],"background":true}"#;
+        let fp = fingerprint_of(&tool, &env, args).await;
+
+        // Denying host, but the fingerprint is allow-listed → short-circuit → the command runs.
+        let out = run_with_allow(
+            &tool,
+            &env,
+            &FixedHost(false),
+            std::slice::from_ref(&fp),
+            args,
+        )
+        .await;
+        assert!(
+            out.result.ok,
+            "an allow-listed command auto-approves despite a denying host: {}",
+            out.result.content
+        );
+
+        // Teeth: without the seed, the same denying host refuses the (always-gated) shell surface.
+        let out = run_with_allow(&tool, &env, &FixedHost(false), &[], args).await;
+        assert!(
+            !out.result.ok,
+            "an un-listed background command is still gated (denied by host)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cluster B / allow_permanent: the short-circuit is fingerprint-EXACT — a DIFFERENT command's
+    // permanence must not auto-approve this one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_permanent_is_fingerprint_specific() {
+        let root = temp_root("allow-perm-diff");
+        let env = LocalEnvironment::new(&root);
+        let tool = ShellTool::with_processes(registry(), ShellConfig::default());
+        let other = fingerprint_of(
+            &tool,
+            &env,
+            r#"{"command":"echo","args":["OTHER"],"background":true}"#,
+        )
+        .await;
+        let out = run_with_allow(
+            &tool,
+            &env,
+            &FixedHost(false),
+            std::slice::from_ref(&other),
+            r#"{"command":"echo","args":["hi"],"background":true}"#,
+        )
+        .await;
+        assert!(
+            !out.result.ok,
+            "a different command's permanence must not auto-approve this one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cluster B / allow_permanent (inline populate): an inline "allow permanently" emits a
+    // `RememberApproval` effect carrying the resolved fingerprint; a single allow emits none.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_allow_permanent_emits_remember_effect() {
+        let root = temp_root("allow-perm-remember");
+        let env = LocalEnvironment::new(&root);
+        let tool = ShellTool::with_processes(registry(), ShellConfig::default());
+        let args = r#"{"command":"echo","args":["hi"],"background":true}"#;
+        let fp = fingerprint_of(&tool, &env, args).await;
+
+        let out = run_with_allow(&tool, &env, &PermanentHost, &[], args).await;
+        assert!(
+            out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::RememberApproval(f) if *f == fp)),
+            "inline 'allow permanently' records the resolved fingerprint via RememberApproval",
+        );
+
+        // A single allow (no permanence) remembers nothing.
+        let out = run_with_allow(&tool, &env, &FixedHost(true), &[], args).await;
+        assert!(
+            !out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::RememberApproval(_))),
+            "a single allow emits no RememberApproval",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cluster B / allow_permanent (offer): permanence is offered ONLY where a fingerprint exists to
+    // key the allow-list on — a command surface (`Some`) offers it; a fingerprint-less gate (`None`,
+    // e.g. an fs edit) does not.
+    #[tokio::test]
+    async fn permanence_offer_only_when_fingerprint_present() {
+        use daemon_core::approve_command;
+        let root = temp_root("offer");
+        let env = LocalEnvironment::new(&root);
+        let captured = std::sync::Arc::new(Mutex::new(Vec::<bool>::new()));
+        let host = CapturingHost {
+            offered: captured.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let events = EventSink::discarding();
+        let cx = TurnCx {
+            cancel,
+            events: &events,
+            host: &host,
+            session_id: SessionId::new("t"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: &env,
+            tool_result_budget: 0,
+            approval_policy: ApprovalPolicy::Ask,
+            pre_approved: false,
+            checkpoints: None,
+            tool_timeout: None,
+            session_allow: &[],
+        };
+        let fp = CommandFingerprint::compute(
+            "exec.argv",
+            std::path::Path::new("/bin/true"),
+            &[],
+            &[],
+            std::path::Path::new("/ws"),
+        );
+        // A command surface keys permanence on its fingerprint → offered.
+        let _ = approve_command(&cx, "p".into(), Some(&fp)).await;
+        // A fingerprint-less gate → not offered.
+        let _ = approve_command(&cx, "p".into(), None).await;
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![true, false],
+            "permanence is offered only where a fingerprint exists to key on",
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
