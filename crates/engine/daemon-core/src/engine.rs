@@ -1091,8 +1091,9 @@ impl Engine {
                     // command `(abs-binary, argv, env-delta, cwd, exec-surface)`, so the pre-approved
                     // re-run (`resolve_approvals`) can refuse if the resolved command later differs —
                     // the approve-then-swap TOCTOU gate. Computed here (not in the pure effect router)
-                    // because it needs the tool registry + turn context. A tool that does not exec
-                    // returns `None` (fs edits, `execute_code`) and is stored unbound (runs verbatim).
+                    // because it needs the tool registry + turn context. A command tool (`shell`,
+                    // `execute_code`) returns `Some` and is TOCTOU-bound; a tool that does not exec
+                    // (fs edits) returns `None` and is stored unbound (runs verbatim).
                     for a in awaiting.iter_mut() {
                         if let Some(tool) = registry.get(&a.call.name) {
                             a.fingerprint = tool.resolved_fingerprint(&a.call, &cx).await;
@@ -1550,7 +1551,7 @@ impl Engine {
                         // Cluster B fingerprint gate: refuse to run if the command that would run now
                         // no longer matches what the operator approved (the approve-then-swap TOCTOU).
                         // Only enforced when the parked approval carries a fingerprint (a command tool
-                        // like `shell`); `None` (fs edits, `execute_code`, legacy snapshots) runs
+                        // like `shell` or `execute_code`); `None` (fs edits, legacy snapshots) runs
                         // verbatim as before. An unresolvable command (`None` now — e.g. the binary
                         // vanished) also refuses, fail-closed.
                         let verified = match &approval.fingerprint {
@@ -1569,8 +1570,8 @@ impl Engine {
                             let outcome = run_tool(&approval.call, &registry, &cx).await;
                             // Least-privilege durable "allow permanently": only a verified fingerprint
                             // (the exact command that just ran) may be remembered. No fingerprint
-                            // (fs edits / `execute_code` / legacy) degrades to a single allow — nothing
-                            // is recorded, so a swapped/absent command can never be auto-trusted.
+                            // (fs edits / legacy) degrades to a single allow — nothing is recorded,
+                            // so a swapped/absent command can never be auto-trusted.
                             if permanent {
                                 if let Some(fp) = &approval.fingerprint {
                                     self.remember_session_allow(fp.clone());

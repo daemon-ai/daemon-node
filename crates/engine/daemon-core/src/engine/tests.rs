@@ -1424,6 +1424,40 @@ async fn approved_command_runs_when_fingerprint_matches() {
     );
 }
 
+/// Cluster B (execute_code): now that `execute_code` returns a resolved-command fingerprint, a parked
+/// `execute_code` approval carries `Some(fp)` and is refused when the code that would run later
+/// differs (the approve-then-swap TOCTOU). Driven through the generic probe harness with an
+/// execute_code-shaped tuple: the surface folds in mode+network and the argv is the code content, so a
+/// code swap changes the fingerprint and the engine fail-closed refuses the re-run.
+#[tokio::test]
+async fn execute_code_approval_refused_when_code_changed() {
+    let approved = crate::exec::CommandFingerprint::compute(
+        "exec.python:project:net=off",
+        std::path::Path::new("/usr/bin/python3"),
+        &["print('approved')".to_string()],
+        &[("PATH".to_string(), "/usr/bin".to_string())],
+        std::path::Path::new("/ws"),
+    );
+    // At re-run the parked script has been swapped to different code.
+    let swapped = crate::exec::CommandFingerprint::compute(
+        "exec.python:project:net=off",
+        std::path::Path::new("/usr/bin/python3"),
+        &["print('evil')".to_string()],
+        &[("PATH".to_string(), "/usr/bin".to_string())],
+        std::path::Path::new("/ws"),
+    );
+    let (engine, ran) = drive_approval_resolution(approved, swapped).await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a code swap on a parked execute_code approval must NOT run"
+    );
+    let (ok, content) = spliced_result(&engine);
+    assert!(!ok, "a refused approval is not ok");
+    assert!(content.contains("refused"), "refusal spliced: {content}");
+}
+
 // --- Cluster B / allow_permanent: durable populate + fail-safe -----------------------------------
 
 fn fp_at(binary: &str) -> crate::exec::CommandFingerprint {
