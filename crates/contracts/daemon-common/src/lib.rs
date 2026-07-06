@@ -521,12 +521,12 @@ impl WireVersion {
     /// cannot decode the new op (mirrors the additive v15–v22 bumps).
     ///
     /// Also in v23 (same unreleased dev cycle, no extra bump — foreign-engine profiles): adds the
-    /// additive `ProfileSpec::engine` selector (`engine-selector = "Core" / { "Acp": { "agent":
-    /// tstr } }`, serde-default `Core`), binding a profile to the native `daemon-core` engine or to
-    /// a foreign ACP agent referenced from the node's ACP catalog BY NAME ONLY — launch recipes
-    /// never travel in profiles (they stay node-side, operator-managed via `acp_register`), so a
-    /// `ProfileCreate` can never smuggle an arbitrary binary spawn. Pre-engine encodings omit the
-    /// field and decode as `Core`.
+    /// additive `ProfileSpec::engine` selector (originally `engine-selector = "Core" / { "Acp":
+    /// { "agent": tstr } }`, serde-default `Core`; the foreign arm was renamed `Foreign` in v29),
+    /// binding a profile to the native `daemon-core` engine or to a foreign agent referenced from
+    /// the node's agent catalog BY NAME ONLY — launch recipes never travel in profiles (they stay
+    /// node-side, operator-managed via the registry ops), so a `ProfileCreate` can never smuggle
+    /// an arbitrary binary spawn. Pre-engine encodings omit the field and decode as `Core`.
     ///
     /// v24–v25 (pagination overhaul, one unreleased dev cycle — neither shipped): every unbounded
     /// list op is paginated or bounded at [`WIRE_PAGE_MAX`] (= 64, the zcbor client codec's fixed
@@ -570,7 +570,35 @@ impl WireVersion {
     /// optional, default-off ed25519 detached signature backing a verify-at-import gate. Additive,
     /// but bumped because `is_compatible` is strict-equal, so an older peer cannot decode the new
     /// fields (mirrors the additive v15–v23 bumps).
-    pub const CURRENT: Self = Self(28);
+    ///
+    /// v29 (the UI/wire gap batch — one coordinated bump, renames included, because
+    /// `is_compatible` is strict-equal):
+    /// (ENG-5) protocol-agnostic foreign engines: `EngineSelector`'s foreign arm renamed
+    /// `Acp { agent }` -> `Foreign { agent }` (and the enum relocated into `daemon-protocol` so
+    /// `unit-node` can carry it); the ACP registry generalized — `acp-agent-entry` ->
+    /// `agent-entry` with a serde-default `protocol: agent-protocol ("Acp" / "StreamJson")`,
+    /// `acp-recipe`/`acp-source` -> `agent-recipe`/`agent-source`, and the ops
+    /// `AcpDiscover/AcpCatalog/AcpRegister/AcpRemove` -> `Agent*` (stream-json entries are
+    /// PATH-probed only; recipes still never travel in profiles).
+    /// (E3) deny-with-reason: optional `reason` on `ApprovalDecide` and on the §17
+    /// `HostResponseBody::Approved`, injected into the agent's conversation as the gated tool's
+    /// error content on deny.
+    /// (D4) fingerprint management: `FingerprintList { session }` -> `[remembered-fingerprint]`
+    /// and `FingerprintRevoke { session, fingerprint }` over the per-session `allow_permanent`
+    /// allow-list.
+    /// (D2) tool inventory: `tool-info` gains the required `enabled` + optional `requires`, and
+    /// the node actually serves `ToolList`.
+    /// (F7) delegation guardrails: the read-only `Caps` op -> `caps-report` (the effective
+    /// orchestrate depth/fanout ceilings, now TOML-configurable); guardrail declines carry a
+    /// structured `guardrail` tool detail.
+    /// (F2) notice provenance: `user-msg` gains the optional `notice: completion-notice-ref`
+    /// (`{ child, ? call_id }`) on injected detached-completion turns.
+    /// (F3) tree enrichment: `unit-node` gains optional `lifetime: delegation-lifetime` and
+    /// `engine: engine-selector`.
+    /// (B5) presence push: the new `node-event` arm `TransportChanged { transport, connection,
+    /// ? presence }`, emitted at coarse real transport transitions so clients stop polling
+    /// `TransportInstances`. Breaking (renames + a required `tool-info` field).
+    pub const CURRENT: Self = Self(29);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
