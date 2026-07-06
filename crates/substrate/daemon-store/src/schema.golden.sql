@@ -34,12 +34,12 @@ rowseq         INTEGER PRIMARY KEY AUTOINCREMENT,
 parent_session TEXT NOT NULL,
 child          TEXT NOT NULL,
 payload        BLOB NOT NULL
-);
+, call_id TEXT);
 CREATE TABLE completion_notices (
 child          TEXT PRIMARY KEY,
 parent_session TEXT NOT NULL,
 notified       INTEGER NOT NULL DEFAULT 0
-);
+, call_id TEXT);
 CREATE TABLE cron_jobs (
     id             TEXT PRIMARY KEY,
     schedule       TEXT NOT NULL,

@@ -54,7 +54,11 @@ usage-delta = {
 }
 
 ; ----- §17 protocol shapes (daemon-protocol; summarized) -----
-user-msg = { "text": tstr, ? "attachments": [* blob-ref] }   ; attachments wire v14 (content-transfer Phase 2b)
+; the detached-delegation completion-notice provenance (wire v29): set only on the notice turn the
+; node injects when a background child finishes, so a client chip-links the turn to the delegation
+; card (the spawning orchestrate call's call_id) and the child unit. The engine ignores it.
+completion-notice-ref = { "child": session-id, ? "call_id": (tstr / null) }
+user-msg = { "text": tstr, ? "attachments": [* blob-ref], ? "notice": (completion-notice-ref / null) }   ; attachments wire v14 (content-transfer Phase 2b); notice wire v29
 
 agent-command-start-turn = { "StartTurn": { "input": user-msg, "request_id": req-id } }
 agent-command-steer = { "Steer": { "text": tstr, "request_id": req-id } }

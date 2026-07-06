@@ -236,8 +236,11 @@ impl JobWorker for FleetJobWorker {
             // completion — the parent never suspended. A joining delegation binds the parent job, so
             // the child's terminal completion fulfills it and wakes the suspended parent.
             if input.detached {
+                // An idempotent re-bind: the spawn-time bind (orchestrate tool) already stamped
+                // the spawning call_id on the edge; this materialize-path bind never overwrites
+                // it (first-writer-wins), so `None` here is safe.
                 self.store
-                    .bind_completion_notice(&child, &job.session_id)
+                    .bind_completion_notice(&child, &job.session_id, None)
                     .await
                     .map_err(ServiceError::new)?;
             } else {

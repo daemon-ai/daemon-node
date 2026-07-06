@@ -20,6 +20,22 @@ use daemon_common::{
 };
 use serde::{Deserialize, Serialize};
 
+/// The provenance of a detached-delegation completion notice (wire v29), carried on the
+/// [`UserMsg`] the node injects into the parent when a `spawn wait:false` child reaches a terminal
+/// state — so a client rendering the injected turn can chip-link it back to the delegation card
+/// (keyed by the spawning `orchestrate` call's `call_id`) and the child's unit/session, instead of
+/// parsing the `[subagent … completed]` text. The engine ignores it (like `attachments`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionNoticeRef {
+    /// The detached child session/unit that completed.
+    pub child: SessionId,
+    /// The parent's `orchestrate` tool `call_id` that spawned the child, when recorded (`None`
+    /// for notices bound before v29 or by paths without a spawning tool call).
+    #[serde(default)]
+    pub call_id: Option<String>,
+}
+
 /// A user-authored turn input (the `StartTurn` payload; the §5 message type proper lives in core).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +47,11 @@ pub struct UserMsg {
     /// sees the on-disk files (plus a note in `text`) and ignores this field.
     #[serde(default)]
     pub attachments: Vec<BlobRef>,
+    /// Detached-delegation provenance (wire v29): set only on the completion-notice turn the node
+    /// injects when a background child finishes, so a client can chip-link the turn to the
+    /// delegation card. The engine ignores it.
+    #[serde(default)]
+    pub notice: Option<CompletionNoticeRef>,
 }
 
 impl UserMsg {
@@ -39,12 +60,19 @@ impl UserMsg {
         Self {
             text: text.into(),
             attachments: Vec::new(),
+            notice: None,
         }
     }
 
     /// Attach content-addressed blobs to this message.
     pub fn with_attachments(mut self, attachments: Vec<BlobRef>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Attach detached-delegation provenance (the completion-notice chip-link, wire v29).
+    pub fn with_notice(mut self, notice: CompletionNoticeRef) -> Self {
+        self.notice = Some(notice);
         self
     }
 

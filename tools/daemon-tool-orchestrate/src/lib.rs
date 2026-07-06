@@ -532,7 +532,12 @@ impl Tool for OrchestrateTool {
                     Ok(child) => child,
                     Err(e) => return Self::err(call, format!("detached spawn failed: {e}")),
                 };
-                if let Err(e) = store.bind_completion_notice(&child, &cx.session_id).await {
+                // Stamp the spawning tool call onto the edge (wire v29): the eventual completion
+                // notice carries it, so a client chip-links the injected turn to THIS call's card.
+                if let Err(e) = store
+                    .bind_completion_notice(&child, &cx.session_id, Some(call.call_id.clone()))
+                    .await
+                {
                     return Self::err(call, format!("detached spawn failed: {e}"));
                 }
                 Self::ok(call, format!("spawned-detached:{child}"), Vec::new())

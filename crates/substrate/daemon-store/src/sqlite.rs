@@ -327,6 +327,14 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // operator surface can display it structurally. NULL on legacy rows and non-command
         // approvals. Display-only — enforcement stays on the engine's typed fingerprint.
         M::up("ALTER TABLE pending_approvals ADD COLUMN fingerprint TEXT;"),
+        // M7 (wire v29 — completion-notice provenance): the parent's spawning `orchestrate` tool
+        // call_id, stamped on the completion-notice edge at bind time and copied onto the outbox
+        // row at the terminal push, so the injected notice turn can chip-link back to the
+        // delegation card. NULL on legacy edges/rows (the notice then carries no call_id).
+        M::up(
+            "ALTER TABLE completion_notices ADD COLUMN call_id TEXT;\n\
+             ALTER TABLE completion_notice_outbox ADD COLUMN call_id TEXT;",
+        ),
     ])
 });
 
@@ -718,16 +726,18 @@ impl SessionStore for SqliteStore {
         // Detached child: if a completion-notice edge exists, push a `CompletionNotice` (delivered to
         // the parent as a fresh reactive turn) in the SAME transaction — never a `completion_inbox`
         // entry or a wake (there is no parent job). The `notified` flag makes it idempotent per child
-        // while keeping the row for tree visibility (`children_of`).
-        let notice_parent: Option<String> = tx
+        // while keeping the row for tree visibility (`children_of`). The edge's `call_id` (wire v29)
+        // is copied onto the outbox row so the injected turn carries chip-link provenance.
+        let notice_edge: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT parent_session FROM completion_notices WHERE child = ?1 AND notified = 0",
+                "SELECT parent_session, call_id FROM completion_notices \
+                 WHERE child = ?1 AND notified = 0",
                 params![checkpoint.session_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some(notice_parent) = notice_parent {
+        if let Some((notice_parent, call_id)) = notice_edge {
             let payload = checkpoint
                 .completion_payload
                 .clone()
@@ -738,9 +748,14 @@ impl SessionStore for SqliteStore {
             )
             .map_err(sql_err)?;
             tx.execute(
-                "INSERT INTO completion_notice_outbox (parent_session, child, payload) \
-                 VALUES (?1, ?2, ?3)",
-                params![notice_parent, checkpoint.session_id.as_str(), payload],
+                "INSERT INTO completion_notice_outbox (parent_session, child, payload, call_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    notice_parent,
+                    checkpoint.session_id.as_str(),
+                    payload,
+                    call_id
+                ],
             )
             .map_err(sql_err)?;
         }
@@ -826,13 +841,15 @@ impl SessionStore for SqliteStore {
         &self,
         child: &SessionId,
         parent: &SessionId,
+        call_id: Option<String>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         // Idempotent tree edge (read by `children_of`), but NOT a `delegations` row: `mark_completed`
         // binds no job and instead pushes a `CompletionNotice` (the child self-closes with a notice).
         conn.execute(
-            "INSERT OR IGNORE INTO completion_notices (child, parent_session) VALUES (?1, ?2)",
-            params![child.as_str(), parent.as_str()],
+            "INSERT OR IGNORE INTO completion_notices (child, parent_session, call_id) \
+             VALUES (?1, ?2, ?3)",
+            params![child.as_str(), parent.as_str(), call_id],
         )
         .map_err(sql_err)?;
         Ok(())
@@ -842,8 +859,8 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT rowseq, parent_session, child, payload FROM completion_notice_outbox \
-                 ORDER BY rowseq LIMIT 1",
+                "SELECT rowseq, parent_session, child, payload, call_id \
+                 FROM completion_notice_outbox ORDER BY rowseq LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -852,6 +869,7 @@ impl SessionStore for SqliteStore {
                             parent: SessionId::new(row.get::<_, String>(1)?),
                             child: SessionId::new(row.get::<_, String>(2)?),
                             payload: row.get::<_, Vec<u8>>(3)?,
+                            call_id: row.get::<_, Option<String>>(4)?,
                         },
                     ))
                 },

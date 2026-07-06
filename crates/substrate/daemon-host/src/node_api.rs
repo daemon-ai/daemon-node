@@ -499,6 +499,18 @@ impl NodeApiImpl {
         session: &SessionId,
         text: String,
     ) -> Result<(), ApiError> {
+        self.inject_session_msg(session, UserMsg::new(text)).await
+    }
+
+    /// [`Self::inject_session_input`] with a structured [`UserMsg`] (wire v29): the
+    /// completion-notice worker passes the provenance-tagged message
+    /// (`UserMsg::with_notice`) so the injected turn's `StartTurn` carries the chip-link fields
+    /// through both the live submit and the durable pending-input rail.
+    pub async fn inject_session_msg(
+        &self,
+        session: &SessionId,
+        msg: UserMsg,
+    ) -> Result<(), ApiError> {
         let owner = self.owners.get(session).map(|o| *o.value());
         let durable = match owner {
             Some(Lifecycle::Live) => false,
@@ -517,7 +529,7 @@ impl NodeApiImpl {
                 Some(_) => {}
             }
             let mut payload = Vec::new();
-            ciborium::into_writer(&UserMsg::new(text), &mut payload)
+            ciborium::into_writer(&msg, &mut payload)
                 .map_err(|e| ApiError::Other(format!("encode injected input: {e}")))?;
             self.store.enqueue_session_input(session, payload).await;
             self.store.enqueue_wake(session.clone()).await;
@@ -532,7 +544,7 @@ impl NodeApiImpl {
             self.submit(
                 session.clone(),
                 AgentCommand::StartTurn {
-                    input: UserMsg::new(text),
+                    input: msg,
                     request_id: daemon_common::ReqId(0),
                 },
             ),

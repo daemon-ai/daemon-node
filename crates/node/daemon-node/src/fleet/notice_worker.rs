@@ -43,7 +43,16 @@ impl NoticeWorker {
         while let Some(notice) = self.store.dequeue_completion_notice().await {
             let result = DelegationResult::decode(&notice.payload);
             let text = format!("[subagent {} completed] {}", notice.child, result.summary);
-            if let Err(e) = self.node.inject_session_input(&notice.parent, text).await {
+            // The structured provenance (wire v29): the injected turn's `UserMsg.notice` carries
+            // the child + the spawning tool call_id, so a client chip-links the turn back to the
+            // delegation card instead of parsing the text.
+            let msg = daemon_protocol::UserMsg::new(text).with_notice(
+                daemon_protocol::CompletionNoticeRef {
+                    child: notice.child.clone(),
+                    call_id: notice.call_id.clone(),
+                },
+            );
+            if let Err(e) = self.node.inject_session_msg(&notice.parent, msg).await {
                 tracing::warn!(
                     parent = %notice.parent,
                     child = %notice.child,

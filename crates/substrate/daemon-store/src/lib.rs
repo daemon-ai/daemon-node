@@ -368,6 +368,11 @@ pub struct CompletionNotice {
     pub parent: SessionId,
     /// The detached child that reached a terminal state.
     pub child: SessionId,
+    /// The parent's spawning tool `call_id` (wire v29), recorded at
+    /// [`bind_completion_notice`](SessionStore::bind_completion_notice) so the injected notice
+    /// turn can chip-link back to the delegation card. `None` for pre-v29 edges.
+    #[serde(default)]
+    pub call_id: Option<String>,
     /// The opaque completion payload (a CBOR `DelegationResult`; the legacy `child:{id}` marker for a
     /// child that produced no structured result).
     pub payload: Vec<u8>,
@@ -783,11 +788,14 @@ pub trait SessionStore: Send + Sync {
     /// `status`/tree see it) but — unlike [`bind_delegation`](Self::bind_delegation) — binds no
     /// parent job, so [`mark_completed`](Self::mark_completed) never records a `completion_inbox`
     /// entry or wakes the parent through the `waiting_for` rail; it pushes a [`CompletionNotice`]
-    /// instead. Idempotent. Default: a no-op (a non-authoritative proxy store).
+    /// instead. `call_id` (wire v29) is the parent's spawning tool call, stamped onto the edge so
+    /// the eventual notice carries chip-link provenance. Idempotent. Default: a no-op (a
+    /// non-authoritative proxy store).
     async fn bind_completion_notice(
         &self,
         _child: &SessionId,
         _parent: &SessionId,
+        _call_id: Option<String>,
     ) -> Result<(), StoreError> {
         Ok(())
     }
@@ -1219,10 +1227,10 @@ struct Inner {
     wake_outbox: VecDeque<SessionId>,
     /// child session -> the parent job its terminal completion fulfills (the durable tree edge).
     delegations: HashMap<SessionId, JobCommand>,
-    /// Detached child session -> its parent (the completion-notice edge). Persistent (drives tree
-    /// visibility via `child_index` + the notice firing in `mark_completed`); the in-memory analogue
-    /// of the SQLite `completion_notices` table.
-    completion_notices: HashMap<SessionId, SessionId>,
+    /// Detached child session -> its parent + the spawning tool call (the completion-notice edge).
+    /// Persistent (drives tree visibility via `child_index` + the notice firing in
+    /// `mark_completed`); the in-memory analogue of the SQLite `completion_notices` table.
+    completion_notices: HashMap<SessionId, (SessionId, Option<String>)>,
     /// Detached children whose terminal notice has already been pushed onto `notice_outbox`, so a
     /// re-completion (a resumed detached child) fires the notice at most once (idempotency).
     notices_fired: HashSet<SessionId>,
@@ -1470,7 +1478,7 @@ impl SessionStore for InMemoryStore {
         // (delivered to the parent as a fresh reactive turn) in the SAME transaction as the terminal
         // flip — NEVER a `completion_inbox` entry or a `wake_outbox` wake (there is no parent job to
         // fulfill). Idempotent per child (a resumed child that completes again fires once).
-        if let Some(parent) = inner
+        if let Some((parent, call_id)) = inner
             .completion_notices
             .get(&checkpoint.session_id)
             .cloned()
@@ -1483,6 +1491,7 @@ impl SessionStore for InMemoryStore {
                 inner.notice_outbox.push_back(CompletionNotice {
                     parent,
                     child: checkpoint.session_id.clone(),
+                    call_id,
                     payload,
                 });
             }
@@ -1535,6 +1544,7 @@ impl SessionStore for InMemoryStore {
         &self,
         child: &SessionId,
         parent: &SessionId,
+        call_id: Option<String>,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         // Idempotent tree edge: record the child under the parent for `children_of`/tree, but not in
@@ -1543,9 +1553,13 @@ impl SessionStore for InMemoryStore {
         if !siblings.contains(child) {
             siblings.push(child.clone());
         }
+        // First-writer-wins (mirrors the SQLite `INSERT OR IGNORE`): the spawn-time bind carries
+        // the call_id; a later idempotent re-bind (the fleet worker's materialize path) must not
+        // clobber it with `None`.
         inner
             .completion_notices
-            .insert(child.clone(), parent.clone());
+            .entry(child.clone())
+            .or_insert((parent.clone(), call_id));
         Ok(())
     }
 
@@ -2728,7 +2742,10 @@ mod detached_delegation_tests {
             .unwrap();
         let parent_fence = store.acquire_activation_lease(&parent).await.unwrap();
 
-        store.bind_completion_notice(&child, &parent).await.unwrap();
+        store
+            .bind_completion_notice(&child, &parent, Some("call-provenance".into()))
+            .await
+            .unwrap();
         // The child is tree-visible under the parent even before it materializes.
         assert!(
             store.children_of(&parent).await.contains(&child),
@@ -2749,7 +2766,8 @@ mod detached_delegation_tests {
             .await
             .unwrap();
 
-        // Exactly one notice, carrying the structured payload, addressed parent<-child.
+        // Exactly one notice, carrying the structured payload, addressed parent<-child, with the
+        // spawn-time call_id provenance (wire v29) surviving the edge -> outbox round-trip.
         let notice = store
             .dequeue_completion_notice()
             .await
@@ -2757,6 +2775,11 @@ mod detached_delegation_tests {
         assert_eq!(notice.parent, parent);
         assert_eq!(notice.child, child);
         assert_eq!(notice.payload, b"did the thing".to_vec());
+        assert_eq!(
+            notice.call_id.as_deref(),
+            Some("call-provenance"),
+            "the spawning tool call_id rides the notice"
+        );
         assert!(
             store.dequeue_completion_notice().await.is_none(),
             "exactly one notice per terminal child"
