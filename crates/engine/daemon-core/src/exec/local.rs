@@ -8,6 +8,7 @@
 //! scrubbed environment (no inherited secrets) so a tool's exec never leaks the host's credentials.
 
 use super::{Command, ContainedRoot, ExecCx, ExecResult, ExecutionEnvironment};
+use daemon_common::env_policy::EnvPolicy;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 
@@ -82,7 +83,6 @@ impl ExecutionEnvironment for LocalEnvironment {
             .as_ref()
             .map(|g| g.path.as_path())
             .unwrap_or(&self.root);
-        // Scrubbed child env: nothing inherited (no host secrets leak into a tool's subprocess).
         // The agent foreground exec: spawns the resolved program with an argv vector (no shell
         // string); cwd is the ContainedRoot-verified `dir` above. Approval/fingerprint is Phase 2.
         #[allow(clippy::disallowed_methods)]
@@ -90,11 +90,16 @@ impl ExecutionEnvironment for LocalEnvironment {
         command
             .args(&cmd.args)
             .current_dir(dir)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // EnvPolicy::Clean — agent-facing tool subprocess: nothing inherited but PATH, so no host
+        // secret leaks into the child. Behavior-identical to the prior `env_clear()` + `PATH` scrub;
+        // now a declared, lintable policy (Cluster E).
+        EnvPolicy::Clean {
+            allowlist: vec!["PATH".into()],
+        }
+        .apply(&mut command, &[] as &[(&str, &str)]);
 
         let mut child = command.spawn()?;
         let mut stdout_pipe = child.stdout.take();
