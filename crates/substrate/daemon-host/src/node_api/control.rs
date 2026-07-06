@@ -390,6 +390,10 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("wake: {e}")))
     }
 
+    async fn caps(&self) -> daemon_api::CapsReport {
+        self.caps
+    }
+
     async fn tool_list(&self) -> Vec<daemon_api::ToolInfo> {
         // The node-wide inventory the binary late-bound (it owns the tool build gates). Bounded at
         // the wire page cap like every other unpaged list.

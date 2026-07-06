@@ -604,6 +604,8 @@ pub enum ApiRequest {
         /// The command + args + session/origin context.
         invocation: CommandInvocation,
     },
+    /// [`ControlApi::caps`] — the read-only delegation guardrail caps (wire v29).
+    Caps,
     /// [`ControlApi::config_get`].
     ConfigGet,
     /// [`ControlApi::config_set`].
@@ -1089,6 +1091,8 @@ pub enum ApiResponse {
     CommandOutput(CommandOutput),
     /// The node runtime config (config_get).
     Config(NodeConfigView),
+    /// The read-only delegation guardrail caps (caps; wire v29).
+    Caps(CapsReport),
     /// The scheduled cron jobs (cron_list).
     CronJobs(Vec<CronJob>),
     /// A created cron job id (cron_create).

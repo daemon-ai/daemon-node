@@ -172,6 +172,32 @@ pub struct NodeAssembly {
     /// `interval`. The default is enabled (300s grace / 60s interval); the first sweep runs one
     /// interval after start, so short-lived test nodes never observe one.
     pub reaper: crate::fleet::ReaperConfig,
+    /// The delegation guardrail caps the `orchestrate` tool enforces (wire v29): the TOML
+    /// `[orchestrate].max_depth` / `.max_fanout` policy ceilings, surfaced read-only via the
+    /// `Caps` op. The effective depth guard composes with [`Self::nesting_depth`] (the assembly
+    /// recursion budget): the tool declines past `min(max_depth, nesting_depth + 1)`, so the
+    /// policy cap can narrow the structural budget but never widen it.
+    pub orchestrate: OrchestrateCaps,
+}
+
+/// The delegation guardrail caps (`[orchestrate].max_depth` / `.max_fanout`) threaded into the
+/// `orchestrate` tool and the read-only `Caps` surface. Defaults mirror the tool's own built-in
+/// ceilings (8 / 8).
+#[derive(Clone, Copy, Debug)]
+pub struct OrchestrateCaps {
+    /// The delegation-tree depth ceiling a `spawn` is declined past.
+    pub max_depth: usize,
+    /// The concurrent detached-children ceiling per parent a `spawn wait:false` is declined past.
+    pub max_fanout: usize,
+}
+
+impl Default for OrchestrateCaps {
+    fn default() -> Self {
+        Self {
+            max_depth: 8,
+            max_fanout: 8,
+        }
+    }
 }
 
 /// The assembled node: the bound surface, its started resident-service handle, and the fleet handle.

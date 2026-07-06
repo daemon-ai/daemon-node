@@ -135,6 +135,7 @@ fn assemble_recording_node(
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     });
     (node, handle)
 }

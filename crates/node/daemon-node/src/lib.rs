@@ -37,4 +37,6 @@ pub use fleet::{
     AgentBackend, EphemeralReaper, FleetJobWorker, FleetViewImpl, ForeignProtocol, LaunchProfile,
     ProfileChildSpawner, ReaperConfig,
 };
-pub use types::{AssembledNode, NodeAssembly, ProviderResolver, ResolvedSkills, SkillsResolver};
+pub use types::{
+    AssembledNode, NodeAssembly, OrchestrateCaps, ProviderResolver, ResolvedSkills, SkillsResolver,
+};

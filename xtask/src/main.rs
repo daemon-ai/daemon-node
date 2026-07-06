@@ -321,6 +321,16 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             reason: Some("fixture reason".into()),
         },
     )?;
+    // The read-only guardrail caps (wire v29).
+    write_cbor(&out, "request-caps.cbor", &ApiRequest::Caps)?;
+    write_cbor(
+        &out,
+        "response-caps.cbor",
+        &ApiResponse::Caps(daemon_api::CapsReport {
+            orchestrate_max_depth: 1,
+            orchestrate_max_fanout: 8,
+        }),
+    )?;
     // Fingerprint management (wire v29): the allow-list list/revoke ops + the list response, so
     // `verify-codec` proves the generated zcbor C decoder accepts the new shapes.
     write_cbor(

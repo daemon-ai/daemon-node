@@ -81,6 +81,7 @@ fn assemble_core_tools(store: Arc<dyn SessionStore>) -> AssembledNode {
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     })
 }
 
@@ -276,6 +277,7 @@ fn assemble_core_approval(store: Arc<dyn SessionStore>) -> AssembledNode {
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     })
 }
 

@@ -80,6 +80,7 @@ impl NodeApiImpl {
             cron: None,
             commands: Arc::new(ArcSwapOption::empty()),
             tools_inventory: Arc::new(ArcSwapOption::empty()),
+            caps: daemon_api::CapsReport::default(),
             auth_store: None,
             auth_audit: None,
             revocations: None,
@@ -175,6 +176,14 @@ impl NodeApiImpl {
     /// knows both what registered and why a disabled optional surface did not.
     pub fn set_tool_inventory(&self, tools: Vec<daemon_api::ToolInfo>) {
         self.tools_inventory.store(Some(Arc::new(tools)));
+    }
+
+    /// Install the read-only delegation guardrail caps backing
+    /// [`daemon_api::ControlApi::caps`] (wire v29) — the EFFECTIVE `orchestrate` ceilings the
+    /// assembly composed (config policy min'd with the recursion budget).
+    pub fn with_caps(mut self, caps: daemon_api::CapsReport) -> Self {
+        self.caps = caps;
+        self
     }
 
     /// Install the host routing registry consulted by [`SessionApi::submit_routed`] (the §5.9

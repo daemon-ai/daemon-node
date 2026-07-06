@@ -154,6 +154,7 @@ fn assemble_with_orchestrator(
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     })
 }
 

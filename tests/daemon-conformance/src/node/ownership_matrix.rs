@@ -401,7 +401,8 @@ fn classify(req: &ApiRequest) -> Coverage {
         | CommandList
         | CommandInvoke { .. }
         | ConfigGet
-        | ConfigSet { .. } => NotSessionTouching,
+        | ConfigSet { .. }
+        | Caps => NotSessionTouching,
         UserCreate { .. }
         | UserList
         | UserDisable { .. }

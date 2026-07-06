@@ -493,6 +493,7 @@ async fn serve_registry(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespons
             api.command_invoke(invocation).await,
             ApiResponse::CommandOutput,
         ),
+        ApiRequest::Caps => ApiResponse::Caps(api.caps().await),
         ApiRequest::ConfigGet => ok_or_err(api.config_get().await, ApiResponse::Config),
         ApiRequest::ConfigSet { config } => unit_or_err(api.config_set(config).await),
         _ => return None,

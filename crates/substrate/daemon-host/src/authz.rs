@@ -197,7 +197,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
 
         // -- serve_registry: extension/agent/provider registry + node config --------------------
         // AgentDiscover only probes recipes and caches in memory (no persistence) -> a read.
-        AgentDiscover | AgentCatalog | ProviderList | ToolList | CommandList | ConfigGet => {
+        AgentDiscover | AgentCatalog | ProviderList | ToolList | CommandList | ConfigGet | Caps => {
             C::RegistryRead
         }
         // CommandInvoke is a coarse-floor read; the command catalog's own `min_access` (now

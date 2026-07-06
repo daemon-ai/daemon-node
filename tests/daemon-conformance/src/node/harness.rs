@@ -83,6 +83,7 @@ pub fn assemble_over(
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     })
 }
 
@@ -164,6 +165,7 @@ pub fn assemble_demo() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     });
     (node, handle)
 }
@@ -300,6 +302,7 @@ fn assemble_daemon_api_gateway_inner(
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     });
     (node, cred_store, handle)
 }

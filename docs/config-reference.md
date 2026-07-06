@@ -11,6 +11,12 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | TOML path | Environment variable | Type | Default |
 |-----------|----------------------|------|---------|
 | `api.auth_db` | `DAEMON_API__AUTH_DB` | optional | _(unset)_ |
+| `api.ingress_max_connections` | `DAEMON_API__INGRESS_MAX_CONNECTIONS` | number | `1024` |
+| `api.ingress_max_decoded_bytes` | `DAEMON_API__INGRESS_MAX_DECODED_BYTES` | optional | _(unset)_ |
+| `api.ingress_max_frame_bytes` | `DAEMON_API__INGRESS_MAX_FRAME_BYTES` | optional | _(unset)_ |
+| `api.ingress_max_tracked_peers` | `DAEMON_API__INGRESS_MAX_TRACKED_PEERS` | number | `4096` |
+| `api.ingress_peer_burst` | `DAEMON_API__INGRESS_PEER_BURST` | number | `256.0` |
+| `api.ingress_peer_rate_per_sec` | `DAEMON_API__INGRESS_PEER_RATE_PER_SEC` | number | `128.0` |
 | `api.local_trust` | `DAEMON_API__LOCAL_TRUST` | string | `system` |
 | `api.require_client_cert` | `DAEMON_API__REQUIRE_CLIENT_CERT` | bool | `false` |
 | `api.tls_addr` | `DAEMON_API__TLS_ADDR` | optional | _(unset)_ |
@@ -152,6 +158,8 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `models.endpoint` | `DAEMON_MODELS__ENDPOINT` | optional | _(unset)_ |
 | `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
 | `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
+| `orchestrate.max_depth` | `DAEMON_ORCHESTRATE__MAX_DEPTH` | number | `8` |
+| `orchestrate.max_fanout` | `DAEMON_ORCHESTRATE__MAX_FANOUT` | number | `8` |
 | `orchestrate.reaper_enabled` | `DAEMON_ORCHESTRATE__REAPER_ENABLED` | bool | `true` |
 | `orchestrate.reaper_grace_ms` | `DAEMON_ORCHESTRATE__REAPER_GRACE_MS` | number | `300000` |
 | `orchestrate.reaper_interval_ms` | `DAEMON_ORCHESTRATE__REAPER_INTERVAL_MS` | number | `60000` |
@@ -193,6 +201,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `shell.truncate_max_bytes` | `DAEMON_SHELL__TRUNCATE_MAX_BYTES` | number | `200000` |
 | `skills.dir` | `DAEMON_SKILLS__DIR` | optional | _(unset)_ |
 | `skills.enable` | `DAEMON_SKILLS__ENABLE` | bool | `true` |
+| `skills.import_verify_key` | `DAEMON_SKILLS__IMPORT_VERIFY_KEY` | optional | _(unset)_ |
 | `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
 | `store` | `DAEMON_STORE` | string | `memory` |
 | `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |

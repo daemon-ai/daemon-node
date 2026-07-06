@@ -1164,7 +1164,8 @@ pub struct MnemosyneOpts {
 }
 
 /// Orchestration-fleet tuning (`[orchestrate]` / `DAEMON_ORCHESTRATE__*`): the ephemeral-subagent
-/// reaper policy (archive `EphemeralSubagent` sessions after they reach a terminal state).
+/// reaper policy (archive `EphemeralSubagent` sessions after they reach a terminal state) and the
+/// delegation guardrail caps the `orchestrate` tool enforces.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OrchestrateConfig {
@@ -1177,6 +1178,13 @@ pub struct OrchestrateConfig {
     /// The sweep cadence (default 60s; the first sweep runs one interval after start).
     #[serde(rename = "reaper_interval_ms", with = "duration_ms")]
     pub reaper_interval: Duration,
+    /// The delegation-tree depth cap the `orchestrate` tool declines a `spawn` past (guardrail;
+    /// default 8). Independent of `nesting_depth` (the assembly recursion budget): this is the
+    /// tool-policy ceiling, surfaced read-only via the `Caps` op.
+    pub max_depth: usize,
+    /// The concurrent detached-children cap per parent the `orchestrate` tool declines a
+    /// `spawn wait:false` past (guardrail; default 8). Surfaced read-only via the `Caps` op.
+    pub max_fanout: usize,
 }
 
 impl Default for OrchestrateConfig {
@@ -1185,6 +1193,8 @@ impl Default for OrchestrateConfig {
             reaper_enabled: true,
             reaper_grace: Duration::from_secs(300),
             reaper_interval: Duration::from_secs(60),
+            max_depth: 8,
+            max_fanout: 8,
         }
     }
 }

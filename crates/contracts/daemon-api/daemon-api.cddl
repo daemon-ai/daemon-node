@@ -726,6 +726,12 @@ agent-entry = {
 }
 
 ; ----- long-tail surface stub DTOs (wire v14; tool-info enriched in v29) -----
+; the read-only delegation guardrail caps (wire v29; ControlApi::caps): the EFFECTIVE orchestrate
+; ceilings the node enforces, so a client renders "why was this spawn declined" without probing.
+caps-report = {
+  "orchestrate_max_depth": uint,
+  "orchestrate_max_fanout": uint,
+}
 provider-info    = { "name": tstr, ? "base_url": (tstr / null), ? "available": bool }
 ; enabled/requires (wire v29): whether the tool is registered on this node, and — for a disabled
 ; config-gated surface — the missing config key / credential / build feature a client renders as
@@ -1139,6 +1145,7 @@ request-tool-list = "ToolList"
 request-tool-register = { "ToolRegister": { "tool": tool-info } }
 request-command-list = "CommandList"
 request-command-invoke = { "CommandInvoke": { "invocation": command-invocation } }
+request-caps = "Caps"
 request-config-get = "ConfigGet"
 request-config-set = { "ConfigSet": { "config": node-config-view } }
 request-cron-list = "CronList"
@@ -1315,6 +1322,7 @@ api-request = request-submit
             / request-tool-register
             / request-command-list
             / request-command-invoke
+            / request-caps
             / request-config-get
             / request-config-set
             / request-cron-list
@@ -1446,6 +1454,7 @@ response-tools = { "Tools": [* tool-info] }
 response-commands = { "Commands": [* command-spec] }
 response-command-output = { "CommandOutput": command-output }
 response-config = { "Config": node-config-view }
+response-caps = { "Caps": caps-report }
 response-cron-jobs = { "CronJobs": [* cron-job] }
 response-cron-id = { "CronId": tstr }
 response-cron-runs = { "CronRuns": [* cron-run] }
@@ -1538,6 +1547,7 @@ api-response = response-ok
              / response-commands
              / response-command-output
              / response-config
+             / response-caps
              / response-cron-jobs
              / response-cron-id
              / response-cron-runs

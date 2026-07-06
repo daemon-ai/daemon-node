@@ -290,6 +290,7 @@ fn assemble_with_store_for_recall(
         processes: Default::default(),
         title_aux,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     });
     (node, handle, store)
 }

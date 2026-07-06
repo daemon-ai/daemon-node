@@ -29,9 +29,18 @@ use daemon_common::{JobId, ReqId, SessionId, UnitId};
 use daemon_core::{Effect, Tool, ToolCall, ToolConcurrency, ToolOutcome, ToolResult, TurnCx};
 use daemon_orchestration::FleetRuntime;
 use daemon_protocol::{
-    DelegationLifetime, HostRequest, HostRequestKind, HostResponseBody, UserMsg,
+    DelegationLifetime, HostRequest, HostRequestKind, HostResponseBody, ToolDetail, UserMsg,
 };
 use daemon_store::{ChildLifetime, SessionStatus};
+
+/// Which guardrail declined a spawn (the structured `kind` inside the `guardrail` tool detail).
+#[derive(Clone, Copy, Debug)]
+enum GuardrailKind {
+    /// The delegation-tree depth cap.
+    Depth,
+    /// The concurrent detached-children cap.
+    Fanout,
+}
 
 /// Map the protocol-level [`DelegationLifetime`] onto the store's [`ChildLifetime`] (the source of
 /// truth for the materialized child's [`SessionRole`](daemon_store::SessionRole)). Kept local so the
@@ -284,6 +293,44 @@ impl OrchestrateTool {
         }
     }
 
+    /// A guardrail decline (wire v29): `ok: true` with the human-readable `content` (the turn
+    /// keeps flowing — a decline is a normal outcome, not a tool failure), PLUS a structured
+    /// [`ToolDetail`] (`kind = "guardrail"`, JSON `{ "kind": "depth"|"fanout", "limit": N,
+    /// "reason": … }` body — the same JSON-body convention the `shell`/`todo` details use) so a
+    /// rich client can render the cap without parsing the `depth-limit:N` / `fanout-limit:N`
+    /// string.
+    fn guardrail(call: &ToolCall, kind: GuardrailKind, limit: usize) -> ToolOutcome {
+        let (tag, reason) = match kind {
+            GuardrailKind::Depth => (
+                "depth",
+                format!(
+                    "delegation-tree depth cap reached ({limit}); complete this branch instead \
+                     of nesting deeper"
+                ),
+            ),
+            GuardrailKind::Fanout => (
+                "fanout",
+                format!(
+                    "concurrent detached-children cap reached ({limit}); wait for a running \
+                     child to finish before spawning another"
+                ),
+            ),
+        };
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": tag,
+            "limit": limit,
+            "reason": reason,
+        }))
+        .unwrap_or_default();
+        let content = match kind {
+            GuardrailKind::Depth => format!("depth-limit:{limit}"),
+            GuardrailKind::Fanout => format!("fanout-limit:{limit}"),
+        };
+        let mut outcome = Self::ok(call, content, Vec::new());
+        outcome.detail = Some(ToolDetail::new("guardrail", body));
+        outcome
+    }
+
     fn err(call: &ToolCall, content: String) -> ToolOutcome {
         ToolOutcome {
             result: ToolResult {
@@ -389,7 +436,7 @@ impl Tool for OrchestrateTool {
             // terminates the recursive durable delegation chain (every child is itself
             // orchestrator-capable, so an always-delegating model would otherwise nest forever).
             Verb::Spawn { .. } if session_depth(cx.session_id.as_str()) >= self.max_depth => {
-                Self::ok(call, format!("depth-limit:{}", self.max_depth), Vec::new())
+                Self::guardrail(call, GuardrailKind::Depth, self.max_depth)
             }
             // DOWN edge (joining): record the delegation through the host port; the fleet worker
             // spawns the child when the resulting durable job is processed. Emitting Effect::Delegate
@@ -458,11 +505,7 @@ impl Tool for OrchestrateTool {
                 // mint unbounded background children. Decline at the cap (mirroring the depth guard).
                 let active = self.active_child_count(&cx.session_id).await;
                 if active >= self.max_fanout {
-                    return Self::ok(
-                        call,
-                        format!("fanout-limit:{}", self.max_fanout),
-                        Vec::new(),
-                    );
+                    return Self::guardrail(call, GuardrailKind::Fanout, self.max_fanout);
                 }
                 let task = task.unwrap_or_else(|| self.label.clone());
                 let payload = daemon_protocol::DelegationInput {

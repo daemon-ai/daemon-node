@@ -950,6 +950,13 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("command_invoke".into()))
     }
 
+    /// The node's read-only delegation guardrail caps (wire v29): the effective `orchestrate`
+    /// depth/fanout ceilings, so a client can render them without probing. Default: zeros (a node
+    /// that wired no orchestration caps).
+    async fn caps(&self) -> CapsReport {
+        CapsReport::default()
+    }
+
     /// Read the node's runtime config (I13). Default: unsupported (config is env/TOML startup-only).
     async fn config_get(&self) -> Result<NodeConfigView, ApiError> {
         Err(ApiError::Unsupported("config_get".into()))
@@ -2252,6 +2259,19 @@ pub struct ProviderInfo {
     /// Whether the node currently has this provider wired/usable.
     #[serde(default)]
     pub available: bool,
+}
+
+/// The node's read-only delegation guardrail caps ([`ControlApi::caps`], wire v29): the EFFECTIVE
+/// ceilings the `orchestrate` tool enforces (config policy composed with the assembly recursion
+/// budget), so a client can render "why was this spawn declined" next to the structured
+/// `guardrail` tool detail without probing by hitting limits.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsReport {
+    /// The delegation-tree depth a `spawn` is declined past.
+    pub orchestrate_max_depth: u32,
+    /// The concurrent detached-children per parent a `spawn wait:false` is declined past.
+    pub orchestrate_max_fanout: u32,
 }
 
 /// A node tool-inventory entry ([`ControlApi::tool_list`]; enriched in wire v29 so a client can

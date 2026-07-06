@@ -144,6 +144,13 @@ async fn depth_guard_still_caps_nested_spawns() {
     assert!(out.result.ok);
     assert_eq!(out.result.content, "depth-limit:2");
     assert!(out.effects.is_empty(), "no delegation past the cap");
+    // v29: the decline also carries the structured guardrail detail a rich client renders.
+    let detail = out.detail.expect("a guardrail decline carries a detail");
+    assert_eq!(detail.kind, "guardrail");
+    let body: serde_json::Value = serde_json::from_slice(&detail.body).expect("JSON body");
+    assert_eq!(body["kind"], "depth");
+    assert_eq!(body["limit"], 2);
+    assert!(body["reason"].as_str().is_some_and(|r| !r.is_empty()));
 }
 
 #[tokio::test]
@@ -489,6 +496,15 @@ async fn detached_fanout_cap_declines_at_the_limit() {
     assert!(capped.result.ok);
     assert_eq!(capped.result.content, "fanout-limit:2");
     assert!(capped.effects.is_empty());
+    // v29: the decline also carries the structured guardrail detail a rich client renders.
+    let detail = capped
+        .detail
+        .as_ref()
+        .expect("a guardrail decline carries a detail");
+    assert_eq!(detail.kind, "guardrail");
+    let body: serde_json::Value = serde_json::from_slice(&detail.body).expect("JSON body");
+    assert_eq!(body["kind"], "fanout");
+    assert_eq!(body["limit"], 2);
     // Only two jobs were enqueued.
     assert!(store.dequeue_job().await.is_some());
     assert!(store.dequeue_job().await.is_some());

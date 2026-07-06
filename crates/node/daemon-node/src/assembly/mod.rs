@@ -252,7 +252,13 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     .with_fleet_events(shared.fleet_events.clone())
     // The node-wide event feed (L3): `events_since` serves from this ring and the §5 emit hooks
     // push onto it.
-    .with_node_events(shared.node_events.clone());
+    .with_node_events(shared.node_events.clone())
+    // The read-only guardrail caps (`Caps`, wire v29): the EFFECTIVE orchestrate ceilings — the
+    // same composition the tool registration below enforces.
+    .with_caps(daemon_api::CapsReport {
+        orchestrate_max_depth: a.orchestrate.max_depth.min(a.nesting_depth + 1) as u32,
+        orchestrate_max_fanout: a.orchestrate.max_fanout as u32,
+    });
     // Background session-title generation (hermes title_generator parity), when the binary resolved
     // an auxiliary provider for it.
     if let Some(aux) = a.title_aux.clone() {
@@ -389,7 +395,12 @@ fn build_orchestrator_profile(
         core_tool_registry_with_skills(&a.extra_tools, launch_skill_tools, &a.fs, procs);
     registry.register(Arc::new(
         daemon_tool_orchestrate::OrchestrateTool::new(fleet.clone())
-            .with_max_depth(a.nesting_depth + 1)
+            // The effective depth guard composes the `[orchestrate].max_depth` policy ceiling with
+            // the assembly recursion budget (`nesting_depth + 1`): policy may narrow the
+            // structural budget but never widen it (the pre-v29 `nesting_depth + 1` behavior is
+            // the default, since the default cap of 8 exceeds it).
+            .with_max_depth(a.orchestrate.max_depth.min(a.nesting_depth + 1))
+            .with_max_fanout(a.orchestrate.max_fanout)
             // The durable session graph backs the tool's `send` (pending-input + wake) and
             // per-child `status` verbs.
             .with_store(a.store.clone()),

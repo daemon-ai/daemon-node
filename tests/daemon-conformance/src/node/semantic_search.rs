@@ -96,6 +96,7 @@ fn assemble_semantic(
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     })
 }
 

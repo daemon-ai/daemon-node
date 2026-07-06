@@ -429,6 +429,10 @@ pub struct NodeApiImpl {
     /// registered tool plus one per disabled config-gated surface (with `requires`). Late-bound by
     /// the assembling binary (which owns the tool build gates); `None` => `tool_list` returns empty.
     tools_inventory: Arc<ArcSwapOption<Vec<daemon_api::ToolInfo>>>,
+    /// The read-only delegation guardrail caps backing [`ControlApi::caps`] (wire v29): the
+    /// EFFECTIVE `orchestrate` ceilings, set at assembly (which owns the policy/budget
+    /// composition). Zeros until wired.
+    caps: daemon_api::CapsReport,
     /// The identity store backing the admin access-control sub-surface ([`daemon_api::AccessControlApi`]).
     /// `None` => every admin op resolves to [`ApiError::Unsupported`] (a node assembled without an
     /// identity store — the FFI / conformance harness). `who_am_i` needs no store (it reads the

@@ -2531,6 +2531,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             grace: cfg.orchestrate.reaper_grace,
             interval: cfg.orchestrate.reaper_interval,
         },
+        orchestrate: daemon_node::OrchestrateCaps {
+            max_depth: cfg.orchestrate.max_depth,
+            max_fanout: cfg.orchestrate.max_fanout,
+        },
     });
     // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
     // conversations are readable through the tool (the node did not exist when the tool was built).

@@ -82,6 +82,7 @@ fn assemble_acp_node() -> (
         processes: Default::default(),
         title_aux: None,
         reaper: Default::default(),
+        orchestrate: Default::default(),
     });
     (node, resolver_called, handle)
 }
