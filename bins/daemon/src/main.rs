@@ -31,15 +31,15 @@ use daemon_api::{
 };
 use daemon_common::{
     CredMode, CredScope, JournalStreamId, ModelEngine, ModelRef, ModelSource, ProfileRef,
-    SessionId, UnitId,
+    SessionId, UnitId, UsageDelta,
 };
 use daemon_context_lcm::{LcmConfig, LcmContextEngine};
 use daemon_core::{
-    CommandProviderHandle, ContextEngine, ContextEngineBuilder, CredentialBuilder,
-    CredentialProvider, EmbeddingProvider, EngineProfile, FileMemory, MemoryBuilder,
-    MemoryProvider, MockProvider, Provider, ProviderRegistry, ScriptStep, ScriptedProvider,
-    SystemPrompt, Tool, ToolCall, ToolDef, ToolOutcome, ToolProvider, ToolRegistry, TurnCx,
-    UnconfiguredProvider,
+    Capabilities, CommandProviderHandle, ContextEngine, ContextEngineBuilder, CredentialBuilder,
+    CredentialProvider, EmbeddingProvider, EngineProfile, Failure, FileMemory, MemoryBuilder,
+    MemoryProvider, MockProvider, ModelOutput, Provider, ProviderRegistry, Request, ScriptStep,
+    SystemPrompt, Tool, ToolCall, ToolCallFormat, ToolDef, ToolOutcome, ToolProvider, ToolRegistry,
+    TurnCx, UnconfiguredProvider,
 };
 use daemon_credentials::{CapabilitySigner, CredentialAuthority};
 // The unix-socket api transport is unix-only (tokio has no AF_UNIX on windows); a windows node
@@ -482,11 +482,98 @@ fn parse_mock_script(raw: Option<&str>) -> (Vec<ScriptStep>, String) {
     (steps, final_text)
 }
 
-/// Build the scripted provider builder shared by the launch registry + per-profile resolver.
+/// A deterministic scripted provider that indexes its script by the number of tool RESULTS already
+/// in the conversation, rather than by a per-instance call counter (as the core `ScriptedProvider`).
+/// This makes it **activation-independent**: a durable session that parks a gated tool call, is
+/// decided from the approvals inbox, and rehydrates into a FRESH engine incarnation still advances
+/// past the (now-resolved) step instead of replaying step 0 forever. For a live (resident)
+/// single-incarnation turn the behavior is identical to the core provider (each round adds exactly
+/// one tool result), so the existing in-stream HITL e2e is unaffected — it just also lets the
+/// durable `ApprovalsPending`→`ApprovalDecide`→resume→complete cycle run under the hermetic gate.
+struct ConversationScriptedProvider {
+    steps: Vec<ScriptStep>,
+    final_text: String,
+}
+
+impl ConversationScriptedProvider {
+    fn output(&self, step: &ScriptStep, usage: UsageDelta) -> ModelOutput {
+        match step {
+            ScriptStep::Call { name, args } => ModelOutput {
+                text: String::new(),
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    call_id: "call-0".into(),
+                    name: name.clone(),
+                    args: args.clone(),
+                }],
+                usage,
+                ..Default::default()
+            },
+            ScriptStep::Calls(list) => ModelOutput {
+                text: String::new(),
+                reasoning: None,
+                tool_calls: list
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, args))| ToolCall {
+                        call_id: format!("call-{i}"),
+                        name: name.clone(),
+                        args: args.clone(),
+                    })
+                    .collect(),
+                usage,
+                ..Default::default()
+            },
+            ScriptStep::Final(text) => ModelOutput {
+                text: text.clone(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ConversationScriptedProvider {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_native_tools: true,
+            supports_streaming: false,
+            tool_call_format: ToolCallFormat::Native,
+            max_context: Some(8192),
+        }
+    }
+
+    async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+        let usage = UsageDelta {
+            input_tokens: 8,
+            output_tokens: 4,
+            api_calls: 1,
+            ..Default::default()
+        };
+        // Index by resolved tool turns in the conversation — activation-independent (see the type doc).
+        let n = req.messages.iter().filter(|m| m.role == "tool").count();
+        let step = self
+            .steps
+            .get(n)
+            .cloned()
+            .unwrap_or_else(|| ScriptStep::Final(self.final_text.clone()));
+        Ok(self.output(&step, usage))
+    }
+}
+
+/// Build the scripted provider builder shared by the launch registry + per-profile resolver. Uses
+/// the conversation-aware [`ConversationScriptedProvider`] so a durable HITL park survives the
+/// rehydration a decide→resume cycle triggers (see that type's doc).
 fn scripted_builder(cfg: &NodeConfig) -> daemon_core::ProviderBuilder {
     let (steps, final_text) = parse_mock_script(cfg.mock_script.as_deref());
     Arc::new(move || {
-        Arc::new(ScriptedProvider::new(steps.clone(), final_text.clone())) as Arc<dyn Provider>
+        Arc::new(ConversationScriptedProvider {
+            steps: steps.clone(),
+            final_text: final_text.clone(),
+        }) as Arc<dyn Provider>
     })
 }
 
