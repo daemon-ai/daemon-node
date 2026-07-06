@@ -207,6 +207,66 @@ impl NodeApiImpl {
         report
     }
 
+    /// Auth 4 (F3): whether the current request principal may see fleet unit `id`. Resolves the unit
+    /// to its owner via `UnitId -> UnitNode.session -> session_meta.owner` (the same
+    /// [`owner_visible`] policy the roster/tree/checkpoints use), so an owned subtree is visible
+    /// whole and a foreign one is denied whole. A sessionless or unknown unit has no owner ⇒
+    /// operator-only (fail-closed on an unknown owner). A `SessionSeeAll` holder sees every unit.
+    /// Mirrors [`tree_owned`](Self::tree_owned)'s per-node ownership resolution (children inherit the
+    /// delegating parent's owner at the delegation seam, so the mapping is well-defined at depth).
+    pub(crate) async fn unit_owner_visible(&self, id: &UnitId) -> bool {
+        let principal = crate::request_context::current_principal();
+        let owner = match &self.fleet {
+            Some(fleet) => match fleet.unit(id).await {
+                Some(node) => match node.session {
+                    Some(s) => self.store.session_meta(&s).await.and_then(|m| m.owner),
+                    None => None,
+                },
+                None => None,
+            },
+            None => None,
+        };
+        owner_visible(&principal, &owner)
+    }
+
+    /// Auth 4 (F4): keep only the node-events a non-`SessionSeeAll` principal may see. The three
+    /// session-bearing variants (`SessionAdvanced`/`SessionMetaChanged`/`ApprovalPending`) are
+    /// dropped unless the referenced session's owner is visible to `principal`; the payload-free
+    /// node-wide pointers (`RosterChanged`/`FleetChanged`/`CatalogChanged`/`DownloadProgress`/
+    /// `ResyncNeeded`) carry no foreign session id and pass (the refetch they nudge —
+    /// `SessionsQuery`/`Tree`/`ModelCatalog` — is itself owner-scoped or non-session). The page
+    /// cursors are left untouched so a client still advances correctly past filtered events.
+    /// Fail-closed: a `None` principal sees no session-bearing event (`owner_visible` denies `None`).
+    /// A `SessionSeeAll` holder is short-circuited by the caller (the whole feed, unscoped).
+    pub(crate) async fn scope_events_page(
+        &self,
+        mut page: daemon_api::EventsPage,
+        principal: &Option<daemon_auth::Principal>,
+    ) -> daemon_api::EventsPage {
+        use daemon_api::NodeEvent;
+        let mut kept = Vec::with_capacity(page.events.len());
+        for ev in page.events {
+            let session = match &ev {
+                NodeEvent::SessionAdvanced { session, .. }
+                | NodeEvent::SessionMetaChanged { session, .. }
+                | NodeEvent::ApprovalPending { session, .. } => Some(session.clone()),
+                _ => None,
+            };
+            let visible = match session {
+                Some(s) => owner_visible(
+                    principal,
+                    &self.store.session_meta(&s).await.and_then(|m| m.owner),
+                ),
+                None => true,
+            };
+            if visible {
+                kept.push(ev);
+            }
+        }
+        page.events = kept;
+        page
+    }
+
     /// Record activity on `session` from an inbound `command`: stamp `last_activity_ms` to now
     /// (roster sort key) and seed a title from the first user turn when none is set.
     /// Read-modify-writes the host meta so the overlay/profile/role stay intact. Best-effort: a
