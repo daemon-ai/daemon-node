@@ -222,6 +222,21 @@ impl Engine {
         self.snapshot.approval_policy = Some(policy);
     }
 
+    /// Record a command fingerprint on the session's `allow_permanent` allow-list (Cluster B),
+    /// dedup-idempotent. The single sanctioned mutator of `session_allow_fingerprints`: the inline
+    /// path reaches it via [`Effect::RememberApproval`](crate::turn::Effect::RememberApproval) applied
+    /// here, the durable path via `resolve_approvals`. Least-privilege — only the exact resolved
+    /// fingerprint is remembered, never a policy widening.
+    fn remember_session_allow(&mut self, fingerprint: crate::exec::CommandFingerprint) {
+        if !self
+            .snapshot
+            .session_allow_fingerprints
+            .contains(&fingerprint)
+        {
+            self.snapshot.session_allow_fingerprints.push(fingerprint);
+        }
+    }
+
     /// Append a user message that opens the next turn.
     pub fn push_user(&mut self, input: UserMsg) {
         self.snapshot.conversation.push_user(input);
@@ -986,6 +1001,9 @@ impl Engine {
                     return Ok(self.complete(out, events, turn_usage));
                 }
 
+                // Seed the round's read-only `allow_permanent` view from the durable snapshot (an owned
+                // clone so it never conflicts with `&mut self.snapshot` mutations later in the round).
+                let session_allow = self.snapshot.session_allow_fingerprints.clone();
                 let cx = TurnCx {
                     cancel: control.cancel_token(),
                     events,
@@ -999,6 +1017,7 @@ impl Engine {
                     pre_approved: false,
                     checkpoints: checkpoints.as_deref(),
                     tool_timeout,
+                    session_allow: &session_allow,
                 };
 
                 // Count this tool-executing round and note skill/memory tool use for the review nudges.
@@ -1046,9 +1065,15 @@ impl Engine {
                     delegated,
                     spawns,
                     mut awaiting,
+                    remember,
                 } = partition_tool_effects(effects);
                 for turn in persists {
                     self.snapshot.conversation.turns.push(turn);
+                }
+                // Inline "allow permanently": record each approved fingerprint on the durable session
+                // allow-list (dedup) so an identical in-session re-request short-circuits its gate.
+                for fp in remember {
+                    self.remember_session_allow(fp);
                 }
                 // Fire-and-forget: issue each spawn as a non-joining host request and keep running. The
                 // parent never enters `waiting_for` and never suspends for these (cf. `Delegate` below).
@@ -1486,6 +1511,9 @@ impl Engine {
         let session_id = self.snapshot.session_id.clone();
         let subsystem_profile = self.subsystem_profile.clone();
         let cancel = control.cancel_token();
+        // Read-only allow-list view for the re-run cx. The durable re-run is `pre_approved` (the gate is
+        // skipped), so this is not consulted here — seeded only to build a complete `TurnCx`.
+        let session_allow_seed = self.snapshot.session_allow_fingerprints.clone();
         let pending = std::mem::take(&mut self.pending);
         let mut rest = Vec::new();
         for completion in pending {
@@ -1499,6 +1527,10 @@ impl Engine {
                     let approval = self.snapshot.pending_approvals.remove(i);
                     let decision = String::from_utf8_lossy(&completion.payload);
                     let allow = decision.starts_with("allow");
+                    // Durable "allow permanently": the payload is `allow_permanent` (see
+                    // `answer_approval`); `starts_with("allow")` keeps `allow` correct, this adds the
+                    // permanence bit. A permanent grant is honored only for a verified fingerprint.
+                    let permanent = &*decision == "allow_permanent";
                     let (ok, content) = if allow {
                         let cx = TurnCx {
                             cancel: cancel.clone(),
@@ -1513,6 +1545,7 @@ impl Engine {
                             pre_approved: true,
                             checkpoints: checkpoints.as_deref(),
                             tool_timeout,
+                            session_allow: &session_allow_seed,
                         };
                         // Cluster B fingerprint gate: refuse to run if the command that would run now
                         // no longer matches what the operator approved (the approve-then-swap TOCTOU).
@@ -1534,6 +1567,15 @@ impl Engine {
                         };
                         if verified {
                             let outcome = run_tool(&approval.call, &registry, &cx).await;
+                            // Least-privilege durable "allow permanently": only a verified fingerprint
+                            // (the exact command that just ran) may be remembered. No fingerprint
+                            // (fs edits / `execute_code` / legacy) degrades to a single allow — nothing
+                            // is recorded, so a swapped/absent command can never be auto-trusted.
+                            if permanent {
+                                if let Some(fp) = &approval.fingerprint {
+                                    self.remember_session_allow(fp.clone());
+                                }
+                            }
                             (outcome.result.ok, outcome.result.content)
                         } else {
                             (

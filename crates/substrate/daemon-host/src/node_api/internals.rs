@@ -1571,13 +1571,19 @@ impl HostRequestHandler for ParkingHandler {
                 Some(daemon_core::ApprovalPolicy::AutoAllow) => {
                     return HostResponse {
                         request_id: req.request_id,
-                        body: HostResponseBody::Approved(true),
+                        body: HostResponseBody::Approved {
+                            approved: true,
+                            allow_permanent: false,
+                        },
                     };
                 }
                 Some(daemon_core::ApprovalPolicy::Deny) => {
                     return HostResponse {
                         request_id: req.request_id,
-                        body: HostResponseBody::Approved(false),
+                        body: HostResponseBody::Approved {
+                            approved: false,
+                            allow_permanent: false,
+                        },
                     };
                 }
                 _ => {}
@@ -1617,7 +1623,10 @@ impl HostRequestHandler for ParkingHandler {
             // The session was dropped before an answer arrived: decline safely.
             Err(_) => HostResponse {
                 request_id,
-                body: HostResponseBody::Approved(false),
+                body: HostResponseBody::Approved {
+                    approved: false,
+                    allow_permanent: false,
+                },
             },
         }
     }

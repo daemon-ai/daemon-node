@@ -483,6 +483,12 @@ pub enum ApiRequest {
         request_id: String,
         /// The operator's decision (allow / deny).
         allow: bool,
+        /// "Allow permanently" (Cluster B): when allowing, also remember the approved command's
+        /// fingerprint on the session allow-list so an identical in-session re-request auto-approves.
+        /// Honored only where the parked approval carries a fingerprint (the durable inbox offers it
+        /// when `ApprovalInfo.fingerprint` is set); otherwise it degrades to a single allow. Additive.
+        #[serde(default)]
+        allow_permanent: bool,
     },
     /// [`ControlApi::checkpoints`].
     CheckpointList {

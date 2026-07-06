@@ -647,7 +647,10 @@ impl HostRequestHandler for DelegateResolver {
             }
             HostRequestKind::Input { .. } => HostResponseBody::Input(String::new()),
             HostRequestKind::Choice { .. } => HostResponseBody::Chosen(0),
-            _ => HostResponseBody::Approved(true),
+            _ => HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         };
         HostResponse {
             request_id: req.request_id,

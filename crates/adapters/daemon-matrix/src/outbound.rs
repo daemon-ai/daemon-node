@@ -89,7 +89,7 @@ impl MatrixProjector {
 /// message; the user's reaction/reply -> `respond` round-trip is deferred (M5), so this only posts.
 fn prompt_text(req: &HostRequest) -> Option<String> {
     match &req.kind {
-        HostRequestKind::Approval { prompt } => Some(format!(
+        HostRequestKind::Approval { prompt, .. } => Some(format!(
             "[approval needed] {prompt}\n(reply to approve — reaction capture coming soon)"
         )),
         HostRequestKind::Input { prompt } => Some(format!("[input needed] {prompt}")),

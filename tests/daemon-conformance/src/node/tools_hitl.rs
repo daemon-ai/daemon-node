@@ -350,7 +350,10 @@ async fn live_approval_park_then_respond_impl(store: Arc<dyn SessionStore>, allo
         session.clone(),
         HostResponse {
             request_id,
-            body: HostResponseBody::Approved(allow),
+            body: HostResponseBody::Approved {
+                approved: allow,
+                allow_permanent: false,
+            },
         },
     )
     .await

@@ -642,6 +642,12 @@ pub enum HostRequestKind {
     Approval {
         /// What is being approved.
         prompt: String,
+        /// Whether the node offers a durable per-session "allow permanently" for this ask — set only
+        /// where a command fingerprint exists to key the per-session allow-list on (a command
+        /// surface). The app renders the "Allow permanently" control ONLY when this is `true`; fs
+        /// edits / non-command asks never offer it. Additive (`#[serde(default)]`).
+        #[serde(default)]
+        allow_permanent_offered: bool,
     },
     /// Ask the host for free-form input.
     Input {
@@ -712,8 +718,18 @@ pub struct HostResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HostResponseBody {
-    /// Approval decision.
-    Approved(bool),
+    /// Approval decision. `allow_permanent` (additive, `#[serde(default)]`) carries the operator's
+    /// "Allow permanently" choice on the inline live path: when `approved` and the node offered it,
+    /// the engine remembers the approved command's fingerprint for the rest of the session (a
+    /// least-privilege per-command allow-list, never a blanket approval-mode flip). Ignored unless a
+    /// fingerprint exists to key on — it then degrades to a single allow.
+    Approved {
+        /// Whether the action is approved.
+        approved: bool,
+        /// The operator chose "Allow permanently" (see the variant docs).
+        #[serde(default)]
+        allow_permanent: bool,
+    },
     /// Free-form input result.
     Input(String),
     /// The index of the chosen option.

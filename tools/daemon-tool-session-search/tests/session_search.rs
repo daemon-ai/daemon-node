@@ -121,6 +121,7 @@ async fn run(archive: FakeArchive, current: &str, args: &str) -> Value {
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),

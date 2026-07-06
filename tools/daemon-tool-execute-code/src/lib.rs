@@ -237,8 +237,11 @@ impl Tool for ExecuteCodeTool {
 
         // §12 approval gate — identical shape to the shell tool (policy-driven; durable defer parks).
         let prompt = approval_prompt(&args.code, mode);
-        match approve_command(cx, prompt.clone()).await {
-            Gate::Proceed => {}
+        // `execute_code` does not expose a resolved-command fingerprint (Phase 2 deferred it), so it
+        // passes `None`: no "allow permanently" offer; a durable permanent decision degrades to a
+        // single allow.
+        match approve_command(cx, prompt.clone(), None).await {
+            Gate::Proceed { .. } => {}
             Gate::Reject(reason) => {
                 return ToolOutcome::text(
                     call.call_id.clone(),

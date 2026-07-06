@@ -37,6 +37,9 @@ pub(super) struct PartitionedEffects {
     pub(super) spawns: Vec<daemon_protocol::SpawnSpec>,
     /// Gated tool calls awaiting a durable operator decision.
     pub(super) awaiting: Vec<crate::snapshot::PendingApproval>,
+    /// Command fingerprints to add to the session `allow_permanent` allow-list (inline "allow
+    /// permanently"): the single-owner applier records each on the durable snapshot.
+    pub(super) remember: Vec<crate::exec::CommandFingerprint>,
 }
 
 /// Partition a tool batch's [`Effect`]s into [`PartitionedEffects`] (?4.3 effect router). Verbatim
@@ -47,11 +50,13 @@ pub(super) fn partition_tool_effects(effects: Vec<Effect>) -> PartitionedEffects
     let mut delegated: Option<(JobId, Vec<u8>)> = None;
     let mut spawns: Vec<daemon_protocol::SpawnSpec> = Vec::new();
     let mut awaiting: Vec<crate::snapshot::PendingApproval> = Vec::new();
+    let mut remember: Vec<crate::exec::CommandFingerprint> = Vec::new();
     for effect in effects {
         match effect {
             Effect::Persist(turn) => persists.push(turn),
             Effect::Delegate { job, payload } => delegated = Some((job, payload)),
             Effect::Spawn(spec) => spawns.push(spec),
+            Effect::RememberApproval(fp) => remember.push(fp),
             Effect::AwaitDecision {
                 job_id,
                 call,
@@ -75,6 +80,7 @@ pub(super) fn partition_tool_effects(effects: Vec<Effect>) -> PartitionedEffects
         delegated,
         spawns,
         awaiting,
+        remember,
     }
 }
 

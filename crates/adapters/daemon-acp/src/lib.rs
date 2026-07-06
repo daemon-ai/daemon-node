@@ -642,10 +642,16 @@ async fn resolve_permission(
     let response = host
         .request(HostRequest {
             request_id,
-            kind: HostRequestKind::Approval { prompt },
+            kind: HostRequestKind::Approval {
+                prompt,
+                allow_permanent_offered: false,
+            },
         })
         .await;
-    let approved = matches!(response.body, HostResponseBody::Approved(true));
+    let approved = matches!(
+        response.body,
+        HostResponseBody::Approved { approved: true, .. }
+    );
 
     let wanted = |kind: &PermissionOptionKind| {
         if approved {
@@ -699,7 +705,10 @@ mod tests {
         async fn request(&self, req: HostRequest) -> HostResponse {
             HostResponse {
                 request_id: req.request_id,
-                body: HostResponseBody::Approved(false),
+                body: HostResponseBody::Approved {
+                    approved: false,
+                    allow_permanent: false,
+                },
             }
         }
     }

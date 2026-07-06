@@ -43,7 +43,10 @@ impl HostRequestHandler for DelegatingHost {
             HostRequestKind::Delegate { .. } => {
                 HostResponseBody::Delegated(daemon_common::JobId::new("job-1"))
             }
-            _ => HostResponseBody::Approved(true),
+            _ => HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         };
         HostResponse {
             request_id: req.request_id,
@@ -79,6 +82,7 @@ async fn run_as(tool: &dyn Tool, session: &str, args: &str) -> ToolOutcome {
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),
