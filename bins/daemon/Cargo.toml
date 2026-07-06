@@ -81,6 +81,9 @@ daemon-http = { workspace = true }
 # The Matrix chat transport, toggled on at launch by `[matrix].enabled`. It isolates the heavy
 # matrix-sdk deps; the daemon binary only references `serve` / `login` / `MatrixConfig`.
 daemon-matrix = { workspace = true }
+# The generic OAuth2/OIDC PKCE interactive-auth family (`AuthFlowKind::OAuth2Pkce`), registered
+# into the wire `AuthApi` next to the Matrix SSO factory (params-driven; no config table).
+daemon-oauth = { workspace = true }
 # The internal Rooms loopback transport, toggled on at launch by `[rooms].enabled`. The daemon binary
 # only references `serve` / `RoomsConfig`; it reuses the same `daemon-ingest`/`daemon-delivery` halves.
 daemon-rooms = { workspace = true }

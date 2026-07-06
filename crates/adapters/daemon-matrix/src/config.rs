@@ -31,6 +31,18 @@ pub struct MatrixConfig {
     /// room of every account with mention-gating on. TOML key `route` (`[[matrix.route]]`).
     #[serde(rename = "route")]
     pub routes: Vec<MatrixRoute>,
+    /// Whether each account auto-accepts room invites addressed to it (EIO-11). Default `true`:
+    /// inviting the bot from your own Matrix client is the natural "get the agent into my room"
+    /// gesture, and without acceptance the bot stays invited forever.
+    ///
+    /// **Security tradeoff:** with this on, *anyone who can invite the bot pulls it into a room*
+    /// (and its route table then decides engagement — mention-gating still applies, but room
+    /// state/history exposure and DM spam are possible). On public/federated homeservers where
+    /// strangers can invite the account, set this to `false` and join rooms explicitly via
+    /// `ConvJoin` / `conv_join`. A finer per-sender allowlist (e.g. owner-only) is a planned
+    /// follow-up policy.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub auto_accept_invites: bool,
 }
 
 impl Default for MatrixConfig {
@@ -39,6 +51,7 @@ impl Default for MatrixConfig {
             enabled: false,
             store_root: std::path::PathBuf::from("matrix"),
             routes: Vec::new(),
+            auto_accept_invites: true,
         }
     }
 }

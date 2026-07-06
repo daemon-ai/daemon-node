@@ -317,6 +317,12 @@ env, no separate `File*` mirror), shaped like `WebConfig` / `MettaConfig`:
 [matrix]
 enabled       = true
 store_root    = "matrix"          # resolved under data_dir; per-account subdir <credential_ref>/
+# Auto-join rooms the bot is invited to (EIO-11). SECURITY TRADEOFF: while true (the default),
+# ANYONE who can invite the account pulls it into a room (mention-gating still governs engagement,
+# but room state/history exposure and DM spam are possible). On public/federated homeservers where
+# strangers can invite the account, set false and join explicitly via ConvJoin. A per-sender
+# allowlist (owner-only) policy is a planned follow-up.
+auto_accept_invites = true
 
 # the route table = the config surface of the routing registry (5.9.1).
 # NO account secrets here — accounts/tokens come from the credential subsystem,

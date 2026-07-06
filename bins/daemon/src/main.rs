@@ -2467,16 +2467,19 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         as Arc<dyn daemon_core::CheckpointStore>);
 
     // Register the interactive-auth families this node exposes over the wire `AuthApi` (the
-    // client-driven SSO/OAuth2 login seam). The Matrix SSO factory is registered whenever the matrix
-    // transport is enabled, so a decoupled GUI can drive `auth_begin`/`auth_complete` to mint and bind
-    // an account's session — keyed by the same per-account store root the transport's `serve` uses.
-    let auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>> = if cfg.matrix.enabled {
-        vec![Arc::new(daemon_matrix::MatrixAuthFlowFactory::new(
+    // client-driven SSO/OAuth2 login seam). The generic OAuth2 PKCE factory is always registered
+    // (params-driven — endpoints/client_id arrive in `auth_begin.params`, so it needs no config);
+    // the Matrix SSO factory rides whenever the matrix transport is enabled, keyed by the same
+    // per-account store root the transport's `serve` uses.
+    let mut auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>> = vec![Arc::new(
+        daemon_oauth::OAuth2PkceFlowFactory::new()
+            .map_err(|e| anyhow::anyhow!("registering the oauth2 auth factory: {e}"))?,
+    )];
+    if cfg.matrix.enabled {
+        auth_factories.push(Arc::new(daemon_matrix::MatrixAuthFlowFactory::new(
             cfg.matrix.store_root.clone(),
-        ))]
-    } else {
-        vec![]
-    };
+        )));
+    }
 
     // Materialize the workspace root eagerly (the way FileBlobStore::open creates its own dir):
     // nothing else creates it, so after a state wipe every `fs_list` on the advertised `workspace`

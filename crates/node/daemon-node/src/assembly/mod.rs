@@ -21,8 +21,8 @@ use daemon_core::{ApprovalPolicy, Config, EngineProfile, StablePromptSource, Sys
 use daemon_host::{
     BackgroundSpawner, BlobStore, BlueprintSource, CoreEngineFactory, CronFiring, CronOps,
     CronScheduler, DurableProfileResolver, FileBlobStore, FleetControl, Host, JournalConfig,
-    ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileStore, RoutingRegistry,
-    SessionBackend, SessionEngineBuilder, WorkspaceFs, WorkspaceRoots,
+    ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileStore, RoutingBuilder,
+    RoutingRegistry, SessionBackend, SessionEngineBuilder, WorkspaceFs, WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_supervision::ManageRequestHandler;
@@ -803,27 +803,37 @@ fn bind_identity_surfaces(mut node_api: NodeApiImpl, a: &NodeAssembly) -> NodeAp
 
 /// Install the host routing registry (§5.9) so routed submits select the session's profile +
 /// delivery from the inbound origin. The account→profile baseline (precedence step 2) is derived
-/// here from every profile's `bound_accounts` (§5.9.4): profile-declared instance bindings fill the
+/// from every profile's `bound_accounts` (§5.9.4): profile-declared instance bindings fill the
 /// registry's `instance_profiles`, while any explicit config `[[routing.instance_profile]]` already
-/// present wins (operator override). A registry is installed when configured *or* when a profile
-/// contributes a binding, even if the config route table was empty.
-fn install_routing(mut node_api: NodeApiImpl, a: &NodeAssembly) -> NodeApiImpl {
-    let profile_specs = a
-        .profiles
-        .as_ref()
-        .and_then(|p| p.list().ok())
-        .unwrap_or_default();
-    let routing = match a.routing.clone() {
-        Some(reg) => Some(reg.bind_instances_from_profiles(&profile_specs)),
-        None => {
-            let reg = RoutingRegistry::new().bind_instances_from_profiles(&profile_specs);
-            (!reg.is_empty()).then_some(reg)
+/// present wins (operator override).
+///
+/// When the node carries a profile store, the derivation is installed as the routing **rebuild
+/// hook** ([`RoutingBuilder`], the §5.9 hot-reload seam) rather than a boot-time snapshot: every
+/// `rebuild_routing()` (fired by `profile_update` / `auth_complete` / the `routing_*` ops)
+/// recomputes the baseline from the LIVE profile store, so binding or un-binding an account takes
+/// effect without a restart (EIO-3/EIO-7/EIO-11 — the `routing_builder` hole). Without a profile
+/// store there is nothing live to re-derive from, so the static config table (if any) is installed
+/// as before.
+fn install_routing(node_api: NodeApiImpl, a: &NodeAssembly) -> NodeApiImpl {
+    let config_base = a.routing.clone();
+    match a.profiles.clone() {
+        Some(profiles) => {
+            let builder: RoutingBuilder = Arc::new(move || {
+                let specs = profiles.list().unwrap_or_default();
+                match config_base.clone() {
+                    Some(reg) => reg.bind_instances_from_profiles(&specs),
+                    None => RoutingRegistry::new().bind_instances_from_profiles(&specs),
+                }
+            });
+            // The consuming builder runs the hook once to seed the live table (boot-equivalent to
+            // the previous static derivation).
+            node_api.with_routing_builder(builder)
         }
-    };
-    if let Some(routing) = routing {
-        node_api = node_api.with_routing(routing);
+        None => match config_base {
+            Some(reg) => node_api.with_routing(reg),
+            None => node_api,
+        },
     }
-    node_api
 }
 
 /// Bind the discovery + live-rebind surfaces: the cloud-model catalog, the (always-on) ACP discovery

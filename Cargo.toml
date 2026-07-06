@@ -80,6 +80,10 @@ rusqlite_migration = "=2.3.0"
 genai = "0.6"
 # still used by the in-process mock HTTP server in the provider wire tests.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# URL construction/parsing for the OAuth2 PKCE auth-flow factory (`daemon-oauth`): authorization-URL
+# query building + callback query parsing (`form_urlencoded`). Already in-tree transitively via
+# reqwest; declared directly so the factory does not depend on reqwest's re-export.
+url = "2"
 # the official Rust MCP SDK: the `daemon-mcp-client` adapter speaks MCP to external tool servers
 # (stdio child-process + streamable-HTTP). default-features off drops the server/macros defaults; we
 # enable only the client + the two client transports. Isolated to that one adapter crate so rmcp's
@@ -287,6 +291,7 @@ daemon-mcp-client = { path = "crates/adapters/daemon-mcp-client" }
 daemon-delivery = { path = "crates/adapters/daemon-delivery" }
 daemon-ingest = { path = "crates/adapters/daemon-ingest" }
 daemon-matrix = { path = "crates/adapters/daemon-matrix" }
+daemon-oauth = { path = "crates/adapters/daemon-oauth" }
 daemon-rooms = { path = "crates/adapters/daemon-rooms" }
 daemon-transport = { path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { path = "crates/orchestration/daemon-orchestration" }
