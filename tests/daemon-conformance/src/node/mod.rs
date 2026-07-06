@@ -29,6 +29,7 @@ mod ingress_governor;
 mod live_agent_e2e;
 mod messaging;
 mod negative_auth;
+mod operator_steer;
 mod ownership;
 mod ownership_matrix;
 mod ownership_transport;
