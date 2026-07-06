@@ -132,6 +132,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `lcm.summary_circuit_breaker_cooldown_seconds` | `DAEMON_LCM__SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | number | `300` |
 | `lcm.summary_circuit_breaker_failure_threshold` | `DAEMON_LCM__SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | number | `2` |
 | `lcm.summary_timeout_ms` | `DAEMON_LCM__SUMMARY_TIMEOUT_MS` | number | `60000` |
+| `matrix.auto_accept_invites` | `DAEMON_MATRIX__AUTO_ACCEPT_INVITES` | bool | `true` |
 | `matrix.enabled` | `DAEMON_MATRIX__ENABLED` | bool | `false` |
 | `matrix.route` | `DAEMON_MATRIX__ROUTE` | array | `[]` |
 | `matrix.store_root` | `DAEMON_MATRIX__STORE_ROOT` | string | `matrix` |
