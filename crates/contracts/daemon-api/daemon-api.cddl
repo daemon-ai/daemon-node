@@ -367,6 +367,11 @@ unit-kind = "Engine"
           / "Host"
           / "Orchestrator"
 
+; the declared delegation lifetime (wire v29): the orchestrate-tool vocabulary for a child unit —
+; a long-lived managed child vs a transient subagent the reaper may archive.
+delegation-lifetime = "Persistent"
+                    / "Ephemeral"
+
 unit-state-finished = { "Finished": { "end_reason": tstr } }
 unit-state = "Running"
            / unit-state-finished
@@ -384,6 +389,11 @@ unit-node = {
   ? "session": (session-id / null),
   ? "title": (tstr / null),
   ? "role": (session-role / null),      ; null => Primary
+  ; lifetime + engine (wire v29): the delegation chip (server-derived from the role, so clients
+  ; never re-implement the role->lifetime rule) + the bound profile's engine selector,
+  ; denormalized so a tree render needs no per-node ProfileGet. null => primary / unbound.
+  ? "lifetime": (delegation-lifetime / null),
+  ? "engine": (engine-selector / null),
 }
 
 ; Paged (wire v25): `nodes` is served 64 per page in unit-id order; `next` is the resume cursor

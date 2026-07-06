@@ -4295,6 +4295,10 @@ mod tests {
                 session: None,
                 title: None,
                 role: None,
+                lifetime: Some(daemon_protocol::DelegationLifetime::Persistent),
+                engine: Some(EngineSelector::Foreign {
+                    agent: "gemini".into(),
+                }),
             }],
             next: Some("root".into()),
         });

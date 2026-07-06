@@ -443,11 +443,14 @@ impl FleetRuntime {
             usage: self.fleet_usage(),
             children,
             // The synthetic node-root is the fleet itself, not a session: no profile/session/title,
-            // and no `SessionRole` (it is above the `Primary`/child taxonomy).
+            // no `SessionRole` (it is above the `Primary`/child taxonomy), and no v29
+            // lifetime/engine enrichment.
             profile: None,
             session: None,
             title: None,
             role: None,
+            lifetime: None,
+            engine: None,
         }
     }
 
@@ -614,12 +617,15 @@ fn project_unit(id: &UnitId, record: &ChildRecord) -> UnitNode {
         work: Some(render_work(&record.work)),
         usage: record.usage,
         children: Vec::new(),
-        // Profile/title are not tracked on the fleet child record yet; the host's `node_for` seam
-        // enriches them from session meta when projecting the tree.
+        // Profile/title (and the v29 lifetime/engine enrichment) are not tracked on the fleet
+        // child record; the host's `node_for` seam enriches them from session meta + the profile
+        // store when projecting the durable tree.
         profile: None,
         session,
         title: None,
         role,
+        lifetime: None,
+        engine: None,
     }
 }
 

@@ -239,9 +239,15 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         manager: host.manager().clone(),
         partition: a.partition,
         engine_builder: session_builder,
-        fleet: Some(
-            Arc::new(FleetViewImpl::new(a.store.clone(), fleet.clone())) as Arc<dyn FleetControl>
-        ),
+        fleet: Some({
+            let mut view = FleetViewImpl::new(a.store.clone(), fleet.clone());
+            // Wire v29 tree enrichment: a bound unit's node denormalizes its profile's engine
+            // selector, so the projection needs the profile store when the node manages profiles.
+            if let Some(profiles) = a.profiles.clone() {
+                view = view.with_profiles(profiles);
+            }
+            Arc::new(view) as Arc<dyn FleetControl>
+        }),
     })
     // Live interactive sessions journal per turn; also records the signer so history reads verify.
     .with_journal(a.store.clone(), shared.signer.clone())

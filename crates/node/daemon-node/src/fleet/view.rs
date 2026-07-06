@@ -21,12 +21,27 @@ use daemon_orchestration::FleetRuntime;
 pub struct FleetViewImpl {
     store: Arc<dyn daemon_store::SessionStore>,
     fleet: FleetRuntime,
+    /// The profile store backing per-node engine enrichment (wire v29 `UnitNode.engine`): a bound
+    /// profile's `EngineSelector` is denormalized onto its tree node. `None` (a node without
+    /// profile management) leaves `engine` unset.
+    profiles: Option<Arc<dyn daemon_host::ProfileStore>>,
 }
 
 impl FleetViewImpl {
     /// A control-surface projection over the durable `store`, with `fleet` for cancel routing.
     pub fn new(store: Arc<dyn daemon_store::SessionStore>, fleet: FleetRuntime) -> Self {
-        Self { store, fleet }
+        Self {
+            store,
+            fleet,
+            profiles: None,
+        }
+    }
+
+    /// Attach the profile store so each bound unit's tree node carries its profile's
+    /// [`EngineSelector`](daemon_api::EngineSelector) (wire v29 enrichment).
+    pub fn with_profiles(mut self, profiles: Arc<dyn daemon_host::ProfileStore>) -> Self {
+        self.profiles = Some(profiles);
+        self
     }
 
     /// Build the tree node for one durable session from its status + durable child edge.
@@ -59,6 +74,28 @@ impl FleetViewImpl {
                 daemon_api::SessionRole::EphemeralSubagent
             }
         };
+        // The declared delegation lifetime (wire v29), derived from the durable role — the SERVER
+        // owns the role->lifetime rule (`ChildLifetime::role` is the forward direction stamped at
+        // materialize time), so clients never re-implement the inversion. Primary units carry none.
+        let lifetime = match role {
+            daemon_api::SessionRole::ManagedChild => {
+                Some(daemon_protocol::DelegationLifetime::Persistent)
+            }
+            daemon_api::SessionRole::EphemeralSubagent => {
+                Some(daemon_protocol::DelegationLifetime::Ephemeral)
+            }
+            daemon_api::SessionRole::Primary => None,
+        };
+        // Denormalize the bound profile's engine selector (wire v29) so a tree render needs no
+        // per-node ProfileGet. Absent profile store / unbound unit / vanished profile => None.
+        let engine = match (&self.profiles, &meta.bound_profile) {
+            (Some(profiles), Some(profile)) => profiles
+                .get(profile.as_str())
+                .ok()
+                .flatten()
+                .map(|spec| spec.engine),
+            _ => None,
+        };
         daemon_api::UnitNode {
             id: UnitId::new(session.as_str()),
             kind,
@@ -70,6 +107,8 @@ impl FleetViewImpl {
             session: Some(session.clone()),
             title: meta.title,
             role: Some(role),
+            lifetime,
+            engine,
         }
     }
 }

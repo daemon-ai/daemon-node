@@ -1542,6 +1542,18 @@ pub struct UnitNode {
     /// `None` on legacy payloads => treat as `Primary`.
     #[serde(default)]
     pub role: Option<SessionRole>,
+    /// The declared delegation lifetime (wire v29) in the orchestrate-tool vocabulary a client
+    /// chips a child with (persistent managed child vs transient subagent). Derived server-side
+    /// from the durable role, so clients never re-implement the role->lifetime rule. `None` for a
+    /// primary (non-delegated) unit.
+    #[serde(default)]
+    pub lifetime: Option<DelegationLifetime>,
+    /// Which execution engine the unit's bound profile selects (wire v29): `Core` or
+    /// `Foreign { agent }`, denormalized from the profile spec so a tree render needs no
+    /// per-node profile fetch. `None` when the unit has no bound profile (or the projection has
+    /// no profile store).
+    #[serde(default)]
+    pub engine: Option<EngineSelector>,
 }
 
 /// The orchestration tree as the GUI/TUI sees it: a flat node list rooted at `root`. `nodes` is
