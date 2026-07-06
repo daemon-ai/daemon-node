@@ -6,7 +6,10 @@
 #   * outbound HTTP must go through `daemon_egress::EgressClient` (SSRF-safe,
 #     per-hop-revalidated redirects), not a raw `reqwest::Client`;
 #   * every process spawn must be a declared, reviewed `#[allow]` site, so a
-#     new `Command::new("sh"/"bash", "-c", ...)` cannot land un-gated.
+#     new `Command::new("sh"/"bash", "-c", ...)` cannot land un-gated;
+#   * every child-process env mutation must go through
+#     `daemon_common::env_policy::EnvPolicy::apply` (a declared InheritFull/Clean
+#     choice), so undeclared inheritance/scrub cannot land un-gated.
 #
 # Mechanism notes (why it is shaped this way):
 #   * clippy.toml is workspace-global and `disallowed_methods` is a single lint,
@@ -69,4 +72,17 @@ disallowed-methods = [
     #     form must live only in the gated exec path (daemon-processes registry). ---
     { path = "std::process::Command::new",   reason = "declare the spawn; sh/bash -c only via the gated exec path" },
     { path = "tokio::process::Command::new", reason = "declare the spawn; sh/bash -c only via the gated exec path" },
+
+    # --- env: every child-process env mutation must be a declared EnvPolicy applied via
+    #     daemon_common::env_policy::EnvPolicy::apply (backed by the two anchored EnvSink impls in
+    #     env_policy.rs, the only sanctioned env-mutation site). An undeclared inheritance/scrub is
+    #     thus unrepresentable. NOTE: shares the single `disallowed_methods` lint with the fs/spawn
+    #     bans, so a scope-level fs `#[allow(clippy::disallowed_methods)]` also silences these (the
+    #     accepted coupling residual; see HARDENING-PLAN.md §4/§7). ---
+    { path = "std::process::Command::env",         reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "std::process::Command::env_clear",   reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "std::process::Command::envs",        reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "tokio::process::Command::env",       reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "tokio::process::Command::env_clear", reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "tokio::process::Command::envs",      reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
 ]

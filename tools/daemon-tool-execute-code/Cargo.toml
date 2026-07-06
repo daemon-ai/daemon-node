@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 daemon-core = { workspace = true }
 daemon-protocol = { workspace = true }
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["process"] }
 # Kernel-enforced exec sandbox: posture decision + the in-process Linux Landlock/seccomp backend
 # (owns the `pre_exec` unsafe so this crate keeps `#![forbid(unsafe_code)]`).
 daemon-sandbox = { workspace = true }

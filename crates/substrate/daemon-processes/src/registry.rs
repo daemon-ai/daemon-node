@@ -458,12 +458,16 @@ impl ProcessRegistry {
             .arg("-c")
             .arg(script)
             .current_dir(cwd)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("PYTHONUNBUFFERED", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        // EnvPolicy::Clean — the one gated background `sh -c` capability: scrubbed env (PATH only)
+        // plus the unbuffered marker, unchanged. Routed through the sanctioned `apply` on the std
+        // `Command` (EnvSink), so this env stays a declared, lintable choice (Cluster E).
+        daemon_common::env_policy::EnvPolicy::Clean {
+            allowlist: vec!["PATH".into()],
+        }
+        .apply(&mut command, &[("PYTHONUNBUFFERED", "1")]);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
