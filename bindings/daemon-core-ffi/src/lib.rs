@@ -951,20 +951,23 @@ mod fixture_tests {
 
     use super::*;
 
-    /// CBOR for `AgentCommand::StartTurn { input: { text: "hi", attachments: [] }, request_id: 1 }`
-    /// (externally-tagged: `{"StartTurn": {"input": {"text": "hi", "attachments": []},
-    /// "request_id": 1}}`).
+    /// CBOR for `AgentCommand::StartTurn { input: { text: "hi", attachments: [], notice: null },
+    /// request_id: 1 }` (externally-tagged: `{"StartTurn": {"input": {"text": "hi",
+    /// "attachments": [], "notice": null}, "request_id": 1}}`). `notice` is the wire-v29
+    /// completion-notice provenance field on `UserMsg` (`#[serde(default)]`, always encoded).
     const START_TURN_HI: &[u8] = &[
         0xA1, // map(1)
         0x69, b'S', b't', b'a', b'r', b't', b'T', b'u', b'r', b'n', // "StartTurn"
         0xA2, // map(2)
         0x65, b'i', b'n', b'p', b'u', b't', // "input"
-        0xA2, // map(2)
+        0xA3, // map(3)
         0x64, b't', b'e', b'x', b't', // "text"
         0x62, b'h', b'i', // "hi"
         0x6B, b'a', b't', b't', b'a', b'c', b'h', b'm', b'e', b'n', b't',
         b's', // "attachments"
         0x80, // array(0)
+        0x66, b'n', b'o', b't', b'i', b'c', b'e', // "notice"
+        0xF6, // null
         0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd', // "request_id"
         0x01, // 1
     ];

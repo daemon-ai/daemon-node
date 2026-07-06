@@ -19,17 +19,20 @@
 
 #include "../include/daemon_core.h"
 
-/* CBOR for AgentCommand::StartTurn { input: { text: "hi", attachments: [] }, request_id: 1 }. */
+/* CBOR for AgentCommand::StartTurn { input: { text: "hi", attachments: [], notice: null },
+ * request_id: 1 }. `notice` is the wire-v29 UserMsg field (serde default, always encoded). */
 static const uint8_t START_TURN_HI[] = {
     0xA1,
     0x69, 'S','t','a','r','t','T','u','r','n',
     0xA2,
     0x65, 'i','n','p','u','t',
-    0xA2,
+    0xA3,
     0x64, 't','e','x','t',
     0x62, 'h','i',
     0x6B, 'a','t','t','a','c','h','m','e','n','t','s',
     0x80,
+    0x66, 'n','o','t','i','c','e',
+    0xF6,
     0x6A, 'r','e','q','u','e','s','t','_','i','d',
     0x01,
 };
