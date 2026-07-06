@@ -138,6 +138,27 @@ impl EgressRequest {
         })
     }
 
+    /// A `POST` of `pairs` as an `application/x-www-form-urlencoded` body — the RFC 6749 token
+    /// endpoint shape (OAuth2 code exchange / refresh). Encoded through [`Url`]'s form
+    /// serializer, so escaping matches what a token endpoint expects.
+    pub fn post_form(url: impl Into<String>, pairs: &[(&str, &str)]) -> Self {
+        // A throwaway base URL only hosts the query-pair serializer; nothing of it is sent.
+        let mut enc = Url::parse("http://form.invalid/").expect("static base url parses");
+        enc.query_pairs_mut().extend_pairs(pairs);
+        let body = enc.query().unwrap_or_default().as_bytes().to_vec();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        Self {
+            method: Method::POST,
+            url: url.into(),
+            headers,
+            body: Some(body),
+        }
+    }
+
     /// Set a header (best-effort: an invalid name/value is ignored). Chainable.
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -391,6 +412,30 @@ mod tests {
         assert!(!stripped.contains_key(AUTHORIZATION));
         assert!(!stripped.contains_key(COOKIE));
         assert!(!stripped.contains_key(PROXY_AUTHORIZATION));
+    }
+
+    #[test]
+    fn post_form_encodes_pairs_as_urlencoded_body() {
+        let req = EgressRequest::post_form(
+            "https://idp.example/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", "http://127.0.0.1:7777/cb"),
+                ("code", "a b+c"),
+            ],
+        );
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(
+            req.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/x-www-form-urlencoded")
+        );
+        let body = String::from_utf8(req.body.expect("form body")).unwrap();
+        assert!(body.contains("grant_type=authorization_code"), "{body}");
+        assert!(
+            body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A7777%2Fcb"),
+            "{body}"
+        );
+        assert!(body.contains("code=a+b%2Bc"), "{body}");
     }
 
     #[test]
