@@ -2768,6 +2768,8 @@ dependencies = [
 name = "daemon-skills"
 version = "0.0.1"
 dependencies = [
+ "bc-components",
+ "bc-envelope",
  "ciborium",
  "daemon-common",
  "daemon-core",

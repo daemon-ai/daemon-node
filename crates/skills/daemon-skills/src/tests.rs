@@ -302,3 +302,84 @@ fn archive_restore_round_trip() {
         Err(SkillError::Invalid(_)) | Err(SkillError::NotFound(_))
     ));
 }
+
+// --- wire v28: opt-in verify-at-import gate -----------------------------------------------------
+
+/// Build a portable bundle carrying a valid SKILL.md (`ARXIV`) under `name`.
+fn arxiv_bundle(name: &str) -> daemon_common::SkillBundle {
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("SKILL.md".to_string(), ARXIV.to_string());
+    daemon_common::SkillBundle {
+        name: name.to_string(),
+        category: Some("research".to_string()),
+        files,
+        signature: None,
+    }
+}
+
+/// Default-off: with NO verifier configured, an unsigned bundle imports exactly as before.
+#[test]
+fn import_unsigned_default_off() {
+    let (d, store) = store();
+    let bundle = arxiv_bundle("arxiv");
+    store
+        .import_bundle(&bundle, daemon_common::Author::Operator, "import")
+        .expect("unsigned import succeeds when signing is off");
+    assert!(d.path().join("skills/research/arxiv/SKILL.md").exists());
+}
+
+/// With a verifier configured, a correctly-signed bundle imports and lands on disk.
+#[test]
+fn import_valid_signature_succeeds() {
+    let (d, _s) = store();
+    let signer = crate::SkillBundleSigner::generate();
+    let store = SkillStore::new(d.path().join("skills"))
+        .with_import_verification(std::sync::Arc::new(signer.verifier()));
+    let mut bundle = arxiv_bundle("arxiv");
+    bundle.signature = Some(signer.sign(&bundle));
+
+    store
+        .import_bundle(&bundle, daemon_common::Author::Operator, "import")
+        .expect("valid signature imports");
+    assert!(d.path().join("skills/research/arxiv/SKILL.md").exists());
+}
+
+/// With a verifier configured, a tampered bundle is refused and NOTHING is written (fail-closed).
+#[test]
+fn import_tampered_signature_refused_nothing_written() {
+    let (d, _s) = store();
+    let signer = crate::SkillBundleSigner::generate();
+    let store = SkillStore::new(d.path().join("skills"))
+        .with_import_verification(std::sync::Arc::new(signer.verifier()));
+    let mut bundle = arxiv_bundle("arxiv");
+    bundle.signature = Some(signer.sign(&bundle));
+    // Mutate a file after signing — the signature no longer matches the content.
+    bundle
+        .files
+        .insert("SKILL.md".into(), ARXIV.replace("arXiv", "evilXiv"));
+
+    let err = store
+        .import_bundle(&bundle, daemon_common::Author::Operator, "import")
+        .expect_err("tampered bundle must be refused");
+    assert!(matches!(err, SkillError::Signature(_)));
+    assert!(
+        !d.path().join("skills/research/arxiv").exists(),
+        "fail-closed: nothing is written on a rejected signature",
+    );
+}
+
+/// With a verifier configured, an unsigned bundle is refused (a require gate, not best-effort).
+#[test]
+fn import_absent_signature_refused_when_required() {
+    let (d, _s) = store();
+    let signer = crate::SkillBundleSigner::generate();
+    let store = SkillStore::new(d.path().join("skills"))
+        .with_import_verification(std::sync::Arc::new(signer.verifier()));
+    let bundle = arxiv_bundle("arxiv"); // signature: None
+
+    let err = store
+        .import_bundle(&bundle, daemon_common::Author::Operator, "import")
+        .expect_err("unsigned bundle must be refused when a key is configured");
+    assert!(matches!(err, SkillError::Signature(_)));
+    assert!(!d.path().join("skills/research/arxiv").exists());
+}

@@ -541,6 +541,10 @@ impl Incarnation for CoreIncarnation {
                         epoch: suspension.epoch,
                         prompt: p.prompt.clone(),
                         path: p.path.clone(),
+                        // wire v28: carry the resolved command fingerprint onto the durable row so
+                        // the operator surface can display it structurally (hex digest; the
+                        // approve-then-swap enforcement stays on the engine's typed `PendingApproval`).
+                        fingerprint: p.fingerprint.as_ref().map(|f| f.as_str().to_string()),
                         decision: None,
                     })
                     .collect();

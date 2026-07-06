@@ -169,6 +169,7 @@ mod tests {
             context_length: None,
             file_type: None,
             mmproj_path: None,
+            sha256: None,
         }
     }
 

@@ -36,8 +36,10 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 mod curator;
+mod signing;
 mod usage;
 pub use curator::{apply_automatic_transitions, CuratorConfig, CuratorTransition};
+pub use signing::{SkillBundleSigner, SkillBundleVerifier};
 pub use usage::FileSkillUsageLog;
 
 /// The curated, tool-agnostic skills daemon ships with, embedded into the binary at compile time and
@@ -77,6 +79,10 @@ pub enum SkillError {
     /// An underlying filesystem error.
     #[error("skills io: {0}")]
     Io(String),
+    /// A bundle failed the opt-in verify-at-import signature gate (absent, malformed, or a signature
+    /// that does not verify against the configured trusted key). Fail-closed: nothing is written.
+    #[error("skill signature rejected: {0}")]
+    Signature(String),
 }
 
 impl From<std::io::Error> for SkillError {
@@ -248,6 +254,10 @@ pub struct SkillStore {
     /// The author attributed to writes through the model-facing tool surface (the agent). Operator
     /// writes (import / revert from the NodeApi) pass their author explicitly.
     default_author: Author,
+    /// The optional verify-at-import trust anchor (wire v28). `None` (the default) => signing is off
+    /// and `import_bundle` behaves exactly as before. When `Some`, an import must carry a signature
+    /// that verifies against this key or it is refused (fail-closed).
+    verifier: Option<Arc<SkillBundleVerifier>>,
 }
 
 impl SkillStore {
@@ -259,12 +269,22 @@ impl SkillStore {
             revisions: None,
             usage: None,
             default_author: Author::Agent("skill_manage".to_string()),
+            verifier: None,
         }
     }
 
     /// Attach an append-only [`RevisionLog`] so every write records a versioned skill snapshot.
     pub fn with_revisions(mut self, revisions: Arc<dyn RevisionLog>) -> Self {
         self.revisions = Some(revisions);
+        self
+    }
+
+    /// Attach a verify-at-import trust anchor (wire v28, opt-in). Once set, [`import_bundle`] refuses
+    /// any bundle without a signature that verifies against `verifier`. Default-off (no verifier).
+    ///
+    /// [`import_bundle`]: SkillStore::import_bundle
+    pub fn with_import_verification(mut self, verifier: Arc<SkillBundleVerifier>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -527,6 +547,8 @@ impl SkillStore {
             name: entry.name,
             category: entry.category,
             files,
+            // Export produces an unsigned bundle; an operator signs out-of-band before distribution.
+            signature: None,
         })
     }
 
@@ -552,6 +574,12 @@ impl SkillStore {
         author: Author,
         reason: &str,
     ) -> Result<(), SkillError> {
+        // wire v28 verify-at-import gate (opt-in): when a trust anchor is configured, refuse a bundle
+        // whose signature is absent or does not verify — BEFORE any filesystem write (fail-closed).
+        // With no verifier configured this is a no-op and unsigned bundles import as before.
+        if let Some(verifier) = &self.verifier {
+            verifier.verify(bundle)?;
+        }
         validate_name(&bundle.name)?;
         let dir = match &bundle.category {
             Some(cat) => {
@@ -690,6 +718,7 @@ impl SkillStore {
             name: name.to_string(),
             category: None,
             files: BTreeMap::new(),
+            signature: None,
         });
         let mut blob = Vec::new();
         if ciborium::into_writer(&bundle, &mut blob).is_ok() {
@@ -841,6 +870,9 @@ pub struct SkillsProvider {
     /// The per-profile usage sidecar factory: given a store root, yields the `.usage.json`-backed log
     /// attached to that profile's store (`None` => usage tracking off).
     usage: Option<UsageLogFactory>,
+    /// The optional verify-at-import trust anchor (wire v28), propagated to every resolved store.
+    /// `None` (default) => skill-bundle signing is off node-wide.
+    verifier: Option<Arc<SkillBundleVerifier>>,
     /// Resolved stores, keyed by profile id (read-mostly; one resident store per agent).
     cache: Mutex<HashMap<String, Arc<SkillStore>>>,
 }
@@ -852,6 +884,7 @@ impl SkillsProvider {
             root: SkillsRoot::PerProfile(data_dir.into()),
             revisions: None,
             usage: None,
+            verifier: None,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -863,6 +896,7 @@ impl SkillsProvider {
             root: SkillsRoot::Fixed(dir.into()),
             revisions: None,
             usage: None,
+            verifier: None,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -870,6 +904,13 @@ impl SkillsProvider {
     /// Attach the shared revision log every resolved store records writes through.
     pub fn with_revisions(mut self, revisions: Arc<dyn RevisionLog>) -> Self {
         self.revisions = Some(revisions);
+        self
+    }
+
+    /// Attach the verify-at-import trust anchor (wire v28, opt-in): every resolved [`SkillStore`]
+    /// then requires a valid signature on `import_bundle`. Default-off (no verifier configured).
+    pub fn with_import_verification(mut self, verifier: Arc<SkillBundleVerifier>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -902,6 +943,9 @@ impl SkillsProvider {
         }
         if let Some(factory) = &self.usage {
             store = store.with_usage(factory(&root));
+        }
+        if let Some(verifier) = &self.verifier {
+            store = store.with_import_verification(verifier.clone());
         }
         let store = Arc::new(store);
         match store.seed_bundled() {
