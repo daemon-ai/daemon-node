@@ -69,8 +69,8 @@ impl NodeApiImpl {
                 crate::adapters::AdapterRegistry::new(),
             )),
             mgmt_journal: Arc::new(std::sync::Mutex::new(None)),
-            acp: None,
-            last_acp: Arc::new(std::sync::RwLock::new(Vec::new())),
+            agents: None,
+            last_agents: Arc::new(std::sync::RwLock::new(Vec::new())),
             checkpoints: None,
             auth_flows: None,
             fleet_events: None,
@@ -246,10 +246,11 @@ impl NodeApiImpl {
         self
     }
 
-    /// Attach the ACP-discovery hook (I7) so `acp_discover` probes the curated direct-binary recipe
-    /// table via the ACP `initialize` handshake. Injected by the binary (which owns `daemon-acp`).
-    pub fn with_acp_discovery(mut self, acp: Arc<dyn AcpDiscovery>) -> Self {
-        self.acp = Some(acp);
+    /// Attach the foreign-agent discovery hook (I7) so `agent_discover` probes the curated
+    /// direct-binary recipe table (ACP entries via the `initialize` handshake). Injected by the
+    /// binary (which owns `daemon-acp`).
+    pub fn with_agent_discovery(mut self, agents: Arc<dyn AgentDiscovery>) -> Self {
+        self.agents = Some(agents);
         self
     }
 

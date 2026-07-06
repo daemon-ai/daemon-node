@@ -839,31 +839,31 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("directory_search".into()))
     }
 
-    // -- ACP discovery + registry (catalog-style; the daemon probes its own PATH/endpoints) --
+    // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
-    /// Trigger a server-side ACP discovery scan (PATH + well-known locations + the curated
-    /// known-agent recipe table + configured endpoints), confirming each candidate via the ACP
-    /// `initialize` handshake. Operator-triggered (spawns subprocesses), like `model_search`.
-    /// Default: empty.
-    async fn acp_discover(&self) -> Vec<AcpAgentEntry> {
+    /// Trigger a server-side foreign-agent discovery scan (PATH + well-known locations + the
+    /// curated known-agent recipe table + configured endpoints), confirming each ACP candidate via
+    /// the `initialize` handshake (stream-json entries are PATH-probed only). Operator-triggered
+    /// (spawns subprocesses), like `model_search`. Default: empty.
+    async fn agent_discover(&self) -> Vec<AgentEntry> {
         Vec::new()
     }
 
-    /// The last ACP discovery results plus any manually-registered recipes (the persisted catalog a
+    /// The last discovery results plus any manually-registered recipes (the persisted catalog a
     /// GUI renders). Default: empty.
-    async fn acp_catalog(&self) -> Vec<AcpAgentEntry> {
+    async fn agent_catalog(&self) -> Vec<AgentEntry> {
         Vec::new()
     }
 
-    /// Manually register (persist) an ACP agent launch recipe — for a local path auto-detect missed
-    /// or a remote endpoint. Default: unsupported.
-    async fn acp_register(&self, _entry: AcpAgentEntry) -> Result<(), ApiError> {
-        Err(ApiError::Unsupported("acp_register".into()))
+    /// Manually register (persist) a foreign-agent launch recipe — for a local path auto-detect
+    /// missed or a remote endpoint. Default: unsupported.
+    async fn agent_register(&self, _entry: AgentEntry) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("agent_register".into()))
     }
 
-    /// Remove a registered/cataloged ACP agent by name. Default: unsupported.
-    async fn acp_remove(&self, _name: String) -> Result<(), ApiError> {
-        Err(ApiError::Unsupported("acp_remove".into()))
+    /// Remove a registered/cataloged foreign agent by name. Default: unsupported.
+    async fn agent_remove(&self, _name: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("agent_remove".into()))
     }
 
     // -- Log-tail (I16): a node-level observability stream (shape now; thin impl later) --
@@ -2087,24 +2087,39 @@ pub struct RewindPoint {
     pub restore_workspace: bool,
 }
 
-/// Where a cataloged ACP agent's launch recipe came from.
+/// Where a cataloged foreign agent's launch recipe came from.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AcpSource {
+pub enum AgentSource {
     /// From the curated builtin known-agent recipe table.
     Builtin,
-    /// Manually registered by an operator (via [`ControlApi::acp_register`]).
+    /// Manually registered by an operator (via [`ControlApi::agent_register`]).
     Manual,
     /// A network endpoint (TCP / stdio-bus / remote), not a PATH binary.
     Endpoint,
 }
 
-/// A launch recipe for a foreign ACP agent — the catalog's mirror of the host's spawn spec. Either a
+/// The wire protocol a cataloged foreign agent speaks — selects the adapter the node drives the
+/// spawned agent with (wire v29; the registry mirror of the fleet spawner's `ForeignProtocol`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentProtocol {
+    /// Agent Client Protocol: symmetric JSON-RPC 2.0 over stdio (the default; pre-v29 entries
+    /// decode as ACP). Probed via the ACP `initialize` handshake.
+    #[default]
+    Acp,
+    /// Claude-Code `stream-json`: NDJSON event envelope over the line transport (also Amp, Cursor).
+    /// Probed installed-on-PATH only — there is no `initialize` handshake, so `version` and
+    /// `capabilities` stay empty.
+    StreamJson,
+}
+
+/// A launch recipe for a foreign agent — the catalog's mirror of the host's spawn spec. Either a
 /// stdio subprocess (`program` + `args` + `env`) or a network `endpoint`; exactly one is meaningful
 /// per `source`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcpRecipe {
+pub struct AgentRecipe {
     /// The program to exec for a stdio agent (the candidate binary, possibly an adapter shim).
     #[serde(default)]
     pub program: Option<String>,
@@ -2119,24 +2134,30 @@ pub struct AcpRecipe {
     pub endpoint: Option<String>,
 }
 
-/// One entry in the ACP agent catalog ([`ControlApi::acp_catalog`] / [`ControlApi::acp_discover`]):
-/// a known/registered agent, whether it is installed, and the ACP `initialize`-verified metadata.
+/// One entry in the foreign-agent catalog ([`ControlApi::agent_catalog`] /
+/// [`ControlApi::agent_discover`]): a known/registered agent, the protocol it speaks, whether it is
+/// installed, and (for ACP) the `initialize`-verified metadata.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcpAgentEntry {
+pub struct AgentEntry {
     /// The agent display name (catalog key, e.g. `"gemini"`, `"goose"`, `"claude-via-zed"`).
     pub name: String,
     /// How to launch it.
-    pub recipe: AcpRecipe,
+    pub recipe: AgentRecipe,
     /// Where the recipe came from.
-    pub source: AcpSource,
+    pub source: AgentSource,
+    /// The wire protocol the agent speaks (wire v29; pre-v29 encodings decode as `Acp`).
+    #[serde(default)]
+    pub protocol: AgentProtocol,
     /// Whether a candidate binary/endpoint was found (PATH/well-known/endpoint probe).
     #[serde(default)]
     pub installed: bool,
-    /// The ACP protocol version the agent reported at `initialize`, when probed.
+    /// The ACP protocol version the agent reported at `initialize`, when probed (`None` for
+    /// stream-json agents — they have no handshake).
     #[serde(default)]
     pub version: Option<String>,
-    /// Agent capabilities advertised at `initialize` (opaque key/value), when probed.
+    /// Agent capabilities advertised at `initialize` (opaque key/value), when probed (empty for
+    /// stream-json agents).
     #[serde(default)]
     pub capabilities: Vec<(String, String)>,
 }
@@ -4084,20 +4105,37 @@ mod tests {
                     restore_workspace: true,
                 },
             },
-            ApiRequest::AcpDiscover,
-            ApiRequest::AcpRegister {
-                entry: AcpAgentEntry {
+            ApiRequest::AgentDiscover,
+            ApiRequest::AgentRegister {
+                entry: AgentEntry {
                     name: "gemini".into(),
-                    recipe: AcpRecipe {
+                    recipe: AgentRecipe {
                         program: Some("gemini".into()),
                         args: vec!["--acp".into()],
                         env: vec![("KEY".into(), "v".into())],
                         endpoint: None,
                     },
-                    source: AcpSource::Builtin,
+                    source: AgentSource::Builtin,
+                    protocol: AgentProtocol::Acp,
                     installed: true,
                     version: Some("0.1".into()),
                     capabilities: vec![("fs".into(), "true".into())],
+                },
+            },
+            ApiRequest::AgentRegister {
+                entry: AgentEntry {
+                    name: "claude".into(),
+                    recipe: AgentRecipe {
+                        program: Some("claude".into()),
+                        args: vec!["--output-format".into(), "stream-json".into()],
+                        env: Vec::new(),
+                        endpoint: None,
+                    },
+                    source: AgentSource::Manual,
+                    protocol: AgentProtocol::StreamJson,
+                    installed: true,
+                    version: None,
+                    capabilities: Vec::new(),
                 },
             },
         ];

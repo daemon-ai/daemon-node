@@ -466,13 +466,13 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
     })
 }
 
-/// Extension registry + node config: ACP agents, providers, tools, commands, config.
+/// Extension registry + node config: foreign agents, providers, tools, commands, config.
 async fn serve_registry(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
-        ApiRequest::AcpDiscover => ApiResponse::AcpCatalog(api.acp_discover().await),
-        ApiRequest::AcpCatalog => ApiResponse::AcpCatalog(api.acp_catalog().await),
-        ApiRequest::AcpRegister { entry } => unit_or_err(api.acp_register(entry).await),
-        ApiRequest::AcpRemove { name } => unit_or_err(api.acp_remove(name).await),
+        ApiRequest::AgentDiscover => ApiResponse::AgentCatalog(api.agent_discover().await),
+        ApiRequest::AgentCatalog => ApiResponse::AgentCatalog(api.agent_catalog().await),
+        ApiRequest::AgentRegister { entry } => unit_or_err(api.agent_register(entry).await),
+        ApiRequest::AgentRemove { name } => unit_or_err(api.agent_remove(name).await),
         ApiRequest::ProviderList => ApiResponse::Providers(api.provider_list().await),
         ApiRequest::ProviderRegister { provider } => {
             unit_or_err(api.provider_register(provider).await)

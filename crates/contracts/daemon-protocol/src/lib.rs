@@ -66,6 +66,35 @@ impl UserMsg {
     }
 }
 
+/// Which execution engine a profile's sessions run on (wire v23; generalized in v29).
+///
+/// `Core` (the default) is the native in-process `daemon-core` engine, materialized from the
+/// profile's provider/model through the usual resolution path. `Foreign { agent }` binds the
+/// profile to a foreign agent from the node's agent catalog, referenced **by name only**: the host
+/// resolves the name to the catalog entry's launch recipe + protocol at spawn time and drives it
+/// through the foreign spawn seam (ACP adapter or the stream-json codec, per the entry's
+/// `AgentProtocol`) — the genai provider/model path is bypassed entirely.
+///
+/// SECURITY INVARIANT (deliberate design): launch recipes never travel in profiles. Recipes stay
+/// node-side and operator-managed (`agent_register` under existing authz), so a `ProfileCreate` can
+/// never smuggle an arbitrary binary spawn — it can only *name* an agent the node already knows.
+///
+/// Lives in `daemon-protocol` (not `daemon-api`) so the fleet tree's `UnitNode` — a protocol type —
+/// can carry the per-unit engine without a contract-crate cycle; `daemon-api` re-exports it next to
+/// `ProfileSpec`, which is the primary carrier.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineSelector {
+    /// The native in-process `daemon-core` engine (provider/model resolution applies).
+    #[default]
+    Core,
+    /// A foreign agent, referenced by its catalog name (never by a recipe).
+    Foreign {
+        /// The agent catalog entry name (e.g. `"gemini"`, `"goose"`, or a manual registration).
+        agent: String,
+    },
+}
+
 /// The lifetime a parent declares for a delegated child — the protocol-level mirror of the store's
 /// `ChildLifetime`, carried inside the opaque delegation payload so the contract crates stay
 /// decoupled (`daemon-protocol` depends only on `daemon-common`; the store enum lives in

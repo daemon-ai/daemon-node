@@ -353,41 +353,41 @@ impl NodeApiImpl {
             .ok_or_else(|| ApiError::Unsupported("profile management not available".into()))
     }
 
-    /// Resolve an ACP catalog entry by `name`: the merged catalog (durable manual registrations +
+    /// Resolve an agent-catalog entry by `name`: the merged catalog (durable manual registrations +
     /// the last discovery scan) first, then the curated builtin recipe table via the injected
-    /// [`AcpDiscovery`](crate::AcpDiscovery) hook (a cheap PATH check, never an `initialize`
+    /// [`AgentDiscovery`](crate::AgentDiscovery) hook (a cheap PATH check, never an `initialize`
     /// probe — validation must not spawn candidate processes). `None` when the node knows no such
     /// agent. Profiles reference agents BY NAME ONLY, so this lookup is the sole recipe source.
-    pub(crate) async fn resolve_acp_entry(&self, name: &str) -> Option<daemon_api::AcpAgentEntry> {
+    pub(crate) async fn resolve_agent_entry(&self, name: &str) -> Option<daemon_api::AgentEntry> {
         if let Some(entry) = self
-            .acp_catalog()
+            .agent_catalog()
             .await
             .into_iter()
             .find(|e| e.name == name)
         {
             return Some(entry);
         }
-        self.acp.as_ref().and_then(|acp| acp.builtin(name))
+        self.agents.as_ref().and_then(|agents| agents.builtin(name))
     }
 
     /// Validate a profile spec's engine selector before it is persisted (create/update/import):
-    /// an `Acp { agent }` binding must name an agent the node's ACP catalog knows AND that is
+    /// a `Foreign { agent }` binding must name an agent the node's catalog knows AND that is
     /// currently installed — otherwise the mutation fails fast with a clear error instead of
     /// minting a profile whose sessions can never spawn. (Spawn re-checks installed-ness too,
     /// since it can change after validation.) `Core` always passes.
     pub(crate) async fn validate_engine(&self, spec: &ProfileSpec) -> Result<(), ApiError> {
-        let daemon_api::EngineSelector::Acp { agent } = &spec.engine else {
+        let daemon_api::EngineSelector::Foreign { agent } = &spec.engine else {
             return Ok(());
         };
-        let entry = self.resolve_acp_entry(agent).await.ok_or_else(|| {
+        let entry = self.resolve_agent_entry(agent).await.ok_or_else(|| {
             ApiError::Other(format!(
-                "profile engine references unknown ACP agent `{agent}` — register it via \
-                 acp_register or run AcpDiscover first"
+                "profile engine references unknown agent `{agent}` — register it via \
+                 agent_register or run AgentDiscover first"
             ))
         })?;
         if !entry.installed {
             return Err(ApiError::Other(format!(
-                "ACP agent `{agent}` is not installed (catalog entry present, binary/endpoint \
+                "agent `{agent}` is not installed (catalog entry present, binary/endpoint \
                  missing)"
             )));
         }

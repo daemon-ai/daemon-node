@@ -683,24 +683,33 @@ gguf-info = {
   "size_bytes": uint64,
 }
 
-; ----- ACP agent discovery/catalog DTOs (wire v14; ControlApi::acp_*) -----
-; Where a cataloged ACP agent's launch recipe came from. A recipe is either a stdio subprocess
-; (`program` + `args` + `env`) or a network `endpoint`; capabilities/version are `initialize`-verified.
-acp-source = "Builtin"
-           / "Manual"
-           / "Endpoint"
+; ----- foreign-agent discovery/catalog DTOs (wire v14 as acp-*; renamed + protocol-tagged in
+; v29; ControlApi::agent_*) -----
+; Where a cataloged foreign agent's launch recipe came from. A recipe is either a stdio subprocess
+; (`program` + `args` + `env`) or a network `endpoint`; capabilities/version are `initialize`-verified
+; for ACP agents (stream-json agents have no handshake, so both stay empty).
+agent-source = "Builtin"
+             / "Manual"
+             / "Endpoint"
 
-acp-recipe = {
+; The wire protocol a cataloged agent speaks (wire v29): ACP (JSON-RPC over stdio, the serde
+; default — pre-v29 entries without the field decode as "Acp") or Claude-Code-style stream-json
+; (NDJSON over the line transport).
+agent-protocol = "Acp"
+               / "StreamJson"
+
+agent-recipe = {
   ? "program": (tstr / null),
   ? "args": [* tstr],
   ? "env": [* kv-pair],
   ? "endpoint": (tstr / null),
 }
 
-acp-agent-entry = {
+agent-entry = {
   "name": tstr,
-  "recipe": acp-recipe,
-  "source": acp-source,
+  "recipe": agent-recipe,
+  "source": agent-source,
+  ? "protocol": agent-protocol,
   ? "installed": bool,
   ? "version": (tstr / null),
   ? "capabilities": [* kv-pair],
@@ -823,15 +832,17 @@ distribution = {
 engine-tunables = { "model_retry_attempts": (uint / null), "context_budget_tokens": (uint / null), "max_iterations": (uint / null), "tool_result_budget": (uint / null) }
 context-engine-sel = "lcm" / "budgeted"
 memory-provider-sel = "mnemosyne" / "file" / "none"
-; which execution engine a profile's sessions run on (wire v23): the native in-process daemon-core
-; engine ("Core", the serde default), or a foreign ACP agent referenced from the node's ACP catalog
-; BY NAME ONLY. Launch recipes deliberately never travel in profiles — they stay node-side and
-; operator-managed (acp_register under existing authz), so a ProfileCreate can never smuggle an
-; arbitrary binary spawn. Optional: pre-engine encodings omit it and decode as "Core".
-engine-acp-agent = { "agent": tstr }
-engine-acp = { "Acp": engine-acp-agent }
+; which execution engine a profile's sessions run on (wire v23; the foreign arm renamed
+; "Acp" -> "Foreign" in v29, protocol now lives on the catalog entry): the native in-process
+; daemon-core engine ("Core", the serde default), or a foreign agent referenced from the node's
+; agent catalog BY NAME ONLY. Launch recipes deliberately never travel in profiles — they stay
+; node-side and operator-managed (agent_register under existing authz), so a ProfileCreate can
+; never smuggle an arbitrary binary spawn. Optional: pre-engine encodings omit it and decode as
+; "Core".
+engine-foreign-agent = { "agent": tstr }
+engine-foreign = { "Foreign": engine-foreign-agent }
 engine-selector = "Core"
-                / engine-acp
+                / engine-foreign
 profile-spec = {
   "id": tstr,
   "provider": provider-selector,
@@ -1101,10 +1112,10 @@ request-session-search = { "SessionSearch": { "query": tstr, "limit": uint } }
 request-session-recap = { "SessionRecap": { "session": session-id } }
 request-session-update-meta = { "SessionUpdateMeta": { "session": session-id, "patch": session-meta-patch } }
 request-rewind = { "Rewind": { "session": session-id, "point": rewind-point } }
-request-acp-discover = "AcpDiscover"
-request-acp-catalog = "AcpCatalog"
-request-acp-register = { "AcpRegister": { "entry": acp-agent-entry } }
-request-acp-remove = { "AcpRemove": { "name": tstr } }
+request-agent-discover = "AgentDiscover"
+request-agent-catalog = "AgentCatalog"
+request-agent-register = { "AgentRegister": { "entry": agent-entry } }
+request-agent-remove = { "AgentRemove": { "name": tstr } }
 request-skill-get = { "SkillGet": { "name": tstr } }
 request-skill-put = { "SkillPut": { "bundle": skill-bundle } }
 request-provider-list = "ProviderList"
@@ -1275,10 +1286,10 @@ api-request = request-submit
             / request-session-recap
             / request-session-update-meta
             / request-rewind
-            / request-acp-discover
-            / request-acp-catalog
-            / request-acp-register
-            / request-acp-remove
+            / request-agent-discover
+            / request-agent-catalog
+            / request-agent-register
+            / request-agent-remove
             / request-skill-get
             / request-skill-put
             / request-provider-list
@@ -1411,7 +1422,7 @@ response-session-page = { "SessionPage": session-page }
 response-session-detail = { "SessionDetail": (session-detail / null) }
 response-session-search = { "SessionSearch": [* session-search-hit] }
 response-session-recap = { "SessionRecap": (session-recap / null) }
-response-acp-catalog = { "AcpCatalog": [* acp-agent-entry] }
+response-agent-catalog = { "AgentCatalog": [* agent-entry] }
 response-providers = { "Providers": [* provider-info] }
 response-tools = { "Tools": [* tool-info] }
 response-commands = { "Commands": [* command-spec] }
@@ -1502,7 +1513,7 @@ api-response = response-ok
              / response-session-detail
              / response-session-search
              / response-session-recap
-             / response-acp-catalog
+             / response-agent-catalog
              / response-providers
              / response-tools
              / response-commands

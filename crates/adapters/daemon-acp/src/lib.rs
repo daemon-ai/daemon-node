@@ -251,9 +251,10 @@ const CURATED: &[(&str, &str, &[&str])] = &[
 ];
 
 /// The server-side ACP discoverer (I7): probes the curated direct-binary recipe table on `$PATH` via
-/// the ACP `initialize` handshake. Implements [`daemon_host::AcpDiscovery`] so the host's
-/// `acp_discover` / `acp_register` ops can confirm + enrich entries without `daemon-host` linking the
-/// ACP runtime (which would be a dependency cycle — `daemon-acp` depends on `daemon-host`).
+/// the ACP `initialize` handshake. Implements [`daemon_host::AgentDiscovery`] so the host's
+/// `agent_discover` / `agent_register` ops can confirm + enrich entries without `daemon-host` linking
+/// the ACP runtime (which would be a dependency cycle — `daemon-acp` depends on `daemon-host`).
+/// Stream-json entries are PATH-probed only (no `initialize` handshake).
 #[derive(Clone, Debug, Default)]
 pub struct AcpDiscoverer;
 
@@ -264,11 +265,11 @@ impl AcpDiscoverer {
     }
 }
 
-/// Build an [`AcpLaunch`] from a wire [`daemon_api::AcpRecipe`]'s program + args + env (stdio agents
-/// only; an endpoint recipe has no local binary to spawn). Public so the node's foreign-engine
-/// resolution (profile `engine = Acp{agent}` -> catalog recipe -> spawn) reuses the exact mapping
-/// discovery uses.
-pub fn launch_from_recipe(recipe: &daemon_api::AcpRecipe) -> Option<AcpLaunch> {
+/// Build an [`AcpLaunch`] from a wire [`daemon_api::AgentRecipe`]'s program + args + env (stdio
+/// agents only; an endpoint recipe has no local binary to spawn). Public so the node's
+/// foreign-engine resolution (profile `engine = Foreign{agent}` -> catalog recipe -> spawn) reuses
+/// the exact mapping discovery uses.
+pub fn launch_from_recipe(recipe: &daemon_api::AgentRecipe) -> Option<AcpLaunch> {
     let program = recipe.program.as_ref()?;
     Some(
         AcpLaunch::new(program.clone())
@@ -281,7 +282,7 @@ pub fn launch_from_recipe(recipe: &daemon_api::AcpRecipe) -> Option<AcpLaunch> {
 /// cheap "is it installed *right now*?" re-check the foreign-engine spawn path runs, since
 /// installed-ness can change between profile validation and spawn. `false` for endpoint-only
 /// recipes (no local binary).
-pub fn recipe_installed(recipe: &daemon_api::AcpRecipe) -> bool {
+pub fn recipe_installed(recipe: &daemon_api::AgentRecipe) -> bool {
     recipe
         .program
         .as_deref()
@@ -289,21 +290,22 @@ pub fn recipe_installed(recipe: &daemon_api::AcpRecipe) -> bool {
 }
 
 #[async_trait]
-impl daemon_host::AcpDiscovery for AcpDiscoverer {
-    async fn discover(&self) -> Vec<daemon_api::AcpAgentEntry> {
+impl daemon_host::AgentDiscovery for AcpDiscoverer {
+    async fn discover(&self) -> Vec<daemon_api::AgentEntry> {
         let mut out = Vec::with_capacity(CURATED.len());
         for (name, program, args) in CURATED {
             let installed = which(program).is_some();
-            let recipe = daemon_api::AcpRecipe {
+            let recipe = daemon_api::AgentRecipe {
                 program: Some((*program).to_string()),
                 args: args.iter().map(|s| (*s).to_string()).collect(),
                 env: Vec::new(),
                 endpoint: None,
             };
-            let mut entry = daemon_api::AcpAgentEntry {
+            let mut entry = daemon_api::AgentEntry {
                 name: (*name).to_string(),
                 recipe,
-                source: daemon_api::AcpSource::Builtin,
+                source: daemon_api::AgentSource::Builtin,
+                protocol: daemon_api::AgentProtocol::Acp,
                 installed,
                 version: None,
                 capabilities: Vec::new(),
@@ -322,9 +324,17 @@ impl daemon_host::AcpDiscovery for AcpDiscoverer {
         out
     }
 
-    async fn probe(&self, mut entry: daemon_api::AcpAgentEntry) -> daemon_api::AcpAgentEntry {
+    async fn probe(&self, mut entry: daemon_api::AgentEntry) -> daemon_api::AgentEntry {
+        // The installed check is protocol-independent (a cheap PATH probe on stdio recipes); the
+        // `initialize` handshake is ACP-only — a stream-json agent has no handshake, so its
+        // version/caps stay empty (installed-on-PATH is the whole probe).
+        if let Some(program) = entry.recipe.program.as_deref() {
+            entry.installed = which(program).is_some();
+        }
+        if entry.protocol != daemon_api::AgentProtocol::Acp {
+            return entry;
+        }
         if let Some(launch) = launch_from_recipe(&entry.recipe) {
-            entry.installed = which(entry.recipe.program.as_deref().unwrap_or("")).is_some();
             if let Some(p) = probe(launch).await {
                 entry.version = Some(p.protocol_version);
                 entry.capabilities = p.capabilities;
@@ -333,21 +343,22 @@ impl daemon_host::AcpDiscovery for AcpDiscoverer {
         entry
     }
 
-    fn builtin(&self, name: &str) -> Option<daemon_api::AcpAgentEntry> {
+    fn builtin(&self, name: &str) -> Option<daemon_api::AgentEntry> {
         // Recipe + PATH check only — deliberately NO initialize probe, so the validation /
         // spawn-resolution fast path never spawns candidate processes.
         let (agent, program, args) = CURATED.iter().find(|(agent, _, _)| *agent == name)?;
-        let recipe = daemon_api::AcpRecipe {
+        let recipe = daemon_api::AgentRecipe {
             program: Some((*program).to_string()),
             args: args.iter().map(|s| (*s).to_string()).collect(),
             env: Vec::new(),
             endpoint: None,
         };
-        Some(daemon_api::AcpAgentEntry {
+        Some(daemon_api::AgentEntry {
             name: (*agent).to_string(),
             installed: recipe_installed(&recipe),
             recipe,
-            source: daemon_api::AcpSource::Builtin,
+            source: daemon_api::AgentSource::Builtin,
+            protocol: daemon_api::AgentProtocol::Acp,
             version: None,
             capabilities: Vec::new(),
         })

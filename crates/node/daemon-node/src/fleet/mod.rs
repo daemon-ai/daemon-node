@@ -5,13 +5,14 @@
 //! conformance harness share one implementation):
 //!
 //! - [`spawner`]: the profile-driven placement seam ([`ProfileChildSpawner`]).
-//! - [`acp_live`]: foreign-engine (ACP) resolution for the live interactive session seam.
+//! - [`foreign_live`]: foreign-engine (ACP / stream-json) resolution for the live interactive
+//!   session seam.
 //! - [`job_worker`]: the durable delegation worker ([`FleetJobWorker`]).
 //! - [`notice_worker`]: the detached-delegation completion-notice worker ([`NoticeWorker`]).
 //! - [`view`]: the durable-graph projection of the management tree ([`FleetViewImpl`]).
 //! - [`reaper`]: the ephemeral-subagent reaper ([`EphemeralReaper`]).
 
-pub(crate) mod acp_live;
+pub(crate) mod foreign_live;
 pub mod job_worker;
 pub mod notice_worker;
 pub mod reaper;

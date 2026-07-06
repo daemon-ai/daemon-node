@@ -531,7 +531,7 @@ fn build_factory(
             Arc::new(move |bound: Option<ProfileRef>, overlay: &SessionOverlay| {
                 let bound = bound?;
                 let spec = store.get(bound.as_str()).ok().flatten()?;
-                // The durable incarnation path is core-only: a FOREIGN-engine (ACP) profile must
+                // The durable incarnation path is core-only: a FOREIGN-engine profile must
                 // never resolve a core `EngineProfile` here (its provider/model fields are inert
                 // and the recipe belongs to the live foreign seam). Decline so the factory keeps
                 // its default profile for whatever durable bookkeeping touches the session; turns
@@ -601,10 +601,10 @@ fn build_session_profile(
 /// path uses). Otherwise sessions are built from the single fixed `session_profile` (moved in here).
 ///
 /// The profile's `engine` selector picks the backend: `Core` runs the native in-process engine
-/// (provider/model resolution as before); `Acp { agent }` returns a deferred foreign factory that
-/// resolves the agent's catalog recipe node-side at spawn (`fleet::acp_live`) — the genai
-/// provider/model path is bypassed entirely for foreign engines. `session_store` supplies the
-/// durable ACP registrations that resolution reads.
+/// (provider/model resolution as before); `Foreign { agent }` returns a deferred foreign factory
+/// that resolves the agent's catalog recipe + protocol node-side at spawn (`fleet::foreign_live`)
+/// — the genai provider/model path is bypassed entirely for foreign engines. `session_store`
+/// supplies the durable agent registrations that resolution reads.
 fn build_session_builder(
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     session_profile: EngineProfile,
@@ -632,12 +632,15 @@ fn build_session_builder(
                             daemon_api::EngineSelector::Core => SessionBackend::Core(
                                 ctx.resolve_effective(&spec, overlay).fresh(id),
                             ),
-                            daemon_api::EngineSelector::Acp { agent } => SessionBackend::Foreign(
-                                crate::fleet::acp_live::acp_session_factory(
-                                    agent.clone(),
-                                    session_store.clone(),
-                                ),
-                            ),
+                            daemon_api::EngineSelector::Foreign { agent } => {
+                                SessionBackend::Foreign(
+                                    crate::fleet::foreign_live::foreign_session_factory(
+                                        agent.clone(),
+                                        id,
+                                        session_store.clone(),
+                                    ),
+                                )
+                            }
                         },
                         None => SessionBackend::Core(fallback.fresh(id)),
                     }
@@ -822,10 +825,11 @@ fn bind_discovery_surfaces(
     if let Some(cloud_catalog) = a.cloud_catalog.clone() {
         node_api = node_api.with_cloud_catalog(cloud_catalog);
     }
-    // Wire the server-side ACP discovery hook (I7): the host's `acp_discover` op probes the curated
-    // direct-binary recipe table via the ACP `initialize` handshake. The host cannot link the ACP
-    // runtime directly (`daemon-acp` depends on `daemon-host`), so the discoverer is injected here.
-    node_api = node_api.with_acp_discovery(Arc::new(daemon_acp::AcpDiscoverer::new()));
+    // Wire the server-side foreign-agent discovery hook (I7): the host's `agent_discover` op probes
+    // the curated direct-binary recipe table (ACP entries via the `initialize` handshake). The host
+    // cannot link the ACP runtime directly (`daemon-acp` depends on `daemon-host`), so the
+    // discoverer is injected here.
+    node_api = node_api.with_agent_discovery(Arc::new(daemon_acp::AcpDiscoverer::new()));
     // Bind the live model-switch factory when this node resolves per-session profiles: a
     // `SetSessionModel` rebuilds a running session's provider for the new model id from the
     // (model-overridden) profile bundle via the same provider resolver.

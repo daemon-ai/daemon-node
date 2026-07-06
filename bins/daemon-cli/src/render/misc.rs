@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The exhaustive tail of the render chain: the ACP catalog, provider/tool listings, config dump,
-//! and the generic `{:?}` fallback for variants without a first-class CLI rendering (e.g. the
-//! filesystem surface). Because this arm is total, the compiler still proves every `ApiResponse`
-//! variant is handled across the render chain.
+//! The exhaustive tail of the render chain: the foreign-agent catalog, provider/tool listings,
+//! config dump, and the generic `{:?}` fallback for variants without a first-class CLI rendering
+//! (e.g. the filesystem surface). Because this arm is total, the compiler still proves every
+//! `ApiResponse` variant is handled across the render chain.
 
 use daemon_api::ApiResponse;
 
 pub(super) fn render_rest(resp: ApiResponse) {
     match resp {
-        ApiResponse::AcpCatalog(entries) => {
-            println!("acp agents: {}", entries.len());
+        ApiResponse::AgentCatalog(entries) => {
+            println!("foreign agents: {}", entries.len());
             for e in entries {
                 println!(
-                    "  - {} [{:?}] installed={} version={:?}",
-                    e.name, e.source, e.installed, e.version
+                    "  - {} [{:?}/{:?}] installed={} version={:?}",
+                    e.name, e.source, e.protocol, e.installed, e.version
                 );
             }
         }

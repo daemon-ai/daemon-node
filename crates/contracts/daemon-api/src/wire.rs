@@ -542,17 +542,17 @@ pub enum ApiRequest {
         /// Where to rewind to.
         point: RewindPoint,
     },
-    /// [`ControlApi::acp_discover`] — trigger an ACP discovery scan.
-    AcpDiscover,
-    /// [`ControlApi::acp_catalog`] — the persisted ACP agent catalog.
-    AcpCatalog,
-    /// [`ControlApi::acp_register`] — register an ACP launch recipe.
-    AcpRegister {
+    /// [`ControlApi::agent_discover`] — trigger a foreign-agent discovery scan.
+    AgentDiscover,
+    /// [`ControlApi::agent_catalog`] — the persisted foreign-agent catalog.
+    AgentCatalog,
+    /// [`ControlApi::agent_register`] — register a foreign-agent launch recipe.
+    AgentRegister {
         /// The recipe to persist.
-        entry: AcpAgentEntry,
+        entry: AgentEntry,
     },
-    /// [`ControlApi::acp_remove`] — remove a cataloged/registered ACP agent.
-    AcpRemove {
+    /// [`ControlApi::agent_remove`] — remove a cataloged/registered foreign agent.
+    AgentRemove {
         /// The agent name to remove.
         name: String,
     },
@@ -1058,8 +1058,8 @@ pub enum ApiResponse {
     SessionSearch(Vec<SessionSearchHit>),
     /// A session's pure-local activity recap, or `None` if unknown/unrecoverable (session_recap).
     SessionRecap(Option<SessionRecap>),
-    /// The ACP agent catalog (acp_discover / acp_catalog).
-    AcpCatalog(Vec<AcpAgentEntry>),
+    /// The foreign-agent catalog (agent_discover / agent_catalog).
+    AgentCatalog(Vec<AgentEntry>),
     /// The runtime provider registry (provider_list).
     Providers(Vec<ProviderInfo>),
     /// The node tool list (tool_list).

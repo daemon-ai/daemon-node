@@ -15,6 +15,9 @@
 //! surface never drags the engine's concrete construction types into the wire protocol.
 
 use daemon_common::{SkillBundle, WireVersion};
+// Relocated to `daemon-protocol` (wire v29) so the fleet tree's `UnitNode.engine` can carry it
+// without a contract-crate cycle; re-exported here because `ProfileSpec` is its primary carrier.
+pub use daemon_protocol::EngineSelector;
 use serde::{Deserialize, Serialize};
 
 /// Which model provider implementation a profile binds to. Mirrors the host's internal
@@ -152,30 +155,6 @@ impl BoundAccount {
     }
 }
 
-/// Which execution engine a profile's sessions run on (wire v23).
-///
-/// `Core` (the default) is the native in-process `daemon-core` engine, materialized from the
-/// profile's provider/model through the usual resolution path. `Acp { agent }` binds the profile
-/// to a foreign ACP agent from the node's ACP catalog, referenced **by name only**: the host
-/// resolves the name to the catalog entry's launch recipe at spawn time and drives it through the
-/// foreign (ACP) spawn seam — the genai provider/model path is bypassed entirely.
-///
-/// SECURITY INVARIANT (deliberate design): launch recipes never travel in profiles. Recipes stay
-/// node-side and operator-managed (`acp_register` under existing authz), so a `ProfileCreate` can
-/// never smuggle an arbitrary binary spawn — it can only *name* an agent the node already knows.
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineSelector {
-    /// The native in-process `daemon-core` engine (provider/model resolution applies).
-    #[default]
-    Core,
-    /// A foreign ACP agent, referenced by its catalog name (never by a recipe).
-    Acp {
-        /// The ACP catalog entry name (e.g. `"gemini"`, `"goose"`, or a manual registration).
-        agent: String,
-    },
-}
-
 /// The full agent configuration bundle a GUI creates/edits and a session binds to.
 ///
 /// One profile is the unit a GUI manages: it names a provider + model, the persona system prompt,
@@ -227,8 +206,9 @@ pub struct ProfileSpec {
     /// registry's `instance_profiles` baseline (account → this profile) from these. Empty by default.
     #[serde(default)]
     pub bound_accounts: Vec<BoundAccount>,
-    /// Which execution engine this profile's sessions run on (wire v23): the native `daemon-core`
-    /// engine (default), or a foreign ACP agent referenced from the node's catalog by name only.
+    /// Which execution engine this profile's sessions run on (wire v23; generalized v29): the
+    /// native `daemon-core` engine (default), or a foreign agent referenced from the node's
+    /// catalog by name only.
     #[serde(default)]
     pub engine: EngineSelector,
 }
@@ -823,23 +803,23 @@ mod tests {
 
     #[test]
     fn engine_selector_wire_shapes_round_trip() {
-        // The unit variant serializes as the bare "Core" string; the ACP arm as the nested
-        // {"Acp": {"agent": ...}} map — mirroring the CDDL `engine-selector` union exactly.
+        // The unit variant serializes as the bare "Core" string; the foreign arm as the nested
+        // {"Foreign": {"agent": ...}} map — mirroring the CDDL `engine-selector` union exactly.
         assert_eq!(
             serde_json::to_string(&EngineSelector::Core).unwrap(),
             "\"Core\""
         );
         assert_eq!(
-            serde_json::to_string(&EngineSelector::Acp {
+            serde_json::to_string(&EngineSelector::Foreign {
                 agent: "gemini".into()
             })
             .unwrap(),
-            "{\"Acp\":{\"agent\":\"gemini\"}}"
+            "{\"Foreign\":{\"agent\":\"gemini\"}}"
         );
-        // And a full ProfileSpec carrying the ACP selector round-trips through CBOR (the on-wire
-        // encoding); the recipe never travels — only the catalog NAME does.
+        // And a full ProfileSpec carrying the foreign selector round-trips through CBOR (the
+        // on-wire encoding); the recipe never travels — only the catalog NAME does.
         let spec = ProfileSpec {
-            engine: EngineSelector::Acp {
+            engine: EngineSelector::Foreign {
                 agent: "goose".into(),
             },
             ..ProfileSpec::new("foreign", ProviderSelector::Mock, "")

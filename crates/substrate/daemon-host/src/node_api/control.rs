@@ -1007,40 +1007,44 @@ impl ControlApi for NodeApiImpl {
             .await
     }
 
-    async fn acp_discover(&self) -> Vec<AcpAgentEntry> {
-        // Probe the curated direct-binary recipe table via the injected ACP hook (the binary owns the
-        // ACP runtime). Cache the results so `acp_catalog` surfaces them without re-probing, then
-        // return the merged catalog (discovery results + durable manual registrations).
-        if let Some(acp) = &self.acp {
-            let discovered = acp.discover().await;
-            *self.last_acp.write().unwrap() = discovered;
+    async fn agent_discover(&self) -> Vec<AgentEntry> {
+        // Probe the curated direct-binary recipe table via the injected discovery hook (the binary
+        // owns the ACP runtime). Cache the results so `agent_catalog` surfaces them without
+        // re-probing, then return the merged catalog (discovery results + durable manual
+        // registrations).
+        if let Some(agents) = &self.agents {
+            let discovered = agents.discover().await;
+            *self.last_agents.write().unwrap() = discovered;
         }
-        self.acp_catalog().await
+        self.agent_catalog().await
     }
 
-    async fn acp_catalog(&self) -> Vec<AcpAgentEntry> {
+    async fn agent_catalog(&self) -> Vec<AgentEntry> {
         // The durable manual registrations (source = Manual) take precedence over a builtin of the
         // same name; the in-memory last-discovery results fill in the auto-detected builtins.
-        let mut by_name: std::collections::BTreeMap<String, AcpAgentEntry> =
+        // (The store table keeps its historical `acp_*` name — the rows are opaque CBOR of the
+        // wire `AgentEntry`, whose added `protocol` field defaults to `Acp` for pre-v29 rows.)
+        let mut by_name: std::collections::BTreeMap<String, AgentEntry> =
             std::collections::BTreeMap::new();
-        for entry in self.last_acp.read().unwrap().iter() {
+        for entry in self.last_agents.read().unwrap().iter() {
             by_name.insert(entry.name.clone(), entry.clone());
         }
         for stored in self.store.acp_list().await {
-            if let Ok(entry) = from_cbor::<AcpAgentEntry>(&stored.entry) {
+            if let Ok(entry) = from_cbor::<AgentEntry>(&stored.entry) {
                 by_name.insert(entry.name.clone(), entry);
             }
         }
         by_name.into_values().collect()
     }
 
-    async fn acp_register(&self, mut entry: AcpAgentEntry) -> Result<(), ApiError> {
-        // A manual registration: force `source = Manual`, then verify/enrich it via the ACP
-        // `initialize` handshake when a discovery hook is wired (fills installed/version/caps).
-        entry.source = AcpSource::Manual;
-        if let Some(acp) = &self.acp {
-            entry = acp.probe(entry).await;
-            entry.source = AcpSource::Manual;
+    async fn agent_register(&self, mut entry: AgentEntry) -> Result<(), ApiError> {
+        // A manual registration: force `source = Manual`, then verify/enrich it via the discovery
+        // hook when wired (PATH check for every protocol; the ACP `initialize` handshake fills
+        // version/caps for ACP entries only).
+        entry.source = AgentSource::Manual;
+        if let Some(agents) = &self.agents {
+            entry = agents.probe(entry).await;
+            entry.source = AgentSource::Manual;
         }
         self.store
             .acp_set(daemon_store::AcpEntry {
@@ -1048,15 +1052,15 @@ impl ControlApi for NodeApiImpl {
                 entry: to_cbor(&entry),
             })
             .await
-            .map_err(|e| ApiError::Other(format!("acp register: {e}")))
+            .map_err(|e| ApiError::Other(format!("agent register: {e}")))
     }
 
-    async fn acp_remove(&self, name: String) -> Result<(), ApiError> {
-        self.last_acp.write().unwrap().retain(|e| e.name != name);
+    async fn agent_remove(&self, name: String) -> Result<(), ApiError> {
+        self.last_agents.write().unwrap().retain(|e| e.name != name);
         self.store
             .acp_remove(&name)
             .await
-            .map_err(|e| ApiError::Other(format!("acp remove: {e}")))
+            .map_err(|e| ApiError::Other(format!("agent remove: {e}")))
     }
 
     // -- Cron (I15): every op delegates to the shared `CronOps`; absent it, the trait defaults

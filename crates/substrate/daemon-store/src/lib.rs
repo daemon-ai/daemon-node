@@ -222,14 +222,16 @@ pub struct RoomMember {
     pub session_id: SessionId,
 }
 
-/// A durable manually-registered ACP agent catalog entry (I7): the operator-persisted half of the
-/// ACP discovery catalog (auto-discovered builtins are re-probed each scan and need no persistence).
-/// `entry` is the opaque host-encoded CBOR of the wire `AcpAgentEntry`; the store stays protocol-free.
+/// A durable manually-registered foreign-agent catalog entry (I7): the operator-persisted half of
+/// the agent discovery catalog (auto-discovered builtins are re-probed each scan and need no
+/// persistence). `entry` is the opaque host-encoded CBOR of the wire `AgentEntry`; the store stays
+/// protocol-free. (The type + table keep their historical `acp` names — the rows are opaque, so
+/// the wire-v29 `AcpAgentEntry` -> `AgentEntry` rename needed no store migration.)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpEntry {
     /// The agent catalog key (display name; the primary key for upsert/lookup/delete).
     pub name: String,
-    /// The opaque host descriptor (CBOR of the wire `AcpAgentEntry`).
+    /// The opaque host descriptor (CBOR of the wire `AgentEntry`).
     pub entry: Vec<u8>,
 }
 

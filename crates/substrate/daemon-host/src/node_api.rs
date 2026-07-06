@@ -38,10 +38,10 @@ use daemon_activation::ActivationManager;
 use daemon_api::{
     from_cbor,
     to_cbor,
-    AcpAgentEntry,
-    AcpSource,
     ActionMenu,
     AdapterInfo,
+    AgentEntry,
+    AgentSource,
     ApiError,
     ApprovalInfo,
     ApprovalMode,
@@ -184,7 +184,7 @@ pub type SessionEngineBuilder =
 /// profile's catalog NAME to a launch recipe reads the durable ACP registrations, and fallible so
 /// a vanished/uninstalled agent fails the spawn with a clear [`ApiError`] instead of a dead actor.
 /// Injected by the assembling binary — `daemon-host` never links the foreign runtime (`daemon-acp`
-/// depends on *it*), mirroring the [`AcpDiscovery`] injection.
+/// depends on *it*), mirroring the [`AgentDiscovery`] injection.
 pub type ForeignSessionFactory = Box<
     dyn FnOnce(
             Arc<dyn HostRequestHandler>,
@@ -196,8 +196,8 @@ pub type ForeignSessionFactory = Box<
 
 /// How a live interactive session's backend is constructed by the [`SessionEngineBuilder`]: the
 /// in-process `daemon-core` [`Engine`] (the native default), or a foreign engine supplied as a
-/// deferred [`ForeignSessionFactory`] (a profile whose `engine = Acp{agent}` resolved through the
-/// node's ACP catalog). Both present identically on the live surface — one merged log, one drain,
+/// deferred [`ForeignSessionFactory`] (a profile whose `engine = Foreign{agent}` resolved through
+/// the node's agent catalog). Both present identically on the live surface — one merged log, one drain,
 /// one journal feeder — only the backend construction differs.
 // Built once per session open and consumed immediately by `ensure` — the variant size delta is
 // irrelevant, and boxing the Engine would leak into the builder closures for no benefit (mirrors
@@ -268,23 +268,26 @@ pub trait CloudCatalog: Send + Sync {
         -> Vec<ModelDescriptor>;
 }
 
-/// The ACP-discovery hook (I7). `daemon-host` does not link the ACP runtime (`daemon-acp` depends on
-/// *it*, not the reverse), so the actual `initialize`-handshake probing — the curated direct-binary
-/// recipe table + PATH probe — is injected by the assembling binary (which owns the ACP crate). When
-/// no hook is wired, `acp_discover` returns empty and only manual registrations are catalogued.
+/// The foreign-agent discovery hook (I7). `daemon-host` does not link the ACP runtime (`daemon-acp`
+/// depends on *it*, not the reverse), so the actual probing — the curated direct-binary recipe
+/// table + PATH probe, plus the ACP `initialize` handshake for ACP entries — is injected by the
+/// assembling binary (which owns the ACP crate). Stream-json entries are probed installed-on-PATH
+/// only (no handshake). When no hook is wired, `agent_discover` returns empty and only manual
+/// registrations are catalogued.
 #[async_trait]
-pub trait AcpDiscovery: Send + Sync {
-    /// Probe PATH + the curated direct-binary recipe table, confirming each candidate via the ACP
+pub trait AgentDiscovery: Send + Sync {
+    /// Probe PATH + the curated direct-binary recipe table, confirming each ACP candidate via the
     /// `initialize` handshake; return verified catalog entries (`source = Builtin`).
-    async fn discover(&self) -> Vec<daemon_api::AcpAgentEntry>;
-    /// Verify/enrich a single (manual) recipe by attempting the `initialize` handshake — fills in
-    /// `installed` / `version` / `capabilities`. Returns the entry unchanged on a failed probe.
-    async fn probe(&self, entry: daemon_api::AcpAgentEntry) -> daemon_api::AcpAgentEntry;
+    async fn discover(&self) -> Vec<daemon_api::AgentEntry>;
+    /// Verify/enrich a single (manual) recipe: a PATH-presence `installed` check, plus the ACP
+    /// `initialize` handshake for `protocol = Acp` entries — fills in `installed` / `version` /
+    /// `capabilities`. Returns the entry unchanged on a failed probe.
+    async fn probe(&self, entry: daemon_api::AgentEntry) -> daemon_api::AgentEntry;
     /// Resolve a curated builtin recipe by `name` WITHOUT the `initialize` probe: the recipe plus a
     /// cheap PATH-presence `installed` check only. Backs the fast-path lookups that must not spawn
     /// candidate processes (profile-engine validation, foreign-engine spawn resolution) when the
     /// name is not among the durable manual registrations. `None` when the name is not curated.
-    fn builtin(&self, name: &str) -> Option<daemon_api::AcpAgentEntry> {
+    fn builtin(&self, name: &str) -> Option<daemon_api::AgentEntry> {
         let _ = name;
         None
     }
@@ -376,13 +379,14 @@ pub struct NodeApiImpl {
     /// mutations (`conv_*`/`member_*`) are recorded + sealed onto it so the audit chains per op.
     /// `None` until the first mutation (and stays `None` when journaling is disabled).
     mgmt_journal: Arc<std::sync::Mutex<Option<Arc<JournalSink>>>>,
-    /// The ACP-discovery hook (I7), injected by the binary (which owns the ACP runtime). `None` =>
-    /// `acp_discover` yields nothing and the catalog is just the durable manual registrations.
-    acp: Option<Arc<dyn AcpDiscovery>>,
-    /// The last ACP discovery scan's results, cached in-memory so `acp_catalog` can surface them
+    /// The foreign-agent discovery hook (I7), injected by the binary (which owns the ACP runtime).
+    /// `None` => `agent_discover` yields nothing and the catalog is just the durable manual
+    /// registrations.
+    agents: Option<Arc<dyn AgentDiscovery>>,
+    /// The last discovery scan's results, cached in-memory so `agent_catalog` can surface them
     /// alongside the durable manual entries without re-probing every read (discovery is the
     /// operator-triggered, subprocess-spawning scan; manual entries are the persisted half).
-    last_acp: Arc<std::sync::RwLock<Vec<daemon_api::AcpAgentEntry>>>,
+    last_agents: Arc<std::sync::RwLock<Vec<daemon_api::AgentEntry>>>,
     /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
     /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
     checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,

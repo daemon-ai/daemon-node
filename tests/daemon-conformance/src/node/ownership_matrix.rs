@@ -388,10 +388,10 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ContactSetAlias { .. }
         | ContactActionMenu { .. }
         | DirectorySearch { .. } => NotSessionTouching,
-        AcpDiscover
-        | AcpCatalog
-        | AcpRegister { .. }
-        | AcpRemove { .. }
+        AgentDiscover
+        | AgentCatalog
+        | AgentRegister { .. }
+        | AgentRemove { .. }
         | ProviderList
         | ProviderRegister { .. }
         | ToolList

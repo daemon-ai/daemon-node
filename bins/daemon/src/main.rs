@@ -727,7 +727,7 @@ fn default_profile_spec(
         credential_ref: None,
         fallback_credential_ref: None,
         bound_accounts: Vec::new(),
-        // The launch-config seed always runs the native engine; foreign (ACP) profiles are
+        // The launch-config seed always runs the native engine; foreign-agent profiles are
         // created explicitly over the ProfileApi.
         engine: daemon_api::EngineSelector::Core,
     }

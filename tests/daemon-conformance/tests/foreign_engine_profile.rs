@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! Foreign-engine (ACP) profiles end-to-end through the NODE API surface (wire v23
-//! `ProfileSpec::engine`): a scripted fake ACP agent is registered in the catalog
-//! (`acp_register`, source Manual — the operator-managed recipe path), a profile is created with
-//! `engine = Acp{agent}`, a session bound to that profile is opened, and one interactive turn
-//! round-trips — proving profile -> catalog resolution -> foreign spawn -> §17 turn, with the
-//! genai provider/model path fully bypassed and the agent's symmetric permission callback parking
-//! as an ordinary host request.
+//! `ProfileSpec::engine`, generalized in v29 to `Foreign{agent}` + the protocol-tagged agent
+//! catalog): a scripted fake ACP agent is registered in the catalog (`agent_register`, source
+//! Manual — the operator-managed recipe path), a profile is created with `engine = Foreign{agent}`,
+//! a session bound to that profile is opened, and one interactive turn round-trips — proving
+//! profile -> catalog resolution -> foreign spawn -> §17 turn, with the genai provider/model path
+//! fully bypassed and the agent's symmetric permission callback parking as an ordinary host
+//! request.
 //!
 //! Also proves the fail-fast validation seams: a profile referencing an unknown catalog name or an
 //! uninstalled agent is rejected at `ProfileCreate`/`ProfileUpdate` with a clear error, and the
@@ -19,8 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemon_api::{
-    AcpAgentEntry, AcpRecipe, AcpSource, ControlApi, EngineSelector, Outbound, ProfileApi,
-    ProfileSpec, ProviderSelector, SessionApi, SessionQuery,
+    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, EngineSelector, Outbound,
+    ProfileApi, ProfileSpec, ProviderSelector, SessionApi, SessionQuery,
 };
 use daemon_common::{ProfileRef, ReqId};
 use daemon_core::{MockProvider, Provider, ProviderBuilder, ProviderRegistry};
@@ -85,11 +86,11 @@ fn assemble_acp_node() -> (
     (node, resolver_called, handle)
 }
 
-/// A profile spec bound to a foreign ACP agent BY NAME ONLY: no provider/model/recipe — the
+/// A profile spec bound to a foreign agent BY NAME ONLY: no provider/model/recipe — the
 /// catalog owns the launch recipe, the node resolves it at spawn.
-fn acp_profile(id: &str, agent: &str) -> ProfileSpec {
+fn foreign_profile(id: &str, agent: &str) -> ProfileSpec {
     ProfileSpec {
-        engine: EngineSelector::Acp {
+        engine: EngineSelector::Foreign {
             agent: agent.into(),
         },
         ..ProfileSpec::new(id, ProviderSelector::Mock, "")
@@ -100,22 +101,23 @@ fn acp_profile(id: &str, agent: &str) -> ProfileSpec {
 /// `AcpDiscoverer::probe` runs the ACP `initialize` handshake against it, so the stored entry is
 /// verified installed with a reported protocol version — the operator registration path, for real.
 async fn register_mock_agent(node: &Arc<NodeApiImpl>, name: &str) {
-    node.acp_register(AcpAgentEntry {
+    node.agent_register(AgentEntry {
         name: name.into(),
-        recipe: AcpRecipe {
+        recipe: AgentRecipe {
             program: Some(env!("CARGO_BIN_EXE_mock_acp_agent").to_string()),
             args: Vec::new(),
             env: Vec::new(),
             endpoint: None,
         },
-        source: AcpSource::Manual,
+        source: AgentSource::Manual,
+        protocol: AgentProtocol::Acp,
         installed: false, // the probe fills this in; a caller-supplied value is not trusted
         version: None,
         capabilities: Vec::new(),
     })
     .await
     .expect("register the mock ACP agent");
-    let catalog = node.acp_catalog().await;
+    let catalog = node.agent_catalog().await;
     let entry = catalog
         .iter()
         .find(|e| e.name == name)
@@ -163,7 +165,7 @@ async fn drain_turn(node: &Arc<NodeApiImpl>, session: &daemon_common::SessionId)
     panic!("timed out waiting for the foreign agent's TurnFinished; drained: {acc:?}");
 }
 
-/// The full round-trip: register -> create profile (engine=Acp) -> session bound to it -> one
+/// The full round-trip: register -> create profile (engine=Foreign) -> session bound to it -> one
 /// interactive turn (text streamed, permission answered, turn completes) — provider seam untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_profile_spawns_and_completes_a_turn() {
@@ -180,7 +182,7 @@ async fn acp_profile_spawns_and_completes_a_turn_impl() {
     let (node, resolver_called, _handle) = assemble_acp_node();
     register_mock_agent(&node, "fake-echo").await;
 
-    node.profile_create(acp_profile("acp-fake", "fake-echo"))
+    node.profile_create(foreign_profile("acp-fake", "fake-echo"))
         .await
         .expect("create a profile bound to the registered ACP agent");
 
@@ -250,9 +252,9 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
 
     // Unknown: never registered, not in the curated builtin table.
     let err = node
-        .profile_create(acp_profile("bad", "no-such-agent"))
+        .profile_create(foreign_profile("bad", "no-such-agent"))
         .await
-        .expect_err("an unknown ACP agent must fail profile_create");
+        .expect_err("an unknown agent must fail profile_create");
     assert!(
         err.to_string().contains("no-such-agent"),
         "the error names the unknown agent: {err}"
@@ -260,15 +262,16 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
 
     // Uninstalled: registered with a recipe whose program does not exist, so the initialize probe
     // cannot verify it (installed stays false).
-    node.acp_register(AcpAgentEntry {
+    node.agent_register(AgentEntry {
         name: "ghost".into(),
-        recipe: AcpRecipe {
+        recipe: AgentRecipe {
             program: Some("/nonexistent/daemon-conformance-ghost-agent".into()),
             args: Vec::new(),
             env: Vec::new(),
             endpoint: None,
         },
-        source: AcpSource::Manual,
+        source: AgentSource::Manual,
+        protocol: AgentProtocol::Acp,
         installed: false,
         version: None,
         capabilities: Vec::new(),
@@ -276,9 +279,9 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
     .await
     .expect("register the ghost agent");
     let err = node
-        .profile_create(acp_profile("ghostly", "ghost"))
+        .profile_create(foreign_profile("ghostly", "ghost"))
         .await
-        .expect_err("an uninstalled ACP agent must fail profile_create");
+        .expect_err("an uninstalled agent must fail profile_create");
     assert!(
         err.to_string().contains("not installed"),
         "the error says the agent is not installed: {err}"
@@ -294,8 +297,8 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
     .await
     .expect("create a native profile");
     let err = node
-        .profile_update(acp_profile("native", "no-such-agent"))
+        .profile_update(foreign_profile("native", "no-such-agent"))
         .await
-        .expect_err("an unknown ACP agent must fail profile_update");
+        .expect_err("an unknown agent must fail profile_update");
     assert!(err.to_string().contains("no-such-agent"));
 }

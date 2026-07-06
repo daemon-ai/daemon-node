@@ -193,15 +193,15 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ContactSetAlias { .. } => C::MessagingWrite,
 
         // -- serve_registry: extension/agent/provider registry + node config --------------------
-        // AcpDiscover only probes recipes and caches in memory (no persistence) -> a read.
-        AcpDiscover | AcpCatalog | ProviderList | ToolList | CommandList | ConfigGet => {
+        // AgentDiscover only probes recipes and caches in memory (no persistence) -> a read.
+        AgentDiscover | AgentCatalog | ProviderList | ToolList | CommandList | ConfigGet => {
             C::RegistryRead
         }
         // CommandInvoke is a coarse-floor read; the command catalog's own `min_access` (now
         // principal-driven, see `commands::caller_access`) does the per-command Admin-tier gating.
         CommandInvoke { .. } => C::RegistryRead,
-        AcpRegister { .. }
-        | AcpRemove { .. }
+        AgentRegister { .. }
+        | AgentRemove { .. }
         | ProviderRegister { .. }
         | ToolRegister { .. }
         | ConfigSet { .. } => C::RegistryWrite,
@@ -311,7 +311,7 @@ mod tests {
                 },
                 Capability::MessagingRead,
             ),
-            (ApiRequest::AcpCatalog, Capability::RegistryRead),
+            (ApiRequest::AgentCatalog, Capability::RegistryRead),
             (ApiRequest::FsRoots, Capability::FsRead),
         ]
     }
@@ -374,7 +374,7 @@ mod tests {
                 Capability::FleetWrite,
             ),
             (
-                ApiRequest::AcpRemove { name: "a".into() },
+                ApiRequest::AgentRemove { name: "a".into() },
                 Capability::RegistryWrite,
             ),
             (

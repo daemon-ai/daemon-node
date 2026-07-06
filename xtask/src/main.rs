@@ -499,20 +499,58 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-profile-daemon-api.cbor",
         &ApiResponse::Profile(Some(daemon_api_spec)),
     )?;
-    // The foreign-engine selector (wire v23): a profile-spec whose `engine` is the ACP arm
-    // (`{"Acp": {"agent": tstr}}` — catalog name only, never a recipe), so `verify-codec` proves
-    // the generated zcbor C decoder accepts the additive `engine-selector` union. The other
-    // profile fixtures above exercise the default "Core" arm (always present on new encodings).
-    let acp_engine_spec = ProfileSpec {
-        engine: daemon_api::EngineSelector::Acp {
+    // The foreign-engine selector (wire v23; generalized v29): a profile-spec whose `engine` is
+    // the foreign arm (`{"Foreign": {"agent": tstr}}` — catalog name only, never a recipe), so
+    // `verify-codec` proves the generated zcbor C decoder accepts the `engine-selector` union. The
+    // other profile fixtures above exercise the default "Core" arm (always present on new
+    // encodings).
+    let foreign_engine_spec = ProfileSpec {
+        engine: daemon_api::EngineSelector::Foreign {
             agent: "gemini".into(),
         },
         ..ProfileSpec::new("foreign", ProviderSelector::Mock, "")
     };
     write_cbor(
         &out,
-        "response-profile-acp-engine.cbor",
-        &ApiResponse::Profile(Some(acp_engine_spec)),
+        "response-profile-foreign-engine.cbor",
+        &ApiResponse::Profile(Some(foreign_engine_spec)),
+    )?;
+    // The foreign-agent catalog (wire v29): one ACP entry + one stream-json entry, so
+    // `verify-codec` proves the generated zcbor C decoder accepts the renamed `agent-entry` shape
+    // and both `agent-protocol` values.
+    write_cbor(
+        &out,
+        "response-agent-catalog.cbor",
+        &ApiResponse::AgentCatalog(vec![
+            daemon_api::AgentEntry {
+                name: "gemini".into(),
+                recipe: daemon_api::AgentRecipe {
+                    program: Some("gemini".into()),
+                    args: vec!["--experimental-acp".into()],
+                    env: Vec::new(),
+                    endpoint: None,
+                },
+                source: daemon_api::AgentSource::Builtin,
+                protocol: daemon_api::AgentProtocol::Acp,
+                installed: true,
+                version: Some("1".into()),
+                capabilities: vec![("fs".into(), "true".into())],
+            },
+            daemon_api::AgentEntry {
+                name: "claude".into(),
+                recipe: daemon_api::AgentRecipe {
+                    program: Some("claude".into()),
+                    args: vec!["--output-format".into(), "stream-json".into()],
+                    env: Vec::new(),
+                    endpoint: None,
+                },
+                source: daemon_api::AgentSource::Manual,
+                protocol: daemon_api::AgentProtocol::StreamJson,
+                installed: true,
+                version: None,
+                capabilities: Vec::new(),
+            },
+        ]),
     )?;
 
     let fixture_descriptor = ModelDescriptor {
