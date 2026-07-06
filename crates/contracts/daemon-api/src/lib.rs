@@ -3541,6 +3541,19 @@ pub enum NodeEvent {
     /// deleted): the client refetches `ModelCatalog`. Payload-free and globally coalesced in the
     /// backlog (a refetch always reads the whole catalog).
     CatalogChanged,
+    /// An events-io transport instance's connection/presence changed (wire v29): emitted at the
+    /// coarse real transitions (adapter serve start with the instance's reported state, clean
+    /// teardown -> `Offline`, a crashed serve loop -> `Error`), carrying the full new state so a
+    /// client updates its channel/presence dots WITHOUT re-polling `TransportInstances`.
+    TransportChanged {
+        /// The instance-qualified transport id (e.g. `"matrix/@bot:hs.org"`, `"room"`).
+        transport: TransportId,
+        /// The new connection state.
+        connection: ConnectionState,
+        /// The new presence (adapters without a presence source report `Unknown`).
+        #[serde(default)]
+        presence: PresenceState,
+    },
     /// The feed could not serve from the client's cursor (aged out / lagged); the client must
     /// re-baseline the named scope ("roster" / "all" / ...).
     ResyncNeeded {

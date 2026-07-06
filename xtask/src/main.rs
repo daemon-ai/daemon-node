@@ -732,6 +732,13 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     total_bytes: 92_000_000,
                 },
                 NodeEvent::CatalogChanged,
+                // v29: the presence-push event, so verify-codec proves the generated decoder
+                // accepts the new node-event arm + the connection/presence enums it carries.
+                NodeEvent::TransportChanged {
+                    transport: daemon_protocol::TransportId::new("matrix/@bot:hs.org"),
+                    connection: daemon_api::ConnectionState::Connected,
+                    presence: daemon_api::PresenceState::Unknown,
+                },
             ],
             next_cursor: 12,
             head_cursor: 12,

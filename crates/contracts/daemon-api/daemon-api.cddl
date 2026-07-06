@@ -530,6 +530,7 @@ node-event = node-event-session-advanced
            / node-event-approval-pending
            / node-event-download-progress
            / node-event-catalog-changed
+           / node-event-transport-changed
            / node-event-resync-needed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
@@ -540,6 +541,9 @@ node-event-approval-pending     = { "ApprovalPending":    { "session": session-i
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64 } }
 ; v26: the installed-model registry changed (download cataloged / model deleted) -> refetch ModelCatalog.
 node-event-catalog-changed      = "CatalogChanged"
+; v29: a transport instance's connection/presence changed (adapter serve start / teardown / crash),
+; carrying the full new state so clients stop navigation-polling TransportInstances.
+node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 events-page = {
   "events": [0*64 node-event],

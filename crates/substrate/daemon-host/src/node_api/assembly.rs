@@ -216,8 +216,57 @@ impl NodeApiImpl {
     /// node as their `api`, returning the spawned task handles (the binary aborts them on shutdown).
     /// Registry-driven lifecycle (daemon-messaging-adapter-spec.md §12.1). Adapters do not hold an
     /// `Arc<dyn NodeApi>` themselves, so handing `self.clone()` here introduces no reference cycle.
+    ///
+    /// Presence push (wire v29, B5): each serve loop is bracketed with
+    /// [`NodeEvent::TransportChanged`](daemon_api::NodeEvent::TransportChanged) emits at the
+    /// coarse REAL transitions — the instance's reported state at serve start, `Offline` at a
+    /// clean teardown, `Error` when the loop crashes — so clients stop navigation-polling
+    /// `TransportInstances`. Deliberately not a presence state machine: adapters that never
+    /// transition simply never re-emit.
     pub fn spawn_adapters(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
-        self.adapters.load_full().spawn_all(self.clone())
+        use futures::FutureExt as _;
+        let registry = self.adapters.load_full();
+        registry
+            .adapters()
+            .iter()
+            .map(|adapter| {
+                let adapter = adapter.clone();
+                let api: Arc<dyn daemon_api::NodeApi> = self.clone();
+                let feed = self.node_events.clone();
+                tokio::spawn(async move {
+                    // Baseline push at serve start: each configured instance's reported state
+                    // (a credentialed account reports Connected — the "serve start" transition).
+                    if let Some(feed) = &feed {
+                        for i in adapter.clone().instances().await {
+                            feed.emit(daemon_api::NodeEvent::TransportChanged {
+                                transport: i.transport,
+                                connection: i.connection,
+                                presence: i.presence,
+                            });
+                        }
+                    }
+                    let crashed = std::panic::AssertUnwindSafe(adapter.clone().serve(api))
+                        .catch_unwind()
+                        .await
+                        .is_err();
+                    // Teardown push: a clean serve exit is Offline; a crashed loop is Error.
+                    if let Some(feed) = &feed {
+                        let connection = if crashed {
+                            daemon_api::ConnectionState::Error
+                        } else {
+                            daemon_api::ConnectionState::Offline
+                        };
+                        for i in adapter.clone().instances().await {
+                            feed.emit(daemon_api::NodeEvent::TransportChanged {
+                                transport: i.transport,
+                                connection,
+                                presence: daemon_api::PresenceState::Offline,
+                            });
+                        }
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Install the routing *rebuild hook* (the §5.9 hot-reload seam): a closure that rebuilds the
