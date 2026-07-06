@@ -23,6 +23,7 @@ pub mod adapter;
 mod auth;
 pub mod config;
 mod inbound;
+mod invite;
 mod login;
 mod mapping;
 mod outbound;
@@ -44,6 +45,7 @@ pub use adapter::MatrixAdapter;
 pub use auth::{sso_begin, sso_complete, MatrixAuthFlowFactory, MatrixLogin, SsoSession};
 pub use config::{MatrixConfig, MatrixRoute};
 pub use inbound::{on_room_message, InboundCtx};
+pub use invite::{on_stripped_member, InviteCtx};
 pub use login::login;
 pub use outbound::{DeliveryManager, MatrixProjector};
 
@@ -232,8 +234,16 @@ pub async fn serve(
             routes: routes.clone(),
             bare: acct.bare.clone(),
             transport: acct.transport.clone(),
-            me,
+            me: me.clone(),
         };
+        // Invite acceptance (EIO-11): join rooms this account is invited to (policy-gated), so an
+        // externally-invited bot lands in the room and its rooms list / `ConvList` reflect it.
+        acct.client.add_event_handler_context(InviteCtx {
+            me,
+            transport: acct.transport.clone(),
+            auto_accept: cfg.auto_accept_invites,
+        });
+        acct.client.add_event_handler(on_stripped_member);
         acct.client.add_event_handler_context(ctx);
         acct.client.add_event_handler(on_room_message);
 

@@ -62,6 +62,13 @@ impl MatrixAdapter {
         })
     }
 
+    /// Register a live, session-restored `client` under its instance-qualified `transport` — the
+    /// same registration [`serve`](TransportAdapter::serve) performs at bring-up. Public so
+    /// vertical tests can stage a mock-homeserver client exactly the way bring-up would.
+    pub async fn register_live_client(&self, transport: TransportId, client: Client) {
+        self.clients.write().await.insert(transport, client);
+    }
+
     /// Resolve the live `Client` for an instance-qualified `transport` (`matrix/@user:hs`, the same
     /// key `instances()` emits and `serve` registers). `Unsupported` when the account is not (yet)
     /// connected (e.g. before `serve` brought it up, or it has no stored session).
