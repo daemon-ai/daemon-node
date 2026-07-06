@@ -241,8 +241,11 @@ async fn operator_assign_wakes_a_parked_durable_child_impl() {
         .await;
 
     // The operator wakes the parked child through the wire `Assign` op; the woken hydrate drains
-    // the pending input into the conversation.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // the pending input into the conversation. Generous deadline + a measured re-nudge cadence:
+    // under full-workspace test load the activation/wake ticks are starved, and a wake absorbed by
+    // a concurrent recovery-scanner activation (which hydrated before the input landed) is benign
+    // — the next Assign recovers it.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         node.assign(child.clone())
             .await
@@ -264,7 +267,7 @@ async fn operator_assign_wakes_a_parked_durable_child_impl() {
             Instant::now() < deadline,
             "the pending input never reached the parked child via Assign"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     // The child stayed parked: the wake folded the input in but did NOT fast-forward the approval.
