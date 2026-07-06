@@ -390,6 +390,19 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("wake: {e}")))
     }
 
+    async fn tool_list(&self) -> Vec<daemon_api::ToolInfo> {
+        // The node-wide inventory the binary late-bound (it owns the tool build gates). Bounded at
+        // the wire page cap like every other unpaged list.
+        match self.tools_inventory.load_full() {
+            Some(tools) => tools
+                .iter()
+                .take(daemon_api::WIRE_PAGE_MAX)
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     async fn fingerprint_list(
         &self,
         session: SessionId,

@@ -1157,6 +1157,85 @@ fn build_execute_code_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
     Some(Arc::new(ExecuteCodeTool::new(settings)) as Arc<dyn Tool>)
 }
 
+/// The node-wide tool inventory (`ControlApi::tool_list`, wire v29): one enabled row per
+/// registered tool — the always-on core role tools plus everything that landed in `extra_tools` —
+/// and one `enabled: false` row (with `requires`: the missing config key / credential / build
+/// feature) per config-gated optional surface that did NOT materialize. Disabled dynamic surfaces
+/// whose tool names are only known once enabled (python, mcp) are represented by their subsystem
+/// name. Mirrors the `build_*_tool(s)` gates above — keep the two in lockstep when adding a gated
+/// tool.
+fn build_tool_inventory(
+    cfg: &NodeConfig,
+    extra_tools: &[Arc<dyn Tool>],
+) -> Vec<daemon_api::ToolInfo> {
+    let enabled = |name: &str| daemon_api::ToolInfo {
+        name: name.into(),
+        description: None,
+        enabled: true,
+        requires: None,
+    };
+    let disabled = |name: &str, requires: &str| daemon_api::ToolInfo {
+        name: name.into(),
+        description: None,
+        enabled: false,
+        requires: Some(requires.into()),
+    };
+    // The always-on core role tools every session registry carries (fs/shell/process), the
+    // orchestration surface the orchestrator role adds, and the scheduler tool.
+    let mut out: Vec<daemon_api::ToolInfo> = ["fs", "shell", "process", "orchestrate", "cron"]
+        .into_iter()
+        .map(enabled)
+        .collect();
+    for tool in extra_tools {
+        out.push(enabled(tool.name()));
+    }
+    fn missing(out: &[daemon_api::ToolInfo], name: &str) -> bool {
+        !out.iter().any(|t| t.name == name)
+    }
+    // The config-gated optional surfaces, in registration order, each mirroring its build gate.
+    if !cfg.metta.enable {
+        out.push(disabled("metta", "[metta].enable"));
+    }
+    if !cfg.web.enable {
+        out.push(disabled(
+            "web_search",
+            "[web].enable (+ a tavily credential)",
+        ));
+        out.push(disabled(
+            "web_extract",
+            "[web].enable (+ a firecrawl credential or [web].local_fallback)",
+        ));
+    }
+    if missing(&out, "vision_analyze") {
+        out.push(disabled(
+            "vision_analyze",
+            "[vision].enable + a vision-capable provider",
+        ));
+    }
+    if !cfg.python.enable {
+        out.push(disabled("python", "[python].enable (worker + tools dir)"));
+    }
+    if !cfg.mcp.servers.iter().any(|s| s.enable) {
+        out.push(disabled("mcp", "an enabled [[mcp.servers]] entry"));
+    }
+    if missing(&out, "browser") {
+        out.push(disabled(
+            "browser",
+            "[browser].enable + a daemon built with the `browser` feature",
+        ));
+    }
+    if !cfg.execute_code.enable {
+        out.push(disabled("execute_code", "[execute_code].enable"));
+    }
+    if missing(&out, "semantic_search") {
+        out.push(disabled(
+            "semantic_search",
+            "[workspace_index].enable + a configured embedder",
+        ));
+    }
+    out
+}
+
 /// Adapts the host's [`CredentialStore`] to the web tools' [`SecretSource`] seam so the heavy
 /// substrate type never enters the tool crate. Reads happen at call time, so a key set later via
 /// `CredentialApi` takes effect immediately.
@@ -2338,6 +2417,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         extra_tools.push(execute_code_tool);
     }
 
+    // The node-wide tool inventory (`tool_list`, wire v29), captured while `extra_tools` is still
+    // ours (assembly takes it by move): what registered and why each disabled config-gated surface
+    // did not. Late-bound onto the node below, next to the other post-assembly binds.
+    let tool_inventory = build_tool_inventory(&cfg, &extra_tools);
+
     let host_config = HostConfig {
         partition: cfg.partition,
         dispatch_interval: cfg.dispatch_interval,
@@ -2451,6 +2535,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
     // conversations are readable through the tool (the node did not exist when the tool was built).
     session_archive.set_live(node.clone());
+    // The node-wide tool inventory (`tool_list`, wire v29): what registered (from the built
+    // `extra_tools` + the always-on core role tools) and why each disabled config-gated surface
+    // did not, so a client can render "why is this tool unavailable".
+    node.set_tool_inventory(tool_inventory);
     // Build the daemon-authoritative command catalog (`command_list`/`command_invoke`): the built-in
     // node-op commands unified with the provider commands the context engine (`/lcm`) and memory
     // provider (`/memory`) contribute, each resolving its per-session bank at invocation time. Bound
@@ -3420,5 +3508,56 @@ mod tests {
         // An unroutable/closed port: the GET fails and the picker sees an empty list.
         let models = daemon_cloud_gateway_models("http://127.0.0.1:1/").await;
         assert!(models.is_empty(), "gateway error => empty list: {models:?}");
+    }
+
+    /// The `tool_list` inventory (wire v29) mirrors the build gates: a default config registers the
+    /// always-on core tools as enabled and reports every config-gated optional surface as
+    /// `enabled: false` with an actionable `requires`; flipping a gate flips its row.
+    #[test]
+    fn tool_inventory_mirrors_build_gates() {
+        let cfg = NodeConfig::default();
+        let inv = build_tool_inventory(&cfg, &[]);
+        let find = |name: &str| {
+            inv.iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("no inventory row for {name}: {inv:?}"))
+        };
+        for core in ["fs", "shell", "process", "orchestrate", "cron"] {
+            assert!(find(core).enabled, "{core} is always-on");
+            assert!(find(core).requires.is_none());
+        }
+        for gated in [
+            "metta",
+            "web_search",
+            "web_extract",
+            "vision_analyze",
+            "python",
+            "mcp",
+            "browser",
+            "execute_code",
+            "semantic_search",
+        ] {
+            let row = find(gated);
+            assert!(!row.enabled, "{gated} is off by default");
+            assert!(
+                row.requires.is_some(),
+                "{gated} names what it requires: {row:?}"
+            );
+        }
+        // Flipping a gate flips its row (and drops the disabled placeholder).
+        let mut on = NodeConfig::default();
+        on.execute_code.enable = true;
+        let tool = build_execute_code_tool(&on).expect("execute_code builds when enabled");
+        let inv = build_tool_inventory(&on, &[tool]);
+        let row = inv
+            .iter()
+            .find(|t| t.name == "execute_code")
+            .expect("an enabled execute_code row");
+        assert!(row.enabled && row.requires.is_none(), "{row:?}");
+        assert_eq!(
+            inv.iter().filter(|t| t.name == "execute_code").count(),
+            1,
+            "no duplicate row for an enabled tool"
+        );
     }
 }

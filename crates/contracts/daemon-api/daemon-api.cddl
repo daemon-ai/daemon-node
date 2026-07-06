@@ -725,9 +725,12 @@ agent-entry = {
   ? "capabilities": [* kv-pair],
 }
 
-; ----- long-tail surface stub DTOs (wire v14) -----
+; ----- long-tail surface stub DTOs (wire v14; tool-info enriched in v29) -----
 provider-info    = { "name": tstr, ? "base_url": (tstr / null), ? "available": bool }
-tool-info        = { "name": tstr, ? "description": (tstr / null) }
+; enabled/requires (wire v29): whether the tool is registered on this node, and — for a disabled
+; config-gated surface — the missing config key / credential / build feature a client renders as
+; "why is this tool unavailable".
+tool-info        = { "name": tstr, ? "description": (tstr / null), "enabled": bool, ? "requires": (tstr / null) }
 node-config-view = { "format": tstr, "body": tstr }
 
 ; ----- cron / scheduling (wire v15; I15; ControlApi::cron_*) -----

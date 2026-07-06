@@ -79,6 +79,7 @@ impl NodeApiImpl {
             blobs: None,
             cron: None,
             commands: Arc::new(ArcSwapOption::empty()),
+            tools_inventory: Arc::new(ArcSwapOption::empty()),
             auth_store: None,
             auth_audit: None,
             revocations: None,
@@ -167,6 +168,13 @@ impl NodeApiImpl {
     /// from node-owned bank caches the node construction does not itself hold.
     pub fn set_commands(&self, commands: Arc<crate::commands::CommandRegistry>) {
         self.commands.store(Some(commands));
+    }
+
+    /// Install the node-wide tool inventory backing [`daemon_api::ControlApi::tool_list`] (wire
+    /// v29). Late-bound by the assembling binary, which owns the tool build gates and therefore
+    /// knows both what registered and why a disabled optional surface did not.
+    pub fn set_tool_inventory(&self, tools: Vec<daemon_api::ToolInfo>) {
+        self.tools_inventory.store(Some(Arc::new(tools)));
     }
 
     /// Install the host routing registry consulted by [`SessionApi::submit_routed`] (the §5.9

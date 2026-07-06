@@ -425,6 +425,10 @@ pub struct NodeApiImpl {
     /// binary can bind it *after* the node is wrapped in an `Arc` (see [`NodeApiImpl::set_commands`]),
     /// since the registry needs node-resolved provider handles the node construction does not own.
     commands: Arc<ArcSwapOption<crate::commands::CommandRegistry>>,
+    /// The node-wide tool inventory backing [`ControlApi::tool_list`] (wire v29): one row per
+    /// registered tool plus one per disabled config-gated surface (with `requires`). Late-bound by
+    /// the assembling binary (which owns the tool build gates); `None` => `tool_list` returns empty.
+    tools_inventory: Arc<ArcSwapOption<Vec<daemon_api::ToolInfo>>>,
     /// The identity store backing the admin access-control sub-surface ([`daemon_api::AccessControlApi`]).
     /// `None` => every admin op resolves to [`ApiError::Unsupported`] (a node assembled without an
     /// identity store — the FFI / conformance harness). `who_am_i` needs no store (it reads the

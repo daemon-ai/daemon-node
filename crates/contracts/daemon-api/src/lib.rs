@@ -2254,15 +2254,27 @@ pub struct ProviderInfo {
     pub available: bool,
 }
 
-/// A node tool entry (I12 stub DTO).
+/// A node tool-inventory entry ([`ControlApi::tool_list`]; enriched in wire v29 so a client can
+/// render "why is this tool unavailable"). One row per registered tool, plus one row per
+/// config-gated optional surface that did NOT materialize (`enabled: false` + `requires`).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInfo {
-    /// The tool name (as used in `ProfileSpec.tool_allowlist`).
+    /// The tool name (as used in `ProfileSpec.tool_allowlist`), or the subsystem name for a
+    /// disabled dynamic surface whose tool names are only known once it is enabled (e.g. `python`,
+    /// `mcp`).
     pub name: String,
     /// A short human description, when known.
     #[serde(default)]
     pub description: Option<String>,
+    /// Whether the tool is registered and usable on this node right now (wire v29). Profile
+    /// allowlists can still narrow a session's view — this is the node-wide availability.
+    pub enabled: bool,
+    /// Why a disabled tool is unavailable (wire v29): the missing config key / credential /
+    /// build feature (e.g. `[web].enable + a tavily credential`, `browser build feature`).
+    /// `None` for enabled tools.
+    #[serde(default)]
+    pub requires: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
