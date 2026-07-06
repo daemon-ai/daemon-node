@@ -285,6 +285,7 @@ mod tests {
                 body: HostResponseBody::Approved {
                     approved: true,
                     allow_permanent: false,
+                    reason: None,
                 },
             }
         }

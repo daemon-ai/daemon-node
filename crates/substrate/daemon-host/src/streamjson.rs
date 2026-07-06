@@ -396,6 +396,7 @@ mod tests {
             body: HostResponseBody::Approved {
                 approved: true,
                 allow_permanent: false,
+                reason: None,
             },
         }));
         let line = String::from_utf8(lines[0].clone()).unwrap();

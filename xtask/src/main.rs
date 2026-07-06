@@ -318,6 +318,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             request_id: "fixture-request".into(),
             allow: true,
             allow_permanent: true,
+            reason: Some("fixture reason".into()),
         },
     )?;
     write_cbor(

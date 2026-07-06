@@ -534,14 +534,17 @@ pub trait ControlApi: Send + Sync {
     /// `request_id` is the opaque id from [`Self::approvals_pending`]. `allow_permanent` (Cluster B)
     /// additionally remembers the approved command's fingerprint on the session allow-list when the
     /// parked approval carries one (so an identical in-session re-request auto-approves); it degrades
-    /// to a single allow otherwise. Idempotent (a redelivered decision is a no-op). Default:
-    /// unsupported (a transport with no durable approval store).
+    /// to a single allow otherwise. `reason` (wire v29) is an optional operator justification: on a
+    /// deny it becomes the gated tool's error content in the agent's conversation, so the model can
+    /// adapt its next attempt; ignored on allow. Idempotent (a redelivered decision is a no-op).
+    /// Default: unsupported (a transport with no durable approval store).
     async fn approval_decide(
         &self,
         _session: SessionId,
         _request_id: String,
         _allow: bool,
         _allow_permanent: bool,
+        _reason: Option<String>,
     ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("approval_decide".into()))
     }

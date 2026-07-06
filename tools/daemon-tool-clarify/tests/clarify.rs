@@ -105,6 +105,7 @@ async fn declined_answer_is_not_ok() {
     let host = ScriptedHost::new(HostResponseBody::Approved {
         approved: false,
         allow_permanent: false,
+        reason: None,
     });
     let out = run(&tool, &host, r#"{"question":"proceed?"}"#).await;
     assert!(!out.result.ok);

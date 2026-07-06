@@ -353,6 +353,7 @@ async fn live_approval_park_then_respond_impl(store: Arc<dyn SessionStore>, allo
             body: HostResponseBody::Approved {
                 approved: allow,
                 allow_permanent: false,
+                reason: None,
             },
         },
     )

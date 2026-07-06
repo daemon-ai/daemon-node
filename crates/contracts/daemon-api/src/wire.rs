@@ -489,6 +489,11 @@ pub enum ApiRequest {
         /// when `ApprovalInfo.fingerprint` is set); otherwise it degrades to a single allow. Additive.
         #[serde(default)]
         allow_permanent: bool,
+        /// An optional operator justification (wire v29). On a deny it is injected into the
+        /// agent's conversation as the gated tool's error content, so the model can adapt its
+        /// next attempt instead of guessing why the action was refused. Ignored on allow.
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// [`ControlApi::checkpoints`].
     CheckpointList {

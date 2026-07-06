@@ -451,6 +451,25 @@ pub struct ParkedApproval {
     pub decision: Option<bool>,
 }
 
+/// Encode an operator approval decision as the [`JobCompletion`] payload the engine's
+/// `resolve_approvals` decodes (shared by both store backends). The sentinels are stable:
+/// `allow_permanent` / `allow` / `deny` — permanence still starts with "allow" (the engine's
+/// allow/deny split is unchanged) and a deny `reason` (wire v29) rides as `deny:{reason}` so the
+/// engine can inject the operator's own words as the gated tool's error content. A reasonless deny
+/// keeps the bare legacy `deny` sentinel.
+pub fn approval_completion_payload(
+    allow: bool,
+    allow_permanent: bool,
+    reason: Option<&str>,
+) -> Vec<u8> {
+    match (allow, allow_permanent, reason.map(str::trim)) {
+        (true, true, _) => b"allow_permanent".to_vec(),
+        (true, false, _) => b"allow".to_vec(),
+        (false, _, Some(reason)) if !reason.is_empty() => format!("deny:{reason}").into_bytes(),
+        (false, _, _) => b"deny".to_vec(),
+    }
+}
+
 /// Errors surfaced by a [`SessionStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -845,18 +864,22 @@ pub trait SessionStore: Send + Sync {
 
     /// Record an operator's decision for a parked approval and wake the session in one transaction:
     /// stamp the parked row's `decision`, record a [`JobCompletion`] for its `job_id` (payload
-    /// `allow`/`allow_permanent`/`deny`) so the rehydrated engine resolves the gated tool call, and
-    /// publish a wake. `allow_permanent` (Cluster B) carries the operator's "Allow permanently" choice
-    /// through to the engine via the completion payload (`allow_permanent`), where `resolve_approvals`
-    /// remembers the verified command fingerprint for the session; it is meaningful only when `allow`.
-    /// Idempotent per `(session, epoch, job)` (a redelivered answer is a no-op). Returns `true` if a
-    /// matching pending approval was found and answered. Default: `false` (no such row).
+    /// `allow`/`allow_permanent`/`deny`/`deny:{reason}`) so the rehydrated engine resolves the gated
+    /// tool call, and publish a wake. `allow_permanent` (Cluster B) carries the operator's "Allow
+    /// permanently" choice through to the engine via the completion payload (`allow_permanent`),
+    /// where `resolve_approvals` remembers the verified command fingerprint for the session; it is
+    /// meaningful only when `allow`. `reason` (wire v29) is the operator's optional deny
+    /// justification, riding the payload as `deny:{reason}` so the engine injects it as the gated
+    /// tool's error content; it is meaningful only when NOT `allow`. Idempotent per `(session,
+    /// epoch, job)` (a redelivered answer is a no-op). Returns `true` if a matching pending approval
+    /// was found and answered. Default: `false` (no such row).
     async fn answer_approval(
         &self,
         _session: &SessionId,
         _job_id: &JobId,
         _allow: bool,
         _allow_permanent: bool,
+        _reason: Option<String>,
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
@@ -1608,6 +1631,7 @@ impl SessionStore for InMemoryStore {
         job_id: &JobId,
         allow: bool,
         allow_permanent: bool,
+        reason: Option<String>,
     ) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let epoch = match inner.pending_approvals.get_mut(session) {
@@ -1626,13 +1650,7 @@ impl SessionStore for InMemoryStore {
             session_id: session.clone(),
             epoch,
             job_id: job_id.clone(),
-            // `allow_permanent` still starts with "allow" (the engine's allow/deny split is unchanged);
-            // `resolve_approvals` reads the exact string to record the verified fingerprint.
-            payload: match (allow, allow_permanent) {
-                (true, true) => b"allow_permanent".to_vec(),
-                (true, false) => b"allow".to_vec(),
-                (false, _) => b"deny".to_vec(),
-            },
+            payload: approval_completion_payload(allow, allow_permanent, reason.as_deref()),
         };
         // Completion durable + session Ready, then publish the wake (one transaction).
         if Self::apply_completion_locked(&mut inner, &completion) {

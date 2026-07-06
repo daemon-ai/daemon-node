@@ -134,8 +134,9 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             request_id,
             allow,
             allow_permanent,
+            reason,
         } => unit_or_err(
-            api.approval_decide(session, request_id, allow, allow_permanent)
+            api.approval_decide(session, request_id, allow, allow_permanent, reason)
                 .await,
         ),
         ApiRequest::CheckpointList { session, after } => {

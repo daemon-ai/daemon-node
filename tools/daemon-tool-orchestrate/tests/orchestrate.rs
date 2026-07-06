@@ -46,6 +46,7 @@ impl HostRequestHandler for DelegatingHost {
             _ => HostResponseBody::Approved {
                 approved: true,
                 allow_permanent: false,
+                reason: None,
             },
         };
         HostResponse {

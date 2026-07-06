@@ -998,6 +998,7 @@ impl SessionStore for SqliteStore {
         job_id: &JobId,
         allow: bool,
         allow_permanent: bool,
+        reason: Option<String>,
     ) -> Result<bool, StoreError> {
         // Stamp the decision, record the completion, and publish the wake in one transaction.
         let mut conn = self.conn.lock().unwrap();
@@ -1021,14 +1022,9 @@ impl SessionStore for SqliteStore {
             params![session.as_str(), job_id.as_str(), allow as i64],
         )
         .map_err(sql_err)?;
-        // `allow_permanent` still starts with "allow" (the engine's allow/deny split is unchanged);
-        // `resolve_approvals` reads the exact string to record the verified fingerprint on the session
-        // allow-list. The `decision` column stays a bool (`allow`) — permanence rides only the payload.
-        let payload: &[u8] = match (allow, allow_permanent) {
-            (true, true) => b"allow_permanent",
-            (true, false) => b"allow",
-            (false, _) => b"deny",
-        };
+        // The shared sentinel encoding (see `approval_completion_payload`): permanence and a deny
+        // reason ride only the payload — the `decision` column stays a bool (`allow`).
+        let payload = crate::approval_completion_payload(allow, allow_permanent, reason.as_deref());
         let fresh = tx
             .execute(
                 "INSERT OR IGNORE INTO completion_inbox (session_id, epoch, job_id, payload) \

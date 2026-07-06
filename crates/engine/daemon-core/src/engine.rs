@@ -1589,10 +1589,20 @@ impl Engine {
                             )
                         }
                     } else {
-                        (
-                            false,
-                            format!("operator denied this action (request {})", approval.job_id),
-                        )
+                        // A deny may carry the operator's reason (wire v29, payload `deny:{reason}`):
+                        // inject it as the tool error's content so the model can adapt its next
+                        // attempt instead of guessing why the action was refused.
+                        let content = match decision.strip_prefix("deny:") {
+                            Some(reason) if !reason.trim().is_empty() => format!(
+                                "operator denied this action (request {}): {}",
+                                approval.job_id,
+                                reason.trim()
+                            ),
+                            _ => {
+                                format!("operator denied this action (request {})", approval.job_id)
+                            }
+                        };
+                        (false, content)
                     };
                     self.replace_awaiting_result(&approval.job_id, ok, content);
                 }

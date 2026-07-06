@@ -101,6 +101,7 @@ async fn drain_turn(node: &Arc<NodeApiImpl>, session: &daemon_common::SessionId)
                         body: HostResponseBody::Approved {
                             approved: true,
                             allow_permanent: false,
+                            reason: None,
                         },
                     },
                 )

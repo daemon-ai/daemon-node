@@ -1574,6 +1574,7 @@ impl HostRequestHandler for ParkingHandler {
                         body: HostResponseBody::Approved {
                             approved: true,
                             allow_permanent: false,
+                            reason: None,
                         },
                     };
                 }
@@ -1583,6 +1584,7 @@ impl HostRequestHandler for ParkingHandler {
                         body: HostResponseBody::Approved {
                             approved: false,
                             allow_permanent: false,
+                            reason: None,
                         },
                     };
                 }
@@ -1626,6 +1628,7 @@ impl HostRequestHandler for ParkingHandler {
                 body: HostResponseBody::Approved {
                     approved: false,
                     allow_permanent: false,
+                    reason: None,
                 },
             },
         }

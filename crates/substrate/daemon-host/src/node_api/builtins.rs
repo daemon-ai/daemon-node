@@ -171,7 +171,9 @@ impl NodeApiImpl {
         })
     }
 
-    /// `/approve` / `/deny <request-id>` — resolve a pending approval on the invoking session.
+    /// `/approve <request-id>` / `/deny <request-id> [reason…]` — resolve a pending approval on the
+    /// invoking session. A deny's trailing text (wire v29) is the operator's reason, surfaced to the
+    /// model as the gated tool's error content.
     async fn builtin_approve_deny(
         &self,
         builtin: crate::commands::Builtin,
@@ -181,17 +183,28 @@ impl NodeApiImpl {
         let args = invocation.args.trim();
         if args.is_empty() {
             return Err(ApiError::Other(format!(
-                "usage: /{} <request-id>",
-                if allow { "approve" } else { "deny" }
+                "usage: /{}",
+                if allow {
+                    "approve <request-id>"
+                } else {
+                    "deny <request-id> [reason…]"
+                }
             )));
         }
         let session = require_session(invocation, "approval")?;
+        // `/deny` takes an optional trailing reason after the request id; `/approve` does not.
+        let (request_id, reason) = match args.split_once(char::is_whitespace) {
+            Some((id, rest)) if !allow && !rest.trim().is_empty() => {
+                (id.to_string(), Some(rest.trim().to_string()))
+            }
+            _ => (args.to_string(), None),
+        };
         // The `/approve` builtin is a single allow — permanence is a GUI affordance, not a text command.
-        self.approval_decide(session, args.to_string(), allow, false)
+        self.approval_decide(session, request_id.clone(), allow, false, reason)
             .await?;
         Ok(CommandOutput {
             text: format!(
-                "request {args} {}",
+                "request {request_id} {}",
                 if allow { "approved" } else { "denied" }
             ),
             ephemeral: true,

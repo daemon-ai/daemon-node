@@ -156,7 +156,9 @@ host-request-kind-t = host-request-kind-approval
                   / host-request-kind-choice
                   / host-request-kind-delegate
                   / host-request-kind-spawn
-host-response-body-approved = { "Approved": { "approved": bool, ? "allow_permanent": bool } }
+; v29: the optional `reason` is an operator justification — meaningful on a deny, where the engine
+; injects it as the gated tool's error content so the model can adapt its next attempt.
+host-response-body-approved = { "Approved": { "approved": bool, ? "allow_permanent": bool, ? "reason": (tstr / null) } }
 host-response-body-input = { "Input": tstr }
 host-response-body-chosen = { "Chosen": uint }
 host-response-body-delegated = { "Delegated": job-id }
@@ -1055,7 +1057,7 @@ request-set-session-model = { "SetSessionModel": { "session": session-id, "model
 request-set-session-mode = { "SetSessionMode": { "session": session-id, "mode": approval-mode } }
 request-set-session-overlay = { "SetSessionOverlay": { "session": session-id, "overlay": session-overlay } }
 request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null), ? "after": (tstr / null) } }
-request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool, ? "allow_permanent": bool } }
+request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool, ? "allow_permanent": bool, ? "reason": (tstr / null) } }
 request-profile-list = "ProfileList"
 request-profile-get = { "ProfileGet": { "id": tstr } }
 request-profile-create = { "ProfileCreate": { "spec": profile-spec } }

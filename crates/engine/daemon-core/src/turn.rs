@@ -252,13 +252,25 @@ async fn ask_host(
         HostResponseBody::Approved {
             approved: true,
             allow_permanent,
+            ..
         } => Gate::Proceed {
             permanent: allow_permanent && fingerprint.is_some(),
         },
         HostResponseBody::Approved {
-            approved: false, ..
-        } => Gate::Reject("denied by operator".to_string()),
+            approved: false,
+            reason,
+            ..
+        } => Gate::Reject(deny_reason(reason)),
         HostResponseBody::Deferred(job_id) => Gate::Defer(job_id),
         _ => Gate::Reject("approval not granted".to_string()),
+    }
+}
+
+/// Render an operator deny as the tool's failure content: the operator's own words when a reason
+/// was supplied (wire v29 — so the model can adapt its next attempt), else the bare fixed string.
+pub(crate) fn deny_reason(reason: Option<String>) -> String {
+    match reason {
+        Some(r) if !r.trim().is_empty() => format!("denied by operator: {r}"),
+        _ => "denied by operator".to_string(),
     }
 }

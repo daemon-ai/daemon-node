@@ -98,6 +98,7 @@ impl HostRequestHandler for NoopHost {
             body: HostResponseBody::Approved {
                 approved: true,
                 allow_permanent: false,
+                reason: None,
             },
         }
     }
@@ -137,6 +138,7 @@ impl HostRequestHandler for SpawnRecordingHost {
             body: HostResponseBody::Approved {
                 approved: true,
                 allow_permanent: false,
+                reason: None,
             },
         }
     }

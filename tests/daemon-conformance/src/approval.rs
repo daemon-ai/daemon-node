@@ -113,7 +113,7 @@ async fn durable_park_allow_resume_completes() {
 
     // Operator allows: records the decision + wakes; the session resumes and completes.
     assert!(store
-        .answer_approval(&id, &request_id, true, false)
+        .answer_approval(&id, &request_id, true, false, None)
         .await
         .expect("answer"));
     assert!(store.pending_approvals_of(Some(&id)).await.is_empty());
@@ -135,7 +135,7 @@ async fn durable_park_deny_resume_completes() {
         .job_id
         .clone();
     assert!(store
-        .answer_approval(&id, &request_id, false, false)
+        .answer_approval(&id, &request_id, false, false, None)
         .await
         .expect("answer"));
     mgr.wake(id.clone()).await.expect("resume");
@@ -158,7 +158,7 @@ async fn parked_approval_survives_restart() {
         .job_id
         .clone();
     assert!(store
-        .answer_approval(&id, &request_id, true, false)
+        .answer_approval(&id, &request_id, true, false, None)
         .await
         .expect("answer"));
     let mgr2 = writing_manager(store.clone());
@@ -213,7 +213,7 @@ async fn store_contract(store: &dyn SessionStore) {
 
     // Answer (allow): records a wake + a completion, drops it from the pending list.
     assert!(store
-        .answer_approval(&id, &job_id, true, false)
+        .answer_approval(&id, &job_id, true, false, None)
         .await
         .expect("answer"));
     assert!(store.pending_approvals_of(Some(&id)).await.is_empty());
@@ -228,22 +228,24 @@ async fn store_contract(store: &dyn SessionStore) {
 
     // Idempotent: a redelivered answer is a no-op (still answered, no extra wake/completion).
     assert!(store
-        .answer_approval(&id, &job_id, true, false)
+        .answer_approval(&id, &job_id, true, false, None)
         .await
         .expect("re-answer"));
     assert!(store.dequeue_wake().await.is_none(), "no duplicate wake");
 
     // An unknown request answers false.
     assert!(!store
-        .answer_approval(&id, &JobId::new("no-such"), true, false)
+        .answer_approval(&id, &JobId::new("no-such"), true, false, None)
         .await
         .expect("unknown"));
 }
 
-/// Test #9 (store): `answer_approval` encodes the operator's permanence choice in the completion
-/// payload the rehydrated engine reads — `allow_permanent` (allow + remember), `allow` (single),
-/// `deny`. Run against both backends so they stay in lockstep. `allow_permanent` must still start with
-/// "allow" so the engine's allow/deny split is unchanged.
+/// Test #9 (store): `answer_approval` encodes the operator's permanence choice — and, wire v29,
+/// an optional deny reason — in the completion payload the rehydrated engine reads:
+/// `allow_permanent` (allow + remember), `allow` (single), `deny`, `deny:{reason}`. Run against
+/// both backends so they stay in lockstep. `allow_permanent` must still start with "allow" so the
+/// engine's allow/deny split is unchanged; a reason is meaningful only on a deny (an allow ignores
+/// it) and a reasonless deny keeps the bare legacy `deny` sentinel.
 async fn permanence_payload_contract(store: &dyn SessionStore) {
     let park = |id: &SessionId, job: &JobId| ParkedApproval {
         session_id: id.clone(),
@@ -254,11 +256,26 @@ async fn permanence_payload_contract(store: &dyn SessionStore) {
         fingerprint: Some("fp-deadbeef".into()),
         decision: None,
     };
-    // The completion payload for a permanent allow / single allow / deny.
-    for (tag, allow, permanent, expected) in [
-        ("perm", true, true, b"allow_permanent".as_slice()),
-        ("single", true, false, b"allow".as_slice()),
-        ("deny", false, true, b"deny".as_slice()),
+    // The completion payload for a permanent allow / single allow / deny / deny-with-reason.
+    for (tag, allow, permanent, reason, expected) in [
+        ("perm", true, true, None, b"allow_permanent".as_slice()),
+        ("single", true, false, None, b"allow".as_slice()),
+        ("deny", false, true, None, b"deny".as_slice()),
+        (
+            "deny-reason",
+            false,
+            false,
+            Some("wrong branch, rebase first".to_string()),
+            b"deny:wrong branch, rebase first".as_slice(),
+        ),
+        // An allow ignores a supplied reason (it is deny-only context).
+        (
+            "allow-reason",
+            true,
+            false,
+            Some("ok".to_string()),
+            b"allow".as_slice(),
+        ),
     ] {
         let id = SessionId::new(format!("perm-{tag}"));
         seed(store, &id).await;
@@ -274,7 +291,7 @@ async fn permanence_payload_contract(store: &dyn SessionStore) {
             .await
             .expect("park");
         assert!(store
-            .answer_approval(&id, &job, allow, permanent)
+            .answer_approval(&id, &job, allow, permanent, reason)
             .await
             .expect("answer"));
         let act = store

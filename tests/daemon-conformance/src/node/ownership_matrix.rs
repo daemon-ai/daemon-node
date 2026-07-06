@@ -473,6 +473,7 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
                     body: HostResponseBody::Approved {
                         approved: true,
                         allow_permanent: false,
+                        reason: None,
                     },
                 },
             },
@@ -547,6 +548,7 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
                 request_id: "r".into(),
                 allow: true,
                 allow_permanent: false,
+                reason: None,
             },
             Deny::Forbidden,
         ),

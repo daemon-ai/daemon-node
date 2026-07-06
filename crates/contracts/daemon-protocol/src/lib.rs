@@ -758,6 +758,11 @@ pub enum HostResponseBody {
         /// The operator chose "Allow permanently" (see the variant docs).
         #[serde(default)]
         allow_permanent: bool,
+        /// An optional operator-supplied justification (wire v29). Meaningful on a deny: the
+        /// engine surfaces it to the model as the gated tool's error content, so the model can
+        /// adapt its next attempt instead of guessing why the action was refused.
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// Free-form input result.
     Input(String),

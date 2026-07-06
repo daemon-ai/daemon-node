@@ -936,6 +936,7 @@ impl HostRequestHandler for ParkingHandler {
                 body: HostResponseBody::Approved {
                     approved: false,
                     allow_permanent: false,
+                    reason: None,
                 },
             },
         }

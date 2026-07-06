@@ -403,6 +403,7 @@ impl HostRequestHandler for ManageToHost {
                 HostResponseBody::Approved {
                     approved: false,
                     allow_permanent: false,
+                    reason: None,
                 }
             };
             return HostResponse { request_id, body };
@@ -444,6 +445,7 @@ fn map_response_body(body: ManageResponseBody, is_delegate: bool) -> HostRespons
         ManageResponseBody::Approved(ok) => HostResponseBody::Approved {
             approved: ok,
             allow_permanent: false,
+            reason: None,
         },
         ManageResponseBody::Input(text) => HostResponseBody::Input(text),
         ManageResponseBody::Chosen(index) => HostResponseBody::Chosen(index),
@@ -457,6 +459,7 @@ fn map_response_body(body: ManageResponseBody, is_delegate: bool) -> HostRespons
         _ => HostResponseBody::Approved {
             approved: false,
             allow_permanent: false,
+            reason: None,
         },
     }
 }

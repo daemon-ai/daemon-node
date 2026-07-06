@@ -640,6 +640,7 @@ mod tests {
                 body: HostResponseBody::Approved {
                     approved: self.0,
                     allow_permanent: false,
+                    reason: None,
                 },
             }
         }
@@ -655,6 +656,7 @@ mod tests {
                 body: HostResponseBody::Approved {
                     approved: true,
                     allow_permanent: true,
+                    reason: None,
                 },
             }
         }
