@@ -846,6 +846,23 @@ pub trait SessionStore: Send + Sync {
         Vec::new()
     }
 
+    /// Compare-and-swap a DORMANT session's snapshot blob: atomically replace it with `new` only
+    /// when the session is NOT `Active` and its current blob equals `expected`. The host-mediated
+    /// snapshot-edit seam (wire v29 `FingerprintRevoke`): an operator mutation of durable engine
+    /// state must never race a running incarnation (which would overwrite the edit at its next
+    /// checkpoint), so an `Active` session — or a blob that changed since the caller's read —
+    /// refuses with `Ok(false)` and the caller retries. The store keeps treating the blob as
+    /// opaque bytes (the typed decode/encode lives host-side). Default: `false` (a
+    /// non-authoritative proxy store).
+    async fn swap_snapshot_if_dormant(
+        &self,
+        _id: &SessionId,
+        _expected: &SnapshotBlob,
+        _new: SnapshotBlob,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     /// Atomically checkpoint a session suspended on a §12 edit-approval decision and durably record
     /// its parked approval row(s) — **without** enqueuing a runnable background job (unlike
     /// [`checkpoint_and_enqueue`]). The session goes `Suspended` on the first approval's `job_id` and
@@ -1769,6 +1786,24 @@ impl SessionStore for InMemoryStore {
             .sessions
             .get(id)
             .map(|rec| rec.snapshot.clone())
+    }
+
+    async fn swap_snapshot_if_dormant(
+        &self,
+        id: &SessionId,
+        expected: &SnapshotBlob,
+        new: SnapshotBlob,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let rec = inner
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        if matches!(rec.status, SessionStatus::Active) || &rec.snapshot != expected {
+            return Ok(false);
+        }
+        rec.snapshot = new;
+        Ok(true)
     }
 
     async fn set_session_meta(&self, id: &SessionId, meta: SessionMeta) -> Result<(), StoreError> {

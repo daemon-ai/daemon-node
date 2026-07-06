@@ -495,6 +495,18 @@ pub enum ApiRequest {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// [`ControlApi::fingerprint_list`] — a session's remembered exec-approval fingerprints.
+    FingerprintList {
+        /// The session whose `allow_permanent` allow-list to read.
+        session: SessionId,
+    },
+    /// [`ControlApi::fingerprint_revoke`] — drop one remembered fingerprint (re-prompts next time).
+    FingerprintRevoke {
+        /// The session whose allow-list to edit.
+        session: SessionId,
+        /// The fingerprint hex (from [`ControlApi::fingerprint_list`] / `ApprovalInfo.fingerprint`).
+        fingerprint: String,
+    },
     /// [`ControlApi::checkpoints`].
     CheckpointList {
         /// Filter to one session, or `None` for the node-wide checkpoint list.
@@ -980,6 +992,8 @@ pub enum ApiResponse {
     Sessions(Vec<SessionInfo>),
     /// A page of parked §12 edit-approval requests awaiting an operator decision (request_id order).
     Approvals(WirePage<ApprovalInfo>),
+    /// A session's remembered exec-approval fingerprints (fingerprint_list; wire v29).
+    Fingerprints(Vec<RememberedFingerprint>),
     /// A page of recorded §12 tool checkpoints (rewind points), checkpoint-id order.
     Checkpoints(WirePage<CheckpointInfo>),
     /// A fleet report.

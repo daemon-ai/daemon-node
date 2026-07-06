@@ -549,6 +549,33 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("approval_decide".into()))
     }
 
+    /// List a session's remembered exec-approval command fingerprints (wire v29; the
+    /// `allow_permanent` allow-list `Effect::RememberApproval` / a durable allow-permanent decision
+    /// records on the session snapshot), truncated at [`WIRE_PAGE_MAX`] (the allow-list is
+    /// operator-curated and small). Reads the DURABLE snapshot: a live-resident session's
+    /// in-memory list is not readable here (it is ephemeral — it dies with the residency).
+    /// Default: unsupported (a transport with no durable session store).
+    async fn fingerprint_list(
+        &self,
+        _session: SessionId,
+    ) -> Result<Vec<RememberedFingerprint>, ApiError> {
+        Err(ApiError::Unsupported("fingerprint_list".into()))
+    }
+
+    /// Revoke one remembered fingerprint from a session's `allow_permanent` allow-list (wire v29):
+    /// the exact command stops auto-approving and the next identical request re-prompts. Applies to
+    /// the DURABLE snapshot of a dormant session; the revoke takes effect at the session's next
+    /// activation (a turn already running when the revoke lands still honors the old list — the
+    /// documented one-round latency). A live-resident or actively-running session refuses with a
+    /// clear error instead of silently losing the edit. Default: unsupported.
+    async fn fingerprint_revoke(
+        &self,
+        _session: SessionId,
+        _fingerprint: String,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("fingerprint_revoke".into()))
+    }
+
     /// The node's journal **verifying** key (hex-encoded dCBOR), so an auditor can independently
     /// verify the sealed segments returned by the history reads. `None` when the node exposes no
     /// journal signer. Default: `None`.
@@ -1965,6 +1992,23 @@ pub struct ApprovalInfo {
     /// approve-then-swap enforcement stays snapshot-side in `daemon-core`.
     #[serde(default)]
     pub fingerprint: Option<String>,
+}
+
+/// One remembered exec-approval command fingerprint on a session's `allow_permanent` allow-list
+/// (wire v29; [`ControlApi::fingerprint_list`] / [`ControlApi::fingerprint_revoke`]): the operator
+/// answered an approval with "Allow permanently", so this exact resolved command auto-approves for
+/// the rest of the session. Least-privilege management surface — list what is trusted, revoke one.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedFingerprint {
+    /// The lowercase-hex sha256 of the resolved `(exec-surface, abs-binary, argv, env-delta, cwd)`
+    /// tuple — the same value [`ApprovalInfo::fingerprint`] displays at park time.
+    pub fingerprint: String,
+    /// An optional human-readable label for the remembered command. Always `None` today (the
+    /// engine stores only the hash); reserved so a future command-summary capture needs no wire
+    /// bump.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`

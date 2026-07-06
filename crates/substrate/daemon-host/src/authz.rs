@@ -78,13 +78,16 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | SessionsQuery { .. }
         | SessionGet { .. }
         | SessionSearch { .. }
-        | SessionRecap { .. } => C::SessionRead,
-        // A user may drive their OWN session's lifecycle (cancel/rewind/checkpoint-rewind/approve +
-        // roster metadata); Track C scopes it to ownership, operators cross via SessionControlAny.
+        | SessionRecap { .. }
+        | FingerprintList { .. } => C::SessionRead,
+        // A user may drive their OWN session's lifecycle (cancel/rewind/checkpoint-rewind/approve/
+        // fingerprint-revoke + roster metadata); Track C scopes it to ownership, operators cross
+        // via SessionControlAny.
         Cancel { .. }
         | Rewind { .. }
         | CheckpointRewind { .. }
         | ApprovalDecide { .. }
+        | FingerprintRevoke { .. }
         | SessionUpdateMeta { .. } => C::SessionWrite,
 
         // -- serve_fleet: orchestration tree ----------------------------------------------------

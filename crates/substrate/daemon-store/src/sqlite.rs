@@ -1334,6 +1334,37 @@ impl SessionStore for SqliteStore {
         .map(SnapshotBlob::new)
     }
 
+    async fn swap_snapshot_if_dormant(
+        &self,
+        id: &SessionId,
+        expected: &SnapshotBlob,
+        new: SnapshotBlob,
+    ) -> Result<bool, StoreError> {
+        // One statement = one transaction: the not-Active + unchanged-blob guards and the write
+        // are atomic, so a concurrent activation (which flips `status_kind` to 'active' first)
+        // can never interleave between check and write.
+        let conn = self.conn.lock().unwrap();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM session_record WHERE session_id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(id.clone()));
+        }
+        let swapped = conn
+            .execute(
+                "UPDATE session_record SET snapshot = ?2 \
+                 WHERE session_id = ?1 AND status_kind != 'active' AND snapshot = ?3",
+                params![id.as_str(), new.0, expected.0],
+            )
+            .map_err(sql_err)?;
+        Ok(swapped > 0)
+    }
+
     async fn set_session_meta(&self, id: &SessionId, meta: SessionMeta) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let bound = meta.bound_profile.as_ref().map(|p| p.as_str());

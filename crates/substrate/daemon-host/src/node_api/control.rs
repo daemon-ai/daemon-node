@@ -390,6 +390,88 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("wake: {e}")))
     }
 
+    async fn fingerprint_list(
+        &self,
+        session: SessionId,
+    ) -> Result<Vec<daemon_api::RememberedFingerprint>, ApiError> {
+        // Auth 4: owner-or-`SessionSeeAll` may read a session's remembered approvals.
+        self.require_session_access(&session, false).await?;
+        // The allow-list of a LIVE-resident session lives in the resident engine's memory (it is
+        // ephemeral — it dies with the residency and is never persisted); the durable snapshot is
+        // the only managed storage. Refuse rather than mislead with an empty durable read.
+        if self.live.resident_is_foreign(&session).is_some() {
+            return Err(ApiError::Unsupported(
+                "fingerprint management targets durable sessions; this session is live-resident \
+                 (its allow-list is in-memory and resets at session close)"
+                    .into(),
+            ));
+        }
+        let Some(blob) = self.store.peek_snapshot(&session).await else {
+            return Ok(Vec::new());
+        };
+        let snap = Snapshot::decode(&blob)
+            .map_err(|e| ApiError::Other(format!("decode session snapshot: {e}")))?;
+        Ok(snap
+            .session_allow_fingerprints
+            .iter()
+            .take(daemon_api::WIRE_PAGE_MAX)
+            .map(|fp| daemon_api::RememberedFingerprint {
+                fingerprint: fp.as_str().to_string(),
+                label: None,
+            })
+            .collect())
+    }
+
+    async fn fingerprint_revoke(
+        &self,
+        session: SessionId,
+        fingerprint: String,
+    ) -> Result<(), ApiError> {
+        // Auth 4: only the owner (or a `SessionControlAny` operator) may edit the allow-list.
+        self.require_session_access(&session, true).await?;
+        if self.live.resident_is_foreign(&session).is_some() {
+            return Err(ApiError::Unsupported(
+                "fingerprint management targets durable sessions; this session is live-resident \
+                 (its allow-list is in-memory and resets at session close)"
+                    .into(),
+            ));
+        }
+        // Read-modify-write of the DORMANT durable snapshot under the store's compare-and-swap:
+        // an Active session (or a concurrent snapshot writer) refuses instead of losing the edit
+        // to the incarnation's next checkpoint. The revoke takes effect at the next activation,
+        // which reseeds the engine's allow-list view from this snapshot.
+        let Some(blob) = self.store.peek_snapshot(&session).await else {
+            return Err(ApiError::Other(format!(
+                "no durable session {session} to revoke a fingerprint on"
+            )));
+        };
+        let mut snap = Snapshot::decode(&blob)
+            .map_err(|e| ApiError::Other(format!("decode session snapshot: {e}")))?;
+        let before = snap.session_allow_fingerprints.len();
+        snap.session_allow_fingerprints
+            .retain(|fp| fp.as_str() != fingerprint);
+        if snap.session_allow_fingerprints.len() == before {
+            return Err(ApiError::Other(format!(
+                "no remembered fingerprint {fingerprint} on session {session}"
+            )));
+        }
+        let new = snap
+            .encode()
+            .map_err(|e| ApiError::Other(format!("encode session snapshot: {e}")))?;
+        let swapped = self
+            .store
+            .swap_snapshot_if_dormant(&session, &blob, new)
+            .await
+            .map_err(|e| ApiError::Other(format!("swap snapshot: {e}")))?;
+        if !swapped {
+            return Err(ApiError::Other(format!(
+                "session {session} is running (or its state changed concurrently) — retry the \
+                 revoke when it is dormant"
+            )));
+        }
+        Ok(())
+    }
+
     async fn assign(&self, session: SessionId) -> Result<(), ApiError> {
         // Auth 4: a peer may only (re)assign a session it owns; an `Absent` session is allowed
         // through so the create-below path can stamp the caller as owner. `SessionControlAny`

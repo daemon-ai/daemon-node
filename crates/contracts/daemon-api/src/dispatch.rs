@@ -139,6 +139,14 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             api.approval_decide(session, request_id, allow, allow_permanent, reason)
                 .await,
         ),
+        ApiRequest::FingerprintList { session } => ok_or_err(
+            api.fingerprint_list(session).await,
+            ApiResponse::Fingerprints,
+        ),
+        ApiRequest::FingerprintRevoke {
+            session,
+            fingerprint,
+        } => unit_or_err(api.fingerprint_revoke(session, fingerprint).await),
         ApiRequest::CheckpointList { session, after } => {
             ApiResponse::Checkpoints(api.checkpoints(session, after).await)
         }

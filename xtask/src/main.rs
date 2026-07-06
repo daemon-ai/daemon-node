@@ -321,6 +321,31 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             reason: Some("fixture reason".into()),
         },
     )?;
+    // Fingerprint management (wire v29): the allow-list list/revoke ops + the list response, so
+    // `verify-codec` proves the generated zcbor C decoder accepts the new shapes.
+    write_cbor(
+        &out,
+        "request-fingerprint-list.cbor",
+        &ApiRequest::FingerprintList {
+            session: SessionId::new("fixture-session"),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-fingerprint-revoke.cbor",
+        &ApiRequest::FingerprintRevoke {
+            session: SessionId::new("fixture-session"),
+            fingerprint: "ab12cd34".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-fingerprints.cbor",
+        &ApiResponse::Fingerprints(vec![daemon_api::RememberedFingerprint {
+            fingerprint: "ab12cd34".into(),
+            label: None,
+        }]),
+    )?;
     write_cbor(
         &out,
         "response-session-created.cbor",

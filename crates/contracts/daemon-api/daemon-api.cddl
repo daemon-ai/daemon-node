@@ -350,6 +350,14 @@ approval-info = {
   ? "fingerprint": (tstr / null),
 }
 
+; one remembered exec-approval fingerprint on a session's allow_permanent allow-list (wire v29;
+; fingerprint_list / fingerprint_revoke). `label` is reserved (always null today — the engine
+; stores only the hash) so a future command-summary capture needs no wire bump.
+remembered-fingerprint = {
+  "fingerprint": tstr,
+  ? "label": (tstr / null),
+}
+
 ; ----- tree projection DTOs (the GUI/TUI surface over the management tree) -----
 unit-kind = "Engine"
           / "Host"
@@ -1058,6 +1066,8 @@ request-set-session-mode = { "SetSessionMode": { "session": session-id, "mode": 
 request-set-session-overlay = { "SetSessionOverlay": { "session": session-id, "overlay": session-overlay } }
 request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null), ? "after": (tstr / null) } }
 request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool, ? "allow_permanent": bool, ? "reason": (tstr / null) } }
+request-fingerprint-list = { "FingerprintList": { "session": session-id } }
+request-fingerprint-revoke = { "FingerprintRevoke": { "session": session-id, "fingerprint": tstr } }
 request-profile-list = "ProfileList"
 request-profile-get = { "ProfileGet": { "id": tstr } }
 request-profile-create = { "ProfileCreate": { "spec": profile-spec } }
@@ -1234,6 +1244,8 @@ api-request = request-submit
             / request-set-session-overlay
             / request-approvals-pending
             / request-approval-decide
+            / request-fingerprint-list
+            / request-fingerprint-revoke
             / request-profile-list
             / request-profile-get
             / request-profile-create
@@ -1384,6 +1396,7 @@ chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
 room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
 conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null) }
 response-approvals = { "Approvals": approval-page }
+response-fingerprints = { "Fingerprints": [0*64 remembered-fingerprint] }
 response-fleet = { "Fleet": fleet-report }
 response-tree = { "Tree": tree-report }
 response-unit = { "Unit": (unit-node / null) }
@@ -1475,6 +1488,7 @@ api-response = response-ok
              / response-telemetry
              / response-sessions
              / response-approvals
+             / response-fingerprints
              / response-fleet
              / response-tree
              / response-unit

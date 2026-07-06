@@ -265,6 +265,8 @@ fn classify(req: &ApiRequest) -> Coverage {
         Assign { .. }
         | Cancel { .. }
         | ApprovalDecide { .. }
+        | FingerprintList { .. }
+        | FingerprintRevoke { .. }
         | CheckpointRewind { .. }
         | SessionUpdateMeta { .. }
         | Rewind { .. } => OwnerGated(Forbidden),
@@ -549,6 +551,19 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
                 allow: true,
                 allow_permanent: false,
                 reason: None,
+            },
+            Deny::Forbidden,
+        ),
+        (
+            "FingerprintList",
+            ApiRequest::FingerprintList { session: s.clone() },
+            Deny::Forbidden,
+        ),
+        (
+            "FingerprintRevoke",
+            ApiRequest::FingerprintRevoke {
+                session: s.clone(),
+                fingerprint: "fp".into(),
             },
             Deny::Forbidden,
         ),
