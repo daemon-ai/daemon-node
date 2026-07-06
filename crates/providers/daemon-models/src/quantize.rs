@@ -204,6 +204,9 @@ async fn run_job(
         context_length: None,
         file_type: None,
         mmproj_path: None,
+        // A freshly-quantized artifact is not pinned (no download-time oid); node-side pinning is the
+        // downloader's job. Display sha256 stays None until a re-catalog through the pin path.
+        sha256: None,
         model,
     };
     inspect::enrich_installed(&mut record);

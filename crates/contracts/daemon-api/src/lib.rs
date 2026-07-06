@@ -1951,6 +1951,13 @@ pub struct ApprovalInfo {
     /// The target path, when the action is a file edit (`None` for a non-path action).
     #[serde(default)]
     pub path: Option<String>,
+    /// The §12 exec-approval command fingerprint (wire v28): the lowercase-hex sha256 of the resolved
+    /// `(abs-binary, argv, env-delta, cwd, exec-surface)` tuple the operator is approving, promoted
+    /// from the free-text `prompt` to a structured field so a GUI can display/correlate it. `None`
+    /// for non-command approvals (fs edits) and pre-v28 rows. Display/correlation only — the
+    /// approve-then-swap enforcement stays snapshot-side in `daemon-core`.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`

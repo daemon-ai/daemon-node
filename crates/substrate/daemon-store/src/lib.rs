@@ -438,6 +438,13 @@ pub struct ParkedApproval {
     pub prompt: String,
     /// The target path, when the action is a file edit (`None` for a non-path action).
     pub path: Option<String>,
+    /// The §12 exec-approval command fingerprint (wire v28): the lowercase-hex sha256 of the resolved
+    /// command tuple, mirrored from the engine's `PendingApproval.fingerprint` so the operator
+    /// surface ([`ApprovalInfo`](daemon_api::ApprovalInfo)) can display it structurally. `None` for
+    /// non-command approvals and pre-v28 rows (`#[serde(default)]`). Display-only — the durable
+    /// re-run enforcement remains keyed on the engine's typed fingerprint.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     /// The operator's decision once answered (`None` while still pending; `Some(true)` = allow).
     pub decision: Option<bool>,
 }

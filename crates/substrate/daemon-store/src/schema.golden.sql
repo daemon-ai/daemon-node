@@ -126,7 +126,7 @@ CREATE TABLE pending_approvals (
     epoch      INTEGER NOT NULL,
     prompt     TEXT NOT NULL,
     path       TEXT,
-    decision   INTEGER,
+    decision   INTEGER, fingerprint TEXT,
     UNIQUE(session_id, job_id)
 );
 CREATE TABLE pending_session_input (

@@ -2275,6 +2275,23 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             Arc::new(daemon_skills::FileSkillUsageLog::open(root))
                 as Arc<dyn daemon_common::SkillUsageLog>
         }));
+        // Opt-in skill-bundle verify-at-import (wire v28), default-off: only when `[skills].
+        // import_verify_key` is set does an import require a valid signature. A malformed key
+        // disables enforcement (warn) rather than failing boot — signing stays optional.
+        if let Some(key_hex) = &cfg.skills.import_verify_key {
+            match daemon_skills::SkillBundleVerifier::from_public_hex(key_hex) {
+                Some(verifier) => {
+                    provider = provider.with_import_verification(Arc::new(verifier));
+                    tracing::info!(
+                        "skill-bundle verify-at-import enabled (trusted key configured)"
+                    );
+                }
+                None => tracing::warn!(
+                    "[skills].import_verify_key is not a valid ed25519 public key (hex dCBOR); \
+                     skill-bundle import verification stays OFF"
+                ),
+            }
+        }
         let provider = Arc::new(provider);
         // The engine-path resolver: each session's engine gets its own profile's tools + index.
         let resolver_provider = provider.clone();

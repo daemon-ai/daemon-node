@@ -10,6 +10,7 @@ fn engine_origin() -> Origin {
     Origin {
         transport: TransportId::new("engine"),
         scope: OriginScope::Internal,
+        sender: None,
     }
 }
 
@@ -20,6 +21,7 @@ fn api_origin() -> Origin {
     Origin {
         transport: TransportId::new("api"),
         scope: OriginScope::Internal,
+        sender: None,
     }
 }
 

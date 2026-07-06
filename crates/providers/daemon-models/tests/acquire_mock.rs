@@ -361,6 +361,7 @@ async fn pairing_scan_links_preexisting_projector_record() {
                 context_length: None,
                 file_type: None,
                 mmproj_path: None,
+                sha256: None,
             })
             .await
             .unwrap();

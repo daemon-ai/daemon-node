@@ -304,6 +304,9 @@ impl ControlApi for NodeApiImpl {
                 request_id: p.job_id.as_str().to_string(),
                 prompt: p.prompt,
                 path: p.path,
+                // wire v28: surface the stamped command fingerprint structurally (was only inside
+                // `prompt`). Enforcement stays snapshot-side; this is display/correlation only.
+                fingerprint: p.fingerprint,
             });
         }
         // The store lists in rowseq (arrival) order; the cursor is the request_id, so sort by it

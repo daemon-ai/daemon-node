@@ -592,6 +592,12 @@ pub struct SkillsConfig {
     pub enable: bool,
     /// The skills root directory (`None` => `<profile_home>/skills`).
     pub dir: Option<PathBuf>,
+    /// Opt-in verify-at-import trust anchor (wire v28): a hex-encoded ed25519 public key
+    /// (`SkillBundleVerifier`'s dCBOR form). When set, `import_bundle` refuses any bundle without a
+    /// signature that verifies against it. `None` (the default) => signing is **off** and unsigned
+    /// bundles import as before. A malformed key disables enforcement (logged), never a hard boot
+    /// failure.
+    pub import_verify_key: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -599,6 +605,7 @@ impl Default for SkillsConfig {
         Self {
             enable: true,
             dir: None,
+            import_verify_key: None,
         }
     }
 }

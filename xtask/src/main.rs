@@ -834,6 +834,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 file_type: Some("Q4_K_M".into()),
                 // The paired vision-projector companion (wire v27); null for text-only models.
                 mmproj_path: Some("/cache/models/mmproj-SmolLM2-135M-Instruct-Q8_0.gguf".into()),
+                // The node-local pinned artifact hash surfaced for display (wire v28).
+                sha256: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                ),
             }]),
         )?;
         write_cbor(

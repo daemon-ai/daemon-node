@@ -899,14 +899,23 @@ pub struct Origin {
     pub transport: TransportId,
     /// The conversational scope (drives session-id derivation + attribution).
     pub scope: OriginScope,
+    /// The immutable, platform-assigned sender identity (wire v28), carried ONWARD from the ingest
+    /// boundary ([`crate`]'s `Reception::sender`, enforced there) for downstream per-event
+    /// attribution on the log/journal. **Never** an input to [`session_id_for`] — group sessions stay
+    /// shared across senders. `None` on host-internal origins, on pre-v28 encodings
+    /// (`#[serde(default)]`), and until an ingest path stamps it.
+    #[serde(default)]
+    pub sender: Option<SenderId>,
 }
 
 impl Origin {
-    /// Construct an origin from a transport and a scope.
+    /// Construct an origin from a transport and a scope (no sender; stamp one with
+    /// [`Origin::with_sender`] when a source identity is known).
     pub fn new(transport: impl Into<TransportId>, scope: OriginScope) -> Self {
         Self {
             transport: transport.into(),
             scope,
+            sender: None,
         }
     }
 
@@ -915,7 +924,15 @@ impl Origin {
         Self {
             transport: transport.into(),
             scope: OriginScope::Internal,
+            sender: None,
         }
+    }
+
+    /// Attach the immutable [`SenderId`] carried from ingest (builder form), for downstream
+    /// attribution. Does not affect [`session_id_for`].
+    pub fn with_sender(mut self, sender: SenderId) -> Self {
+        self.sender = Some(sender);
+        self
     }
 }
 
@@ -1796,6 +1813,37 @@ mod tests {
             session_id_for(&origin, IsolationPolicy::Shared).as_str(),
             "schedule:internal",
         );
+    }
+
+    // wire v28: a populated `Origin.sender` is attribution metadata only — it must NOT change the
+    // derived session id under ANY policy (in particular, a group scope stays one shared conversation
+    // regardless of who sent the message).
+    #[test]
+    fn session_id_for_ignores_sender() {
+        let group = || OriginScope::Group {
+            chat: "c1".into(),
+            thread: None,
+        };
+        let base = Origin::new("matrix", group());
+        let with_a = Origin::new("matrix", group()).with_sender(SenderId::new("@alice:hs"));
+        let with_b = Origin::new("matrix", group()).with_sender(SenderId::new("@bob:hs"));
+        for policy in [
+            IsolationPolicy::PerUser,
+            IsolationPolicy::PerChat,
+            IsolationPolicy::PerThread,
+            IsolationPolicy::Shared,
+        ] {
+            assert_eq!(
+                session_id_for(&base, policy),
+                session_id_for(&with_a, policy),
+                "sender must not perturb derivation ({policy:?})",
+            );
+            assert_eq!(
+                session_id_for(&with_a, policy),
+                session_id_for(&with_b, policy),
+                "distinct senders in one group derive the same id ({policy:?})",
+            );
+        }
     }
 
     #[test]

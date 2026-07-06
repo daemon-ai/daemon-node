@@ -181,6 +181,7 @@ async fn seed_approval(store: &Arc<dyn SessionStore>, s: &SessionId) {
                 epoch: Epoch(1),
                 prompt: "approve write to secret.txt".into(),
                 path: Some("secret.txt".into()),
+                fingerprint: None,
                 decision: None,
             }],
             fence,

@@ -576,6 +576,10 @@ fn notify_catalog_changed(slot: &CatalogChangedSlot) {
 /// Build a catalog record for a freshly acquired model, enriching it with GGUF metadata (arch,
 /// context length, authoritative file-type) when the local artifact is a single GGUF file.
 fn build_record(model: ModelRef, local_path: PathBuf, size_bytes: u64) -> InstalledModel {
+    // wire v28: surface the node-local provenance pin (`<local_path>.sha256`) on the wire record for
+    // display. Read before `local_path` is moved into the struct; `None` for directory models / no
+    // sidecar. Node-side verify-before-load stays authoritative.
+    let sha256 = read_pin(&local_path);
     let mut record = InstalledModel {
         id: model_id(&model),
         display_name: display_name(&model),
@@ -587,6 +591,7 @@ fn build_record(model: ModelRef, local_path: PathBuf, size_bytes: u64) -> Instal
         context_length: None,
         file_type: None,
         mmproj_path: None,
+        sha256,
         model,
     };
     crate::inspect::enrich_installed(&mut record);
@@ -790,6 +795,7 @@ mod tests {
                 context_length: None,
                 file_type: None,
                 mmproj_path: None,
+                sha256: None,
             };
             registry.upsert(record).await.unwrap();
         }
@@ -870,6 +876,7 @@ mod tests {
                     context_length: None,
                     file_type: None,
                     mmproj_path: None,
+                    sha256: None,
                 })
                 .await
                 .unwrap();
@@ -884,6 +891,35 @@ mod tests {
         .await
         .expect("manager");
         (manager, m, artifact, bytes)
+    }
+
+    /// wire v28: `build_record` surfaces the node-local provenance pin (`<path>.sha256`) on the wire
+    /// `InstalledModel.sha256` for display; an artifact with no sidecar reports `None`.
+    #[test]
+    fn build_record_surfaces_pin_sha256() {
+        let dir =
+            std::env::temp_dir().join(format!("daemon-models-pin-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = ModelRef::new(
+            ModelEngine::Llama,
+            ModelSource::hf_file("org/pinned", "m.gguf"),
+        );
+
+        // Pinned artifact: the sidecar hash surfaces on the record.
+        let pinned = dir.join("m.gguf");
+        std::fs::write(&pinned, b"gguf-bytes").unwrap();
+        write_pin(&pinned, "abc123def456");
+        let rec = build_record(m.clone(), pinned, 10);
+        assert_eq!(rec.sha256.as_deref(), Some("abc123def456"));
+
+        // No sidecar: sha256 is None (a legacy / unpinned install).
+        let unpinned = dir.join("legacy.gguf");
+        std::fs::write(&unpinned, b"gguf-bytes").unwrap();
+        let rec2 = build_record(m, unpinned, 10);
+        assert_eq!(rec2.sha256, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A cataloged artifact whose on-disk bytes still match its pin resolves for load.

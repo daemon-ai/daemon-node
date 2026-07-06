@@ -181,6 +181,9 @@ async fn store_contract(store: &dyn SessionStore) {
         epoch: Epoch(1),
         prompt: "approve write to a.txt".into(),
         path: Some("a.txt".into()),
+        // wire v28: a command approval carries the resolved-command fingerprint; it must survive the
+        // durable round-trip so the operator surface can display it structurally.
+        fingerprint: Some("abc123def456".into()),
         decision: None,
     };
     store
@@ -200,6 +203,11 @@ async fn store_contract(store: &dyn SessionStore) {
     let pending = store.pending_approvals_of(Some(&id)).await;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].prompt, "approve write to a.txt");
+    assert_eq!(
+        pending[0].fingerprint.as_deref(),
+        Some("abc123def456"),
+        "the command fingerprint survives the durable park/list round-trip (both backends)",
+    );
     // A node-wide listing finds it too.
     assert_eq!(store.pending_approvals_of(None).await.len(), 1);
 

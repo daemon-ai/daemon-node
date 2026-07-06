@@ -227,6 +227,11 @@ impl Ingestor {
             )));
         }
         let session = session_id_for(&r.origin, self.policy.isolation);
+        // Carry the immutable, adapter-supplied sender ONWARD onto the origin the host routes on, so
+        // the merged log/journal can attribute each event to its platform identity (wire v28). This
+        // does NOT touch `session_id_for` (computed above from transport+scope only) — group sessions
+        // stay shared across senders.
+        let origin = r.origin.clone().with_sender(r.sender.clone());
         // Phase 1: decide + mutate gate state under the lock, collecting commands to submit (the
         // std Mutex must not be held across an await).
         let commands = {
@@ -236,7 +241,7 @@ impl Ingestor {
         };
         // Phase 2: submit outside the lock.
         for command in commands {
-            self.api.submit_routed(r.origin.clone(), command).await?;
+            self.api.submit_routed(origin.clone(), command).await?;
         }
         Ok(session)
     }

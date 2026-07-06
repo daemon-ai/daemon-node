@@ -557,7 +557,20 @@ impl WireVersion {
     /// `arch == "clip"`): excluded from quant recommendations and local chat-model offers, and
     /// rejected by `ModelActivate`/resolve with an actionable error instead of the llama worker's
     /// `unsupported model architecture: 'clip'` fatal. Breaking (the `model-file` shape).
-    pub const CURRENT: Self = Self(27);
+    ///
+    /// v28 (deferred-wire bundle): batches four additive, deferred wire additions that earlier
+    /// Phase 2/3 hardening tracks intentionally held back for one codec regen. All four are optional
+    /// (`#[serde(default)]`, encoded as CBOR `null` when absent): (1) `Origin.sender` — the immutable
+    /// [`SenderId`](daemon_protocol::SenderId) carried ONWARD from the ingest boundary onto `Origin`
+    /// for downstream attribution (does NOT feed `session_id_for`, so group-session sharing is
+    /// unperturbed); (2) `ApprovalInfo.fingerprint` — the §12 exec-approval command fingerprint
+    /// promoted from the free-text prompt to a structured field (snapshot-side enforcement
+    /// unchanged); (3) `InstalledModel.sha256` — display-only exposure of the node-local pinned
+    /// artifact hash (node-side pin/verify stays authoritative); (4) `SkillBundle.signature` — an
+    /// optional, default-off ed25519 detached signature backing a verify-at-import gate. Additive,
+    /// but bumped because `is_compatible` is strict-equal, so an older peer cannot decode the new
+    /// fields (mirrors the additive v15–v23 bumps).
+    pub const CURRENT: Self = Self(28);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -1288,6 +1301,13 @@ pub struct InstalledModel {
     /// text-only models and for projector records themselves.
     #[serde(default)]
     pub mmproj_path: Option<String>,
+    /// The node-local pinned artifact hash (lowercase-hex sha256), read from the `<local_path>.sha256`
+    /// provenance sidecar for **display only** (wire v28). Node-side pinning/verification
+    /// (`daemon-models`) stays authoritative; this merely surfaces the pin so a client can show
+    /// provenance. `None` for directory (multi-file) models, for artifacts with no sidecar, and for
+    /// legacy records cataloged before the pin existed — **a re-catalog (re-download) repins them**.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1438,14 @@ pub struct SkillBundle {
     pub category: Option<String>,
     /// Bundle-relative path -> file contents (includes `SKILL.md`).
     pub files: std::collections::BTreeMap<String, String>,
+    /// An optional hex-encoded ed25519 detached signature over the bundle's canonical digest
+    /// (name + category + sorted files), backing the opt-in verify-at-import gate (wire v28).
+    /// `None` for unsigned bundles (the default); verification is **off** unless an operator has
+    /// configured a trusted key, in which case `import_bundle` requires a valid signature. Carried
+    /// as a string so this lowest contract layer stays free of the crypto stack (the digest + verify
+    /// live in `daemon-skills`).
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// How a session's workspace root is chosen (host-spec §7). Carried on the session overlay and
