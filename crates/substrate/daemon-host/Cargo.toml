@@ -11,7 +11,7 @@ license.workspace = true
 # remaining deferred deps (daemon-credentials, daemon-transport) land with credential authority /
 # cross-node distribution.
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["governor"] }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here touches the model cache/registry under the node data root (paths derived from
+// sanitized model refs, not attacker-influenced); raw fs allowed file-wide. No process spawns here.
+#![allow(clippy::disallowed_methods)]
+
 //! [`ModelManager`] — the one facade the node surface (`ModelApi`) and the local provider wiring
 //! call. It owns the HF client, the acquisition engine, the installed-model catalog, the shared
 //! cache config, and the per-profile *active model* selection used for runtime model switching.
@@ -341,6 +345,7 @@ impl ModelManager {
                 local_path: path.clone(),
                 size_bytes: size,
                 mmproj_path: None,
+                sha256: None,
             });
         }
         if let ModelSource::Hf { file: Some(f), .. } = &model.source {
@@ -353,6 +358,10 @@ impl ModelManager {
             if mmproj::is_projector_record(&record) {
                 return Err(projector_rejection(&record.display_name));
             }
+            // Provenance: verify the on-disk artifact against its node-local pin BEFORE load, and
+            // refuse (never load) on mismatch — a content swap that preserves size + GGUF magic
+            // slips past `artifact_intact` but not this hash check (Phase 3 / Cluster E, L2).
+            verify_pin_before_load(&record.local_path).await?;
             if artifact_intact(&record) {
                 let mmproj_path = record
                     .mmproj_path
@@ -363,6 +372,7 @@ impl ModelManager {
                     local_path: record.local_path,
                     size_bytes: record.size_bytes,
                     mmproj_path,
+                    sha256: None,
                 });
             }
         }
@@ -375,6 +385,7 @@ impl ModelManager {
             local_path: record.local_path,
             size_bytes: record.size_bytes,
             mmproj_path: record.mmproj_path.as_deref().map(PathBuf::from),
+            sha256: None,
         })
     }
 
@@ -459,10 +470,19 @@ async fn catalog_artifact(
     model: ModelRef,
     artifact: ResolvedArtifact,
 ) -> Result<InstalledModel> {
-    let mut record = build_record(model, artifact.local_path, artifact.size_bytes);
-    record.mmproj_path = artifact
-        .mmproj_path
-        .map(|p| p.to_string_lossy().into_owned());
+    let ResolvedArtifact {
+        local_path,
+        size_bytes,
+        mmproj_path,
+        sha256,
+    } = artifact;
+    // Record the node-local provenance pin beside the primary single-file artifact (Phase 3 /
+    // Cluster E, L2). Verified before every subsequent load; a failed write is non-fatal.
+    if let Some(hash) = &sha256 {
+        write_pin(&local_path, hash);
+    }
+    let mut record = build_record(model, local_path, size_bytes);
+    record.mmproj_path = mmproj_path.map(|p| p.to_string_lossy().into_owned());
     registry.upsert(record.clone()).await?;
     pair_projector_companions(registry).await;
     notify_catalog_changed(catalog_changed);
@@ -556,6 +576,10 @@ fn notify_catalog_changed(slot: &CatalogChangedSlot) {
 /// Build a catalog record for a freshly acquired model, enriching it with GGUF metadata (arch,
 /// context length, authoritative file-type) when the local artifact is a single GGUF file.
 fn build_record(model: ModelRef, local_path: PathBuf, size_bytes: u64) -> InstalledModel {
+    // wire v28: surface the node-local provenance pin (`<local_path>.sha256`) on the wire record for
+    // display. Read before `local_path` is moved into the struct; `None` for directory models / no
+    // sidecar. Node-side verify-before-load stays authoritative.
+    let sha256 = read_pin(&local_path);
     let mut record = InstalledModel {
         id: model_id(&model),
         display_name: display_name(&model),
@@ -567,6 +591,7 @@ fn build_record(model: ModelRef, local_path: PathBuf, size_bytes: u64) -> Instal
         context_length: None,
         file_type: None,
         mmproj_path: None,
+        sha256,
         model,
     };
     crate::inspect::enrich_installed(&mut record);
@@ -605,7 +630,60 @@ fn best_effort_delete(path: &std::path::Path) {
         let _ = std::fs::remove_dir_all(path);
     } else {
         let _ = std::fs::remove_file(path);
+        // Drop the provenance pin sidecar alongside the artifact so it can't linger and refuse a
+        // legitimately re-downloaded replacement.
+        let _ = std::fs::remove_file(pin_sidecar(path));
     }
+}
+
+/// The node-local provenance-pin sidecar path for an artifact (`<artifact>.sha256`).
+fn pin_sidecar(artifact: &std::path::Path) -> PathBuf {
+    let mut p = artifact.as_os_str().to_os_string();
+    p.push(".sha256");
+    PathBuf::from(p)
+}
+
+/// Read the recorded pin (lowercase-hex sha256) for `artifact`, if a non-empty sidecar exists.
+fn read_pin(artifact: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(pin_sidecar(artifact))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Best-effort write of the provenance pin beside `artifact`. A failure logs a warning and leaves
+/// the model loadable-but-unpinned (matching a legacy install) rather than blocking the install.
+fn write_pin(artifact: &std::path::Path, sha256: &str) {
+    let sidecar = pin_sidecar(artifact);
+    if let Err(e) = std::fs::write(&sidecar, sha256) {
+        tracing::warn!(path = %sidecar.display(), error = %e, "failed to write artifact pin sidecar");
+    }
+}
+
+/// Verify a cataloged artifact against its node-local provenance pin **before load**. When a
+/// `<artifact>.sha256` sidecar exists and the artifact is a present file, recompute its sha256 and
+/// refuse (never load) on mismatch. No sidecar (a legacy install) or a missing file → `Ok` (the
+/// existing existence/size check then decides fast-path vs benign re-acquire).
+async fn verify_pin_before_load(local_path: &std::path::Path) -> Result<()> {
+    let Some(expected) = read_pin(local_path) else {
+        return Ok(());
+    };
+    if !local_path.is_file() {
+        return Ok(());
+    }
+    let path = local_path.to_path_buf();
+    let actual = tokio::task::spawn_blocking(move || crate::hash::sha256_file(&path))
+        .await
+        .map_err(|e| ModelError::Other(format!("hashing task failed: {e}")))?
+        .map_err(|e| ModelError::io(local_path, e))?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(ModelError::Integrity(format!(
+            "{}: on-disk artifact sha256 {actual} does not match the pinned {expected} — refusing \
+             to load a tampered or corrupted model",
+            local_path.display(),
+        )));
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -675,6 +753,7 @@ mod tests {
             local_path: PathBuf::from("/tmp/notify.gguf"),
             size_bytes: 42,
             mmproj_path: None,
+            sha256: None,
         };
         let record = catalog_artifact(&registry, &slot, m.clone(), artifact)
             .await
@@ -716,6 +795,7 @@ mod tests {
                 context_length: None,
                 file_type: None,
                 mmproj_path: None,
+                sha256: None,
             };
             registry.upsert(record).await.unwrap();
         }
@@ -744,6 +824,140 @@ mod tests {
         // A second delete removes nothing — no spurious event.
         manager.delete(&id).await.expect("idempotent delete");
         assert_eq!(fired.load(Ordering::SeqCst), 1, "no-op delete stays quiet");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- artifact provenance pinning (Phase 3 / Cluster E) ------------------------------------
+
+    /// The node-local pin sidecar path for an artifact (`<artifact>.sha256`) — computed here
+    /// independently of the impl so the test pins down the on-disk convention.
+    fn sidecar_of(artifact: &std::path::Path) -> PathBuf {
+        let mut p = artifact.as_os_str().to_os_string();
+        p.push(".sha256");
+        PathBuf::from(p)
+    }
+
+    /// Lowercase-hex sha256 of `bytes` (the pin format).
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Seed a manager over `dir` with one cataloged single-file GGUF artifact + its pin sidecar.
+    /// Returns `(manager, model, artifact_path, bytes)`.
+    async fn seed_pinned(dir: &std::path::Path) -> (ModelManager, ModelRef, PathBuf, Vec<u8>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let registry_path = dir.join("catalog.json");
+        let artifact = dir.join("model-Q4_K_M.gguf");
+        let mut bytes = b"GGUF".to_vec();
+        bytes.resize(256, 0xCD);
+        std::fs::write(&artifact, &bytes).unwrap();
+        std::fs::write(sidecar_of(&artifact), sha256_hex(&bytes)).unwrap();
+
+        let m = ModelRef::new(
+            ModelEngine::Llama,
+            ModelSource::hf_file("org/pinned", "model-Q4_K_M.gguf"),
+        );
+        {
+            let registry = Registry::open(&registry_path).await.unwrap();
+            registry
+                .upsert(InstalledModel {
+                    id: crate::registry::model_id(&m),
+                    model: m.clone(),
+                    display_name: "org/pinned".into(),
+                    local_path: artifact.clone(),
+                    size_bytes: bytes.len() as u64,
+                    quant: Some("Q4_K_M".into()),
+                    installed_at_ms: 1,
+                    arch: None,
+                    context_length: None,
+                    file_type: None,
+                    mmproj_path: None,
+                    sha256: None,
+                })
+                .await
+                .unwrap();
+        }
+        let manager = ModelManager::new(ManagerConfig {
+            cache_dir: Some(dir.join("hub")),
+            fallback_cache_dir: None,
+            registry_path: Some(registry_path),
+            endpoint: None,
+            quantize_worker_bin: None,
+        })
+        .await
+        .expect("manager");
+        (manager, m, artifact, bytes)
+    }
+
+    /// wire v28: `build_record` surfaces the node-local provenance pin (`<path>.sha256`) on the wire
+    /// `InstalledModel.sha256` for display; an artifact with no sidecar reports `None`.
+    #[test]
+    fn build_record_surfaces_pin_sha256() {
+        let dir =
+            std::env::temp_dir().join(format!("daemon-models-pin-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = ModelRef::new(
+            ModelEngine::Llama,
+            ModelSource::hf_file("org/pinned", "m.gguf"),
+        );
+
+        // Pinned artifact: the sidecar hash surfaces on the record.
+        let pinned = dir.join("m.gguf");
+        std::fs::write(&pinned, b"gguf-bytes").unwrap();
+        write_pin(&pinned, "abc123def456");
+        let rec = build_record(m.clone(), pinned, 10);
+        assert_eq!(rec.sha256.as_deref(), Some("abc123def456"));
+
+        // No sidecar: sha256 is None (a legacy / unpinned install).
+        let unpinned = dir.join("legacy.gguf");
+        std::fs::write(&unpinned, b"gguf-bytes").unwrap();
+        let rec2 = build_record(m, unpinned, 10);
+        assert_eq!(rec2.sha256, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cataloged artifact whose on-disk bytes still match its pin resolves for load.
+    #[tokio::test]
+    async fn valid_pinned_artifact_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("daemon-models-pin-valid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (manager, model, artifact, _bytes) = seed_pinned(&dir).await;
+
+        let resolved = manager.resolve(&model).await.expect("valid pin loads");
+        assert_eq!(resolved.local_path, artifact);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cataloged artifact tampered after install — content swapped while size + `GGUF` magic stay
+    /// intact (so the size/magic `artifact_intact` check still trusts it) — is REFUSED before load
+    /// with `ModelError::Integrity`, never resolved.
+    #[tokio::test]
+    async fn tampered_pinned_artifact_is_refused_before_load() {
+        let dir =
+            std::env::temp_dir().join(format!("daemon-models-pin-tampered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (manager, model, artifact, mut bytes) = seed_pinned(&dir).await;
+
+        // Tamper: same length, `GGUF` magic preserved, one interior byte flipped.
+        bytes[100] ^= 0xFF;
+        std::fs::write(&artifact, &bytes).unwrap();
+
+        let err = manager
+            .resolve(&model)
+            .await
+            .expect_err("tampered artifact must be refused before load");
+        assert!(
+            matches!(err, ModelError::Integrity(_)),
+            "expected Integrity refusal, got: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

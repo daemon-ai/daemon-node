@@ -9,11 +9,19 @@ license.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 arbitrary = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [features]
 # Derive `arbitrary::Arbitrary` on the wire types for the CDDL conformance proptest. Off by default
 # (and never enabled in production builds), so `arbitrary` is a test-only compile-time dependency.
 arbitrary = ["dep:arbitrary"]
+# `EnvPolicy::apply` (the sanctioned child-env application helper) needs `tokio::process`; gated so
+# non-spawning consumers of this contracts crate stay runtime-free. Spawning crates enable it.
+process = ["dep:tokio"]
+# `IngressGovernor` (the Cluster-F ingress enforcer) needs `tokio::sync::Semaphore`; gated so the
+# pure `IngressLimits` policy stays runtime-free for non-networked consumers. Networked carriers
+# (daemon-host, daemon-transport) enable it.
+governor = ["dep:tokio"]
 
 [lints]
 workspace = true

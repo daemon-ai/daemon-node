@@ -14,8 +14,15 @@
 //! runs only **transient** commands that complete within a tool call — it does not own live
 //! background processes, so it never blocks the engine from dehydrating at a phase boundary.
 
+pub mod contained;
 pub mod local;
 
+pub use contained::{ChildCwd, ContainedRoot, DirEntryLite, Meta};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -107,6 +114,15 @@ pub trait ExecutionEnvironment: Send + Sync {
     async fn list(&self, path: &Path) -> std::io::Result<Vec<String>>;
     /// The environment's working directory (its containment root).
     fn cwd(&self) -> &Path;
+    /// Whether this environment's root is *trusted*: a node-managed isolated per-session sandbox
+    /// (`true`, the default) vs. an operator-bound external directory whose contents may be
+    /// attacker-influenced (`false`). Tools use this to refuse auto-trusting workspace-discovered
+    /// artifacts — e.g. `execute_code` will not auto-execute a `.venv` interpreter found under an
+    /// untrusted root (Cluster E policy partition). Defaulted `true` so a backend that is inherently
+    /// contained/managed need not override it.
+    fn workspace_trusted(&self) -> bool {
+        true
+    }
 }
 
 /// Resolve `requested` against `root` and assert workspace containment.
@@ -154,10 +170,289 @@ fn escape_error(requested: &Path) -> std::io::Error {
     )
 }
 
+// Note (Cluster C): the Phase 1 interim symlink/TOCTOU guards (`open_read_guarded`,
+// `open_write_guarded`, `reject_symlink_final`, `reject_symlink_final_below`, `symlink_escape_error`)
+// that once lived here are removed — superseded by the Phase 3 [`ContainedRoot`] capability
+// (`exec::contained`), which resolves every relative path via
+// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` and thereby closes the intermediate-component
+// symlink escape and the check-then-open TOCTOU that the interim final-component guards left open.
+// `contain` itself is retained: it is the lexical floor reused by `ContainedRoot`'s non-unix fallback
+// and by policy-only path resolution (`ContainedRoot::resolve_display`).
+
+// --- Exec-approval fingerprinting (Cluster B) ----------------------------------------------------
+//
+// A command's approval decision and operator-facing display are bound to a hash of the FULLY-RESOLVED
+// command tuple `(exec-surface, absolute-binary, argv, env-delta, cwd)`. The engine refuses to run a
+// parked approval whose resolved tuple no longer matches what was approved/displayed, closing the
+// approve-then-swap TOCTOU on the durable HITL path.
+//
+// The ambient `PATH` value is intentionally NOT part of the tuple: the *resolved absolute binary*
+// already captures what `PATH` would have selected at approval time, and hashing the raw `PATH` would
+// spuriously refuse on benign daemon-env changes with no added security. Only the explicit env-delta
+// (vars the command sets, e.g. `PYTHONUNBUFFERED`) is hashed — never the ambient `PATH`.
+//
+// COVERAGE (honest): this binds the resolved *path* and argv, not the binary's *contents* — a
+// same-absolute-path content swap between approval and exec is a file-level TOCTOU left to the Phase 3
+// OS exec sandbox / artifact-provenance work.
+
+/// A stable fingerprint of a fully-resolved command — lowercase-hex SHA-256 over the tuple
+/// `(exec-surface, absolute-binary, argv, env-delta, cwd)`. Bound to an exec approval so the engine
+/// can refuse a command whose resolved form differs from what was approved (Cluster B).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandFingerprint(String);
+
+impl CommandFingerprint {
+    /// Compute the fingerprint over the resolved command tuple. `env_delta` is the *explicit*
+    /// environment set for the child (never the ambient `PATH`); it is sorted here so entry order
+    /// never changes the digest. Fields are length-prefixed and label-tagged so no two distinct
+    /// tuples share an encoding.
+    pub fn compute(
+        surface: &str,
+        program_abs: &Path,
+        argv: &[String],
+        env_delta: &[(String, String)],
+        cwd: &Path,
+    ) -> Self {
+        let mut env: Vec<(&str, &str)> = env_delta
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        env.sort_unstable();
+
+        let mut h = Sha256::new();
+        feed(&mut h, b"surface", surface.as_bytes());
+        feed(
+            &mut h,
+            b"program",
+            program_abs.as_os_str().as_encoded_bytes(),
+        );
+        feed(&mut h, b"argc", &(argv.len() as u64).to_le_bytes());
+        for a in argv {
+            feed(&mut h, b"arg", a.as_bytes());
+        }
+        feed(&mut h, b"envc", &(env.len() as u64).to_le_bytes());
+        for (k, v) in &env {
+            feed(&mut h, b"envk", k.as_bytes());
+            feed(&mut h, b"envv", v.as_bytes());
+        }
+        feed(&mut h, b"cwd", cwd.as_os_str().as_encoded_bytes());
+
+        let digest = h.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            let _ = write!(hex, "{b:02x}");
+        }
+        CommandFingerprint(hex)
+    }
+
+    /// The full lowercase-hex digest.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A short prefix for compact operator display / correlation.
+    pub fn short(&self) -> &str {
+        &self.0[..self.0.len().min(12)]
+    }
+}
+
+/// Length-prefixed, domain-separated feed into the hasher: `len(label) || label || len(bytes) || bytes`,
+/// so field boundaries are unambiguous.
+fn feed(h: &mut Sha256, label: &[u8], bytes: &[u8]) {
+    h.update((label.len() as u64).to_le_bytes());
+    h.update(label);
+    h.update((bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// Resolve `program` to the absolute executable path the child will exec, using `path_env` (the
+/// child's `PATH`) for a bare name and `cwd` for a relative path. Canonicalizes the result so the
+/// fingerprint pins the real target.
+///
+/// SELF-CONTAINED / purely additive: it does not touch [`contain`], [`Command`], or the
+/// [`ExecutionEnvironment`] trait, so it merges cleanly alongside other additions to this module.
+///
+/// - absolute path: used as-is (verified);
+/// - relative path with a separator (`./x`, `sub/x`): resolved against `cwd`;
+/// - bare name (`printf`): the first entry in `path_env` that names an executable file wins.
+///
+/// Errors with [`std::io::ErrorKind::NotFound`] if no executable file is found.
+pub fn resolve_program_abs(
+    program: &str,
+    cwd: &Path,
+    path_env: &OsStr,
+) -> std::io::Result<PathBuf> {
+    let p = Path::new(program);
+    let candidate = if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else if p.components().count() > 1 {
+        Some(cwd.join(p))
+    } else {
+        std::env::split_paths(path_env)
+            .map(|dir| dir.join(p))
+            .find(|c| is_executable_file(c))
+    };
+    match candidate {
+        Some(c) if is_executable_file(&c) => Ok(abs_preserving_name(&c)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no executable found for program: {program}"),
+        )),
+    }
+}
+
+/// Return an absolute path that pins the resolved *directory* (canonicalized, so symlinked dirs
+/// resolve to a stable location) while KEEPING the original final component name.
+///
+/// We deliberately do NOT canonicalize the final component: multicall binaries (nix/busybox
+/// `coreutils`, where `pwd`/`printf`/… are symlinks to one dispatcher) dispatch on the basename of
+/// the exec path, so following that final symlink to `…/coreutils` would break the exec. Pinning the
+/// directory + name still prevents `PATH`-divergence between approval and exec; a final-symlink
+/// retarget is the same-path-content-swap residual left to the Phase 3 exec sandbox.
+fn abs_preserving_name(candidate: &Path) -> PathBuf {
+    match (candidate.parent(), candidate.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(dir) => dir.join(name),
+            Err(_) => candidate.to_path_buf(),
+        },
+        _ => candidate.to_path_buf(),
+    }
+}
+
+/// Whether `path` names a regular file with an executable bit (unix) / any regular file (non-unix).
+fn is_executable_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn command_fingerprint_is_field_sensitive_and_deterministic() {
+        let base = || {
+            CommandFingerprint::compute(
+                "exec.argv",
+                Path::new("/bin/x"),
+                &["--flag".to_string()],
+                &[],
+                Path::new("/ws"),
+            )
+        };
+        // Same tuple -> same digest.
+        assert_eq!(base(), base());
+        // Every field participates in the identity.
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute(
+                "exec.shell",
+                Path::new("/bin/x"),
+                &["--flag".to_string()],
+                &[],
+                Path::new("/ws")
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute(
+                "exec.argv",
+                Path::new("/bin/y"),
+                &["--flag".to_string()],
+                &[],
+                Path::new("/ws")
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute(
+                "exec.argv",
+                Path::new("/bin/x"),
+                &["--other".to_string()],
+                &[],
+                Path::new("/ws")
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute(
+                "exec.argv",
+                Path::new("/bin/x"),
+                &["--flag".to_string()],
+                &[("K".to_string(), "V".to_string())],
+                Path::new("/ws")
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute(
+                "exec.argv",
+                Path::new("/bin/x"),
+                &["--flag".to_string()],
+                &[],
+                Path::new("/elsewhere")
+            )
+        );
+        // env-delta is order-insensitive (sorted before hashing).
+        let e1 = CommandFingerprint::compute(
+            "exec.argv",
+            Path::new("/bin/x"),
+            &[],
+            &[
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+            Path::new("/ws"),
+        );
+        let e2 = CommandFingerprint::compute(
+            "exec.argv",
+            Path::new("/bin/x"),
+            &[],
+            &[
+                ("B".to_string(), "2".to_string()),
+                ("A".to_string(), "1".to_string()),
+            ],
+            Path::new("/ws"),
+        );
+        assert_eq!(e1, e2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_program_abs_resolves_path_binary_and_rejects_missing() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let cwd = std::env::temp_dir();
+        // A real PATH binary resolves to an absolute path that PRESERVES its final name (so a
+        // multicall dispatcher like coreutils still dispatches correctly on exec).
+        let sh = resolve_program_abs("sh", &cwd, &path).expect("sh is on PATH");
+        assert!(
+            sh.is_absolute(),
+            "resolved to an absolute path: {}",
+            sh.display()
+        );
+        assert_eq!(
+            sh.file_name().and_then(|n| n.to_str()),
+            Some("sh"),
+            "final component name preserved: {}",
+            sh.display()
+        );
+        // A bare name not on PATH is a NotFound error.
+        let err = resolve_program_abs("definitely-not-a-real-binary-xyz", &cwd, &path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn contain_accepts_relative_and_rejects_escapes() {

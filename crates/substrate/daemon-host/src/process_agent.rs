@@ -125,12 +125,16 @@ mod tests {
                             request_id: ReqId(1),
                             kind: HostRequestKind::Approval {
                                 prompt: "may I?".into(),
+                                allow_permanent_offered: false,
                             },
                         });
                         let _ = cw.send(&encode_up(&req)).await;
                     }
                     Some(Inbound::Response(resp)) => {
-                        assert!(matches!(resp.body, HostResponseBody::Approved(true)));
+                        assert!(matches!(
+                            resp.body,
+                            HostResponseBody::Approved { approved: true, .. }
+                        ));
                         let started = Outbound::Event(AgentEvent::TurnStarted {
                             seq: 0,
                             trigger: TurnTrigger::User,

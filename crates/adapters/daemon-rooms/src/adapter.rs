@@ -37,10 +37,11 @@ use daemon_api::{
 };
 use daemon_common::{JournalStreamId, SessionId, UnitId};
 use daemon_host::journal::JournalSink;
+use daemon_host::{with_request_context, RequestContext};
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
-    AgentEvent, RoomId, RoomMember, RoomPolicy, SessionPayload, TranscriptBlock, TranscriptRole,
-    TransportId,
+    AgentEvent, RoomId, RoomMember, RoomPolicy, SenderId, SessionPayload, TranscriptBlock,
+    TranscriptRole, TransportId,
 };
 use daemon_store::{Room, RoomMember as StoreRoomMember, SessionStore};
 use daemon_telemetry::TraceSigner;
@@ -80,7 +81,9 @@ enum RoomCommand {
     /// Fan a `from`-attributed external post out to a room's members (floor-gated; transcribed).
     Post {
         room: RoomId,
-        sender: String,
+        /// The immutable sender identity (an agent/contact handle, or [`SenderId::local_loopback`]
+        /// for an operator post) — never re-derived from display text.
+        sender: SenderId,
         text: String,
     },
 }
@@ -119,7 +122,7 @@ struct RoomRuntimeParts {
 /// cascade (`reset_budget`).
 struct RoomPost {
     room: RoomId,
-    sender: String,
+    sender: SenderId,
     text: String,
     role: TranscriptRole,
     reset_budget: bool,
@@ -181,40 +184,47 @@ impl RoomRuntime {
         let Some(this) = self.me.upgrade() else {
             return;
         };
-        tokio::spawn(async move {
-            let mut stream = match this.api.subscribe(session.clone(), 0).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, session = %session.as_str(), "rooms: subscribe failed");
-                    this.subscribed.lock().unwrap().remove(&session);
-                    return;
-                }
-            };
-            while let Some(item) = stream.next().await {
-                // Best-effort-skip a lossy lag (turn-lifecycle notes may be missed; the durable
-                // conv journal remains the record). Re-baseline is future work.
-                let entry = match item {
-                    daemon_api::LogStreamItem::Entry(e) => e,
-                    daemon_api::LogStreamItem::Lagged => continue,
-                };
-                match &entry.payload {
-                    SessionPayload::Event(AgentEvent::TurnStarted { .. }) => {
-                        this.ingestor.note_turn_started(&session);
+        // Bind the in-process `internal` principal for the detached subscription task: a spawned task
+        // inherits no request context, so the now-ownership-gated `subscribe` and the ingestor's
+        // `submit`/`submit_routed` (via `note_turn_finished` / `reinject_reply`) would run with `None`
+        // (deny). `internal` is the trusted embedded-caller identity for these fan-out sessions.
+        tokio::spawn(with_request_context(
+            RequestContext::internal(),
+            async move {
+                let mut stream = match this.api.subscribe(session.clone(), 0).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, session = %session.as_str(), "rooms: subscribe failed");
+                        this.subscribed.lock().unwrap().remove(&session);
+                        return;
                     }
-                    SessionPayload::Event(AgentEvent::TurnFinished { summary, .. }) => {
-                        if let Some(text) = &summary.final_text {
-                            if !text.is_empty() {
-                                this.reinject_reply(&session, text.clone()).await;
+                };
+                while let Some(item) = stream.next().await {
+                    // Best-effort-skip a lossy lag (turn-lifecycle notes may be missed; the durable
+                    // conv journal remains the record). Re-baseline is future work.
+                    let entry = match item {
+                        daemon_api::LogStreamItem::Entry(e) => e,
+                        daemon_api::LogStreamItem::Lagged => continue,
+                    };
+                    match &entry.payload {
+                        SessionPayload::Event(AgentEvent::TurnStarted { .. }) => {
+                            this.ingestor.note_turn_started(&session);
+                        }
+                        SessionPayload::Event(AgentEvent::TurnFinished { summary, .. }) => {
+                            if let Some(text) = &summary.final_text {
+                                if !text.is_empty() {
+                                    this.reinject_reply(&session, text.clone()).await;
+                                }
+                            }
+                            if let Err(e) = this.ingestor.note_turn_finished(&session).await {
+                                tracing::warn!(error = %e, "rooms: gate flush failed");
                             }
                         }
-                        if let Err(e) = this.ingestor.note_turn_finished(&session).await {
-                            tracing::warn!(error = %e, "rooms: gate flush failed");
-                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        });
+            },
+        ));
     }
 
     /// The (lazily opened, cached) transcript writer for `room`.
@@ -258,7 +268,7 @@ impl RoomRuntime {
         let sink = self.transcript_sink(&room);
         let block = TranscriptBlock::Message {
             role,
-            text: format!("{sender}: {text}"),
+            text: format!("{}: {}", sender.as_str(), text),
         };
         if let Err(e) = sink.record_block(&block).await {
             tracing::warn!(error = %e, "rooms: transcript record failed");
@@ -282,7 +292,7 @@ impl RoomRuntime {
             if reset_budget {
                 fc.begin_post();
             }
-            fc.decide(&members, &sender, &text)
+            fc.decide(&members, sender.as_str(), &text)
         };
 
         // 4. Fan out (creates member sessions on first `StartTurn`).
@@ -301,7 +311,7 @@ impl RoomRuntime {
     }
 
     /// An external/operator `ConvSend` post (starts a fresh cascade).
-    async fn external_post(&self, room: RoomId, sender: String, text: String) {
+    async fn external_post(&self, room: RoomId, sender: SenderId, text: String) {
         self.post(RoomPost {
             room,
             sender,
@@ -318,7 +328,8 @@ impl RoomRuntime {
         if let Some((room, member)) = resolved {
             self.post(RoomPost {
                 room,
-                sender: member,
+                // The member handle is a structured identity (from the membership table), not text.
+                sender: SenderId::new(member),
                 text,
                 role: TranscriptRole::Assistant,
                 reset_budget: false,
@@ -514,7 +525,14 @@ impl TransportAdapter for RoomsAdapter {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 RoomCommand::Post { room, sender, text } => {
-                    runtime.external_post(room, sender, text).await;
+                    // The serve loop runs with no request context; an external post fans out via the
+                    // ownership-gated `submit_from`, so bind the trusted `internal` embedded-caller
+                    // identity for the fan-out.
+                    with_request_context(
+                        RequestContext::internal(),
+                        runtime.external_post(room, sender, text),
+                    )
+                    .await;
                 }
             }
         }
@@ -660,9 +678,11 @@ impl SupportsConversations for RoomsAdapter {
             return Err(ApiError::Other(format!("room {conv} not found")));
         }
         let sender = match from {
-            Some(Participant::Agent { member, .. }) => member,
-            Some(Participant::Contact(c)) => c.id,
-            None => "operator".to_string(),
+            Some(Participant::Agent { member, .. }) => SenderId::new(member),
+            Some(Participant::Contact(c)) => SenderId::new(c.id),
+            // No external participant: a node/operator loopback post — a typed, documented identity
+            // rather than a re-derivable "operator" string.
+            None => SenderId::local_loopback(),
         };
         self.cmd_tx
             .send(RoomCommand::Post {

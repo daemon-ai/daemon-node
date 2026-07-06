@@ -28,7 +28,7 @@ use crate::credstore::CredentialStore;
 use crate::engine_incarnation::JournalConfig;
 use crate::journal::{JournalFeeder, JournalSink};
 use crate::profiles::ProfileStore;
-use crate::request_context::current_principal;
+use crate::request_context::{current_principal, with_request_context, RequestContext};
 use crate::routing::RoutingRegistry;
 use crate::supervisor::{HealthStatus, SupervisorObserver};
 use crate::FleetControl;
@@ -430,6 +430,20 @@ pub struct NodeApiImpl {
     /// audit is a no-op (no journaling). The same handle is given to the transport's
     /// [`Authenticator`](crate::authn::Authenticator) so login/denial events ride the same chain.
     auth_audit: Option<Arc<crate::auth_audit::AuthAudit>>,
+    /// The shared per-principal revocation registry (Cluster F, Part A). The admin ops that revoke a
+    /// principal (`session_revoke`/`user_disable`/`user_set_roles`/`user_set_password`) bump the
+    /// user's epoch here *after* the store mutation, so a live mux connection holding the old epoch
+    /// is torn down. Pass the **same** [`SessionRevocations`](crate::revocation::SessionRevocations)
+    /// to the transport's [`Authenticator`](crate::authn::Authenticator). `None` => live-connection
+    /// revocation is not enforced (the store mutation still invalidates the reconnect fast-path).
+    revocations: Option<Arc<crate::revocation::SessionRevocations>>,
+    /// The credential-authority revoker (Cluster F, Part B). `credential_remove`/`credential_set`
+    /// call [`revoke_profile`](crate::revocation::CredentialRevoker::revoke_profile) so the profile's
+    /// cached [`CredentialAuthority`](daemon_credentials::CredentialAuthority) bumps its lease epoch
+    /// (invalidating outstanding leases at `use_capability`) and drops retained proxied keys. `None`
+    /// => only the credential *store* is mutated (a fresh acquire no longer sees the removed key,
+    /// but an already-minted lease is not invalidated).
+    credential_revoker: Option<Arc<dyn crate::revocation::CredentialRevoker>>,
 }
 
 impl NodeApiImpl {
@@ -497,12 +511,19 @@ impl NodeApiImpl {
             self.store.enqueue_wake(session.clone()).await;
             return Ok(());
         }
-        self.submit(
-            session.clone(),
-            AgentCommand::StartTurn {
-                input: UserMsg::new(text),
-                request_id: daemon_common::ReqId(0),
-            },
+        // `self.submit` is the `SessionApi` trait method (Auth 4 ownership-gated). This seam is
+        // driven by background workers (the process notifier, the delegation notice worker) that
+        // carry no request context, so bind the trusted in-process `internal` principal — otherwise
+        // the ownership check would see `None` (now deny) and drop the injection.
+        with_request_context(
+            RequestContext::internal(),
+            self.submit(
+                session.clone(),
+                AgentCommand::StartTurn {
+                    input: UserMsg::new(text),
+                    request_id: daemon_common::ReqId(0),
+                },
+            ),
         )
         .await
     }
@@ -510,6 +531,7 @@ impl NodeApiImpl {
 
 mod access;
 mod assembly;
+mod authorized;
 mod builtins;
 mod control;
 mod cred_auth;
@@ -536,6 +558,7 @@ pub use provisioning::{AccountProvisioning, ProvisionedAccount};
 
 // Crate-internal re-exports so the sibling sub-modules (each `use super::*;`) resolve the helpers
 // that live in another concern module.
+pub(crate) use authorized::{AuthorizedFor, Session};
 pub(crate) use builtins::command_err_to_api;
 pub(crate) use internals::{apply_rewind_side_effects, LiveSessions, RewindSideEffects};
 pub(crate) use messaging::participant_label;

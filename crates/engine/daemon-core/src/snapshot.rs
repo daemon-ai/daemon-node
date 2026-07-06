@@ -77,6 +77,17 @@ pub struct Snapshot {
     /// decodable.
     #[serde(default)]
     pub pending_approvals: Vec<PendingApproval>,
+    /// Command fingerprints the operator approved **permanently** this session (Cluster B /
+    /// `allow_permanent`): an exact-tuple match auto-approves the §12 gate without re-prompting for the
+    /// rest of the session. Least-privilege — trusts the specific resolved command (the Phase 2
+    /// `(surface, abs-binary, argv, env-delta, cwd)` fingerprint), never a blanket approval-mode flip.
+    /// Only grows within a session and shares the session's lifetime (cleared when the session ends);
+    /// durable so a permanent allow survives restart. `#[serde(default)]` keeps pre-existing snapshots
+    /// decodable (empty). Written only through the single-owner effect applier
+    /// ([`Effect::RememberApproval`](crate::turn::Effect::RememberApproval), inline) and
+    /// `resolve_approvals` (durable).
+    #[serde(default)]
+    pub session_allow_fingerprints: Vec<crate::exec::CommandFingerprint>,
     /// Provenance: the node build that last wrote this snapshot (`daemon_common::VERSION`, e.g.
     /// `0.0.1+g1a2b3c4`). Stamped on [`Snapshot::encode`], not a migration key — the snapshot format
     /// itself evolves via `#[serde(default)]`. Empty on snapshots written before this field existed.
@@ -99,6 +110,13 @@ pub struct PendingApproval {
     /// The target path for an fs edit (used for the sensitive-path carve-out + display), if any.
     #[serde(default)]
     pub path: Option<String>,
+    /// The §12 exec-approval fingerprint (Cluster B): a hash of the fully-resolved command tuple
+    /// `(abs-binary, argv, env-delta, cwd, exec-surface)` the operator approved. On the durable
+    /// re-run the engine recomputes the tuple and refuses if it no longer matches (the approve-then-swap
+    /// TOCTOU gate). `None` for non-command approvals (fs edits) and for pre-existing snapshots
+    /// (`#[serde(default)]` keeps them decodable); a `None` fingerprint runs verbatim as before.
+    #[serde(default)]
+    pub fingerprint: Option<crate::exec::CommandFingerprint>,
 }
 
 impl Snapshot {
@@ -114,6 +132,7 @@ impl Snapshot {
             turns_since_memory: 0,
             approval_policy: None,
             pending_approvals: Vec::new(),
+            session_allow_fingerprints: Vec::new(),
             writer_version: String::new(),
         }
     }
@@ -193,7 +212,31 @@ mod tests {
         assert_eq!(decoded.session_id, SessionId::new("s1"));
         assert!(decoded.writer_version.is_empty());
         assert!(decoded.pending_approvals.is_empty());
+        // Cluster B / allow_permanent: the allow-list defaults to empty on a pre-field blob.
+        assert!(decoded.session_allow_fingerprints.is_empty());
         assert_eq!(decoded.iters_since_skill, 0);
+    }
+
+    /// Cluster B / allow_permanent: the per-session command allow-list survives the durable
+    /// encode/decode round-trip so a permanent allow persists across restart.
+    #[test]
+    fn round_trips_the_session_allow_list() {
+        let fp = crate::exec::CommandFingerprint::compute(
+            "exec.argv",
+            std::path::Path::new("/usr/bin/printf"),
+            &["hi".to_string()],
+            &[],
+            std::path::Path::new("/ws"),
+        );
+        let mut snap = Snapshot::fresh(SessionId::new("s-allow"));
+        snap.session_allow_fingerprints.push(fp.clone());
+        let blob = snap.encode().unwrap();
+        let decoded = Snapshot::decode(&blob).unwrap();
+        assert_eq!(
+            decoded.session_allow_fingerprints,
+            vec![fp],
+            "the allow_permanent allow-list survives encode/decode",
+        );
     }
 
     /// `encode` stamps the running build's version, and a round-trip preserves it.

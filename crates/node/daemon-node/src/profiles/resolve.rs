@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the fs here creates the daemon-internal profile/data dir (operator-configured node root),
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Per-session engine resolution: the one [`resolve_effective`](SessionFactoryCtx::resolve_effective)
 //! path shared by the live session surface and the durable rehydration resolver — a session's
 //! engine is materialized from its bound [`ProfileSpec`] overlaid with its [`SessionOverlay`].
@@ -206,16 +210,34 @@ impl SessionFactoryCtx {
             let roots = roots.clone();
             let binding = overlay.workspace.clone();
             profile = profile.with_exec(Arc::new(move |id: &SessionId| {
-                let root = match &binding {
-                    Some(WorkspaceBinding::Bound(p)) => p.clone(),
-                    _ => roots.isolated_root(id.as_str()),
+                // A `Bound` root is an operator-specified external directory whose contents may be
+                // attacker-influenced — mark it UNTRUSTED so workspace-discovered artifacts (a
+                // planted `.venv` interpreter) are not auto-trusted (Cluster E). The isolated
+                // per-session sandbox is node-managed and trusted.
+                let (root, trusted) = match &binding {
+                    Some(WorkspaceBinding::Bound(p)) => (canonicalize_bound(p), false),
+                    _ => (roots.isolated_root(id.as_str()), true),
                 };
                 roots.record(id.as_str(), root.clone());
-                Arc::new(LocalEnvironment::new(root)) as Arc<dyn ExecutionEnvironment>
+                Arc::new(LocalEnvironment::with_trust(root, trusted))
+                    as Arc<dyn ExecutionEnvironment>
             }));
         }
         profile
     }
+}
+
+/// Canonicalize an operator-`Bound` workspace root at bind time (Cluster C): create it if missing,
+/// then resolve symlinks/`.`/`..` in the root's own prefix to a stable absolute real path. The
+/// resulting path is what the engine roots at and records to the FS surface, so the `ContainedRoot`'s
+/// root fd opens a stable target and `RESOLVE_BENEATH` is well-defined regardless of symlinks in the
+/// bound path's prefix. We deliberately do NOT require `Bound` to live under the node root — `Bound`
+/// is by design the external "work on my repo" directory, and the operator-tier capability that gates
+/// setting it (Phase 2) is the "explicitly allowed" condition. Falls back to the raw path when the
+/// directory cannot be created/canonicalized (e.g. a not-yet-existent mount), preserving prior behavior.
+fn canonicalize_bound(p: &std::path::Path) -> std::path::PathBuf {
+    let _ = std::fs::create_dir_all(p);
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Map a wire-level [`ApprovalMode`] onto the engine's [`ApprovalPolicy`] (the §12 session mode),
@@ -260,7 +282,10 @@ mod tests {
         async fn request(&self, req: HostRequest) -> HostResponse {
             HostResponse {
                 request_id: req.request_id,
-                body: HostResponseBody::Approved(true),
+                body: HostResponseBody::Approved {
+                    approved: true,
+                    allow_permanent: false,
+                },
             }
         }
     }

@@ -96,9 +96,24 @@ impl CronWorker {
         let Some(dir) = &self.scripts_dir else {
             return (false, "no scripts directory configured".into());
         };
-        let Ok(path) = daemon_core::exec::contain(dir, std::path::Path::new(rel)) else {
+        // fd-contained selection of WHICH script runs: openat2 (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
+        // proves the path is beneath the scripts dir with no symlink escape at any component, and
+        // refuses a symlinked script. (The exec itself is the process-sandbox seam; here we only
+        // constrain the target.)
+        let Ok(cr) = daemon_core::exec::ContainedRoot::open(dir) else {
+            return (false, "scripts directory unavailable".into());
+        };
+        let rel_path = std::path::Path::new(rel);
+        match cr.symlink_metadata(rel_path).await {
+            Ok(meta) if !meta.is_symlink => {}
+            _ => return (false, format!("script path escapes scripts dir: {rel}")),
+        }
+        let Ok(path) = cr.resolve_display(rel_path) else {
             return (false, format!("script path escapes scripts dir: {rel}"));
         };
+        // Spawns a cron seed script resolved (ContainedRoot) to an absolute path under the scripts
+        // dir (argv-only, no shell); the path was contained above via `cr.resolve_display`.
+        #[allow(clippy::disallowed_methods)]
         let out =
             tokio::task::spawn_blocking(move || std::process::Command::new(&path).output()).await;
         match out {

@@ -148,6 +148,33 @@ async fn local_fetch_extracts_html_to_markdown() {
     assert!(doc.content.contains("main article body"));
 }
 
+/// Bug repro: a page that `302`s to link-local metadata space must be rejected mid-chain, not
+/// followed. The initial (loopback-mock) URL is intentionally reachable — only the redirect hop is
+/// re-validated by the shared egress client. Pre-fix, reqwest auto-followed the hop and returned the
+/// metadata endpoint's body to the model.
+#[tokio::test]
+async fn local_fetch_rejects_redirect_to_link_local() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redirect"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+        )
+        .mount(&server)
+        .await;
+
+    let backend = LocalFetch::new();
+    let err = backend
+        .fetch(&format!("{}/redirect", server.uri()), &FetchOpts::default())
+        .await
+        .expect_err("redirect into link-local space must be rejected");
+    assert!(
+        matches!(err, WebError::Rejected(_)),
+        "expected WebError::Rejected, got {err:?}"
+    );
+}
+
 /// Builds a throwaway [`TurnCx`] so a tool's `run` can be exercised in isolation.
 struct NoopHost;
 #[async_trait]
@@ -155,7 +182,10 @@ impl HostRequestHandler for NoopHost {
     async fn request(&self, req: HostRequest) -> HostResponse {
         HostResponse {
             request_id: req.request_id,
-            body: HostResponseBody::Approved(true),
+            body: HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         }
     }
 }
@@ -177,6 +207,7 @@ async fn run_tool(tool: &dyn Tool, args: &str) -> daemon_core::ToolOutcome {
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),

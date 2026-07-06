@@ -118,6 +118,15 @@ impl ApprovalMode {
         }
     }
 
+    /// Whether this mode *widens* autonomy — auto-approves gated actions (`AcceptEdits` auto-allows
+    /// workspace edits; `AutoAllow` auto-allows nearly everything) — vs. the safe directions (`Ask`,
+    /// the default that prompts; `Deny`, the strictest that blocks). Widening a live session's
+    /// autonomy is an operator-tier act (Cluster E): a non-operator may narrow (`Ask`/`Deny`) or
+    /// switch model/provider on its own session, but not widen its approval posture.
+    pub fn widens_autonomy(self) -> bool {
+        matches!(self, ApprovalMode::AcceptEdits | ApprovalMode::AutoAllow)
+    }
+
     /// The full set of advertisable modes (for a GUI mode picker / session-state advertisement).
     pub const ALL: [ApprovalMode; 4] = [
         ApprovalMode::Ask,
@@ -522,13 +531,17 @@ pub trait ControlApi: Send + Sync {
 
     /// Answer a parked §12 edit-approval request: record the operator's decision and wake the dormant
     /// session so it resumes (allow -> the gated tool runs; deny -> the tool returns an error). The
-    /// `request_id` is the opaque id from [`Self::approvals_pending`]. Idempotent (a redelivered
-    /// decision is a no-op). Default: unsupported (a transport with no durable approval store).
+    /// `request_id` is the opaque id from [`Self::approvals_pending`]. `allow_permanent` (Cluster B)
+    /// additionally remembers the approved command's fingerprint on the session allow-list when the
+    /// parked approval carries one (so an identical in-session re-request auto-approves); it degrades
+    /// to a single allow otherwise. Idempotent (a redelivered decision is a no-op). Default:
+    /// unsupported (a transport with no durable approval store).
     async fn approval_decide(
         &self,
         _session: SessionId,
         _request_id: String,
         _allow: bool,
+        _allow_permanent: bool,
     ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("approval_decide".into()))
     }
@@ -1942,6 +1955,13 @@ pub struct ApprovalInfo {
     /// The target path, when the action is a file edit (`None` for a non-path action).
     #[serde(default)]
     pub path: Option<String>,
+    /// The §12 exec-approval command fingerprint (wire v28): the lowercase-hex sha256 of the resolved
+    /// `(abs-binary, argv, env-delta, cwd, exec-surface)` tuple the operator is approving, promoted
+    /// from the free-text `prompt` to a structured field so a GUI can display/correlate it. `None`
+    /// for non-command approvals (fs edits) and pre-v28 rows. Display/correlation only — the
+    /// approve-then-swap enforcement stays snapshot-side in `daemon-core`.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`

@@ -177,6 +177,12 @@ pub struct Authenticator {
     /// `node-auth` chain as the admin events). `None` => login/denial audit is a no-op (e.g. tests
     /// or a node assembled without journaling).
     audit: Option<Arc<crate::auth_audit::AuthAudit>>,
+    /// The shared per-principal revocation registry (Cluster F, Part A). A newly-authenticated
+    /// connection captures its principal's revocation epoch from here so a later admin op
+    /// (`session_revoke`/role/password/disable) can tear the live connection down. `None` => live
+    /// revocation is not enforced on this transport (e.g. tests, or a node assembled without it);
+    /// the connection then holds no guard and behaves as before.
+    revocations: Option<Arc<crate::revocation::SessionRevocations>>,
 }
 
 impl Authenticator {
@@ -190,6 +196,7 @@ impl Authenticator {
             store,
             decoy_secret,
             audit: None,
+            revocations: None,
         }
     }
 
@@ -198,6 +205,25 @@ impl Authenticator {
     pub fn with_audit(mut self, audit: Arc<crate::auth_audit::AuthAudit>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Attach the shared per-principal revocation registry (Cluster F, Part A). Pass the **same**
+    /// [`SessionRevocations`](crate::revocation::SessionRevocations) to the
+    /// [`NodeApiImpl`](crate::node_api::NodeApiImpl) admin surface so a `session_revoke` (etc.) bump
+    /// reaches the connections this authenticator elevated. Absent, live connections are not
+    /// revocable (they still fail the reconnect fast-path on the deleted store session).
+    pub fn with_revocations(
+        mut self,
+        revocations: Arc<crate::revocation::SessionRevocations>,
+    ) -> Self {
+        self.revocations = Some(revocations);
+        self
+    }
+
+    /// The shared revocation registry, if one is attached — the transport reads it to capture a
+    /// connection's principal epoch at auth success.
+    pub fn revocations(&self) -> Option<&Arc<crate::revocation::SessionRevocations>> {
+        self.revocations.as_ref()
     }
 
     /// The attached auth-audit sink, if any (the transport reaches it to record permission denials,

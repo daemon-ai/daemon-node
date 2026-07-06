@@ -18,8 +18,10 @@ browser = ["dep:daemon-tool-browser", "daemon-tool-browser/cdp"]
 otel = ["daemon-telemetry/otel", "daemon-core/otel"]
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["governor"] }
 daemon-core = { workspace = true }
+# The SSRF-safe outbound HTTP client (Daemon Cloud gateway `/models` probe goes through it).
+daemon-egress = { workspace = true }
 # The default context engine (LCM) and memory provider (Mnemosyne) the host wires in as defaults.
 daemon-context-lcm = { workspace = true }
 daemon-mnemosyne = { workspace = true }
@@ -95,9 +97,6 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Daemon Cloud gateway model discovery (`GET /models`, unauth MVP). Workspace default features
-# (json + rustls-tls); no new tree beyond what genai/daemon-models already pull.
-reqwest = { workspace = true }
 # The node's launch/composition config: layered defaults <- TOML <- env <- CLI, merged into NodeConfig.
 # (figment's `toml` feature pulls the TOML parser transitively; the binary no longer uses it directly.)
 figment = { workspace = true }

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here reads the daemon-controlled HF cache/token path under the node data root,
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Shared Hugging Face cache resolution + token discovery.
 //!
 //! Ported from `mistral.rs`' `pipeline/hf.rs` (`hf_hub_cache_dir`, token source) so the daemon's

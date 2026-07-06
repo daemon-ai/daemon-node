@@ -113,7 +113,7 @@ async fn durable_park_allow_resume_completes() {
 
     // Operator allows: records the decision + wakes; the session resumes and completes.
     assert!(store
-        .answer_approval(&id, &request_id, true)
+        .answer_approval(&id, &request_id, true, false)
         .await
         .expect("answer"));
     assert!(store.pending_approvals_of(Some(&id)).await.is_empty());
@@ -135,7 +135,7 @@ async fn durable_park_deny_resume_completes() {
         .job_id
         .clone();
     assert!(store
-        .answer_approval(&id, &request_id, false)
+        .answer_approval(&id, &request_id, false, false)
         .await
         .expect("answer"));
     mgr.wake(id.clone()).await.expect("resume");
@@ -158,7 +158,7 @@ async fn parked_approval_survives_restart() {
         .job_id
         .clone();
     assert!(store
-        .answer_approval(&id, &request_id, true)
+        .answer_approval(&id, &request_id, true, false)
         .await
         .expect("answer"));
     let mgr2 = writing_manager(store.clone());
@@ -181,6 +181,9 @@ async fn store_contract(store: &dyn SessionStore) {
         epoch: Epoch(1),
         prompt: "approve write to a.txt".into(),
         path: Some("a.txt".into()),
+        // wire v28: a command approval carries the resolved-command fingerprint; it must survive the
+        // durable round-trip so the operator surface can display it structurally.
+        fingerprint: Some("abc123def456".into()),
         decision: None,
     };
     store
@@ -200,12 +203,17 @@ async fn store_contract(store: &dyn SessionStore) {
     let pending = store.pending_approvals_of(Some(&id)).await;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].prompt, "approve write to a.txt");
+    assert_eq!(
+        pending[0].fingerprint.as_deref(),
+        Some("abc123def456"),
+        "the command fingerprint survives the durable park/list round-trip (both backends)",
+    );
     // A node-wide listing finds it too.
     assert_eq!(store.pending_approvals_of(None).await.len(), 1);
 
     // Answer (allow): records a wake + a completion, drops it from the pending list.
     assert!(store
-        .answer_approval(&id, &job_id, true)
+        .answer_approval(&id, &job_id, true, false)
         .await
         .expect("answer"));
     assert!(store.pending_approvals_of(Some(&id)).await.is_empty());
@@ -220,16 +228,83 @@ async fn store_contract(store: &dyn SessionStore) {
 
     // Idempotent: a redelivered answer is a no-op (still answered, no extra wake/completion).
     assert!(store
-        .answer_approval(&id, &job_id, true)
+        .answer_approval(&id, &job_id, true, false)
         .await
         .expect("re-answer"));
     assert!(store.dequeue_wake().await.is_none(), "no duplicate wake");
 
     // An unknown request answers false.
     assert!(!store
-        .answer_approval(&id, &JobId::new("no-such"), true)
+        .answer_approval(&id, &JobId::new("no-such"), true, false)
         .await
         .expect("unknown"));
+}
+
+/// Test #9 (store): `answer_approval` encodes the operator's permanence choice in the completion
+/// payload the rehydrated engine reads — `allow_permanent` (allow + remember), `allow` (single),
+/// `deny`. Run against both backends so they stay in lockstep. `allow_permanent` must still start with
+/// "allow" so the engine's allow/deny split is unchanged.
+async fn permanence_payload_contract(store: &dyn SessionStore) {
+    let park = |id: &SessionId, job: &JobId| ParkedApproval {
+        session_id: id.clone(),
+        job_id: job.clone(),
+        epoch: Epoch(1),
+        prompt: "approve shell".into(),
+        path: None,
+        fingerprint: Some("fp-deadbeef".into()),
+        decision: None,
+    };
+    // The completion payload for a permanent allow / single allow / deny.
+    for (tag, allow, permanent, expected) in [
+        ("perm", true, true, b"allow_permanent".as_slice()),
+        ("single", true, false, b"allow".as_slice()),
+        ("deny", false, true, b"deny".as_slice()),
+    ] {
+        let id = SessionId::new(format!("perm-{tag}"));
+        seed(store, &id).await;
+        let fence = store.acquire_activation_lease(&id).await.expect("lease");
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+        let job = JobId::new(format!("perm-{tag}:1:approval:0"));
+        store
+            .park_approval(
+                Checkpoint::new(id.clone(), Epoch(1), blob),
+                vec![park(&id, &job)],
+                fence,
+            )
+            .await
+            .expect("park");
+        assert!(store
+            .answer_approval(&id, &job, allow, permanent)
+            .await
+            .expect("answer"));
+        let act = store
+            .load_for_activation(&id, fence)
+            .await
+            .expect("activation");
+        assert_eq!(act.unapplied.len(), 1, "one completion recorded ({tag})");
+        assert_eq!(
+            act.unapplied[0].payload, expected,
+            "the permanence choice is encoded in the completion payload ({tag})",
+        );
+        // Back-compat: a permanent allow still reads as an allow.
+        if allow {
+            assert!(
+                String::from_utf8_lossy(&act.unapplied[0].payload).starts_with("allow"),
+                "an allow payload starts with \"allow\" ({tag})",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn permanence_payload_in_memory() {
+    permanence_payload_contract(&InMemoryStore::new()).await;
+}
+
+#[tokio::test]
+async fn permanence_payload_sqlite() {
+    let store = SqliteStore::open_in_memory().expect("sqlite");
+    permanence_payload_contract(&store).await;
 }
 
 #[tokio::test]

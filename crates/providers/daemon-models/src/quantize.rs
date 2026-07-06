@@ -134,10 +134,15 @@ async fn run_job(
 ) {
     set_state(&status, QuantizeState::Quantizing).await;
 
-    if let Err(e) = tokio::fs::create_dir_all(&output_dir).await {
+    // Output dir is under the daemon-controlled model cache; not attacker-influenced.
+    #[allow(clippy::disallowed_methods)]
+    let mk = tokio::fs::create_dir_all(&output_dir).await;
+    if let Err(e) = mk {
         return fail(&status, format!("creating output dir: {e}")).await;
     }
 
+    // Spawns the daemon-controlled quantize worker binary (argv-only, no shell).
+    #[allow(clippy::disallowed_methods)]
     let spawn = Command::new(&worker_bin)
         .arg("quantize")
         .arg("--in")
@@ -199,6 +204,9 @@ async fn run_job(
         context_length: None,
         file_type: None,
         mmproj_path: None,
+        // A freshly-quantized artifact is not pinned (no download-time oid); node-side pinning is the
+        // downloader's job. Display sha256 stays None until a re-catalog through the pin path.
+        sha256: None,
         model,
     };
     inspect::enrich_installed(&mut record);

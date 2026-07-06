@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: integration test crate; raw fs/reqwest/Command are expected in tests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! Acquisition-path tests against an in-process `wiremock` Hub (no live network): companion
 //! (mmproj) plan expansion + cataloging, the size-integrity gate, the local pairing scan, and the
@@ -82,6 +84,50 @@ async fn mount_repo(server: &MockServer, repo: &str, files: &[(&str, &[u8], u64)
             .mount(server)
             .await;
     }
+}
+
+/// Mount a single-file repo whose tree advertises a git-LFS `oid` (sha256), so the acquisition
+/// path can verify the downloaded bytes against the Hub-declared hash (Phase 3 / Cluster E, L1).
+async fn mount_repo_lfs(
+    server: &MockServer,
+    repo: &str,
+    name: &str,
+    bytes: &[u8],
+    declared: u64,
+    oid: &str,
+) {
+    let tree = json!([{
+        "type": "file", "path": name, "size": declared,
+        "lfs": { "oid": oid, "size": declared },
+    }]);
+    Mock::given(method("GET"))
+        .and(path(format!("/api/models/{repo}/tree/main")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tree))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{repo}/resolve/main/{name}")))
+        .respond_with(ResolveFile {
+            bytes: bytes.to_vec(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        })
+        .mount(server)
+        .await;
+}
+
+/// Lowercase-hex sha256 of `bytes` (the pin/oid format).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The node-local pin sidecar path for an artifact (`<artifact>.sha256`).
+fn sidecar_of(artifact: &std::path::Path) -> PathBuf {
+    let mut p = artifact.as_os_str().to_os_string();
+    p.push(".sha256");
+    PathBuf::from(p)
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -315,6 +361,7 @@ async fn pairing_scan_links_preexisting_projector_record() {
                 context_length: None,
                 file_type: None,
                 mmproj_path: None,
+                sha256: None,
             })
             .await
             .unwrap();
@@ -342,6 +389,71 @@ async fn pairing_scan_links_preexisting_projector_record() {
         .find(|r| r.model == proj_ref)
         .expect("projector record kept");
     assert!(proj_record.mmproj_path.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L1 provenance: a download whose bytes do NOT hash to the Hub-declared git-LFS `oid` fails the
+/// job (even though size + `GGUF` magic are intact) and is never cataloged.
+#[tokio::test]
+async fn download_oid_mismatch_fails_and_is_not_cataloged() {
+    let server = MockServer::start().await;
+    let bytes = gguf_bytes(200);
+    let wrong_oid = "0".repeat(64); // does not match the served bytes
+    mount_repo_lfs(
+        &server,
+        "org/oidbad",
+        "Model-Q8_0.gguf",
+        &bytes,
+        200,
+        &wrong_oid,
+    )
+    .await;
+
+    let dir = temp_dir("oidbad");
+    let manager = manager_over(&dir, server.uri()).await;
+    let model = ModelRef::new(
+        ModelEngine::Llama,
+        ModelSource::hf_file("org/oidbad", "Model-Q8_0.gguf"),
+    );
+    let id = manager.download(model.clone()).await.expect("download");
+    assert_eq!(await_terminal(&manager, id).await, DownloadState::Failed);
+    let status = manager
+        .downloads()
+        .await
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    let err = status.error.expect("failure reason");
+    assert!(err.contains("sha256 mismatch"), "unexpected error: {err}");
+    assert!(manager.catalog().await.is_empty(), "nothing cataloged");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L1 provenance: a download whose bytes hash to the Hub-declared `oid` completes and records the
+/// pin in a node-local `<artifact>.sha256` sidecar equal to the oid.
+#[tokio::test]
+async fn download_oid_match_records_pin() {
+    let server = MockServer::start().await;
+    let bytes = gguf_bytes(200);
+    let oid = sha256_hex(&bytes);
+    mount_repo_lfs(&server, "org/oidok", "Model-Q8_0.gguf", &bytes, 200, &oid).await;
+
+    let dir = temp_dir("oidok");
+    let manager = manager_over(&dir, server.uri()).await;
+    let model = ModelRef::new(
+        ModelEngine::Llama,
+        ModelSource::hf_file("org/oidok", "Model-Q8_0.gguf"),
+    );
+    let id = manager.download(model.clone()).await.expect("download");
+    assert_eq!(await_terminal(&manager, id).await, DownloadState::Completed);
+
+    let record = await_record(&manager, &model).await;
+    let sidecar = sidecar_of(&record.local_path);
+    let pinned =
+        std::fs::read_to_string(&sidecar).expect("pin sidecar written beside the artifact");
+    assert_eq!(pinned.trim(), oid, "the pin equals the Hub-declared oid");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

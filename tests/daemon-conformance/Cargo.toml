@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["governor"] }
 daemon-protocol = { workspace = true }
 daemon-supervision = { workspace = true }
 daemon-api = { workspace = true }
@@ -66,6 +66,9 @@ wiremock = { workspace = true }
 # Track 5 discovery e2e: the keyless `GET /models` listing the Daemon Cloud discovery hook performs
 # against the mock gateway (mirrors the binary's `daemon_cloud_gateway_models`). Test-only.
 reqwest = { workspace = true }
+# Auth-4 ownership: the HTTP transport's session-log routes must keep working under `[api].local_trust`
+# after the None-principal flip (they now dispatch inside a `RequestContext::system()` scope). Test-only.
+daemon-http = { workspace = true }
 
 [lints]
 workspace = true

@@ -328,3 +328,16 @@ pub fn temp_socket() -> std::path::PathBuf {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("daemon-api-gate-{}-{}.sock", std::process::id(), n))
 }
+
+/// Run `fut` as the trusted in-process `system` principal — the identity a real local embedder (the
+/// C FFI, `bins/daemon`) binds via `with_request_context(RequestContext::system(), …)`.
+///
+/// After the Auth 4 flip a `None` request principal is DENIED, so a conformance test that drives the
+/// node directly (not over an authenticated transport) must establish an explicit context exactly as
+/// the embedder does. `system` holds every capability (including the ownership overrides), so it is
+/// the faithful stand-in for the local-trust driver these transport-agnostic tests represent. Tests
+/// that assert per-user ownership *scoping* instead bind specific principals themselves (see
+/// `ownership.rs`), so they do not use this helper.
+pub async fn as_system<F: std::future::Future>(fut: F) -> F::Output {
+    daemon_host::with_request_context(daemon_host::RequestContext::system(), fut).await
+}

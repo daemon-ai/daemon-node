@@ -2074,6 +2074,7 @@ dependencies = [
  "daemon-context-lcm",
  "daemon-core",
  "daemon-credentials",
+ "daemon-egress",
  "daemon-host",
  "daemon-http",
  "daemon-infer",
@@ -2109,7 +2110,6 @@ dependencies = [
  "daemon-workspace-index",
  "figment",
  "nix 0.31.3",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
@@ -2207,6 +2207,7 @@ dependencies = [
  "arbitrary",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -2225,6 +2226,7 @@ dependencies = [
  "daemon-credentials",
  "daemon-delivery",
  "daemon-host",
+ "daemon-http",
  "daemon-ingest",
  "daemon-matrix",
  "daemon-models",
@@ -2286,8 +2288,11 @@ dependencies = [
  "daemon-common",
  "daemon-protocol",
  "futures",
+ "idna",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "strsim 0.11.1",
  "thiserror 2.0.18",
  "tokio",
@@ -2334,6 +2339,19 @@ dependencies = [
  "daemon-protocol",
  "futures",
  "tokio",
+]
+
+[[package]]
+name = "daemon-egress"
+version = "0.0.1"
+dependencies = [
+ "daemon-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -2527,6 +2545,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "daemon-core",
+ "daemon-egress",
  "flate2",
  "regex",
  "reqwest 0.12.28",
@@ -2542,6 +2561,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "wiremock",
 ]
 
 [[package]]
@@ -2726,6 +2746,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-sandbox"
+version = "0.0.1"
+dependencies = [
+ "landlock",
+ "libc",
+ "seccompiler",
+ "tokio",
+]
+
+[[package]]
 name = "daemon-schedule"
 version = "0.0.1"
 dependencies = [
@@ -2738,6 +2768,8 @@ dependencies = [
 name = "daemon-skills"
 version = "0.0.1"
 dependencies = [
+ "bc-components",
+ "bc-envelope",
  "ciborium",
  "daemon-common",
  "daemon-core",
@@ -2849,11 +2881,13 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-protocol",
+ "daemon-sandbox",
  "nix 0.31.3",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -3036,6 +3070,7 @@ dependencies = [
  "async-trait",
  "daemon-common",
  "daemon-core",
+ "daemon-egress",
  "daemon-protocol",
  "dom_smoothie",
  "reqwest 0.12.28",
@@ -5685,6 +5720,17 @@ checksum = "f660d5f887e3562f9ab6f4a14988795b694099d66b4f5dedc02d197ba9becb1d"
 dependencies = [
  "const_panic",
  "typewit",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -9133,6 +9179,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

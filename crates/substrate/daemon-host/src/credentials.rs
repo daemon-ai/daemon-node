@@ -217,6 +217,21 @@ impl MultiProfileStoreBroker {
         }
     }
 
+    /// Revoke every outstanding lease for `profile` (Cluster F, Part B). If no authority has been
+    /// built for the profile yet there are no leases to invalidate, so this is a no-op (it does not
+    /// create one). Clones the `Arc<CredentialAuthority>` out from under the `authorities` lock
+    /// before calling `revoke_all`, so that lock is never held across the authority's own locks.
+    pub fn revoke_profile(&self, profile: &ProfileRef) {
+        let authority = {
+            let map = self.authorities.lock().unwrap();
+            map.get(profile).cloned()
+        };
+        if let Some(authority) = authority {
+            let ctx = AcquireCtx::new(None, current_trace());
+            authority.revoke_all(&ctx);
+        }
+    }
+
     /// Get (or lazily create) the authority that serves `profile`.
     fn authority_for(&self, profile: &ProfileRef) -> Arc<CredentialAuthority> {
         let mut map = self.authorities.lock().unwrap();
@@ -272,6 +287,12 @@ impl CredentialBroker for MultiProfileStoreBroker {
 
     async fn rotate(&self, _requester: Option<UnitId>, profile: &ProfileRef, cap_id: &CredId) {
         self.authority_for(profile).rotate(cap_id);
+    }
+}
+
+impl crate::revocation::CredentialRevoker for MultiProfileStoreBroker {
+    fn revoke_profile(&self, profile: &str) {
+        MultiProfileStoreBroker::revoke_profile(self, &ProfileRef::new(profile));
     }
 }
 
@@ -523,6 +544,70 @@ mod tests {
             !broker.take_audit().is_empty(),
             "acquires recorded audit across profiles"
         );
+    }
+
+    /// Cluster F (Part B): after `revoke_profile`, a lease minted before it is refused at
+    /// `use_capability`, while a freshly-acquired lease (under the new epoch) resolves — and a
+    /// different profile's leases are untouched.
+    #[tokio::test]
+    async fn revoke_profile_invalidates_outstanding_lease() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("alpha", "key-alpha").unwrap();
+        store.set("beta", "key-beta").unwrap();
+        let signer = Arc::new(CapabilitySigner::generate());
+        let broker = MultiProfileStoreBroker::new(
+            store,
+            signer,
+            "sk-fallback",
+            ["chat"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        );
+        let scope_a = CredScope::new(["alpha"], ["chat"], Some(1_000));
+        let scope_b = CredScope::new(["beta"], ["chat"], Some(1_000));
+
+        let lease_a = broker
+            .acquire(None, &ProfileRef::new("alpha"), &scope_a)
+            .await
+            .expect("alpha acquires");
+        let lease_b = broker
+            .acquire(None, &ProfileRef::new("beta"), &scope_b)
+            .await
+            .expect("beta acquires");
+        // Both resolve before revocation.
+        broker
+            .use_capability(None, &lease_a)
+            .await
+            .expect("alpha use");
+        broker
+            .use_capability(None, &lease_b)
+            .await
+            .expect("beta use");
+
+        // Revoke alpha only.
+        broker.revoke_profile(&ProfileRef::new("alpha"));
+
+        // alpha's outstanding lease is now refused …
+        let err = broker
+            .use_capability(None, &lease_a)
+            .await
+            .expect_err("alpha's pre-revoke lease must be refused");
+        assert!(matches!(err, CredError::Unavailable(_)), "got {err:?}");
+        // … a freshly-acquired alpha lease works again (new epoch) …
+        let fresh_a = broker
+            .acquire(None, &ProfileRef::new("alpha"), &scope_a)
+            .await
+            .expect("re-acquire alpha");
+        broker
+            .use_capability(None, &fresh_a)
+            .await
+            .expect("post-revoke alpha lease resolves");
+        // … and beta is entirely undisturbed.
+        broker
+            .use_capability(None, &lease_b)
+            .await
+            .expect("beta lease unaffected by alpha revocation");
     }
 
     /// A profile with no stored key falls back to the configured fallback (zero-config bootstrap).

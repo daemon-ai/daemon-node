@@ -24,16 +24,19 @@ use daemon_protocol::{AgentCommand, AgentEvent, UserMsg};
 /// turn: a second `TurnFinished` arrives without any user submit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_input_drives_a_reactive_turn_on_a_live_session() {
+    as_system(injected_input_drives_a_reactive_turn_on_a_live_session_impl()).await;
+}
+async fn injected_input_drives_a_reactive_turn_on_a_live_session_impl() {
     let (node, handle) = assemble();
     let session = SessionId::new("notify-live-1");
 
-    node.submit(
+    as_system(node.submit(
         session.clone(),
         AgentCommand::StartTurn {
             input: UserMsg::new("hello"),
             request_id: ReqId(1),
         },
-    )
+    ))
     .await
     .expect("submit StartTurn");
     drain_until_finished_count(&node, &session, 1).await;
@@ -98,6 +101,7 @@ async fn injected_input_reaches_a_parked_durable_session_via_the_store_seam() {
         },
         prompt: "approve write to gated.txt".into(),
         path: Some("gated.txt".into()),
+        fingerprint: None,
     }];
     store
         .create_session(
@@ -181,6 +185,9 @@ async fn injected_input_reaches_a_parked_durable_session_via_the_store_seam() {
 /// the owner is gone; nothing should resurrect it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_input_into_a_settled_durable_session_is_dropped() {
+    as_system(injected_input_into_a_settled_durable_session_is_dropped_impl()).await;
+}
+async fn injected_input_into_a_settled_durable_session_is_dropped_impl() {
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
     let AssembledNode { node, handle, .. } =
         assemble_over(store.clone(), 0, [0x66; 32], fast_host_config());

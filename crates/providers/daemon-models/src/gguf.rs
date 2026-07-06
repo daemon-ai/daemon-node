@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here opens a resolved model artifact under the daemon-controlled cache, not
+// attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! GGUF filename heuristics + a magic-byte preflight.
 //!
 //! Ported (Rust-idiomatic, regex-free) from the old `HuggingFaceService` filename parsing: detect

@@ -10,15 +10,37 @@
 //! See `docs/daemon-workspace-layout.md` and `docs/specs/`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command (e.g. the EnvPolicy::apply tests spawn `env`);
+// the --lib pass still guards production. `EnvPolicy::apply` itself carries a scoped production anchor.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 /// The shared cursored-ring primitive (`CursoredRing`/`CursoredItem`) backing the daemon's live
 /// streams (merged log, node-event feed, fs-watch). Pure + sync.
 pub mod cursored;
 
+/// The declared child-process env-inheritance policy (`EnvPolicy`) every spawn site states
+/// explicitly (OpenClaw Cluster E). The enum is pure data; the tokio application helper is gated
+/// behind the `process` feature.
+pub mod env_policy;
+
 /// A permissive boolean serde helper (`#[serde(with = "daemon_common::flex_bool")]`) accepting
 /// `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. Used by the node's layered config so an env var
 /// (`DAEMON_*__ENABLE=1`, auto-typed to an integer by figment) or a `=on` string both parse.
 pub mod flex_bool;
+
+/// Shared ingress size bounds ([`MAX_FRAME_BYTES`]): the pre-allocation frame cap every
+/// length-framed transport enforces before allocating a receive buffer.
+pub mod limits;
+pub use limits::MAX_FRAME_BYTES;
+
+/// The central ingress governor (OpenClaw Cluster F, Phase 4): one fail-closed policy
+/// ([`IngressLimits`]) — max frame/decoded size, per-peer connection rate, connection concurrency —
+/// that every networked carrier funnels through. The pure policy is always compiled; the runtime
+/// enforcer ([`IngressGovernor`]) is behind the `governor` feature.
+pub mod ingress;
+#[cfg(feature = "governor")]
+pub use ingress::{ConnectionPermit, IngressGovernor};
+pub use ingress::{IngressLimits, IngressReject, PeerKey, RateSpec};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -535,7 +557,20 @@ impl WireVersion {
     /// `arch == "clip"`): excluded from quant recommendations and local chat-model offers, and
     /// rejected by `ModelActivate`/resolve with an actionable error instead of the llama worker's
     /// `unsupported model architecture: 'clip'` fatal. Breaking (the `model-file` shape).
-    pub const CURRENT: Self = Self(27);
+    ///
+    /// v28 (deferred-wire bundle): batches four additive, deferred wire additions that earlier
+    /// Phase 2/3 hardening tracks intentionally held back for one codec regen. All four are optional
+    /// (`#[serde(default)]`, encoded as CBOR `null` when absent): (1) `Origin.sender` — the immutable
+    /// [`SenderId`](daemon_protocol::SenderId) carried ONWARD from the ingest boundary onto `Origin`
+    /// for downstream attribution (does NOT feed `session_id_for`, so group-session sharing is
+    /// unperturbed); (2) `ApprovalInfo.fingerprint` — the §12 exec-approval command fingerprint
+    /// promoted from the free-text prompt to a structured field (snapshot-side enforcement
+    /// unchanged); (3) `InstalledModel.sha256` — display-only exposure of the node-local pinned
+    /// artifact hash (node-side pin/verify stays authoritative); (4) `SkillBundle.signature` — an
+    /// optional, default-off ed25519 detached signature backing a verify-at-import gate. Additive,
+    /// but bumped because `is_compatible` is strict-equal, so an older peer cannot decode the new
+    /// fields (mirrors the additive v15–v23 bumps).
+    pub const CURRENT: Self = Self(28);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -881,6 +916,12 @@ pub struct CapabilityLease {
     pub mode: CredMode,
     /// Wall-clock expiry, in milliseconds since the Unix epoch.
     pub expires_at_ms: u64,
+    /// The minting authority's revocation epoch at issue time (Cluster F, Part B). A credential
+    /// mutation (`credential_remove`/`credential_set`) bumps the authority's epoch; `use_capability`
+    /// refuses any lease whose `epoch` no longer matches, so an outstanding lease minted against the
+    /// removed/replaced material is invalidated at use. Covered by the `signature`, so an
+    /// intermediate relay cannot re-stamp it. `0` for the standalone L1 pool (no remote authority).
+    pub epoch: u64,
     /// The short-lived token, present only in `Native` mode.
     pub secret: Option<LeaseSecret>,
     /// The authority's detached signature over the canonical capability bytes.
@@ -1260,6 +1301,13 @@ pub struct InstalledModel {
     /// text-only models and for projector records themselves.
     #[serde(default)]
     pub mmproj_path: Option<String>,
+    /// The node-local pinned artifact hash (lowercase-hex sha256), read from the `<local_path>.sha256`
+    /// provenance sidecar for **display only** (wire v28). Node-side pinning/verification
+    /// (`daemon-models`) stays authoritative; this merely surfaces the pin so a client can show
+    /// provenance. `None` for directory (multi-file) models, for artifacts with no sidecar, and for
+    /// legacy records cataloged before the pin existed — **a re-catalog (re-download) repins them**.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,6 +1438,14 @@ pub struct SkillBundle {
     pub category: Option<String>,
     /// Bundle-relative path -> file contents (includes `SKILL.md`).
     pub files: std::collections::BTreeMap<String, String>,
+    /// An optional hex-encoded ed25519 detached signature over the bundle's canonical digest
+    /// (name + category + sorted files), backing the opt-in verify-at-import gate (wire v28).
+    /// `None` for unsigned bundles (the default); verification is **off** unless an operator has
+    /// configured a trusted key, in which case `import_bundle` requires a valid signature. Carried
+    /// as a string so this lowest contract layer stays free of the crypto stack (the digest + verify
+    /// live in `daemon-skills`).
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// How a session's workspace root is chosen (host-spec §7). Carried on the session overlay and

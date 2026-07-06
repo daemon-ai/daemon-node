@@ -42,8 +42,10 @@ pub async fn plan(client: &HfClient, model: &ModelRef) -> Result<DownloadPlan> {
                      ModelRecommend pick)"
                 ))
             })?;
-            let listing = files::list_files(client, repo, revision, ModelEngine::Llama).await?;
+            let (listing, oids) =
+                files::list_files_with_oids(client, repo, revision, ModelEngine::Llama).await?;
             let size_of = |p: &str| listing.iter().find(|f| f.path == p).map(|f| f.size_bytes);
+            let oid_of = |p: &str| oids.get(p).cloned();
 
             let mut plan_files: Vec<PlanFile> = if gguf::is_first_shard(&file) {
                 let set = gguf::shard_set(&file)
@@ -51,6 +53,7 @@ pub async fn plan(client: &HfClient, model: &ModelRef) -> Result<DownloadPlan> {
                 set.into_iter()
                     .map(|p| PlanFile {
                         size: size_of(&p).unwrap_or(0),
+                        expected_sha256: oid_of(&p),
                         path: p,
                         is_mmproj_companion: false,
                     })
@@ -58,6 +61,7 @@ pub async fn plan(client: &HfClient, model: &ModelRef) -> Result<DownloadPlan> {
             } else {
                 vec![PlanFile {
                     size: size_of(&file).unwrap_or(0),
+                    expected_sha256: oid_of(&file),
                     path: file.clone(),
                     is_mmproj_companion: false,
                 }]
@@ -71,6 +75,7 @@ pub async fn plan(client: &HfClient, model: &ModelRef) -> Result<DownloadPlan> {
             ) {
                 if plan_files.iter().all(|f| f.path != proj_path) {
                     plan_files.push(PlanFile {
+                        expected_sha256: oid_of(&proj_path),
                         path: proj_path,
                         size: proj_size,
                         is_mmproj_companion: true,
@@ -87,6 +92,8 @@ pub async fn plan(client: &HfClient, model: &ModelRef) -> Result<DownloadPlan> {
                     path,
                     size,
                     is_mmproj_companion: false,
+                    // Directory (mistral.rs) artifacts are not pinned in this phase.
+                    expected_sha256: None,
                 })
                 .collect();
             plan_for(model, plan_files, false)

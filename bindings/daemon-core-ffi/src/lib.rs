@@ -56,6 +56,7 @@ fn engine_origin() -> Origin {
     Origin {
         transport: TransportId::new("engine"),
         scope: OriginScope::Internal,
+        sender: None,
     }
 }
 
@@ -64,6 +65,7 @@ fn ffi_origin() -> Origin {
     Origin {
         transport: TransportId::new("ffi"),
         scope: OriginScope::Internal,
+        sender: None,
     }
 }
 
@@ -931,7 +933,10 @@ impl HostRequestHandler for ParkingHandler {
             Ok(resp) => resp,
             Err(_) => HostResponse {
                 request_id,
-                body: HostResponseBody::Approved(false),
+                body: HostResponseBody::Approved {
+                    approved: false,
+                    allow_permanent: false,
+                },
             },
         }
     }

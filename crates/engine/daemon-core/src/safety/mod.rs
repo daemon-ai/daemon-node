@@ -9,4 +9,4 @@
 
 pub mod url;
 
-pub use url::{check_url, CheckedUrl, UrlReject};
+pub use url::{check_url, check_url_resolved, check_url_resolved_with, CheckedUrl, UrlReject};

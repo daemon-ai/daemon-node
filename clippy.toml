@@ -1,0 +1,88 @@
+# Phase 4 hardening guardrails (OpenClaw class). See HARDENING-PLAN-clippy-disallow.md.
+#
+# These make the Phase 1-3 choke points unbypassable going forward:
+#   * attacker-influenced fs must go through `daemon_core::ContainedRoot`
+#     (openat2 RESOLVE_BENEATH|NO_SYMLINKS), not raw std/tokio fs;
+#   * outbound HTTP must go through `daemon_egress::EgressClient` (SSRF-safe,
+#     per-hop-revalidated redirects), not a raw `reqwest::Client`;
+#   * every process spawn must be a declared, reviewed `#[allow]` site, so a
+#     new `Command::new("sh"/"bash", "-c", ...)` cannot land un-gated;
+#   * every child-process env mutation must go through
+#     `daemon_common::env_policy::EnvPolicy::apply` (a declared InheritFull/Clean
+#     choice), so undeclared inheritance/scrub cannot land un-gated.
+#
+# Mechanism notes (why it is shaped this way):
+#   * clippy.toml is workspace-global and `disallowed_methods` is a single lint,
+#     so "outside module X" is expressed only via `#[allow(...)]` anchors at the
+#     sanctioned homes / trusted stragglers -- never via config scoping.
+#   * reqwest is under disallowed-TYPES (a *separate* lint from disallowed-methods)
+#     so an fs `#[allow(clippy::disallowed_methods)]` can never silently re-open
+#     the egress hole.
+#   * clippy cannot match on call arguments, so the shell-string ban is expressed
+#     as an arg-blind ban on `Command::new`; every legitimate spawn carries a
+#     commented `#[allow]` naming what it spawns (the Phase 2 exec-approval gate
+#     handles approval-time TOCTOU; this handles compile-time "no new spawn path").
+
+disallowed-types = [
+    { path = "reqwest::Client", reason = "build the SSRF-safe client via daemon_egress::EgressClient" },
+    { path = "reqwest::ClientBuilder", reason = "build the SSRF-safe client via daemon_egress::EgressClient" },
+    # `blocking` is not enabled on the workspace reqwest today (default-features = false), so this path
+    # is currently unreachable; `allow-invalid` keeps the ban ready without warning if it is ever added.
+    { path = "reqwest::blocking::Client", reason = "blocking reqwest is banned; use daemon_egress", allow-invalid = true },
+]
+
+disallowed-methods = [
+    # --- fs: mutating / content-opening ops. Route attacker-influenced paths through
+    #     daemon_core::ContainedRoot. Pure stat probes (metadata/symlink_metadata/
+    #     try_exists/canonicalize) are intentionally NOT banned. ---
+    { path = "std::fs::write",              reason = "use ContainedRoot::write / open_write_file" },
+    { path = "std::fs::read",               reason = "use ContainedRoot::read" },
+    { path = "std::fs::read_to_string",     reason = "use ContainedRoot::read" },
+    { path = "std::fs::read_dir",           reason = "use ContainedRoot::read_dir" },
+    { path = "std::fs::create_dir",         reason = "use ContainedRoot::create_dir_all" },
+    { path = "std::fs::create_dir_all",     reason = "use ContainedRoot::create_dir_all" },
+    { path = "std::fs::remove_file",        reason = "use ContainedRoot::remove_file" },
+    { path = "std::fs::remove_dir",         reason = "use ContainedRoot::remove_dir" },
+    { path = "std::fs::remove_dir_all",     reason = "use ContainedRoot::remove_dir_all_sync" },
+    { path = "std::fs::rename",             reason = "use ContainedRoot::rename" },
+    { path = "std::fs::copy",               reason = "route through ContainedRoot" },
+    { path = "std::fs::hard_link",          reason = "route through ContainedRoot" },
+    { path = "std::fs::set_permissions",    reason = "use ContainedRoot::set_mode" },
+    { path = "std::fs::File::open",         reason = "open via ContainedRoot (read / open_write_file)" },
+    { path = "std::fs::File::create",       reason = "open via ContainedRoot::open_write_file" },
+    { path = "std::fs::OpenOptions::new",   reason = "open via ContainedRoot::open_write_file" },
+    { path = "tokio::fs::write",            reason = "use ContainedRoot::write" },
+    { path = "tokio::fs::read",             reason = "use ContainedRoot::read" },
+    { path = "tokio::fs::read_to_string",   reason = "use ContainedRoot::read" },
+    { path = "tokio::fs::read_dir",         reason = "use ContainedRoot::read_dir" },
+    { path = "tokio::fs::create_dir",       reason = "use ContainedRoot::create_dir_all" },
+    { path = "tokio::fs::create_dir_all",   reason = "use ContainedRoot::create_dir_all" },
+    { path = "tokio::fs::remove_file",      reason = "use ContainedRoot::remove_file" },
+    { path = "tokio::fs::remove_dir",       reason = "use ContainedRoot::remove_dir" },
+    { path = "tokio::fs::remove_dir_all",   reason = "use ContainedRoot::remove_dir_all_sync" },
+    { path = "tokio::fs::rename",           reason = "use ContainedRoot::rename" },
+    { path = "tokio::fs::copy",             reason = "route through ContainedRoot" },
+    { path = "tokio::fs::hard_link",        reason = "route through ContainedRoot" },
+    { path = "tokio::fs::set_permissions",  reason = "use ContainedRoot::set_mode" },
+    { path = "tokio::fs::File::open",       reason = "open via ContainedRoot" },
+    { path = "tokio::fs::File::create",     reason = "open via ContainedRoot" },
+    { path = "tokio::fs::OpenOptions::new", reason = "open via ContainedRoot" },
+
+    # --- shell / process: force every spawn to be a declared, reviewed site; the sh/bash -c
+    #     form must live only in the gated exec path (daemon-processes registry). ---
+    { path = "std::process::Command::new",   reason = "declare the spawn; sh/bash -c only via the gated exec path" },
+    { path = "tokio::process::Command::new", reason = "declare the spawn; sh/bash -c only via the gated exec path" },
+
+    # --- env: every child-process env mutation must be a declared EnvPolicy applied via
+    #     daemon_common::env_policy::EnvPolicy::apply (backed by the two anchored EnvSink impls in
+    #     env_policy.rs, the only sanctioned env-mutation site). An undeclared inheritance/scrub is
+    #     thus unrepresentable. NOTE: shares the single `disallowed_methods` lint with the fs/spawn
+    #     bans, so a scope-level fs `#[allow(clippy::disallowed_methods)]` also silences these (the
+    #     accepted coupling residual; see HARDENING-PLAN.md §4/§7). ---
+    { path = "std::process::Command::env",         reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "std::process::Command::env_clear",   reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "std::process::Command::envs",        reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "tokio::process::Command::env",       reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "tokio::process::Command::env_clear", reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+    { path = "tokio::process::Command::envs",      reason = "declare child env via daemon_common::env_policy::EnvPolicy::apply" },
+]

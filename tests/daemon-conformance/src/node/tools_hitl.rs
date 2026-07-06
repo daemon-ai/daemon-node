@@ -89,6 +89,9 @@ fn assemble_core_tools(store: Arc<dyn SessionStore>) -> AssembledNode {
 /// against its contained workspace, and the tool I/O lands in the durable, verified
 /// `session_history`. Asserted against both store backends.
 async fn core_tools_session_does_real_work(store: Arc<dyn SessionStore>) {
+    as_system(core_tools_session_does_real_work_impl(store)).await;
+}
+async fn core_tools_session_does_real_work_impl(store: Arc<dyn SessionStore>) {
     use daemon_api::{JournalRecordPayload, Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{AgentCommand, AgentEvent, TranscriptBlock, UserMsg};
@@ -96,13 +99,13 @@ async fn core_tools_session_does_real_work(store: Arc<dyn SessionStore>) {
     let AssembledNode { node, handle, .. } = assemble_core_tools(store);
     let session = SessionId::new("core-tools-1");
 
-    node.submit(
+    as_system(node.submit(
         session.clone(),
         AgentCommand::StartTurn {
             input: UserMsg::new("do file work"),
             request_id: ReqId(1),
         },
-    )
+    ))
     .await
     .expect("submit StartTurn");
 
@@ -283,6 +286,9 @@ fn assemble_core_approval(store: Arc<dyn SessionStore>) -> AssembledNode {
 /// completes. This is the live counterpart to the durable `answer_approval` cycle and the
 /// surfacing daemon-app's DaemonTurnEngine relies on.
 async fn live_approval_park_then_respond(store: Arc<dyn SessionStore>, allow: bool) {
+    as_system(live_approval_park_then_respond_impl(store, allow)).await;
+}
+async fn live_approval_park_then_respond_impl(store: Arc<dyn SessionStore>, allow: bool) {
     use daemon_api::{Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{
@@ -344,7 +350,10 @@ async fn live_approval_park_then_respond(store: Arc<dyn SessionStore>, allow: bo
         session.clone(),
         HostResponse {
             request_id,
-            body: HostResponseBody::Approved(allow),
+            body: HostResponseBody::Approved {
+                approved: allow,
+                allow_permanent: false,
+            },
         },
     )
     .await

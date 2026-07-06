@@ -562,7 +562,8 @@ pub struct ExecuteCodeConfig {
     pub max_stdout_bytes: usize,
     /// The stderr byte cap (head-only).
     pub max_stderr_bytes: usize,
-    /// The OS-sandbox policy: `auto` (bwrap when usable, else plain), `bwrap` (required), `none`.
+    /// The OS-sandbox posture: `auto` (strongest usable backend, else plain+warn), `require` (a
+    /// kernel backend or fail closed; legacy `bwrap` alias), `plain` (unconfined; legacy `none`).
     pub sandbox: daemon_tool_execute_code::SandboxPolicy,
     /// The child network policy under the sandbox: `off` (`--unshare-net`) or `shared`.
     pub network: daemon_tool_execute_code::NetworkPolicy,
@@ -591,6 +592,12 @@ pub struct SkillsConfig {
     pub enable: bool,
     /// The skills root directory (`None` => `<profile_home>/skills`).
     pub dir: Option<PathBuf>,
+    /// Opt-in verify-at-import trust anchor (wire v28): a hex-encoded ed25519 public key
+    /// (`SkillBundleVerifier`'s dCBOR form). When set, `import_bundle` refuses any bundle without a
+    /// signature that verifies against it. `None` (the default) => signing is **off** and unsigned
+    /// bundles import as before. A malformed key disables enforcement (logged), never a hard boot
+    /// failure.
+    pub import_verify_key: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -598,6 +605,7 @@ impl Default for SkillsConfig {
         Self {
             enable: true,
             dir: None,
+            import_verify_key: None,
         }
     }
 }
@@ -784,6 +792,51 @@ pub struct ApiConfig {
     /// `"system"`) binds a full-trust local context; `""`/`off`/`none` (normalized to `None`) makes
     /// the Unix socket require SCRAM and fully gates HTTP. TCP/TLS always requires authentication.
     pub local_trust: Option<String>,
+
+    // -- Cluster F: the central ingress governor (secure-by-default; applies to the NETWORKED
+    // carriers — TLS/TCP, WebSocket, web front. The local-trust Unix socket / named pipe are exempt
+    // from rate + concurrency so a network flood cannot starve the operator CLI). --------------
+    /// Max concurrent networked connections across the governed carriers. `0` = unbounded. Default
+    /// 1024 — a generous ceiling that bounds a connection flood without rejecting legitimate use.
+    pub ingress_max_connections: usize,
+    /// Per-peer new-connection token-bucket capacity (the largest instantaneous burst from one peer
+    /// IP). `0` disables the per-peer rate limit. Default 256.
+    pub ingress_peer_burst: f64,
+    /// Per-peer new-connection refill rate (tokens/second). Default 128.
+    pub ingress_peer_rate_per_sec: f64,
+    /// Max distinct peers the rate limiter tracks (its own memory bound; beyond it new peers share a
+    /// shared overflow bucket). Default 4096.
+    pub ingress_max_tracked_peers: usize,
+    /// Override the max accepted length-framed frame size (bytes), rejected before allocation.
+    /// `None` = the shared `MAX_FRAME_BYTES` (640 MiB) default.
+    pub ingress_max_frame_bytes: Option<usize>,
+    /// Override the max decoded payload size (bytes). `None` = the shared `MAX_FRAME_BYTES` default
+    /// (≥ the 256 MiB blob ceiling, so no in-spec blob is newly rejected).
+    pub ingress_max_decoded_bytes: Option<usize>,
+}
+
+impl ApiConfig {
+    /// Build the [`daemon_common::IngressLimits`] policy from the configured `[api]` knobs, filling
+    /// unset frame/decoded overrides from the secure defaults. `0` connections / burst disables that
+    /// specific cap (explicit opt-out).
+    pub fn ingress_limits(&self) -> daemon_common::IngressLimits {
+        let d = daemon_common::IngressLimits::default();
+        daemon_common::IngressLimits {
+            max_frame_bytes: self.ingress_max_frame_bytes.unwrap_or(d.max_frame_bytes),
+            max_decoded_bytes: self
+                .ingress_max_decoded_bytes
+                .unwrap_or(d.max_decoded_bytes),
+            max_connections: (self.ingress_max_connections != 0)
+                .then_some(self.ingress_max_connections),
+            peer_conn_rate: (self.ingress_peer_burst > 0.0
+                && self.ingress_peer_rate_per_sec >= 0.0)
+                .then_some(daemon_common::RateSpec {
+                    burst: self.ingress_peer_burst,
+                    refill_per_sec: self.ingress_peer_rate_per_sec,
+                }),
+            max_tracked_peers: self.ingress_max_tracked_peers,
+        }
+    }
 }
 
 impl Default for ApiConfig {
@@ -798,6 +851,13 @@ impl Default for ApiConfig {
             ws_allowed_origins: Vec::new(),
             auth_db: None,
             local_trust: Some("system".to_string()),
+            // Cluster F secure-by-default ingress governor (mirrors `IngressLimits::default`).
+            ingress_max_connections: 1024,
+            ingress_peer_burst: 256.0,
+            ingress_peer_rate_per_sec: 128.0,
+            ingress_max_tracked_peers: 4096,
+            ingress_max_frame_bytes: None,
+            ingress_max_decoded_bytes: None,
         }
     }
 }

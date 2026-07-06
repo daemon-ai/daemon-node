@@ -483,6 +483,12 @@ pub enum ApiRequest {
         request_id: String,
         /// The operator's decision (allow / deny).
         allow: bool,
+        /// "Allow permanently" (Cluster B): when allowing, also remember the approved command's
+        /// fingerprint on the session allow-list so an identical in-session re-request auto-approves.
+        /// Honored only where the parked approval carries a fingerprint (the durable inbox offers it
+        /// when `ApprovalInfo.fingerprint` is set); otherwise it degrades to a single allow. Additive.
+        #[serde(default)]
+        allow_permanent: bool,
     },
     /// [`ControlApi::checkpoints`].
     CheckpointList {
@@ -1415,6 +1421,20 @@ pub fn is_streaming(req: &ApiRequest) -> bool {
         req,
         ApiRequest::Subscribe { .. } | ApiRequest::EventsSince { .. }
     )
+}
+
+impl ApiRequest {
+    /// The size, in bytes, of any inline byte payload this decoded request carries — used by the
+    /// Cluster-F ingress governor's post-decode ("max decoded size") check. O(1): it reads the
+    /// length of a `Vec<u8>` already decoded in place, never re-encoding or re-allocating. Only
+    /// [`ApiRequest::BlobPut`] carries inline bytes today (a `serde_bytes` byte string); every other
+    /// variant carries no bulk inline payload and returns `0`.
+    pub fn ingress_payload_len(&self) -> usize {
+        match self {
+            ApiRequest::BlobPut { bytes } => bytes.len(),
+            _ => 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -642,6 +642,12 @@ pub enum HostRequestKind {
     Approval {
         /// What is being approved.
         prompt: String,
+        /// Whether the node offers a durable per-session "allow permanently" for this ask — set only
+        /// where a command fingerprint exists to key the per-session allow-list on (a command
+        /// surface). The app renders the "Allow permanently" control ONLY when this is `true`; fs
+        /// edits / non-command asks never offer it. Additive (`#[serde(default)]`).
+        #[serde(default)]
+        allow_permanent_offered: bool,
     },
     /// Ask the host for free-form input.
     Input {
@@ -712,8 +718,18 @@ pub struct HostResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HostResponseBody {
-    /// Approval decision.
-    Approved(bool),
+    /// Approval decision. `allow_permanent` (additive, `#[serde(default)]`) carries the operator's
+    /// "Allow permanently" choice on the inline live path: when `approved` and the node offered it,
+    /// the engine remembers the approved command's fingerprint for the rest of the session (a
+    /// least-privilege per-command allow-list, never a blanket approval-mode flip). Ignored unless a
+    /// fingerprint exists to key on — it then degrades to a single allow.
+    Approved {
+        /// Whether the action is approved.
+        approved: bool,
+        /// The operator chose "Allow permanently" (see the variant docs).
+        #[serde(default)]
+        allow_permanent: bool,
+    },
     /// Free-form input result.
     Input(String),
     /// The index of the chosen option.
@@ -815,6 +831,49 @@ impl From<String> for TransportId {
     }
 }
 
+/// An **immutable, platform-assigned sender identity** — a Matrix MXID (`@user:hs`), a Telegram user
+/// id, etc. NEVER a display name or any user/operator-mutable text.
+///
+/// Sender allow-listing (the ingest `SenderPolicy`) and attribution key on this, so it must be the
+/// stable identifier the platform guarantees, **supplied by the adapter** — never re-derived from a
+/// message body or display text (the OpenClaw display-name `allowFrom` substrate). It is deliberately
+/// off the wire in this iteration (enforced at the ingest boundary via `Reception`); carrying it onto
+/// `Origin`/the log is a separate follow-on.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SenderId(pub String);
+
+impl SenderId {
+    /// Construct a sender id from its stable, immutable platform identifier.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The sender id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The reserved identity for a node-internal **loopback** origin that has no external sender
+    /// (e.g. a Rooms operator post). A typed, documented constant so no ingest path re-derives a
+    /// sender from free text — the whole point of the newtype.
+    pub fn local_loopback() -> Self {
+        Self("local:loopback".to_string())
+    }
+}
+
+impl From<&str> for SenderId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for SenderId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// The conversational scope an inbound item belongs to — the single input (with the transport) to
 /// deterministic session-id derivation, and the per-event attribution carried on the log. This is
 /// the daemon analogue of hermes's `build_session_key` input, but carried explicitly (never via
@@ -856,14 +915,23 @@ pub struct Origin {
     pub transport: TransportId,
     /// The conversational scope (drives session-id derivation + attribution).
     pub scope: OriginScope,
+    /// The immutable, platform-assigned sender identity (wire v28), carried ONWARD from the ingest
+    /// boundary ([`crate`]'s `Reception::sender`, enforced there) for downstream per-event
+    /// attribution on the log/journal. **Never** an input to [`session_id_for`] — group sessions stay
+    /// shared across senders. `None` on host-internal origins, on pre-v28 encodings
+    /// (`#[serde(default)]`), and until an ingest path stamps it.
+    #[serde(default)]
+    pub sender: Option<SenderId>,
 }
 
 impl Origin {
-    /// Construct an origin from a transport and a scope.
+    /// Construct an origin from a transport and a scope (no sender; stamp one with
+    /// [`Origin::with_sender`] when a source identity is known).
     pub fn new(transport: impl Into<TransportId>, scope: OriginScope) -> Self {
         Self {
             transport: transport.into(),
             scope,
+            sender: None,
         }
     }
 
@@ -872,7 +940,15 @@ impl Origin {
         Self {
             transport: transport.into(),
             scope: OriginScope::Internal,
+            sender: None,
         }
+    }
+
+    /// Attach the immutable [`SenderId`] carried from ingest (builder form), for downstream
+    /// attribution. Does not affect [`session_id_for`].
+    pub fn with_sender(mut self, sender: SenderId) -> Self {
+        self.sender = Some(sender);
+        self
     }
 }
 
@@ -1753,6 +1829,37 @@ mod tests {
             session_id_for(&origin, IsolationPolicy::Shared).as_str(),
             "schedule:internal",
         );
+    }
+
+    // wire v28: a populated `Origin.sender` is attribution metadata only — it must NOT change the
+    // derived session id under ANY policy (in particular, a group scope stays one shared conversation
+    // regardless of who sent the message).
+    #[test]
+    fn session_id_for_ignores_sender() {
+        let group = || OriginScope::Group {
+            chat: "c1".into(),
+            thread: None,
+        };
+        let base = Origin::new("matrix", group());
+        let with_a = Origin::new("matrix", group()).with_sender(SenderId::new("@alice:hs"));
+        let with_b = Origin::new("matrix", group()).with_sender(SenderId::new("@bob:hs"));
+        for policy in [
+            IsolationPolicy::PerUser,
+            IsolationPolicy::PerChat,
+            IsolationPolicy::PerThread,
+            IsolationPolicy::Shared,
+        ] {
+            assert_eq!(
+                session_id_for(&base, policy),
+                session_id_for(&with_a, policy),
+                "sender must not perturb derivation ({policy:?})",
+            );
+            assert_eq!(
+                session_id_for(&with_a, policy),
+                session_id_for(&with_b, policy),
+                "distinct senders in one group derive the same id ({policy:?})",
+            );
+        }
     }
 
     #[test]

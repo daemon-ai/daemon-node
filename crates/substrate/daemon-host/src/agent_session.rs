@@ -400,7 +400,10 @@ impl HostRequestHandler for ManageToHost {
             let body = if is_delegate {
                 HostResponseBody::Delegated(JobId::new("undelegated"))
             } else {
-                HostResponseBody::Approved(false)
+                HostResponseBody::Approved {
+                    approved: false,
+                    allow_permanent: false,
+                }
             };
             return HostResponse { request_id, body };
         };
@@ -416,7 +419,9 @@ impl HostRequestHandler for ManageToHost {
 
 fn map_request_kind(kind: HostRequestKind) -> ManageRequestKind {
     match kind {
-        HostRequestKind::Approval { prompt } => ManageRequestKind::Approval(ApprovalReq { prompt }),
+        HostRequestKind::Approval { prompt, .. } => {
+            ManageRequestKind::Approval(ApprovalReq { prompt })
+        }
         HostRequestKind::Input { prompt } => ManageRequestKind::Input(InputReq { prompt }),
         HostRequestKind::Choice { prompt, options } => {
             ManageRequestKind::Choice(ChoiceReq { prompt, options })
@@ -436,7 +441,10 @@ fn map_request_kind(kind: HostRequestKind) -> ManageRequestKind {
 
 fn map_response_body(body: ManageResponseBody, is_delegate: bool) -> HostResponseBody {
     match body {
-        ManageResponseBody::Approved(ok) => HostResponseBody::Approved(ok),
+        ManageResponseBody::Approved(ok) => HostResponseBody::Approved {
+            approved: ok,
+            allow_permanent: false,
+        },
         ManageResponseBody::Input(text) => HostResponseBody::Input(text),
         ManageResponseBody::Chosen(index) => HostResponseBody::Chosen(index),
         ManageResponseBody::Delegated(units) => HostResponseBody::Delegated(
@@ -446,6 +454,9 @@ fn map_response_body(body: ManageResponseBody, is_delegate: bool) -> HostRespons
                 .unwrap_or_else(|| JobId::new("delegated")),
         ),
         _ if is_delegate => HostResponseBody::Delegated(JobId::new("delegated")),
-        _ => HostResponseBody::Approved(false),
+        _ => HostResponseBody::Approved {
+            approved: false,
+            allow_permanent: false,
+        },
     }
 }

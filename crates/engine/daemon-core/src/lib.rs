@@ -20,6 +20,9 @@
 //! See `crates/engine/daemon-core/docs/` for the engine spec family.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production. (The
+// ContainedRoot module + exec spawn sites carry their own tight production anchors.)
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 pub mod actor;
 pub mod approval;
@@ -71,7 +74,10 @@ pub use engine::{
     APPROVAL_SUSPEND_PAYLOAD,
 };
 pub use events::{EventSink, SessionLog};
-pub use exec::{contain, Command, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment};
+pub use exec::{
+    contain, resolve_program_abs, ChildCwd, Command, CommandFingerprint, ContainedRoot,
+    DirEntryLite, ExecCx, ExecResult, ExecutionEnvironment, LocalEnvironment, Meta,
+};
 #[cfg(feature = "otel")]
 pub use genai_telemetry::set_genai_capture;
 pub use memory::{
@@ -91,11 +97,11 @@ pub use repair::{
     repair_tool_args, repair_tool_call, repair_tool_name, sanitize_tool_error, scrub_content,
     wrap_untrusted_tool_result, ArgRepair, NameRepairError, ScrubChunk, StreamingThinkScrubber,
 };
-pub use safety::{check_url, CheckedUrl, UrlReject};
+pub use safety::{check_url, check_url_resolved, check_url_resolved_with, CheckedUrl, UrlReject};
 pub use snapshot::{PendingApproval, ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;
 pub use tools::{
     DelegateTool, Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError,
     ToolRegistry,
 };
-pub use turn::{approve_command, approve_path, Effect, Gate, TurnCx};
+pub use turn::{approve_command, approve_path, approve_shell_command, Effect, Gate, TurnCx};

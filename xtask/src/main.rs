@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: xtask is dev/build tooling (codegen, CI helpers) run by maintainers, not a runtime
+// security surface. Its fs (build artifacts) and spawns (cbindgen/cc/bash build steps) are
+// developer-controlled; the hardening bans target the shipped node, so xtask is allowed crate-wide.
+#![allow(clippy::disallowed_methods)]
+
 //! `xtask` — repo automation (codegen, CI helpers).
 //!
 //! Subcommands:
@@ -301,6 +306,18 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiRequest::SessionCreate {
             session: Some(SessionId::new("fixture-session")),
             profile: Some(ProfileRef::new("default")),
+        },
+    )?;
+    // Cluster B / allow_permanent: a committed fixture exercising the additive optional field at v28,
+    // so the CDDL↔Rust agreement on `request-approval-decide` is proven on a real ciborium payload.
+    write_cbor(
+        &out,
+        "request-approval-decide.cbor",
+        &ApiRequest::ApprovalDecide {
+            session: SessionId::new("fixture-session"),
+            request_id: "fixture-request".into(),
+            allow: true,
+            allow_permanent: true,
         },
     )?;
     write_cbor(
@@ -829,6 +846,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 file_type: Some("Q4_K_M".into()),
                 // The paired vision-projector companion (wire v27); null for text-only models.
                 mmproj_path: Some("/cache/models/mmproj-SmolLM2-135M-Instruct-Q8_0.gguf".into()),
+                // The node-local pinned artifact hash surfaced for display (wire v28).
+                sha256: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                ),
             }]),
         )?;
         write_cbor(

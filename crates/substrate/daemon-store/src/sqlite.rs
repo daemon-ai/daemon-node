@@ -322,6 +322,11 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              );\n\
              ALTER TABLE job_outbox ADD COLUMN child TEXT;",
         ),
+        // M6 (wire v28 — exec-approval fingerprint): the durable mirror of the engine's
+        // `PendingApproval.fingerprint` (lowercase-hex sha256 of the resolved command tuple), so the
+        // operator surface can display it structurally. NULL on legacy rows and non-command
+        // approvals. Display-only — enforcement stays on the engine's typed fingerprint.
+        M::up("ALTER TABLE pending_approvals ADD COLUMN fingerprint TEXT;"),
     ])
 });
 
@@ -969,14 +974,15 @@ impl SessionStore for SqliteStore {
             // Dedupe a re-parked row on deterministic recovery (UNIQUE(session_id, job_id)).
             tx.execute(
                 "INSERT OR IGNORE INTO pending_approvals \
-                 (session_id, job_id, epoch, prompt, path, decision) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                 (session_id, job_id, epoch, prompt, path, fingerprint, decision) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
                 params![
                     approval.session_id.as_str(),
                     approval.job_id.as_str(),
                     approval.epoch.0 as i64,
                     approval.prompt,
                     approval.path,
+                    approval.fingerprint,
                 ],
             )
             .map_err(sql_err)?;
@@ -991,6 +997,7 @@ impl SessionStore for SqliteStore {
         session: &SessionId,
         job_id: &JobId,
         allow: bool,
+        allow_permanent: bool,
     ) -> Result<bool, StoreError> {
         // Stamp the decision, record the completion, and publish the wake in one transaction.
         let mut conn = self.conn.lock().unwrap();
@@ -1014,7 +1021,14 @@ impl SessionStore for SqliteStore {
             params![session.as_str(), job_id.as_str(), allow as i64],
         )
         .map_err(sql_err)?;
-        let payload: &[u8] = if allow { b"allow" } else { b"deny" };
+        // `allow_permanent` still starts with "allow" (the engine's allow/deny split is unchanged);
+        // `resolve_approvals` reads the exact string to record the verified fingerprint on the session
+        // allow-list. The `decision` column stays a bool (`allow`) — permanence rides only the payload.
+        let payload: &[u8] = match (allow, allow_permanent) {
+            (true, true) => b"allow_permanent",
+            (true, false) => b"allow",
+            (false, _) => b"deny",
+        };
         let fresh = tx
             .execute(
                 "INSERT OR IGNORE INTO completion_inbox (session_id, epoch, job_id, payload) \
@@ -1047,13 +1061,14 @@ impl SessionStore for SqliteStore {
                 epoch: Epoch(r.get::<_, i64>(2)? as u64),
                 prompt: r.get::<_, String>(3)?,
                 path: r.get::<_, Option<String>>(4)?,
+                fingerprint: r.get::<_, Option<String>>(5)?,
                 decision: None,
             })
         };
         match session {
             Some(id) => {
                 let mut stmt = match conn.prepare(
-                    "SELECT session_id, job_id, epoch, prompt, path FROM pending_approvals \
+                    "SELECT session_id, job_id, epoch, prompt, path, fingerprint FROM pending_approvals \
                      WHERE session_id = ?1 AND decision IS NULL ORDER BY rowseq",
                 ) {
                     Ok(s) => s,
@@ -1065,7 +1080,7 @@ impl SessionStore for SqliteStore {
             }
             None => {
                 let mut stmt = match conn.prepare(
-                    "SELECT session_id, job_id, epoch, prompt, path FROM pending_approvals \
+                    "SELECT session_id, job_id, epoch, prompt, path, fingerprint FROM pending_approvals \
                      WHERE decision IS NULL ORDER BY rowseq",
                 ) {
                     Ok(s) => s,
@@ -2081,8 +2096,9 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (5: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
-    /// terminal clock, and the detached-delegation completion-notice seam).
+    /// `user_version` (6: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// terminal clock, the detached-delegation completion-notice seam, and the wire-v28
+    /// pending-approval fingerprint column).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2093,7 +2109,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 6, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

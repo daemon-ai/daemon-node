@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["process"] }
 daemon-protocol = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -17,9 +17,22 @@ ciborium = { workspace = true }
 futures = { workspace = true }
 strsim = { workspace = true }
 serde_json = { workspace = true }
+# UTS#46 IDNA/punycode normalization for the `check_url` egress guard (safety/url.rs).
+idna = { workspace = true }
+# Command-fingerprint hashing (Cluster B exec-approval): SHA-256 over the resolved command tuple so an
+# approval decision is bound to what will actually run (the approve-then-swap TOCTOU gate).
+sha2 = { workspace = true }
 # best-effort observability for the §12 checkpoint stage (capture/restore failures never fail a turn,
 # so they are logged rather than propagated). The only logging dep in the otherwise log-free core.
 tracing = { workspace = true }
+
+# The Phase 3 `ContainedRoot` capability (Cluster C, `exec::contained`): `openat2`
+# (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | NO_MAGICLINKS) on Linux + the `openat`/`fstatat`/
+# `mkdirat`/`unlinkat`/`renameat` family for the cross-unix fd-relative fallback. rustix's public API
+# is safe, so `#![forbid(unsafe_code)]` (lib.rs) is preserved — no `unsafe` is written here. Unix-only;
+# the non-unix build uses the lexical `contain()` + `symlink_metadata` stub and never links rustix.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [features]
 # OFF by default. Gates recording the OpenTelemetry GenAI attributes (incl. full prompt/completion/

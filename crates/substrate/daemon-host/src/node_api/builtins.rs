@@ -186,7 +186,8 @@ impl NodeApiImpl {
             )));
         }
         let session = require_session(invocation, "approval")?;
-        self.approval_decide(session, args.to_string(), allow)
+        // The `/approve` builtin is a single allow — permanence is a GUI affordance, not a text command.
+        self.approval_decide(session, args.to_string(), allow, false)
             .await?;
         Ok(CommandOutput {
             text: format!(

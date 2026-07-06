@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: integration test crate; raw fs/reqwest/Command are expected in tests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! `semantic_search` tool coverage over a real [`WorkspaceIndex`] (MockEmbedder-backed): the
 //! unready message, ranked `path:span` output, the `num_results` clamp, `target_directories`
@@ -81,6 +83,7 @@ async fn run_tool(index: Arc<WorkspaceIndex>, cwd: &Path, args: &str) -> (bool, 
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),

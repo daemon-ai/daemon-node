@@ -11,7 +11,8 @@ process = []
 container = []
 
 [dependencies]
-daemon-common = { workspace = true }
+# `process` gives `EnvPolicy::apply`, the sanctioned child-env application at `spawn_framed`.
+daemon-common = { workspace = true, features = ["process"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

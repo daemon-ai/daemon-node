@@ -7,6 +7,9 @@ use super::harness::*;
 /// `unit_events` and the lifecycle ops agree in-process and over the socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tree_surface_is_transport_agnostic() {
+    as_system(tree_surface_is_transport_agnostic_impl()).await;
+}
+async fn tree_surface_is_transport_agnostic_impl() {
     use daemon_api::ApiError;
 
     let (node, handle) = assemble();
@@ -166,6 +169,9 @@ async fn tree_surface_is_transport_agnostic() {
 /// scoped roster is byte-identical in-process and over the socket (live+durable parity).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roster_top_level_excludes_managed_children_across_transports() {
+    as_system(roster_top_level_excludes_managed_children_across_transports_impl()).await;
+}
+async fn roster_top_level_excludes_managed_children_across_transports_impl() {
     use daemon_api::{SessionQuery, SessionRole, SessionScope};
 
     let (node, handle) = assemble();
@@ -277,6 +283,9 @@ async fn roster_top_level_excludes_managed_children_across_transports() {
 /// well-defined even when activity timestamps collide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roster_pagination_cursor_is_total() {
+    as_system(roster_pagination_cursor_is_total_impl()).await;
+}
+async fn roster_pagination_cursor_is_total_impl() {
     use daemon_api::{SessionApi, SessionQuery, SessionScope};
     use daemon_protocol::{AgentCommand, UserMsg};
 
@@ -467,6 +476,9 @@ async fn tree_pages_beyond_the_wire_bound() {
 /// `SessionsByProfile` wire op (v25): loop the scoped pages per profile and group locally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roster_by_profile_scope_composes_the_per_agent_grouping() {
+    as_system(roster_by_profile_scope_composes_the_per_agent_grouping_impl()).await;
+}
+async fn roster_by_profile_scope_composes_the_per_agent_grouping_impl() {
     use daemon_api::{ControlApi, SessionApi, SessionQuery, SessionScope};
     use daemon_common::ProfileRef;
     use daemon_protocol::{AgentCommand, UserMsg};
@@ -530,6 +542,9 @@ async fn roster_by_profile_scope_composes_the_per_agent_grouping() {
 /// node's rev (the daemon-restart case, in-memory index reset) falls back to a full page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roster_delta_since_rev_returns_changed_and_falls_back_to_full() {
+    as_system(roster_delta_since_rev_returns_changed_and_falls_back_to_full_impl()).await;
+}
+async fn roster_delta_since_rev_returns_changed_and_falls_back_to_full_impl() {
     use daemon_api::{ControlApi, SessionApi, SessionMetaPatch, SessionQuery, SessionScope};
     use daemon_protocol::{AgentCommand, UserMsg};
 
@@ -668,6 +683,9 @@ async fn roster_delta_since_rev_returns_changed_and_falls_back_to_full() {
 /// (c) `include_ephemeral=false` still delivers the (non-ephemeral) managed-child delta.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tree_subscribe_pushes_delegation_spawn_promptly() {
+    as_system(tree_subscribe_pushes_delegation_spawn_promptly_impl()).await;
+}
+async fn tree_subscribe_pushes_delegation_spawn_promptly_impl() {
     use daemon_api::{ControlApi, TreeEvent, TreeSubFilter};
     use futures::StreamExt;
 
@@ -736,6 +754,9 @@ async fn tree_subscribe_pushes_delegation_spawn_promptly() {
 /// history) is byte-identical in-process and over the socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_tree_projection_is_recursive_and_transport_agnostic() {
+    as_system(nested_tree_projection_is_recursive_and_transport_agnostic_impl()).await;
+}
+async fn nested_tree_projection_is_recursive_and_transport_agnostic_impl() {
     let (node, handle) = assemble_nested(1);
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);
@@ -958,6 +979,9 @@ async fn nested_tree_projection_is_recursive_and_transport_agnostic() {
 /// because every level is a parent-bound durable session driven by the one shared outbox +
 /// recovery scanner. Asserted against both store backends (`InMemoryStore`, `SqliteStore`).
 async fn nested_delegation_recovers_after_restart(store: Arc<dyn SessionStore>) {
+    as_system(nested_delegation_recovers_after_restart_impl(store)).await;
+}
+async fn nested_delegation_recovers_after_restart_impl(store: Arc<dyn SessionStore>) {
     let session = SessionId::new("rec-op");
 
     // Node A: a stalled cadence so its resident services never advance the delegation after the

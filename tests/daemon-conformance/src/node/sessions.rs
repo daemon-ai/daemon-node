@@ -5,6 +5,10 @@ use super::harness::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_surface_is_transport_agnostic_and_drives_a_session_to_completion() {
+    as_system(control_surface_is_transport_agnostic_and_drives_a_session_to_completion_impl())
+        .await;
+}
+async fn control_surface_is_transport_agnostic_and_drives_a_session_to_completion_impl() {
     let (node, handle) = assemble();
 
     // Serve the same surface over a Unix socket.
@@ -115,6 +119,9 @@ fn sorted_names(h: &daemon_api::HealthReport) -> Vec<String> {
 /// patch op round-trips over the socket (`ApiResponse::Ok`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_meta_rename_pin_archive_round_trip() {
+    as_system(session_meta_rename_pin_archive_round_trip_impl()).await;
+}
+async fn session_meta_rename_pin_archive_round_trip_impl() {
     use daemon_api::{SessionApi, SessionMetaPatch, SessionQuery, SessionScope};
     use daemon_protocol::{AgentCommand, UserMsg};
 
@@ -128,13 +135,13 @@ async fn session_meta_rename_pin_archive_round_trip() {
     // Three live top-level conversations (opened oldest-first so activity order is a, b, c).
     let ids: Vec<SessionId> = (0..3).map(|n| SessionId::new(format!("act-{n}"))).collect();
     for id in &ids {
-        node.submit(
+        as_system(node.submit(
             id.clone(),
             AgentCommand::StartTurn {
                 input: UserMsg::new("hi"),
                 request_id: daemon_common::ReqId(1),
             },
-        )
+        ))
         .await
         .expect("submit opens a live session");
     }
@@ -224,6 +231,9 @@ async fn session_meta_rename_pin_archive_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_surface_runs_an_interactive_turn_to_finished() {
+    as_system(session_surface_runs_an_interactive_turn_to_finished_impl()).await;
+}
+async fn session_surface_runs_an_interactive_turn_to_finished_impl() {
     use daemon_api::{Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{AgentCommand, AgentEvent, UserMsg};
@@ -453,6 +463,9 @@ async fn phase0_gui_readiness_demo_gate() {
 /// profile's default — proving the override survives a (live) respawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_overlay_persists_and_restores_on_respawn() {
+    as_system(session_overlay_persists_and_restores_on_respawn_impl()).await;
+}
+async fn session_overlay_persists_and_restores_on_respawn_impl() {
     use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_common::ReqId;
     use daemon_host::{
@@ -624,6 +637,9 @@ async fn session_overlay_persists_and_restores_on_respawn() {
 /// with the in-process transport (the phase-9 control-surface parity gate).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_snapshot_interrupt_drive_over_socket_with_parity() {
+    as_system(steer_snapshot_interrupt_drive_over_socket_with_parity_impl()).await;
+}
+async fn steer_snapshot_interrupt_drive_over_socket_with_parity_impl() {
     use daemon_api::{Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{AgentCommand, AgentEvent, ConvView, UserMsg};

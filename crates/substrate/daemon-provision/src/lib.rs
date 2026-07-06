@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use daemon_common::env_policy::EnvPolicy;
 use daemon_common::SessionId;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -292,6 +293,8 @@ impl ProcessProvisioner {
     async fn spawn_framed(spec: PlacementSpec, framing: Framing) -> Result<Placement, ProvErr> {
         use std::process::Stdio;
 
+        // Spawns a trusted node worker program (provisioner placement, argv-only, no shell).
+        #[allow(clippy::disallowed_methods)]
         let mut command = tokio::process::Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -299,9 +302,11 @@ impl ProcessProvisioner {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        for (key, value) in &spec.env {
-            command.env(key, value);
-        }
+        // Declared env policy (Cluster E): `InheritFull` — a placed worker is a trusted node
+        // component (a cut of the daemon itself) that needs the daemon's ambient environment
+        // (provider keys, PATH, locale) by design. `spec.env` extras layer on top exactly as
+        // before; only the *declaration* is new.
+        EnvPolicy::InheritFull.apply(&mut command, &spec.env);
 
         let mut child = command.spawn().map_err(|e| ProvErr::Spawn(e.to_string()))?;
         let stdin = child
@@ -331,9 +336,11 @@ impl Provisioner for ProcessProvisioner {
         spec: WorkspaceSpec,
     ) -> Result<WorkspaceRoot, ProvErr> {
         let root = spec.root.join(id.as_str());
-        tokio::fs::create_dir_all(&root)
-            .await
-            .map_err(|e| ProvErr::Workspace(e.to_string()))?;
+        // Creates the per-session workspace root under the daemon-configured workspace root (the id
+        // is a sanitized SessionId); not attacker-influenced.
+        #[allow(clippy::disallowed_methods)]
+        let mk = tokio::fs::create_dir_all(&root).await;
+        mk.map_err(|e| ProvErr::Workspace(e.to_string()))?;
         Ok(WorkspaceRoot(root))
     }
 

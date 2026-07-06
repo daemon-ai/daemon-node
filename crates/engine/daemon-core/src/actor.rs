@@ -37,6 +37,7 @@ fn local_origin() -> Origin {
     Origin {
         transport: TransportId::new("local"),
         scope: OriginScope::Internal,
+        sender: None,
     }
 }
 
@@ -396,6 +397,7 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
         let self_origin = Origin {
             transport: TransportId::new("engine"),
             scope: OriginScope::Internal,
+            sender: None,
         };
         let sink = SessionLog::with_log(
             self_origin,
@@ -612,7 +614,10 @@ mod tests {
         async fn request(&self, req: HostRequest) -> HostResponse {
             HostResponse {
                 request_id: req.request_id,
-                body: HostResponseBody::Approved(true),
+                body: HostResponseBody::Approved {
+                    approved: true,
+                    allow_permanent: false,
+                },
             }
         }
     }

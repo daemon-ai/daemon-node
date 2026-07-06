@@ -21,6 +21,9 @@
 //!   reserved extension (`resource_grants`).
 
 #![forbid(unsafe_code)]
+// Phase 4: auth fs is daemon-internal (identity store dir under the node data root), not
+// attacker-influenced; raw fs allowed crate-wide. No process spawns in this crate.
+#![allow(clippy::disallowed_methods)]
 
 pub mod bootstrap;
 pub mod capability;
@@ -29,7 +32,10 @@ pub mod scram;
 pub mod store;
 
 pub use bootstrap::{AdminSeed, SeededAdmin};
-pub use capability::{Capability, Principal, Role};
+pub use capability::{
+    is_reserved_username, Capability, Principal, Role, INTERNAL_USERNAME, RESERVED_USERNAMES,
+    SYSTEM_USERNAME,
+};
 pub use error::{Error, Result};
 pub use scram::{ScramMaterial, SCRAM_DEFAULT_ITERATIONS, SCRAM_SHA_256};
 pub use store::{generate_secret_hex, AuthStore, UserRecord, DEFAULT_SESSION_TTL_SECS};

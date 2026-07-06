@@ -19,6 +19,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # CBOR (de)serialization of a portable skill bundle (the snapshot blob + distribution payload).
 ciborium = { workspace = true }
+# Optional skill-bundle signing (wire v28, default-off): the same in-tree ed25519 / Gordian Envelope
+# stack used by daemon-credentials capability leases — bc-envelope for the deterministic digest,
+# bc-components for the ed25519 key + Signature. Already vetted in-tree (no new crate in the graph).
+bc-components = { workspace = true }
+bc-envelope = { workspace = true }
 # Embeds the curated bundled-skills tree (`bundled/`) into the binary so a deployed daemon can seed
 # the profile's skills dir with no repo/filesystem dependency (parity with hermes' wheel-data bundle).
 include_dir = "0.7"

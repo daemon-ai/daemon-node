@@ -11,9 +11,9 @@ impl SessionApi for NodeApiImpl {
         // Auth 4: own-or-`SessionControlAny`. An `Absent` (brand-new) session passes here, then
         // `note_activity` stamps the caller as owner — checked BEFORE `note_activity` so a foreign
         // caller never mutates last-activity / the FTS index.
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
-        self.live.submit(session, command).await
+        self.live.submit(&auth, command).await
     }
 
     async fn submit_from(
@@ -23,9 +23,9 @@ impl SessionApi for NodeApiImpl {
         command: AgentCommand,
     ) -> Result<(), ApiError> {
         self.claim(&session, Lifecycle::Live)?;
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
-        self.live.submit_from(session, origin, command).await
+        self.live.submit_from(&auth, origin, command).await
     }
 
     async fn session_create(
@@ -90,7 +90,7 @@ impl SessionApi for NodeApiImpl {
             profile,
         } = args;
         self.claim(&session, Lifecycle::Live)?;
-        self.require_session_access(&session, true).await?;
+        let auth = self.require_session_access(&session, true).await?;
         // Bind the explicit profile sticky-on-first-open (the same `ensure` seam `submit_routed`
         // uses), so a GUI can "open this chat as agent X" before the first turn submits.
         if profile.is_some() {
@@ -98,8 +98,8 @@ impl SessionApi for NodeApiImpl {
         }
         self.note_activity(&session, &command).await;
         match origin {
-            Some(origin) => self.live.submit_from(session, origin, command).await,
-            None => self.live.submit(session, command).await,
+            Some(origin) => self.live.submit_from(&auth, origin, command).await,
+            None => self.live.submit(&auth, command).await,
         }
     }
 
@@ -115,7 +115,7 @@ impl SessionApi for NodeApiImpl {
         self.claim(&resolved.session, Lifecycle::Live)?;
         // Auth 4: own-or-`SessionControlAny` on the resolved session (new sessions pass and are
         // stamped by `note_activity`).
-        self.require_session_access(&resolved.session, true).await?;
+        let auth = self.require_session_access(&resolved.session, true).await?;
         // For session-opening commands, bind the resolved profile (sticky on first `ensure`) and seed
         // the resolved `Primary` before submitting, so routing owns agent-selection + delivery. Other
         // commands act on an already-open session whose profile/Primary were bound when it opened.
@@ -132,21 +132,19 @@ impl SessionApi for NodeApiImpl {
                 .seed_primary_target(&resolved.session, resolved.delivery.clone());
         }
         self.note_activity(&resolved.session, &command).await;
-        self.live
-            .submit_from(resolved.session.clone(), origin, command)
-            .await?;
+        self.live.submit_from(&auth, origin, command).await?;
         Ok(resolved.session)
     }
 
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
         // Auth 4: own-or-`SessionControlAny` (the task's named control ops include `poll`).
-        self.require_session_access(&session, true).await?;
-        self.live.poll(&session, max)
+        let auth = self.require_session_access(&session, true).await?;
+        self.live.poll(&auth, max)
     }
 
     async fn respond(&self, session: SessionId, response: HostResponse) -> Result<(), ApiError> {
-        self.require_session_access(&session, true).await?;
-        self.live.respond(&session, response)
+        let auth = self.require_session_access(&session, true).await?;
+        self.live.respond(&auth, response)
     }
 
     async fn session_history(
@@ -170,21 +168,38 @@ impl SessionApi for NodeApiImpl {
         after_seq: u64,
         max: u32,
     ) -> Result<LogPageView, ApiError> {
-        Ok(self.live.log_after(&session, after_seq, max))
+        // Auth 4: own-or-`SessionControlAny`. This is the one-shot / long-poll form of the live
+        // `Subscribe` op (the wire `Subscribe` `Call` routes here); it must enforce the SAME
+        // ownership check as the streaming `subscribe` below (both are `control = true`, so the
+        // `Call` and `Open` forms of one op deny identically). Previously unguarded — the gap that
+        // let a non-owner read another user's live transcript.
+        let auth = self.require_session_access(&session, true).await?;
+        Ok(self.live.log_after(&auth, after_seq, max))
     }
 
     async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
         // Auth 4: own-or-`SessionControlAny` (a live subscription is a session-interaction op).
-        self.require_session_access(&session, true).await?;
-        Ok(self.live.subscribe(&session, after_seq))
+        let auth = self.require_session_access(&session, true).await?;
+        Ok(self.live.subscribe(&auth, after_seq))
     }
 
     async fn log_epoch(&self, session: SessionId) -> u64 {
-        self.live.log_epoch(&session)
+        // Auth 4 (read-of-one, non-fallible): deny → 0. Not wire-reachable on its own (the mux pump
+        // reads it before `subscribe`, which now enforces ownership under the same bound principal),
+        // so this is defense-in-depth for any future caller.
+        let Ok(auth) = self.require_session_access(&session, false).await else {
+            return 0;
+        };
+        self.live.log_epoch(&auth)
     }
 
     async fn delivery_targets(&self, session: SessionId) -> Vec<DeliveryTarget> {
-        self.live.delivery_targets(&session)
+        // Auth 4 (read-of-one, non-fallible): a peer must not read another user's reply-routing —
+        // deny → empty (no existence oracle). Previously unguarded.
+        let Ok(auth) = self.require_session_access(&session, false).await else {
+            return Vec::new();
+        };
+        self.live.delivery_targets(&auth)
     }
 
     async fn delivery_sessions(
@@ -194,7 +209,20 @@ impl SessionApi for NodeApiImpl {
     ) -> daemon_api::WirePage<SessionId> {
         // The live registry is a DashMap scan with no stable order; sort by session id (the
         // cursor key) before slicing.
-        let mut sessions = self.live.delivery_sessions(&transport);
+        let sessions = self.live.delivery_sessions(&transport);
+        // Auth 4 (F4): a non-owner must not enumerate another owner's sessions on a shared transport
+        // (own sessions only unless SessionSeeAll) — per-row owner_visible, mirroring the roster /
+        // checkpoints filter. The internal delivery bridge (daemon-http `serve_delivery_scoped`) runs
+        // under a SessionSeeAll `system` scope, so it still discovers the transport's full owned set.
+        let principal = current_principal();
+        let mut visible = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            let owner = self.store.session_meta(&s).await.and_then(|m| m.owner);
+            if owner_visible(&principal, &owner) {
+                visible.push(s);
+            }
+        }
+        let mut sessions = visible;
         sessions.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         daemon_api::paginate(sessions, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |s| {
             s.as_str().to_string()
@@ -203,14 +231,14 @@ impl SessionApi for NodeApiImpl {
 
     async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
-        self.require_session_access(&session, true).await?;
-        self.live.handover(&session, target)
+        let auth = self.require_session_access(&session, true).await?;
+        self.live.handover(&auth, target)
     }
 
     async fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny` (writes into the session's live log).
-        self.require_session_access(&args.session, true).await?;
-        self.live.record_meta(args)
+        let auth = self.require_session_access(&args.session, true).await?;
+        self.live.record_meta(&auth, args)
     }
 
     async fn set_session_model(
@@ -244,6 +272,11 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
         self.require_session_access(&session, true).await?;
+        // Cluster E: widening a session's autonomy (`AcceptEdits`/`AutoAllow`) is operator-tier — a
+        // non-operator owner may narrow (`Ask`/`Deny`) but not widen its own approval posture.
+        if mode.widens_autonomy() {
+            self.require_operator("widening the session approval mode")?;
+        }
         // Persist the edit-approval override on the overlay, then switch the live actor's policy in
         // place when resident (the live ParkingHandler reads `session_modes` to auto-allow vs park).
         let overlay = self
@@ -264,6 +297,13 @@ impl SessionApi for NodeApiImpl {
     ) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
         self.require_session_access(&session, true).await?;
+        // Cluster E: the security-widening subset of an overlay (autonomy-widening approval mode, or
+        // `FullToolset`) is operator-tier; the rest (model/provider/workspace/`Allowlist`/`Ask`/
+        // `Deny`) stays owner-allowed. A non-operator owner cannot widen its own approval posture or
+        // tool surface through the unified overlay write.
+        if overlay.widens_security_posture() {
+            self.require_operator("widening the session approval mode or tool surface")?;
+        }
         // The unified per-session override write: persist the whole overlay, then apply what can be
         // hot-applied to a resident actor (model/provider/approval). A tool-allowlist change takes
         // effect on the next (re)hydration (the live registry is fixed for an actor's lifetime).

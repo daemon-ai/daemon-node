@@ -83,16 +83,25 @@ impl FleetJobWorker {
             return;
         }
         let parent_root = roots.session_root(parent.as_str());
-        let inbox = roots.session_root(child.as_str()).join("inbox");
-        if std::fs::create_dir_all(&inbox).is_err() {
+        let child_root = roots.session_root(child.as_str());
+        // Both roots are opened as fd-contained boundaries (openat2 RESOLVE_BENEATH |
+        // RESOLVE_NO_SYMLINKS): every attachment read/write below is symlink-escape-proof.
+        let (Ok(parent_cr), Ok(child_cr)) = (
+            daemon_core::exec::ContainedRoot::open(&parent_root),
+            daemon_core::exec::ContainedRoot::open(&child_root),
+        ) else {
+            return;
+        };
+        if child_cr
+            .create_dir_all(std::path::Path::new("inbox"))
+            .await
+            .is_err()
+        {
             return;
         }
         for path in paths {
-            let Ok(src) = daemon_core::exec::contain(&parent_root, std::path::Path::new(path))
-            else {
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(&src) else {
+            // The attachment path is agent-influenced (the parent's workspace); read it fd-contained.
+            let Ok(bytes) = parent_cr.read(std::path::Path::new(path)).await else {
                 continue;
             };
             let Ok(blob_ref) = blobs.put(&bytes).await else {
@@ -104,7 +113,9 @@ impl FleetJobWorker {
             let name = std::path::Path::new(path)
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("attachment"));
-            let _ = std::fs::write(inbox.join(name), out);
+            let _ = child_cr
+                .write(&std::path::Path::new("inbox").join(name), &out)
+                .await;
         }
     }
 

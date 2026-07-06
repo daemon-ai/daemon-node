@@ -35,12 +35,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daemon_api::{
     dispatch, ApiError, ApiRequest, ApiResponse, FsRootId, FsWatchAfterArgs, LogFilter,
-    LogLineStream, LogStream, NodeApi, SessionLogEntry, TreeStream, TreeSubFilter,
+    LogLineStream, LogStream, LogStreamItem, NodeApi, SessionLogEntry, TreeStream, TreeSubFilter,
 };
 use daemon_common::SessionId;
-use daemon_delivery::{serve_delivery, Projector};
+use daemon_delivery::Projector;
 use daemon_host::{authorize, with_request_context, RequestContext};
-use daemon_protocol::{AgentCommand, Origin, OriginScope, TransportId};
+use daemon_protocol::{AgentCommand, Origin, OriginScope, SinkKind, TransportId};
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
@@ -218,6 +218,83 @@ impl Projector for ChannelProjector {
     }
 }
 
+/// A set of per-session delivery tasks that abort on drop — the daemon-http-local equivalent of
+/// [`daemon_delivery::DeliverySubscription`]. It exists because each task must run inside a
+/// [`RequestContext::system`] scope so the (now ownership-gated) `subscribe` / `delivery_targets`
+/// calls see a bound principal; the shared [`daemon_delivery::serve_delivery`] spawns its tasks in
+/// the pure-contracts crate, which cannot set the host request-context task-local. Behavior mirrors
+/// `serve_delivery` (backfill from seq 0, project each entry, stop on handover demotion).
+// Phase-3 (capability tokens) can unify this back with `serve_delivery`.
+struct ScopedDelivery {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ScopedDelivery {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// The local-trust HTTP counterpart to [`daemon_delivery::serve_delivery`]: discover the sessions
+/// `transport` owns, subscribe each merged log, and forward entries to `projector` — every node call
+/// wrapped in a [`RequestContext::system`] scope (HTTP has no per-user identity yet). Each task stops
+/// once the transport is no longer the session's `Primary` (handover demotion), like `serve_delivery`.
+async fn serve_delivery_scoped(
+    api: Arc<dyn NodeApi>,
+    transport: TransportId,
+    projector: Arc<ChannelProjector>,
+) -> ScopedDelivery {
+    // Enumerate the full owned set (paginate the wire bound) under a system scope.
+    let sessions = with_request_context(RequestContext::system(), async {
+        let mut sessions = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = api.delivery_sessions(transport.clone(), after.take()).await;
+            sessions.extend(page.items);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        sessions
+    })
+    .await;
+    let mut tasks = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let api = api.clone();
+        let transport = transport.clone();
+        let projector = projector.clone();
+        tasks.push(tokio::spawn(with_request_context(
+            RequestContext::system(),
+            async move {
+                let mut stream = match api.subscribe(session.clone(), 0).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                while let Some(item) = stream.next().await {
+                    let entry = match item {
+                        LogStreamItem::Entry(e) => e,
+                        LogStreamItem::Lagged => continue,
+                    };
+                    // Handover stop: drop out once no longer the session's Primary sink.
+                    let still_primary = api
+                        .delivery_targets(session.clone())
+                        .await
+                        .iter()
+                        .any(|t| t.kind == SinkKind::Primary && t.transport == transport);
+                    if !still_primary {
+                        break;
+                    }
+                    projector.project(session.clone(), entry).await;
+                }
+            },
+        )));
+    }
+    ScopedDelivery { tasks }
+}
+
 /// `GET /tenants/{tenant}/delivery` — the reconnect-safe outbound pull path (§5.9.3). Uses
 /// [`serve_delivery`] to enumerate the `http/{tenant}` instance's owned sessions, subscribe each
 /// merged log, and multiplex them into a single SSE stream (one event per `(session, entry)`). The
@@ -230,7 +307,7 @@ async fn tenant_delivery_sse(
     let transport = TransportId::new(format!("http/{tenant}"));
     let (tx, rx) = mpsc::channel(256);
     let projector = Arc::new(ChannelProjector { tx });
-    let subscription = serve_delivery(state.api.clone(), transport, projector).await;
+    let subscription = serve_delivery_scoped(state.api.clone(), transport, projector).await;
     // Carry the subscription in the stream state so it is dropped (aborting the per-session tasks)
     // only when the SSE response is dropped — i.e. when the tenant disconnects.
     let events = futures::stream::unfold(
@@ -261,7 +338,14 @@ async fn log_after(
     Query(q): Query<CursorQuery>,
 ) -> Json<ApiResponse> {
     let session = SessionId::new(session);
-    match state.api.log_after(session, q.after_seq, q.max).await {
+    // Only mounted under local trust: dispatch inside a `system()` scope so the Auth 4 ownership
+    // check in `log_after` sees a bound (full-trust) principal instead of `None` (now deny). HTTP
+    // carries no per-user identity yet, so `system` is the honest identity for this transport.
+    let result = with_request_context(RequestContext::system(), async {
+        state.api.log_after(session, q.after_seq, q.max).await
+    })
+    .await;
+    match result {
         Ok(page) => Json(ApiResponse::LogPage(page)),
         Err(e) => Json(ApiResponse::Error(e)),
     }
@@ -317,13 +401,18 @@ async fn pump_ws(mut socket: WebSocket, state: AppState, session: String, after_
 }
 
 /// Open the merged-log push stream for a session, degrading to an empty stream on error (an unknown
-/// session, or a transport with no live log).
+/// session, a transport with no live log, or — after the Auth 4 flip — an ownership denial). The
+/// `subscribe` call runs inside a `system()` scope (local-trust HTTP has no per-user principal), so
+/// its ownership check sees a bound full-trust identity rather than `None` (now deny).
 async fn open_log(state: &AppState, session: String, after_seq: u64) -> LogStream {
-    state
-        .api
-        .subscribe(SessionId::new(session), after_seq)
-        .await
-        .unwrap_or_else(|_| futures::stream::empty().boxed())
+    with_request_context(RequestContext::system(), async {
+        state
+            .api
+            .subscribe(SessionId::new(session), after_seq)
+            .await
+            .unwrap_or_else(|_| futures::stream::empty().boxed())
+    })
+    .await
 }
 
 /// Query params for the tree-subscribe push stream (`?include_ephemeral=bool&coalesce_ms=N`). Both
@@ -358,12 +447,18 @@ async fn tree_subscribe_sse(
 }
 
 /// Open the tree push stream, degrading to an empty stream when the node exposes no live tree.
+/// Runs inside a `system()` scope: `tree_subscribe` captures the request principal at call time to
+/// owner-scope the long-lived stream, so without a bound identity it would capture `None` and (after
+/// the flip) project an empty tree. `system` (SeeAll) yields the full operator view for local trust.
 async fn open_tree(state: &AppState, filter: TreeSubFilter) -> TreeStream {
-    state
-        .api
-        .tree_subscribe(filter)
-        .await
-        .unwrap_or_else(|_| futures::stream::empty().boxed())
+    with_request_context(RequestContext::system(), async {
+        state
+            .api
+            .tree_subscribe(filter)
+            .await
+            .unwrap_or_else(|_| futures::stream::empty().boxed())
+    })
+    .await
 }
 
 /// Query params for the filesystem change stream (`?root=workspace&dir=src&poll_ms=750`). `root` is

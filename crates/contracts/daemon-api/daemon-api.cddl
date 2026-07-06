@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 27)
+wire_version = uint                 ; daemon-common WireVersion (current = 28)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -146,7 +146,7 @@ rate-limit-snapshot = { "remaining": (uint64 / null), "limit": (uint64 / null), 
 budget = { "tokens": (uint64 / null), "wall_ms": (uint64 / null) }
 spawn-seed = "FromConversation"
 spawn-spec = { "kind": tstr, "seed": spawn-seed }
-host-request-kind-approval = { "Approval": { "prompt": tstr } }
+host-request-kind-approval = { "Approval": { "prompt": tstr, ? "allow_permanent_offered": bool } }
 host-request-kind-input = { "Input": { "prompt": tstr } }
 host-request-kind-choice = { "Choice": { "prompt": tstr, "options": [* tstr] } }
 host-request-kind-delegate = { "Delegate": { "label": tstr, "budget": budget } }
@@ -156,7 +156,7 @@ host-request-kind-t = host-request-kind-approval
                   / host-request-kind-choice
                   / host-request-kind-delegate
                   / host-request-kind-spawn
-host-response-body-approved = { "Approved": bool }
+host-response-body-approved = { "Approved": { "approved": bool, ? "allow_permanent": bool } }
 host-response-body-input = { "Input": tstr }
 host-response-body-chosen = { "Chosen": uint }
 host-response-body-delegated = { "Delegated": job-id }
@@ -341,6 +341,11 @@ approval-info = {
   "request_id": tstr,
   "prompt": tstr,
   ? "path": (tstr / null),
+  ; fingerprint (wire v28): the §12 exec-approval command fingerprint (lowercase-hex sha256 of the
+  ; resolved (abs-binary, argv, env-delta, cwd, exec-surface) tuple), promoted from the prompt string
+  ; to a structured field for the operator display. null for non-command approvals (fs edits) and
+  ; pre-v28 rows. Enforcement stays snapshot-side (daemon-core).
+  ? "fingerprint": (tstr / null),
 }
 
 ; ----- tree projection DTOs (the GUI/TUI surface over the management tree) -----
@@ -453,9 +458,14 @@ origin-scope-t = origin-scope-dm
                / origin-scope-api
                / "Internal"
 
+; sender-id (wire v28): the immutable, platform-assigned sender identity (Matrix MXID, etc.),
+; the transparent newtype `SenderId(String)`. Carried onto `Origin` for downstream attribution
+; only — never an input to session-id derivation. Absent/null on host-internal + pre-v28 origins.
+sender-id = tstr
 origin = {
   "transport": transport-id,
   "scope": origin-scope-t,
+  ? "sender": (sender-id / null),
 }
 
 direction   = "Inbound" / "Outbound"
@@ -618,6 +628,10 @@ installed-model = {
   ? "context_length": (uint / null),
   ? "file_type": (tstr / null),
   ? "mmproj_path": (tstr / null),
+  ; sha256 (wire v28): the node-local pinned artifact hash (lowercase hex), read from the
+  ; `<local_path>.sha256` provenance sidecar for display. Node-side pin/verify stays authoritative;
+  ; null for legacy records cataloged before the pin existed (a re-catalog repins them).
+  ? "sha256": (tstr / null),
 }
 
 ; ----- recommend / quantize / inspect DTOs -----
@@ -790,7 +804,10 @@ revision = {
   "ts_ms": uint64,
 }
 ; a portable skill bundle: bundle-relative path -> file contents (text; includes SKILL.md).
-skill-bundle = { "name": tstr, "category": (tstr / null), "files": { * tstr => tstr } }
+; signature (wire v28): an optional hex-encoded ed25519 detached signature over the bundle's
+; canonical digest (name + category + sorted files), backing the opt-in verify-at-import gate.
+; null for unsigned bundles (the default); verification is off unless an operator configures a key.
+skill-bundle = { "name": tstr, "category": (tstr / null), "files": { * tstr => tstr }, ? "signature": (tstr / null) }
 ; a portable profile distribution: the concrete profile-spec plus the profile's local skills;
 ; credential_ref is kept (a name, not a secret).
 distribution = {
@@ -1027,7 +1044,7 @@ request-set-session-model = { "SetSessionModel": { "session": session-id, "model
 request-set-session-mode = { "SetSessionMode": { "session": session-id, "mode": approval-mode } }
 request-set-session-overlay = { "SetSessionOverlay": { "session": session-id, "overlay": session-overlay } }
 request-approvals-pending = { "ApprovalsPending": { ? "session": (session-id / null), ? "after": (tstr / null) } }
-request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool } }
+request-approval-decide = { "ApprovalDecide": { "session": session-id, "request_id": tstr, "allow": bool, ? "allow_permanent": bool } }
 request-profile-list = "ProfileList"
 request-profile-get = { "ProfileGet": { "id": tstr } }
 request-profile-create = { "ProfileCreate": { "spec": profile-spec } }

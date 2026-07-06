@@ -112,6 +112,8 @@ impl LocalCheckpointStore {
         self.root.join("snapshots")
     }
 
+    // fs: the checkpoint ledger file under the daemon-internal store root (not attacker-influenced).
+    #[allow(clippy::disallowed_methods)]
     fn append_ledger(&self, record: &CheckpointRecord) -> std::io::Result<()> {
         use std::io::Write;
         let _guard = self.ledger_lock.lock().expect("checkpoint ledger poisoned");
@@ -124,6 +126,8 @@ impl LocalCheckpointStore {
         writeln!(f, "{line}")
     }
 
+    // fs: the checkpoint ledger file under the daemon-internal store root (not attacker-influenced).
+    #[allow(clippy::disallowed_methods)]
     fn read_ledger(&self) -> Vec<CheckpointRecord> {
         let Ok(text) = std::fs::read_to_string(self.ledger_path()) else {
             return Vec::new();
@@ -246,6 +250,9 @@ fn capture_blocking(workspace: &Path, snapshots_root: &Path, id: &str) -> Option
 }
 
 /// Rewind to a recorded checkpoint.
+// Spawns `git` (fixed binary, argv-only, no shell) to rewind the workspace tree; fs is the
+// daemon-internal snapshot store. Not attacker-influenced.
+#[allow(clippy::disallowed_methods)]
 fn restore_blocking(record: &CheckpointRecord) -> std::io::Result<()> {
     let workspace = PathBuf::from(&record.workspace);
     match &record.kind {
@@ -276,6 +283,8 @@ fn restore_blocking(record: &CheckpointRecord) -> std::io::Result<()> {
 
 /// `git stash create`: records the working tree as a dangling commit without touching the tree or
 /// index. Returns the sha, or `HEAD`'s sha when the tree is clean (stash-create prints nothing).
+// Spawns `git` (fixed binary, argv-only, no shell) to snapshot the workspace via stash-create.
+#[allow(clippy::disallowed_methods)]
 fn git_stash_create(workspace: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -308,6 +317,8 @@ fn git_stash_create(workspace: &Path) -> Option<String> {
 }
 
 /// Recursively copy `src` into `dst` (creating `dst`), skipping any `.git` directory.
+// fs: copies within the daemon-internal snapshot store (not attacker-influenced).
+#[allow(clippy::disallowed_methods)]
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -330,6 +341,8 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Remove every entry of `dir` except `.git` (the pre-restore clear of a snapshot rewind).
+// fs: clears within the daemon-internal snapshot store (not attacker-influenced).
+#[allow(clippy::disallowed_methods)]
 fn clear_dir_except_git(dir: &Path) -> std::io::Result<()> {
     if !dir.exists() {
         return Ok(());

@@ -92,6 +92,8 @@ impl FsLintConfig {
 fn render_command(template: &str, rel_path: &str) -> Option<Command> {
     let mut parts = template.split_whitespace();
     let program = parts.next()?.replace("{file}", rel_path);
+    // Spawns an operator-configured linter template (argv-only, whitespace-split, no shell/quoting).
+    #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(program);
     for part in parts {
         cmd = cmd.arg(part.replace("{file}", rel_path));
@@ -232,12 +234,14 @@ async fn baseline_output(
         }
         _ => PathBuf::from(format!(".fs-lint-pre.{nanos}.{file_name}")),
     };
-    let tmp_abs = daemon_core::exec::contain(workspace, &tmp_rel).ok()?;
-    tokio::fs::write(&tmp_abs, pre_content).await.ok()?;
+    let cr = daemon_core::exec::ContainedRoot::open(workspace).ok()?;
+    // fd-contained temp write (openat2: a symlinked component in the file's parent is rejected).
+    cr.write(&tmp_rel, pre_content.as_bytes()).await.ok()?;
+    let tmp_abs = cr.resolve_display(&tmp_rel).ok()?;
     let tmp_rel_str = tmp_rel.to_string_lossy().into_owned();
     let cmd = render_command(&rule.command, &tmp_rel_str)?;
     let run = run_linter(cx, cfg, cmd).await;
-    let _ = tokio::fs::remove_file(&tmp_abs).await;
+    let _ = cr.remove_file(&tmp_rel).await;
     if run.timed_out {
         return None;
     }

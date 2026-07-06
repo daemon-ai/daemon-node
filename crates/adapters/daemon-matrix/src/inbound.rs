@@ -18,8 +18,9 @@ use matrix_sdk::ruma::events::room::message::{MessageType, OriginalSyncRoomMessa
 use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::Room;
 
+use daemon_host::{with_request_context, RequestContext};
 use daemon_ingest::{Ingestor, Reception};
-use daemon_protocol::{Origin, OriginScope, TransportId, UserMsg};
+use daemon_protocol::{Origin, OriginScope, SenderId, TransportId, UserMsg};
 
 use crate::config::{self, MatrixRoute};
 use crate::outbound::DeliveryManager;
@@ -98,11 +99,21 @@ pub async fn on_room_message(ev: OriginalSyncRoomMessageEvent, room: Room, ctx: 
     let attributed = format!("{}: {}", ev.sender, body);
     let reception = Reception {
         origin,
+        // The immutable platform identity: the Matrix MXID (`@user:hs`), never the room display name.
+        // This is what the ingest `SenderPolicy` gate keys on — supplied structurally, never parsed
+        // back out of `attributed`.
+        sender: SenderId::new(ev.sender.as_str()),
         input: UserMsg::new(attributed),
         addressed,
     };
 
-    match ctx.ingestor.receive(reception).await {
+    // Bind the in-process `internal` principal: `receive` drives `submit_routed`, whose Auth 4
+    // ownership check now denies a `None` principal. This inbound handler runs in a matrix-sdk event
+    // task with no request context, so it supplies the trusted embedded-caller identity explicitly
+    // (a fresh chat session is then stamped `owner = "internal"` — see the plan's stamping note).
+    let received =
+        with_request_context(RequestContext::internal(), ctx.ingestor.receive(reception)).await;
+    match received {
         Ok(session) => ctx.delivery.ensure(session, ctx.transport.clone()),
         Err(e) => tracing::warn!(error = %e, "matrix: ingest receive failed"),
     }

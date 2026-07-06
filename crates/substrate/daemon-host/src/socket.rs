@@ -17,6 +17,7 @@ use crate::auth_audit::AuthAudit;
 use crate::authn::{AuthExchange, AuthSuccess, Authenticator, BeginOutcome, StepOutcome, TlsState};
 use crate::authz::authorize;
 use crate::request_context::{with_request_context, AuthMethod, RequestContext};
+use crate::revocation::RevocationGuard;
 use daemon_api::{
     dispatch, from_cbor, is_streaming, to_cbor, wire_feature_api, ApiError, ApiRequest,
     ApiResponse, EventsPage, LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C,
@@ -24,6 +25,7 @@ use daemon_api::{
     WIRE_VERSION,
 };
 use daemon_auth::Principal;
+use daemon_common::{IngressGovernor, IngressLimits};
 use daemon_telemetry::{fields, ingress_trace, with_trace_span, SpanKind};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -85,7 +87,16 @@ impl AuthMode {
 /// `local_trust`) use [`serve_api_unix_authenticated`]. Runs forever; spawn it as a background task.
 #[cfg(unix)]
 pub async fn serve_api_unix(listener: UnixListener, api: Arc<dyn NodeApi>) {
-    accept_unix(listener, api, Arc::new(AuthMode::LocalSystem)).await;
+    // Local-trust carrier (Cluster F): exempt from per-peer rate + connection concurrency (§1.6) —
+    // a networked flood must never starve the operator CLI — so it enforces only the secure-default
+    // frame/decoded caps via the governor's limits.
+    accept_unix(
+        listener,
+        api,
+        Arc::new(AuthMode::LocalSystem),
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 /// As [`serve_api_unix`], but the Unix socket **requires** a SASL exchange (no local trust): the
@@ -101,18 +112,29 @@ pub async fn serve_api_unix_authenticated(
         auth,
         tls_state: TlsState::plaintext(),
     });
-    accept_unix(listener, api, mode).await;
+    accept_unix(
+        listener,
+        api,
+        mode,
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 #[cfg(unix)]
-async fn accept_unix(listener: UnixListener, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
+async fn accept_unix(
+    listener: UnixListener,
+    api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
+    limits: IngressLimits,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let api = api.clone();
                 let mode = mode.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_conn(stream, api, mode).await {
+                    if let Err(e) = serve_conn(stream, api, mode, limits).await {
                         tracing::debug!("api socket connection ended: {e}");
                     }
                 });
@@ -130,9 +152,10 @@ async fn serve_conn(
     stream: UnixStream,
     api: Arc<dyn NodeApi>,
     mode: Arc<AuthMode>,
+    limits: IngressLimits,
 ) -> std::io::Result<()> {
     let (rd, wr) = stream.into_split();
-    serve_conn_split(rd, wr, api, mode, next_conn_id()).await
+    serve_conn_split(rd, wr, api, mode, next_conn_id(), limits).await
 }
 
 /// First-frame mode-select over any split byte stream — the shared per-connection entry point for
@@ -147,18 +170,19 @@ async fn serve_conn_split<R, W>(
     api: Arc<dyn NodeApi>,
     mode: Arc<AuthMode>,
     conn_id: u64,
+    limits: IngressLimits,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let first = match read_frame(&mut rd).await? {
+    let first = match read_frame(&mut rd, &limits).await? {
         Some(bytes) => bytes,
         None => return Ok(()),
     };
     match from_cbor::<WireC2S>(&first) {
-        Ok(frame) => serve_mux(rd, wr, api, mode, Some(frame), conn_id).await,
-        Err(_) => serve_legacy(rd, wr, api, mode, first, conn_id).await,
+        Ok(frame) => serve_mux(rd, wr, api, mode, Some(frame), conn_id, limits).await,
+        Err(_) => serve_legacy(rd, wr, api, mode, first, conn_id, limits).await,
     }
 }
 
@@ -169,7 +193,14 @@ where
 /// Runs forever; spawn it as a background task.
 #[cfg(windows)]
 pub async fn serve_api_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>) {
-    accept_windows_pipe(pipe_name, api, Arc::new(AuthMode::LocalSystem)).await;
+    // Local-trust carrier (Cluster F): rate/concurrency-exempt (§1.6); frame/decoded caps only.
+    accept_windows_pipe(
+        pipe_name,
+        api,
+        Arc::new(AuthMode::LocalSystem),
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 /// As [`serve_api_windows_pipe`], but the pipe **requires** a SASL exchange (no local trust): a
@@ -185,7 +216,13 @@ pub async fn serve_api_windows_pipe_authenticated(
         auth,
         tls_state: TlsState::plaintext(),
     });
-    accept_windows_pipe(pipe_name, api, mode).await;
+    accept_windows_pipe(
+        pipe_name,
+        api,
+        mode,
+        IngressGovernor::secure_default().limits(),
+    )
+    .await;
 }
 
 /// The windows named-pipe accept loop (peer of [`accept_unix`]). Uses the standard tokio pattern:
@@ -193,7 +230,12 @@ pub async fn serve_api_windows_pipe_authenticated(
 /// while the next instance is created ahead of it, so there is never a window where a connecting
 /// client finds no server listening.
 #[cfg(windows)]
-async fn accept_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>, mode: Arc<AuthMode>) {
+async fn accept_windows_pipe(
+    pipe_name: String,
+    api: Arc<dyn NodeApi>,
+    mode: Arc<AuthMode>,
+    limits: IngressLimits,
+) {
     use tokio::net::windows::named_pipe::ServerOptions;
     let mut server = match ServerOptions::new()
         .first_pipe_instance(true)
@@ -223,7 +265,7 @@ async fn accept_windows_pipe(pipe_name: String, api: Arc<dyn NodeApi>, mode: Arc
         tokio::spawn(async move {
             let conn_id = next_conn_id();
             let (rd, wr) = tokio::io::split(connected);
-            if let Err(e) = serve_conn_split(rd, wr, api, mode, conn_id).await {
+            if let Err(e) = serve_conn_split(rd, wr, api, mode, conn_id, limits).await {
                 tracing::debug!("named pipe connection ended: {e}");
             }
         });
@@ -244,6 +286,7 @@ async fn serve_legacy<R, W>(
     mode: Arc<AuthMode>,
     first: Vec<u8>,
     conn_id: u64,
+    limits: IngressLimits,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -259,6 +302,12 @@ where
             async {
                 match from_cbor::<ApiRequest>(&bytes) {
                     Ok(request) => {
+                        // Cluster F: reject an oversize decoded inline payload (blob put) before it
+                        // is dispatched — the post-decode ingress cap, measured O(1) from the
+                        // already-decoded request.
+                        if let Err(e) = limits.check_decoded_len(request.ingress_payload_len()) {
+                            return ApiResponse::Error(ApiError::Other(e.to_string()));
+                        }
                         tracing::debug!(
                             trace_id = %trace,
                             api_variant = ?std::mem::discriminant(&request),
@@ -283,7 +332,7 @@ where
         )
         .await;
         write_frame(&mut wr, &to_cbor(&response)).await?;
-        match read_frame(&mut rd).await? {
+        match read_frame(&mut rd, &limits).await? {
             Some(b) => bytes = b,
             None => return Ok(()),
         }
@@ -300,7 +349,48 @@ enum ConnAuth {
     Authenticated {
         principal: Principal,
         method: AuthMethod,
+        /// The captured per-principal revocation epoch (Cluster F, Part A). `Some` for a
+        /// network-authenticated connection when the authenticator carries a revocation registry;
+        /// `None` for local trust (deliberately non-revocable) or a node without the registry. When
+        /// the guard reads revoked, the connection (and its live pumps) are torn down.
+        guard: Option<RevocationGuard>,
     },
+}
+
+/// Capture the revocation guard for a freshly-authenticated `user_id` on this connection: `Some`
+/// only under [`AuthMode::Required`] with a registry-carrying authenticator. Local trust and a
+/// registry-less node yield `None` (non-revocable).
+fn capture_guard(mode: &AuthMode, user_id: &str) -> Option<RevocationGuard> {
+    match mode {
+        AuthMode::Required { auth, .. } => auth.revocations().map(|r| r.guard(user_id)),
+        AuthMode::LocalSystem => None,
+    }
+}
+
+/// This connection's live revocation guard, if it is authenticated and revocable (Cluster F).
+fn conn_guard(conn: &ConnAuth) -> Option<RevocationGuard> {
+    match conn {
+        ConnAuth::Authenticated { guard, .. } => guard.clone(),
+        _ => None,
+    }
+}
+
+/// Abort every live stream pump on this connection (Cluster F teardown, and normal connection
+/// close). `AbortHandle::abort` is non-blocking; a pump already finished is a no-op.
+fn teardown_streams(streams: &mut HashMap<u64, AbortHandle>) {
+    for (_, handle) in streams.drain() {
+        handle.abort();
+    }
+}
+
+/// Resolve when the connection's principal is revoked; never resolves for a non-revocable
+/// connection (local trust / no registry). Lets a stream pump add a uniform revocation `select!`
+/// arm regardless of whether a guard is present (Cluster F, Part A pump self-teardown).
+async fn revoked_or_never(guard: &Option<RevocationGuard>) {
+    match guard {
+        Some(g) => g.revoked().await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Map a SASL mechanism name to its [`AuthMethod`] (audit/telemetry tag).
@@ -428,6 +518,7 @@ pub(crate) async fn serve_mux<R, W>(
     mode: Arc<AuthMode>,
     first: Option<WireC2S>,
     conn_id: u64,
+    limits: IngressLimits,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -444,10 +535,12 @@ where
     });
 
     // Local trust pre-binds the system principal; an auth-required transport starts unelevated.
+    // Local trust is deliberately non-revocable, so it carries no guard.
     let mut conn = if mode.is_local_system() {
         ConnAuth::Authenticated {
             principal: RequestContext::system().principal,
             method: AuthMethod::LocalTrust,
+            guard: None,
         }
     } else {
         ConnAuth::Unauthenticated
@@ -466,14 +559,34 @@ where
     loop {
         let frame = match pending.take() {
             Some(f) => f,
-            None => match read_frame(&mut rd).await? {
-                Some(bytes) => match from_cbor::<WireC2S>(&bytes) {
-                    Ok(f) => f,
-                    // A frame we cannot decode is dropped rather than killing the connection.
-                    Err(_) => continue,
-                },
-                None => break,
-            },
+            None => {
+                // Cluster F (Part A): while idle-waiting for the next client frame, race the read
+                // against a revocation of this connection's principal. On revoke, synchronously tear
+                // down the connection's live stream pumps and close the connection instead of
+                // serving on with the revoked identity. Local-trust / unauthenticated connections
+                // carry no guard and simply read.
+                let read = read_frame(&mut rd, &limits);
+                let bytes = match conn_guard(&conn) {
+                    Some(g) => {
+                        tokio::select! {
+                            r = read => r?,
+                            _ = g.revoked() => {
+                                teardown_streams(&mut streams);
+                                break;
+                            }
+                        }
+                    }
+                    None => read.await?,
+                };
+                match bytes {
+                    Some(bytes) => match from_cbor::<WireC2S>(&bytes) {
+                        Ok(f) => f,
+                        // A frame we cannot decode is dropped rather than killing the connection.
+                        Err(_) => continue,
+                    },
+                    None => break,
+                }
+            }
         };
         match frame {
             WireC2S::Hello { .. } => {
@@ -513,7 +626,12 @@ where
                                 let principal = complete_auth(&tx, final_data, success).await;
                                 auth.audit_login_ok(&principal.user_id, method_label(method))
                                     .await;
-                                ConnAuth::Authenticated { principal, method }
+                                let guard = capture_guard(&mode, &principal.user_id);
+                                ConnAuth::Authenticated {
+                                    principal,
+                                    method,
+                                    guard,
+                                }
                             }
                             BeginOutcome::Failed(reject) => {
                                 auth.audit_login_fail(&mechanism, None).await;
@@ -553,7 +671,12 @@ where
                                 if let Some(a) = &audit {
                                     a.login_ok(&principal.user_id, method_label(method)).await;
                                 }
-                                ConnAuth::Authenticated { principal, method }
+                                let guard = capture_guard(&mode, &principal.user_id);
+                                ConnAuth::Authenticated {
+                                    principal,
+                                    method,
+                                    guard,
+                                }
                             }
                             StepOutcome::Failed(reject) => {
                                 if let Some(a) = &audit {
@@ -599,9 +722,11 @@ where
                                     method_label(AuthMethod::Token),
                                 )
                                 .await;
+                                let guard = capture_guard(&mode, &principal.user_id);
                                 ConnAuth::Authenticated {
                                     principal,
                                     method: AuthMethod::Token,
+                                    guard,
                                 }
                             }
                             BeginOutcome::Failed(reject) => {
@@ -626,7 +751,37 @@ where
                 }
             },
             WireC2S::Call { id, req } => {
-                if let ConnAuth::Authenticated { principal, method } = &conn {
+                if let ConnAuth::Authenticated {
+                    principal,
+                    method,
+                    guard,
+                } = &conn
+                {
+                    // Cluster F: a frame that arrived just as the principal was revoked (racing the
+                    // idle read above) must not dispatch — refuse it and close the connection.
+                    if guard.as_ref().is_some_and(|g| g.is_revoked()) {
+                        let _ = tx
+                            .send(WireS2C::Reply {
+                                id,
+                                res: ApiResponse::Error(ApiError::Unauthenticated(
+                                    "credentials revoked; re-authenticate".into(),
+                                )),
+                            })
+                            .await;
+                        teardown_streams(&mut streams);
+                        break;
+                    }
+                    // Cluster F: reject an oversize decoded inline payload (blob put) before it is
+                    // dispatched — the post-decode ingress cap, measured O(1) from the decoded req.
+                    if let Err(e) = limits.check_decoded_len(req.ingress_payload_len()) {
+                        let _ = tx
+                            .send(WireS2C::Reply {
+                                id,
+                                res: ApiResponse::Error(ApiError::Other(e.to_string())),
+                            })
+                            .await;
+                        continue;
+                    }
                     let api = api.clone();
                     let tx = tx.clone();
                     let audit = audit.clone();
@@ -658,17 +813,53 @@ where
                 }
             }
             WireC2S::Open { id, req } => {
-                if let ConnAuth::Authenticated { principal, method } = &conn {
+                if let ConnAuth::Authenticated {
+                    principal,
+                    method,
+                    guard,
+                } = &conn
+                {
+                    // Cluster F: refuse a stream open on a just-revoked connection and close it.
+                    if guard.as_ref().is_some_and(|g| g.is_revoked()) {
+                        let _ = tx
+                            .send(WireS2C::End {
+                                id,
+                                error: Some(ApiError::Unauthenticated(
+                                    "credentials revoked; re-authenticate".into(),
+                                )),
+                            })
+                            .await;
+                        teardown_streams(&mut streams);
+                        break;
+                    }
                     if is_streaming(&req) {
                         // Gate the stream at open time under the request context (the pump itself
                         // does not re-dispatch). On allow, spawn the stream; else End{error}.
                         let ctx = RequestContext::authenticated(principal.clone(), None)
                             .with_conn_id(conn_id)
                             .with_auth_method(*method);
-                        let allowed = with_request_context(ctx, async { authorize(&req) }).await;
+                        let allowed =
+                            with_request_context(ctx.clone(), async { authorize(&req) }).await;
                         match allowed {
                             Ok(()) => {
-                                streams.insert(id, spawn_stream(api.clone(), tx.clone(), id, req));
+                                // Bind the connection's authenticated principal into the detached
+                                // pump task: a `tokio::spawn`ed task does NOT inherit the task-local,
+                                // so the pump would otherwise run with `None` principal and the Auth 4
+                                // ownership check inside `subscribe` would see no identity. Passing
+                                // `ctx` closes the cross-owner mux transcript read. The revocation
+                                // guard clone lets the pump self-terminate on revoke (belt-and-
+                                // suspenders with the serve-loop teardown above).
+                                streams.insert(
+                                    id,
+                                    spawn_stream(
+                                        api.clone(),
+                                        tx.clone(),
+                                        id,
+                                        req,
+                                        ctx,
+                                        guard.clone(),
+                                    ),
+                                );
                             }
                             Err(e) => {
                                 if let Some(a) = &audit {
@@ -725,24 +916,34 @@ pub(crate) fn spawn_stream(
     tx: mpsc::Sender<WireS2C>,
     id: u64,
     req: ApiRequest,
+    ctx: RequestContext,
+    guard: Option<RevocationGuard>,
 ) -> AbortHandle {
     let task = tokio::spawn(async move {
-        match req {
-            ApiRequest::Subscribe {
-                session, after_seq, ..
-            } => pump_session_log(api, tx, id, session, after_seq).await,
-            ApiRequest::EventsSince { cursor, .. } => pump_node_events(api, tx, id, cursor).await,
-            _ => {
-                let _ = tx
-                    .send(WireS2C::End {
-                        id,
-                        error: Some(ApiError::Unsupported(
-                            "non-streaming request on the stream path".into(),
-                        )),
-                    })
-                    .await;
+        // Re-establish the connection's request context inside the spawned task (the task-local is
+        // NOT inherited across `spawn`), so the pump's api calls — notably `subscribe`'s Auth 4
+        // ownership check — run under the authenticated principal, not `None`.
+        with_request_context(ctx, async move {
+            match req {
+                ApiRequest::Subscribe {
+                    session, after_seq, ..
+                } => pump_session_log(api, tx, id, session, after_seq, guard).await,
+                ApiRequest::EventsSince { cursor, .. } => {
+                    pump_node_events(api, tx, id, cursor, guard).await
+                }
+                _ => {
+                    let _ = tx
+                        .send(WireS2C::End {
+                            id,
+                            error: Some(ApiError::Unsupported(
+                                "non-streaming request on the stream path".into(),
+                            )),
+                        })
+                        .await;
+                }
             }
-        }
+        })
+        .await;
     });
     task.abort_handle()
 }
@@ -757,6 +958,7 @@ async fn pump_session_log(
     id: u64,
     session: daemon_common::SessionId,
     after_seq: u64,
+    guard: Option<RevocationGuard>,
 ) {
     // The activation epoch is constant for this log generation; read it once and stamp every
     // page + any Reset with it.
@@ -773,6 +975,15 @@ async fn pump_session_log(
     let mut last_seq = after_seq;
     loop {
         tokio::select! {
+            // Cluster F: if this connection's principal is revoked, end the live pump immediately
+            // rather than keep streaming another generation's transcript.
+            _ = revoked_or_never(&guard) => {
+                let _ = tx.send(WireS2C::End {
+                    id,
+                    error: Some(ApiError::Unauthenticated("credentials revoked".into())),
+                }).await;
+                break;
+            }
             item = stream.next() => match item {
                 Some(LogStreamItem::Entry(entry)) => {
                     last_seq = entry.seq;
@@ -812,7 +1023,13 @@ async fn pump_session_log(
 /// frames. The feed itself surfaces an aged-out cursor / a broadcast lag as a `ResyncNeeded` event
 /// *inside* a page (the client re-baselines), so this pump just forwards pages; idle ticks send an
 /// empty keepalive page; the stream ends with `End`.
-async fn pump_node_events(api: Arc<dyn NodeApi>, tx: mpsc::Sender<WireS2C>, id: u64, cursor: u64) {
+async fn pump_node_events(
+    api: Arc<dyn NodeApi>,
+    tx: mpsc::Sender<WireS2C>,
+    id: u64,
+    cursor: u64,
+    guard: Option<RevocationGuard>,
+) {
     let mut stream = match api.events_subscribe(cursor).await {
         Ok(s) => s,
         Err(e) => {
@@ -825,6 +1042,14 @@ async fn pump_node_events(api: Arc<dyn NodeApi>, tx: mpsc::Sender<WireS2C>, id: 
     let mut last_cursor = cursor;
     loop {
         tokio::select! {
+            // Cluster F: end the live pump immediately when the connection's principal is revoked.
+            _ = revoked_or_never(&guard) => {
+                let _ = tx.send(WireS2C::End {
+                    id,
+                    error: Some(ApiError::Unauthenticated("credentials revoked".into())),
+                }).await;
+                break;
+            }
             item = stream.next() => match item {
                 Some(page) => {
                     if page.next_cursor > last_cursor {
@@ -872,7 +1097,7 @@ impl ApiClient {
         write_frame(&mut stream, &to_cbor(&request))
             .await
             .map_err(|e| ApiError::Other(format!("send: {e}")))?;
-        let bytes = read_frame(&mut stream)
+        let bytes = read_frame(&mut stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv: {e}")))?
             .ok_or_else(|| ApiError::Other("connection closed before a response".into()))?;
@@ -905,7 +1130,7 @@ impl ApiClient {
         write_frame(&mut stream, &to_cbor(&request))
             .await
             .map_err(|e| ApiError::Other(format!("send: {e}")))?;
-        let bytes = read_frame(&mut stream)
+        let bytes = read_frame(&mut stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv: {e}")))?
             .ok_or_else(|| ApiError::Other("connection closed before a response".into()))?;
@@ -977,7 +1202,7 @@ impl MuxApiClient {
         write_frame(&mut stream, &to_cbor(&hello))
             .await
             .map_err(|e| ApiError::Other(format!("send hello: {e}")))?;
-        let bytes = read_frame(&mut stream)
+        let bytes = read_frame(&mut stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv hello: {e}")))?
             .ok_or_else(|| ApiError::Other("closed before hello ack".into()))?;
@@ -1083,7 +1308,7 @@ impl MuxApiClient {
 
     /// Read the next server frame.
     pub async fn next(&mut self) -> Result<WireS2C, ApiError> {
-        let bytes = read_frame(&mut self.stream)
+        let bytes = read_frame(&mut self.stream, &IngressLimits::unlimited())
             .await
             .map_err(|e| ApiError::Other(format!("recv: {e}")))?
             .ok_or_else(|| ApiError::Other("connection closed".into()))?;
@@ -1098,8 +1323,14 @@ impl MuxApiClient {
 }
 
 /// Read one length-framed message. Returns `Ok(None)` on a clean EOF at a frame boundary.
+///
+/// Cluster F (Phase 4): the oversize-length rejection is now the ingress governor's single frame cap
+/// ([`IngressLimits::check_frame_len`]) rather than a per-call-site inline constant — the check fires
+/// BEFORE the receive buffer is allocated, so a hostile/corrupt prefix cannot force a huge allocation
+/// pre-decode / pre-auth.
 pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
+    limits: &IngressLimits,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
@@ -1108,6 +1339,7 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    limits.check_frame_len(len).map_err(|e| e.as_io_error())?;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(Some(buf))
@@ -1182,5 +1414,39 @@ mod tests {
             windows_pipe_path("/tmp/daemon-api.sock"),
             r"\\.\pipe\daemon-api-_tmp_daemon-api.sock"
         );
+    }
+
+    /// Cluster F: an oversize length prefix is rejected with `InvalidData` BEFORE the receive
+    /// buffer is allocated. The frame declares `MAX_FRAME_BYTES + 1` and supplies NO body — so a
+    /// guard that fires pre-allocation returns `InvalidData`, whereas the unguarded path would
+    /// allocate the (huge) buffer and then hit `UnexpectedEof` reading the absent body. Asserting
+    /// `InvalidData` (not `UnexpectedEof`) proves the rejection is pre-allocation.
+    #[tokio::test]
+    async fn read_frame_rejects_oversize_length_before_allocating() {
+        let over = (daemon_common::MAX_FRAME_BYTES as u64 + 1) as u32;
+        let framed = over.to_be_bytes();
+        let mut reader: &[u8] = &framed;
+        let err = read_frame(&mut reader, &IngressLimits::default())
+            .await
+            .expect_err("an oversize frame length must be rejected");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "oversize must be rejected pre-allocation (InvalidData), not read as UnexpectedEof"
+        );
+    }
+
+    /// An in-bounds frame still round-trips unchanged (the cap does not perturb normal traffic).
+    #[tokio::test]
+    async fn read_frame_accepts_in_bounds_frame() {
+        let payload = b"in-bounds";
+        let mut framed = (payload.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(payload);
+        let mut reader: &[u8] = &framed;
+        let got = read_frame(&mut reader, &IngressLimits::default())
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(got, payload);
     }
 }

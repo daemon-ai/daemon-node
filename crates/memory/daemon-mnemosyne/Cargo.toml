@@ -12,13 +12,16 @@ default = []
 # sqlite-vec vec0 virtual tables (float32/int8/bit + native distance fns). Off by default uses an
 # in-Rust cosine fallback over f32 BLOBs (mirrors Mnemosyne's numpy fallback).
 vec-ext = ["dep:sqlite-vec"]
-# Event-log replication + streaming (sync.py / streaming.py).
-sync = ["dep:reqwest", "dep:chacha20poly1305", "dep:argon2"]
+# Event-log replication + streaming (sync.py / streaming.py). Outbound HTTP goes through the
+# shared SSRF-safe daemon-egress client (manual, re-validated redirects); reqwest stays for the
+# reqwest::Response type + the in-crate test transport.
+sync = ["dep:reqwest", "dep:daemon-egress", "dep:chacha20poly1305", "dep:argon2"]
 # Exact token counts via tiktoken (else len/4).
 tiktoken = ["dep:tiktoken-rs"]
 
 [dependencies]
 daemon-core = { workspace = true }
+daemon-egress = { workspace = true, optional = true }
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 rusqlite_migration = { workspace = true }
 serde = { workspace = true }
@@ -45,6 +48,8 @@ tiktoken-rs = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# in-process mock HTTP server for the sync egress tests (redirect / token-leak repros).
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

@@ -143,7 +143,10 @@ async fn drain_turn(node: &Arc<NodeApiImpl>, session: &daemon_common::SessionId)
                     session.clone(),
                     HostResponse {
                         request_id: req.request_id,
-                        body: HostResponseBody::Approved(true),
+                        body: HostResponseBody::Approved {
+                            approved: true,
+                            allow_permanent: false,
+                        },
                     },
                 )
                 .await
@@ -164,6 +167,16 @@ async fn drain_turn(node: &Arc<NodeApiImpl>, session: &daemon_common::SessionId)
 /// interactive turn (text streamed, permission answered, turn completes) — provider seam untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_profile_spawns_and_completes_a_turn() {
+    // Drive the node as the trusted local embedder (`system`): after the Auth 4 flip a `None`
+    // request principal is denied, so an in-process test must bind a context exactly as `bins/daemon`
+    // does. `system` holds the ownership overrides, so it stands in for the local-trust driver.
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        acp_profile_spawns_and_completes_a_turn_impl(),
+    )
+    .await;
+}
+async fn acp_profile_spawns_and_completes_a_turn_impl() {
     let (node, resolver_called, _handle) = assemble_acp_node();
     register_mock_agent(&node, "fake-echo").await;
 

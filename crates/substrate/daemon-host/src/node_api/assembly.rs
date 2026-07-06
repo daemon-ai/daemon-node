@@ -81,6 +81,8 @@ impl NodeApiImpl {
             commands: Arc::new(ArcSwapOption::empty()),
             auth_store: None,
             auth_audit: None,
+            revocations: None,
+            credential_revoker: None,
         }
     }
 
@@ -99,6 +101,31 @@ impl NodeApiImpl {
     /// together with the admin events. Absent, admin-op audit is a no-op.
     pub fn with_auth_audit(mut self, auth_audit: Arc<crate::auth_audit::AuthAudit>) -> Self {
         self.auth_audit = Some(auth_audit);
+        self
+    }
+
+    /// Bind the shared per-principal revocation registry (Cluster F, Part A). Pass the **same**
+    /// [`SessionRevocations`](crate::revocation::SessionRevocations) to the transport's
+    /// [`Authenticator`](crate::authn::Authenticator) so an admin `session_revoke` (etc.) bump tears
+    /// down the live connections it elevated. Absent, live connections are not torn down (the store
+    /// mutation still invalidates the reconnect fast-path).
+    pub fn with_revocations(
+        mut self,
+        revocations: Arc<crate::revocation::SessionRevocations>,
+    ) -> Self {
+        self.revocations = Some(revocations);
+        self
+    }
+
+    /// Bind the credential-authority revoker (Cluster F, Part B) so `credential_remove`/
+    /// `credential_set` invalidate the profile's outstanding leases. Pass the credential broker
+    /// ([`MultiProfileStoreBroker`](crate::credentials::MultiProfileStoreBroker)), the same instance
+    /// the engine acquires leases through. Absent, only the credential store is mutated.
+    pub fn with_credential_revoker(
+        mut self,
+        revoker: Arc<dyn crate::revocation::CredentialRevoker>,
+    ) -> Self {
+        self.credential_revoker = Some(revoker);
         self
     }
 

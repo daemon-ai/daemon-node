@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daemon_common::{
-    Budget, Epoch, FenceToken, ReqId, SessionId, SnapshotBlob, TraceId, WireVersion,
+    Budget, Epoch, FenceToken, IngressGovernor, IngressLimits, PeerKey, ReqId, SessionId,
+    SnapshotBlob, TraceId, WireVersion,
 };
 use daemon_store::{Checkpoint, SessionStatus, SessionStore, StoreErrorWire};
 use daemon_supervision::{Ack, ManageCommand, ManageEvent, ManagedUnit, WorkRef};
@@ -118,7 +119,7 @@ where
     Ok(())
 }
 
-async fn read_frame<R, B>(r: &mut R) -> std::io::Result<Option<Wire<B>>>
+async fn read_frame<R, B>(r: &mut R, limits: &IngressLimits) -> std::io::Result<Option<Wire<B>>>
 where
     R: AsyncReadExt + Unpin,
     B: DeserializeOwned,
@@ -130,6 +131,9 @@ where
         Err(e) => return Err(e),
     }
     let n = u32::from_be_bytes(len) as usize;
+    // Cluster F: the pre-alloc frame cap is now the ingress governor's single check (unified with
+    // the socket.rs/ws.rs sites) — reject an oversize length BEFORE allocating the receive buffer.
+    limits.check_frame_len(n).map_err(|e| e.as_io_error())?;
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
     let frame = ciborium::from_reader(&buf[..])
@@ -147,24 +151,47 @@ pub struct RemoteHost {
     store: Arc<dyn SessionStore>,
     unit: Arc<dyn ManagedUnit>,
     drive_timeout: Duration,
+    /// The Cluster-F ingress governor for this network-facing accept loop. The cross-node `remote`
+    /// carrier is a `TcpListener` (network ingress), so it applies the FULL governor: the pre-alloc
+    /// frame cap, per-peer connection rate, and connection concurrency. Its control frames carry no
+    /// inline byte payload, so the decoded cap is a no-op here (nothing to expand).
+    governor: Arc<IngressGovernor>,
 }
 
 impl RemoteHost {
-    /// Build a server over an authoritative `store` and a hosted `unit`.
+    /// Build a server over an authoritative `store` and a hosted `unit`, governed by the
+    /// secure-by-default ingress governor (see [`RemoteHost::with_governor`] to inject a custom one).
     pub fn new(store: Arc<dyn SessionStore>, unit: Arc<dyn ManagedUnit>) -> Self {
         Self {
             store,
             unit,
             drive_timeout: Duration::from_secs(10),
+            governor: IngressGovernor::secure_default(),
         }
+    }
+
+    /// Override the ingress governor (tests inject a tiny-limit governor to exercise the caps).
+    pub fn with_governor(mut self, governor: Arc<IngressGovernor>) -> Self {
+        self.governor = governor;
+        self
     }
 
     /// Accept connections on `listener` until it errors or is dropped, serving each concurrently.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
         loop {
-            let (stream, _peer) = listener.accept().await?;
+            let (stream, peer) = listener.accept().await?;
+            // Cluster F: per-peer rate + global concurrency (fail-closed) before spawning the handler.
+            if let Err(e) = self.governor.check_peer(&PeerKey::ip(peer.ip())) {
+                tracing::debug!(%peer, "remote connection refused: {e}");
+                continue;
+            }
+            let Some(permit) = self.governor.admit_connection() else {
+                tracing::debug!(%peer, "remote connection refused: connection cap reached");
+                continue;
+            };
             let me = self.clone();
             tokio::spawn(async move {
+                let _permit = permit; // held for the connection; RAII-freed on close.
                 let _ = me.handle(stream).await;
             });
         }
@@ -173,9 +200,10 @@ impl RemoteHost {
     /// Serve a single connection (used directly in tests).
     pub async fn handle(&self, stream: TcpStream) -> std::io::Result<()> {
         let (mut r, mut w) = stream.into_split();
+        let limits = self.governor.limits();
         // A trace scope so `set_trace` (restore-on-decode) governs the replies we stamp back.
         with_trace(TraceId::NONE, async move {
-            while let Some(frame) = read_frame::<OwnedReadHalf, Req>(&mut r).await? {
+            while let Some(frame) = read_frame::<OwnedReadHalf, Req>(&mut r, &limits).await? {
                 let operation = req_kind(&frame.body);
                 let span = restore_trace_span(
                     frame.trace,
@@ -298,9 +326,12 @@ impl RemoteClient {
             body,
         };
         write_frame::<OwnedWriteHalf, Req>(&mut self.writer, &frame).await?;
-        let reply = read_frame::<OwnedReadHalf, Resp>(&mut self.reader)
-            .await?
-            .ok_or(TransportError::Closed)?;
+        // The client trusts its peer daemon; a generous cap avoids rejecting a large legitimate
+        // reply while still bounding a corrupt prefix.
+        let reply =
+            read_frame::<OwnedReadHalf, Resp>(&mut self.reader, &IngressLimits::unlimited())
+                .await?
+                .ok_or(TransportError::Closed)?;
         // Restore the peer's trace context (so the journal/logs here correlate with the server).
         let span = restore_trace_span(
             reply.trace,
@@ -398,5 +429,29 @@ impl RemoteClient {
             Resp::Status(s) => Ok(s),
             _ => Err(TransportError::Protocol),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cluster F: the `remote` transport rejects an oversize length prefix with `InvalidData`
+    /// BEFORE allocating the receive buffer. The frame declares `MAX_FRAME_BYTES + 1` and supplies
+    /// no body; a pre-allocation guard returns `InvalidData`, while the unguarded path would
+    /// allocate the huge buffer and then read the absent body as `UnexpectedEof`.
+    #[tokio::test]
+    async fn read_frame_rejects_oversize_length_before_allocating() {
+        let over = (daemon_common::MAX_FRAME_BYTES as u64 + 1) as u32;
+        let framed = over.to_be_bytes();
+        let mut reader: &[u8] = &framed;
+        let err = read_frame::<_, Resp>(&mut reader, &IngressLimits::default())
+            .await
+            .expect_err("an oversize frame length must be rejected");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "oversize must be rejected pre-allocation (InvalidData), not read as UnexpectedEof"
+        );
     }
 }

@@ -12,6 +12,9 @@ use super::harness::*;
 /// starts (targets are re-read every event).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivery_sink_push_honors_handover() {
+    as_system(delivery_sink_push_honors_handover_impl()).await;
+}
+async fn delivery_sink_push_honors_handover_impl() {
     use daemon_api::{DeliverySink, Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_common::ReqId;
     use daemon_host::{
@@ -223,14 +226,18 @@ async fn delivery_sink_push_honors_handover() {
 /// transport is demoted from `Primary`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivery_sessions_discovery_and_pull_subscriber() {
-    use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
+    as_system(delivery_sessions_discovery_and_pull_subscriber_impl()).await;
+}
+async fn delivery_sessions_discovery_and_pull_subscriber_impl() {
+    use daemon_api::{LogStreamItem, Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_common::ReqId;
-    use daemon_delivery::{serve_delivery, Projector};
+    use daemon_delivery::Projector;
     use daemon_host::{MemCredentialStore, MemProfileStore, ProfileStore, RoutingRegistry};
     use daemon_protocol::{
         AgentCommand, AgentEvent, DeliveryTarget, Origin, OriginScope, SessionLogEntry,
         SessionPayload, SinkKind, TransportId, UserMsg,
     };
+    use futures::StreamExt;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -374,9 +381,47 @@ async fn delivery_sessions_discovery_and_pull_subscriber() {
 
     // 2. The reusable pull subscriber discovers + projects @a:hs's owned session.
     let recorder = Arc::new(Recorder::default());
-    let api: Arc<dyn daemon_api::NodeApi> = node.clone();
-    let sub = serve_delivery(api, TransportId::new("matrix/@a:hs"), recorder.clone()).await;
-    assert_eq!(sub.len(), 1, "exactly one owned session under delivery");
+    // `daemon_delivery::serve_delivery` spawns its own per-session subscribe tasks, and a spawned
+    // task never inherits this request scope — so after the Auth 4 flip those subscribes would run
+    // with no principal and be denied. Production delivery therefore binds a trusted embedded-caller
+    // context per spawned subscribe (daemon-http's `serve_delivery_scoped`, the matrix
+    // `DeliveryManager`); this mirrors that scoped pattern for the real ownership-enforcing node.
+    let owned = node
+        .delivery_sessions(TransportId::new("matrix/@a:hs"), None)
+        .await;
+    assert_eq!(
+        owned.items.len(),
+        1,
+        "exactly one owned session under delivery"
+    );
+    let mut tasks = Vec::new();
+    for session in owned.items {
+        let node = node.clone();
+        let recorder = recorder.clone();
+        let transport = TransportId::new("matrix/@a:hs");
+        tasks.push(tokio::spawn(as_system(async move {
+            let mut stream = match node.subscribe(session.clone(), 0).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while let Some(item) = stream.next().await {
+                let entry = match item {
+                    LogStreamItem::Entry(e) => e,
+                    LogStreamItem::Lagged => continue,
+                };
+                let still_primary = node
+                    .delivery_targets(session.clone())
+                    .await
+                    .iter()
+                    .any(|t| t.kind == SinkKind::Primary && t.transport == transport);
+                if !still_primary {
+                    break;
+                }
+                recorder.project(session.clone(), entry).await;
+            }
+        })));
+    }
+    assert_eq!(tasks.len(), 1, "exactly one owned session under delivery");
 
     // Wait until the backfilled history (incl. the first turn's TurnFinished) is projected.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -422,9 +467,13 @@ async fn delivery_sessions_discovery_and_pull_subscriber() {
         )
         .await;
     // The subscription's per-session task must end (halt-on-demotion); bound the wait.
-    let halted = tokio::time::timeout(Duration::from_secs(10), sub.join())
-        .await
-        .is_ok();
+    let halted = tokio::time::timeout(Duration::from_secs(10), async {
+        for task in tasks {
+            let _ = task.await;
+        }
+    })
+    .await
+    .is_ok();
     assert!(halted, "the pull subscription halts once handed over");
 
     // The demoted subscription never projected for any session other than session_a.
@@ -449,6 +498,9 @@ async fn delivery_sessions_discovery_and_pull_subscriber() {
 /// profile-less (legacy) engine resolves the shared default home (the pre-routing behavior).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_profiles_get_isolated_memory_banks() {
+    as_system(routed_profiles_get_isolated_memory_banks_impl()).await;
+}
+async fn routed_profiles_get_isolated_memory_banks_impl() {
     use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
     use daemon_common::ReqId;
     use daemon_core::{EngineProfile, MemoryBuilder, MemoryProvider, SystemPrompt, ToolRegistry};

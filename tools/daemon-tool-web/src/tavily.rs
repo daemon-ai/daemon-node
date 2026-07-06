@@ -20,6 +20,10 @@ pub const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 /// The Tavily-backed [`WebSearchBackend`]. Reads its API key live from the [`SecretSource`] under
 /// `key_id` (default `"tavily"`).
 pub struct TavilySearch {
+    // Straggler (scoped): a raw reqwest client to a fixed operator-keyed SaaS endpoint
+    // (api.tavily.com); no agent-controlled URL and no redirect-follow, so it is not an SSRF surface.
+    // Dedupe into daemon-egress is a follow-up.
+    #[allow(clippy::disallowed_types)]
     http: reqwest::Client,
     secrets: Arc<dyn SecretSource>,
     key_id: String,
@@ -28,6 +32,7 @@ pub struct TavilySearch {
 
 impl TavilySearch {
     /// A Tavily backend reading its key from the `"tavily"` credential profile.
+    #[allow(clippy::disallowed_types)] // scoped straggler: fixed operator-keyed SaaS host (see struct)
     pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
         Self {
             http: reqwest::Client::new(),

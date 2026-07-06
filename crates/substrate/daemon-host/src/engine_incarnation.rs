@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here is the daemon-internal engine inbox/outbox IPC dirs under the node data root
+// (not attacker-influenced); raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! The engine ⇄ activation-seam adapter (host-spec §3.1).
 //!
 //! `daemon-core` is deliberately free of the durable substrate (it depends only on
@@ -537,6 +541,10 @@ impl Incarnation for CoreIncarnation {
                         epoch: suspension.epoch,
                         prompt: p.prompt.clone(),
                         path: p.path.clone(),
+                        // wire v28: carry the resolved command fingerprint onto the durable row so
+                        // the operator surface can display it structurally (hex digest; the
+                        // approve-then-swap enforcement stays on the engine's typed `PendingApproval`).
+                        fingerprint: p.fingerprint.as_ref().map(|f| f.as_str().to_string()),
                         decision: None,
                     })
                     .collect();
@@ -639,7 +647,10 @@ impl HostRequestHandler for DelegateResolver {
             }
             HostRequestKind::Input { .. } => HostResponseBody::Input(String::new()),
             HostRequestKind::Choice { .. } => HostResponseBody::Chosen(0),
-            _ => HostResponseBody::Approved(true),
+            _ => HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         };
         HostResponse {
             request_id: req.request_id,

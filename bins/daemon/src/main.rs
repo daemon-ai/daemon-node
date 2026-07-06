@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the node bootstrap fs (config path, socket path, ws_root) is operator/daemon-controlled,
+// not attacker-influenced; raw fs allowed file-wide. This file spawns no processes.
+#![allow(clippy::disallowed_methods)]
+
 //! `daemon` — the host binary that assembles an engine, its host, tools, and orchestration.
 //!
 //! It is the role-by-config node (workspace-layout §6):
@@ -314,7 +318,17 @@ struct GatewayModel {
 /// `author/slug` so they feed `ProfileSpec.model` verbatim.
 async fn daemon_cloud_gateway_models(base: &str) -> Vec<ModelDescriptor> {
     let url = format!("{}models", NodeConfig::ensure_trailing_slash(base));
-    let resp = match reqwest::Client::new().get(&url).send().await {
+    // Route through the SSRF-safe egress client. `base` is the operator-configured Daemon Cloud
+    // gateway (config-influenced), so `Redirects::None` is used: it may legitimately be a private/
+    // self-hosted host, and a `/models` probe never needs to follow a redirect.
+    let client = match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon cloud gateway egress client init");
+            return Vec::new();
+        }
+    };
+    let resp = match client.get(&url, daemon_egress::Redirects::None).await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::debug!(status = %r.status(), "daemon cloud gateway /models non-success");
@@ -2261,6 +2275,23 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             Arc::new(daemon_skills::FileSkillUsageLog::open(root))
                 as Arc<dyn daemon_common::SkillUsageLog>
         }));
+        // Opt-in skill-bundle verify-at-import (wire v28), default-off: only when `[skills].
+        // import_verify_key` is set does an import require a valid signature. A malformed key
+        // disables enforcement (warn) rather than failing boot — signing stays optional.
+        if let Some(key_hex) = &cfg.skills.import_verify_key {
+            match daemon_skills::SkillBundleVerifier::from_public_hex(key_hex) {
+                Some(verifier) => {
+                    provider = provider.with_import_verification(Arc::new(verifier));
+                    tracing::info!(
+                        "skill-bundle verify-at-import enabled (trusted key configured)"
+                    );
+                }
+                None => tracing::warn!(
+                    "[skills].import_verify_key is not a valid ed25519 public key (hex dCBOR); \
+                     skill-bundle import verification stays OFF"
+                ),
+            }
+        }
         let provider = Arc::new(provider);
         // The engine-path resolver: each session's engine gets its own profile's tools + index.
         let resolver_provider = provider.clone();
@@ -2489,20 +2520,39 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // reassigning `node` before any listener spawn. The audit shares the node's durable `store` +
     // journal `signer` so its records land on — and verify against — the node's own journal.
     let auth_audit = daemon_host::AuthAudit::shared(store.clone(), signer.clone());
+    // Cluster F (Part A): the shared per-principal revocation registry. Wired into BOTH the node
+    // (admin ops bump it) and the transport authenticator (connections capture their principal's
+    // epoch), so a `session_revoke`/`user_disable`/role/password change synchronously tears down the
+    // affected principal's already-open mux connections and their live stream pumps.
+    let revocations = daemon_host::SessionRevocations::new();
     let node = Arc::new(
         (*node)
             .clone()
             .with_auth_store(auth_store.clone())
-            .with_auth_audit(auth_audit.clone()),
+            .with_auth_audit(auth_audit.clone())
+            .with_revocations(revocations.clone())
+            // Cluster F (Part B): the same per-profile broker the engine leases through, so
+            // credential_remove/credential_set bump the profile authority's lease epoch.
+            .with_credential_revoker(owner_broker.clone()),
     );
     // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
     // keeps its own reference for the auth check.
-    let authenticator =
-        Arc::new(daemon_host::Authenticator::new(auth_store.clone()).with_audit(auth_audit));
+    let authenticator = Arc::new(
+        daemon_host::Authenticator::new(auth_store.clone())
+            .with_audit(auth_audit)
+            .with_revocations(revocations),
+    );
     // B5: `[api].local_trust` defaults to `system` — the Unix socket / FFI / in-process HTTP run as
     // the deliberate full-trust principal. Disable it to require SCRAM on the Unix socket and fully
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
     let local_trust = cfg.api.local_trust.is_some();
+
+    // Cluster F: one secure-by-default ingress governor, shared by the networked carriers (TLS/TCP,
+    // WebSocket, web front). Bounds max frame/decoded size, per-peer new-connection rate, and live
+    // connection concurrency (fail-closed). The local-trust Unix socket / named pipe carriers build
+    // their own secure-default limits internally and are exempt from rate + concurrency (§1.6), so a
+    // networked flood cannot starve the operator CLI.
+    let ingress_governor = daemon_common::IngressGovernor::new(cfg.api.ingress_limits());
 
     // Bind the api socket (fresh) and serve the unified surface over it. A managed/user launch may
     // target a nested runtime path (e.g. under $XDG_RUNTIME_DIR) whose parent dir does not exist
@@ -2580,6 +2630,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 server_config,
                 node.clone(),
                 authenticator.clone(),
+                ingress_governor.clone(),
             )))
         }
         (Some(_), _, _) => {
@@ -2605,6 +2656,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 node.clone(),
                 authenticator.clone(),
                 cfg.api.ws_allowed_origins.clone(),
+                ingress_governor.clone(),
             )))
         }
         None => None,
@@ -2679,6 +2731,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 authenticator.clone(),
                 cfg.api.ws_allowed_origins.clone(),
                 health,
+                ingress_governor.clone(),
             )))
         }
         None => None,

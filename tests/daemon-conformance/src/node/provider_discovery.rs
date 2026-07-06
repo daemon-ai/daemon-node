@@ -231,6 +231,7 @@ async fn projector_records_are_excluded_and_activate_rejects() {
         context_length: None,
         file_type: None,
         mmproj_path: None,
+        sha256: None,
     };
     let text_id = daemon_models::model_id(&text_ref);
     let proj_id = daemon_models::model_id(&proj_ref);

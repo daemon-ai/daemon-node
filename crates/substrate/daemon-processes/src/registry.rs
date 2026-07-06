@@ -405,7 +405,11 @@ impl ProcessRegistry {
     ///
     /// [`LocalEnvironment`]: https://docs.rs/daemon-core
     pub fn spawn(self: &Arc<Self>, req: SpawnRequest) -> Result<Arc<ProcSession>, SpawnError> {
-        std::fs::create_dir_all(&req.cwd)?;
+        // Creates the caller-supplied working dir for the gated background-process capability (the
+        // same high-friction surface as the `sh -c` gate below).
+        #[allow(clippy::disallowed_methods)]
+        let mk = std::fs::create_dir_all(&req.cwd);
+        mk?;
         let id = self.gen_id();
         let state = ProcState {
             exited: false,
@@ -445,17 +449,25 @@ impl ProcessRegistry {
         // `exec 2>&1` merges stderr into the one captured stream with true ordering; `set +m`
         // silences job-control noise (hermes parity).
         let script = format!("exec 2>&1\nset +m\n{line}");
+        // THE sanctioned `sh -c` gate: the one high-friction background-shell capability (Phase 2).
+        // This is the single place a shell string is spawned; the workspace-wide Command::new ban
+        // makes any *other* `sh -c` site fail clippy, forcing it back through this gate.
+        #[allow(clippy::disallowed_methods)]
         let mut command = std::process::Command::new("sh");
         command
             .arg("-c")
             .arg(script)
             .current_dir(cwd)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("PYTHONUNBUFFERED", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        // EnvPolicy::Clean — the one gated background `sh -c` capability: scrubbed env (PATH only)
+        // plus the unbuffered marker, unchanged. Routed through the sanctioned `apply` on the std
+        // `Command` (EnvSink), so this env stays a declared, lintable choice (Cluster E).
+        daemon_common::env_policy::EnvPolicy::Clean {
+            allowlist: vec!["PATH".into()],
+        }
+        .apply(&mut command, &[("PYTHONUNBUFFERED", "1")]);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;

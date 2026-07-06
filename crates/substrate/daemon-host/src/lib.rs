@@ -31,6 +31,9 @@
 //! See `docs/specs/daemon-host-spec.md`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+// (workspace_fs.rs production is ContainedRoot-only and stays guarded; trusted stores are file-anchored.)
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 pub mod adapters;
 pub mod agent_session;
@@ -55,6 +58,7 @@ pub mod process_agent;
 pub mod profiles;
 pub mod request_context;
 pub mod revision;
+pub mod revocation;
 pub mod routing;
 pub mod services;
 pub mod session_index;
@@ -123,9 +127,10 @@ pub use process_agent::ProcessAgentUnit;
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use request_context::{
     current_context, current_principal, with_request_context, AuthMethod, RequestContext,
-    SYSTEM_USERNAME,
+    INTERNAL_USERNAME, SYSTEM_USERNAME,
 };
 pub use revision::FileRevisionLog;
+pub use revocation::{CredentialRevoker, RevocationGuard, SessionRevocations};
 pub use routing::{
     DeliveryPolicy, OriginMatcher, Resolved, RoutingRegistry, ScopePattern, SessionBinding,
     TransportPattern,

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here serves the static web bundle. The request path is only a KEY into a startup-scanned
+// allow-map (`WebRoot::lookup`); `file_path` is a pre-enumerated bundle file, never concatenated from
+// the request -- so no path traversal, and ContainedRoot is not required. Raw fs allowed file-wide.
+#![allow(clippy::disallowed_methods)]
+
 //! The single-origin web front for the browser GUI: ONE plain-HTTP listener that serves the Qt
 //! WASM app bundle as static files AND hosts the same mux-over-WebSocket carrier ([`crate::ws`])
 //! on `GET /ws` — so a browser loads the GUI *from the daemon* and connects back to the very
@@ -52,6 +57,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use daemon_api::NodeApi;
+use daemon_common::{IngressGovernor, IngressLimits, PeerKey};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -60,7 +66,7 @@ use tokio_tungstenite::tungstenite::http::header::HOST;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::authn::Authenticator;
-use crate::ws::{apply_upgrade_policy, serve_mux_over_ws};
+use crate::ws::{apply_upgrade_policy, serve_mux_over_ws, ws_config};
 
 /// The bundle's entry page, served for `/` (the Qt wasm installer's flat layout).
 const INDEX_FILE: &str = "daemon-app.html";
@@ -551,22 +557,39 @@ pub async fn serve_web(
     auth: Arc<Authenticator>,
     allowed_origins: Vec<String>,
     health: WebHealth,
+    governor: Arc<IngressGovernor>,
 ) {
     let site = Arc::new(site);
     let allowed = Arc::new(allowed_origins);
     let health = Arc::new(health);
+    let limits = governor.limits();
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // Cluster F: per-peer rate + global concurrency (fail-closed) per connection —
+                // covering both the static surface and the `/ws` upgrade; a refused connection is
+                // dropped cleanly.
+                let peer = PeerKey::ip(addr.ip());
+                if let Err(e) = governor.check_peer(&peer) {
+                    tracing::debug!(%addr, "web connection refused: {e}");
+                    continue;
+                }
+                let Some(permit) = governor.admit_connection() else {
+                    tracing::debug!(%addr, "web connection refused: connection cap reached");
+                    continue;
+                };
                 let site = site.clone();
                 let api = api.clone();
                 let auth = auth.clone();
                 let allowed = allowed.clone();
                 let health = health.clone();
                 tokio::spawn(async move {
-                    // A failed conversation (malformed request, refused upgrade, an aborted
-                    // download) is dropped cleanly — never panics the accept loop.
-                    if let Err(e) = handle_conn(stream, &site, api, auth, &allowed, &health).await {
+                    let _permit = permit; // held for the connection (incl. a /ws upgrade); RAII-freed.
+                                          // A failed conversation (malformed request, refused upgrade, an aborted
+                                          // download) is dropped cleanly — never panics the accept loop.
+                    if let Err(e) =
+                        handle_conn(stream, &site, api, auth, &allowed, &health, limits).await
+                    {
                         tracing::debug!("web connection ended: {e}");
                     }
                 });
@@ -589,6 +612,7 @@ async fn handle_conn(
     auth: Arc<Authenticator>,
     allowed_origins: &[String],
     health: &WebHealth,
+    limits: IngressLimits,
 ) -> io::Result<()> {
     let mut carry = Vec::new();
     loop {
@@ -605,10 +629,10 @@ async fn handle_conn(
             // past it) so its server handshake re-reads the same request off the live stream.
             let mut replay = head_bytes;
             replay.extend_from_slice(&rest);
-            let ws = accept_web_ws(Rewind::new(replay, stream), allowed_origins)
+            let ws = accept_web_ws(Rewind::new(replay, stream), allowed_origins, limits)
                 .await
                 .map_err(io::Error::other)?;
-            return serve_mux_over_ws(ws, api, auth).await;
+            return serve_mux_over_ws(ws, api, auth, limits).await;
         }
 
         let keep = if head.path() == HEALTHZ_PATH {
@@ -666,17 +690,22 @@ async fn read_head(
 async fn accept_web_ws<S>(
     stream: S,
     allowed_origins: &[String],
+    limits: IngressLimits,
 ) -> Result<WebSocketStream<S>, tokio_tungstenite::tungstenite::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
-        let mut effective = allowed_origins.to_vec();
-        if let Some(own) = self_origin(req) {
-            effective.push(own);
-        }
-        apply_upgrade_policy(req, resp, &effective)
-    })
+    tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        |req: &Request, resp: Response| {
+            let mut effective = allowed_origins.to_vec();
+            if let Some(own) = self_origin(req) {
+                effective.push(own);
+            }
+            apply_upgrade_policy(req, resp, &effective)
+        },
+        Some(ws_config(&limits)),
+    )
     .await
 }
 

@@ -144,6 +144,27 @@ fn spec_from(map: &serde_json::Map<String, serde_json::Value>) -> Result<CronSpe
         .unwrap_or_default()
         .to_owned();
     check_prompt(&prompt)?;
+    // Cluster E: the agent `cron` tool may never author the operator-tier fields. `workdir` becomes a
+    // Bound workspace (per-session sandbox escape) and `enabled_toolsets` pins an unattended run's
+    // tool surface — both are operator-only (gated centrally in `CronOps`). Reject them here as
+    // defense in depth so a tool-authored spec can never carry them, independent of whether a request
+    // principal is bound during the turn.
+    if map
+        .get("workdir")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return Err("workdir is operator-only and cannot be set from the agent cron tool".into());
+    }
+    if map
+        .get("enabled_toolsets")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return Err(
+            "enabled_toolsets is operator-only and cannot be set from the agent cron tool".into(),
+        );
+    }
     let str_field = |k: &str| {
         map.get(k)
             .and_then(|v| v.as_str())
@@ -209,7 +230,7 @@ impl Tool for CronTool {
     }
 
     fn schema(&self) -> &str {
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","list","update","pause","resume","run","remove"],"description":"the operation; defaults to list"},"id":{"type":"string","description":"the job id (required for update/pause/resume/run/remove)"},"name":{"type":"string","description":"a human name for the job (required for create/update)"},"schedule":{"type":"string","description":"cron expr (e.g. \"0 9 * * *\"), @every <dur>, or an ISO timestamp (required for create/update)"},"prompt":{"type":"string","description":"the agent instruction the fired run executes (a cron run has no chat memory, so be self-contained)"},"timezone":{"type":"string","description":"IANA timezone for cron evaluation (e.g. \"Europe/Berlin\")"},"repeat":{"type":"integer","description":"auto-delete after this many fires; omit for unlimited"},"jitter_secs":{"type":"integer","description":"random 0..=N second spread applied to each fire"},"enabled":{"type":"boolean","description":"create armed (true, default) or paused (false)"},"overlap":{"type":"string","enum":["skip","allow","queue"],"description":"behavior when a fire overlaps a still-running run (default skip)"},"catch_up":{"type":"string","enum":["grace","skip","always"],"description":"missed-fire catch-up policy when overdue (default grace)"},"target":{"type":"string","description":"the profile/agent the run is bound to"},"deliver":{"type":"string","description":"delivery routing: \"origin\", \"all\", \"<transport>:<chat>\", or omit for store-only"},"script":{"type":"string","description":"a node-scripts-relative path to run before/instead of the agent (no absolute paths, no ..)"},"no_agent":{"type":"boolean","description":"run script only, no LLM turn (requires script)"},"context_from":{"type":"array","items":{"type":"string"},"description":"job ids whose latest output is injected into this job's prompt (output chaining)"},"enabled_toolsets":{"type":"array","items":{"type":"string"},"description":"restrict the run's toolset to these tool names"},"skills":{"type":"array","items":{"type":"string"},"description":"skill names to preload (their content is injected ahead of the prompt) before the run"},"workdir":{"type":"string","description":"absolute working directory the run is bound to"},"model":{"type":"string","description":"per-job model override"},"provider":{"type":"string","description":"per-job provider override"}},"required":["action"]}"#
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","list","update","pause","resume","run","remove"],"description":"the operation; defaults to list"},"id":{"type":"string","description":"the job id (required for update/pause/resume/run/remove)"},"name":{"type":"string","description":"a human name for the job (required for create/update)"},"schedule":{"type":"string","description":"cron expr (e.g. \"0 9 * * *\"), @every <dur>, or an ISO timestamp (required for create/update)"},"prompt":{"type":"string","description":"the agent instruction the fired run executes (a cron run has no chat memory, so be self-contained)"},"timezone":{"type":"string","description":"IANA timezone for cron evaluation (e.g. \"Europe/Berlin\")"},"repeat":{"type":"integer","description":"auto-delete after this many fires; omit for unlimited"},"jitter_secs":{"type":"integer","description":"random 0..=N second spread applied to each fire"},"enabled":{"type":"boolean","description":"create armed (true, default) or paused (false)"},"overlap":{"type":"string","enum":["skip","allow","queue"],"description":"behavior when a fire overlaps a still-running run (default skip)"},"catch_up":{"type":"string","enum":["grace","skip","always"],"description":"missed-fire catch-up policy when overdue (default grace)"},"target":{"type":"string","description":"the profile/agent the run is bound to"},"deliver":{"type":"string","description":"delivery routing: \"origin\", \"all\", \"<transport>:<chat>\", or omit for store-only"},"script":{"type":"string","description":"a node-scripts-relative path to run before/instead of the agent (no absolute paths, no ..)"},"no_agent":{"type":"boolean","description":"run script only, no LLM turn (requires script)"},"context_from":{"type":"array","items":{"type":"string"},"description":"job ids whose latest output is injected into this job's prompt (output chaining)"},"skills":{"type":"array","items":{"type":"string"},"description":"skill names to preload (their content is injected ahead of the prompt) before the run"},"model":{"type":"string","description":"per-job model override"},"provider":{"type":"string","description":"per-job provider override"}},"required":["action"]}"#
     }
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
@@ -356,11 +377,13 @@ mod tests {
 
     #[test]
     fn spec_maps_full_arg_set() {
+        // The agent-authorable arg set (Cluster E: `workdir`/`enabled_toolsets` are operator-only and
+        // rejected — see `spec_from_rejects_operator_only_workdir_and_toolset`).
         let spec = spec_from(&obj(
             r#"{"name":"digest","schedule":"@every 1h","prompt":"go","timezone":"UTC",
                 "repeat":3,"jitter_secs":30,"no_agent":true,"script":"scripts/run.sh",
-                "context_from":["job-a"],"deliver":"origin","enabled_toolsets":["fs"],
-                "overlap":"queue","catch_up":"always","target":"opus","workdir":"/srv/p",
+                "context_from":["job-a"],"deliver":"origin",
+                "overlap":"queue","catch_up":"always","target":"opus",
                 "model":"gpt-5","provider":"genai","skills":["briefing","calendar"]}"#,
         ))
         .unwrap();
@@ -370,11 +393,9 @@ mod tests {
         assert!(spec.no_agent);
         assert_eq!(spec.script.as_deref(), Some("scripts/run.sh"));
         assert_eq!(spec.context_from, vec!["job-a".to_owned()]);
-        assert_eq!(spec.enabled_toolsets, Some(vec!["fs".to_owned()]));
         assert_eq!(spec.overlap, OverlapPolicy::Queue);
         assert_eq!(spec.catch_up, CatchUpPolicy::Always);
         assert_eq!(spec.target.as_deref(), Some("opus"));
-        assert_eq!(spec.workdir.as_deref(), Some("/srv/p"));
         assert_eq!(spec.model.as_deref(), Some("gpt-5"));
         assert_eq!(spec.provider.as_deref(), Some("genai"));
         assert_eq!(
@@ -391,7 +412,7 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(tool.schema()).expect("schema is valid JSON");
         let props = schema["properties"].as_object().expect("properties object");
-        // Every CronSpec-backed field the agent can set is discoverable in the schema.
+        // Every agent-authorable CronSpec-backed field is discoverable in the schema.
         for field in [
             "action",
             "id",
@@ -409,14 +430,38 @@ mod tests {
             "script",
             "no_agent",
             "context_from",
-            "enabled_toolsets",
             "skills",
-            "workdir",
             "model",
             "provider",
         ] {
             assert!(props.contains_key(field), "schema must advertise `{field}`");
         }
+        // Cluster E: the operator-only fields are NOT advertised — the agent is not told it can set
+        // them (they are rejected in `spec_from` and gated in `CronOps`).
+        for field in ["workdir", "enabled_toolsets"] {
+            assert!(
+                !props.contains_key(field),
+                "schema must NOT advertise operator-only `{field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_from_rejects_operator_only_workdir_and_toolset() {
+        // Cluster E: the agent `cron` tool must never author the operator-tier fields. `workdir`
+        // becomes a Bound workspace (sandbox escape) and `enabled_toolsets` pins an unattended run's
+        // tool surface — both are refused unconditionally here (defense in depth on top of the
+        // CronOps operator gate).
+        assert!(spec_from(&obj(
+            r#"{"name":"x","schedule":"0 9 * * *","workdir":"/srv/p"}"#
+        ))
+        .is_err());
+        assert!(spec_from(&obj(
+            r#"{"name":"x","schedule":"0 9 * * *","enabled_toolsets":["fs"]}"#
+        ))
+        .is_err());
+        // A blank/empty workdir is not "setting" it — still accepted.
+        assert!(spec_from(&obj(r#"{"name":"x","schedule":"0 9 * * *","workdir":""}"#)).is_ok());
     }
 
     #[test]

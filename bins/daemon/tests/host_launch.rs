@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: integration test crate; raw fs/reqwest/Command are expected in tests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! THE HOST-LAUNCH BOOT GATE: the `daemon` binary in its host role now BOOTS with no model provider
 //! configured (no silent mock — the node installs `UnconfiguredProvider`, and a turn against an

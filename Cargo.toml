@@ -25,6 +25,12 @@ unused = { level = "warn", priority = -1 }
 todo = "warn"
 unimplemented = "warn"
 dbg_macro = "warn"
+# Phase 4 hardening guardrails (config in clippy.toml): raw fs outside ContainedRoot, raw reqwest
+# clients outside daemon-egress, undeclared process spawns. `just lint`'s `-D warnings` makes these
+# hard errors. `disallowed_types` carries the reqwest ban decoupled from the fs `disallowed_methods`
+# allows, so an fs `#[allow]` can never silently re-open the egress hole.
+disallowed_methods = "warn"
+disallowed_types = "warn"
 
 [workspace.dependencies]
 # shared third-party deps (single source of truth)
@@ -46,6 +52,11 @@ thiserror = "2"
 anyhow = "1"
 futures = "0.3"
 strsim = "0.11"
+# UTS#46 IDNA/punycode host normalization for the `check_url` SSRF gate (safety/url.rs): fold a
+# unicode/punycode host to the canonical ASCII form the resolver uses, so an alternate-separator /
+# fullwidth-digit host cannot slip an IP-literal or `localhost` past the denylist. Already resolved
+# in-tree transitively (reqwest -> url -> idna), so this adds no new crate/license (deny stays green).
+idna = "1"
 # SASL state machine for the node authentication handshake (SCRAM-SHA-256 / PLAIN / EXTERNAL). v2+
 # is dual Apache-2.0/MIT. default-features off drops gssapi (native libgssapi) + the SSO mechanisms;
 # we enable only what the node serves. Isolated to `daemon-host` (the transport crate).
@@ -127,6 +138,24 @@ wiremock = "0.6"
 # the graceful-shutdown launch gate (dev) sends SIGTERM/SIGINT to the real spawned binary exactly
 # the way a container runtime stops it.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
+# Unix syscall wrappers for the Phase 3 `ContainedRoot` capability (Cluster C): `openat2`
+# (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | NO_MAGICLINKS) on Linux plus the `openat`/`fstatat`/
+# `mkdirat`/`unlinkat`/`renameat` family for the cross-unix (macOS) fd-relative fallback. rustix's
+# public API is SAFE (it wraps the raw syscalls), so `daemon-core`'s `#![forbid(unsafe_code)]` is
+# preserved. Already resolved in-tree transitively (rustix 1.1.4), so promoting it to a direct dep of
+# `daemon-core` adds zero crates to the graph. Unix-only — the non-unix build falls back to the
+# lexical `contain()` + `symlink_metadata` stub and never links rustix.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+# Low-level syscall constants/wrappers for the `daemon-sandbox` Linux exec sandbox: `prctl`
+# (NO_NEW_PRIVS), `AF_INET`/`AF_INET6`, and `SYS_socket` for the seccomp filter. Consumed only by
+# `daemon-sandbox` under `[target.'cfg(target_os="linux")']` (else pulled transitively by rustix/nix).
+libc = "0.2"
+# Kernel-enforced exec sandbox (Cluster B/C) for the `execute_code` plain fallback, isolated to the
+# `daemon-sandbox` crate under `[target.'cfg(target_os="linux")']`: Landlock scopes the child's
+# filesystem, seccomp denies INET/INET6 sockets — the case bwrap can't cover (userns unavailable).
+# landlock: MIT OR Apache-2.0; seccompiler: Apache-2.0 OR BSD-3-Clause (both permissive, deny-clean).
+landlock = "0.4.5"
+seccompiler = "0.5.0"
 # Cross-platform pseudo-terminal (wezterm's pty layer) for interactive background CLIs
 # (`shell(pty=true)` → `daemon-processes`). MIT; pins some older transitives (bitflags 1, nix 0.28)
 # — duplicate-version warnings only (deny.toml multiple-versions = "warn").
@@ -233,6 +262,7 @@ daemon-protocol = { path = "crates/contracts/daemon-protocol" }
 daemon-supervision = { path = "crates/contracts/daemon-supervision" }
 daemon-api = { path = "crates/contracts/daemon-api" }
 daemon-core = { path = "crates/engine/daemon-core" }
+daemon-egress = { path = "crates/engine/daemon-egress" }
 daemon-context-lcm = { path = "crates/engine/daemon-context-lcm" }
 daemon-mnemosyne = { path = "crates/memory/daemon-mnemosyne" }
 daemon-providers = { path = "crates/providers/daemon-providers" }
@@ -244,6 +274,7 @@ daemon-auth = { path = "crates/substrate/daemon-auth" }
 daemon-store = { path = "crates/substrate/daemon-store" }
 daemon-workspace-index = { path = "crates/substrate/daemon-workspace-index" }
 daemon-processes = { path = "crates/substrate/daemon-processes" }
+daemon-sandbox = { path = "crates/substrate/daemon-sandbox" }
 daemon-schedule = { path = "crates/substrate/daemon-schedule" }
 daemon-activation = { path = "crates/substrate/daemon-activation" }
 daemon-provision = { path = "crates/substrate/daemon-provision" }

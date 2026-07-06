@@ -20,6 +20,8 @@
 //! provider's diagnostic [`label`](ToolProvider::label) keeps the human-readable `mcp:{server}` form.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,11 +137,16 @@ impl McpClient {
     async fn connect(&self) -> Result<RunningService<RoleClient, ()>, McpClientError> {
         match &self.config.transport {
             McpTransport::Stdio { command, args, env } => {
+                // Spawns the operator-configured MCP stdio server program (argv-only, no shell).
+                #[allow(clippy::disallowed_methods)]
                 let mut cmd = tokio::process::Command::new(command);
                 cmd.args(args);
-                for (k, v) in env {
-                    cmd.env(k, v);
-                }
+                // Declared env policy (Cluster E): `InheritFull` — MCP stdio servers are launched
+                // as trusted node components today and inherit the daemon env by design. NOTE:
+                // server configs can originate from less-trusted sources; if per-entry trust
+                // lands, flip such entries to `EnvPolicy::Clean { allowlist }`. Behavior is
+                // unchanged for now — the config `env` extras layer on top exactly as before.
+                daemon_common::env_policy::EnvPolicy::InheritFull.apply(&mut cmd, env);
                 let transport = TokioChildProcess::new(cmd)
                     .map_err(|e| McpClientError::Connect(e.to_string()))?;
                 ().serve(transport)

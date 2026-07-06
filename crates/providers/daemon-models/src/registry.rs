@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: fs here is the model-catalog manifest under the node data root (daemon-controlled path),
+// not attacker-influenced; raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! The installed-model catalog: a single atomic JSON manifest of [`InstalledModel`] records.
 //!
 //! Chosen over SQLite (the old app's store) because the catalog is small, read-mostly, and benefits
@@ -165,6 +169,7 @@ mod tests {
             context_length: None,
             file_type: None,
             mmproj_path: None,
+            sha256: None,
         }
     }
 

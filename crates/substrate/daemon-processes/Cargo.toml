@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-daemon-common = { workspace = true }
+daemon-common = { workspace = true, features = ["process"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

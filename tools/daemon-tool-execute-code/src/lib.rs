@@ -23,6 +23,8 @@
 //! checkpoints before it runs.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 mod exec;
 mod python;
@@ -33,7 +35,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use daemon_core::{approve_command, Effect, Gate, Tool, ToolCall, ToolOutcome, TurnCx};
+use daemon_core::{
+    approve_command, ContainedRoot, Effect, Gate, Tool, ToolCall, ToolOutcome, TurnCx,
+};
 use daemon_protocol::ToolDetail;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -70,18 +74,23 @@ impl Mode {
     }
 }
 
-/// The OS-sandbox policy for the child process.
+/// The OS-sandbox posture for the child process. Selects among the per-platform kernel backends
+/// (Linux bwrap → Landlock+seccomp; macOS `sandbox-exec`) behind one policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxPolicy {
-    /// Use bubblewrap when it is present *and* usable (user namespaces work), else a plain
-    /// subprocess. The default.
+    /// Use the strongest available kernel backend for this platform; if none is usable, run a plain
+    /// (unconfined) subprocess after logging a warning. The default.
     #[default]
     Auto,
-    /// Require bubblewrap: fail the call if it is absent or unusable (no silent unsandboxed run).
-    Bwrap,
-    /// Never sandbox — always a plain subprocess.
-    None,
+    /// Require a kernel backend: fail the call if none is usable (no silent unsandboxed run). The
+    /// legacy `bwrap` label still parses to this posture.
+    #[serde(alias = "bwrap")]
+    Require,
+    /// Never sandbox — an explicit, high-friction operator choice for an unconfined subprocess. The
+    /// legacy `none` label still parses to this posture.
+    #[serde(alias = "none")]
+    Plain,
 }
 
 /// The child's network policy (only enforced under the bwrap sandbox).
@@ -157,6 +166,8 @@ struct ExecDetail<'a> {
     status: &'a str,
     mode: &'a str,
     sandboxed: bool,
+    /// The chosen backend label (`bwrap`/`landlock`/`sandbox-exec`/`plain`).
+    backend: &'a str,
     exit_code: i32,
     duration_seconds: f64,
     stdout_len: usize,
@@ -176,10 +187,10 @@ struct ResultJson {
     error: Option<String>,
 }
 
-/// The internal outcome of a completed run plus the sandbox flag (for the detail envelope).
+/// The internal outcome of a completed run plus the chosen sandbox backend (for the detail envelope).
 struct Executed {
     outcome: RunOutcome,
-    sandboxed: bool,
+    kind: sandbox::SandboxKind,
     mode: Mode,
 }
 
@@ -226,8 +237,11 @@ impl Tool for ExecuteCodeTool {
 
         // §12 approval gate — identical shape to the shell tool (policy-driven; durable defer parks).
         let prompt = approval_prompt(&args.code, mode);
-        match approve_command(cx, prompt.clone()).await {
-            Gate::Proceed => {}
+        // `execute_code` does not expose a resolved-command fingerprint (Phase 2 deferred it), so it
+        // passes `None`: no "allow permanently" offer; a durable permanent decision degrades to a
+        // single allow.
+        match approve_command(cx, prompt.clone(), None).await {
+            Gate::Proceed { .. } => {}
             Gate::Reject(reason) => {
                 return ToolOutcome::text(
                     call.call_id.clone(),
@@ -251,7 +265,13 @@ impl Tool for ExecuteCodeTool {
         }
 
         let ws_root = cx.exec.cwd().to_path_buf();
-        match self.execute(&ws_root, mode, &args.code, &cx.cancel).await {
+        // Cluster E: on an untrusted (operator-bound) workspace root, project mode must not
+        // auto-trust a workspace-discovered venv interpreter — thread the trust bit into resolution.
+        let trusted = cx.exec.workspace_trusted();
+        match self
+            .execute(&ws_root, mode, trusted, &args.code, &cx.cancel)
+            .await
+        {
             Ok(exec) => self.success_outcome(call, exec),
             Err(e) => setup_error_outcome(call, &e.to_string()),
         }
@@ -264,12 +284,13 @@ impl ExecuteCodeTool {
         &self,
         ws_root: &Path,
         mode: Mode,
+        trusted: bool,
         code: &str,
         cancel: &CancellationToken,
     ) -> std::io::Result<Executed> {
         // Fail before staging when the interpreter or a required sandbox is unavailable, so a
         // setup error never leaves a stray staging dir behind.
-        let interpreter = python::resolve_interpreter(mode, ws_root)
+        let interpreter = python::resolve_interpreter(mode, ws_root, trusted)
             .await
             .ok_or_else(|| {
                 std::io::Error::new(
@@ -279,40 +300,53 @@ impl ExecuteCodeTool {
             })?;
         let kind = sandbox::resolve(self.settings.sandbox).await?;
 
-        let staging = ws_root.join(".execute_code").join(new_run_id());
-        tokio::fs::create_dir_all(&staging).await?;
+        // Stage inside the workspace through `ContainedRoot` (openat2 RESOLVE_BENEATH |
+        // RESOLVE_NO_SYMLINKS): the `.execute_code/<run_id>` dir and its `script.py` are created
+        // fd-relative to the workspace root, so a symlinked `.execute_code` (or any symlinked
+        // staging component) is refused rather than followed out of the workspace. `open` also
+        // creates the root if missing (the historical lazy `ensure_root`).
+        let rel_stage = Path::new(".execute_code").join(new_run_id());
+        let rel_script = rel_stage.join("script.py");
+        let root = ContainedRoot::open(ws_root)?;
+        root.create_dir_all(&rel_stage).await?;
+        root.write(&rel_script, code.as_bytes()).await?;
+
+        // Absolute paths for the *child* (its argv + cwd) — resolved by the OS at spawn; the
+        // daemon-side opens above are the containment-sensitive ones and never touch raw `fs`.
+        let staging = ws_root.join(&rel_stage);
+        let script = ws_root.join(&rel_script);
         let cwd = match mode {
             Mode::Project => ws_root.to_path_buf(),
-            Mode::Strict => staging.clone(),
+            Mode::Strict => staging,
         };
 
-        let sandboxed = matches!(kind, sandbox::SandboxKind::Bwrap);
         let run = self
-            .run_staged(&staging, &interpreter, &cwd, kind, code, cancel)
+            .run_staged(&script, &interpreter, &cwd, kind, cancel)
             .await;
-        // Best-effort cleanup regardless of outcome — the staging dir is ours and disposable.
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        // Best-effort contained cleanup: `remove_dir_all_sync` unlinks a symlinked entry as the link
+        // (never follows it out of root). Run off the reactor (blocking recursive remove).
+        let ws = ws_root.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            ContainedRoot::open(&ws).and_then(|r| r.remove_dir_all_sync(&rel_stage))
+        })
+        .await;
 
         run.map(|outcome| Executed {
             outcome,
-            sandboxed,
+            kind,
             mode,
         })
     }
 
-    /// Write `script.py` into `staging`, build the argv, and run it to completion.
+    /// Build the argv for the pre-staged `script` and run it to completion.
     async fn run_staged(
         &self,
-        staging: &Path,
+        script: &Path,
         interpreter: &Path,
         cwd: &Path,
         kind: sandbox::SandboxKind,
-        code: &str,
         cancel: &CancellationToken,
     ) -> std::io::Result<RunOutcome> {
-        let script = staging.join("script.py");
-        tokio::fs::write(&script, code).await?;
-
         let path_env = std::env::var_os("PATH").unwrap_or_default();
         let tz = std::env::var("TZ").ok().filter(|s| !s.is_empty());
         let argv = sandbox::argv(
@@ -320,10 +354,14 @@ impl ExecuteCodeTool {
             self.settings.network,
             cwd,
             interpreter,
-            &script,
+            script,
             &path_env,
             tz.as_deref(),
         );
+        // The in-process (Landlock+seccomp) backend is applied at spawn; the argv-wrapper backends
+        // (bwrap, sandbox-exec) carry their confinement in `argv` and pass no in-process spec.
+        let confine = (kind == sandbox::SandboxKind::Landlock)
+            .then(|| sandbox::landlock_spec(cwd, interpreter, self.settings.network));
         let caps = OutputCaps {
             stdout: self.settings.max_stdout_bytes,
             stderr: self.settings.max_stderr_bytes,
@@ -335,6 +373,7 @@ impl ExecuteCodeTool {
             tz,
             self.settings.timeout,
             caps,
+            confine,
             cancel,
         )
         .await
@@ -397,7 +436,8 @@ impl ExecuteCodeTool {
         let detail = ExecDetail {
             status: status_label,
             mode: exec.mode.as_str(),
-            sandboxed: exec.sandboxed,
+            sandboxed: exec.kind.is_confined(),
+            backend: exec.kind.label(),
             exit_code,
             duration_seconds: secs,
             stdout_len,

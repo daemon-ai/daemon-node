@@ -65,6 +65,12 @@ pub(crate) struct RunOutcome {
 }
 
 /// Spawn `argv` in `cwd` and run it to completion, honoring `timeout` and `cancel`.
+///
+/// When `confine` is `Some`, the in-process (Linux Landlock+seccomp) sandbox is installed on the
+/// child at spawn (a no-op off Linux); `TMPDIR` is redirected under the working dir so the child's
+/// temp files stay inside the sandbox's writable scope. Argv-wrapper backends (bwrap, `sandbox-exec`)
+/// carry their confinement in `argv` and pass `confine = None`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_subprocess(
     argv: &[OsString],
     cwd: &Path,
@@ -72,20 +78,44 @@ pub(crate) async fn run_subprocess(
     tz: Option<String>,
     timeout: Duration,
     caps: OutputCaps,
+    confine: Option<daemon_sandbox::SandboxSpec>,
     cancel: &CancellationToken,
 ) -> std::io::Result<RunOutcome> {
+    // Spawns the resolved interpreter (argv[0]) with an argv vector (no shell); env is scrubbed
+    // below. Runs inside the execute_code kernel sandbox where applicable.
+    #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)
-        .env_clear()
-        .env("PATH", &path_env)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // EnvPolicy::Clean — agent-facing execute_code interpreter: scrub everything, then set exactly
+    // the declared extras (PATH carries the caller-computed `path_env`, i.e. `var_os("PATH")`; the
+    // markers layer on top). Byte-identical to the prior `env_clear()` + explicit `.env` calls; now
+    // a declared, lintable policy (Cluster E). `TMPDIR` is carried losslessly as an OsStr.
+    let mut extra: Vec<(&str, OsString)> = vec![
+        ("PATH", path_env),
+        ("PYTHONDONTWRITEBYTECODE", OsString::from("1")),
+    ];
     if let Some(tz) = &tz {
-        cmd.env("TZ", tz);
+        extra.push(("TZ", OsString::from(tz)));
+    }
+    if let Some(spec) = &confine {
+        // Keep the child's temp files inside the sandbox's writable scope (Landlock cannot grant a
+        // private /tmp), then install the in-process confinement before spawn.
+        extra.push(("TMPDIR", cwd.as_os_str().to_os_string()));
+        daemon_common::env_policy::EnvPolicy::Clean {
+            allowlist: Vec::new(),
+        }
+        .apply(&mut cmd, &extra);
+        daemon_sandbox::confine_command(&mut cmd, spec)?;
+    } else {
+        daemon_common::env_policy::EnvPolicy::Clean {
+            allowlist: Vec::new(),
+        }
+        .apply(&mut cmd, &extra);
     }
     // A fresh process group so the timeout/cancel path can signal the whole tree (the child plus any
     // grandchildren it spawns), not just the direct child.

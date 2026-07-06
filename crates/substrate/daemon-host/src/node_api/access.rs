@@ -76,6 +76,16 @@ impl NodeApiImpl {
             .ok_or_else(|| ApiError::Unsupported("access control not available".into()))
     }
 
+    /// Tear down `user_id`'s live mux connections (Cluster F, Part A): bump the principal's
+    /// revocation epoch so a connection holding the old epoch is closed and its live stream pumps
+    /// end. Called **after** the store mutation has committed (its `conn` lock already released), so
+    /// the epoch bump never runs under the store lock. A no-op when no revocation registry is wired.
+    fn revoke_principal(&self, user_id: &str) {
+        if let Some(revocations) = &self.revocations {
+            revocations.revoke(user_id);
+        }
+    }
+
     /// Project a store [`UserRecord`] onto the wire [`AccessUser`] (resolving its roles). No secrets.
     fn access_user(store: &AuthStore, rec: UserRecord) -> Result<AccessUser, ApiError> {
         let roles = store
@@ -133,6 +143,12 @@ impl AccessControlApi for NodeApiImpl {
         store
             .set_disabled_guarded(&user_id, disabled)
             .map_err(auth_err)?;
+        // Disabling revokes the user's store sessions; also tear down any live mux connection so a
+        // disabled account cannot keep acting on an already-open connection. (Re-enabling need not
+        // revoke — no live connection to invalidate.)
+        if disabled {
+            self.revoke_principal(&user_id);
+        }
         if let Some(a) = &self.auth_audit {
             a.user_disabled(&user_id, disabled).await;
         }
@@ -147,6 +163,9 @@ impl AccessControlApi for NodeApiImpl {
         store
             .set_roles_guarded(&user_id, &parsed)
             .map_err(auth_err)?;
+        // A role change alters the effective capability set; tear down live connections so they
+        // cannot keep acting under the pre-change capabilities.
+        self.revoke_principal(&user_id);
         if let Some(a) = &self.auth_audit {
             a.roles_changed(&user_id, &roles).await;
         }
@@ -160,6 +179,9 @@ impl AccessControlApi for NodeApiImpl {
         // coherent); we additionally revoke the user's sessions so a reset forces re-login.
         store.set_password(&user_id, &password).map_err(auth_err)?;
         store.revoke_user_sessions(&user_id).map_err(auth_err)?;
+        // A password reset revokes store sessions; also tear down live mux connections so the old
+        // credential cannot keep acting on an already-open connection.
+        self.revoke_principal(&user_id);
         if let Some(a) = &self.auth_audit {
             a.password_reset(&user_id).await;
         }
@@ -189,6 +211,9 @@ impl AccessControlApi for NodeApiImpl {
         require_admin()?;
         let store = self.auth_store()?;
         store.revoke_user_sessions(&user_id).map_err(auth_err)?;
+        // Tear down any live mux connection for this user (Cluster F): the store delete alone only
+        // blocks reconnect; the epoch bump closes an already-open connection.
+        self.revoke_principal(&user_id);
         if let Some(a) = &self.auth_audit {
             a.sessions_revoked(&user_id).await;
         }

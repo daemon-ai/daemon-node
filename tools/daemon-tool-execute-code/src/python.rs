@@ -20,8 +20,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve the child interpreter for `mode`, rooted at the session workspace `ws_root`. Returns the
 /// first candidate that exists, is executable, and is Python >= 3.8; `None` if none qualifies.
-pub(crate) async fn resolve_interpreter(mode: Mode, ws_root: &Path) -> Option<PathBuf> {
-    for cand in candidate_paths(mode, ws_root) {
+///
+/// `trusted` reflects whether `ws_root` is a node-managed isolated sandbox (`true`) or an
+/// operator-bound external directory whose contents may be attacker-influenced (`false`; Cluster E).
+/// On an untrusted root, venv auto-discovery is suppressed so a planted `.venv`/`venv` (or an
+/// inherited `VIRTUAL_ENV`/`CONDA_PREFIX`) is never auto-executed — see [`candidate_paths`].
+pub(crate) async fn resolve_interpreter(
+    mode: Mode,
+    ws_root: &Path,
+    trusted: bool,
+) -> Option<PathBuf> {
+    for cand in candidate_paths(mode, ws_root, trusted) {
         if is_executable_file(&cand) && is_usable_python(&cand).await {
             return Some(cand);
         }
@@ -29,10 +38,14 @@ pub(crate) async fn resolve_interpreter(mode: Mode, ws_root: &Path) -> Option<Pa
     None
 }
 
-/// The ordered interpreter candidates for `mode`.
-fn candidate_paths(mode: Mode, ws_root: &Path) -> Vec<PathBuf> {
+/// The ordered interpreter candidates for `mode`. In `Project` mode on a `trusted` root the venv-aware
+/// candidates (`VIRTUAL_ENV`/`CONDA_PREFIX`, then workspace-local `.venv`/`venv`) precede the system
+/// PATH interpreters. On an *untrusted* root (an operator-bound directory) the venv candidates are
+/// dropped — we never auto-trust a venv discovered under a root whose contents may be
+/// attacker-planted (Cluster E), so project mode resolves the same system-PATH set as `strict`.
+fn candidate_paths(mode: Mode, ws_root: &Path, trusted: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if mode == Mode::Project {
+    if mode == Mode::Project && trusted {
         for var in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
             if let Some(root) = std::env::var_os(var).filter(|v| !v.is_empty()) {
                 push_venv(&mut out, Path::new(&root));
@@ -124,6 +137,9 @@ async fn is_usable_python(path: &Path) -> bool {
 
 /// Fork `<path> -c "…"` and report whether it exits 0 for Python >= 3.8 within [`PROBE_TIMEOUT`].
 async fn probe(path: &Path) -> bool {
+    // Spawns the candidate Python interpreter with `-c <version check>` (python -c, NOT a shell);
+    // argv-only version probe.
+    #[allow(clippy::disallowed_methods)]
     let fut = tokio::process::Command::new(path)
         .arg("-c")
         .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
@@ -135,4 +151,38 @@ async fn probe(path: &Path) -> bool {
         tokio::time::timeout(PROBE_TIMEOUT, fut).await,
         Ok(Ok(status)) if status.success()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cluster E: on an *untrusted* (operator-bound) workspace root, project mode must not offer the
+    /// workspace-local `.venv`/`venv` (nor `VIRTUAL_ENV`/`CONDA_PREFIX`) as interpreter candidates —
+    /// a planted venv there would be silently executed. It falls back to the system PATH interpreters
+    /// only (the same set `strict` mode uses).
+    #[test]
+    fn untrusted_root_skips_workspace_venv_candidates() {
+        let root = Path::new("/ws/session");
+        let trusted = candidate_paths(Mode::Project, root, true);
+        let untrusted = candidate_paths(Mode::Project, root, false);
+
+        let under_venv = |cands: &[PathBuf]| {
+            cands
+                .iter()
+                .any(|c| c.starts_with(root.join(".venv")) || c.starts_with(root.join("venv")))
+        };
+        // Trusted (isolated sandbox) still auto-discovers the workspace venv.
+        assert!(
+            under_venv(&trusted),
+            "trusted project mode should include the workspace .venv/venv"
+        );
+        // Untrusted (Bound) root: no workspace venv candidate is offered.
+        assert!(
+            !under_venv(&untrusted),
+            "untrusted project mode must not include a workspace-local venv candidate"
+        );
+        // Strict mode never adds venv candidates regardless of trust.
+        assert!(!under_venv(&candidate_paths(Mode::Strict, root, true)));
+    }
 }

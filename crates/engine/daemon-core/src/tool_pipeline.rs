@@ -340,7 +340,10 @@ mod tests {
                 async fn request(&self, req: HostRequest) -> HostResponse {
                     HostResponse {
                         request_id: req.request_id,
-                        body: HostResponseBody::Approved(true),
+                        body: HostResponseBody::Approved {
+                            approved: true,
+                            allow_permanent: false,
+                        },
                     }
                 }
             }
@@ -359,6 +362,7 @@ mod tests {
                 pre_approved: false,
                 checkpoints: None,
                 tool_timeout: None,
+                session_allow: &[],
             };
             $body
         }};
@@ -378,7 +382,10 @@ mod tests {
             async fn request(&self, req: HostRequest) -> HostResponse {
                 HostResponse {
                     request_id: req.request_id,
-                    body: HostResponseBody::Approved(true),
+                    body: HostResponseBody::Approved {
+                        approved: true,
+                        allow_permanent: false,
+                    },
                 }
             }
         }
@@ -400,6 +407,7 @@ mod tests {
             pre_approved: false,
             checkpoints: None,
             tool_timeout: None,
+            session_allow: &[],
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -557,7 +565,10 @@ mod tests {
             async fn request(&self, req: HostRequest) -> HostResponse {
                 HostResponse {
                     request_id: req.request_id,
-                    body: HostResponseBody::Approved(true),
+                    body: HostResponseBody::Approved {
+                        approved: true,
+                        allow_permanent: false,
+                    },
                 }
             }
         }
@@ -591,6 +602,7 @@ mod tests {
             pre_approved: false,
             checkpoints: Some(store.as_ref()),
             tool_timeout: None,
+            session_allow: &[],
         };
         let call = ToolCall {
             call_id: "call-1".into(),
@@ -672,7 +684,10 @@ mod tests {
             async fn request(&self, req: HostRequest) -> HostResponse {
                 HostResponse {
                     request_id: req.request_id,
-                    body: HostResponseBody::Approved(true),
+                    body: HostResponseBody::Approved {
+                        approved: true,
+                        allow_permanent: false,
+                    },
                 }
             }
         }
@@ -695,6 +710,7 @@ mod tests {
             pre_approved: false,
             checkpoints: None,
             tool_timeout: timeout,
+            session_allow: &[],
         };
         let call = ToolCall {
             call_id: "c1".into(),

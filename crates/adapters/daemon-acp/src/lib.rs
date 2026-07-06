@@ -31,6 +31,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use async_trait::async_trait;
+use daemon_common::env_policy::EnvPolicy;
 use daemon_common::{ReqId, UnitId};
 use daemon_host::{AgentSession, AgentUnit, JournalFeeder};
 use daemon_protocol::{
@@ -53,6 +54,13 @@ pub struct AcpLaunch {
     pub env: Vec<(String, String)>,
     /// The working directory advertised to the agent in `session/new`.
     pub cwd: PathBuf,
+    /// The declared env policy for the agent subprocess (Cluster E): always
+    /// [`EnvPolicy::InheritFull`] — an ACP agent is a trusted foreign-engine node component that
+    /// inherits the full daemon env by design (provider keys etc.), with `env` extras added on
+    /// top. `Clean` is **not currently representable** here: the `agent_client_protocol`
+    /// transport owns the actual spawn and exposes no env-clearing hook, so this field is private
+    /// with no `Clean` constructor (declaration-only enforcement until upstream grows one).
+    policy: EnvPolicy,
 }
 
 impl AcpLaunch {
@@ -63,6 +71,7 @@ impl AcpLaunch {
             args: Vec::new(),
             env: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            policy: EnvPolicy::InheritFull,
         }
     }
 
@@ -85,6 +94,19 @@ impl AcpLaunch {
     }
 
     fn into_agent(self) -> (AcpAgent, PathBuf) {
+        // Declared env policy (Cluster E), stated so the spawn is auditable even though the
+        // `agent_client_protocol` transport owns the actual process spawn: `InheritFull` — the
+        // library-spawned agent inherits the full daemon env, and `self.env` extras are passed
+        // through below exactly as before.
+        match &self.policy {
+            EnvPolicy::InheritFull => { /* the transport's spawn inherits; extras follow */ }
+            EnvPolicy::Clean { .. } => {
+                // No constructor produces `Clean` for ACP (see the `policy` field docs): the
+                // transport exposes no env-clearing hook, so a Clean ACP launch is
+                // unrepresentable today.
+                unreachable!("AcpLaunch env policy is always InheritFull (no Clean constructor)")
+            }
+        }
         let name = self
             .program
             .file_name()
@@ -620,10 +642,16 @@ async fn resolve_permission(
     let response = host
         .request(HostRequest {
             request_id,
-            kind: HostRequestKind::Approval { prompt },
+            kind: HostRequestKind::Approval {
+                prompt,
+                allow_permanent_offered: false,
+            },
         })
         .await;
-    let approved = matches!(response.body, HostResponseBody::Approved(true));
+    let approved = matches!(
+        response.body,
+        HostResponseBody::Approved { approved: true, .. }
+    );
 
     let wanted = |kind: &PermissionOptionKind| {
         if approved {
@@ -677,7 +705,10 @@ mod tests {
         async fn request(&self, req: HostRequest) -> HostResponse {
             HostResponse {
                 request_id: req.request_id,
-                body: HostResponseBody::Approved(false),
+                body: HostResponseBody::Approved {
+                    approved: false,
+                    allow_permanent: false,
+                },
             }
         }
     }

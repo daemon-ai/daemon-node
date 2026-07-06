@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
+// Phase 4: the fs here writes the daemon-internal engine inbox IPC dir under the node data root
+// (not attacker-influenced); raw fs allowed file-wide. No process spawns in this file.
+#![allow(clippy::disallowed_methods)]
+
 //! Roster / session-meta projection: the unified durable+live session list, per-turn activity
 //! stamping, and the tree/roster change notifications pushed onto the fleet bus + L3 event feed.
 
@@ -143,41 +147,23 @@ impl NodeApiImpl {
         }
     }
 
-    /// The per-resource ownership gate (Auth 4), enforced *beneath* Auth 2's coarse capability gate.
-    /// The caller must own `session`, or hold the relevant override capability:
-    /// [`SessionControlAny`](daemon_auth::Capability::SessionControlAny) for an interaction op
-    /// (`control = true`) or [`SessionSeeAll`](daemon_auth::Capability::SessionSeeAll) for a
-    /// read-of-one (`control = false`). An `Absent` session passes so the create/`NotFound` flow runs
-    /// downstream; a `LegacyUnowned` (owner-NULL) session is reachable only via the override.
-    ///
-    /// `None` principal is the trusted in-process / local-embedding path (see [`owner_visible`]): the
-    /// transport gate (`authorize`) has already denied any unauthenticated *network* request before
-    /// dispatch, so a missing principal here is the privileged local caller and passes.
-    pub(crate) async fn require_session_access(
-        &self,
-        session: &SessionId,
-        control: bool,
-    ) -> Result<(), ApiError> {
-        // Trusted in-process caller (no transport principal bound): the network gate guarantees a
-        // principal upstream, so `None` is the local embedding / Unix-socket `system` path.
-        let Some(principal) = crate::request_context::current_principal() else {
-            return Ok(());
-        };
-        let override_cap = if control {
-            daemon_auth::Capability::SessionControlAny
-        } else {
-            daemon_auth::Capability::SessionSeeAll
-        };
-        if principal.has(override_cap) {
-            return Ok(());
-        }
-        match self.session_ownership(session).await {
-            // No such session yet: let the normal create / not-found path handle it.
-            SessionOwnership::Absent => Ok(()),
-            SessionOwnership::Owned(owner) if owner == principal.user_id => Ok(()),
-            _ => Err(ApiError::Forbidden(format!(
-                "session {session} is not owned by the caller"
+    /// The operator-tier gate for **security-widening** mutations (Cluster E policy partition):
+    /// widening a session overlay's autonomy/tool-surface (`approval_mode` -> `AcceptEdits`/
+    /// `AutoAllow`, or `ToolsOverride::FullToolset`) and setting cron `workdir`/`enabled_toolsets`.
+    /// Requires [`SessionControlAny`](daemon_auth::Capability::SessionControlAny) — held only by
+    /// `Role::Operator`/`Admin` (and the synthetic `system`/`internal` in-process principals), never
+    /// by `User`/`Viewer`. Fail-closed: a `None` request principal is DENIED, matching the ownership
+    /// layer. This is enforced *beneath* the coarse `SessionWrite`/`CronWrite` capability gate — it
+    /// partitions the security-relevant subset of an otherwise user-tier write.
+    pub(crate) fn require_operator(&self, what: &str) -> Result<(), ApiError> {
+        match crate::request_context::current_principal() {
+            Some(p) if p.has(daemon_auth::Capability::SessionControlAny) => Ok(()),
+            Some(_) => Err(ApiError::Forbidden(format!(
+                "{what} requires an operator-tier capability"
             ))),
+            None => Err(ApiError::Unauthenticated(
+                "no authenticated principal bound to this request".into(),
+            )),
         }
     }
 
@@ -219,6 +205,66 @@ impl NodeApiImpl {
             }
         }
         report
+    }
+
+    /// Auth 4 (F3): whether the current request principal may see fleet unit `id`. Resolves the unit
+    /// to its owner via `UnitId -> UnitNode.session -> session_meta.owner` (the same
+    /// [`owner_visible`] policy the roster/tree/checkpoints use), so an owned subtree is visible
+    /// whole and a foreign one is denied whole. A sessionless or unknown unit has no owner ⇒
+    /// operator-only (fail-closed on an unknown owner). A `SessionSeeAll` holder sees every unit.
+    /// Mirrors [`tree_owned`](Self::tree_owned)'s per-node ownership resolution (children inherit the
+    /// delegating parent's owner at the delegation seam, so the mapping is well-defined at depth).
+    pub(crate) async fn unit_owner_visible(&self, id: &UnitId) -> bool {
+        let principal = crate::request_context::current_principal();
+        let owner = match &self.fleet {
+            Some(fleet) => match fleet.unit(id).await {
+                Some(node) => match node.session {
+                    Some(s) => self.store.session_meta(&s).await.and_then(|m| m.owner),
+                    None => None,
+                },
+                None => None,
+            },
+            None => None,
+        };
+        owner_visible(&principal, &owner)
+    }
+
+    /// Auth 4 (F4): keep only the node-events a non-`SessionSeeAll` principal may see. The three
+    /// session-bearing variants (`SessionAdvanced`/`SessionMetaChanged`/`ApprovalPending`) are
+    /// dropped unless the referenced session's owner is visible to `principal`; the payload-free
+    /// node-wide pointers (`RosterChanged`/`FleetChanged`/`CatalogChanged`/`DownloadProgress`/
+    /// `ResyncNeeded`) carry no foreign session id and pass (the refetch they nudge —
+    /// `SessionsQuery`/`Tree`/`ModelCatalog` — is itself owner-scoped or non-session). The page
+    /// cursors are left untouched so a client still advances correctly past filtered events.
+    /// Fail-closed: a `None` principal sees no session-bearing event (`owner_visible` denies `None`).
+    /// A `SessionSeeAll` holder is short-circuited by the caller (the whole feed, unscoped).
+    pub(crate) async fn scope_events_page(
+        &self,
+        mut page: daemon_api::EventsPage,
+        principal: &Option<daemon_auth::Principal>,
+    ) -> daemon_api::EventsPage {
+        use daemon_api::NodeEvent;
+        let mut kept = Vec::with_capacity(page.events.len());
+        for ev in page.events {
+            let session = match &ev {
+                NodeEvent::SessionAdvanced { session, .. }
+                | NodeEvent::SessionMetaChanged { session, .. }
+                | NodeEvent::ApprovalPending { session, .. } => Some(session.clone()),
+                _ => None,
+            };
+            let visible = match session {
+                Some(s) => owner_visible(
+                    principal,
+                    &self.store.session_meta(&s).await.and_then(|m| m.owner),
+                ),
+                None => true,
+            };
+            if visible {
+                kept.push(ev);
+            }
+        }
+        page.events = kept;
+        page
     }
 
     /// Record activity on `session` from an inbound `command`: stamp `last_activity_ms` to now
@@ -334,14 +380,14 @@ fn now_ms() -> u64 {
 const DEFAULT_ROSTER_PAGE: usize = 50;
 
 /// Whether `owner` is visible to `principal` under the Auth 4 enumeration policy:
-/// - a `SessionSeeAll` holder (operator) sees everything, including legacy `owner IS NULL` rows;
+/// - a `SessionSeeAll` holder (operator, and the synthetic `system`/`internal` principals which are
+///   operator-or-above) sees everything, including legacy `owner IS NULL` rows;
 /// - any other authenticated principal sees only rows it owns (a peer never sees another's session,
 ///   and a legacy/unowned row is hidden — deny-closed on an *unknown owner*);
-/// - `None` is a **trusted in-process caller** and sees everything. By the time any read reaches
-///   this point a network request has already been bound to a principal by the transport gate
-///   (`authorize`, which denies an unauthenticated request *before* dispatch), so `None` can only be
-///   the local/embedding path (the Unix socket binds the `system` principal, FFI/direct calls are
-///   in-process trust). The "deny-closed with no principal" invariant is enforced at that gate.
+/// - `None` (no bound principal) is DENIED — **fail-closed**. Every legitimate in-process caller now
+///   enters an explicit [`system`](crate::RequestContext::system) /
+///   [`internal`](crate::RequestContext::internal) scope, so an unscoped read is a bug, not implicit
+///   trust; it must reveal nothing.
 ///
 /// Used by every read/enumeration surface (roster, `session_get`, `session_search`, the tree).
 pub(crate) fn owner_visible(
@@ -349,7 +395,7 @@ pub(crate) fn owner_visible(
     owner: &Option<String>,
 ) -> bool {
     match principal {
-        None => true,
+        None => false,
         Some(p) if p.has(daemon_auth::Capability::SessionSeeAll) => true,
         Some(p) => owner.as_deref() == Some(p.user_id.as_str()),
     }
@@ -541,10 +587,22 @@ mod owner_visible_tests {
     }
 
     #[test]
-    fn no_principal_is_trusted_in_process_and_sees_all() {
-        // The transport gate denies an unauthenticated network request before dispatch, so a `None`
-        // principal at this layer is the trusted local/embedding caller.
-        assert!(owner_visible(&None, &Some("alice".to_string())));
-        assert!(owner_visible(&None, &None));
+    fn no_principal_is_denied_fail_closed() {
+        // Fail-closed: an unscoped read (no bound principal) reveals nothing. Every legitimate
+        // in-process caller now enters an explicit `system()` / `internal()` scope instead.
+        assert!(!owner_visible(&None, &Some("alice".to_string())));
+        assert!(!owner_visible(&None, &None));
+    }
+
+    #[test]
+    fn internal_marker_sees_all_like_an_operator() {
+        // The synthetic in-process `internal` principal (Operator ⇒ SessionSeeAll) crosses ownership
+        // for the legitimate embedded callers (delivery pumps, ingest, injection).
+        let internal = crate::request_context::RequestContext::internal().principal;
+        assert!(owner_visible(
+            &Some(internal.clone()),
+            &Some("alice".to_string())
+        ));
+        assert!(owner_visible(&Some(internal), &None));
     }
 }

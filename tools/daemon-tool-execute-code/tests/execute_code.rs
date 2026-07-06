@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Phase 4: integration test crate; raw fs/reqwest/Command are expected in tests.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! Integration tests for the `execute_code` tool.
 //!
@@ -30,7 +32,10 @@ impl HostRequestHandler for NoopHost {
     async fn request(&self, req: HostRequest) -> HostResponse {
         HostResponse {
             request_id: req.request_id,
-            body: HostResponseBody::Approved(true),
+            body: HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+            },
         }
     }
 }
@@ -115,6 +120,7 @@ async fn run_in(
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),
@@ -128,7 +134,7 @@ async fn run_in(
 async fn run_plain(root: &Path, args: &str) -> ToolOutcome {
     run_in(
         root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -142,6 +148,15 @@ fn detail_sandboxed(out: &ToolOutcome) -> Option<bool> {
     let detail = out.detail.as_ref()?;
     let v: serde_json::Value = serde_json::from_slice(&detail.body).ok()?;
     v.get("sandboxed").and_then(|b| b.as_bool())
+}
+
+/// Parse the `backend` label (`bwrap`/`landlock`/`sandbox-exec`/`plain`) out of the detail body.
+fn detail_backend(out: &ToolOutcome) -> Option<String> {
+    let detail = out.detail.as_ref()?;
+    let v: serde_json::Value = serde_json::from_slice(&detail.body).ok()?;
+    v.get("backend")
+        .and_then(|b| b.as_str())
+        .map(str::to_string)
 }
 
 // --- Test 1: argument parsing (no python needed) ---------------------------------------------
@@ -166,7 +181,7 @@ async fn deny_policy_refuses_without_running() {
     let root = temp_root("deny");
     let out = run_in(
         &root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::Deny,
         &NoopHost,
         CancellationToken::new(),
@@ -185,7 +200,7 @@ async fn ask_policy_defers_durably_with_await_effect() {
     let root = temp_root("defer");
     let out = run_in(
         &root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::Ask,
         &DeferHost,
         CancellationToken::new(),
@@ -247,7 +262,7 @@ async fn large_stdout_is_truncated_head_tail() {
         return;
     }
     let root = temp_root("cap");
-    let mut s = settings(SandboxPolicy::None);
+    let mut s = settings(SandboxPolicy::Plain);
     s.max_stdout_bytes = 200;
     let out = run_in(
         &root,
@@ -275,7 +290,7 @@ async fn timeout_kills_and_reports() {
         return;
     }
     let root = temp_root("timeout");
-    let mut s = settings(SandboxPolicy::None);
+    let mut s = settings(SandboxPolicy::Plain);
     s.timeout = Duration::from_secs(1);
     let out = run_in(
         &root,
@@ -318,13 +333,14 @@ async fn cancel_interrupts_running_script() {
         pre_approved: false,
         checkpoints: None,
         tool_timeout: None,
+        session_allow: &[],
     };
     let call = ToolCall {
         call_id: "c1".into(),
         name: "execute_code".into(),
         args: args("import time; time.sleep(60)"),
     };
-    let tool = ExecuteCodeTool::new(settings(SandboxPolicy::None));
+    let tool = ExecuteCodeTool::new(settings(SandboxPolicy::Plain));
     let run_fut = tool.run(&call, &cx);
     let cancel_fut = async {
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -353,7 +369,7 @@ async fn project_and_strict_modes_use_expected_cwd() {
     // Strict mode: CWD is the isolated staging dir under the workspace.
     let strict = run_in(
         &root,
-        settings(SandboxPolicy::None),
+        settings(SandboxPolicy::Plain),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -399,7 +415,7 @@ async fn bwrap_blocks_out_of_workspace_write() {
 
     let out = run_in(
         &ws,
-        settings(SandboxPolicy::Bwrap),
+        settings(SandboxPolicy::Require),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -440,6 +456,8 @@ async fn none_policy_runs_unsandboxed() {
     let out = run_plain(&root, &args("print('plain')")).await;
     assert!(out.result.ok, "expected success: {}", out.result.content);
     assert_eq!(detail_sandboxed(&out), Some(false));
+    // `Plain` is the explicit unconfined backend.
+    assert_eq!(detail_backend(&out).as_deref(), Some("plain"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -454,7 +472,7 @@ async fn required_bwrap_either_sandboxes_or_reports_unavailable() {
     let root = temp_root("reqbwrap");
     let out = run_in(
         &root,
-        settings(SandboxPolicy::Bwrap),
+        settings(SandboxPolicy::Require),
         ApprovalPolicy::AutoAllow,
         &NoopHost,
         CancellationToken::new(),
@@ -462,12 +480,67 @@ async fn required_bwrap_either_sandboxes_or_reports_unavailable() {
     )
     .await;
     if out.result.ok {
-        // bwrap usable here → the run was actually sandboxed.
+        // A kernel backend was usable → the run was actually confined (bwrap on this host, or the
+        // Landlock+seccomp fallback where userns is off).
         assert_eq!(detail_sandboxed(&out), Some(true));
+        assert!(
+            matches!(
+                detail_backend(&out).as_deref(),
+                Some("bwrap") | Some("landlock")
+            ),
+            "Require must resolve to a kernel backend, got {:?}",
+            detail_backend(&out)
+        );
         assert!(out.result.content.contains("probe"));
     } else {
-        // bwrap unusable → a clear setup error, never a silent unsandboxed run.
+        // No backend usable → a clear setup error, never a silent unsandboxed run (fail closed).
         assert!(out.result.content.contains("unavailable"));
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- Test 11: staging-open containment (Cluster C, host-side) ---------------------------------
+
+// The staging lifecycle (`.execute_code/<run_id>` create, `script.py` write, cleanup) runs in the
+// DAEMON, so the child-process sandbox does not cover it. Routed through `ContainedRoot`
+// (openat2 RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS), a symlinked `.execute_code` planted in the
+// workspace is refused rather than followed: staging fails, the run never starts, and the
+// out-of-workspace target is untouched. With the pre-guard raw `tokio::fs` staging, the same setup
+// would have created `<run_id>/script.py` inside the symlink target.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_symlink_is_not_followed_out_of_workspace() {
+    if !python_available() {
+        eprintln!("skipping staging_symlink_is_not_followed_out_of_workspace: no usable python3");
+        return;
+    }
+    use std::os::unix::fs::symlink;
+    let base = temp_root("staging-symlink");
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    // Plant `.execute_code` as a symlink pointing OUT of the workspace.
+    symlink(&outside, ws.join(".execute_code")).unwrap();
+
+    let out = run_plain(&ws, &args("print('should-not-run')")).await;
+
+    // The staging open through the symlink is refused → a setup error, and no process ran.
+    assert!(
+        !out.result.ok,
+        "staging that escapes via a symlink must fail: {}",
+        out.result.content
+    );
+    // Nothing was created through the symlink into the out-of-workspace target.
+    let leaked: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "staging must not create anything in the out-of-workspace target, found {leaked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }

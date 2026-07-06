@@ -17,6 +17,8 @@
 //! See `docs/specs/daemon-lifecycle-persistence.md`.
 
 #![forbid(unsafe_code)]
+// Phase 4: test code may use raw fs/reqwest/Command; the --lib pass still guards production.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 use async_trait::async_trait;
 use daemon_common::{
@@ -436,6 +438,13 @@ pub struct ParkedApproval {
     pub prompt: String,
     /// The target path, when the action is a file edit (`None` for a non-path action).
     pub path: Option<String>,
+    /// The §12 exec-approval command fingerprint (wire v28): the lowercase-hex sha256 of the resolved
+    /// command tuple, mirrored from the engine's `PendingApproval.fingerprint` so the operator
+    /// surface ([`ApprovalInfo`](daemon_api::ApprovalInfo)) can display it structurally. `None` for
+    /// non-command approvals and pre-v28 rows (`#[serde(default)]`). Display-only — the durable
+    /// re-run enforcement remains keyed on the engine's typed fingerprint.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     /// The operator's decision once answered (`None` while still pending; `Some(true)` = allow).
     pub decision: Option<bool>,
 }
@@ -834,7 +843,10 @@ pub trait SessionStore: Send + Sync {
 
     /// Record an operator's decision for a parked approval and wake the session in one transaction:
     /// stamp the parked row's `decision`, record a [`JobCompletion`] for its `job_id` (payload
-    /// `allow`/`deny`) so the rehydrated engine resolves the gated tool call, and publish a wake.
+    /// `allow`/`allow_permanent`/`deny`) so the rehydrated engine resolves the gated tool call, and
+    /// publish a wake. `allow_permanent` (Cluster B) carries the operator's "Allow permanently" choice
+    /// through to the engine via the completion payload (`allow_permanent`), where `resolve_approvals`
+    /// remembers the verified command fingerprint for the session; it is meaningful only when `allow`.
     /// Idempotent per `(session, epoch, job)` (a redelivered answer is a no-op). Returns `true` if a
     /// matching pending approval was found and answered. Default: `false` (no such row).
     async fn answer_approval(
@@ -842,6 +854,7 @@ pub trait SessionStore: Send + Sync {
         _session: &SessionId,
         _job_id: &JobId,
         _allow: bool,
+        _allow_permanent: bool,
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
@@ -1592,6 +1605,7 @@ impl SessionStore for InMemoryStore {
         session: &SessionId,
         job_id: &JobId,
         allow: bool,
+        allow_permanent: bool,
     ) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let epoch = match inner.pending_approvals.get_mut(session) {
@@ -1610,10 +1624,12 @@ impl SessionStore for InMemoryStore {
             session_id: session.clone(),
             epoch,
             job_id: job_id.clone(),
-            payload: if allow {
-                b"allow".to_vec()
-            } else {
-                b"deny".to_vec()
+            // `allow_permanent` still starts with "allow" (the engine's allow/deny split is unchanged);
+            // `resolve_approvals` reads the exact string to record the verified fingerprint.
+            payload: match (allow, allow_permanent) {
+                (true, true) => b"allow_permanent".to_vec(),
+                (true, false) => b"allow".to_vec(),
+                (false, _) => b"deny".to_vec(),
             },
         };
         // Completion durable + session Ready, then publish the wake (one transaction).
