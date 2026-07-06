@@ -38,6 +38,7 @@ mod profiles_skills;
 mod provider_discovery;
 mod revocation_transport;
 mod routing_auth;
+mod routing_hot_reload;
 mod semantic_search;
 mod session_recall;
 mod sessions;

@@ -41,6 +41,9 @@ impl ProfileApi for NodeApiImpl {
         let id = spec.id.clone();
         self.profile_store()?.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "create");
+        // A created profile can declare `bound_accounts`: rebuild the live routing table so its
+        // account baseline takes effect without a restart (§5.9 hot-reload).
+        self.rebuild_routing();
         Ok(())
     }
 
@@ -57,7 +60,10 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_delete(&self, id: String) -> Result<(), ApiError> {
-        self.profile_store()?.delete(&id).map_err(profile_err)
+        self.profile_store()?.delete(&id).map_err(profile_err)?;
+        // A deleted profile takes its `bound_accounts` baseline with it (§5.9 hot-reload).
+        self.rebuild_routing();
+        Ok(())
     }
 
     async fn profile_select(&self, id: String) -> Result<(), ApiError> {
@@ -155,6 +161,8 @@ impl ProfileApi for NodeApiImpl {
                     .map_err(|e| ApiError::Other(format!("skill import: {e}")))?;
             }
         }
+        // An imported profile can declare `bound_accounts` (§5.9 hot-reload).
+        self.rebuild_routing();
         Ok(id)
     }
 
