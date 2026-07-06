@@ -6,17 +6,48 @@ use super::*;
 #[async_trait]
 impl ControlApi for NodeApiImpl {
     async fn events_page(&self, cursor: u64, max: u32) -> EventsPage {
-        match &self.node_events {
-            Some(feed) => feed.page(cursor, max),
-            None => EventsPage::default(),
+        let Some(feed) = &self.node_events else {
+            return EventsPage::default();
+        };
+        let page = feed.page(cursor, max);
+        // Auth 4 (F4): scope the node-wide feed to the request principal — a non-owner must not learn
+        // another owner's session advanced / changed / is awaiting approval. An operator
+        // (SessionSeeAll) reads the whole feed; fail-closed on a missing principal.
+        let principal = current_principal();
+        if principal
+            .as_ref()
+            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll))
+        {
+            return page;
         }
+        self.scope_events_page(page, &principal).await
     }
 
     async fn events_subscribe(&self, cursor: u64) -> Result<NodeEventStream, ApiError> {
-        Ok(match &self.node_events {
-            Some(feed) => feed.subscribe(cursor),
-            None => stream::empty().boxed(),
-        })
+        let Some(feed) = &self.node_events else {
+            return Ok(stream::empty().boxed());
+        };
+        let raw = feed.subscribe(cursor);
+        // Auth 4 (F4): capture the subscriber's principal AT SUBSCRIBE TIME — the returned long-lived
+        // stream is polled outside this request's task-local scope (the same rule `tree_subscribe`
+        // notes), so `current_principal()` would be `None` there. An operator (SessionSeeAll) gets
+        // the raw feed; any other subscriber has each page owner-scoped so no foreign-session event
+        // ever rides through.
+        let principal = current_principal();
+        if principal
+            .as_ref()
+            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll))
+        {
+            return Ok(raw);
+        }
+        let this = self.clone();
+        Ok(raw
+            .then(move |page| {
+                let this = this.clone();
+                let principal = principal.clone();
+                async move { this.scope_events_page(page, &principal).await }
+            })
+            .boxed())
     }
 
     async fn health(&self) -> HealthReport {
@@ -392,10 +423,40 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn fleet(&self) -> FleetReport {
-        match &self.fleet {
-            Some(fleet) => fleet.report().await,
-            None => FleetReport::default(),
+        let Some(fleet) = &self.fleet else {
+            return FleetReport::default();
+        };
+        let full = fleet.report().await;
+        // Auth 4 (F3): an operator (SessionSeeAll) sees the whole fleet unchanged; any other
+        // principal sees only the units it owns (UnitId -> session -> owner), with usage folded over
+        // just those so the total never sums another owner's work. Fail-closed on a missing
+        // principal (owner_visible denies None).
+        let principal = current_principal();
+        if principal
+            .as_ref()
+            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll))
+        {
+            return full;
         }
+        let mut children = Vec::new();
+        let mut usage = daemon_common::UsageDelta::default();
+        for id in full.children {
+            let node = fleet.unit(&id).await;
+            let owner = match &node {
+                Some(n) => match &n.session {
+                    Some(s) => self.store.session_meta(s).await.and_then(|m| m.owner),
+                    None => None,
+                },
+                None => None,
+            };
+            if owner_visible(&principal, &owner) {
+                if let Some(n) = &node {
+                    usage.add(&n.usage);
+                }
+                children.push(id);
+            }
+        }
+        FleetReport { children, usage }
     }
 
     async fn tree(&self, after: Option<String>) -> TreeReport {
@@ -419,9 +480,20 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn unit(&self, id: UnitId) -> Option<UnitNode> {
-        match &self.fleet {
-            Some(fleet) => fleet.unit(&id).await,
+        let node = match &self.fleet {
+            Some(fleet) => fleet.unit(&id).await?,
+            None => return None,
+        };
+        // Auth 4 (F3): a non-owner must not resolve another owner's unit (own units only unless
+        // SessionSeeAll). Owner resolved from the fetched node's backing session; deny -> None.
+        let owner = match &node.session {
+            Some(s) => self.store.session_meta(s).await.and_then(|m| m.owner),
             None => None,
+        };
+        if owner_visible(&current_principal(), &owner) {
+            Some(node)
+        } else {
+            None
         }
     }
 
@@ -1050,6 +1122,11 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
+        // Auth 4 (F3): a non-owner must not read another owner's unit management events (deny ->
+        // empty; own units only unless SessionSeeAll).
+        if !self.unit_owner_visible(&id).await {
+            return Vec::new();
+        }
         match &self.fleet {
             Some(fleet) => fleet.unit_events(&id, max).await,
             None => Vec::new(),
@@ -1057,6 +1134,11 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn unit_outbound(&self, id: UnitId, max: u32) -> Vec<Outbound> {
+        // Auth 4 (F3): gate BEFORE the drain — a non-owner must never consume another owner's
+        // outbound buffer (this is a destructive single-consumer drain). Deny -> empty.
+        if !self.unit_owner_visible(&id).await {
+            return Vec::new();
+        }
         match &self.fleet {
             Some(fleet) => fleet.unit_outbound(&id, max).await,
             None => Vec::new(),
@@ -1064,6 +1146,10 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn unit_history(&self, id: UnitId, after_cursor: u64, max: u32) -> JournalPageView {
+        // Auth 4 (F3): a non-owner must not read another owner's unit history (deny -> empty page).
+        if !self.unit_owner_visible(&id).await {
+            return JournalPageView::default();
+        }
         self.read_history(JournalStreamId::unit(&id), after_cursor, max)
             .await
     }

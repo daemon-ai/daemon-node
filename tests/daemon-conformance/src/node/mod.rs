@@ -19,6 +19,7 @@ mod daemon_cloud_e2e;
 mod delivery_memory;
 mod detached_delegation;
 mod events_transport;
+mod f3f4_ownership;
 mod fs_content;
 mod harness;
 mod history;

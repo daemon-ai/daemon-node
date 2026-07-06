@@ -13,10 +13,15 @@
 //! * [`Coverage::OwnerGated`] — session-touching; a non-owner must be denied (the table drives it and
 //!   asserts the per-variant deny shape: [`Deny::Forbidden`] for fallible ops, [`Deny::EmptyOrAbsent`]
 //!   for the infallible reads that deny by returning nothing — no existence oracle);
-//! * [`Coverage::KnownGap`] — a documented residual not owner-scoped yet (F3 fleet/unit surface, F4
-//!   node-wide feeds); the deny-test asserts its CURRENT (non-denying) behavior so the suite stays
-//!   green while the leak is greppable and honest (tracked as a follow-on);
 //! * [`Coverage::NotSessionTouching`] — its own domain/capability gate; not deny-asserted here.
+//!
+//! The former F3 (fleet/unit surface) and F4 (node-wide `EventsSince` feed, transport-keyed
+//! `DeliverySessions`) `KnownGap` residuals are now fully `OwnerGated`: the fleet/unit reads resolve
+//! a unit to its owner via `UnitId -> UnitNode.session -> session owner` (children inherit the
+//! delegating parent's owner), the event feed filters its session-bearing variants to the request
+//! principal, and `delivery_sessions` filters per-row — so this table now asserts EVERY
+//! session-touching variant denies a non-owner, with no `KnownGap` arm left. The dedicated
+//! RED→GREEN repro pair lives in `f3f4_ownership.rs`.
 //!
 //! It also lands the two live cross-owner leaks this net made visible (F1): `approvals_pending` and
 //! `checkpoints` had no ownership scope, so any `User` (which holds `ControlRead`) could read another
@@ -217,8 +222,6 @@ enum Deny {
 enum Coverage {
     /// Session-touching: a non-owner MUST be denied with the given shape (driven + asserted).
     OwnerGated(Deny),
-    /// A documented residual not owner-scoped yet — asserted at CURRENT behavior (greppable, tracked).
-    KnownGap(&'static str),
     /// Not session-touching: its own domain/capability gate applies; not deny-asserted here.
     NotSessionTouching,
 }
@@ -244,11 +247,11 @@ fn classify(req: &ApiRequest) -> Coverage {
         | SetSessionModel { .. }
         | SetSessionMode { .. }
         | SetSessionOverlay { .. } => OwnerGated(Forbidden),
-        // Infallible session reads: deny by returning nothing of the owner's.
-        SessionHistory { .. } | DeliveryTargets { .. } => OwnerGated(EmptyOrAbsent),
-        // A transport-keyed enumeration, not per-owner scoped (F4 residual).
-        DeliverySessions { .. } => {
-            KnownGap("F4: delivery_sessions is transport-keyed, not owner-scoped")
+        // Infallible session reads: deny by returning nothing of the owner's. `DeliverySessions`
+        // (F4, now owner-scoped): a transport's session list is filtered per-row by ownership, so a
+        // non-owner never enumerates another owner's session on a shared transport.
+        SessionHistory { .. } | DeliveryTargets { .. } | DeliverySessions { .. } => {
+            OwnerGated(EmptyOrAbsent)
         }
 
         // -- serve_control: roster / read-of-one / durable lifecycle ----------------------------
@@ -265,16 +268,21 @@ fn classify(req: &ApiRequest) -> Coverage {
         | SessionUpdateMeta { .. }
         | Rewind { .. } => OwnerGated(Forbidden),
         Health | Stats | Telemetry | VerifyingKey => NotSessionTouching,
-        // Node-wide L3 event feed, not per-owner scoped (F4 residual).
-        EventsSince { .. } => KnownGap("F4: events feed is node-wide, not owner-scoped"),
+        // Node-wide L3 event feed (F4, now owner-scoped): the session-bearing events
+        // (SessionAdvanced/SessionMetaChanged/ApprovalPending) are filtered to the request
+        // principal; the payload-free node-wide pointers pass (the refetch they nudge is scoped).
+        EventsSince { .. } => OwnerGated(EmptyOrAbsent),
 
-        // -- serve_fleet: the orchestration tree is owner-scoped; the flat unit surface is not ---
-        Tree { .. } => OwnerGated(EmptyOrAbsent),
-        Fleet | Unit { .. } | UnitEvents { .. } | UnitOutbound { .. } | UnitHistory { .. } => {
-            KnownGap(
-                "F3: fleet/unit surface is not owner-scoped (UnitId→session→owner mapping TBD)",
-            )
-        }
+        // -- serve_fleet: the orchestration tree AND the flat unit surface are owner-scoped (F3, now
+        // gated): a unit maps to its owner via UnitId -> UnitNode.session -> session owner (children
+        // inherit the delegating parent's owner at the seam), so an owned subtree resolves whole and
+        // a foreign one is denied whole. A sessionless/unknown unit is operator-only (fail-closed).
+        Tree { .. }
+        | Fleet
+        | Unit { .. }
+        | UnitEvents { .. }
+        | UnitOutbound { .. }
+        | UnitHistory { .. } => OwnerGated(EmptyOrAbsent),
         Pause { .. } | Resume { .. } | Scale { .. } => NotSessionTouching,
 
         // -- serve_fs: a `FsRootId::Session` root addresses a session sandbox (owner-gated) -------
@@ -707,44 +715,48 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
             Deny::EmptyOrAbsent,
         ),
         ("FsRoots", ApiRequest::FsRoots, Deny::EmptyOrAbsent),
-    ]
-}
-
-/// One instance of every `KnownGap` variant (F3 fleet/unit, F4 node-wide feeds) — driven to assert
-/// CURRENT (non-denying) behavior so the residual is greppable and the suite is honest.
-fn known_gap_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest)> {
-    let unit = UnitId::new(s.as_str());
-    vec![
-        ("Fleet", ApiRequest::Fleet),
-        ("Unit", ApiRequest::Unit { unit: unit.clone() }),
+        // F3 (now gated): the fleet/unit surface — deny by returning nothing of the owner's.
+        ("Fleet", ApiRequest::Fleet, Deny::EmptyOrAbsent),
+        (
+            "Unit",
+            ApiRequest::Unit {
+                unit: UnitId::new(s.as_str()),
+            },
+            Deny::EmptyOrAbsent,
+        ),
         (
             "UnitEvents",
             ApiRequest::UnitEvents {
-                unit: unit.clone(),
+                unit: UnitId::new(s.as_str()),
                 max: 8,
             },
+            Deny::EmptyOrAbsent,
         ),
         (
             "UnitOutbound",
             ApiRequest::UnitOutbound {
-                unit: unit.clone(),
+                unit: UnitId::new(s.as_str()),
                 max: 8,
             },
+            Deny::EmptyOrAbsent,
         ),
         (
             "UnitHistory",
             ApiRequest::UnitHistory {
-                unit,
+                unit: UnitId::new(s.as_str()),
                 after_cursor: 0,
                 max: 8,
             },
+            Deny::EmptyOrAbsent,
         ),
+        // F4 (now gated): the node-wide feeds — deny by returning nothing of the owner's.
         (
             "EventsSince",
             ApiRequest::EventsSince {
                 cursor: 0,
                 wait_ms: None,
             },
+            Deny::EmptyOrAbsent,
         ),
         (
             "DeliverySessions",
@@ -752,6 +764,7 @@ fn known_gap_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest)> {
                 transport: daemon_protocol::TransportId::new("matrix/acct"),
                 after: None,
             },
+            Deny::EmptyOrAbsent,
         ),
     ]
 }
@@ -804,6 +817,34 @@ fn assert_denied(label: &str, resp: &ApiResponse, deny: Deny, s: &SessionId) {
                     .any(|r| matches!(&r.id, FsRootId::Session(sid) if sid == s)),
                 "{label}: leaked a session fs root"
             ),
+            // F3 fleet/unit surface (now gated).
+            ApiResponse::Fleet(r) => assert!(
+                !r.children.contains(&UnitId::new(s.as_str())),
+                "{label}: leaked a fleet child"
+            ),
+            ApiResponse::Unit(u) => assert!(u.is_none(), "{label}: leaked a unit node"),
+            ApiResponse::UnitEvents(v) => {
+                assert!(v.is_empty(), "{label}: leaked {} unit events", v.len())
+            }
+            ApiResponse::Drained(v) => {
+                assert!(
+                    v.is_empty(),
+                    "{label}: leaked {} unit outbound items",
+                    v.len()
+                )
+            }
+            // F4 node-wide feeds (now gated): no session-bearing event / no session-scoped list entry.
+            ApiResponse::EventsPage(p) => assert!(
+                !p.events.iter().any(|e| matches!(e,
+                    daemon_api::NodeEvent::SessionAdvanced { session, .. }
+                    | daemon_api::NodeEvent::SessionMetaChanged { session, .. }
+                    | daemon_api::NodeEvent::ApprovalPending { session, .. }
+                        if session == s)),
+                "{label}: leaked a session-bearing node event"
+            ),
+            ApiResponse::DeliverySessions(p) => {
+                assert!(!p.items.contains(s), "{label}: leaked a delivery session")
+            }
             other => panic!("{label}: unexpected empty-deny response shape {other:?}"),
         },
     }
@@ -880,33 +921,6 @@ async fn owner_and_operator_are_not_denied() {
                 "{name} ({role:?}) must NOT be Forbidden on {label}, got {resp:?}"
             );
         }
-    }
-
-    handle.shutdown().await;
-}
-
-/// The documented residuals (F3 fleet/unit, F4 node-wide feeds) are classified `KnownGap` and,
-/// today, do NOT deny a non-owner — asserted at current behavior so the suite is green while the
-/// residual stays greppable and tracked (they are follow-ons, deliberately not fixed in this track).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn known_gaps_are_documented_and_not_owner_gated() {
-    let s = SessionId::new("s-knowngap");
-    let (node, handle, _cp) = fixture(&s).await;
-
-    for (label, req) in known_gap_samples(&s) {
-        assert!(
-            matches!(classify(&req), Coverage::KnownGap(_)),
-            "{label}: must be classified KnownGap"
-        );
-        let resp = with_request_context(ctx("bob", Role::User), async {
-            daemon_api::dispatch(&*node, req.clone()).await
-        })
-        .await;
-        // Current behavior: these are NOT owner-gated (the residual this test documents).
-        assert!(
-            !matches!(resp, ApiResponse::Error(ApiError::Forbidden(_))),
-            "{label}: KnownGap residual is expected NOT to Forbidden today, got {resp:?}"
-        );
     }
 
     handle.shutdown().await;

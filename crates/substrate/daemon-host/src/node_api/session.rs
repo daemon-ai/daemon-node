@@ -209,7 +209,20 @@ impl SessionApi for NodeApiImpl {
     ) -> daemon_api::WirePage<SessionId> {
         // The live registry is a DashMap scan with no stable order; sort by session id (the
         // cursor key) before slicing.
-        let mut sessions = self.live.delivery_sessions(&transport);
+        let sessions = self.live.delivery_sessions(&transport);
+        // Auth 4 (F4): a non-owner must not enumerate another owner's sessions on a shared transport
+        // (own sessions only unless SessionSeeAll) — per-row owner_visible, mirroring the roster /
+        // checkpoints filter. The internal delivery bridge (daemon-http `serve_delivery_scoped`) runs
+        // under a SessionSeeAll `system` scope, so it still discovers the transport's full owned set.
+        let principal = current_principal();
+        let mut visible = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            let owner = self.store.session_meta(&s).await.and_then(|m| m.owner);
+            if owner_visible(&principal, &owner) {
+                visible.push(s);
+            }
+        }
+        let mut sessions = visible;
         sessions.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         daemon_api::paginate(sessions, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |s| {
             s.as_str().to_string()
