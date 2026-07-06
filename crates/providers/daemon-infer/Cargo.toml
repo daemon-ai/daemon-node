@@ -19,9 +19,10 @@ default = []
 llama = ["dep:llama-cpp-4", "dep:encoding_rs"]
 # Multimodal projector loading (llama.cpp mtmd): the worker loads a paired mmproj GGUF alongside
 # the text weights at `Command::Load` (media *inference* is a later phase — this validates and
-# holds the projector). Separate from `llama` because the dev-shell prebuilt
-# (`LLAMA_PREBUILT_DIR`, built with LLAMA_BUILD_TOOLS=OFF) carries no libmtmd — the sandboxed
-# from-source lanes (`nix build .#daemon-infer-llama`) enable it.
+# holds the projector). Kept separate from `llama` as an opt-in engine capability. The dev-shell
+# prebuilt (`LLAMA_PREBUILT_DIR`) now ships libmtmd (built with LLAMA_BUILD_TOOLS=ON), so this
+# feature links both in the dev shell (`--features llama,mtmd,dynamic-link`) and in the sandboxed
+# from-source lanes (`nix build .#daemon-infer-llama`).
 mtmd = ["llama", "llama-cpp-4/mtmd"]
 # Link a prebuilt *shared* llama.cpp (via `LLAMA_PREBUILT_DIR`) instead of static-compiling it from
 # source. Used in the Nix dev shell to skip cmake on hosts without `/bin/sh`.

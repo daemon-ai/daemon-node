@@ -87,9 +87,14 @@
           src = llama-cpp-src;
           nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config pkgs.shaderc ];
           buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
-          # Build only the ggml + libllama shared libraries; everything else (tools, the unified
-          # `app` binary, server, examples, tests, common, web UI) is dropped — we only consume the
-          # `.so`s, and those extra targets pull in deps that fail to link in this trimmed build.
+          # Build the ggml + libllama shared libraries AND libmtmd (the multimodal projector loader).
+          # `mtmd` lives under tools/, so it only builds with LLAMA_BUILD_TOOLS=ON + the common lib
+          # (LLAMA_BUILD_COMMON=ON) — mirroring the proven Windows lane below. Everything else (the
+          # unified `app` binary, server, examples, tests, web UI) stays off; `MTMD_VIDEO=OFF` avoids
+          # the optional ffmpeg dependency. TOOLS=ON also drags tool byproducts (`*-impl` libs,
+          # libcommon) into the install; those are pruned in postInstall because `llama-cpp-sys-4`'s
+          # prebuilt mode GLOBS every lib in `$out/lib` and links them all — the dir must hold exactly
+          # the core runtime `.so`s (llama/ggml*/mtmd), nothing more.
           cmakeFlags = [
             "-DBUILD_SHARED_LIBS=ON"
             "-DGGML_NATIVE=OFF"
@@ -98,12 +103,33 @@
             "-DLLAMA_BUILD_TESTS=OFF"
             "-DLLAMA_BUILD_EXAMPLES=OFF"
             "-DLLAMA_BUILD_SERVER=OFF"
-            "-DLLAMA_BUILD_TOOLS=OFF"
+            "-DLLAMA_BUILD_TOOLS=ON" # mtmd lives under tools/
             "-DLLAMA_BUILD_APP=OFF"
-            "-DLLAMA_BUILD_COMMON=OFF"
+            "-DLLAMA_BUILD_COMMON=ON"
             "-DLLAMA_BUILD_HTML=OFF"
             "-DLLAMA_BUILD_UI=OFF"
+            "-DMTMD_VIDEO=OFF" # avoid the optional ffmpeg dependency
           ];
+          # Prune `$out/lib` to the core shared libs the sys crate should link (llama/ggml*/mtmd).
+          # LLAMA_BUILD_TOOLS=ON installs tool-support byproducts (`*-impl` libs, libcommon) into the
+          # same dir; the crate's prebuilt mode globs the dir and links EVERY lib, so anything that is
+          # not a core runtime lib must be removed (mirrors the Windows `prebuilt/lib` whitelist).
+          # Guard that libmtmd survived so a broken build fails loudly instead of silently dropping
+          # multimodal support.
+          postInstall = ''
+            shopt -s nullglob
+            for f in "$out/lib"/*; do
+              bn="$(basename "$f")"
+              case "$bn" in
+                libllama.so* | libggml*.so* | libmtmd.so*) ;;
+                *) echo "prune: removing non-core entry $bn from \$out/lib"; rm -rf "$f" ;;
+              esac
+            done
+            if [ -z "$(find "$out/lib" -maxdepth 1 -name 'libmtmd.so*' -print -quit)" ]; then
+              echo "FATAL: libmtmd.so missing from \$out/lib after build"; ls -la "$out/lib"; exit 1
+            fi
+            echo "== llamaCpp: \$out/lib (link-time whitelist) =="; ls -la "$out/lib"
+          '';
         };
 
         rustToolchain = fenix.packages.${system}.stable.withComponents [
@@ -222,7 +248,21 @@
             commonArgs
             // {
               pname = "daemon-infer-${name}";
-              inherit cargoArtifacts;
+              # Features-matched deps artifact: the heavy native trees this lane pulls in
+              # (llama.cpp's cmake build, mistral.rs's candle) are NOT in the default-feature
+              # `cargoArtifacts`, so without this every workspace source edit recompiles them from
+              # scratch. Building deps-only with the SAME features moves them into a cached layer
+              # keyed on Cargo.lock/toolchain/pin — "compile once per arch until the hash changes"
+              # (the Windows llama lane's `daemonInferLlamaWindowsDeps` is the same pattern).
+              cargoArtifacts = craneLib.buildDepsOnly (
+                commonArgs
+                // {
+                  pname = "daemon-infer-${name}-deps";
+                  cargoExtraArgs = "-p daemon-infer --features ${features}";
+                  nativeBuildInputs = engineNativeInputs;
+                  LIBCLANG_PATH = libclangPath;
+                }
+              );
               cargoExtraArgs = "-p daemon-infer --features ${features}";
               # The patchelf/libgomp RUNPATH fixup is a Linux-only concern (ELF binaries +
               # libgomp.so). On darwin the worker is a Mach-O binary and llama.cpp's OpenMP is
@@ -238,9 +278,10 @@
           );
 
         # The llama lane ships with multimodal projector loading (`mtmd`): this is a from-source
-        # cmake build inside the sandbox, so tools/mtmd compiles in (unlike the dev-shell prebuilt,
-        # which stays LLAMA_BUILD_TOOLS=OFF and has no libmtmd — keep `mtmd` out of dev-shell
-        # `dynamic-link` builds).
+        # cmake build inside the sandbox, so tools/mtmd compiles in. The dev-shell prebuilt
+        # (`packages.llama-cpp`) now also builds tools/mtmd (LLAMA_BUILD_TOOLS=ON) and ships
+        # libmtmd, so `cargo build -p daemon-infer --features llama,mtmd,dynamic-link` links it in
+        # the dev shell too — dev multimodal matches the sandbox/bundle behavior.
         daemon-infer-llama = buildEngineWorker "llama" "llama,mtmd";
         daemon-infer-mistralrs = buildEngineWorker "mistralrs" "mistralrs";
 
@@ -276,7 +317,18 @@
           commonArgs
           // {
             pname = "daemon-infer-mistralrs-metal";
-            inherit cargoArtifacts;
+            # Features-matched deps artifact (see `buildEngineWorker`): keeps the mistral.rs/candle
+            # tree in a cached layer instead of recompiling it on every workspace source edit.
+            cargoArtifacts = craneLib.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "daemon-infer-mistralrs-metal-deps";
+                cargoExtraArgs = "-p daemon-infer --features mistralrs,mistralrs-metal";
+                nativeBuildInputs = engineNativeInputs;
+                LIBCLANG_PATH = libclangPath;
+                MISTRALRS_METAL_PRECOMPILE = "0";
+              }
+            );
             cargoExtraArgs = "-p daemon-infer --features mistralrs,mistralrs-metal";
             nativeBuildInputs = engineNativeInputs;
             LIBCLANG_PATH = libclangPath;
@@ -295,7 +347,18 @@
           commonArgs
           // {
             pname = "daemon-infer-vulkan";
-            inherit cargoArtifacts;
+            # Features-matched deps artifact (see `buildEngineWorker`): moves the from-source
+            # Vulkan llama.cpp cmake build into a cached layer instead of recompiling it per edit.
+            cargoArtifacts = craneLib.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "daemon-infer-vulkan-deps";
+                cargoExtraArgs = "-p daemon-infer --features vulkan";
+                nativeBuildInputs = engineNativeInputs ++ [ pkgs.shaderc ];
+                buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.spirv-headers ];
+                LIBCLANG_PATH = libclangPath;
+              }
+            );
             cargoExtraArgs = "-p daemon-infer --features vulkan";
             nativeBuildInputs = engineNativeInputs ++ [ pkgs.shaderc ];
             # `spirv-headers` satisfies the `find_package(SPIRV-Headers)` in the crate's vendored
@@ -706,7 +769,17 @@
           // {
             pname = "daemon-metta";
             version = baseVersion;
-            inherit cargoArtifacts;
+            # Features-matched deps artifact (see `buildEngineWorker`): `hyperon` is a big non-default
+            # git dep absent from the default-feature `cargoArtifacts`, so without this it recompiles
+            # on every workspace source edit. Deps-only with `--features hyperon` caches it.
+            cargoArtifacts = craneLib.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "daemon-metta-deps";
+                cargoExtraArgs = "-p daemon-metta --features hyperon";
+                nativeBuildInputs = [ pkgs.pkg-config ];
+              }
+            );
             cargoExtraArgs = "-p daemon-metta --features hyperon";
             nativeBuildInputs = [ pkgs.pkg-config ];
             doCheck = false;
@@ -788,9 +861,11 @@
             #
             # llama lane in the dev shell: rather than compile llama.cpp from source here, we point
             # `LLAMA_PREBUILT_DIR` at the pinned `packages.llama-cpp` (built from source in the Nix
-            # sandbox), so `cargo build -p daemon-infer --features llama,dynamic-link` links that
-            # prebuilt and skips cmake entirely (only the `cc`-built `mtp_shim` compiles locally).
-            # That prebuilt now bundles the Vulkan backend (one CPU+Vulkan artifact), so
+            # sandbox), so `cargo build -p daemon-infer --features llama,mtmd,dynamic-link` links that
+            # prebuilt and skips cmake entirely (only the `cc`-built `mtp_shim` compiles locally). The
+            # prebuilt now ships libmtmd (built with LLAMA_BUILD_TOOLS=ON), so the `mtmd` multimodal
+            # feature links in the dev shell exactly as it does in the sandbox lane / bundle.
+            # That prebuilt also bundles the Vulkan backend (one CPU+Vulkan artifact), so
             # `LD_LIBRARY_PATH` also includes the Vulkan loader: `libggml-vulkan.so` has a `DT_NEEDED`
             # on `libvulkan.so`, which must resolve even for a CPU-only (`n_gpu_layers = 0`) run. It
             # also makes the shared llama/ggml libs + libgomp resolvable when the worker runs in-shell
