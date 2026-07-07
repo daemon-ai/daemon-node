@@ -77,8 +77,8 @@ pub use adapters::AdapterRegistry;
 pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
 pub use auth::{
-    AuthFlowFactory, AuthOutcome, CredentialSlotKind, PendingAuthFlow, PendingAuthFlows,
-    DEFAULT_FLOW_TTL_SECS,
+    AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, FlowStep, PendingAuthFlow,
+    PendingAuthFlows, DEFAULT_FLOW_TTL_SECS,
 };
 pub use auth_audit::{AuthAudit, AUTH_JOURNAL_UNIT};
 pub use authn::{

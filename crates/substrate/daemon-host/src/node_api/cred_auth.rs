@@ -56,19 +56,44 @@ impl AuthApi for NodeApiImpl {
         flows.begin(req).await
     }
 
-    async fn auth_complete(
-        &self,
-        req: AuthCompleteRequest,
-    ) -> Result<AuthCompleteResponse, ApiError> {
+    async fn auth_step(&self, req: AuthStepRequest) -> Result<AuthStepResult, ApiError> {
         let flows = self
             .auth_flows
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("interactive auth not available".into()))?;
-        // Pull the parked flow out (and its bind request) *before* awaiting the family completion, so
-        // the registry lock is never held across the network round-trip the family performs.
-        let (flow, bind) = flows.take(&req.flow_id)?;
-        let outcome = flow.complete(&req.callback).await?;
+        // Advance the parked flow one step (the registry awaits the family's step outside its lock).
+        match flows.step(&req.flow_id, req.input).await? {
+            crate::auth::FlowStep::Challenge(challenge) => Ok(AuthStepResult::Challenge(challenge)),
+            crate::auth::FlowStep::Completed { outcome, bind } => Ok(AuthStepResult::Completed(
+                self.finish_auth_outcome(outcome, bind)?,
+            )),
+        }
+    }
 
+    async fn auth_cancel(&self, flow_id: String) -> Result<(), ApiError> {
+        if let Some(flows) = self.auth_flows.as_ref() {
+            flows.cancel(&flow_id);
+        }
+        Ok(())
+    }
+
+    async fn auth_providers(&self) -> Vec<AuthProviderInfo> {
+        self.auth_flows
+            .as_ref()
+            .map(|f| f.providers())
+            .unwrap_or_default()
+    }
+}
+
+impl NodeApiImpl {
+    /// Persist a completed flow's [`AuthOutcome`] into the credential store and honor any bind,
+    /// returning the wire [`AuthCompleteResponse`]. The single credential-slot resolution path shared
+    /// by `auth_step` completion and (via it) the `auth_complete` compatibility wrapper.
+    fn finish_auth_outcome(
+        &self,
+        outcome: crate::auth::AuthOutcome,
+        bind: Option<AuthBindRequest>,
+    ) -> Result<AuthCompleteResponse, ApiError> {
         let store = self
             .credentials
             .as_ref()
@@ -152,19 +177,5 @@ impl AuthApi for NodeApiImpl {
             transport_instance: outcome.transport_instance,
             bound_profile,
         })
-    }
-
-    async fn auth_cancel(&self, flow_id: String) -> Result<(), ApiError> {
-        if let Some(flows) = self.auth_flows.as_ref() {
-            flows.cancel(&flow_id);
-        }
-        Ok(())
-    }
-
-    async fn auth_providers(&self) -> Vec<AuthProviderInfo> {
-        self.auth_flows
-            .as_ref()
-            .map(|f| f.providers())
-            .unwrap_or_default()
     }
 }

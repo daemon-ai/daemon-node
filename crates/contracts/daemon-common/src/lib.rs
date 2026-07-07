@@ -598,7 +598,22 @@ impl WireVersion {
     /// (B5) presence push: the new `node-event` arm `TransportChanged { transport, connection,
     /// ? presence }`, emitted at coarse real transport transitions so clients stop polling
     /// `TransportInstances`. Breaking (renames + a required `tool-info` field).
-    pub const CURRENT: Self = Self(29);
+    ///
+    /// v30 is claimed by a sibling wire batch (`backlog/node-v30`); this batch skips it to avoid a
+    /// version collision when the two land.
+    ///
+    /// v31 (multi-step interactive auth): generalizes the client-driven login seam from a single
+    /// begin/complete redirect into an n-step challenge/response state machine modeled on libpurple's
+    /// request-fields API (phone/OTP/token/QR prompts). Adds the `AuthStep { flow_id, input }` op ->
+    /// `AuthStepped(auth-step-result)` response, the `auth-challenge` (`Redirect`/`Form`/`Qr`/
+    /// `Message`), `auth-step-input` (`Fields`/`Callback`/`Poll`), `auth-step-result`
+    /// (`Challenge`/`Completed`) and `auth-step-request` DTOs, and extends `auth-flow-kind` with
+    /// `BotToken`/`UserToken`/`PhoneOtp`/`QrPairing`. `AuthBeginResponse` is reshaped to carry the
+    /// initial `challenge` (an `auth-challenge`) instead of the redirect-only `authorization_url`/
+    /// `redirect_uri`/`flow_kind` trio; `auth_complete` stays as a single-step compatibility wrapper
+    /// over `auth_step`. Breaking (`auth-begin-response` shape + new required op), bumped because
+    /// `is_compatible` is strict-equal.
+    pub const CURRENT: Self = Self(31);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

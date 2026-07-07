@@ -344,6 +344,7 @@ fn classify(req: &ApiRequest) -> Coverage {
         | CuratorRun { .. } => NotSessionTouching,
         AuthProviders
         | AuthBegin(_)
+        | AuthStep(_)
         | AuthComplete(_)
         | AuthCancel { .. }
         | CredentialSet { .. }
