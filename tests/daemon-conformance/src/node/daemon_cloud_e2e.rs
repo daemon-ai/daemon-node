@@ -51,6 +51,7 @@ impl CloudCatalog for DiscoveryChatCatalog {
                 requires_key: false,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
             ProviderDescriptor {
                 id: "mistral_rs".into(),
@@ -60,6 +61,7 @@ impl CloudCatalog for DiscoveryChatCatalog {
                 requires_key: false,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
             ProviderDescriptor {
                 id: "anthropic".into(),
@@ -69,6 +71,7 @@ impl CloudCatalog for DiscoveryChatCatalog {
                 requires_key: true,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
             ProviderDescriptor {
                 id: "daemon_cloud".into(),
@@ -79,6 +82,7 @@ impl CloudCatalog for DiscoveryChatCatalog {
                 requires_key: true,
                 supports_model_discovery: true,
                 default_base_url: Some(self.models_base.clone()),
+                sign_in: None,
             },
         ]
     }

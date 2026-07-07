@@ -1012,6 +1012,18 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// List the node-wide tool enable/disable overrides (wire v30; `ToolSetEnabled`) as
+    /// `(tool, enabled)` pairs. `tool_list` overlays these on the bound inventory and per-session
+    /// tool wiring consults them. Default: none (a store without the override table).
+    async fn tool_overrides(&self) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+
+    /// Upsert a node-wide tool enable/disable override (wire v30). Default: no-op.
+    async fn set_tool_override(&self, _tool: &str, _enabled: bool) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List every durable Room (daemon-rooms-spec.md). The Rooms adapter loads these at bring-up to
     /// reconstruct the loopback transports. Default: none (a store without durable rooms — rooms are
     /// then in-memory only for the process lifetime, mirroring the `routing_*` default).
@@ -1263,6 +1275,9 @@ struct Inner {
     /// Durable chat→session routing pins, keyed by canonical origin key (§5.9; the in-memory analogue
     /// of the SQLite `chat_routes` table).
     chat_routes: HashMap<String, ChatRoute>,
+    /// Node-wide tool enable/disable overrides (wire v30), keyed by tool name (the in-memory
+    /// analogue of the SQLite `tool_overrides` table).
+    tool_overrides: HashMap<String, bool>,
     /// Durable manually-registered ACP catalog entries, keyed by name (I7; the in-memory analogue of
     /// the SQLite `acp_catalog` table).
     acp_catalog: HashMap<String, AcpEntry>,
@@ -1868,6 +1883,25 @@ impl SessionStore for InMemoryStore {
 
     async fn routing_remove(&self, key: &str) -> Result<(), StoreError> {
         self.inner.lock().unwrap().chat_routes.remove(key);
+        Ok(())
+    }
+
+    async fn tool_overrides(&self) -> Vec<(String, bool)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .tool_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    async fn set_tool_override(&self, tool: &str, enabled: bool) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .tool_overrides
+            .insert(tool.to_string(), enabled);
         Ok(())
     }
 

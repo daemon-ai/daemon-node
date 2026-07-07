@@ -368,7 +368,9 @@ fn classify(req: &ApiRequest) -> Coverage {
         | RoutingUnbindChat { .. }
         | TransportRooms { .. }
         | TransportAdapters
-        | TransportInstances => NotSessionTouching,
+        | TransportInstances
+        | TransportDisconnect { .. }
+        | TransportRemove { .. } => NotSessionTouching,
         ConvList { .. }
         | ConvGet { .. }
         | ConvCreateDetails { .. }
@@ -398,6 +400,7 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ProviderRegister { .. }
         | ToolList
         | ToolRegister { .. }
+        | ToolSetEnabled { .. }
         | CommandList
         | CommandInvoke { .. }
         | ConfigGet

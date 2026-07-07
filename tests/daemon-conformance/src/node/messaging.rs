@@ -43,6 +43,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         .with_adapter(daemon_matrix::MatrixAdapter::new(
             provisioning,
             daemon_matrix::MatrixConfig::default(),
+            None,
         ));
     node.set_adapters(registry);
     let adapter_tasks = node.spawn_adapters();

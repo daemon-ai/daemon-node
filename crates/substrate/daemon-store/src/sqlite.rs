@@ -335,6 +335,15 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
             "ALTER TABLE completion_notices ADD COLUMN call_id TEXT;\n\
              ALTER TABLE completion_notice_outbox ADD COLUMN call_id TEXT;",
         ),
+        // M8 (wire v30 — tool overrides): the node-wide `ToolSetEnabled` enable/disable overlay,
+        // keyed by tool name. `tool_list` overlays it on the bound inventory and per-session tool
+        // wiring consults it. A row exists only for an explicitly-overridden tool.
+        M::up(
+            "CREATE TABLE tool_overrides (\n\
+                 tool    TEXT PRIMARY KEY,\n\
+                 enabled INTEGER NOT NULL\n\
+             );",
+        ),
     ])
 });
 
@@ -1560,6 +1569,33 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn tool_overrides(&self) -> Vec<(String, bool)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT tool, enabled FROM tool_overrides ORDER BY tool")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn set_tool_override(&self, tool: &str, enabled: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tool_overrides (tool, enabled) VALUES (?1, ?2) \
+             ON CONFLICT(tool) DO UPDATE SET enabled = ?2",
+            params![tool, enabled as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn room_list(&self) -> Vec<Room> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -2141,9 +2177,10 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (7: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// `user_version` (8: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
-    /// pending-approval fingerprint column, and the wire-v29 completion-notice call_id columns).
+    /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, and the
+    /// wire-v30 `tool_overrides` table).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2154,7 +2191,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 8, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

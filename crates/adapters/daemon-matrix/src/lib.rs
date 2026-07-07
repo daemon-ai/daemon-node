@@ -26,6 +26,7 @@ mod inbound;
 mod invite;
 mod login;
 mod mapping;
+mod membership;
 mod outbound;
 
 use std::collections::HashMap;
@@ -109,6 +110,7 @@ pub async fn serve(
     provisioning: Arc<dyn AccountProvisioning>,
     cfg: MatrixConfig,
     live_clients: LiveClients,
+    sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
 ) {
     if !cfg.enabled {
         return;
@@ -246,6 +248,21 @@ pub async fn serve(
         acct.client.add_event_handler(on_stripped_member);
         acct.client.add_event_handler_context(ctx);
         acct.client.add_event_handler(on_room_message);
+        // [waveA:node-v30] membership push: report conversation/membership deltas through the node
+        // lifecycle sink (item 3). Re-derives `me` from the client so it does not depend on the
+        // move order of the surrounding ctx registrations.
+        if let Some(sink) = &sink {
+            if let Some(me) = acct.client.user_id().map(|u| u.to_owned()) {
+                acct.client
+                    .add_event_handler_context(crate::membership::MembershipCtx {
+                        sink: sink.clone(),
+                        transport: acct.transport.clone(),
+                        me,
+                    });
+                acct.client
+                    .add_event_handler(crate::membership::on_room_member);
+            }
+        }
 
         let client = acct.client.clone();
         let instance = acct.transport.clone();

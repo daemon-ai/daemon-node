@@ -246,12 +246,15 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 
 fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
-        ApiRequest, ApiResponse, CommandInvocation, CommandOutput, CredentialInfo, EventsPage,
-        HealthReport, LogPageView, ModelDescriptor, NodeEvent, ProfileSpec, ProviderDescriptor,
-        ProviderKindWire, ProviderSelector, ServiceHealth, SessionPage,
+        AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiRequest, ApiResponse,
+        ApprovalInfo, CommandInvocation, CommandOutput, ConnectionState, ConvChange,
+        CredentialInfo, DisconnectReason, EventsPage, HealthReport, LogPageView, MembershipChange,
+        ModelDescriptor, NodeEvent, PolicyEntry, PresenceState, ProfileSpec, ProviderDescriptor,
+        ProviderKindWire, ProviderSelector, ProviderSignIn, ServiceHealth, SessionPage,
+        TransportInstanceInfo,
     };
     use daemon_common::{ProfileRef, ReqId, SessionId};
-    use daemon_protocol::{AgentCommand, UserMsg};
+    use daemon_protocol::{AgentCommand, ToolDetail, TransportId, UserMsg};
 
     let root = workspace_root();
     let out = root.join("crates/contracts/daemon-api/fixtures/cbor");
@@ -353,7 +356,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-fingerprints.cbor",
         &ApiResponse::Fingerprints(vec![daemon_api::RememberedFingerprint {
             fingerprint: "ab12cd34".into(),
-            label: None,
+            // Provenance (wire v30): a populated label + capture timestamp.
+            label: Some("git status".into()),
+            remembered_at_ms: 1_700_000_000_000,
         }]),
     )?;
     write_cbor(
@@ -362,6 +367,98 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiResponse::SessionCreated {
             session: SessionId::new("fixture-session"),
         },
+    )?;
+    // ----- wire v30 batch -----
+    // Item 1: transport lifecycle ops.
+    write_cbor(
+        &out,
+        "request-transport-disconnect.cbor",
+        &ApiRequest::TransportDisconnect {
+            transport: TransportId::new("matrix/@bot:hs.org"),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-transport-remove.cbor",
+        &ApiRequest::TransportRemove {
+            transport: TransportId::new("matrix/@bot:hs.org"),
+        },
+    )?;
+    // Item 2: an instance carrying a fatal auth failure (reason/message/fatal + Error state).
+    write_cbor(
+        &out,
+        "response-transport-instances.cbor",
+        &ApiResponse::TransportInstances(vec![TransportInstanceInfo {
+            transport: TransportId::new("matrix/@bot:hs.org"),
+            family: "matrix".into(),
+            display_name: "@bot:hs.org".into(),
+            connection: ConnectionState::Error,
+            presence: PresenceState::Offline,
+            bound_profile: Some(ProfileRef::new("default")),
+            reason: Some(DisconnectReason::AuthenticationFailed),
+            message: Some("M_FORBIDDEN: invalid access token".into()),
+            fatal: true,
+        }]),
+    )?;
+    // Item 4: adapter policies — matrix reports auto_accept_invites; a second adapter reports none.
+    write_cbor(
+        &out,
+        "response-adapters.cbor",
+        &ApiResponse::Adapters(vec![
+            AdapterInfo {
+                family: "matrix".into(),
+                display_name: "Matrix".into(),
+                capabilities: AdapterCapabilities {
+                    rooms: true,
+                    direct_messages: true,
+                    presence: true,
+                    room_enumeration: true,
+                    file_transfer: false,
+                    interactive_auth: true,
+                },
+                account_schema: AccountSettingsSchema::default(),
+                policies: vec![PolicyEntry {
+                    key: "auto_accept_invites".into(),
+                    label: "Automatically accept room invites".into(),
+                    value: "true".into(),
+                }],
+            },
+            AdapterInfo {
+                family: "room".into(),
+                display_name: "Rooms (internal)".into(),
+                capabilities: AdapterCapabilities::default(),
+                account_schema: AccountSettingsSchema::default(),
+                policies: Vec::new(),
+            },
+        ]),
+    )?;
+    // Item 6: the tool-override op.
+    write_cbor(
+        &out,
+        "request-tool-set-enabled.cbor",
+        &ApiRequest::ToolSetEnabled {
+            tool: "browser".into(),
+            enabled: false,
+        },
+    )?;
+    // Item 7: an fs/edit approval carrying a node-computed diff detail.
+    write_cbor(
+        &out,
+        "response-approvals.cbor",
+        &ApiResponse::Approvals(daemon_api::WirePage {
+            items: vec![ApprovalInfo {
+                session: SessionId::new("fixture-session"),
+                request_id: "fixture-approval".into(),
+                prompt: "Apply edit to src/lib.rs".into(),
+                path: Some("src/lib.rs".into()),
+                fingerprint: None,
+                detail: Some(ToolDetail::new(
+                    "fs.diff",
+                    br#"{"path":"src/lib.rs","diff":"@@ -1 +1 @@\n-old\n+new\n"}"#.to_vec(),
+                )),
+            }],
+            next: None,
+        }),
     )?;
     write_cbor(&out, "request-profile-list.cbor", &ApiRequest::ProfileList)?;
     write_cbor(
@@ -641,16 +738,34 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-provider-catalog.cbor",
-        &ApiResponse::ProviderCatalog(vec![ProviderDescriptor {
-            id: "daemon_cloud".into(),
-            display_name: "Daemon Cloud".into(),
-            kind: ProviderKindWire::DaemonCloud,
-            wire_selector: ProviderSelector::DaemonApi,
-            // Daemon Cloud needs a key to run turns (lists keyless — see the host-spec semantics).
-            requires_key: true,
-            supports_model_discovery: true,
-            default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
-        }]),
+        &ApiResponse::ProviderCatalog(vec![
+            ProviderDescriptor {
+                id: "daemon_cloud".into(),
+                display_name: "Daemon Cloud".into(),
+                kind: ProviderKindWire::DaemonCloud,
+                wire_selector: ProviderSelector::DaemonApi,
+                // Daemon Cloud needs a key to run turns (lists keyless — host-spec semantics).
+                requires_key: true,
+                supports_model_discovery: true,
+                default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
+                sign_in: None,
+            },
+            // The OpenRouter genai row advertises interactive sign-in (wire v30, CON-15): the node
+            // states the auth family + label; the client calls `auth_begin { family, params: {} }`.
+            ProviderDescriptor {
+                id: "open_router".into(),
+                display_name: "OpenRouter".into(),
+                kind: ProviderKindWire::Cloud,
+                wire_selector: ProviderSelector::GenAi,
+                requires_key: true,
+                supports_model_discovery: true,
+                default_base_url: None,
+                sign_in: Some(ProviderSignIn {
+                    family: "provider/openrouter".into(),
+                    label: "Sign in with OpenRouter".into(),
+                }),
+            },
+        ]),
     )?;
     write_cbor(
         &out,
@@ -735,9 +850,37 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 // v29: the presence-push event, so verify-codec proves the generated decoder
                 // accepts the new node-event arm + the connection/presence enums it carries.
                 NodeEvent::TransportChanged {
-                    transport: daemon_protocol::TransportId::new("matrix/@bot:hs.org"),
-                    connection: daemon_api::ConnectionState::Connected,
-                    presence: daemon_api::PresenceState::Unknown,
+                    transport: TransportId::new("matrix/@bot:hs.org"),
+                    connection: ConnectionState::Connected,
+                    presence: PresenceState::Unknown,
+                    reason: None,
+                    message: None,
+                    fatal: false,
+                },
+                // v30: a disconnect transition carrying a reason/message + the transient
+                // Disconnecting state (reconnect/backoff is node-owned; fatal:false = will retry).
+                NodeEvent::TransportChanged {
+                    transport: TransportId::new("matrix/@bot:hs.org"),
+                    connection: ConnectionState::Disconnecting,
+                    presence: PresenceState::Offline,
+                    reason: Some(DisconnectReason::NetworkError),
+                    message: Some("connection reset by peer".into()),
+                    fatal: false,
+                },
+                // v30: the two membership-push tiers.
+                NodeEvent::ConversationsChanged {
+                    transport: TransportId::new("matrix/@bot:hs.org"),
+                    conv: "!room:hs.org".into(),
+                    change: ConvChange::Added,
+                },
+                NodeEvent::MembershipChanged {
+                    transport: TransportId::new("matrix/@bot:hs.org"),
+                    conv: "!room:hs.org".into(),
+                    member: "@bot:hs.org".into(),
+                    change: MembershipChange::Kicked,
+                    actor: Some("@admin:hs.org".into()),
+                    reason: Some("cleanup".into()),
+                    is_self: true,
                 },
             ],
             next_cursor: 12,

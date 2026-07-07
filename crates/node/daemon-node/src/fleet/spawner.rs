@@ -176,6 +176,8 @@ impl ChildSpawner for ProfileChildSpawner {
                             .await
                             .expect("place stream-json foreign agent");
                         let daemon_provision::Placement { channel, child } = placement;
+                        // The unit id is the foreign agent's attribution for a mid-turn-death failure.
+                        let agent = Some(id.as_str().to_string());
                         Arc::new(AgentUnit::start_journaled(
                             id,
                             feeder,
@@ -185,6 +187,7 @@ impl ChildSpawner for ProfileChildSpawner {
                                     Some(child),
                                     host,
                                     StreamJsonCodec::new(),
+                                    agent.clone(),
                                 )) as Arc<dyn AgentSession>
                             },
                         ))

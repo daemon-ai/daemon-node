@@ -256,6 +256,91 @@ impl CommandFingerprint {
     }
 }
 
+/// One remembered exec-approval on a session's `allow_permanent` allow-list, with provenance
+/// (wire v30): the fingerprint plus when it was remembered and an optional human label. The durable
+/// analogue of [`daemon_api::RememberedFingerprint`] (kept here so the snapshot stays the source of
+/// truth). Serializes as a map; **deserializes tolerantly** — a pre-v30 snapshot stored a bare
+/// `CommandFingerprint` (a hex string) per entry, so an incoming string decodes as
+/// `{ fingerprint, remembered_at_ms: 0, label: None }`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RememberedApproval {
+    /// The resolved-command fingerprint that auto-approves.
+    pub fingerprint: CommandFingerprint,
+    /// Unix milliseconds when the operator remembered it (`0` for pre-v30 entries).
+    #[serde(default)]
+    pub remembered_at_ms: u64,
+    /// An optional human label, when the engine captured a command summary.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl RememberedApproval {
+    /// A remembered approval stamped now (no label captured).
+    pub fn now(fingerprint: CommandFingerprint) -> Self {
+        Self {
+            fingerprint,
+            remembered_at_ms: crate::credentials::now_ms(),
+            label: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RememberedApproval {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct RaVisitor;
+        impl<'de> Visitor<'de> for RaVisitor {
+            type Value = RememberedApproval;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a fingerprint hex string (pre-v30) or a remembered-approval map")
+            }
+            // Pre-v30 compat: a bare fingerprint string.
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(RememberedApproval {
+                    fingerprint: CommandFingerprint(v.to_string()),
+                    remembered_at_ms: 0,
+                    label: None,
+                })
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(RememberedApproval {
+                    fingerprint: CommandFingerprint(v),
+                    remembered_at_ms: 0,
+                    label: None,
+                })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fingerprint: Option<CommandFingerprint> = None;
+                let mut remembered_at_ms: u64 = 0;
+                let mut label: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "fingerprint" => fingerprint = Some(map.next_value()?),
+                        "remembered_at_ms" => remembered_at_ms = map.next_value()?,
+                        "label" => label = map.next_value()?,
+                        _ => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let fingerprint =
+                    fingerprint.ok_or_else(|| de::Error::missing_field("fingerprint"))?;
+                Ok(RememberedApproval {
+                    fingerprint,
+                    remembered_at_ms,
+                    label,
+                })
+            }
+        }
+        deserializer.deserialize_any(RaVisitor)
+    }
+}
+
 /// Length-prefixed, domain-separated feed into the hasher: `len(label) || label || len(bytes) || bytes`,
 /// so field boundaries are unambiguous.
 fn feed(h: &mut Sha256, label: &[u8], bytes: &[u8]) {

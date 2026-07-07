@@ -40,12 +40,15 @@ impl ProcessAgentUnit {
         journal: Option<Arc<crate::journal::JournalFeeder>>,
     ) -> AgentUnit {
         let Placement { channel, child } = placement;
+        // The unit id doubles as the foreign agent's attribution name for a mid-turn-death failure.
+        let agent = Some(id.as_str().to_string());
         AgentUnit::start_journaled(id, journal, move |host: Arc<dyn HostRequestHandler>| {
             Arc::new(CodecSession::from_channel(
                 channel,
                 Some(child),
                 host,
                 NativeCutCodec,
+                agent.clone(),
             )) as Arc<dyn AgentSession>
         })
     }
@@ -54,12 +57,14 @@ impl ProcessAgentUnit {
     /// Used by tests to exercise the cut framing without spawning a process.
     #[cfg(test)]
     pub fn from_channel(id: UnitId, channel: daemon_provision::CutChannel) -> AgentUnit {
+        let agent = Some(id.as_str().to_string());
         AgentUnit::start_journaled(id, None, move |host: Arc<dyn HostRequestHandler>| {
             Arc::new(CodecSession::from_channel(
                 channel,
                 None,
                 host,
                 NativeCutCodec,
+                agent.clone(),
             )) as Arc<dyn AgentSession>
         })
     }

@@ -598,7 +598,41 @@ impl WireVersion {
     /// (B5) presence push: the new `node-event` arm `TransportChanged { transport, connection,
     /// ? presence }`, emitted at coarse real transport transitions so clients stop polling
     /// `TransportInstances`. Breaking (renames + a required `tool-info` field).
-    pub const CURRENT: Self = Self(29);
+    ///
+    /// v30 (the node-authority UI/wire batch — one coordinated bump; additive, but strict version
+    /// equality means a client must speak v30 regardless):
+    /// (1) transport lifecycle: the `TransportDisconnect { transport }` (reversible — stop the
+    /// serve loop, `Offline`, keep credential/config/bound_profile) and `TransportRemove
+    /// { transport }` (disconnect + one node-side teardown: close conversations, unbind routing,
+    /// drop credential + config) control ops. The client issues one intent; the node sequences.
+    /// (2) disconnect reason: `reason: disconnect-reason?` + `message: tstr?` + node-decided
+    /// `fatal: bool` on both `TransportChanged` and `TransportInstanceInfo`, plus a transient
+    /// `ConnectionState::Disconnecting`. `disconnect-reason` is the closed Matrix-scoped set
+    /// `UserRequested | NetworkError | AuthenticationFailed | ReplacedByOtherClient |
+    /// InvalidSettings | CertificateError | Other`. Reconnect/backoff stays node-owned (retry on
+    /// transient reasons emitting per-attempt `TransportChanged`, stop on `fatal:true`).
+    /// (3) membership push, two tiers: `NodeEvent::ConversationsChanged { transport, conv, change:
+    /// conv-change }` (retires client `ConvList` re-polling) and `NodeEvent::MembershipChanged
+    /// { transport, conv, member, change: membership-change, actor?, reason?, is_self }`. On a
+    /// self removal the node reconciles its own routing (drops the dangling `ChatRoute` pin)
+    /// before emitting; mass-resync stays `ResyncNeeded`.
+    /// (4) adapter policy query: display-oriented `policies: [* policy-entry]` on `AdapterInfo`
+    /// (matrix reports `auto_accept_invites`; node decides labels).
+    /// (5) provider sign-in (CON-15 wire half): `sign_in: provider-sign-in?
+    /// ({ family, label })` on `ProviderDescriptor` — the node advertises interactive sign-in via
+    /// an auth family; the OpenRouter genai row advertises `family "provider/openrouter"`.
+    /// (6) tool overlay: the `ToolSetEnabled { tool, enabled }` store-backed override consulted by
+    /// `tool_list` + per-session tool wiring.
+    /// (7) approval detail: optional `detail: tool-detail?` on `ApprovalInfo` (a node-computed
+    /// `"fs.diff"` for fs/edit gated calls).
+    /// (8) fingerprint provenance: `remembered_at_ms: uint64` (+ populated `label`) on
+    /// `RememberedFingerprint`, captured at the `allow_permanent` decide path.
+    /// (9) structured foreign failure: optional `failure: foreign-failure?
+    /// ({ stage: foreign-stage, agent? })` on `TurnSummary`, synthesized as a terminal
+    /// `TurnFinished{Failed}` when a foreign child dies mid-turn (stdout EOF).
+    /// Additive (new ops/events/optional fields; `is_self` is required only inside the brand-new
+    /// `MembershipChanged` variant; no renames).
+    pub const CURRENT: Self = Self(30);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

@@ -375,6 +375,17 @@ pub struct NodeApiImpl {
     /// default (skeleton: lifecycle still lives in `bins/daemon`; this only feeds the descriptor
     /// enumeration). Installed by the assembling binary via [`NodeApiImpl::with_adapters`].
     adapters: Arc<ArcSwap<crate::adapters::AdapterRegistry>>,
+    /// Live serve-loop handles per adapter family (wire v30, item 1): `spawn_adapters` records each
+    /// adapter's supervised serve task here so `transport_disconnect`/`transport_remove` can stop a
+    /// single instance's adapter. Keyed by adapter family (the coarsest per-instance granularity the
+    /// single-serve-loop-per-adapter architecture supports).
+    adapter_handles:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>>,
+    /// Per-transport fatal-disconnect flags (wire v30, item 2): the [`daemon_api::LifecycleSink`]
+    /// sets one when an adapter reports a fatal cause (auth/settings/cert); the reconnect supervisor
+    /// in `spawn_adapters` reads it to short-circuit the backoff loop (stop, offer re-auth) instead
+    /// of respawning a serve loop that will only fail again.
+    disconnect_fatal: Arc<dashmap::DashMap<TransportId, bool>>,
     /// The lazily-opened verifiable-journal writer for the `node-management` stream: management
     /// mutations (`conv_*`/`member_*`) are recorded + sealed onto it so the audit chains per op.
     /// `None` until the first mutation (and stays `None` when journaling is disabled).
@@ -561,6 +572,7 @@ mod control;
 mod cred_auth;
 mod delivery;
 mod journal_audit;
+mod membership;
 mod messaging;
 mod model;
 mod overlay;

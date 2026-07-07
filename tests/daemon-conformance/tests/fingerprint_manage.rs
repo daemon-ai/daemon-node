@@ -187,6 +187,7 @@ fn fingerprint_ops_round_trip() {
     let dto = RememberedFingerprint {
         fingerprint: "ab12".into(),
         label: None,
+        remembered_at_ms: 0,
     };
     assert_eq!(
         dto,
@@ -264,12 +265,16 @@ async fn remembered_fingerprint_lists_revokes_and_reprompts_impl() {
         .await
         .expect("fingerprint_list");
     assert_eq!(
-        listed,
-        vec![RememberedFingerprint {
-            fingerprint: fp_a.clone(),
-            label: None,
-        }],
+        listed.len(),
+        1,
         "the allow-list holds exactly the permanently-allowed fingerprint"
+    );
+    assert_eq!(listed[0].fingerprint, fp_a);
+    assert_eq!(listed[0].label, None);
+    // Provenance (wire v30): the remembered-at timestamp is stamped at the decide path.
+    assert!(
+        listed[0].remembered_at_ms > 0,
+        "provenance timestamp is captured"
     );
 
     // Revoke it (the session is dormant, so the compare-and-swap applies cleanly), and prove the

@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 29)
+wire_version = uint                 ; daemon-common WireVersion (current = 30)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -143,7 +143,11 @@ turn-trigger-background = { "BackgroundCompletion": { "source": completion-sourc
 turn-trigger-scheduled = { "Scheduled": { "job": job-id } }
 turn-trigger = "User" / "Steer" / turn-trigger-background / turn-trigger-scheduled
 end-reason = "Completed" / "Suspended" / "Interrupted" / "BudgetExhausted" / "NoProgress" / "Failed"
-turn-summary = { "end_reason": end-reason, "final_text": (tstr / null), "usage": usage-delta }
+; foreign-agent failure (wire v30, C6): a structured cause carried on a terminal turn-summary when a
+; foreign child dies mid-turn (its stdout closes), so a client renders a crash instead of hanging.
+foreign-stage = "Spawn" / "Handshake" / "Turn" / "Unknown"
+foreign-failure = { "stage": foreign-stage, ? "agent": (tstr / null) }
+turn-summary = { "end_reason": end-reason, "final_text": (tstr / null), "usage": usage-delta, ? "failure": (foreign-failure / null) }
 rate-limit-snapshot = { "remaining": (uint64 / null), "limit": (uint64 / null), "reset_ms": (uint64 / null) }
 
 ; ----- concrete host-request / host-response payloads (tightened from `any`) -----
@@ -352,14 +356,20 @@ approval-info = {
   ; to a structured field for the operator display. null for non-command approvals (fs edits) and
   ; pre-v28 rows. Enforcement stays snapshot-side (daemon-core).
   ? "fingerprint": (tstr / null),
+  ; detail (wire v30): a node-computed structured detail for the gated call — an fs/edit approval
+  ; attaches a unified diff (tool-detail with kind == "fs.diff", JSON body {path, diff}). null for
+  ; approvals with no computable detail and pre-v30 rows.
+  ? "detail": (tool-detail / null),
 }
 
 ; one remembered exec-approval fingerprint on a session's allow_permanent allow-list (wire v29;
-; fingerprint_list / fingerprint_revoke). `label` is reserved (always null today — the engine
-; stores only the hash) so a future command-summary capture needs no wire bump.
+; fingerprint_list / fingerprint_revoke). `label` (wire v30) is populated from the engine's command
+; summary at the allow_permanent decide path when known; `remembered_at_ms` (wire v30) is the unix-ms
+; capture time (0 for pre-v30 rows).
 remembered-fingerprint = {
   "fingerprint": tstr,
   ? "label": (tstr / null),
+  ? "remembered_at_ms": uint64,
 }
 
 ; ----- tree projection DTOs (the GUI/TUI surface over the management tree) -----
@@ -523,6 +533,9 @@ log-page-view = {
 }
 
 ; ----- node-wide event feed (L3 EventsSince): payload-free "what changed out of focus" pointers -----
+; wire v30 membership-push deltas.
+conv-change = "Added" / "Removed"
+membership-change = "Joined" / "Left" / "Invited" / "Kicked" / "Banned"
 node-event = node-event-session-advanced
            / node-event-session-meta-changed
            / node-event-roster-changed
@@ -531,6 +544,8 @@ node-event = node-event-session-advanced
            / node-event-download-progress
            / node-event-catalog-changed
            / node-event-transport-changed
+           / node-event-conversations-changed
+           / node-event-membership-changed
            / node-event-resync-needed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
@@ -543,7 +558,9 @@ node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "
 node-event-catalog-changed      = "CatalogChanged"
 ; v29: a transport instance's connection/presence changed (adapter serve start / teardown / crash),
 ; carrying the full new state so clients stop navigation-polling TransportInstances.
-node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state } }
+node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state, ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool } }
+node-event-conversations-changed = { "ConversationsChanged": { "transport": transport-id, "conv": tstr, "change": conv-change } }
+node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 events-page = {
   "events": [0*64 node-event],
@@ -906,7 +923,9 @@ provider-selector = "mock"
                   / "mistral_rs"
 model-descriptor = { "id": tstr, "provider": provider-selector, ? "display_name": (tstr / null), "context_length": (uint / null), "input_price_micros_per_mtok": (uint64 / null), "output_price_micros_per_mtok": (uint64 / null), "local": bool }
 provider-kind-wire = "local" / "cloud" / "daemon_cloud"
-provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-wire, "wire_selector": provider-selector, "requires_key": bool, "supports_model_discovery": bool, "default_base_url": (tstr / null) }
+; provider-sign-in (wire v30, CON-15): the node advertises interactive sign-in via an auth family.
+provider-sign-in = { "family": tstr, "label": tstr }
+provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-wire, "wire_selector": provider-selector, "requires_key": bool, "supports_model_discovery": bool, "default_base_url": (tstr / null), ? "sign_in": (provider-sign-in / null) }
 skill-creator = "agent" / "user" / "bundled"
 skill-state = "active" / "stale" / "archived"
 skill-usage = { "created_by": skill-creator, "state": skill-state, "pinned": bool, "use_count": uint64, "view_count": uint64, "patch_count": uint64, "created_at_ms": uint64, "last_used_ms": (uint64 / null), "last_viewed_ms": (uint64 / null), "last_patched_ms": (uint64 / null) }
@@ -984,11 +1003,23 @@ adapter-capabilities = {
   "rooms": bool, "direct_messages": bool, "presence": bool,
   "room_enumeration": bool, "file_transfer": bool, "interactive_auth": bool,
 }
-adapter-info = { "family": tstr, "display_name": tstr, "capabilities": adapter-capabilities, ? "account_schema": account-settings-schema }
+; policy-entry (wire v30): a node-labeled, node-valued adapter policy a client renders read-only
+; (the auth-param-field.label precedent). Matrix reports auto_accept_invites.
+policy-entry = { "key": tstr, "label": tstr, "value": tstr }
+adapter-info = { "family": tstr, "display_name": tstr, "capabilities": adapter-capabilities, ? "account_schema": account-settings-schema, ? "policies": [* policy-entry] }
 connection-state = "Offline"
                  / "Connecting"
                  / "Connected"
+                 / "Disconnecting"
                  / "Error"
+; disconnect-reason (wire v30): the closed Matrix-scoped cause set; the node decides `fatal`.
+disconnect-reason = "UserRequested"
+                  / "NetworkError"
+                  / "AuthenticationFailed"
+                  / "ReplacedByOtherClient"
+                  / "InvalidSettings"
+                  / "CertificateError"
+                  / "Other"
 presence-state = "Unknown"
                / "Offline"
                / "Available"
@@ -998,6 +1029,7 @@ presence-state = "Unknown"
 transport-instance-info = {
   "transport": transport-id, "family": tstr, "display_name": tstr,
   ? "connection": connection-state, ? "presence": presence-state, ? "bound_profile": (profile-ref / null),
+  ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool,
 }
 conversation-type = "Unset"
                   / "Dm"
@@ -1161,6 +1193,7 @@ request-provider-list = "ProviderList"
 request-provider-register = { "ProviderRegister": { "provider": provider-info } }
 request-tool-list = "ToolList"
 request-tool-register = { "ToolRegister": { "tool": tool-info } }
+request-tool-set-enabled = { "ToolSetEnabled": { "tool": tstr, "enabled": bool } }
 request-command-list = "CommandList"
 request-command-invoke = { "CommandInvoke": { "invocation": command-invocation } }
 request-caps = "Caps"
@@ -1184,6 +1217,8 @@ request-routing-unbind-chat = { "RoutingUnbindChat": { "origin": origin } }
 request-transport-rooms = { "TransportRooms": { "transport": transport-id, ? "after": (tstr / null) } }
 request-transport-adapters = "TransportAdapters"
 request-transport-instances = "TransportInstances"
+request-transport-disconnect = { "TransportDisconnect": { "transport": transport-id } }
+request-transport-remove = { "TransportRemove": { "transport": transport-id } }
 request-conv-list = { "ConvList": { "transport": transport-id, ? "after": (tstr / null) } }
 request-conv-get = { "ConvGet": { "transport": transport-id, "conv": tstr } }
 request-conv-create-details = { "ConvCreateDetails": { "transport": transport-id } }
@@ -1338,6 +1373,7 @@ api-request = request-submit
             / request-provider-register
             / request-tool-list
             / request-tool-register
+            / request-tool-set-enabled
             / request-command-list
             / request-command-invoke
             / request-caps
@@ -1361,6 +1397,8 @@ api-request = request-submit
             / request-transport-rooms
             / request-transport-adapters
             / request-transport-instances
+            / request-transport-disconnect
+            / request-transport-remove
             / request-conv-list
             / request-conv-get
             / request-conv-create-details

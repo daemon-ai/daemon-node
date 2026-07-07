@@ -330,6 +330,20 @@ impl ControlApi for NodeApiImpl {
             if !owner_visible(&principal, &owner) {
                 continue;
             }
+            // wire v30 (item 7): attach a node-computed structured detail for fs/edit approvals — a
+            // `tool-detail` with kind "fs.diff" and JSON body `{path, diff}`. The diff is sourced
+            // from the engine's node-computed approval prompt, which for a path-bearing (fs edit)
+            // gate IS the diff summary the operator is asked to approve (the proposed edit content
+            // is carried to daemon-host on the durable parked row, so the compute happens here at
+            // park time — decision F). Command approvals (no path) carry no diff detail.
+            let detail = p.path.as_ref().map(|path| {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "path": path,
+                    "diff": p.prompt,
+                }))
+                .unwrap_or_default();
+                daemon_protocol::ToolDetail::new("fs.diff", body)
+            });
             approvals.push(ApprovalInfo {
                 session: p.session_id,
                 request_id: p.job_id.as_str().to_string(),
@@ -338,6 +352,7 @@ impl ControlApi for NodeApiImpl {
                 // wire v28: surface the stamped command fingerprint structurally (was only inside
                 // `prompt`). Enforcement stays snapshot-side; this is display/correlation only.
                 fingerprint: p.fingerprint,
+                detail,
             });
         }
         // The store lists in rowseq (arrival) order; the cursor is the request_id, so sort by it
@@ -395,16 +410,39 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn tool_list(&self) -> Vec<daemon_api::ToolInfo> {
-        // The node-wide inventory the binary late-bound (it owns the tool build gates). Bounded at
-        // the wire page cap like every other unpaged list.
-        match self.tools_inventory.load_full() {
+        // The node-wide inventory the binary late-bound (it owns the tool build gates), overlaid
+        // with the durable `ToolSetEnabled` overrides (wire v30, item 6). Bounded at the wire page
+        // cap like every other unpaged list.
+        let mut tools: Vec<daemon_api::ToolInfo> = match self.tools_inventory.load_full() {
             Some(tools) => tools
                 .iter()
                 .take(daemon_api::WIRE_PAGE_MAX)
                 .cloned()
                 .collect(),
             None => Vec::new(),
+        };
+        for (name, enabled) in self.store.tool_overrides().await {
+            if let Some(row) = tools.iter_mut().find(|t| t.name == name) {
+                if !enabled {
+                    // Force-disable is always honored.
+                    row.enabled = false;
+                } else if row.requires.is_none() {
+                    // Force-enable re-enables a policy-disabled tool but can never conjure one
+                    // missing its build feature (a `requires` row stays disabled — decision E).
+                    row.enabled = true;
+                }
+            }
         }
+        tools
+    }
+
+    async fn tool_set_enabled(&self, tool: String, enabled: bool) -> Result<(), ApiError> {
+        // Persist the node-wide override (wire v30, item 6). `tool_list` overlays it and per-session
+        // tool wiring consults it, so a disabled tool disappears from new turns.
+        self.store
+            .set_tool_override(&tool, enabled)
+            .await
+            .map_err(|e| ApiError::Other(format!("set tool override: {e}")))
     }
 
     async fn fingerprint_list(
@@ -432,9 +470,11 @@ impl ControlApi for NodeApiImpl {
             .session_allow_fingerprints
             .iter()
             .take(daemon_api::WIRE_PAGE_MAX)
-            .map(|fp| daemon_api::RememberedFingerprint {
-                fingerprint: fp.as_str().to_string(),
-                label: None,
+            .map(|r| daemon_api::RememberedFingerprint {
+                fingerprint: r.fingerprint.as_str().to_string(),
+                // Provenance (wire v30): the label + capture timestamp recorded at the decide path.
+                label: r.label.clone(),
+                remembered_at_ms: r.remembered_at_ms,
             })
             .collect())
     }
@@ -466,7 +506,7 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("decode session snapshot: {e}")))?;
         let before = snap.session_allow_fingerprints.len();
         snap.session_allow_fingerprints
-            .retain(|fp| fp.as_str() != fingerprint);
+            .retain(|r| r.fingerprint.as_str() != fingerprint);
         if snap.session_allow_fingerprints.len() == before {
             return Err(ApiError::Other(format!(
                 "no remembered fingerprint {fingerprint} on session {session}"
@@ -797,6 +837,68 @@ impl ControlApi for NodeApiImpl {
     async fn transport_instances(&self) -> Vec<TransportInstanceInfo> {
         // Live per-account connection/presence, aggregated across every registered adapter.
         self.adapters.load_full().instances().await
+    }
+
+    async fn transport_disconnect(&self, transport: TransportId) -> Result<(), ApiError> {
+        // Reversible (wire v30, item 1): abort the owning adapter's supervised serve loop and mark
+        // the instance Offline, KEEPING its credential/config/bound_profile. The serve loop is
+        // per-adapter (the coarsest per-instance granularity this architecture supports), so we key
+        // the handle by family. A later re-`spawn_adapters` (or restart) resumes it.
+        let family = self
+            .adapters
+            .load_full()
+            .adapter_for_transport(&transport)
+            .map(|a| a.family().to_string())
+            .ok_or_else(|| {
+                ApiError::Other(format!("no adapter owns transport {}", transport.as_str()))
+            })?;
+        if let Some(handle) = self.adapter_handles.lock().unwrap().remove(&family) {
+            handle.abort();
+        }
+        // A user-requested disconnect is transient (not fatal): a reconnect can resume it.
+        self.disconnect_fatal.insert(transport.clone(), false);
+        if let Some(feed) = self.node_feed() {
+            feed.emit(daemon_api::NodeEvent::TransportChanged {
+                transport,
+                connection: daemon_api::ConnectionState::Offline,
+                presence: daemon_api::PresenceState::Offline,
+                reason: Some(daemon_api::DisconnectReason::UserRequested),
+                message: None,
+                fatal: false,
+            });
+        }
+        Ok(())
+    }
+
+    async fn transport_remove(&self, transport: TransportId) -> Result<(), ApiError> {
+        // Remove implies disconnect, then ONE node-side teardown (wire v30, item 1): the client
+        // issues a single intent; the node sequences the steps. (1) disconnect, (2) leave every
+        // conversation the instance owns, (3) unbind its routing pins, (4) drop its credential.
+        self.transport_disconnect(transport.clone()).await?;
+        // (2) close conversations (best-effort; adapters that do not support leave are skipped).
+        let mut after: Option<String> = None;
+        loop {
+            let page = self.conv_list(transport.clone(), after.take()).await;
+            for conv in &page.items {
+                let _ = self.conv_leave(transport.clone(), conv.id.clone()).await;
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        // (3) unbind routing pins whose origin belongs to this transport instance.
+        for route in self.store.routing_list().await {
+            if let Some(wire) = super::routing::wire_route_from_store(&route) {
+                if super::routing::transport_family_matches(&wire.origin.transport, &transport) {
+                    let _ = self.store.routing_remove(&route.key).await;
+                }
+            }
+        }
+        self.load_routing_pins().await;
+        // (4) drop the instance's credential (best-effort; keyed by the instance-qualified id).
+        let _ = self.credential_remove(transport.as_str().to_string()).await;
+        Ok(())
     }
 
     // ----- messaging-adapter management (daemon-messaging-adapter-spec.md §6): forwarded generically

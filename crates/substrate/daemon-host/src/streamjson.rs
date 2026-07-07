@@ -170,6 +170,7 @@ impl Codec for StreamJsonCodec {
                         end_reason,
                         final_text: env.result,
                         usage: UsageDelta::default(),
+                        failure: None,
                     },
                 }));
             }

@@ -528,6 +528,18 @@ pub enum ProviderKindWire {
     DaemonCloud,
 }
 
+/// The interactive sign-in a provider advertises (wire v30, CON-15). The node states the auth
+/// family and render label; the client calls `auth_begin { family, params: {} }` and the node fills
+/// every flow detail. Clients key nothing off vendor ids.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSignIn {
+    /// The `auth_begin.family` to drive interactive sign-in for this provider.
+    pub family: String,
+    /// The node-decided button/render label (e.g. "Sign in with OpenRouter").
+    pub label: String,
+}
+
 /// One discoverable provider row for the GUI/TUI picker (returned by `ProviderCatalog`). Carries
 /// everything the client needs to render the provider list and, on selection, drive `ProviderModels`
 /// and persist a working profile — without hardcoding any endpoint or provider list.
@@ -552,6 +564,11 @@ pub struct ProviderDescriptor {
     /// The gateway/base URL the client should persist for this provider, so it never hardcodes one.
     /// Daemon Cloud carries `https://api.daemon.ai/api/v1/`; `None` for genai vendors + local.
     pub default_base_url: Option<String>,
+    /// The interactive sign-in this provider supports (wire v30, CON-15). `Some` for a provider
+    /// with an interactive login (the OpenRouter genai row advertises `family
+    /// "provider/openrouter"`); `None` for key-in-a-field-only and local providers.
+    #[serde(default)]
+    pub sign_in: Option<ProviderSignIn>,
 }
 
 /// A redacted view of a stored credential (the shape a GUI's "API keys" list renders). The secret
