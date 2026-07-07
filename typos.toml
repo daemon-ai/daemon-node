@@ -29,6 +29,7 @@ lod = "lod"                 # LOD: level-of-detail
 muc = "muc"                 # MUC: XMPP multi-user chat
 arange = "arange"           # numpy np.arange in skill examples
 canva = "canva"             # Canva (product name)
+grammers = "grammers"       # the `grammers` Telegram MTProto crate family (daemon-telegram)
 # Short fragments typos extracts from larger identifiers/words/fixtures (PNGs, MorAlekss, ...).
 nd = "nd"
 ot = "ot"
