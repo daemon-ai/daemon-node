@@ -13,10 +13,17 @@ use async_trait::async_trait;
 use daemon_api::{ModelDescriptor, ProviderSelector};
 use daemon_common::UsageDelta;
 use daemon_core::{ModelOutput, Provider, Request, StreamEvent, ToolCall};
-use daemon_gateway::{Completion, GatewayBackend, GatewayError};
+use daemon_gateway::{Completion, GatewayBackend, GatewayError, GatewayPrincipal};
 use futures::{stream, StreamExt};
 
 const TOKEN: &str = "test-gateway-token";
+
+/// The shared bearer resolution both test backends use: the fixed test token authenticates as the
+/// admin caller; everything else is rejected (`None` → 401). Per-session tokens are exercised in the
+/// binary's own registry tests.
+async fn authorize_test_token(token: &str) -> Option<GatewayPrincipal> {
+    (token == TOKEN).then_some(GatewayPrincipal::Admin)
+}
 
 /// A deterministic backend: `catalog()` returns a fixed list; `complete()` echoes the last user
 /// message. When the model is `"tooly"` it emits a tool call; when streaming it splits the reply
@@ -40,8 +47,13 @@ impl GatewayBackend for MockBackend {
         ]
     }
 
+    async fn authorize(&self, token: &str) -> Option<GatewayPrincipal> {
+        authorize_test_token(token).await
+    }
+
     async fn complete(
         &self,
+        _principal: &GatewayPrincipal,
         model: &str,
         req: Request,
         stream_flag: bool,
@@ -95,7 +107,7 @@ async fn spawn_gateway() -> String {
     let addr = listener.local_addr().unwrap();
     let backend: Arc<dyn GatewayBackend> = Arc::new(MockBackend);
     tokio::spawn(async move {
-        let _ = daemon_gateway::serve(listener, backend, TOKEN.to_string()).await;
+        let _ = daemon_gateway::serve(listener, backend).await;
     });
     format!("http://{addr}")
 }
@@ -253,8 +265,13 @@ impl GatewayBackend for ProviderBackend {
         }]
     }
 
+    async fn authorize(&self, token: &str) -> Option<GatewayPrincipal> {
+        authorize_test_token(token).await
+    }
+
     async fn complete(
         &self,
+        _principal: &GatewayPrincipal,
         _model: &str,
         req: Request,
         stream_flag: bool,
@@ -293,7 +310,7 @@ async fn real_provider_seam_e2e() {
     let addr = listener.local_addr().unwrap();
     let backend: Arc<dyn GatewayBackend> = Arc::new(ProviderBackend);
     tokio::spawn(async move {
-        let _ = daemon_gateway::serve(listener, backend, TOKEN.to_string()).await;
+        let _ = daemon_gateway::serve(listener, backend).await;
     });
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();

@@ -71,6 +71,49 @@ impl ProviderSelector {
     }
 }
 
+/// How a `Foreign`-engine profile sources its model backend (wire v30). `EngineSelector::Foreign`
+/// picks the *agent* (by catalog name); this picks *where that agent's turns get their tokens*:
+///
+/// - [`ForeignBackend::AgentNative`] — the agent runs on its own backend; the node only steers its
+///   model choice via ACP `set_config_option` (no provider knob, no keys). The default, so a bare
+///   `Foreign { agent }` profile keeps today's "the agent uses whatever backend it ships with"
+///   behavior.
+/// - [`ForeignBackend::NodeProvider`] — the agent's OpenAI-wire backend is repointed at the node's
+///   gateway (a per-session loopback token), so its turns run on a node [`ProviderSelector`] +
+///   model with the real credential resolved node-side. Keys never reach the agent.
+///
+/// Foreign model selection lives HERE, not on the top-level [`ProfileSpec::model`] (which stays
+/// Core-only): a foreign profile names an agent + a backend, never a native provider/model.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignBackend {
+    /// The agent's own backend; the node steers only the model (via ACP), if one is named. `None`
+    /// leaves the agent on whatever model it defaults to.
+    AgentNative {
+        /// The model id to steer the agent to (best-effort, via ACP), or `None` for the agent
+        /// default.
+        model: Option<String>,
+    },
+    /// The agent is routed through the node gateway to a node [`ProviderSelector`] + model; the
+    /// credential stays node-side (resolved from `credential_ref`, else the profile's credential).
+    NodeProvider {
+        /// The node provider the gateway routes this agent's turns to.
+        provider: ProviderSelector,
+        /// The model id the gateway routes to (required — a routed backend must name a model).
+        model: String,
+        /// The stored credential the gateway acquires the provider bearer from (`None` = the
+        /// profile's own credential). A name, never the secret.
+        credential_ref: Option<String>,
+    },
+}
+
+impl Default for ForeignBackend {
+    fn default() -> Self {
+        // Today's behavior: a foreign profile runs the agent's own backend, model unsteered.
+        ForeignBackend::AgentNative { model: None }
+    }
+}
+
 /// Which default context engine (§10) a profile wires into its engine.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +254,12 @@ pub struct ProfileSpec {
     /// catalog by name only.
     #[serde(default)]
     pub engine: EngineSelector,
+    /// For a `Foreign` engine: how that agent sources its model backend (its own, model-steered via
+    /// ACP; or routed through the node gateway to a node provider). Ignored for `Core` (whose
+    /// provider/model live in the top-level fields). Defaults to `AgentNative { model: None }` so a
+    /// pre-`foreign_backend` encoding decodes to today's behavior (safe migration).
+    #[serde(default)]
+    pub foreign_backend: ForeignBackend,
 }
 
 impl ProfileSpec {
@@ -235,6 +284,7 @@ impl ProfileSpec {
             fallback_credential_ref: None,
             bound_accounts: Vec::new(),
             engine: EngineSelector::Core,
+            foreign_backend: ForeignBackend::default(),
         }
     }
 
@@ -845,6 +895,66 @@ mod tests {
         ciborium::into_writer(&spec, &mut buf).unwrap();
         let back: ProfileSpec = ciborium::from_reader(&buf[..]).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn foreign_backend_default_and_wire_shapes() {
+        // The default arm is the safe-migration behavior: the agent's own backend, unsteered.
+        assert_eq!(
+            ForeignBackend::default(),
+            ForeignBackend::AgentNative { model: None }
+        );
+        // Externally-tagged struct variants — the shape the CDDL `foreign-backend` union mirrors.
+        assert_eq!(
+            serde_json::to_string(&ForeignBackend::AgentNative {
+                model: Some("mock-model-b".into())
+            })
+            .unwrap(),
+            "{\"AgentNative\":{\"model\":\"mock-model-b\"}}"
+        );
+        assert_eq!(
+            serde_json::to_string(&ForeignBackend::NodeProvider {
+                provider: ProviderSelector::GenAi,
+                model: "gpt-4o".into(),
+                credential_ref: None,
+            })
+            .unwrap(),
+            "{\"NodeProvider\":{\"provider\":\"genai\",\"model\":\"gpt-4o\",\"credential_ref\":null}}"
+        );
+        // Round-trips through CBOR (the on-wire encoding) inside a full ProfileSpec.
+        let spec = ProfileSpec {
+            engine: EngineSelector::Foreign {
+                agent: "codex".into(),
+            },
+            foreign_backend: ForeignBackend::NodeProvider {
+                provider: ProviderSelector::GenAi,
+                model: "gpt-4o".into(),
+                credential_ref: Some("openai".into()),
+            },
+            ..ProfileSpec::new("routed", ProviderSelector::Mock, "")
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&spec, &mut buf).unwrap();
+        let back: ProfileSpec = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn pre_foreign_backend_encodings_decode_as_agent_native() {
+        // A profile persisted before `foreign_backend` existed omits the key; it must decode with
+        // the default `AgentNative { model: None }` (the additive-compat contract for the optional
+        // CDDL field), preserving today's "agent's own backend" behavior.
+        let legacy = serde_json::json!({
+            "id": "old-foreign",
+            "provider": "mock",
+            "model": "",
+            "engine": { "Foreign": { "agent": "codex" } }
+        });
+        let spec: ProfileSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            spec.foreign_backend,
+            ForeignBackend::AgentNative { model: None }
+        );
     }
 
     #[test]

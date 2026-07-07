@@ -383,6 +383,11 @@ impl NodeApiImpl {
     /// currently installed — otherwise the mutation fails fast with a clear error instead of
     /// minting a profile whose sessions can never spawn. (Spawn re-checks installed-ness too,
     /// since it can change after validation.) `Core` always passes.
+    ///
+    /// A `Foreign` profile additionally validates its [`daemon_api::ForeignBackend`]: `AgentNative`
+    /// always passes (the agent owns its backend); `NodeProvider` requires a non-empty model that
+    /// is an installed local model (for a local provider) and a resolvable credential (for a cloud
+    /// provider) — so a routed foreign session can never mint on an un-serveable provider/model.
     pub(crate) async fn validate_engine(&self, spec: &ProfileSpec) -> Result<(), ApiError> {
         let daemon_api::EngineSelector::Foreign { agent } = &spec.engine else {
             return Ok(());
@@ -398,6 +403,69 @@ impl NodeApiImpl {
                 "agent `{agent}` is not installed (catalog entry present, binary/endpoint \
                  missing)"
             )));
+        }
+        if let daemon_api::ForeignBackend::NodeProvider {
+            provider,
+            model,
+            credential_ref,
+        } = &spec.foreign_backend
+        {
+            self.validate_node_provider(spec, *provider, model, credential_ref.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Validate a `NodeProvider` foreign backend (the gateway-routed arm): the model must be
+    /// non-empty and, for a local provider, an installed model in the node catalog; a cloud provider
+    /// must have a resolvable credential. The membership/credential checks degrade gracefully when
+    /// the backing surface is absent (no model manager / no credential store) — validation never
+    /// spawns or probes, mirroring [`validate_inference`].
+    async fn validate_node_provider(
+        &self,
+        spec: &ProfileSpec,
+        provider: ProviderSelector,
+        model: &str,
+        credential_ref: Option<&str>,
+    ) -> Result<(), ApiError> {
+        if model.trim().is_empty() {
+            return Err(ApiError::Unsupported(format!(
+                "profile `{}` routes a NodeProvider foreign backend but names no model — set \
+                 `foreign_backend.model`",
+                spec.id
+            )));
+        }
+        if provider.is_local() {
+            // A local routed model must be installed (the same latitude `validate_inference` gives:
+            // only enforced when a model catalog is available to verify against).
+            if self.models.is_some() {
+                let installed = self
+                    .models_all()
+                    .await
+                    .into_iter()
+                    .any(|m| m.local && m.id == model);
+                if !installed {
+                    return Err(ApiError::Unsupported(format!(
+                        "NodeProvider model `{model}` is not an installed local model — download \
+                         one (ModelSearch/ModelDownload) and name its installed catalog id"
+                    )));
+                }
+            }
+        } else if !matches!(provider, ProviderSelector::Mock) {
+            // A cloud provider needs a resolvable credential (the profile's own `credential_ref`, or
+            // the backend override). Only enforced when a credential store is wired.
+            let cref = credential_ref
+                .map(str::to_string)
+                .unwrap_or_else(|| spec.credential_profile().to_string());
+            if let Some(store) = &self.credentials {
+                if store.get(&cref).is_none() {
+                    return Err(ApiError::Unsupported(format!(
+                        "NodeProvider cloud backend for profile `{}` needs a resolvable credential \
+                         `{cref}` — provision it via CredentialSet",
+                        spec.id
+                    )));
+                }
+            }
         }
         Ok(())
     }

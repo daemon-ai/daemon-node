@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemon_api::{
-    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, EngineSelector, Outbound,
-    ProfileApi, ProfileSpec, ProviderSelector, SessionApi, SessionQuery,
+    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, EngineSelector,
+    ForeignBackend, Outbound, ProfileApi, ProfileSpec, ProviderSelector, SessionApi, SessionQuery,
 };
 use daemon_common::{ProfileRef, ReqId};
 use daemon_core::{MockProvider, Provider, ProviderBuilder, ProviderRegistry};
@@ -99,11 +99,15 @@ fn foreign_profile(id: &str, agent: &str) -> ProfileSpec {
     }
 }
 
-/// Like [`foreign_profile`] but carrying a node-validated `model` (Layer 1): the catalog still owns
-/// the launch recipe; only the model string is threaded through to the ACP `set_config_option`.
+/// Like [`foreign_profile`] but carrying a node-validated model in its `AgentNative` foreign
+/// backend: the catalog still owns the launch recipe; only the model string is threaded through to
+/// the ACP `set_config_option`. (Wire v30: the foreign model lives in `foreign_backend`, not the
+/// Core-only top-level `model`.)
 fn foreign_profile_with_model(id: &str, agent: &str, model: &str) -> ProfileSpec {
     ProfileSpec {
-        model: model.into(),
+        foreign_backend: ForeignBackend::AgentNative {
+            model: Some(model.into()),
+        },
         ..foreign_profile(id, agent)
     }
 }
@@ -420,4 +424,46 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
         .await
         .expect_err("an unknown agent must fail profile_update");
     assert!(err.to_string().contains("no-such-agent"));
+}
+
+/// A `Foreign` profile whose backend routes through the node gateway (`NodeProvider`): the
+/// installed-agent check still applies, and the `NodeProvider` arm additionally rejects an empty
+/// routed model while accepting a well-formed one (a `Mock` provider needs neither an installed
+/// local model nor a credential), proving the Phase-2 `validate_engine` extension.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_provider_backend_validation() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+
+    // NodeProvider with no routed model is rejected (the routed backend must name a model).
+    let modelless = ProfileSpec {
+        foreign_backend: ForeignBackend::NodeProvider {
+            provider: ProviderSelector::Mock,
+            model: String::new(),
+            credential_ref: None,
+        },
+        ..foreign_profile("routed-empty", "fake-echo")
+    };
+    let err = node
+        .profile_create(modelless)
+        .await
+        .expect_err("a NodeProvider backend with no model must be rejected");
+    assert!(
+        err.to_string().contains("names no model"),
+        "the error explains the missing routed model: {err}"
+    );
+
+    // NodeProvider with a well-formed routing (Mock provider needs no installed model / credential)
+    // is accepted.
+    let routed = ProfileSpec {
+        foreign_backend: ForeignBackend::NodeProvider {
+            provider: ProviderSelector::Mock,
+            model: "mock-model".into(),
+            credential_ref: None,
+        },
+        ..foreign_profile("routed-ok", "fake-echo")
+    };
+    node.profile_create(routed)
+        .await
+        .expect("a well-formed NodeProvider foreign profile is accepted");
 }

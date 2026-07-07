@@ -40,18 +40,44 @@ pub enum Completion {
     Stream(EventStream),
 }
 
+/// The caller resolved from a presented bearer token by [`GatewayBackend::authorize`], threaded
+/// into [`GatewayBackend::complete`] so the backend enforces the token's binding.
+///
+/// The gateway is both a resident surface for external OpenAI clients (the `Admin` token) and the
+/// per-session routing target for node-managed foreign agents (`Session` tokens). This enum lets the
+/// server stay agnostic of *how* the backend resolves a token while still carrying the discriminant
+/// completion needs: an `Admin` caller picks the model per request; a `Session` caller's model +
+/// provider + credential are pinned node-side to the token's binding (the request model is ignored),
+/// so a foreign agent's loopback token can only ever invoke its bound triple.
+#[derive(Clone, Debug)]
+pub enum GatewayPrincipal {
+    /// The admin/global bearer (an external OpenAI client, or the node's boot-minted token): the
+    /// request's `model` is honored and the provider/credential are resolved node-side.
+    Admin,
+    /// A per-session bearer bound node-side to a fixed provider+model+credential. The opaque token
+    /// lets the backend re-resolve the binding; the request's model is ignored.
+    Session(String),
+}
+
 /// The node-side backing of the OpenAI-compatible surface. Implemented by the binary (which has the
-/// provider resolver, credential broker, and catalog in scope); the gateway crate never depends on
-/// the binary or on `NodeApi`.
+/// provider resolver, credential broker, catalog, and per-session token registry in scope); the
+/// gateway crate never depends on the binary or on `NodeApi`.
 #[async_trait]
 pub trait GatewayBackend: Send + Sync {
     /// The discoverable model catalog, rendered by `GET /v1/models`.
     async fn catalog(&self) -> Vec<ModelDescriptor>;
 
-    /// Run a completion for `model` from the mapped `req`. `stream` mirrors the request's `stream`
-    /// flag; the backend returns the matching [`Completion`] variant.
+    /// Resolve a presented bearer token to its caller. `None` rejects the request (`401`); the
+    /// server never compares tokens itself — the backend owns the admin token and the per-session
+    /// token registry.
+    async fn authorize(&self, token: &str) -> Option<GatewayPrincipal>;
+
+    /// Run a completion for the resolved `principal`. `model` is the request's model (honored for
+    /// an `Admin` caller; ignored for a `Session` caller, whose model is pinned by its binding).
+    /// `stream` mirrors the request's `stream` flag; the backend returns the matching [`Completion`].
     async fn complete(
         &self,
+        principal: &GatewayPrincipal,
         model: &str,
         req: Request,
         stream: bool,

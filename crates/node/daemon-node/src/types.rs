@@ -178,25 +178,85 @@ pub struct NodeAssembly {
     /// recursion budget): the tool declines past `min(max_depth, nesting_depth + 1)`, so the
     /// policy cap can narrow the structural budget but never widen it.
     pub orchestrate: OrchestrateCaps,
-    /// The node gateway's loopback coordinates for Layer 2 injection into opted-in OpenAI-wire
-    /// foreign agents. `None` (the default) leaves foreign agents on their own backend.
+    /// The node gateway's loopback coordinates + per-session token minter, for routing
+    /// `NodeProvider`-backed OpenAI-wire foreign agents through the gateway. `None` (the default)
+    /// leaves foreign agents on their own backend; the binary sets it when the gateway has a bind
+    /// address.
     pub foreign_gateway: Option<GatewayCoords>,
 }
 
 /// The loopback coordinates of the node's OpenAI-compatible gateway (`daemon-gateway`), threaded
-/// into the interactive session builder so an opted-in OpenAI-wire foreign agent (codex/opencode)
-/// is spawned pointed at the gateway (`OPENAI_BASE_URL`/`OPENAI_API_KEY`) instead of holding a real
-/// provider key. `None` on [`NodeAssembly::foreign_gateway`] leaves foreign agents on their own
-/// backend (the default); the binary sets it only when the gateway is enabled AND
-/// `[gateway].inject_foreign` is on. Injection is env-only — the launch recipe still comes from the
-/// catalog by name, preserving the foreign-engine security invariant.
-#[derive(Clone, Debug)]
+/// into the interactive session builder so a `NodeProvider`-backed OpenAI-wire foreign agent
+/// (codex/opencode) is spawned pointed at the gateway (`OPENAI_BASE_URL`/`OPENAI_API_KEY`) instead
+/// of holding a real provider key. `None` on [`NodeAssembly::foreign_gateway`] leaves foreign agents
+/// on their own backend; the binary sets it whenever the gateway has a bind address.
+///
+/// The bearer is no longer a single global token: routing is now per-profile (Phase 2). When a
+/// `NodeProvider` foreign session opens, the builder mints a PER-SESSION token via [`minter`] bound
+/// to that session's `{provider, model, credential_ref}` and injects it as `OPENAI_API_KEY`; the
+/// gateway resolves the provider+model+credential from the presented token (node-side), so no
+/// provider key ever reaches the agent. Injection is env-only — the launch recipe still comes from
+/// the catalog by name, preserving the foreign-engine security invariant.
+///
+/// [`minter`]: GatewayCoords::minter
+#[derive(Clone)]
 pub struct GatewayCoords {
     /// The gateway base URL an agent's `OPENAI_BASE_URL` is set to (e.g. `http://127.0.0.1:8081/v1`).
     pub base_url: String,
-    /// The gateway bearer token an agent's `OPENAI_API_KEY` is set to (a loopback capability, not a
-    /// real provider key).
-    pub token: String,
+    /// The per-session token registry: mint a loopback bearer bound to a foreign session's routing,
+    /// revoked when the session ends. Implemented by the binary over the gateway backend's registry.
+    pub minter: Arc<dyn GatewayTokenMinter>,
+}
+
+/// The node-side routing a per-session gateway token is bound to (Phase 2): a foreign
+/// `NodeProvider` session's turns run on this `{provider, model, credential_ref}`. Mirrors
+/// [`daemon_api::ForeignBackend::NodeProvider`] but stays a plain host-side struct (never wire), so
+/// the token→binding table can live node-side and the agent only ever holds an opaque bearer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayBinding {
+    /// The node provider the gateway routes the token's turns to.
+    pub provider: daemon_api::ProviderSelector,
+    /// The model id the gateway routes to.
+    pub model: String,
+    /// The stored credential the gateway acquires the provider bearer from (`None` = the routed
+    /// profile's own credential). A name, never the secret.
+    pub credential_ref: Option<String>,
+}
+
+/// The per-session gateway-token registry seam the binary implements over the gateway backend's
+/// token→binding table. `daemon-node` never links `daemon-gateway`/the binary, so this trait is the
+/// injection point (mirroring [`ProviderResolver`]): the session builder mints a token bound to a
+/// foreign session's routing at open and revokes it at close, keeping the real provider key
+/// node-side.
+pub trait GatewayTokenMinter: Send + Sync {
+    /// Mint a fresh loopback bearer bound to `binding`, returning the opaque token to inject as the
+    /// agent's `OPENAI_API_KEY`.
+    fn mint(&self, binding: GatewayBinding) -> String;
+
+    /// Revoke a previously-minted token (idempotent), dropping its binding from the registry.
+    fn revoke(&self, token: &str);
+}
+
+/// A drop guard tying a minted per-session gateway token to the lifetime of the foreign session it
+/// was minted for: when the session's [`AgentSession`](daemon_host::AgentSession) is dropped (the
+/// session closed / the node shut down), the guard revokes the token so its binding never outlives
+/// the session and the registry cannot grow unbounded.
+pub struct GatewayLease {
+    minter: Arc<dyn GatewayTokenMinter>,
+    token: String,
+}
+
+impl GatewayLease {
+    /// Build a lease over a freshly-minted `token`; dropping it revokes via `minter`.
+    pub fn new(minter: Arc<dyn GatewayTokenMinter>, token: String) -> Self {
+        Self { minter, token }
+    }
+}
+
+impl Drop for GatewayLease {
+    fn drop(&mut self) {
+        self.minter.revoke(&self.token);
+    }
 }
 
 /// The delegation guardrail caps (`[orchestrate].max_depth` / `.max_fanout`) threaded into the

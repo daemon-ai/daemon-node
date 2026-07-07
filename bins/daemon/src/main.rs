@@ -837,6 +837,8 @@ fn default_profile_spec(
         // The launch-config seed always runs the native engine; foreign-agent profiles are
         // created explicitly over the ProfileApi.
         engine: daemon_api::EngineSelector::Core,
+        // Core engine: the foreign backend is inert (default). A foreign profile sets it explicitly.
+        foreign_backend: daemon_api::ForeignBackend::default(),
     }
 }
 
@@ -2662,31 +2664,34 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             minted
         }
     };
-    // Layer 2 coords: only when the gateway is enabled AND injection is explicitly opted in.
+    // The per-session gateway-token registry (Phase 2): the node-side token->binding table shared
+    // by the interactive session builder's minter (mint at foreign-session open) and the gateway
+    // backend (resolve a presented session token to its provider+model+credential). Replaces the
+    // retired global provider->credential map + `inject_foreign` flag — routing is now per-profile.
+    let gateway_registry = Arc::new(gateway_backend::GatewayTokenRegistry::new());
+    // The node gateway's loopback coordinates + per-session minter, threaded into the session
+    // builder so a `NodeProvider`-backed OpenAI-wire foreign agent is spawned pointed at the gateway
+    // with a per-session bearer. Set whenever the gateway has a bind address (its reachable
+    // loopback URL); `None` leaves foreign agents on their own backend.
     let gateway_coords: Option<daemon_node::GatewayCoords> =
-        match (cfg.gateway.inject_foreign, &cfg.gateway.addr) {
-            (true, Some(addr)) => Some(daemon_node::GatewayCoords {
+        cfg.gateway
+            .addr
+            .as_ref()
+            .map(|addr| daemon_node::GatewayCoords {
                 base_url: gateway_base_url(addr),
-                token: gateway_token.clone(),
-            }),
-            _ => None,
-        };
+                minter: gateway_registry.clone(),
+            });
     // Capture the gateway backend seams before `provider_resolver` is moved into the assembly; the
     // node surface is bound after assembly. Built UNCONDITIONALLY so the resident gateway resource
     // can serve whenever it is enabled (at boot via `[gateway].addr`, or at runtime via `GatewaySet`).
     let gateway_seams = {
         let credentials: Arc<dyn CredentialProvider> =
             Arc::new(BrokeredCredentialProvider::new(owner.clone(), None));
-        let cred_map: Vec<(ProviderSelector, String)> = cfg
-            .gateway
-            .credentials
-            .iter()
-            .map(|c| (c.provider, c.credential_ref.clone()))
-            .collect();
         gateway_backend::GatewaySeams {
             provider_resolver: provider_resolver.clone(),
             credentials,
-            cred_map,
+            admin_token: gateway_token.clone(),
+            registry: gateway_registry.clone(),
             default_credential_ref: cfg.profile.clone(),
             allowlist: cfg.gateway.models_allowlist.clone(),
         }
@@ -3144,7 +3149,6 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         Arc::new(gateway_seams.into_backend(node.clone()));
     let gateway_resource = Arc::new(managed_backends::GatewayResource::new(
         gateway_backend_impl,
-        gateway_token,
         store.clone(),
         cfg.gateway.addr.clone(),
         cfg.gateway.addr.is_some(),

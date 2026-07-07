@@ -231,6 +231,26 @@ impl ControlApi for NodeApiImpl {
             Some(store) => store.list(Some(session.as_str())).await.len() as u32,
             None => 0,
         };
+        // Denormalize the backend from the bound profile so a detail pane renders it without a
+        // second `profile_get`: the engine selector and (for a foreign engine) its model backend.
+        // A session with no bound profile / a node without profile management is the native default.
+        let (engine, foreign_backend) = match (&self.profiles, meta.bound_profile.as_ref()) {
+            (Some(store), Some(bound)) => store
+                .get(bound.as_str())
+                .ok()
+                .flatten()
+                .map(|spec| (spec.engine, spec.foreign_backend))
+                .unwrap_or_else(|| {
+                    (
+                        daemon_api::EngineSelector::Core,
+                        daemon_api::ForeignBackend::default(),
+                    )
+                }),
+            _ => (
+                daemon_api::EngineSelector::Core,
+                daemon_api::ForeignBackend::default(),
+            ),
+        };
         Some(SessionDetail {
             info,
             overlay,
@@ -238,6 +258,8 @@ impl ControlApi for NodeApiImpl {
             delivery_targets,
             children,
             checkpoints,
+            engine,
+            foreign_backend,
         })
     }
 

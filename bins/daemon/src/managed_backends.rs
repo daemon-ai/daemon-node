@@ -27,10 +27,10 @@ use tokio::task::JoinHandle;
 
 /// The node-owned OpenAI-compatible gateway as a resident, wire-configurable managed resource.
 pub struct GatewayResource {
-    /// The gateway request backend (node catalog + provider resolution), shared across (re)binds.
+    /// The gateway request backend (node catalog + provider resolution + bearer auth), shared
+    /// across (re)binds. Auth (admin + per-session tokens) is owned by the backend, so the serve
+    /// path threads no token of its own.
     backend: Arc<dyn GatewayBackend>,
-    /// The bearer token clients present (minted/pinned at boot).
-    token: String,
     /// The durable store the enable/rebind override persists to (boot config is the fallback).
     store: Arc<dyn SessionStore>,
     /// The boot `[gateway].addr` — the default address when no runtime override is set.
@@ -64,14 +64,12 @@ impl GatewayResource {
     /// [`ManagedResource::activate`] (called once at node startup).
     pub fn new(
         backend: Arc<dyn GatewayBackend>,
-        token: String,
         store: Arc<dyn SessionStore>,
         boot_addr: Option<String>,
         boot_enabled: bool,
     ) -> Self {
         Self {
             backend,
-            token,
             store,
             boot_addr,
             boot_enabled,
@@ -110,13 +108,12 @@ impl GatewayResource {
         match TcpListener::bind(&addr).await {
             Ok(listener) => {
                 let backend = self.backend.clone();
-                let token = self.token.clone();
                 tracing::info!(
                     %addr,
                     "serving OpenAI-compatible gateway (POST /v1/chat/completions + GET /v1/models, bearer-gated)"
                 );
                 let task = tokio::spawn(async move {
-                    if let Err(e) = daemon_gateway::serve(listener, backend, token).await {
+                    if let Err(e) = daemon_gateway::serve(listener, backend).await {
                         tracing::warn!(error = %e, "gateway surface ended");
                     }
                 });

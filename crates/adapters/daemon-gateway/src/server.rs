@@ -14,12 +14,12 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use daemon_core::StreamEvent;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::{Completion, EventStream, GatewayBackend, GatewayError};
+use crate::backend::{Completion, EventStream, GatewayBackend, GatewayError, GatewayPrincipal};
 use crate::mapping::{self, ChunkCtx};
 use crate::wire::ChatCompletionRequest;
 
@@ -29,16 +29,18 @@ struct AppState {
     backend: Arc<dyn GatewayBackend>,
 }
 
-/// Build the gateway [`Router`] over an injected [`GatewayBackend`] and the bearer `token`. Handy
-/// for embedding/testing without binding a socket. Auth is enforced on the mounted routes; an
+/// Build the gateway [`Router`] over an injected [`GatewayBackend`]. Handy for embedding/testing
+/// without binding a socket. Auth is delegated to the backend ([`GatewayBackend::authorize`]) — the
+/// backend owns the admin token and the per-session token registry — so the server holds no token.
+/// The resolved [`GatewayPrincipal`] is threaded into the route handlers as a request extension. An
 /// unmatched path is a plain `404` (no token needed to learn a route does not exist).
-pub fn router(backend: Arc<dyn GatewayBackend>, token: String) -> Router {
-    let token: Arc<str> = Arc::from(token);
+pub fn router(backend: Arc<dyn GatewayBackend>) -> Router {
+    let state = AppState { backend };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
-        .route_layer(from_fn_with_state(token, bearer_auth))
-        .with_state(AppState { backend })
+        .route_layer(from_fn_with_state(state.clone(), bearer_auth))
+        .with_state(state)
 }
 
 /// Serve the gateway over a bound listener until it errors. Spawn it as a background task; the
@@ -46,39 +48,34 @@ pub fn router(backend: Arc<dyn GatewayBackend>, token: String) -> Router {
 pub async fn serve(
     listener: tokio::net::TcpListener,
     backend: Arc<dyn GatewayBackend>,
-    token: String,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(backend, token)).await
+    axum::serve(listener, router(backend)).await
 }
 
-/// Constant-time-ish equality over the bearer token (loopback capability, but avoid an early-exit
-/// compare on principle).
-fn token_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Bearer middleware for `/v1/*`: require `Authorization: Bearer <token>`, else `401`.
+/// Bearer middleware for `/v1/*`: require `Authorization: Bearer <token>` that the backend resolves
+/// to a [`GatewayPrincipal`] (the admin token or a registered per-session token), else `401`. The
+/// resolved principal is stashed as a request extension for the route handler.
 async fn bearer_auth(
-    State(expected): State<Arc<str>>,
-    req: axum::extract::Request,
+    State(state): State<AppState>,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(tok) if token_eq(tok, &expected) => next.run(req).await,
-        _ => error_response(&GatewayError::bad_auth()),
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let principal = match presented {
+        Some(tok) => state.backend.authorize(&tok).await,
+        None => None,
+    };
+    match principal {
+        Some(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+        None => error_response(&GatewayError::bad_auth()),
     }
 }
 
@@ -132,9 +129,11 @@ async fn list_models(State(state): State<AppState>) -> Response {
     Json(mapping::catalog_to_models(&catalog)).into_response()
 }
 
-/// `POST /v1/chat/completions` — stream + non-stream.
+/// `POST /v1/chat/completions` — stream + non-stream. The [`GatewayPrincipal`] resolved by the
+/// bearer middleware is passed to the backend so a per-session token enforces its binding.
 async fn chat_completions(
     State(state): State<AppState>,
+    Extension(principal): Extension<GatewayPrincipal>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let stream = req.stream.unwrap_or(false);
@@ -143,7 +142,11 @@ async fn chat_completions(
         Ok(r) => r,
         Err(e) => return error_response(&e),
     };
-    match state.backend.complete(&model, core, stream).await {
+    match state
+        .backend
+        .complete(&principal, &model, core, stream)
+        .await
+    {
         Ok(Completion::Once(out)) if !stream => {
             Json(mapping::output_to_response(&model, &out)).into_response()
         }

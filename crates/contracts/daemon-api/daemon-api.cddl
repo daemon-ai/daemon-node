@@ -279,6 +279,8 @@ session-detail = {
   ? "delivery_targets": [* delivery-target],
   ? "children": [* session-id],
   ? "checkpoints": uint,
+  ? "engine": engine-selector,
+  ? "foreign_backend": foreign-backend,
 }
 
 session-search-hit = { "session": session-id, "title": tstr, "snippet": tstr }
@@ -898,6 +900,15 @@ engine-foreign-agent = { "agent": tstr }
 engine-foreign = { "Foreign": engine-foreign-agent }
 engine-selector = "Core"
                 / engine-foreign
+; how a Foreign-engine profile sources its model backend (wire v30; ForeignBackend). Externally
+; tagged struct variants: "AgentNative" steers only the agent's own model (via ACP), "NodeProvider"
+; routes the agent through the node gateway to a node provider+model (credential stays node-side).
+; Optional on profile-spec/session-detail: a pre-v30 encoding omits it and decodes as
+; AgentNative{model:null}. Foreign model selection lives here, not on the Core-only top-level model.
+foreign-backend-agent-native = { "AgentNative": { "model": (tstr / null) } }
+foreign-backend-node-provider = { "NodeProvider": { "provider": provider-selector, "model": tstr, "credential_ref": (tstr / null) } }
+foreign-backend = foreign-backend-agent-native
+                / foreign-backend-node-provider
 profile-spec = {
   "id": tstr,
   "provider": provider-selector,
@@ -913,6 +924,7 @@ profile-spec = {
   "fallback_credential_ref": (tstr / null),
   "bound_accounts": [* bound-account],
   ? "engine": engine-selector,
+  ? "foreign_backend": foreign-backend,
 }
 bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account] }

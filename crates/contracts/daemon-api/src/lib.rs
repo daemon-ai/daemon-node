@@ -46,9 +46,9 @@ pub mod profile;
 pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
-    Distribution, EngineSelector, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo,
-    ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn,
-    SessionOverlay, ToolsOverride,
+    Distribution, EngineSelector, EngineTunables, ForeignBackend, MemoryProviderSel,
+    ModelDescriptor, ProfileInfo, ProfileSpec, ProviderDescriptor, ProviderKindWire,
+    ProviderSelector, ProviderSignIn, SessionOverlay, ToolsOverride,
 };
 
 /// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live
@@ -2219,6 +2219,16 @@ pub struct SessionDetail {
     /// How many §12 tool checkpoints are recorded for this session (rewind points).
     #[serde(default)]
     pub checkpoints: u32,
+    /// Which execution engine this session runs on (wire v30): the native `Core` engine, or a
+    /// `Foreign { agent }` backed by a catalog agent. Denormalized from the bound profile so a
+    /// detail pane renders the backend without a second `profile_get`. Defaults to `Core`.
+    #[serde(default)]
+    pub engine: EngineSelector,
+    /// For a `Foreign` engine: how the agent sources its model backend (its own, model-steered; or
+    /// routed through the node gateway to a node provider). Denormalized from the bound profile;
+    /// `AgentNative { model: None }` for `Core` sessions and pre-v30 encodings.
+    #[serde(default)]
+    pub foreign_backend: ForeignBackend,
 }
 
 /// One full-text session-search hit — the transport-stable mirror of the store's `SessionSearchHit`
@@ -4711,6 +4721,14 @@ mod tests {
                 delivery_targets: vec![],
                 children: vec![SessionId::new("c1")],
                 checkpoints: 2,
+                engine: EngineSelector::Foreign {
+                    agent: "codex".into(),
+                },
+                foreign_backend: ForeignBackend::NodeProvider {
+                    provider: ProviderSelector::GenAi,
+                    model: "gpt-4o".into(),
+                    credential_ref: None,
+                },
             })),
             ApiResponse::SessionSearch(vec![SessionSearchHit {
                 session: SessionId::new("s1"),

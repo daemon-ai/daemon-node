@@ -22,7 +22,7 @@ pub mod mapping;
 pub mod server;
 pub mod wire;
 
-pub use backend::{Completion, EventStream, GatewayBackend, GatewayError};
+pub use backend::{Completion, EventStream, GatewayBackend, GatewayError, GatewayPrincipal};
 pub use mapping::{catalog_to_models, output_to_response, request_to_core};
 pub use server::{router, serve};
 pub use wire::{

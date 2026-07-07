@@ -733,6 +733,26 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-profile-foreign-engine.cbor",
         &ApiResponse::Profile(Some(foreign_engine_spec)),
     )?;
+    // The `NodeProvider` foreign backend (wire v30): a Foreign profile routed through the node
+    // gateway to a provider+model, so `verify-codec` proves the generated zcbor C decoder accepts
+    // the `foreign-backend` union's `NodeProvider` arm (the `foreign-engine` fixture above exercises
+    // the default `AgentNative` arm, present on every profile encoding).
+    let foreign_node_provider_spec = ProfileSpec {
+        engine: daemon_api::EngineSelector::Foreign {
+            agent: "codex".into(),
+        },
+        foreign_backend: daemon_api::ForeignBackend::NodeProvider {
+            provider: ProviderSelector::GenAi,
+            model: "gpt-4o".into(),
+            credential_ref: Some("openai".into()),
+        },
+        ..ProfileSpec::new("routed", ProviderSelector::Mock, "")
+    };
+    write_cbor(
+        &out,
+        "response-profile-foreign-node-provider.cbor",
+        &ApiResponse::Profile(Some(foreign_node_provider_spec)),
+    )?;
     // The foreign-agent catalog (wire v29): one ACP entry + one stream-json entry, so
     // `verify-codec` proves the generated zcbor C decoder accepts the renamed `agent-entry` shape
     // and both `agent-protocol` values.

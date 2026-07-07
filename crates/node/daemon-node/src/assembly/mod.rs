@@ -656,36 +656,69 @@ fn build_session_builder(
                                 ctx.resolve_effective(&spec, overlay).fresh(id),
                             ),
                             daemon_api::EngineSelector::Foreign { agent } => {
-                                // Compute the effective model the same way the Core path does:
-                                // clone the spec and apply the session overlay (so a per-session
-                                // model override propagates). It feeds both the ACP model selector
-                                // and the gateway-injected OPENAI_MODEL.
-                                let mut effective = spec.clone();
-                                overlay.apply_to(&mut effective);
-                                // Layer 2: when the gateway is enabled + injecting, build the
-                                // per-agent OpenAI-wire env (empty for a non-OpenAI-wire agent) so
-                                // the spawn is repointed at the node gateway. Env-only — the recipe
-                                // still comes from the catalog by name.
-                                let extra_env = foreign_gateway
-                                    .as_ref()
-                                    .map(|coords| {
-                                        crate::fleet::foreign_live::foreign_gateway_env(
-                                            agent,
-                                            coords,
-                                            &effective.model,
+                                // A persisted per-session model override still steers a foreign
+                                // session at open (Phase 3 makes `SetSessionModel` fully
+                                // foreign-aware); it takes precedence over the profile's foreign
+                                // backend model for both arms.
+                                let overlay_model =
+                                    overlay.model.clone().filter(|m| !m.trim().is_empty());
+                                match &spec.foreign_backend {
+                                    // AgentNative: steer only the agent's OWN model via ACP; no
+                                    // gateway env, no token — the agent keeps its native backend.
+                                    daemon_api::ForeignBackend::AgentNative { model } => {
+                                        let steer = overlay_model
+                                            .or_else(|| model.clone())
+                                            .filter(|m| !m.trim().is_empty());
+                                        SessionBackend::Foreign(
+                                            crate::fleet::foreign_live::foreign_session_factory(
+                                                agent.clone(),
+                                                steer,
+                                                id,
+                                                session_store.clone(),
+                                                Vec::new(),
+                                                None,
+                                            ),
                                         )
-                                    })
-                                    .unwrap_or_default();
-                                let model = Some(effective.model).filter(|m| !m.trim().is_empty());
-                                SessionBackend::Foreign(
-                                    crate::fleet::foreign_live::foreign_session_factory(
-                                        agent.clone(),
+                                    }
+                                    // NodeProvider: route through the node gateway. Mint a
+                                    // per-session token bound to this {provider, model,
+                                    // credential_ref} and inject the OpenAI-wire env; the agent's
+                                    // own model selector stays unset (the model is chosen node-side
+                                    // by the gateway). Env-only — the recipe still comes from the
+                                    // catalog by name, preserving the security invariant.
+                                    daemon_api::ForeignBackend::NodeProvider {
+                                        provider,
                                         model,
-                                        id,
-                                        session_store.clone(),
-                                        extra_env,
-                                    ),
-                                )
+                                        credential_ref,
+                                    } => {
+                                        let routed_model =
+                                            overlay_model.unwrap_or_else(|| model.clone());
+                                        let (extra_env, lease) = match &foreign_gateway {
+                                            Some(coords) => {
+                                                crate::fleet::foreign_live::node_provider_injection(
+                                                    agent,
+                                                    coords,
+                                                    crate::GatewayBinding {
+                                                        provider: *provider,
+                                                        model: routed_model,
+                                                        credential_ref: credential_ref.clone(),
+                                                    },
+                                                )
+                                            }
+                                            None => (Vec::new(), None),
+                                        };
+                                        SessionBackend::Foreign(
+                                            crate::fleet::foreign_live::foreign_session_factory(
+                                                agent.clone(),
+                                                None,
+                                                id,
+                                                session_store.clone(),
+                                                extra_env,
+                                                lease,
+                                            ),
+                                        )
+                                    }
+                                }
                             }
                         },
                         None => SessionBackend::Core(fallback.fresh(id)),

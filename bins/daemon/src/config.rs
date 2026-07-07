@@ -505,42 +505,29 @@ impl Default for WebConfig {
     }
 }
 
-/// One row of the gateway's per-provider credential map (`[[gateway.credentials]]`): which stored
-/// `credential_ref` a resolved provider acquires its key from. Local providers (llama.cpp /
-/// mistral.rs) need no entry; a cloud provider (`genai` / `daemon_api`) maps to a profile the
-/// credential broker holds a key for.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GatewayCredential {
-    /// The provider selector this entry maps (`genai` / `daemon_api` / `llama_cpp` / …).
-    pub provider: daemon_api::ProviderSelector,
-    /// The stored credential-profile the resolved provider acquires its bearer from.
-    pub credential_ref: String,
-}
-
 /// The `[gateway]` table / `DAEMON_GATEWAY__*`: the node-owned OpenAI-compatible HTTP gateway
 /// (`daemon-gateway`). Off by default; when `addr` is set the node serves
 /// `POST /v1/chat/completions` + `GET /v1/models` on a bearer-gated loopback listener backed by the
 /// existing provider stack. Distinct from `[api]`/`[web]` (whose auth is all-or-nothing local
 /// trust): the gateway is a narrow, key-scoped capability so a foreign OpenAI-wire agent can run on
 /// a node-configured provider without ever holding a real API key.
+///
+/// Foreign-agent routing is per-profile (a `Foreign` profile's `foreign_backend = NodeProvider`),
+/// not a global gateway flag: the retired `inject_foreign` toggle + per-provider `credentials` map
+/// are replaced by per-session tokens the node mints bound to each routed session's
+/// `{provider, model, credential_ref}` (see `daemon-node`'s gateway token registry). A cloud call
+/// with no explicit credential falls back to the node's default profile.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatewayConfig {
     /// Bind address (recommend `127.0.0.1:<port>`); `None` (the default) keeps the gateway off.
     pub addr: Option<String>,
-    /// The bearer token clients must present. `None` boot-mints an ephemeral token (logged once).
+    /// The bearer token external OpenAI clients must present. `None` boot-mints an ephemeral token
+    /// (logged once). Node-managed foreign agents present a per-session token instead.
     pub token: Option<String>,
-    /// The per-provider credential map (`provider -> credential_ref`). A cloud provider with no
-    /// entry falls back to the node's default profile (which already holds `DAEMON_CLOUD_API_KEY`).
-    pub credentials: Vec<GatewayCredential>,
-    /// An optional allowlist bounding `GET /v1/models` (and routing) to these model ids. `None`
-    /// exposes the full node catalog.
+    /// An optional allowlist bounding `GET /v1/models` (and `Admin`-caller routing) to these model
+    /// ids. `None` exposes the full node catalog.
     pub models_allowlist: Option<Vec<String>>,
-    /// Whether to inject the gateway coordinates (`OPENAI_BASE_URL`/`OPENAI_API_KEY`/model) into
-    /// opted-in OpenAI-wire foreign agents (codex/opencode) at spawn (Layer 2). Off by default so
-    /// foreign agents keep their own backend unless the operator opts into node routing.
-    #[serde(with = "daemon_common::flex_bool")]
-    pub inject_foreign: bool,
 }
 
 /// Tuning for the `browser` tool (`daemon-tool-browser`). `[browser]` / `DAEMON_BROWSER__*`.
