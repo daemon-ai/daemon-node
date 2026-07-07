@@ -525,6 +525,7 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
                 credential_ref: "stub/acct".to_string(),
                 account_label: "stub-user".to_string(),
                 transport_instance: TransportId::new("stub/stub-user"),
+                slot: daemon_host::CredentialSlotKind::Derived,
             })
         }
     }
@@ -706,6 +707,243 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
         })
         .await;
     assert!(after_cancel.is_err(), "a cancelled flow cannot complete");
+
+    handle.shutdown().await;
+}
+
+/// CON-15 node half (the provider-bound OAuth family registration): the curated OpenRouter
+/// descriptor registers as its own auth family whose id is EXACTLY `"provider/openrouter"` (the
+/// string the sibling wire stream's `ProviderDescriptor.sign_in` advertisement points at) with an
+/// EMPTY `params_schema` — the node owns every parameter, so the client calls
+/// `auth_begin { family: "provider/openrouter", params: {} }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_openrouter_family_registered_with_empty_schema() {
+    use daemon_api::{AuthApi, AuthFlowKind};
+    use daemon_oauth::{openrouter, DescriptorFlowFactory, OPENROUTER_FAMILY};
+
+    let factory = Arc::new(
+        DescriptorFlowFactory::new(openrouter()).expect("build the openrouter descriptor factory"),
+    );
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("alpha"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x55; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: None,
+        provider_resolver: None,
+        credential_store: Some(Arc::new(daemon_host::MemCredentialStore::new())),
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![factory],
+        workspace_root: None,
+        blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
+        reaper: Default::default(),
+        orchestrate: Default::default(),
+    });
+
+    let providers = node.auth_providers().await;
+    let openrouter_info = providers
+        .iter()
+        .find(|p| p.family == OPENROUTER_FAMILY)
+        .expect("the openrouter family is registered");
+    assert_eq!(openrouter_info.family, "provider/openrouter");
+    assert_eq!(openrouter_info.flow_kind, AuthFlowKind::OAuth2Pkce);
+    assert!(
+        openrouter_info.params_schema.is_empty(),
+        "the provider-bound family owns every parameter (empty schema), got {:?}",
+        openrouter_info.params_schema
+    );
+
+    handle.shutdown().await;
+}
+
+/// CON-15 node half (the provider-key slot mapping): a provider-bound OAuth family mints a MODEL
+/// API key that must ride the BOUND PROFILE's credential slot — the id the model broker reads — so
+/// it flows downstream exactly like a pasted key, and NO `BoundAccount` is attached (a provider key
+/// is not a transport account). A `ProviderKeyForProfile` outcome with no bind is rejected (the key
+/// would be stranded where no broker reads it). Driven through the node `AuthApi` end to end: a
+/// provider-key descriptor whose JSON key-mint endpoint is a wiremock server returning `{"key":…}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_key_slots_under_bound_profile_and_requires_bind() {
+    use daemon_api::{
+        AuthApi, AuthBeginRequest, AuthBindRequest, AuthCompleteRequest, CredentialApi,
+        ProfileSpec, ProviderSelector,
+    };
+    use daemon_host::{MemCredentialStore, MemProfileStore, ProfileStore};
+    use daemon_oauth::{
+        CallbackParam, CredentialShape, DescriptorFlowFactory, ExchangeStyle, OAuthFlowDescriptor,
+        Source,
+    };
+    use std::collections::BTreeMap;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "sk-or-minted-abcd",
+        })))
+        .mount(&server)
+        .await;
+
+    // OpenRouter's provider-key shape, with the JSON key-mint endpoint pointed at wiremock (a
+    // param) so the exchange runs against the mock; PKCE-only (no state), CallbackUrl.
+    let descriptor = OAuthFlowDescriptor {
+        family: "provider/openrouter",
+        display_name: "OpenRouter (test)",
+        authorization_endpoint: Source::Fixed("https://openrouter.ai/auth"),
+        token_endpoint: Source::Param("token_endpoint"),
+        client_id: None,
+        client_secret_param: None,
+        scopes: None,
+        callback_param: CallbackParam::CallbackUrl,
+        use_state: false,
+        exchange: ExchangeStyle::JsonPost { key_field: "key" },
+        credential: CredentialShape::ProviderKey {
+            account_label: "openrouter",
+        },
+        params_schema: Vec::new(),
+    };
+    let factory = Arc::new(DescriptorFlowFactory::new(descriptor).expect("build factory"));
+
+    let profiles = Arc::new(MemProfileStore::new());
+    profiles
+        .create(ProfileSpec::new(
+            "alpha",
+            ProviderSelector::GenAi,
+            "model-a",
+        ))
+        .expect("create alpha");
+    let creds = Arc::new(MemCredentialStore::new());
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("alpha"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x55; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: Some(profiles.clone()),
+        provider_resolver: None,
+        credential_store: Some(creds),
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![factory],
+        workspace_root: None,
+        blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
+        reaper: Default::default(),
+        orchestrate: Default::default(),
+    });
+
+    let params = || {
+        let mut p = BTreeMap::new();
+        p.insert(
+            "token_endpoint".to_string(),
+            format!("{}/keys", server.uri()),
+        );
+        p
+    };
+
+    // (1) WITH a bind: the minted bare key lands under the bound profile id (the broker's slot),
+    // the response reports that ref, and NO BoundAccount is attached.
+    let begun = node
+        .auth_begin(AuthBeginRequest {
+            family: "provider/openrouter".into(),
+            params: params(),
+            redirect_uri: "http://127.0.0.1:7777/cb".into(),
+            bind: Some(AuthBindRequest {
+                profile: ProfileRef::new("alpha"),
+                transport_instance: None,
+                credential_ref: None,
+            }),
+        })
+        .await
+        .expect("auth_begin");
+    let done = node
+        .auth_complete(AuthCompleteRequest {
+            flow_id: begun.flow_id,
+            callback: "http://127.0.0.1:7777/cb?code=or-code".into(),
+        })
+        .await
+        .expect("auth_complete");
+    assert_eq!(
+        done.credential_ref, "alpha",
+        "the node slots the provider key under the BOUND PROFILE id, not a client-named ref"
+    );
+    assert_eq!(
+        done.bound_profile.as_ref().map(|p| p.as_str()),
+        Some("alpha")
+    );
+
+    let listed = node.credential_list().await;
+    assert!(
+        listed.iter().any(|c| c.profile == "alpha" && c.present),
+        "the minted key is stored under the profile slot (redacted): {listed:?}"
+    );
+    let alpha = profiles.get("alpha").unwrap().unwrap();
+    assert!(
+        alpha.bound_accounts.is_empty(),
+        "a provider key is NOT a transport account — no BoundAccount attach, got {:?}",
+        alpha.bound_accounts
+    );
+
+    // (2) WITHOUT a bind: a provider-key mint is rejected (nowhere to slot the key).
+    let begun2 = node
+        .auth_begin(AuthBeginRequest {
+            family: "provider/openrouter".into(),
+            params: params(),
+            redirect_uri: "http://127.0.0.1:7777/cb".into(),
+            bind: None,
+        })
+        .await
+        .expect("auth_begin 2");
+    let err = node
+        .auth_complete(AuthCompleteRequest {
+            flow_id: begun2.flow_id,
+            callback: "http://127.0.0.1:7777/cb?code=or-code".into(),
+        })
+        .await;
+    assert!(
+        err.is_err(),
+        "a provider-key mint with no bind target must be rejected"
+    );
 
     handle.shutdown().await;
 }

@@ -1,46 +1,46 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-oauth` — the generic OAuth2 / OIDC authorization-code + PKCE interactive-auth family
-//! (`daemon-interactive-auth-spec.md` §7, the A2 roadmap item).
+//! `daemon-oauth` — ONE descriptor-driven OAuth2 / OIDC authorization-code + PKCE engine covering
+//! every authorization-code variant (`daemon-interactive-auth-spec.md` §7).
 //!
-//! A production [`AuthFlowFactory`] for [`AuthFlowKind::OAuth2Pkce`], registered by the daemon
-//! binary next to the Matrix SSO factory so a decoupled client can drive a browser login against
-//! any authorization-code IdP over the wire `AuthApi`:
+//! A single [`DescriptorFlowFactory`] implements the whole begin/complete flow; an
+//! [`OAuthFlowDescriptor`] parameterizes it (endpoints, client id, scopes, callback param name,
+//! CSRF `state` on/off, exchange style, credential shape). PKCE (S256) is **always on**. The daemon
+//! registers one factory per descriptor next to the Matrix SSO factory, so a decoupled (possibly
+//! remote) client drives a browser-redirect login over the wire `AuthApi`:
 //!
-//! - `auth_begin` (→ [`OAuth2PkceFlowFactory::begin`]): mints a fresh PKCE `code_verifier` +
-//!   S256 `code_challenge` + CSRF `state`, builds the authorization URL against the
-//!   *client-owned* `redirect_uri`, and parks `{ verifier, state, token_endpoint, … }` as the
-//!   pending flow.
-//! - `auth_complete` (→ [`PendingAuthFlow::complete`]): parses `code` + `state` from the captured
-//!   callback, **validates `state`** (reject on mismatch), exchanges `code` + `code_verifier` at
-//!   the token endpoint (an `application/x-www-form-urlencoded` POST through the one SSRF-safe
-//!   [`daemon_egress::EgressClient`], redirects never followed), and hands the raw token-response
-//!   JSON back as the credential blob the node persists.
+//! - `auth_begin` (→ [`DescriptorFlowFactory::begin`]): mints a fresh PKCE `code_verifier` + S256
+//!   `code_challenge` (+ a CSRF `state` when the descriptor enables it), builds the authorization
+//!   URL against the *client-owned* callback (under the descriptor's callback param — RFC
+//!   `redirect_uri` or OpenRouter's `callback_url`), and parks the continuation.
+//! - `auth_complete` (→ [`PendingAuthFlow::complete`]): validates `state` (when enabled), exchanges
+//!   `code` + `code_verifier` through the one SSRF-safe [`daemon_egress::EgressClient`] (redirects
+//!   never followed) — either an RFC 6749 `application/x-www-form-urlencoded` POST or a JSON POST —
+//!   and returns the credential blob + slot the node persists.
 //!
-//! **Params-driven, not config-driven:** the family is generic (`"oauth2"`); the client supplies
-//! `authorization_endpoint` / `token_endpoint` / `client_id` (+ optional `scopes`,
-//! `client_secret`, `account_label`) in `auth_begin.params`, so any IdP works with zero node
-//! config. A curated per-provider config table can layer on later without touching the wire.
+//! ## The descriptors
 //!
-//! **Account identity derivation** (label → `credential_ref` `oauth2/<label>` and
-//! `transport_instance` `oauth2/<label>`), in order:
-//! 1. the explicit `account_label` param, when supplied;
-//! 2. the `sub` claim of an `id_token` in the token response, when present — decoded **without
-//!    signature verification**, which is sound here because the value only *labels* the stored
-//!    credential (nothing authenticates against it; the tokens themselves came over TLS from the
-//!    token endpoint we called);
-//! 3. a stable short hash of `(token_endpoint, client_id)` — deterministic, so re-running the
-//!    flow for the same app+IdP overwrites the same credential slot instead of minting siblings.
-//!
-//! The token endpoint may legitimately live on a private/loopback host (a self-hosted IdP), so
-//! the exchange uses [`Redirects::None`] — the daemon-egress mode for trusted, non-redirecting
-//! peers: no redirect is ever followed (killing the redirect-SSRF and credential-leak vectors)
-//! and the operator-configured host is not subjected to the public-host gate.
+//! - [`generic_oauth2`] — the operator-facing generic `oauth2` family: endpoints + client_id arrive
+//!   in `auth_begin.params`, `use_state` on, RFC form-post exchange, the raw token JSON stored under
+//!   a `oauth2/<label>` ref (identity: explicit `account_label` → `id_token` `sub` → stable hash).
+//!   Byte-identical to the pre-refactor factory (no behavior change for operators).
+//! - [`openrouter`] — a curated provider-bound family (`"provider/openrouter"`, EMPTY params
+//!   schema — the node owns every parameter). Deliberately non-RFC: authorize at
+//!   `https://openrouter.ai/auth?callback_url=<redirect>&code_challenge=<S256>&code_challenge_method=S256`
+//!   (no `client_id`, no `state` — PKCE binds the flow), exchange is a JSON POST to
+//!   `https://openrouter.ai/api/v1/auth/keys` with `{code, code_verifier, code_challenge_method}`
+//!   returning `{"key": "..."}`. The minted `key` is an ordinary OpenRouter API key, stored BARE
+//!   under the bound profile's credential slot ([`CredentialSlotKind::ProviderKeyForProfile`]).
+//! - [`huggingface`] — a curated provider-bound family (`"provider/huggingface"`, EMPTY params
+//!   schema), gated on an operator-supplied `client_id` in node config: standard OIDC
+//!   (`https://huggingface.co/oauth/authorize` + `/oauth/token`), `inference-api` scope, `use_state`
+//!   on, RFC form-post exchange, provider-key credential shape.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,29 +50,220 @@ use sha2::{Digest, Sha256};
 
 use daemon_api::{ApiError, AuthFlowKind, AuthParamField, AuthProviderInfo};
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_host::{AuthFlowFactory, AuthOutcome, PendingAuthFlow};
+use daemon_host::{AuthFlowFactory, AuthOutcome, CredentialSlotKind, PendingAuthFlow};
 use daemon_protocol::TransportId;
 
-/// The transport/provider family this factory serves (`auth_begin.family`).
+/// The generic operator-facing family (`auth_begin.family`).
 pub const FAMILY: &str = "oauth2";
+/// The OpenRouter provider-bound family — the auth family a `ProviderDescriptor.sign_in`
+/// advertisement points at. Its `params_schema` is empty (the node owns every parameter).
+pub const OPENROUTER_FAMILY: &str = "provider/openrouter";
+/// The Hugging Face provider-bound family (registered only when an operator supplies a client id).
+pub const HUGGINGFACE_FAMILY: &str = "provider/huggingface";
 
-/// The `auth_begin` param naming the IdP's authorization endpoint URL (required).
+/// The `auth_begin` param naming the IdP's authorization endpoint URL (generic family).
 pub const PARAM_AUTHORIZATION_ENDPOINT: &str = "authorization_endpoint";
-/// The `auth_begin` param naming the IdP's token endpoint URL (required).
+/// The `auth_begin` param naming the IdP's token endpoint URL (generic family).
 pub const PARAM_TOKEN_ENDPOINT: &str = "token_endpoint";
-/// The `auth_begin` param naming the OAuth2 client id (required).
+/// The `auth_begin` param naming the OAuth2 client id (generic family).
 pub const PARAM_CLIENT_ID: &str = "client_id";
 /// The `auth_begin` param carrying the space-delimited scope list (optional).
 pub const PARAM_SCOPES: &str = "scopes";
-/// The `auth_begin` param carrying a confidential-client secret (optional; PKCE public clients
-/// omit it).
+/// The `auth_begin` param carrying a confidential-client secret (optional; PKCE public clients omit).
 pub const PARAM_CLIENT_SECRET: &str = "client_secret";
-/// The `auth_begin` param naming the account label / credential slot explicitly (optional; see
-/// the crate docs for the derivation order when absent).
+/// The `auth_begin` param naming the account label / credential slot explicitly (optional).
 pub const PARAM_ACCOUNT_LABEL: &str = "account_label";
 
 /// The per-request deadline on the token exchange.
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A descriptor field resolved either from a node-fixed value or a client `begin` param.
+#[derive(Clone, Debug)]
+pub enum Source {
+    /// A node-owned constant (curated families).
+    Fixed(&'static str),
+    /// Read from `auth_begin.params[key]` (the generic family).
+    Param(&'static str),
+}
+
+impl Source {
+    /// Resolve a required value: a fixed constant, or a non-empty begin param.
+    fn require(&self, params: &BTreeMap<String, String>) -> Result<String, ApiError> {
+        match self {
+            Source::Fixed(v) => Ok((*v).to_string()),
+            Source::Param(key) => require(params, key).map(str::to_string),
+        }
+    }
+
+    /// Resolve an optional value: a fixed constant, or a (possibly absent) begin param.
+    fn resolve_opt(&self, params: &BTreeMap<String, String>) -> Option<String> {
+        match self {
+            Source::Fixed("") => None,
+            Source::Fixed(v) => Some((*v).to_string()),
+            Source::Param(key) => params.get(*key).filter(|s| !s.is_empty()).cloned(),
+        }
+    }
+}
+
+/// The callback query parameter the authorization URL carries the client-owned redirect under.
+#[derive(Clone, Copy, Debug)]
+pub enum CallbackParam {
+    /// RFC 6749 `redirect_uri` (also emits `response_type=code`).
+    RedirectUri,
+    /// OpenRouter's `callback_url` (no `response_type`).
+    CallbackUrl,
+}
+
+/// How the authorization `code` + PKCE `code_verifier` are exchanged for the credential.
+#[derive(Clone, Debug)]
+pub enum ExchangeStyle {
+    /// RFC 6749 §4.1.3 `application/x-www-form-urlencoded` POST.
+    FormPost,
+    /// A JSON POST of `{code, code_verifier, code_challenge_method: "S256"}`; the response field
+    /// named `key_field` carries the minted secret (OpenRouter: `"key"`).
+    JsonPost { key_field: &'static str },
+}
+
+/// What the completed flow yields as the stored credential + how the node slots it.
+#[derive(Clone, Debug)]
+pub enum CredentialShape {
+    /// Store the raw token-response JSON as the blob under a family-derived `oauth2/<label>` ref
+    /// ([`CredentialSlotKind::Derived`]); identity: explicit label → `id_token` `sub` → stable hash.
+    RawTokenJson,
+    /// Store the BARE minted key (the exchange's `key_field`) under the bound profile's credential
+    /// slot ([`CredentialSlotKind::ProviderKeyForProfile`]); `account_label` is the fixed provider
+    /// name. Requires a [`ExchangeStyle::JsonPost`] exchange.
+    ProviderKey { account_label: &'static str },
+}
+
+/// The parameterization of the one OAuth engine — one begin/complete implementation covers every
+/// authorization-code variant by binding these fields (PKCE S256 is always on).
+#[derive(Clone, Debug)]
+pub struct OAuthFlowDescriptor {
+    /// The auth family this descriptor serves (`auth_begin.family`).
+    pub family: &'static str,
+    /// A human display name for capability discovery.
+    pub display_name: &'static str,
+    /// The IdP authorization endpoint.
+    pub authorization_endpoint: Source,
+    /// The IdP token endpoint (the exchange target).
+    pub token_endpoint: Source,
+    /// The OAuth2 client id, when the flow carries one (`None` = omit — OpenRouter binds via PKCE).
+    pub client_id: Option<Source>,
+    /// The `auth_begin` param carrying a confidential-client secret (`None` = public client).
+    pub client_secret_param: Option<&'static str>,
+    /// The scope list, when the flow carries one (`None` = omit the `scope` param).
+    pub scopes: Option<Source>,
+    /// Which query param the client-owned callback rides under.
+    pub callback_param: CallbackParam,
+    /// Whether to mint + enforce a CSRF `state` (RFC); `false` binds the flow via PKCE alone.
+    pub use_state: bool,
+    /// The token-exchange style.
+    pub exchange: ExchangeStyle,
+    /// The credential shape + slot mapping.
+    pub credential: CredentialShape,
+    /// The `params` fields a client collects (EMPTY for provider-bound families — the node owns
+    /// every parameter, so the client calls `auth_begin { family, params: {} }`).
+    pub params_schema: Vec<AuthParamField>,
+}
+
+/// The operator-facing generic `oauth2` descriptor: client-supplied endpoints/client_id, RFC
+/// form-post exchange, raw-token-JSON credential. Byte-identical to the pre-refactor factory.
+pub fn generic_oauth2() -> OAuthFlowDescriptor {
+    OAuthFlowDescriptor {
+        family: FAMILY,
+        display_name: "OAuth2 / OIDC (PKCE)",
+        authorization_endpoint: Source::Param(PARAM_AUTHORIZATION_ENDPOINT),
+        token_endpoint: Source::Param(PARAM_TOKEN_ENDPOINT),
+        client_id: Some(Source::Param(PARAM_CLIENT_ID)),
+        client_secret_param: Some(PARAM_CLIENT_SECRET),
+        scopes: Some(Source::Param(PARAM_SCOPES)),
+        callback_param: CallbackParam::RedirectUri,
+        use_state: true,
+        exchange: ExchangeStyle::FormPost,
+        credential: CredentialShape::RawTokenJson,
+        params_schema: vec![
+            AuthParamField {
+                key: PARAM_AUTHORIZATION_ENDPOINT.to_string(),
+                label: "Authorization endpoint URL".to_string(),
+                required: true,
+            },
+            AuthParamField {
+                key: PARAM_TOKEN_ENDPOINT.to_string(),
+                label: "Token endpoint URL".to_string(),
+                required: true,
+            },
+            AuthParamField {
+                key: PARAM_CLIENT_ID.to_string(),
+                label: "Client id".to_string(),
+                required: true,
+            },
+            AuthParamField {
+                key: PARAM_SCOPES.to_string(),
+                label: "Scopes (space-delimited, optional)".to_string(),
+                required: false,
+            },
+            AuthParamField {
+                key: PARAM_CLIENT_SECRET.to_string(),
+                label: "Client secret (confidential clients only)".to_string(),
+                required: false,
+            },
+            AuthParamField {
+                key: PARAM_ACCOUNT_LABEL.to_string(),
+                label: "Account label (optional)".to_string(),
+                required: false,
+            },
+        ],
+    }
+}
+
+/// The curated OpenRouter descriptor (`"provider/openrouter"`, empty params schema): non-RFC PKCE
+/// with a JSON key-mint exchange whose `key` is an ordinary OpenRouter API key, slotted as a
+/// provider key under the bound profile.
+pub fn openrouter() -> OAuthFlowDescriptor {
+    OAuthFlowDescriptor {
+        family: OPENROUTER_FAMILY,
+        display_name: "OpenRouter",
+        authorization_endpoint: Source::Fixed("https://openrouter.ai/auth"),
+        token_endpoint: Source::Fixed("https://openrouter.ai/api/v1/auth/keys"),
+        client_id: None,
+        client_secret_param: None,
+        scopes: None,
+        callback_param: CallbackParam::CallbackUrl,
+        use_state: false,
+        exchange: ExchangeStyle::JsonPost { key_field: "key" },
+        credential: CredentialShape::ProviderKey {
+            account_label: "openrouter",
+        },
+        params_schema: Vec::new(),
+    }
+}
+
+/// The curated Hugging Face descriptor (`"provider/huggingface"`, empty params schema), gated on an
+/// operator-supplied `client_id`: standard OIDC authorization-code + PKCE with the `inference-api`
+/// scope, RFC form-post exchange, provider-key credential shape. Registered only when the operator
+/// has configured `oauth.huggingface_client_id` (so an unconfigured node never advertises it).
+pub fn huggingface(client_id: String) -> OAuthFlowDescriptor {
+    // The client id is operator config, resolved once at registration; leak it to a `'static`
+    // so the descriptor's `Source::Fixed` can carry it (the process lives for the descriptor).
+    let client_id: &'static str = Box::leak(client_id.into_boxed_str());
+    OAuthFlowDescriptor {
+        family: HUGGINGFACE_FAMILY,
+        display_name: "Hugging Face",
+        authorization_endpoint: Source::Fixed("https://huggingface.co/oauth/authorize"),
+        token_endpoint: Source::Fixed("https://huggingface.co/oauth/token"),
+        client_id: Some(Source::Fixed(client_id)),
+        client_secret_param: None,
+        scopes: Some(Source::Fixed("inference-api")),
+        callback_param: CallbackParam::RedirectUri,
+        use_state: true,
+        exchange: ExchangeStyle::FormPost,
+        credential: CredentialShape::ProviderKey {
+            account_label: "huggingface",
+        },
+        params_schema: Vec::new(),
+    }
+}
 
 /// `n` OS-entropy bytes as unpadded base64url — the PKCE verifier/state alphabet (RFC 7636's
 /// unreserved set). 32 bytes → 43 chars, the spec's minimum verifier length.
@@ -90,7 +281,7 @@ fn s256_challenge(verifier: &str) -> String {
 }
 
 /// The `sub` claim of a JWT `id_token` in `tokens`, decoded WITHOUT signature verification — used
-/// only to label the stored credential (crate docs), never as an authentication decision.
+/// only to label the stored credential, never as an authentication decision.
 fn id_token_sub(tokens: &serde_json::Value) -> Option<String> {
     let jwt = tokens.get("id_token")?.as_str()?;
     let payload = jwt.split('.').nth(1)?;
@@ -124,69 +315,41 @@ fn require<'p>(params: &'p BTreeMap<String, String>, key: &str) -> Result<&'p st
         .ok_or_else(|| ApiError::Other(format!("oauth2 auth: missing `{key}`")))
 }
 
-/// The generic OAuth2 authorization-code + PKCE factory: registered with the node so a client can
-/// drive any authorization-code IdP over the wire `AuthApi`. Stateless beyond the shared egress
-/// client; every flow's endpoints/identity arrive in the begin params.
-pub struct OAuth2PkceFlowFactory {
+/// The one OAuth engine: a factory over an [`OAuthFlowDescriptor`] + the shared SSRF-safe egress
+/// client. Stateless beyond the descriptor; every flow's runtime values are resolved at `begin`.
+pub struct DescriptorFlowFactory {
+    descriptor: Arc<OAuthFlowDescriptor>,
     http: EgressClient,
 }
 
-impl OAuth2PkceFlowFactory {
-    /// A factory over a fresh [`EgressClient`]. Fails only when the TLS backend cannot initialize
-    /// (a boot-environment defect) — surfaced, not defaulted.
-    pub fn new() -> Result<Self, ApiError> {
+impl DescriptorFlowFactory {
+    /// A factory over `descriptor` with a fresh [`EgressClient`]. Fails only when the TLS backend
+    /// cannot initialize (a boot-environment defect) — surfaced, not defaulted.
+    pub fn new(descriptor: OAuthFlowDescriptor) -> Result<Self, ApiError> {
         let http = EgressClient::new(EgressConfig {
             user_agent: Some("daemon".to_string()),
             timeout: Some(TOKEN_EXCHANGE_TIMEOUT),
         })
         .map_err(|e| ApiError::Other(format!("oauth2: building egress client: {e}")))?;
-        Ok(Self { http })
+        Ok(Self {
+            descriptor: Arc::new(descriptor),
+            http,
+        })
     }
 }
 
 #[async_trait]
-impl AuthFlowFactory for OAuth2PkceFlowFactory {
+impl AuthFlowFactory for DescriptorFlowFactory {
     fn family(&self) -> &str {
-        FAMILY
+        self.descriptor.family
     }
 
     fn provider_info(&self) -> AuthProviderInfo {
         AuthProviderInfo {
-            family: FAMILY.to_string(),
+            family: self.descriptor.family.to_string(),
             flow_kind: AuthFlowKind::OAuth2Pkce,
-            display_name: "OAuth2 / OIDC (PKCE)".to_string(),
-            params_schema: vec![
-                AuthParamField {
-                    key: PARAM_AUTHORIZATION_ENDPOINT.to_string(),
-                    label: "Authorization endpoint URL".to_string(),
-                    required: true,
-                },
-                AuthParamField {
-                    key: PARAM_TOKEN_ENDPOINT.to_string(),
-                    label: "Token endpoint URL".to_string(),
-                    required: true,
-                },
-                AuthParamField {
-                    key: PARAM_CLIENT_ID.to_string(),
-                    label: "Client id".to_string(),
-                    required: true,
-                },
-                AuthParamField {
-                    key: PARAM_SCOPES.to_string(),
-                    label: "Scopes (space-delimited, optional)".to_string(),
-                    required: false,
-                },
-                AuthParamField {
-                    key: PARAM_CLIENT_SECRET.to_string(),
-                    label: "Client secret (confidential clients only)".to_string(),
-                    required: false,
-                },
-                AuthParamField {
-                    key: PARAM_ACCOUNT_LABEL.to_string(),
-                    label: "Account label (optional)".to_string(),
-                    required: false,
-                },
-            ],
+            display_name: self.descriptor.display_name.to_string(),
+            params_schema: self.descriptor.params_schema.clone(),
         }
     }
 
@@ -195,40 +358,65 @@ impl AuthFlowFactory for OAuth2PkceFlowFactory {
         params: &BTreeMap<String, String>,
         redirect_uri: &str,
     ) -> Result<Box<dyn PendingAuthFlow>, ApiError> {
-        let authorization_endpoint = require(params, PARAM_AUTHORIZATION_ENDPOINT)?;
-        let token_endpoint = require(params, PARAM_TOKEN_ENDPOINT)?.to_string();
-        let client_id = require(params, PARAM_CLIENT_ID)?.to_string();
-        let scopes = params.get(PARAM_SCOPES).cloned().unwrap_or_default();
+        let d = &self.descriptor;
+        let authorization_endpoint = d.authorization_endpoint.require(params)?;
+        let token_endpoint = d.token_endpoint.require(params)?;
+        let client_id = match &d.client_id {
+            Some(src) => Some(src.require(params)?),
+            None => None,
+        };
+        let client_secret = d
+            .client_secret_param
+            .and_then(|key| params.get(key).filter(|s| !s.is_empty()).cloned());
+        let scopes = d.scopes.as_ref().and_then(|src| src.resolve_opt(params));
 
         let verifier = random_urlsafe(32)?;
-        let state = random_urlsafe(16)?;
         let challenge = s256_challenge(&verifier);
+        let state = if d.use_state {
+            Some(random_urlsafe(16)?)
+        } else {
+            None
+        };
 
-        let mut url = url::Url::parse(authorization_endpoint).map_err(|e| {
-            ApiError::Other(format!(
-                "oauth2 auth: invalid `{PARAM_AUTHORIZATION_ENDPOINT}`: {e}"
-            ))
+        let mut url = url::Url::parse(&authorization_endpoint).map_err(|e| {
+            ApiError::Other(format!("oauth2 auth: invalid authorization endpoint: {e}"))
         })?;
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("response_type", "code")
-                .append_pair("client_id", &client_id)
-                .append_pair("redirect_uri", redirect_uri)
-                .append_pair("state", &state)
-                .append_pair("code_challenge", &challenge)
+            // The client-owned callback under the descriptor's param; RFC flows also carry
+            // `response_type=code` (OpenRouter's authorize endpoint takes neither that nor a state).
+            match d.callback_param {
+                CallbackParam::RedirectUri => {
+                    q.append_pair("response_type", "code")
+                        .append_pair("redirect_uri", redirect_uri);
+                }
+                CallbackParam::CallbackUrl => {
+                    q.append_pair("callback_url", redirect_uri);
+                }
+            }
+            if let Some(cid) = &client_id {
+                q.append_pair("client_id", cid);
+            }
+            if let Some(state) = &state {
+                q.append_pair("state", state);
+            }
+            q.append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256");
-            if !scopes.is_empty() {
-                q.append_pair("scope", &scopes);
+            if let Some(scopes) = &scopes {
+                if !scopes.is_empty() {
+                    q.append_pair("scope", scopes);
+                }
             }
         }
 
-        Ok(Box::new(OAuth2PendingFlow {
+        Ok(Box::new(DescriptorPendingFlow {
+            descriptor: self.descriptor.clone(),
             http: self.http.clone(),
             authorization_url: url.into(),
             token_endpoint,
             client_id,
-            client_secret: params.get(PARAM_CLIENT_SECRET).cloned(),
-            account_label: params.get(PARAM_ACCOUNT_LABEL).cloned(),
+            client_secret,
+            explicit_label: params.get(PARAM_ACCOUNT_LABEL).cloned(),
             redirect_uri: redirect_uri.to_string(),
             verifier,
             state,
@@ -236,23 +424,24 @@ impl AuthFlowFactory for OAuth2PkceFlowFactory {
     }
 }
 
-/// A parked PKCE flow: the secret continuation state (`verifier` + expected `state` + the token
-/// endpoint identity) held between `begin` and `complete`.
-struct OAuth2PendingFlow {
+/// A parked descriptor flow: the secret continuation state (`verifier` + expected `state` + the
+/// resolved endpoint identity + the descriptor) held between `begin` and `complete`.
+struct DescriptorPendingFlow {
+    descriptor: Arc<OAuthFlowDescriptor>,
     http: EgressClient,
     authorization_url: String,
     token_endpoint: String,
-    client_id: String,
+    client_id: Option<String>,
     client_secret: Option<String>,
-    account_label: Option<String>,
+    explicit_label: Option<String>,
     redirect_uri: String,
     verifier: String,
-    state: String,
+    state: Option<String>,
 }
 
-impl OAuth2PendingFlow {
+impl DescriptorPendingFlow {
     /// Parse + validate the captured callback (full redirect URL or bare query): surface an IdP
-    /// `error`, enforce the `state` echo, and extract the authorization `code`.
+    /// `error`, enforce the `state` echo when the descriptor uses one, and extract the `code`.
     fn callback_code(&self, callback: &str) -> Result<String, ApiError> {
         let query = callback.split_once('?').map(|(_, q)| q).unwrap_or(callback);
         let mut code = None;
@@ -274,52 +463,55 @@ impl OAuth2PendingFlow {
                 "oauth2 auth: authorization failed: {error} {detail}"
             )));
         }
-        // Mandatory CSRF gate: the redirect must echo the exact state minted at begin.
-        if state.as_deref() != Some(self.state.as_str()) {
-            return Err(ApiError::Other(
-                "oauth2 auth: state mismatch on callback (possible CSRF); restart the flow".into(),
-            ));
+        // Mandatory CSRF gate WHEN the descriptor mints a state: the redirect must echo it. A
+        // PKCE-only descriptor (OpenRouter) binds the flow via the verifier and skips this.
+        if let Some(expected) = &self.state {
+            if state.as_deref() != Some(expected.as_str()) {
+                return Err(ApiError::Other(
+                    "oauth2 auth: state mismatch on callback (possible CSRF); restart the flow"
+                        .into(),
+                ));
+            }
         }
         code.filter(|c| !c.is_empty())
             .ok_or_else(|| ApiError::Other("oauth2 auth: callback carries no `code`".into()))
     }
-}
 
-#[async_trait]
-impl PendingAuthFlow for OAuth2PendingFlow {
-    fn authorization_url(&self) -> &str {
-        &self.authorization_url
-    }
-
-    fn flow_kind(&self) -> AuthFlowKind {
-        AuthFlowKind::OAuth2Pkce
-    }
-
-    async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError> {
-        let code = self.callback_code(callback)?;
-
-        // RFC 6749 §4.1.3 + RFC 7636 §4.5: exchange code + verifier at the token endpoint. The
-        // redirect_uri is echoed for the server-side binding check; a confidential client adds its
-        // secret. `Redirects::None` — a token endpoint never legitimately redirects.
-        let mut pairs: Vec<(&str, &str)> = vec![
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &self.redirect_uri),
-            ("client_id", &self.client_id),
-            ("code_verifier", &self.verifier),
-        ];
-        if let Some(secret) = self.client_secret.as_deref() {
-            pairs.push(("client_secret", secret));
-        }
+    /// Run the descriptor's token exchange, returning the parsed response JSON + its raw body.
+    async fn exchange(&self, code: &str) -> Result<(serde_json::Value, String), ApiError> {
+        let request = match &self.descriptor.exchange {
+            ExchangeStyle::FormPost => {
+                // RFC 6749 §4.1.3 + RFC 7636 §4.5. `client_id` is included when the flow carries one.
+                let mut pairs: Vec<(&str, &str)> = vec![
+                    ("grant_type", "authorization_code"),
+                    ("code", code),
+                    ("redirect_uri", &self.redirect_uri),
+                    ("code_verifier", &self.verifier),
+                ];
+                if let Some(cid) = &self.client_id {
+                    pairs.push(("client_id", cid));
+                }
+                if let Some(secret) = &self.client_secret {
+                    pairs.push(("client_secret", secret));
+                }
+                EgressRequest::post_form(&self.token_endpoint, &pairs)
+            }
+            ExchangeStyle::JsonPost { .. } => {
+                let body = serde_json::json!({
+                    "code": code,
+                    "code_verifier": self.verifier,
+                    "code_challenge_method": "S256",
+                });
+                EgressRequest::post_json(&self.token_endpoint, &body)
+                    .map_err(|e| ApiError::Other(format!("oauth2 auth: building exchange: {e}")))?
+            }
+        };
+        // `Redirects::None` — a token endpoint never legitimately redirects (kills redirect-SSRF).
         let response = self
             .http
-            .execute(
-                EgressRequest::post_form(&self.token_endpoint, &pairs),
-                Redirects::None,
-            )
+            .execute(request, Redirects::None)
             .await
             .map_err(|e| ApiError::Other(format!("oauth2 auth: token exchange: {e}")))?;
-
         let status = response.status();
         let body = response
             .text()
@@ -330,34 +522,87 @@ impl PendingAuthFlow for OAuth2PendingFlow {
                 "oauth2 auth: token endpoint returned {status}: {body}"
             )));
         }
-        let tokens: serde_json::Value = serde_json::from_str(&body)
+        let json: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| ApiError::Other(format!("oauth2 auth: token response not JSON: {e}")))?;
-        if tokens
-            .get("access_token")
-            .and_then(|t| t.as_str())
-            .is_none()
-        {
-            return Err(ApiError::Other(
-                "oauth2 auth: token response carries no access_token".into(),
-            ));
+        Ok((json, body))
+    }
+}
+
+#[async_trait]
+impl PendingAuthFlow for DescriptorPendingFlow {
+    fn authorization_url(&self) -> &str {
+        &self.authorization_url
+    }
+
+    fn flow_kind(&self) -> AuthFlowKind {
+        AuthFlowKind::OAuth2Pkce
+    }
+
+    async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError> {
+        let code = self.callback_code(callback)?;
+        let (tokens, body) = self.exchange(&code).await?;
+
+        match &self.descriptor.credential {
+            CredentialShape::RawTokenJson => {
+                if tokens
+                    .get("access_token")
+                    .and_then(|t| t.as_str())
+                    .is_none()
+                {
+                    return Err(ApiError::Other(
+                        "oauth2 auth: token response carries no access_token".into(),
+                    ));
+                }
+                // Identity: explicit label → id_token sub → stable hash of (token_endpoint, client_id).
+                let client_id = self.client_id.as_deref().unwrap_or_default();
+                let label = self
+                    .explicit_label
+                    .clone()
+                    .filter(|l| !l.is_empty())
+                    .or_else(|| id_token_sub(&tokens))
+                    .unwrap_or_else(|| derived_label(&self.token_endpoint, client_id));
+                let family = self.descriptor.family;
+                Ok(AuthOutcome {
+                    // The raw token-response JSON is the opaque blob the node persists; consumers
+                    // re-parse what they need.
+                    credential_blob: body,
+                    credential_ref: format!("{family}/{label}"),
+                    account_label: label.clone(),
+                    transport_instance: TransportId::new(format!("{family}/{label}")),
+                    slot: CredentialSlotKind::Derived,
+                })
+            }
+            CredentialShape::ProviderKey { account_label } => {
+                let ExchangeStyle::JsonPost { key_field } = &self.descriptor.exchange else {
+                    // A misconfigured descriptor (provider-key credential without a key-mint
+                    // exchange) is a build defect, surfaced rather than mislabelling a blob.
+                    return Err(ApiError::Other(
+                        "oauth2 auth: provider-key credential requires a JSON key-mint exchange"
+                            .into(),
+                    ));
+                };
+                let key = tokens
+                    .get(*key_field)
+                    .and_then(|k| k.as_str())
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::Other(format!(
+                            "oauth2 auth: key-mint response carries no `{key_field}`"
+                        ))
+                    })?;
+                let family = self.descriptor.family;
+                Ok(AuthOutcome {
+                    // The BARE minted key rides the exact downstream path as a pasted API key; the
+                    // node slots it under the bound profile's credential slot (never the raw JSON).
+                    credential_blob: key.to_string(),
+                    // Informational default; `auth_complete` targets the bound profile slot instead.
+                    credential_ref: format!("{family}/{account_label}"),
+                    account_label: (*account_label).to_string(),
+                    transport_instance: TransportId::new(format!("{family}/{account_label}")),
+                    slot: CredentialSlotKind::ProviderKeyForProfile,
+                })
+            }
         }
-
-        // Identity derivation order (crate docs): explicit label → id_token sub → stable hash.
-        let label = self
-            .account_label
-            .clone()
-            .filter(|l| !l.is_empty())
-            .or_else(|| id_token_sub(&tokens))
-            .unwrap_or_else(|| derived_label(&self.token_endpoint, &self.client_id));
-
-        Ok(AuthOutcome {
-            // The raw token-response JSON (access/refresh/expiry/id_token) is the opaque blob the
-            // node persists in the CredentialStore; consumers re-parse what they need.
-            credential_blob: body,
-            credential_ref: format!("{FAMILY}/{label}"),
-            account_label: label.clone(),
-            transport_instance: TransportId::new(format!("{FAMILY}/{label}")),
-        })
     }
 }
 
@@ -372,15 +617,6 @@ mod tests {
             .collect()
     }
 
-    /// Unwrap an expected completion error (`AuthOutcome` deliberately has no `Debug` — it carries
-    /// the secret blob — so `expect_err` is unavailable).
-    fn completion_err(result: Result<AuthOutcome, ApiError>, ctx: &str) -> ApiError {
-        match result {
-            Err(e) => e,
-            Ok(_) => panic!("{ctx}: expected an error"),
-        }
-    }
-
     fn base_params() -> BTreeMap<String, String> {
         params(&[
             (
@@ -393,7 +629,6 @@ mod tests {
         ])
     }
 
-    /// Extract a query param from a URL.
     fn query_param(url: &str, key: &str) -> Option<String> {
         let parsed = url::Url::parse(url).unwrap();
         parsed
@@ -410,7 +645,6 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert_ne!(random_urlsafe(32).unwrap(), verifier, "fresh per call");
-        // The S256 challenge is the base64url sha256 of the ASCII verifier.
         assert_eq!(
             s256_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
@@ -419,8 +653,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_builds_a_pkce_authorization_url() {
-        let factory = OAuth2PkceFlowFactory::new().unwrap();
+    async fn generic_begin_builds_a_pkce_authorization_url() {
+        let factory = DescriptorFlowFactory::new(generic_oauth2()).unwrap();
         let flow = factory
             .begin(&base_params(), "http://127.0.0.1:7777/cb")
             .await
@@ -448,8 +682,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_requires_endpoints_and_client_id() {
-        let factory = OAuth2PkceFlowFactory::new().unwrap();
+    async fn generic_begin_requires_endpoints_and_client_id() {
+        let factory = DescriptorFlowFactory::new(generic_oauth2()).unwrap();
         for missing in [
             PARAM_AUTHORIZATION_ENDPOINT,
             PARAM_TOKEN_ENDPOINT,
@@ -462,43 +696,68 @@ mod tests {
         }
     }
 
-    /// A callback whose `state` does not echo the minted one is rejected BEFORE any network I/O
-    /// (the CSRF gate), as is an IdP error and a missing code.
     #[tokio::test]
-    async fn complete_rejects_bad_callbacks_before_any_exchange() {
-        let factory = OAuth2PkceFlowFactory::new().unwrap();
-        let begin = || async {
-            factory
-                .begin(&base_params(), "http://127.0.0.1:7777/cb")
-                .await
-                .unwrap()
-        };
-
-        let flow = begin().await;
-        let err = completion_err(
-            flow.complete("http://127.0.0.1:7777/cb?code=abc&state=WRONG")
-                .await,
-            "state mismatch must be rejected",
+    async fn openrouter_begin_is_pkce_only_with_callback_url() {
+        let factory = DescriptorFlowFactory::new(openrouter()).unwrap();
+        // The node owns every parameter — the client calls begin with an empty params map.
+        let flow = factory
+            .begin(&BTreeMap::new(), "http://127.0.0.1:7777/cb")
+            .await
+            .unwrap();
+        let url = flow.authorization_url();
+        assert!(url.starts_with("https://openrouter.ai/auth?"), "{url}");
+        assert_eq!(
+            query_param(url, "callback_url").as_deref(),
+            Some("http://127.0.0.1:7777/cb"),
+            "OpenRouter carries the callback under `callback_url`"
         );
-        assert!(err.to_string().contains("state mismatch"), "{err}");
-
-        let flow = begin().await;
-        let err = completion_err(
-            flow.complete("http://127.0.0.1:7777/cb?error=access_denied&error_description=nope")
-                .await,
-            "an IdP error must be surfaced",
+        assert_eq!(
+            query_param(url, "code_challenge_method").as_deref(),
+            Some("S256")
         );
-        assert!(err.to_string().contains("access_denied"), "{err}");
-
-        let flow = begin().await;
-        let url = flow.authorization_url().to_string();
-        let state = query_param(&url, "state").unwrap();
-        let err = completion_err(
-            flow.complete(&format!("http://127.0.0.1:7777/cb?state={state}"))
-                .await,
-            "a code-less callback must be rejected",
+        assert_eq!(
+            query_param(url, "code_challenge").map(|c| c.len()),
+            Some(43)
         );
-        assert!(err.to_string().contains("no `code`"), "{err}");
+        // PKCE-only: no client_id, no state, no response_type, no redirect_uri.
+        assert!(query_param(url, "client_id").is_none());
+        assert!(query_param(url, "state").is_none());
+        assert!(query_param(url, "response_type").is_none());
+        assert!(query_param(url, "redirect_uri").is_none());
+    }
+
+    #[tokio::test]
+    async fn huggingface_begin_is_rfc_with_inference_scope() {
+        let factory = DescriptorFlowFactory::new(huggingface("hf-client-123".into())).unwrap();
+        let flow = factory
+            .begin(&BTreeMap::new(), "http://127.0.0.1:7777/cb")
+            .await
+            .unwrap();
+        let url = flow.authorization_url();
+        assert!(
+            url.starts_with("https://huggingface.co/oauth/authorize?"),
+            "{url}"
+        );
+        assert_eq!(query_param(url, "response_type").as_deref(), Some("code"));
+        assert_eq!(
+            query_param(url, "client_id").as_deref(),
+            Some("hf-client-123")
+        );
+        assert_eq!(query_param(url, "scope").as_deref(), Some("inference-api"));
+        assert!(query_param(url, "state").is_some(), "HF uses CSRF state");
+        assert_eq!(
+            query_param(url, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+    }
+
+    #[test]
+    fn openrouter_family_constant_is_stable() {
+        // The sibling wire stream's `ProviderDescriptor.sign_in` advertisement points at this exact
+        // string; it must not drift.
+        assert_eq!(OPENROUTER_FAMILY, "provider/openrouter");
+        assert!(openrouter().params_schema.is_empty());
+        assert!(huggingface("x".into()).params_schema.is_empty());
     }
 
     #[test]

@@ -293,6 +293,56 @@ No new wire surface is needed — `AuthFlowKind::OAuth2Pkce`, `params` carries t
 and `flow_kind` tells the GUI it is an OAuth flow. This is why the seam is generic from day one even
 though only Matrix SSO is implemented first.
 
+### 7.1 The descriptor-driven OAuth engine (A2, ✅ landed)
+
+`daemon-oauth` is ONE descriptor-driven engine, not a factory-per-provider. A single
+`DescriptorFlowFactory` implements the whole begin/complete flow; an `OAuthFlowDescriptor`
+parameterizes it — endpoints (`Source::Fixed` for a curated provider, `Source::Param` for the
+generic family), optional `client_id`/`client_secret`/`scopes`, the callback param name
+(`CallbackParam::RedirectUri` for RFC 6749 vs `CallbackUrl` for OpenRouter), whether a CSRF `state`
+is minted+enforced (`use_state`), the exchange style (`ExchangeStyle::FormPost` for RFC 6749 §4.1.3,
+or `JsonPost { key_field }` for a JSON key-mint), and the credential shape. PKCE (S256) is **always
+on**; every descriptor advertises `AuthFlowKind::OAuth2Pkce` (no new wire variant).
+
+Curated descriptors (all instantiations of the one engine — no duplicate flow code):
+
+- **generic `oauth2`** — the operator-facing family: client-supplied endpoints/client_id in
+  `auth_begin.params`, RFC form-post, raw token JSON stored under a `oauth2/<label>` ref (identity:
+  explicit `account_label` → `id_token` `sub` → stable hash). Byte-identical to the pre-refactor
+  factory.
+- **`provider/openrouter`** — a built-in provider-bound family with an EMPTY `params_schema` (the
+  node owns every parameter; the client calls `auth_begin { family: "provider/openrouter", params:
+  {} }`). Deliberately non-RFC: authorize at
+  `https://openrouter.ai/auth?callback_url=<redirect>&code_challenge=<S256>&code_challenge_method=S256`
+  (no `client_id`, no `state` — PKCE binds it), exchange is a JSON POST to
+  `https://openrouter.ai/api/v1/auth/keys` returning `{"key": …}`. The minted `key` is an ordinary
+  OpenRouter API key. The family string is exported as
+  `daemon_oauth::OPENROUTER_FAMILY = "provider/openrouter"` — the string a wire
+  `ProviderDescriptor.sign_in` advertisement points at.
+- **`provider/huggingface`** — a provider-bound family gated on an operator-supplied `client_id`
+  (`oauth.huggingface_client_id` in node config; OFF by default, so an unconfigured node never
+  advertises it). Standard OIDC (`https://huggingface.co/oauth/{authorize,token}`), `inference-api`
+  scope, `use_state` on, RFC form-post, provider-key credential shape.
+
+Registration lives in `bins/daemon/src/main.rs` next to the Matrix SSO factory: the generic +
+OpenRouter families register unconditionally; Hugging Face rides only when its client id is set.
+
+#### Slot semantics — the node decides where a credential lands, never the client
+
+`AuthOutcome` carries a non-wire `slot: CredentialSlotKind`:
+
+- **`Derived`** (Matrix SSO, generic `oauth2`) — the historical transport-account shape: store the
+  opaque blob under the flow's `credential_ref` (a bind-supplied `credential_ref` may override) and,
+  when a bind was requested, attach a `BoundAccount { transport_instance, credential_ref }` to the
+  profile.
+- **`ProviderKeyForProfile`** (OpenRouter, Hugging Face) — a minted MODEL-PROVIDER API key: the node
+  stores the BARE key under the **bound profile's** credential slot (the profile id the credential
+  broker reads), so it rides the exact same downstream path as a pasted API key, and does NOT attach
+  a `BoundAccount` (a provider key is not a transport account). It REQUIRES a bind naming the target
+  profile — a key with no bind target would be stranded where no broker reads it, so `auth_complete`
+  rejects the no-bind case with a clear error. The client never names the slot; the descriptor +
+  bind decide it.
+
 ---
 
 ## 8. GUI integration contract (for `daemon-app`)
@@ -342,8 +392,13 @@ Both use the same `NodeApi` / Unix-socket seam the app already plans to adopt fo
   bound; cancel + consumed-flow rejection) and a `MatrixMockServer`-backed `sso_begin`/`sso_complete`
   test. *Deferred within A1:* completion over the in-process surface is exercised directly; a transport
   end-to-end over the Unix socket rides with the GUI wiring in A3.
-- **A2 — OAuth2/OIDC family.** A generic `OAuthAuthFlowFactory` (PKCE + state) and/or the matrix-sdk
-  `oauth()` path for Matrix MAS; provider metadata in `auth_providers`.
+- **A2 — OAuth2/OIDC family. ✅ Landed.** ONE descriptor-driven engine in `daemon-oauth` (§7.1): the
+  generic `oauth2` family (client-supplied endpoints, PKCE + state), plus curated provider-bound
+  families (`provider/openrouter` built-in, `provider/huggingface` config-gated) whose minted
+  provider key is slotted under the bound profile (`CredentialSlotKind::ProviderKeyForProfile`).
+  Proven by mock-IdP tests for both exchange styles (RFC form-post + JSON key-mint), the CSRF `state`
+  gate for `use_state` true/false, and node-side conformance for the empty-schema family
+  registration + the provider-key slot mapping + the no-bind rejection.
 - **A3 — GUI wiring (`daemon-app`).** Desktop loopback sink + mobile deep-link sink; an "add account"
   UI driving `auth_providers` → `auth_begin` → browser → `auth_complete`, bound to a profile.
 - **A4 — hardening.** Channel auth for the wire surface (orthogonal but a prerequisite for non-loopback

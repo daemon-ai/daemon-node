@@ -160,6 +160,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `models.endpoint` | `DAEMON_MODELS__ENDPOINT` | optional | _(unset)_ |
 | `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
 | `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
+| `oauth.huggingface_client_id` | `DAEMON_OAUTH__HUGGINGFACE_CLIENT_ID` | optional | _(unset)_ |
 | `orchestrate.max_depth` | `DAEMON_ORCHESTRATE__MAX_DEPTH` | number | `8` |
 | `orchestrate.max_fanout` | `DAEMON_ORCHESTRATE__MAX_FANOUT` | number | `8` |
 | `orchestrate.reaper_enabled` | `DAEMON_ORCHESTRATE__REAPER_ENABLED` | bool | `true` |

@@ -69,6 +69,43 @@ impl AuthApi for NodeApiImpl {
         let (flow, bind) = flows.take(&req.flow_id)?;
         let outcome = flow.complete(&req.callback).await?;
 
+        let store = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
+
+        // Slot mapping (the node decides, never the client): a provider-bound family (OpenRouter /
+        // Hugging Face) mints a MODEL-PROVIDER API key, which must ride the target profile's
+        // credential slot — the id the credential broker reads — so it flows downstream exactly like
+        // a pasted API key. It requires a bind naming the profile (a key with no bind target would be
+        // stranded where no broker reads it); no `BoundAccount` is attached (a provider key is not a
+        // transport account).
+        if outcome.slot == crate::auth::CredentialSlotKind::ProviderKeyForProfile {
+            let bind = bind.ok_or_else(|| {
+                ApiError::Other(
+                    "provider-key auth requires a bind naming the target profile: the minted key \
+                     must land in that profile's credential slot for the model broker to use it"
+                        .into(),
+                )
+            })?;
+            let profile = bind.profile.clone();
+            let credential_ref = profile.as_str().to_string();
+            store
+                .set(&credential_ref, &outcome.credential_blob)
+                .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;
+            // Replacing the profile's provider key must invalidate leases minted against any prior
+            // material — bump the authority's lease epoch after the store write (as `credential_set`).
+            if let Some(revoker) = &self.credential_revoker {
+                revoker.revoke_profile(&credential_ref);
+            }
+            return Ok(AuthCompleteResponse {
+                credential_ref,
+                account_label: outcome.account_label,
+                transport_instance: outcome.transport_instance,
+                bound_profile: Some(profile),
+            });
+        }
+
         // The credential ref: a bind-supplied override wins over the family-derived default, so an
         // operator can pin where the blob lands; otherwise the family names it (e.g. by resolved user).
         let credential_ref = bind
@@ -76,10 +113,6 @@ impl AuthApi for NodeApiImpl {
             .and_then(|b| b.credential_ref.clone())
             .unwrap_or_else(|| outcome.credential_ref.clone());
 
-        let store = self
-            .credentials
-            .as_ref()
-            .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
         store
             .set(&credential_ref, &outcome.credential_blob)
             .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;

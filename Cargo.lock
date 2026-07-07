@@ -2232,6 +2232,7 @@ dependencies = [
  "daemon-matrix",
  "daemon-models",
  "daemon-node",
+ "daemon-oauth",
  "daemon-orchestration",
  "daemon-protocol",
  "daemon-providers",
