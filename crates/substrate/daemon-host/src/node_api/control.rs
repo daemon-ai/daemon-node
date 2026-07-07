@@ -432,9 +432,11 @@ impl ControlApi for NodeApiImpl {
             .session_allow_fingerprints
             .iter()
             .take(daemon_api::WIRE_PAGE_MAX)
-            .map(|fp| daemon_api::RememberedFingerprint {
-                fingerprint: fp.as_str().to_string(),
-                label: None,
+            .map(|r| daemon_api::RememberedFingerprint {
+                fingerprint: r.fingerprint.as_str().to_string(),
+                // Provenance (wire v30): the label + capture timestamp recorded at the decide path.
+                label: r.label.clone(),
+                remembered_at_ms: r.remembered_at_ms,
             })
             .collect())
     }
@@ -466,7 +468,7 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("decode session snapshot: {e}")))?;
         let before = snap.session_allow_fingerprints.len();
         snap.session_allow_fingerprints
-            .retain(|fp| fp.as_str() != fingerprint);
+            .retain(|r| r.fingerprint.as_str() != fingerprint);
         if snap.session_allow_fingerprints.len() == before {
             return Err(ApiError::Other(format!(
                 "no remembered fingerprint {fingerprint} on session {session}"

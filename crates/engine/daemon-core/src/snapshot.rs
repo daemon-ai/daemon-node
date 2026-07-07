@@ -86,8 +86,15 @@ pub struct Snapshot {
     /// decodable (empty). Written only through the single-owner effect applier
     /// ([`Effect::RememberApproval`](crate::turn::Effect::RememberApproval), inline) and
     /// `resolve_approvals` (durable).
+    ///
+    /// Wire v30 carries provenance ([`RememberedApproval`](crate::exec::RememberedApproval):
+    /// `remembered_at_ms` + optional `label`). A pre-v30 snapshot stored a bare
+    /// `CommandFingerprint` (a hex string) per entry; `RememberedApproval`'s tolerant `Deserialize`
+    /// decodes those as `{ remembered_at_ms: 0, label: None }`, so old blobs still load. The snapshot
+    /// format has no numeric schema-version const — it evolves via `#[serde(default)]` + the
+    /// `writer_version` provenance stamp (see [`Snapshot::decode`]).
     #[serde(default)]
-    pub session_allow_fingerprints: Vec<crate::exec::CommandFingerprint>,
+    pub session_allow_fingerprints: Vec<crate::exec::RememberedApproval>,
     /// Provenance: the node build that last wrote this snapshot (`daemon_common::VERSION`, e.g.
     /// `0.0.1+g1a2b3c4`). Stamped on [`Snapshot::encode`], not a migration key — the snapshot format
     /// itself evolves via `#[serde(default)]`. Empty on snapshots written before this field existed.
@@ -218,7 +225,8 @@ mod tests {
     }
 
     /// Cluster B / allow_permanent: the per-session command allow-list survives the durable
-    /// encode/decode round-trip so a permanent allow persists across restart.
+    /// encode/decode round-trip so a permanent allow persists across restart, carrying its wire-v30
+    /// provenance (`remembered_at_ms` + `label`).
     #[test]
     fn round_trips_the_session_allow_list() {
         let fp = crate::exec::CommandFingerprint::compute(
@@ -228,15 +236,53 @@ mod tests {
             &[],
             std::path::Path::new("/ws"),
         );
+        let entry = crate::exec::RememberedApproval {
+            fingerprint: fp.clone(),
+            remembered_at_ms: 1_700_000_000_000,
+            label: Some("printf hi".into()),
+        };
         let mut snap = Snapshot::fresh(SessionId::new("s-allow"));
-        snap.session_allow_fingerprints.push(fp.clone());
+        snap.session_allow_fingerprints.push(entry.clone());
         let blob = snap.encode().unwrap();
         let decoded = Snapshot::decode(&blob).unwrap();
         assert_eq!(
             decoded.session_allow_fingerprints,
-            vec![fp],
-            "the allow_permanent allow-list survives encode/decode",
+            vec![entry],
+            "the allow_permanent allow-list + provenance survives encode/decode",
         );
+    }
+
+    /// Pre-v30 back-compat: a snapshot whose `session_allow_fingerprints` was an array of bare
+    /// fingerprint hex strings (the old `Vec<CommandFingerprint>` shape) decodes into
+    /// `RememberedApproval`s with `remembered_at_ms: 0` and `label: None`.
+    #[test]
+    fn decodes_pre_v30_bare_fingerprint_allow_list() {
+        // A minimal old-shape snapshot: only the allow-list field, as bare strings.
+        #[derive(Serialize)]
+        struct OldSnapshot {
+            session_id: SessionId,
+            epoch: Epoch,
+            conversation: Conversation,
+            references: References,
+            waiting_for: Vec<JobId>,
+            session_allow_fingerprints: Vec<String>,
+        }
+        let old = OldSnapshot {
+            session_id: SessionId::new("s-old-allow"),
+            epoch: Epoch::ZERO,
+            conversation: Conversation::default(),
+            references: References::default(),
+            waiting_for: Vec::new(),
+            session_allow_fingerprints: vec!["deadbeef".to_string()],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        let decoded = Snapshot::decode(&SnapshotBlob::new(bytes)).expect("old allow-list decodes");
+        assert_eq!(decoded.session_allow_fingerprints.len(), 1);
+        let entry = &decoded.session_allow_fingerprints[0];
+        assert_eq!(entry.fingerprint.as_str(), "deadbeef");
+        assert_eq!(entry.remembered_at_ms, 0);
+        assert!(entry.label.is_none());
     }
 
     /// `encode` stamps the running build's version, and a round-trip preserves it.

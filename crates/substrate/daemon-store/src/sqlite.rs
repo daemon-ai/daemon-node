@@ -335,6 +335,15 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
             "ALTER TABLE completion_notices ADD COLUMN call_id TEXT;\n\
              ALTER TABLE completion_notice_outbox ADD COLUMN call_id TEXT;",
         ),
+        // M8 (wire v30 — tool overrides): the node-wide `ToolSetEnabled` enable/disable overlay,
+        // keyed by tool name. `tool_list` overlays it on the bound inventory and per-session tool
+        // wiring consults it. A row exists only for an explicitly-overridden tool.
+        M::up(
+            "CREATE TABLE tool_overrides (\n\
+                 tool    TEXT PRIMARY KEY,\n\
+                 enabled INTEGER NOT NULL\n\
+             );",
+        ),
     ])
 });
 
@@ -1557,6 +1566,33 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM chat_routes WHERE key = ?1", params![key])
             .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn tool_overrides(&self) -> Vec<(String, bool)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT tool, enabled FROM tool_overrides ORDER BY tool")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn set_tool_override(&self, tool: &str, enabled: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tool_overrides (tool, enabled) VALUES (?1, ?2) \
+             ON CONFLICT(tool) DO UPDATE SET enabled = ?2",
+            params![tool, enabled as i64],
+        )
+        .map_err(sql_err)?;
         Ok(())
     }
 

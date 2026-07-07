@@ -231,9 +231,13 @@ impl Engine {
         if !self
             .snapshot
             .session_allow_fingerprints
-            .contains(&fingerprint)
+            .iter()
+            .any(|r| r.fingerprint == fingerprint)
         {
-            self.snapshot.session_allow_fingerprints.push(fingerprint);
+            // Wire v30: capture provenance (the remembered-at timestamp) at the decide path.
+            self.snapshot
+                .session_allow_fingerprints
+                .push(crate::exec::RememberedApproval::now(fingerprint));
         }
     }
 
@@ -1003,7 +1007,13 @@ impl Engine {
 
                 // Seed the round's read-only `allow_permanent` view from the durable snapshot (an owned
                 // clone so it never conflicts with `&mut self.snapshot` mutations later in the round).
-                let session_allow = self.snapshot.session_allow_fingerprints.clone();
+                // The gate matches on the bare fingerprint; provenance (v30) stays snapshot-side.
+                let session_allow: Vec<crate::exec::CommandFingerprint> = self
+                    .snapshot
+                    .session_allow_fingerprints
+                    .iter()
+                    .map(|r| r.fingerprint.clone())
+                    .collect();
                 let cx = TurnCx {
                     cancel: control.cancel_token(),
                     events,
@@ -1516,7 +1526,12 @@ impl Engine {
         let cancel = control.cancel_token();
         // Read-only allow-list view for the re-run cx. The durable re-run is `pre_approved` (the gate is
         // skipped), so this is not consulted here — seeded only to build a complete `TurnCx`.
-        let session_allow_seed = self.snapshot.session_allow_fingerprints.clone();
+        let session_allow_seed: Vec<crate::exec::CommandFingerprint> = self
+            .snapshot
+            .session_allow_fingerprints
+            .iter()
+            .map(|r| r.fingerprint.clone())
+            .collect();
         let pending = std::mem::take(&mut self.pending);
         let mut rest = Vec::new();
         for completion in pending {

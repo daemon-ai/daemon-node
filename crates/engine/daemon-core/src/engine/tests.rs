@@ -1485,7 +1485,11 @@ async fn durable_allow_permanent_remembers_verified_fingerprint() {
         "a verified permanent allow runs"
     );
     assert!(
-        engine.snapshot.session_allow_fingerprints.contains(&fp),
+        engine
+            .snapshot
+            .session_allow_fingerprints
+            .iter()
+            .any(|r| r.fingerprint == fp),
         "a verified permanent allow records the command fingerprint on the session allow-list",
     );
 }
