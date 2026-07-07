@@ -2599,6 +2599,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.whatsapp.enabled {
         auth_factories.push(Arc::new(daemon_whatsapp::WhatsappAuthFlowFactory::new()));
     }
+    #[cfg(feature = "discord")]
     if cfg.discord.enabled {
         auth_factories.push(Arc::new(daemon_discord::DiscordAuthFlowFactory::new(
             cfg.discord.mode,
@@ -3017,6 +3018,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             cfg.whatsapp.clone(),
         ));
     }
+    #[cfg(feature = "discord")]
     if cfg.discord.enabled {
         tracing::info!("registering discord transport (daemon-discord)");
         let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();

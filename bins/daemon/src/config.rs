@@ -1322,7 +1322,10 @@ pub struct NodeConfig {
     /// The WhatsApp chat transport config (`enabled = false` by default).
     #[serde(default)]
     pub whatsapp: daemon_whatsapp::WhatsappConfig,
-    /// The Discord chat transport config (`enabled = false` by default).
+    /// The Discord chat transport config (`enabled = false` by default). Behind the off-by-default
+    /// `discord` cargo feature: `serenity_self` pins an old TLS stack with live advisories, so it is
+    /// excluded from the default binary. Build `--features discord` to compile it in.
+    #[cfg(feature = "discord")]
     #[serde(default)]
     pub discord: daemon_discord::DiscordConfig,
     /// The WeChat chat transport config (`enabled = false` by default).
@@ -1396,6 +1399,7 @@ impl Default for NodeConfig {
             // [waveB:msg-adapters]
             telegram: daemon_telegram::TelegramConfig::default(),
             whatsapp: daemon_whatsapp::WhatsappConfig::default(),
+            #[cfg(feature = "discord")]
             discord: daemon_discord::DiscordConfig::default(),
             wechat: daemon_wechat::WeChatConfig::default(),
             line: daemon_line::LineConfig::default(),
