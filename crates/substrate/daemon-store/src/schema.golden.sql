@@ -191,6 +191,10 @@ CREATE TABLE session_usage (
     cost_micros         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE sqlite_sequence(name,seq);
+CREATE TABLE tool_overrides (
+tool    TEXT PRIMARY KEY,
+enabled INTEGER NOT NULL
+);
 CREATE TABLE wake_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL

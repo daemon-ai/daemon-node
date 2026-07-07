@@ -2177,9 +2177,10 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (7: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// `user_version` (8: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
-    /// pending-approval fingerprint column, and the wire-v29 completion-notice call_id columns).
+    /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, and the
+    /// wire-v30 `tool_overrides` table).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2190,7 +2191,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 8, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {
