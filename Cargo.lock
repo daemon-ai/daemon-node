@@ -2250,6 +2250,7 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "rsasl",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

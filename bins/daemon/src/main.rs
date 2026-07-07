@@ -3575,6 +3575,33 @@ mod tests {
         assert_eq!(anthropic.wire_selector, ProviderSelector::GenAi);
     }
 
+    /// CON-15 (wire v30, item 5): the OpenRouter genai row advertises interactive sign-in via the
+    /// EXACT `provider/openrouter` auth family + label; every other row carries `None`. The full
+    /// catalog↔factory cross-check lands at integration; this asserts the advertised family/label.
+    #[tokio::test] // [waveA:node-v30]
+    async fn openrouter_row_advertises_sign_in() {
+        let catalog = GenAiCloudCatalog;
+        let providers = CloudCatalog::providers(&catalog).await;
+        let openrouter = providers
+            .iter()
+            .find(|p| p.id == "open_router")
+            .expect("openrouter row present");
+        let sign_in = openrouter
+            .sign_in
+            .as_ref()
+            .expect("openrouter advertises interactive sign-in");
+        assert_eq!(sign_in.family, "provider/openrouter");
+        assert_eq!(sign_in.label, "Sign in with OpenRouter");
+        // Every other provider row (local, daemon_cloud, other genai vendors) advertises none.
+        for p in providers.iter().filter(|p| p.id != "open_router") {
+            assert!(
+                p.sign_in.is_none(),
+                "only the OpenRouter row advertises sign-in; {} must not",
+                p.id
+            );
+        }
+    }
+
     /// `ProviderModels(daemon_cloud)` lists the gateway's `author/slug` models keyless via
     /// `GET {base}/models`, against a mock upstream (OpenAI `{ "data": [..] }` envelope).
     #[tokio::test]

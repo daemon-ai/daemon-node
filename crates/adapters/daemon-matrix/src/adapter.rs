@@ -548,6 +548,25 @@ mod tests {
         adapter
     }
 
+    /// Wire v30 (item 4): the adapter advertises its `auto_accept_invites` policy with a
+    /// node-decided label + the current config value, for the app to render read-only.
+    #[test]
+    fn info_advertises_auto_accept_invites_policy() {
+        let cfg = MatrixConfig {
+            auto_accept_invites: false,
+            ..MatrixConfig::default()
+        };
+        let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), cfg, None);
+        let info = TransportAdapter::info(&*adapter);
+        let policy = info
+            .policies
+            .iter()
+            .find(|p| p.key == "auto_accept_invites")
+            .expect("matrix reports the auto_accept_invites policy");
+        assert_eq!(policy.value, "false");
+        assert!(!policy.label.is_empty(), "the node decides a human label");
+    }
+
     #[test]
     fn supported_reports_the_matrix_subset_plus_extras() {
         let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), MatrixConfig::default(), None);

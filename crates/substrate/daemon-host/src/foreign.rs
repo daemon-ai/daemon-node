@@ -179,3 +179,126 @@ pub fn encode_inbound(frame: &Inbound) -> Vec<u8> {
 pub fn decode_outbound(bytes: &[u8]) -> Option<Outbound> {
     ciborium::from_reader(bytes).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_protocol::{EndReason, HostRequest, HostResponse, TurnTrigger};
+    use std::time::Duration;
+
+    struct NoHost;
+    #[async_trait]
+    impl HostRequestHandler for NoHost {
+        async fn request(&self, _req: HostRequest) -> HostResponse {
+            unreachable!("no host request in the mid-turn-death test")
+        }
+    }
+
+    fn encode_up(frame: &Outbound) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(frame, &mut buf).expect("encode Outbound");
+        buf
+    }
+
+    /// Mid-turn death (wire v30, C6): a foreign agent emits a `TurnStarted` then its stdout closes
+    /// WITHOUT a clean `TurnFinished`. The reader loop must synthesize a terminal
+    /// `TurnFinished{Failed}` carrying a `ForeignFailure` so a subscriber unblocks instead of hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreign_stdout_eof_midturn_synthesizes_failed_turn() {
+        let (p2c_a, p2c_b) = tokio::io::duplex(64 * 1024);
+        let (c2p_a, c2p_b) = tokio::io::duplex(64 * 1024);
+        let parent = CutChannel::from_parts(Box::new(c2p_b), Box::new(p2c_a));
+        let child = CutChannel::from_parts(Box::new(p2c_b), Box::new(c2p_a));
+
+        let session = CodecSession::from_channel(
+            parent,
+            None,
+            Arc::new(NoHost),
+            NativeCutCodec,
+            Some("gemini".to_string()),
+        );
+        let mut events = session.subscribe();
+
+        // The "foreign agent": open a turn, then close stdout mid-turn (drop the writer).
+        let (cw, _cr) = child.split();
+        cw.send(&encode_up(&Outbound::Event(AgentEvent::TurnStarted {
+            seq: 7,
+            trigger: TurnTrigger::User,
+        })))
+        .await
+        .expect("send TurnStarted");
+        drop(cw); // stdout closes: EOF on the parent reader.
+
+        // Expect the streamed TurnStarted, then the synthesized terminal failure.
+        let mut saw_started = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("timed out awaiting the synthesized failure")
+                .expect("event stream closed unexpectedly");
+            match ev {
+                AgentEvent::TurnStarted { .. } => saw_started = true,
+                AgentEvent::TurnFinished { seq, summary } => {
+                    assert!(saw_started, "TurnFinished before TurnStarted");
+                    assert_eq!(summary.end_reason, EndReason::Failed);
+                    let failure = summary.failure.expect("carries a ForeignFailure");
+                    assert_eq!(failure.stage, ForeignStage::Turn);
+                    assert_eq!(failure.agent.as_deref(), Some("gemini"));
+                    assert!(seq > 7, "synthetic seq is monotonic past the last event");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A CLEAN `TurnFinished` must NOT trigger a synthesized failure on the subsequent EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_turn_finish_then_eof_emits_no_synthetic_failure() {
+        let (p2c_a, p2c_b) = tokio::io::duplex(64 * 1024);
+        let (c2p_a, c2p_b) = tokio::io::duplex(64 * 1024);
+        let parent = CutChannel::from_parts(Box::new(c2p_b), Box::new(p2c_a));
+        let child = CutChannel::from_parts(Box::new(p2c_b), Box::new(c2p_a));
+
+        let session = CodecSession::from_channel(
+            parent,
+            None,
+            Arc::new(NoHost),
+            NativeCutCodec,
+            Some("gemini".to_string()),
+        );
+        let mut events = session.subscribe();
+
+        let (cw, _cr) = child.split();
+        cw.send(&encode_up(&Outbound::Event(AgentEvent::TurnFinished {
+            seq: 3,
+            summary: TurnSummary::ended(EndReason::Completed),
+        })))
+        .await
+        .expect("send clean TurnFinished");
+        drop(cw);
+
+        // The clean Completed arrives; a second (synthetic Failed) must NOT.
+        let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("timed out")
+            .expect("stream closed");
+        assert!(matches!(
+            first,
+            AgentEvent::TurnFinished {
+                summary: TurnSummary {
+                    end_reason: EndReason::Completed,
+                    ..
+                },
+                ..
+            }
+        ));
+        // No further event (the reader saw a clean finish; the broadcast closes on task end).
+        let next = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
+        match next {
+            Err(_) => {} // timed out: no synthetic event (good).
+            Ok(Err(broadcast::error::RecvError::Closed)) => {} // sender dropped, no event (good).
+            Ok(other) => panic!("unexpected extra event after a clean finish: {other:?}"),
+        }
+    }
+}
