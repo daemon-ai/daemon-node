@@ -473,6 +473,12 @@ pub struct NodeApiImpl {
     /// => only the credential *store* is mutated (a fresh acquire no longer sees the removed key,
     /// but an already-minted lease is not invalidated).
     credential_revoker: Option<Arc<dyn crate::revocation::CredentialRevoker>>,
+    /// The user-feedback outbox drain seam (N1 → N2): the wired OTLP exporter the `FeedbackSubmit`
+    /// enqueue + node startup drain each queued [`daemon_store::FeedbackRecord`] through, mapped to a
+    /// [`daemon_telemetry::feedback::FeedbackEvent`] and shipped to `telemetry.feedback_endpoint`.
+    /// `None` => export is inert (no endpoint configured, or the `otel` feature is off) and records
+    /// simply stay queued. Bound via [`NodeApiImpl::with_feedback_endpoint`] at assembly.
+    feedback_drain: Option<Arc<feedback::FeedbackDrain>>,
 }
 
 impl NodeApiImpl {
@@ -627,6 +633,7 @@ mod builtins;
 mod control;
 mod cred_auth;
 mod delivery;
+mod feedback;
 mod journal_audit;
 mod membership;
 mod messaging;

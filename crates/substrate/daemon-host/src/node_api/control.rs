@@ -537,8 +537,12 @@ impl ControlApi for NodeApiImpl {
             .feedback_enqueue(record)
             .await
             .map_err(|e| ApiError::Other(format!("enqueue feedback: {e}")))?;
-        // The ack means accepted+queued to the durable outbox — NEVER delivered (export is a
-        // separate, best-effort drain wired in the integration phase).
+        // Trigger a best-effort, detached drain of the outbox to the OTLP exporter (N1 → N2). This
+        // does NOT block the ack, and is a no-op when export is inert (no `telemetry.feedback_endpoint`
+        // or the `otel` feature is off) — the record then just stays queued.
+        self.spawn_feedback_drain();
+        // The ack means accepted+queued to the durable outbox. Delivery to the collector is the
+        // separate best-effort drain above; a queued record survives a failed/absent export.
         Ok(FeedbackAck {
             accepted: true,
             queued: true,

@@ -1076,9 +1076,13 @@ pub trait SessionStore: Send + Sync {
 
     /// The oldest undelivered feedback records (by `created_at_ms`), capped at `limit` (`0` = all).
     ///
-    /// This is the exporter's DRAIN seam: the OpenTelemetry exporter (a sibling workstream, wired in
-    /// the integration phase — N1 leaves it unwired) polls this, ships each record as an OTel log
-    /// event, then calls [`Self::feedback_mark_delivered`]. Default: none (a store without the
+    /// This is the exporter's DRAIN seam, now wired: `daemon-host`'s feedback drain
+    /// (`node_api::feedback`) polls this after each `FeedbackSubmit` enqueue and once at node
+    /// startup, maps each record to a `daemon_telemetry::feedback::FeedbackEvent`, ships it to the
+    /// configured `telemetry.feedback_endpoint` (reusing a `FeedbackExporter` for `"opted-in"`
+    /// records, `emit_one_shot` for `"explicit-one-shot"`), then calls
+    /// [`Self::feedback_mark_delivered`] on success — leaving a record queued on failure or when
+    /// export is inert (no endpoint / the `otel` feature off). Default: none (a store without the
     /// outbox).
     async fn feedback_pending(&self, _limit: usize) -> Vec<FeedbackRecord> {
         Vec::new()

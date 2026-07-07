@@ -87,7 +87,18 @@ impl NodeApiImpl {
             auth_audit: None,
             revocations: None,
             credential_revoker: None,
+            feedback_drain: None,
         }
+    }
+
+    /// Wire the user-feedback outbox drain (N1 → N2): records enqueued by `FeedbackSubmit` are
+    /// mapped to [`daemon_telemetry::feedback::FeedbackEvent`]s and shipped to `endpoint` (the
+    /// `telemetry.feedback_endpoint` product config). A `None` endpoint — or a build without the
+    /// `otel` feature — leaves the drain inert (records stay queued, no error spam), so calling this
+    /// unconditionally with the config value is safe. Call during assembly.
+    pub fn with_feedback_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.feedback_drain = feedback::drain_for_endpoint(endpoint);
+        self
     }
 
     /// Bind the identity store backing the admin access-control sub-surface
