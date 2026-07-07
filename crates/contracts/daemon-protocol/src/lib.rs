@@ -123,6 +123,176 @@ pub enum EngineSelector {
     },
 }
 
+/// Which model provider implementation a profile binds to. Mirrors the host's internal
+/// `ProviderKind`, kept as a contract enum so the wire surface does not depend on the binary's
+/// config crate.
+///
+/// Lives in `daemon-protocol` (alongside [`EngineSelector`] / [`ForeignBackend`]) so the inline
+/// sub-agent spec that rides the opaque delegation payload ([`InlineProfileSpec`]) can carry the
+/// foreign backend without a contract-crate cycle; `daemon-api` re-exports it next to `ProfileSpec`,
+/// which is its primary carrier.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSelector {
+    /// The deterministic in-tree provider (no network/keys).
+    #[default]
+    Mock,
+    /// Any networked provider served by `genai` — the adapter (OpenAI, Anthropic, Gemini, Groq,
+    /// DeepSeek, xAI, OpenRouter, Cohere, …) is inferred from the (optionally namespaced) model
+    /// name; there is no daemon-side provider registry. Legacy provider names persisted before this
+    /// collapse (`openai`, `anthropic`, and the short-lived per-family variants) deserialize here
+    /// via serde aliases.
+    #[serde(
+        rename = "genai",
+        alias = "openai",
+        alias = "anthropic",
+        alias = "gemini",
+        alias = "groq",
+        alias = "deep_seek",
+        alias = "xai",
+        alias = "open_router",
+        alias = "cohere"
+    )]
+    GenAi,
+    /// The daemon-api OpenRouter-clone gateway (OpenAI-compatible). The host binds genai's OpenAI
+    /// adapter pinned at `https://api.daemon.ai/api/v1/` (override via the profile `base_url` /
+    /// `DAEMON_BASE_URL`); model ids are OpenRouter-style `author/slug` (e.g.
+    /// `anthropic/claude-sonnet-4-5`) and the bearer is a daemon-api key. It is networked (not
+    /// local), and never resolves the Anthropic-native adapter for `claude-*` ids.
+    DaemonApi,
+    /// A local llama.cpp model via the supervised `daemon-infer` worker (on-disk GGUF, listed from
+    /// the `ModelManager` catalog).
+    LlamaCpp,
+    /// A local mistral.rs model via the supervised `daemon-infer` worker (on-disk, listed from the
+    /// `ModelManager` catalog).
+    MistralRs,
+}
+
+impl ProviderSelector {
+    /// Whether this selector is a local-inference engine (llama.cpp / mistral.rs).
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            ProviderSelector::LlamaCpp | ProviderSelector::MistralRs
+        )
+    }
+}
+
+/// How a `Foreign`-engine profile sources its model backend (wire v30). [`EngineSelector::Foreign`]
+/// picks the *agent* (by catalog name); this picks *where that agent's turns get their tokens*:
+///
+/// - [`ForeignBackend::AgentNative`] — the agent runs on its own backend; the node only steers its
+///   model choice via ACP `set_config_option` (no provider knob, no keys). The default, so a bare
+///   `Foreign { agent }` profile keeps today's "the agent uses whatever backend it ships with"
+///   behavior.
+/// - [`ForeignBackend::NodeProvider`] — the agent's OpenAI-wire backend is repointed at the node's
+///   gateway (a per-session loopback token), so its turns run on a node [`ProviderSelector`] +
+///   model with the real credential resolved node-side. Keys never reach the agent.
+///
+/// Foreign model selection lives HERE, not on the top-level `ProfileSpec::model` (which stays
+/// Core-only): a foreign profile names an agent + a backend, never a native provider/model.
+///
+/// Lives in `daemon-protocol` (relocated with [`ProviderSelector`]) so [`InlineProfileSpec`] can
+/// carry it without a contract-crate cycle; `daemon-api` re-exports it next to `ProfileSpec`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignBackend {
+    /// The agent's own backend; the node steers only the model (via ACP), if one is named. `None`
+    /// leaves the agent on whatever model it defaults to.
+    AgentNative {
+        /// The model id to steer the agent to (best-effort, via ACP), or `None` for the agent
+        /// default.
+        model: Option<String>,
+    },
+    /// The agent is routed through the node gateway to a node [`ProviderSelector`] + model; the
+    /// credential stays node-side (resolved from `credential_ref`, else the profile's credential).
+    NodeProvider {
+        /// The node provider the gateway routes this agent's turns to.
+        provider: ProviderSelector,
+        /// The model id the gateway routes to (required — a routed backend must name a model).
+        model: String,
+        /// The stored credential the gateway acquires the provider bearer from (`None` = the
+        /// profile's own credential). A name, never the secret.
+        credential_ref: Option<String>,
+    },
+}
+
+impl Default for ForeignBackend {
+    fn default() -> Self {
+        // Today's behavior: a foreign profile runs the agent's own backend, model unsteered.
+        ForeignBackend::AgentNative { model: None }
+    }
+}
+
+/// An ad-hoc, un-saved agent configuration carried inline by an [`orchestrate spawn`] delegation
+/// (wire: the opaque `DelegationInput` payload, not the CDDL `ApiRequest`/`ApiResponse` graph). It
+/// is the [`ChildSource::Inline`] alternative to naming a registered profile: a parent hands a
+/// transient child its persona/toolset/engine directly, and the node materializes an ephemeral
+/// sub-agent from it with `bound_profile = None`.
+///
+/// It mirrors the security-relevant subset of a `ProfileSpec` (persona + tool allowlist + engine +
+/// foreign backend + model); every other profile knob falls back to the node default at
+/// materialization. `tool_allowlist` = `None` means the full node toolset — a security-widening the
+/// orchestrate tool rejects for a non-operator (see [`InlineProfileSpec::widens_security_posture`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineProfileSpec {
+    /// The persona / system prompt the inline sub-agent runs under (empty = the node default).
+    #[serde(default)]
+    pub system_prompt: String,
+    /// The tools the sub-agent may use. `None` = the full node toolset (a widening, operator-only);
+    /// `Some(list)` = only those tool names (a least-privilege allowlist).
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
+    /// Which execution engine the sub-agent runs on: the native `Core` engine (default) or a
+    /// `Foreign { agent }` catalog agent — the same field a saved `ProfileSpec` carries.
+    #[serde(default)]
+    pub engine: EngineSelector,
+    /// For a `Foreign` engine: how that agent sources its model backend (its own, model-steered via
+    /// ACP; or routed through the node gateway). Ignored for `Core`. Defaults to
+    /// `AgentNative { model: None }`.
+    #[serde(default)]
+    pub foreign_backend: ForeignBackend,
+    /// The model id the sub-agent's engine resolves (Core: the provider model id; empty = the node
+    /// default). Foreign model selection lives on `foreign_backend`, not here.
+    #[serde(default)]
+    pub model: String,
+}
+
+impl InlineProfileSpec {
+    /// Whether this inline spec *widens* the security posture — the [`SessionOverlay`-analogue
+    /// widening](../daemon_api/profile/struct.SessionOverlay.html#method.widens_security_posture)
+    /// that requires an operator-tier capability to grant. For an inline sub-agent that is a request
+    /// for the **full node toolset** (`tool_allowlist == None`); an explicit allowlist is a
+    /// restriction, never a widening. In-turn agents have no principal (never operators), so the
+    /// orchestrate tool rejects a widening inline spec outright.
+    pub fn widens_security_posture(&self) -> bool {
+        self.tool_allowlist.is_none()
+    }
+}
+
+/// Where a delegated child's engine comes from ([`DelegationInput::source`]): a **registered
+/// profile** (by name), an **inline** ad-hoc spec, or the node's **default** engine shape. A tagged
+/// union so "profile ref vs inline spec" is exactly-one-of by construction (no parallel optionals),
+/// and future backends stay non-breaking. Rides the opaque delegation payload; the fleet job worker
+/// materializes the child from the selected arm.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSource {
+    /// The node's default engine shape (the orchestrator profile). The historical "no profile"
+    /// behavior; a pre-`ChildSource` payload (which carried `profile: null`) decodes here.
+    #[default]
+    Default,
+    /// A registered profile the child's engine resolves from, by name. The node-side worker binds it
+    /// as the child's `bound_profile`; an unknown name falls back to the default shape at resolve time.
+    Profile(String),
+    /// An ad-hoc, un-saved [`InlineProfileSpec`]: the child is materialized as an ephemeral sub-agent
+    /// from the inline persona/toolset/engine, with `bound_profile = None`.
+    Inline(InlineProfileSpec),
+}
+
 /// The lifetime a parent declares for a delegated child — the protocol-level mirror of the store's
 /// `ChildLifetime`, carried inside the opaque delegation payload so the contract crates stay
 /// decoupled (`daemon-protocol` depends only on `daemon-common`; the store enum lives in
@@ -156,11 +326,12 @@ pub struct DelegationInput {
     /// payloads decoding as `Persistent`.
     #[serde(default)]
     pub lifetime: DelegationLifetime,
-    /// The named profile the child's engine resolves from (`None` = the node's default engine
-    /// shape). The node-side worker binds it as the child's `bound_profile`; an unknown name falls
-    /// back to the default shape at resolve time.
+    /// Where the child's engine comes from: a registered profile (by name), an inline ad-hoc spec,
+    /// or the node's default engine shape. Replaces the pre-`ChildSource` `profile: Option<String>`
+    /// (a bare name -> [`ChildSource::Profile`]; `None` -> [`ChildSource::Default`]). `serde(default)`
+    /// keeps a pre-upgrade payload (with a stray `profile` key and no `source`) decoding as `Default`.
     #[serde(default)]
-    pub profile: Option<String>,
+    pub source: ChildSource,
     /// Whether this is a **detached** (non-suspending) delegation — the orchestrate `spawn wait:false`
     /// mode. `false` (the default) is the ordinary joining delegation: the parent suspends and the
     /// child's terminal completion wakes it. `true` runs the child in the background: the parent's
@@ -173,13 +344,13 @@ pub struct DelegationInput {
 }
 
 impl DelegationInput {
-    /// A bare delegation with no attachments (default lifetime + profile).
+    /// A bare delegation with no attachments (default lifetime + default engine source).
     pub fn task(task: impl Into<String>) -> Self {
         Self {
             task: task.into(),
             attachments: Vec::new(),
             lifetime: DelegationLifetime::default(),
-            profile: None,
+            source: ChildSource::default(),
             detached: false,
         }
     }
@@ -198,7 +369,7 @@ impl DelegationInput {
             task: String::from_utf8_lossy(bytes).into_owned(),
             attachments: Vec::new(),
             lifetime: DelegationLifetime::default(),
-            profile: None,
+            source: ChildSource::default(),
             detached: false,
         })
     }
@@ -1691,16 +1862,29 @@ mod tests {
 
     #[test]
     fn delegation_payloads_round_trip_and_fall_back() {
-        // Structured round-trip, including the v2 lifetime + profile fields.
+        // Structured round-trip, including the v2 lifetime + the ChildSource engine source.
         let input = DelegationInput {
             task: "do the thing".into(),
             attachments: vec!["src/a.rs".into(), "notes.md".into()],
             lifetime: DelegationLifetime::Ephemeral,
-            profile: Some("opus".into()),
+            source: ChildSource::Profile("opus".into()),
             detached: true,
         };
         assert_eq!(DelegationInput::decode(&input.encode()), input);
         assert!(DelegationInput::decode(&input.encode()).detached);
+
+        // An inline source round-trips too (the ad-hoc sub-agent spec).
+        let inline = DelegationInput {
+            task: "inline work".into(),
+            source: ChildSource::Inline(InlineProfileSpec {
+                system_prompt: "be terse".into(),
+                tool_allowlist: Some(vec!["fs".into()]),
+                model: "mock-model".into(),
+                ..InlineProfileSpec::default()
+            }),
+            ..DelegationInput::task("inline work")
+        };
+        assert_eq!(DelegationInput::decode(&inline.encode()), inline);
 
         let hash = daemon_common::ContentHash::new([3u8; 32]);
         let result = DelegationResult {
@@ -1714,7 +1898,7 @@ mod tests {
         assert_eq!(legacy_in.task, "delegated-work");
         assert!(legacy_in.attachments.is_empty());
         assert_eq!(legacy_in.lifetime, DelegationLifetime::Persistent);
-        assert!(legacy_in.profile.is_none());
+        assert_eq!(legacy_in.source, ChildSource::Default);
         assert!(!legacy_in.detached, "legacy payloads decode as joining");
 
         let legacy_out = DelegationResult::decode(b"child:parent/c1");
@@ -1744,8 +1928,56 @@ mod tests {
         assert_eq!(decoded.task, "old job");
         assert_eq!(decoded.attachments, vec!["a.txt".to_string()]);
         assert_eq!(decoded.lifetime, DelegationLifetime::Persistent);
-        assert!(decoded.profile.is_none());
+        assert_eq!(decoded.source, ChildSource::Default);
         assert!(!decoded.detached, "pre-upgrade payloads default to joining");
+    }
+
+    #[test]
+    fn pre_child_source_payload_decodes_as_default_source() {
+        // A payload encoded by the pre-`ChildSource` shape (a `profile: Option<String>` key, no
+        // `source`) must still decode: the stray `profile` key is ignored and `source` defaults to
+        // `Default` (a sane fallback within this stacked branch — jobs enqueued before the upgrade
+        // resolve to the node's default engine shape rather than failing).
+        #[derive(Serialize)]
+        struct PreChildSource {
+            task: String,
+            attachments: Vec<String>,
+            lifetime: DelegationLifetime,
+            profile: Option<String>,
+            detached: bool,
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &PreChildSource {
+                task: "pre-source job".into(),
+                attachments: Vec::new(),
+                lifetime: DelegationLifetime::Ephemeral,
+                profile: Some("opus".into()),
+                detached: false,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = DelegationInput::decode(&buf);
+        assert_eq!(decoded.task, "pre-source job");
+        assert_eq!(decoded.lifetime, DelegationLifetime::Ephemeral);
+        assert_eq!(decoded.source, ChildSource::Default);
+    }
+
+    #[test]
+    fn inline_spec_widening_classification() {
+        // Full node toolset (no allowlist) is a widening; an explicit allowlist is a restriction.
+        assert!(InlineProfileSpec::default().widens_security_posture());
+        assert!(InlineProfileSpec {
+            tool_allowlist: None,
+            ..InlineProfileSpec::default()
+        }
+        .widens_security_posture());
+        assert!(!InlineProfileSpec {
+            tool_allowlist: Some(vec!["fs".into()]),
+            ..InlineProfileSpec::default()
+        }
+        .widens_security_posture());
     }
 
     #[test]

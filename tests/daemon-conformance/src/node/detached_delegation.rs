@@ -171,7 +171,7 @@ async fn enqueue_detached(
         task: task.into(),
         attachments: Vec::new(),
         lifetime: daemon_protocol::DelegationLifetime::Persistent,
-        profile: None,
+        source: daemon_protocol::ChildSource::Default,
         detached: true,
     }
     .encode();

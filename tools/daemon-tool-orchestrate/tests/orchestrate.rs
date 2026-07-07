@@ -17,8 +17,8 @@ use daemon_core::exec::LocalEnvironment;
 use daemon_core::{Effect, Tool, ToolCall, ToolConcurrency, ToolOutcome, TurnCx};
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_protocol::{
-    DelegationInput, DelegationLifetime, HostRequest, HostRequestHandler, HostRequestKind,
-    HostResponse, HostResponseBody, UserMsg,
+    ChildSource, DelegationInput, DelegationLifetime, HostRequest, HostRequestHandler,
+    HostRequestKind, HostResponse, HostResponseBody, InlineProfileSpec, UserMsg,
 };
 use daemon_store::{InMemoryStore, SessionMeta, SessionRole, SessionStore};
 use daemon_supervision::{DelegationSpec, ManagedUnit};
@@ -104,13 +104,13 @@ fn delegation_payload(out: &ToolOutcome) -> DelegationInput {
 }
 
 #[tokio::test]
-async fn spawn_plumbs_task_lifetime_and_profile_into_the_payload() {
+async fn spawn_plumbs_task_lifetime_and_source_into_the_payload() {
     let store = Arc::new(InMemoryStore::new());
     let tool = OrchestrateTool::new(fleet(store));
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"spawn","task":"summarize the repo","lifetime":"ephemeral","profile":"opus","attachments":["notes.md"]}"#,
+        r#"{"verb":"spawn","task":"summarize the repo","lifetime":"ephemeral","source":{"profile":"opus"},"attachments":["notes.md"]}"#,
     )
     .await;
     assert!(out.result.ok);
@@ -118,7 +118,7 @@ async fn spawn_plumbs_task_lifetime_and_profile_into_the_payload() {
     let input = delegation_payload(&out);
     assert_eq!(input.task, "summarize the repo");
     assert_eq!(input.lifetime, DelegationLifetime::Ephemeral);
-    assert_eq!(input.profile.as_deref(), Some("opus"));
+    assert_eq!(input.source, ChildSource::Profile("opus".into()));
     assert_eq!(input.attachments, vec!["notes.md".to_string()]);
 
     // The joining spawn carries a `delegation-spawn` detail whose body names the durable `job`
@@ -135,9 +135,9 @@ async fn spawn_plumbs_task_lifetime_and_profile_into_the_payload() {
 }
 
 #[tokio::test]
-async fn spawn_defaults_lifetime_profile_and_joining_wait() {
-    // A spawn with only the required `task` defaults to persistent lifetime, no profile, and a
-    // joining (wait:true) delegation.
+async fn spawn_defaults_lifetime_source_and_joining_wait() {
+    // A spawn with only the required `task` defaults to persistent lifetime, the default engine
+    // source, and a joining (wait:true) delegation.
     let store = Arc::new(InMemoryStore::new());
     let tool = OrchestrateTool::new(fleet(store));
     let out = run_as(&tool, "parent", r#"{"verb":"spawn","task":"do the work"}"#).await;
@@ -150,8 +150,55 @@ async fn spawn_defaults_lifetime_profile_and_joining_wait() {
     let input = delegation_payload(&out);
     assert_eq!(input.task, "do the work");
     assert_eq!(input.lifetime, DelegationLifetime::Persistent);
-    assert!(input.profile.is_none());
+    assert_eq!(input.source, ChildSource::Default);
     assert!(!input.detached, "the default payload is joining");
+}
+
+#[tokio::test]
+async fn spawn_carries_an_inline_source_and_rejects_posture_widening() {
+    let store = Arc::new(InMemoryStore::new());
+    let tool = OrchestrateTool::new(fleet(store));
+    // An inline sub-agent with an explicit (restricting) tool_allowlist is accepted and its spec
+    // rides the delegation payload verbatim.
+    let out = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","task":"inline work","source":{"inline":{"system_prompt":"be terse","tool_allowlist":["fs"],"model":"mock-model"}}}"#,
+    )
+    .await;
+    assert!(out.result.ok, "{}", out.result.content);
+    let input = delegation_payload(&out);
+    assert_eq!(
+        input.source,
+        ChildSource::Inline(InlineProfileSpec {
+            system_prompt: "be terse".into(),
+            tool_allowlist: Some(vec!["fs".into()]),
+            model: "mock-model".into(),
+            ..InlineProfileSpec::default()
+        })
+    );
+
+    // An inline spec with NO tool_allowlist requests the full node toolset — a security-widening
+    // that is operator-only, so the in-turn agent's spawn is rejected.
+    let denied = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","task":"inline work","source":{"inline":{"system_prompt":"anything"}}}"#,
+    )
+    .await;
+    assert!(
+        !denied.result.ok,
+        "a posture-widening inline spec is denied"
+    );
+    assert!(
+        denied.result.content.contains("operator-only"),
+        "the decline explains the operator gate: {}",
+        denied.result.content
+    );
+    assert!(
+        denied.effects.is_empty(),
+        "a denied spawn delegates nothing"
+    );
 }
 
 #[tokio::test]
@@ -420,7 +467,7 @@ async fn detached_spawn_enqueues_a_bare_job_and_notice_edge_without_an_effect() 
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"spawn","wait":false,"task":"bg work","lifetime":"ephemeral","profile":"opus"}"#,
+        r#"{"verb":"spawn","wait":false,"task":"bg work","lifetime":"ephemeral","source":{"profile":"opus"}}"#,
     )
     .await;
     assert!(out.result.ok, "{}", out.result.content);
@@ -451,7 +498,7 @@ async fn detached_spawn_enqueues_a_bare_job_and_notice_edge_without_an_effect() 
     assert_eq!(input.task, "bg work");
     assert!(input.detached, "the payload carries detached=true");
     assert_eq!(input.lifetime, DelegationLifetime::Ephemeral);
-    assert_eq!(input.profile.as_deref(), Some("opus"));
+    assert_eq!(input.source, ChildSource::Profile("opus".into()));
 
     // The completion-notice edge makes the child tree-visible under the parent (not a delegation).
     assert!(

@@ -130,6 +130,13 @@ pub struct SessionMeta {
     /// non-terminal sessions and legacy rows (which are therefore never reaped — forward-looking).
     #[serde(default)]
     pub terminal_ms: Option<u64>,
+    /// The ad-hoc inline engine spec an [`orchestrate spawn { source: Inline }`] child was
+    /// materialized from (Phase 1): the opaque CBOR of the host's `ProfileSpec` (the store stays
+    /// protocol-free, mirroring `overlay`). The resolver decodes it at hydrate to build the
+    /// sub-agent's engine when `bound_profile` is `None`. Empty for every non-inline session
+    /// (bound-profile / default) and legacy rows.
+    #[serde(default)]
+    pub inline_profile: Vec<u8>,
 }
 
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
@@ -2598,6 +2605,7 @@ mod session_meta_tests {
             activation_epoch: 3,
             owner: Some("user-alice".into()),
             terminal_ms: Some(1_700_000_000_500),
+            inline_profile: vec![0xAA, 0xBB, 0xCC],
         }
     }
 

@@ -373,6 +373,12 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  addr    TEXT\n\
              );",
         ),
+        // M11 (Phase 1 — inline sub-agents): the opaque CBOR of the host `ProfileSpec` an
+        // `orchestrate spawn { source: Inline }` child was materialized from. The resolver decodes
+        // it at hydrate to build the sub-agent's engine when `bound_profile` is NULL (mirroring how
+        // `overlay` is treated — protocol-free bytes). NULL on legacy rows and every non-inline
+        // (bound-profile / default) session.
+        M::up("ALTER TABLE session_meta ADD COLUMN inline_profile BLOB;"),
     ])
 });
 
@@ -1429,11 +1435,11 @@ impl SessionStore for SqliteStore {
         let last_activity = meta.last_activity_ms.map(|v| v as i64);
         let scheduled_job = meta.scheduled_job.as_ref().map(|j| j.as_str());
         conn.execute(
-            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms, inline_profile) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
              last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10, \
-             activation_epoch = ?11, owner = ?12, terminal_ms = ?13",
+             activation_epoch = ?11, owner = ?12, terminal_ms = ?13, inline_profile = ?14",
             params![
                 id.as_str(),
                 bound,
@@ -1448,6 +1454,7 @@ impl SessionStore for SqliteStore {
                 meta.activation_epoch as i64,
                 meta.owner,
                 meta.terminal_ms.map(|v| v as i64),
+                meta.inline_profile,
             ],
         )
         .map_err(sql_err)?;
@@ -1457,7 +1464,7 @@ impl SessionStore for SqliteStore {
     async fn session_meta(&self, id: &SessionId) -> Option<SessionMeta> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms \
+            "SELECT bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms, inline_profile \
              FROM session_meta WHERE session_id = ?1",
             params![id.as_str()],
             |row| {
@@ -1473,6 +1480,8 @@ impl SessionStore for SqliteStore {
                 let activation_epoch: i64 = row.get(9)?;
                 let owner: Option<String> = row.get(10)?;
                 let terminal_ms: Option<i64> = row.get(11)?;
+                // NULL on legacy/non-inline rows (and the terminal-clock upsert path) -> empty bytes.
+                let inline_profile: Option<Vec<u8>> = row.get(12)?;
                 Ok(SessionMeta {
                     bound_profile: bound.map(ProfileRef::new),
                     overlay,
@@ -1486,6 +1495,7 @@ impl SessionStore for SqliteStore {
                     activation_epoch: activation_epoch as u64,
                     owner,
                     terminal_ms: terminal_ms.map(|v| v as u64),
+                    inline_profile: inline_profile.unwrap_or_default(),
                 })
             },
         )
@@ -1498,7 +1508,7 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT session_id, bound_profile, overlay, title, last_activity_ms, role, parent, \
-             pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms FROM session_meta",
+             pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms, inline_profile FROM session_meta",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -1523,6 +1533,7 @@ impl SessionStore for SqliteStore {
                     activation_epoch: row.get::<_, i64>(10)? as u64,
                     owner: row.get::<_, Option<String>>(11)?,
                     terminal_ms: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+                    inline_profile: row.get::<_, Option<Vec<u8>>>(13)?.unwrap_or_default(),
                 },
             ))
         });
@@ -2309,11 +2320,12 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (10: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// `user_version` (11: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
     /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, the
-    /// wire-v30 `tool_overrides` table, the wire-v32 feedback outbox + telemetry-consent seam, and
-    /// the gateway runtime-override `gateway_config` single-row setting).
+    /// wire-v30 `tool_overrides` table, the wire-v32 feedback outbox + telemetry-consent seam, the
+    /// gateway runtime-override `gateway_config` single-row setting, and the Phase 1 inline
+    /// sub-agent `session_meta.inline_profile` column).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2324,7 +2336,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 11, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

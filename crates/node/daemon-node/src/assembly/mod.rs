@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemon_activation::EngineFactory;
-use daemon_api::{SessionOverlay, TreeEvent};
+use daemon_api::{from_cbor, EngineSelector, ProfileSpec, SessionOverlay, TreeEvent};
 use daemon_common::{ProfileRef, SessionId};
 use daemon_core::{ApprovalPolicy, Config, EngineProfile, StablePromptSource, SystemPrompt, Tool};
 use daemon_host::{
@@ -217,7 +217,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     );
     // One durable job worker for the whole node: every delegation (top or nested) materializes a
     // parent-bound durable child session seeded from the same orchestrator profile (moved in here).
-    let job_worker = build_job_worker(&a, orchestrator_profile, &shared);
+    let job_worker = build_job_worker(&a, orchestrator_profile, &session_ctx, &shared);
     // The resident cron scheduler (`cron.cron_worker`, built above) drives the 5th supervised service.
     let host = Host::new(a.store.clone(), factory, a.host_config)
         .with_job_worker(Arc::new(job_worker))
@@ -554,16 +554,30 @@ fn build_factory(
     if let Some((store, ctx)) = session_ctx {
         let store = store.clone();
         let ctx = ctx.clone();
-        // Re-resolve a durable session from its bound profile + overlay; no recorded binding (e.g. a
-        // delegated orchestrator child) yields `None`, so the factory keeps its orchestrator profile.
-        // `resolve_effective` stays Core-only: a `Foreign{agent}` binding is routed to the
-        // dispatching factory's foreign incarnation, so the resolver only ever sees Core specs.
-        let resolver: DurableProfileResolver =
-            Arc::new(move |bound: Option<ProfileRef>, overlay: &SessionOverlay| {
+        // Re-resolve a durable session's engine at hydrate. Precedence:
+        //   1. an INLINE sub-agent spec (Phase 1): the opaque `ProfileSpec` persisted in
+        //      `SessionMeta.inline_profile` (bound_profile is `None` for an inline child). A Core
+        //      inline spec resolves here; a Foreign inline spec is routed to the dispatching
+        //      factory's foreign incarnation, so this returns `None` (the foreign path).
+        //   2. a bound profile name -> the profile store.
+        //   3. neither (e.g. a delegated orchestrator child) -> `None`, so the factory keeps its
+        //      orchestrator profile.
+        // `resolve_effective` stays Core-only: a `Foreign{agent}` binding/inline is routed to the
+        // foreign incarnation, so the resolver only ever builds Core specs.
+        let resolver: DurableProfileResolver = Arc::new(
+            move |bound: Option<ProfileRef>, inline: &[u8], overlay: &SessionOverlay| {
+                if !inline.is_empty() {
+                    let spec = from_cbor::<ProfileSpec>(inline).ok()?;
+                    return match spec.engine {
+                        EngineSelector::Core => Some(ctx.resolve_effective(&spec, overlay)),
+                        EngineSelector::Foreign { .. } => None,
+                    };
+                }
                 let bound = bound?;
                 let spec = store.get(bound.as_str()).ok().flatten()?;
                 Some(ctx.resolve_effective(&spec, overlay))
-            });
+            },
+        );
         factory = factory.with_session_resolver(resolver);
     }
     // Give durable incarnations the content store + workspace roots so a completed child captures
@@ -592,6 +606,7 @@ fn build_factory(
 fn build_job_worker(
     a: &NodeAssembly,
     orchestrator_profile: EngineProfile,
+    session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     shared: &Shared,
 ) -> FleetJobWorker {
     let mut job_worker = FleetJobWorker::new(a.store.clone(), a.partition, orchestrator_profile)
@@ -605,6 +620,11 @@ fn build_job_worker(
     // seeded for the durable foreign path (empty snapshot + task on the input seam).
     if let Some(profiles) = a.profiles.clone() {
         job_worker = job_worker.with_profiles(profiles);
+    }
+    // Give the worker the per-session resolution ctx so a Core INLINE sub-agent (Phase 1) seeds its
+    // first snapshot from `resolve_effective(inline_spec)` (persona/toolset reflected from the start).
+    if let Some((_, ctx)) = session_ctx {
+        job_worker = job_worker.with_session_ctx(ctx.clone());
     }
     job_worker
 }

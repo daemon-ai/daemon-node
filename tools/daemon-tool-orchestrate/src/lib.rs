@@ -29,8 +29,8 @@ use daemon_common::{JobId, ReqId, SessionId, UnitId};
 use daemon_core::{Effect, Tool, ToolCall, ToolConcurrency, ToolOutcome, ToolResult, TurnCx};
 use daemon_orchestration::FleetRuntime;
 use daemon_protocol::{
-    DelegationInput, DelegationLifetime, HostRequest, HostRequestKind, HostResponseBody,
-    ToolDetail, UserMsg,
+    ChildSource, DelegationInput, DelegationLifetime, HostRequest, HostRequestKind,
+    HostResponseBody, ToolDetail, UserMsg,
 };
 use daemon_store::{ChildLifetime, SessionStatus};
 use serde::Deserialize;
@@ -58,20 +58,20 @@ fn map_lifetime(lifetime: DelegationLifetime) -> ChildLifetime {
 /// Build the CBOR [`DelegationInput`] payload both spawn paths hand the node-side worker: the
 /// joining path carries it on `Effect::Delegate`, the detached path stamps it onto the bare
 /// [`JobCommand`](daemon_store::JobCommand). `detached` is the only field that differs between the
-/// two paths, so the caller passes it; everything else (task, attachments, lifetime, profile) is
-/// identical — this is the single payload-construction seam.
+/// two paths, so the caller passes it; everything else (task, attachments, lifetime, engine source)
+/// is identical — this is the single payload-construction seam.
 fn delegation_payload(
     task: String,
     attachments: Vec<String>,
     lifetime: DelegationLifetime,
-    profile: Option<String>,
+    source: ChildSource,
     detached: bool,
 ) -> Vec<u8> {
     DelegationInput {
         task,
         attachments,
         lifetime,
-        profile,
+        source,
         detached,
     }
     .encode()
@@ -118,9 +118,11 @@ enum Verb {
         /// The declared child lifetime (managed vs transient subagent); defaults to `persistent`.
         #[serde(default)]
         lifetime: Lifetime,
-        /// The named profile the child's engine resolves from (`None` = the default engine shape).
+        /// Where the child's engine comes from: omit for the node's default engine shape,
+        /// `{"profile":"name"}` to delegate to a registered profile, or `{"inline":{…}}` for an
+        /// ad-hoc sub-agent (Phase 1). Defaults to [`ChildSource::Default`].
         #[serde(default)]
-        profile: Option<String>,
+        source: ChildSource,
         /// Parent-workspace-relative paths to hand down into the child's `inbox/`.
         #[serde(default)]
         attachments: Vec<String>,
@@ -371,7 +373,7 @@ impl Tool for OrchestrateTool {
     }
 
     fn schema(&self) -> &str {
-        r#"{"type":"object","required":["verb"],"properties":{"verb":{"type":"string","enum":["spawn","send","status","cancel"],"description":"spawn a child, send a follow-up message to one, report per-child status, or cancel one"},"task":{"type":"string","description":"spawn: the instruction seeding the child's first turn (required for spawn)"},"message":{"type":"string","description":"send: the message text to deliver into the child (required for send)"},"lifetime":{"type":"string","enum":["persistent","ephemeral"],"description":"spawn: persistent = long-lived managed child (default); ephemeral = transient subagent, archived after it completes"},"profile":{"type":"string","description":"spawn: named profile the child runs under (omit for the default engine shape)"},"attachments":{"type":"array","items":{"type":"string"},"description":"spawn: parent-workspace-relative paths handed to the child's inbox/"},"wait":{"type":"boolean","description":"spawn: true (default) blocks this turn until the child finishes and returns its result inline; false runs the child in the background and delivers a completion notification later, letting this turn continue and fan out more subagents"},"target":{"type":"string","description":"send/cancel: the child id (required). status: optional filter to one child."}}}"#
+        r#"{"type":"object","required":["verb"],"properties":{"verb":{"type":"string","enum":["spawn","send","status","cancel"],"description":"spawn a child, send a follow-up message to one, report per-child status, or cancel one"},"task":{"type":"string","description":"spawn: the instruction seeding the child's first turn (required for spawn)"},"message":{"type":"string","description":"send: the message text to deliver into the child (required for send)"},"lifetime":{"type":"string","enum":["persistent","ephemeral"],"description":"spawn: persistent = long-lived managed child (default); ephemeral = transient subagent, archived after it completes"},"source":{"description":"spawn: where the child's engine comes from — omit for the node's default engine shape; {\"profile\":\"name\"} to delegate to a registered profile; or {\"inline\":{...}} for an ad-hoc sub-agent","oneOf":[{"type":"object","required":["profile"],"additionalProperties":false,"properties":{"profile":{"type":"string","description":"the registered profile name the child runs under"}}},{"type":"object","required":["inline"],"additionalProperties":false,"properties":{"inline":{"type":"object","additionalProperties":false,"description":"an ad-hoc, un-saved sub-agent config (no saved profile)","properties":{"system_prompt":{"type":"string","description":"the sub-agent's persona"},"tool_allowlist":{"type":"array","items":{"type":"string"},"description":"the tools the sub-agent may use (an explicit allowlist is required; omitting it requests the full toolset, which is operator-only and rejected)"},"model":{"type":"string","description":"the model id the sub-agent resolves (Core)"},"engine":{"description":"\"Core\" (default) or {\"Foreign\":{\"agent\":\"name\"}}"},"foreign_backend":{"description":"for a Foreign engine: how it sources its model backend"}}}}}]},"attachments":{"type":"array","items":{"type":"string"},"description":"spawn: parent-workspace-relative paths handed to the child's inbox/"},"wait":{"type":"boolean","description":"spawn: true (default) blocks this turn until the child finishes and returns its result inline; false runs the child in the background and delivers a completion notification later, letting this turn continue and fan out more subagents"},"target":{"type":"string","description":"send/cancel: the child id (required). status: optional filter to one child."}}}"#
     }
 
     /// Per-call batch-concurrency class: `status` is a read-only projection and may run alongside
@@ -406,10 +408,25 @@ impl Tool for OrchestrateTool {
             Verb::Spawn {
                 task,
                 lifetime,
-                profile,
+                source,
                 attachments,
                 wait,
             } => {
+                // Security gate (Cluster E): an INLINE sub-agent spec that widens the security
+                // posture (requests the full node toolset) is operator-tier. An in-turn agent has no
+                // principal (never an operator), so the tool rejects a widening inline spec outright
+                // — an inline sub-agent must run under an explicit least-privilege tool allowlist.
+                if let ChildSource::Inline(spec) = &source {
+                    if spec.widens_security_posture() {
+                        return Self::err(
+                            call,
+                            "inline sub-agent denied: an inline spec may not request the full node \
+                             toolset (set an explicit tool_allowlist); widening the tool surface is \
+                             operator-only"
+                                .into(),
+                        );
+                    }
+                }
                 let lifetime = DelegationLifetime::from(lifetime);
                 if wait {
                     // DOWN edge (joining): record the delegation through the host port; the fleet
@@ -429,9 +446,9 @@ impl Tool for OrchestrateTool {
                         _ => JobId::new(format!("{}:unresolved", cx.session_id)),
                     };
                     // The node-side worker seeds the child from `task`, materializes `attachments`
-                    // into its inbox/, derives its role from `lifetime`, and binds `profile` for the
-                    // durable resolver.
-                    let payload = delegation_payload(task, attachments, lifetime, profile, false);
+                    // into its inbox/, derives its role from `lifetime`, and resolves the engine from
+                    // `source` (bound profile / inline spec / default) for the durable resolver.
+                    let payload = delegation_payload(task, attachments, lifetime, source, false);
                     // A structured `delegation-spawn` detail (opaque kind+body, no wire bump) a rich
                     // client renders as a spawn card. The joining child's session id is minted
                     // node-side (`{parent}/c{epoch}`) only when the durable Delegate job is
@@ -471,7 +488,7 @@ impl Tool for OrchestrateTool {
                     if active >= self.max_fanout {
                         return Self::guardrail(call, GuardrailKind::Fanout, self.max_fanout);
                     }
-                    let payload = delegation_payload(task, attachments, lifetime, profile, true);
+                    let payload = delegation_payload(task, attachments, lifetime, source, true);
                     // The store mints the unique `{parent}/dN` child id, stamps it onto the bare job,
                     // and enqueues it (no checkpoint/suspension). Then record the completion-notice
                     // edge so the child's terminal `mark_completed` delivers a notice to this parent

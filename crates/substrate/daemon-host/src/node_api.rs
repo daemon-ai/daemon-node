@@ -226,8 +226,15 @@ pub enum SessionBackend {
 /// is configured or the bound profile is absent, so the durable path falls back to the factory's
 /// default (orchestrator) profile. This is the seam that makes durable rehydration re-resolve from
 /// the profile store + overlay instead of pinning the factory's fixed profile.
+/// The `inline` argument carries the opaque CBOR of an inline sub-agent's host `ProfileSpec` (Phase
+/// 1), read from `SessionMeta.inline_profile`; empty for every non-inline session. When non-empty
+/// and the decoded engine is `Core`, the resolver builds the sub-agent's engine from it directly
+/// (`bound_profile` is `None` for an inline child); a `Foreign` inline is handled by the dispatching
+/// factory's foreign incarnation, so the resolver returns `None` for it.
 pub type DurableProfileResolver = Arc<
-    dyn Fn(Option<ProfileRef>, &SessionOverlay) -> Option<daemon_core::EngineProfile> + Send + Sync,
+    dyn Fn(Option<ProfileRef>, &[u8], &SessionOverlay) -> Option<daemon_core::EngineProfile>
+        + Send
+        + Sync,
 >;
 
 /// Builds a fresh model [`Provider`] from a (model-overridden) [`ProfileSpec`] — the seam a live

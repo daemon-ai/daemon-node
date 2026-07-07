@@ -15,104 +15,12 @@
 //! surface never drags the engine's concrete construction types into the wire protocol.
 
 use daemon_common::{SkillBundle, WireVersion};
-// Relocated to `daemon-protocol` (wire v29) so the fleet tree's `UnitNode.engine` can carry it
-// without a contract-crate cycle; re-exported here because `ProfileSpec` is its primary carrier.
-pub use daemon_protocol::EngineSelector;
+// Relocated to `daemon-protocol` so the wire types that cannot depend on `daemon-api` can carry
+// them without a contract-crate cycle: `EngineSelector` (wire v29, the fleet tree's `UnitNode`);
+// `ProviderSelector` + `ForeignBackend` (Phase 1, the inline sub-agent spec on the delegation
+// payload). Re-exported here because `ProfileSpec` is their primary carrier.
+pub use daemon_protocol::{EngineSelector, ForeignBackend, ProviderSelector};
 use serde::{Deserialize, Serialize};
-
-/// Which model provider implementation a profile binds to. Mirrors the host's internal
-/// `ProviderKind`, kept as a contract enum so the wire surface does not depend on the binary's
-/// config crate.
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderSelector {
-    /// The deterministic in-tree provider (no network/keys).
-    #[default]
-    Mock,
-    /// Any networked provider served by `genai` — the adapter (OpenAI, Anthropic, Gemini, Groq,
-    /// DeepSeek, xAI, OpenRouter, Cohere, …) is inferred from the (optionally namespaced) model
-    /// name; there is no daemon-side provider registry. Legacy provider names persisted before this
-    /// collapse (`openai`, `anthropic`, and the short-lived per-family variants) deserialize here
-    /// via serde aliases.
-    #[serde(
-        rename = "genai",
-        alias = "openai",
-        alias = "anthropic",
-        alias = "gemini",
-        alias = "groq",
-        alias = "deep_seek",
-        alias = "xai",
-        alias = "open_router",
-        alias = "cohere"
-    )]
-    GenAi,
-    /// The daemon-api OpenRouter-clone gateway (OpenAI-compatible). The host binds genai's OpenAI
-    /// adapter pinned at `https://api.daemon.ai/api/v1/` (override via the profile `base_url` /
-    /// `DAEMON_BASE_URL`); model ids are OpenRouter-style `author/slug` (e.g.
-    /// `anthropic/claude-sonnet-4-5`) and the bearer is a daemon-api key. It is networked (not
-    /// local), and never resolves the Anthropic-native adapter for `claude-*` ids.
-    DaemonApi,
-    /// A local llama.cpp model via the supervised `daemon-infer` worker (on-disk GGUF, listed from
-    /// the `ModelManager` catalog).
-    LlamaCpp,
-    /// A local mistral.rs model via the supervised `daemon-infer` worker (on-disk, listed from the
-    /// `ModelManager` catalog).
-    MistralRs,
-}
-
-impl ProviderSelector {
-    /// Whether this selector is a local-inference engine (llama.cpp / mistral.rs).
-    pub fn is_local(self) -> bool {
-        matches!(
-            self,
-            ProviderSelector::LlamaCpp | ProviderSelector::MistralRs
-        )
-    }
-}
-
-/// How a `Foreign`-engine profile sources its model backend (wire v30). `EngineSelector::Foreign`
-/// picks the *agent* (by catalog name); this picks *where that agent's turns get their tokens*:
-///
-/// - [`ForeignBackend::AgentNative`] — the agent runs on its own backend; the node only steers its
-///   model choice via ACP `set_config_option` (no provider knob, no keys). The default, so a bare
-///   `Foreign { agent }` profile keeps today's "the agent uses whatever backend it ships with"
-///   behavior.
-/// - [`ForeignBackend::NodeProvider`] — the agent's OpenAI-wire backend is repointed at the node's
-///   gateway (a per-session loopback token), so its turns run on a node [`ProviderSelector`] +
-///   model with the real credential resolved node-side. Keys never reach the agent.
-///
-/// Foreign model selection lives HERE, not on the top-level [`ProfileSpec::model`] (which stays
-/// Core-only): a foreign profile names an agent + a backend, never a native provider/model.
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ForeignBackend {
-    /// The agent's own backend; the node steers only the model (via ACP), if one is named. `None`
-    /// leaves the agent on whatever model it defaults to.
-    AgentNative {
-        /// The model id to steer the agent to (best-effort, via ACP), or `None` for the agent
-        /// default.
-        model: Option<String>,
-    },
-    /// The agent is routed through the node gateway to a node [`ProviderSelector`] + model; the
-    /// credential stays node-side (resolved from `credential_ref`, else the profile's credential).
-    NodeProvider {
-        /// The node provider the gateway routes this agent's turns to.
-        provider: ProviderSelector,
-        /// The model id the gateway routes to (required — a routed backend must name a model).
-        model: String,
-        /// The stored credential the gateway acquires the provider bearer from (`None` = the
-        /// profile's own credential). A name, never the secret.
-        credential_ref: Option<String>,
-    },
-}
-
-impl Default for ForeignBackend {
-    fn default() -> Self {
-        // Today's behavior: a foreign profile runs the agent's own backend, model unsteered.
-        ForeignBackend::AgentNative { model: None }
-    }
-}
 
 /// Which default context engine (§10) a profile wires into its engine.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -285,6 +193,24 @@ impl ProfileSpec {
             bound_accounts: Vec::new(),
             engine: EngineSelector::Core,
             foreign_backend: ForeignBackend::default(),
+        }
+    }
+
+    /// Materialize a full [`ProfileSpec`] from an ad-hoc [`InlineProfileSpec`](daemon_protocol::InlineProfileSpec)
+    /// under a synthetic `id` — the Phase 1 inline-sub-agent seam. The inline spec carries only the
+    /// security-relevant subset (persona + tool allowlist + engine + foreign backend + model); every
+    /// other field takes the `ProfileSpec::new` default (provider `Mock`, no credential/budget), so a
+    /// Core inline sub-agent resolves through the ordinary `resolve_effective` path and a Foreign one
+    /// routes to the foreign incarnation. It is never persisted in the profile store (the child binds
+    /// `bound_profile = None`); the id is only its transient engine identity.
+    pub fn from_inline(id: impl Into<String>, inline: &daemon_protocol::InlineProfileSpec) -> Self {
+        Self {
+            system_prompt: inline.system_prompt.clone(),
+            tool_allowlist: inline.tool_allowlist.clone(),
+            model: inline.model.clone(),
+            engine: inline.engine.clone(),
+            foreign_backend: inline.foreign_backend.clone(),
+            ..Self::new(id, ProviderSelector::default(), inline.model.clone())
         }
     }
 

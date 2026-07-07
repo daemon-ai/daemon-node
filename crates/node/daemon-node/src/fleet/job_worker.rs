@@ -7,10 +7,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use daemon_api::{EngineSelector, ManageEventView, SubagentPhase, TreeEvent};
+use daemon_api::{
+    to_cbor, EngineSelector, ManageEventView, ProfileSpec, SessionOverlay, SubagentPhase, TreeEvent,
+};
 use daemon_common::{PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::EngineProfile;
 use daemon_host::{BlobStore, JobWorker, ProfileStore, ServiceError, WorkspaceRoots};
+use daemon_protocol::ChildSource;
+
+use crate::profiles::resolve::SessionFactoryCtx;
 
 /// Drives the durable job outbox by materializing each delegation as a *durable child session*:
 /// seed a fresh orchestrator-capable engine snapshot with the delegated work, create the child row,
@@ -42,6 +47,12 @@ pub struct FleetJobWorker {
     /// foreign backend, not a Core engine, runs the turn). `None` (no profile store) keeps every
     /// child on the Core seeding path.
     profiles: Option<Arc<dyn ProfileStore>>,
+    /// The per-session resolution context, used to seed a Core INLINE sub-agent's first snapshot
+    /// from `resolve_effective(inline_spec)` (Phase 1) so its persona/toolset is reflected from the
+    /// start. `None` (no profile store / provider resolver) falls back to the default engine shape
+    /// for the seed; the durable resolver still rebuilds the inline engine from the persisted spec
+    /// at every hydrate, so the run-time config is honored regardless.
+    session_ctx: Option<Arc<SessionFactoryCtx>>,
 }
 
 impl FleetJobWorker {
@@ -60,6 +71,7 @@ impl FleetJobWorker {
             workspace_roots: None,
             blobs: None,
             profiles: None,
+            session_ctx: None,
         }
     }
 
@@ -71,6 +83,14 @@ impl FleetJobWorker {
         self
     }
 
+    /// Give the worker the per-session resolution context so a Core INLINE sub-agent (Phase 1) is
+    /// seeded from `resolve_effective(inline_spec)` rather than the default orchestrator profile.
+    /// `pub(crate)` because [`SessionFactoryCtx`] is a crate-internal type (wired only by `assemble`).
+    pub(crate) fn with_session_ctx(mut self, ctx: Arc<SessionFactoryCtx>) -> Self {
+        self.session_ctx = Some(ctx);
+        self
+    }
+
     /// Whether `profile` names a `Foreign{agent}` engine in the profile store. `false` when no store
     /// is wired, the profile is unknown, or it is a Core profile — the Core seeding path.
     fn is_foreign_profile(&self, profile: &str) -> bool {
@@ -79,6 +99,27 @@ impl FleetJobWorker {
             .and_then(|store| store.get(profile).ok().flatten())
             .map(|spec| matches!(spec.engine, EngineSelector::Foreign { .. }))
             .unwrap_or(false)
+    }
+
+    /// Resolve a delegation's [`ChildSource`] into the child's engine binding (Phase 1): the bound
+    /// profile name to record (for the durable resolver / foreign dispatch), the inline `ProfileSpec`
+    /// to persist as `inline_profile`, and whether the child runs a `Foreign{agent}` backend (seeded
+    /// on the foreign path). `child` is the synthetic id an inline spec takes for its transient
+    /// engine identity (scopes its context/memory + credentials at resolve time).
+    fn resolve_source(
+        &self,
+        source: &ChildSource,
+        child: &SessionId,
+    ) -> (Option<String>, Option<ProfileSpec>, bool) {
+        match source {
+            ChildSource::Default => (None, None, false),
+            ChildSource::Profile(name) => (Some(name.clone()), None, self.is_foreign_profile(name)),
+            ChildSource::Inline(inline) => {
+                let spec = ProfileSpec::from_inline(child.as_str(), inline);
+                let is_foreign = matches!(spec.engine, EngineSelector::Foreign { .. });
+                (None, Some(spec), is_foreign)
+            }
+        }
     }
 
     /// Give the worker the workspace roots + content store so it materializes a delegation's
@@ -211,21 +252,27 @@ impl JobWorker for FleetJobWorker {
                     .await;
                 // Captured before the task moves into the seed: the child's roster/tree title.
                 let child_title: String = input.task.chars().take(80).collect();
-                // A child bound to a `Foreign{agent}` profile runs its turn in the foreign backend
+                // Resolve the child's engine source (Phase 1 `ChildSource`): a bound profile name,
+                // an inline ad-hoc spec, or the node default. `is_foreign` decides the seed path.
+                let (bound_profile, inline_spec, is_foreign) =
+                    self.resolve_source(&input.source, &child);
+                // A `Foreign{agent}` child (bound OR inline) runs its turn in the foreign backend
                 // process, not a Core engine: seed a minimal id-carrying snapshot and hand the task
                 // down the durable input seam (the `ForeignIncarnation` drains it at hydrate). A Core
-                // child keeps the existing path: a fresh orchestrator-engine snapshot with the task
-                // pushed as its first user turn.
-                let is_foreign = input
-                    .profile
-                    .as_deref()
-                    .is_some_and(|p| self.is_foreign_profile(p));
+                // child seeds a fresh engine snapshot with the task as its first user turn — an inline
+                // Core spec seeds from `resolve_effective(spec)` (when a session ctx is wired) so its
+                // persona/toolset is reflected from the start; otherwise the default engine shape.
                 let blob = if is_foreign {
                     daemon_core::Snapshot::fresh(child.clone())
                         .encode()
                         .map_err(ServiceError::new)?
                 } else {
-                    let mut engine = self.profile.fresh(child.clone());
+                    let mut engine = match (&inline_spec, &self.session_ctx) {
+                        (Some(spec), Some(ctx)) => ctx
+                            .resolve_effective(spec, &SessionOverlay::default())
+                            .fresh(child.clone()),
+                        _ => self.profile.fresh(child.clone()),
+                    };
                     engine.push_user(daemon_protocol::UserMsg::new(input.task.clone()));
                     engine.snapshot().encode().map_err(ServiceError::new)?
                 };
@@ -259,12 +306,18 @@ impl JobWorker for FleetJobWorker {
                     .session_meta(&job.session_id)
                     .await
                     .and_then(|m| m.owner);
-                // Per-child profile: a named profile in the delegation binds the child's engine
-                // resolution — the durable resolver rehydrates it from `bound_profile` exactly like
-                // an interactive session's binding. Unset keeps the one default engine shape, and
-                // an unknown name silently falls back at resolve time (the resolver declines).
-                if let Some(profile) = &input.profile {
-                    meta.bound_profile = Some(ProfileRef::new(profile.clone()));
+                // Per-child engine binding (Phase 1). A `Profile(name)` source binds the child's
+                // `bound_profile` — the durable resolver rehydrates it exactly like an interactive
+                // session's binding (an unknown name silently falls back at resolve time). An
+                // `Inline` source instead persists the ad-hoc `ProfileSpec` as opaque bytes in
+                // `inline_profile` with `bound_profile = None`; the durable resolver / foreign
+                // dispatch decode it at every hydrate so the sub-agent's config is honored across
+                // restarts. `Default` leaves both unset (the node default engine shape).
+                if let Some(name) = &bound_profile {
+                    meta.bound_profile = Some(ProfileRef::new(name.clone()));
+                }
+                if let Some(spec) = &inline_spec {
+                    meta.inline_profile = to_cbor(spec);
                 }
                 // Title the child from its task (truncated) so the parent's `status` verb and the
                 // GUI tree show what each child is doing; never clobbers an existing title.
@@ -380,7 +433,7 @@ mod tests {
             task: "summarize the repo".into(),
             attachments: Vec::new(),
             lifetime: daemon_protocol::DelegationLifetime::Ephemeral,
-            profile: Some("opus".into()),
+            source: daemon_protocol::ChildSource::Profile("opus".into()),
             detached: false,
         }
         .encode();
@@ -450,7 +503,7 @@ mod tests {
             task: "background work".into(),
             attachments: Vec::new(),
             lifetime: daemon_protocol::DelegationLifetime::Persistent,
-            profile: None,
+            source: daemon_protocol::ChildSource::Default,
             detached: true,
         }
         .encode();

@@ -62,7 +62,7 @@ impl Provider for DelegateToProfileProvider {
                 call_id: "spawn-foreign".into(),
                 name: "orchestrate".into(),
                 args: format!(
-                    r#"{{"verb":"spawn","profile":"{}","task":"do the foreign work"}}"#,
+                    r#"{{"verb":"spawn","source":{{"profile":"{}"}},"task":"do the foreign work"}}"#,
                     self.profile
                 ),
             }],

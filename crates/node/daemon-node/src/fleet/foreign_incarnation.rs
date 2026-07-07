@@ -91,23 +91,25 @@ struct DispatchingIncarnation {
 }
 
 impl DispatchingIncarnation {
-    /// Resolve the session's foreign binding from `snapshot`: decode the session id, read its bound
-    /// profile, and — when that profile's engine is `Foreign{agent}` — return the id + agent name +
-    /// foreign backend. `None` means "run this session on the Core path" (no binding, an unknown
-    /// profile, or a Core-engine profile). `resolve_effective` on the Core resolver therefore never
-    /// sees a foreign spec. Static over `&ForeignConfig` (not `&self`) so the future stays `Send`
-    /// (`self` also holds a non-`Sync` `Box<dyn Incarnation>`).
+    /// Resolve the session's foreign binding from `snapshot`: decode the session id, resolve its
+    /// effective spec (an INLINE sub-agent spec from `SessionMeta.inline_profile` takes precedence
+    /// over a bound profile name — Phase 1), and — when that spec's engine is `Foreign{agent}` —
+    /// return the id + agent name + foreign backend. `None` means "run this session on the Core
+    /// path" (no binding/inline, an unknown profile, or a Core-engine spec). `resolve_effective` on
+    /// the Core resolver therefore never sees a foreign spec. Static over `&ForeignConfig` (not
+    /// `&self`) so the future stays `Send` (`self` also holds a non-`Sync` `Box<dyn Incarnation>`).
     async fn resolve_foreign(
         foreign: &ForeignConfig,
         snapshot: &SnapshotBlob,
     ) -> Option<(SessionId, String, ForeignBackend)> {
         let session_id = Snapshot::decode(snapshot).ok()?.session_id;
-        let bound = foreign
-            .store
-            .session_meta(&session_id)
-            .await?
-            .bound_profile?;
-        let spec = foreign.profiles.get(bound.as_str()).ok().flatten()?;
+        let meta = foreign.store.session_meta(&session_id).await?;
+        let spec = if !meta.inline_profile.is_empty() {
+            daemon_api::from_cbor::<daemon_api::ProfileSpec>(&meta.inline_profile).ok()?
+        } else {
+            let bound = meta.bound_profile?;
+            foreign.profiles.get(bound.as_str()).ok().flatten()?
+        };
         match spec.engine {
             EngineSelector::Foreign { agent } => Some((session_id, agent, spec.foreign_backend)),
             EngineSelector::Core => None,
