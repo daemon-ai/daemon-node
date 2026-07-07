@@ -650,9 +650,16 @@ fn build_session_builder(
                                 ctx.resolve_effective(&spec, overlay).fresh(id),
                             ),
                             daemon_api::EngineSelector::Foreign { agent } => {
+                                // Compute the effective model the same way the Core path does:
+                                // clone the spec, apply the session overlay (so a per-session model
+                                // override propagates), and pass a non-empty model into the factory.
+                                let mut effective = spec.clone();
+                                overlay.apply_to(&mut effective);
+                                let model = Some(effective.model).filter(|m| !m.trim().is_empty());
                                 SessionBackend::Foreign(
                                     crate::fleet::foreign_live::foreign_session_factory(
                                         agent.clone(),
+                                        model,
                                         id,
                                         session_store.clone(),
                                     ),

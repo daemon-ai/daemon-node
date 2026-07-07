@@ -25,8 +25,10 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, ContentChunk, EnvVariable, InitializeRequest, McpServer,
     McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCall, ToolCallStatus, ToolCallUpdate,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall,
+    ToolCallStatus, ToolCallUpdate,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
@@ -54,6 +56,11 @@ pub struct AcpLaunch {
     pub env: Vec<(String, String)>,
     /// The working directory advertised to the agent in `session/new`.
     pub cwd: PathBuf,
+    /// The node-validated profile model to steer the agent to (Layer 1), applied best-effort after
+    /// `session/new` via `session/set_config_option` when the agent advertises a `Model` selector.
+    /// `None` leaves the agent on its own default model. This is *not* an arbitrary spawn input:
+    /// only the model string flows here — the launch recipe still comes from the catalog by name.
+    pub desired_model: Option<String>,
     /// The declared env policy for the agent subprocess (Cluster E): always
     /// [`EnvPolicy::InheritFull`] — an ACP agent is a trusted foreign-engine node component that
     /// inherits the full daemon env by design (provider keys etc.), with `env` extras added on
@@ -71,6 +78,7 @@ impl AcpLaunch {
             args: Vec::new(),
             env: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            desired_model: None,
             policy: EnvPolicy::InheritFull,
         }
     }
@@ -90,6 +98,12 @@ impl AcpLaunch {
     /// Set the working directory advertised in `session/new`.
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = cwd.into();
+        self
+    }
+
+    /// Set the desired model to steer the agent to (best-effort; see [`AcpLaunch::desired_model`]).
+    pub fn model(mut self, model: Option<String>) -> Self {
+        self.desired_model = model;
         self
     }
 
@@ -486,6 +500,7 @@ async fn drive(
     seq: Arc<AtomicU64>,
     mut command_rx: mpsc::UnboundedReceiver<AgentCommand>,
 ) {
+    let desired_model = launch.desired_model.clone();
     let (agent, cwd) = launch.into_agent();
 
     // Notification handler: stream `session/update`s up as §17 events.
@@ -537,6 +552,13 @@ async fn drive(
                 .block_task()
                 .await?;
             let session_id = session.session_id;
+
+            // Layer 1: best-effort model selection over the agent's advertised config options.
+            // Any failure or missing selector is logged and the session proceeds on the agent's
+            // default model — model selection never aborts the session.
+            if let Some(wanted) = desired_model.as_deref() {
+                apply_model(&cx, &session_id, session.config_options.as_deref(), wanted).await;
+            }
 
             while let Some(cmd) = command_rx.recv().await {
                 match cmd {
@@ -610,6 +632,117 @@ async fn drive(
 
     if let Err(err) = result {
         tracing::warn!(error = %err, "acp connection ended with error");
+    }
+}
+
+/// Layer 1 best-effort model selection: after `session/new`, if the agent advertised a
+/// `Model`-category `Select` config option, try to switch it to the node-validated profile model
+/// `wanted` via `session/set_config_option`. Matching prefers the option value's id, then its
+/// display name case-insensitively. Every outcome is logged (`applied` / `already-current` /
+/// `not-offered` / `no-selector`) and the function never returns an error that aborts the session —
+/// on any miss or failure the agent keeps its own default model.
+async fn apply_model(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    config_options: Option<&[SessionConfigOption]>,
+    wanted: &str,
+) {
+    // Locate the Model-category Select selector, if the agent advertised one.
+    let selector = config_options.into_iter().flatten().find_map(|opt| {
+        if opt.category != Some(SessionConfigOptionCategory::Model) {
+            return None;
+        }
+        match &opt.kind {
+            SessionConfigKind::Select(select) => Some((opt, select)),
+            _ => None,
+        }
+    });
+    let Some((option, select)) = selector else {
+        tracing::info!(
+            requested_model = wanted,
+            outcome = "no-selector",
+            "foreign ACP agent advertised no Model selector; keeping its default model"
+        );
+        return;
+    };
+
+    // id-exact first, then a case-insensitive display-name fallback.
+    let matched = select_options(&select.options)
+        .find(|v| v.value.0.as_ref() == wanted)
+        .or_else(|| select_options(&select.options).find(|v| v.name.eq_ignore_ascii_case(wanted)));
+    let Some(value) = matched else {
+        tracing::info!(
+            requested_model = wanted,
+            outcome = "not-offered",
+            "foreign ACP agent's Model selector does not offer the requested model; keeping default"
+        );
+        return;
+    };
+
+    if value.value == select.current_value {
+        tracing::info!(
+            requested_model = wanted,
+            model = %value.value.0,
+            outcome = "already-current",
+            "foreign ACP agent's Model selector is already on the requested model"
+        );
+        return;
+    }
+
+    match cx
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            option.id.clone(),
+            value.value.clone(),
+        ))
+        .block_task()
+        .await
+    {
+        Ok(resp) => {
+            // Read back the resulting current_value for the same option, falling back to the value
+            // we requested when the agent does not echo the option in its response.
+            let current = resp
+                .config_options
+                .iter()
+                .find(|o| o.id == option.id)
+                .and_then(|o| match &o.kind {
+                    SessionConfigKind::Select(s) => Some(s.current_value.0.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| value.value.0.to_string());
+            tracing::info!(
+                requested_model = wanted,
+                model = %value.value.0,
+                current_value = %current,
+                outcome = "applied",
+                "selected model on foreign ACP agent"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                requested_model = wanted,
+                model = %value.value.0,
+                error = %err,
+                outcome = "error",
+                "failed to set model on foreign ACP agent; keeping its default"
+            );
+        }
+    }
+}
+
+/// Flatten a select option's (possibly grouped) choices into one iterator of value entries, so the
+/// id/name matching in [`apply_model`] treats ungrouped and grouped selectors uniformly.
+fn select_options(
+    options: &SessionConfigSelectOptions,
+) -> Box<dyn Iterator<Item = &SessionConfigSelectOption> + '_> {
+    match options {
+        SessionConfigSelectOptions::Ungrouped(list) => Box::new(list.iter()),
+        SessionConfigSelectOptions::Grouped(groups) => {
+            Box::new(groups.iter().flat_map(|g| g.options.iter()))
+        }
+        // `SessionConfigSelectOptions` is `#[non_exhaustive]`: an unknown future grouping simply
+        // yields no matchable values, so the model stays `not-offered` (default model kept).
+        _ => Box::new(std::iter::empty()),
     }
 }
 

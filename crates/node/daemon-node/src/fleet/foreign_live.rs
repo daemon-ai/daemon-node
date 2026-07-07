@@ -33,6 +33,7 @@ use daemon_store::SessionStore;
 /// ordinary host approval requests).
 pub(crate) fn foreign_session_factory(
     agent: String,
+    model: Option<String>,
     session: SessionId,
     store: Arc<dyn SessionStore>,
 ) -> ForeignSessionFactory {
@@ -50,13 +51,17 @@ pub(crate) fn foreign_session_factory(
             }
             match entry.protocol {
                 AgentProtocol::Acp => {
-                    let launch =
-                        daemon_acp::launch_from_recipe(&entry.recipe).ok_or_else(|| {
+                    let launch = daemon_acp::launch_from_recipe(&entry.recipe)
+                        .ok_or_else(|| {
                             ApiError::Unsupported(format!(
                                 "agent `{agent}` has an endpoint-only recipe; endpoint agents are \
                              not spawnable as session engines yet"
                             ))
-                        })?;
+                        })?
+                        // Layer 1: steer the agent to the profile's node-validated model
+                        // (best-effort inside daemon-acp after session/new); the recipe still
+                        // comes only from the catalog by name.
+                        .model(model);
                     Ok(daemon_acp::AcpSession::connect(launch, host))
                 }
                 AgentProtocol::StreamJson => {

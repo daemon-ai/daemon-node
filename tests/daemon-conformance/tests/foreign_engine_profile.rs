@@ -98,6 +98,15 @@ fn foreign_profile(id: &str, agent: &str) -> ProfileSpec {
     }
 }
 
+/// Like [`foreign_profile`] but carrying a node-validated `model` (Layer 1): the catalog still owns
+/// the launch recipe; only the model string is threaded through to the ACP `set_config_option`.
+fn foreign_profile_with_model(id: &str, agent: &str, model: &str) -> ProfileSpec {
+    ProfileSpec {
+        model: model.into(),
+        ..foreign_profile(id, agent)
+    }
+}
+
 /// Register the compiled mock ACP agent under `name` (source Manual). The node's real
 /// `AcpDiscoverer::probe` runs the ACP `initialize` handshake against it, so the stored entry is
 /// verified installed with a reported protocol version — the operator registration path, for real.
@@ -243,6 +252,113 @@ async fn acp_profile_spawns_and_completes_a_turn_impl() {
     assert!(
         !row.rewindable,
         "a live foreign (ACP) session must advertise rewindable=false"
+    );
+}
+
+/// Layer-1 model selection (positive): a foreign profile whose `model` matches a value the agent
+/// advertises in its `Model` `Select` config option drives the adapter to send
+/// `session/set_config_option`, which the mock reflects back in-band (`set:model=mock-model-b`) —
+/// proving the full assembly -> foreign_live -> daemon-acp thread applies the model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_profile_matching_model_is_applied() {
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        acp_profile_matching_model_is_applied_impl(),
+    )
+    .await;
+}
+
+async fn acp_profile_matching_model_is_applied_impl() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+
+    node.profile_create(foreign_profile_with_model(
+        "acp-model",
+        "fake-echo",
+        "mock-model-b",
+    ))
+    .await
+    .expect("create a foreign profile carrying a model the agent offers");
+
+    let session = node
+        .session_create(None, Some(ProfileRef::new("acp-model")))
+        .await
+        .expect("create a session bound to the model-carrying ACP profile");
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hello foreign agent"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit a turn to the foreign-engine session");
+
+    let items = drain_turn(&node, &session).await;
+    let applied = items.iter().any(|o| {
+        matches!(o, Outbound::Event(AgentEvent::TextDelta { text, .. })
+                 if text.contains("set:model=mock-model-b"))
+    });
+    assert!(
+        applied,
+        "a matching profile model must be applied via set_config_option: {items:?}"
+    );
+}
+
+/// Layer-1 model selection (negative): a foreign profile whose `model` the agent does not offer
+/// sends no `session/set_config_option` (the mock reports `unset`), and the session still runs to a
+/// finished turn on the agent's default model — model selection is best-effort, never fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_profile_unknown_model_sends_nothing_and_still_runs() {
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        acp_profile_unknown_model_sends_nothing_and_still_runs_impl(),
+    )
+    .await;
+}
+
+async fn acp_profile_unknown_model_sends_nothing_and_still_runs_impl() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+
+    node.profile_create(foreign_profile_with_model(
+        "acp-unknown-model",
+        "fake-echo",
+        "no-such-model",
+    ))
+    .await
+    .expect("create a foreign profile carrying a model the agent does not offer");
+
+    let session = node
+        .session_create(None, Some(ProfileRef::new("acp-unknown-model")))
+        .await
+        .expect("create a session bound to the unknown-model ACP profile");
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hello foreign agent"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit a turn to the foreign-engine session");
+
+    let items = drain_turn(&node, &session).await;
+    let reported_unset = items.iter().any(|o| {
+        matches!(o, Outbound::Event(AgentEvent::TextDelta { text, .. })
+                 if text.contains("unset"))
+    });
+    assert!(
+        reported_unset,
+        "an unmatched model must not send any set_config_option (mock reports unset): {items:?}"
+    );
+    let completed = items.iter().any(|o| {
+        matches!(o, Outbound::Event(AgentEvent::TurnFinished { summary, .. })
+                 if summary.end_reason == daemon_protocol::EndReason::Completed)
+    });
+    assert!(
+        completed,
+        "the session must still complete on the default model: {items:?}"
     );
 }
 
