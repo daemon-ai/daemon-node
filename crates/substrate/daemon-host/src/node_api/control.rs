@@ -506,9 +506,26 @@ impl ControlApi for NodeApiImpl {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        // Best-effort enrichment: N1 stores the raw target (session + journal cursor + trace); the
-        // model/provider/end-reason/usage enrichment from the journal at `cursor` is left to the
-        // exporter phase (a sibling workstream) to keep this handler cheap and side-effect-free.
+        // Best-effort embodiment (the "disembodied thumbs" fix): attach the rated turn's model and,
+        // when the submitter consented via `include_content`, the rated response text, so the
+        // exported event is self-describing rather than a bare `(session, cursor)` anchor. Both are
+        // read from the durable journal at submit time (frozen as-rated; the drain stays a pure
+        // record->event map). Per-turn end_reason/usage are currently only journaled as a
+        // `mgmt.turn_finished` debug string, so they are left None here (structured per-turn summary
+        // is a follow-up); the record + `FeedbackEvent` keep the slots.
+        let (turn_model, response_content) = match (kind, target.as_ref()) {
+            (FeedbackKind::Response, Some(t)) => {
+                let model = self.session_models.get(&t.session).map(|m| m.clone());
+                let content = if include_content {
+                    self.rated_response_text(&t.session, t.cursor).await
+                } else {
+                    None
+                };
+                (model, content)
+            }
+            _ => (None, None),
+        };
+
         let record = FeedbackRecord {
             id: mint_feedback_id(),
             created_at_ms,
@@ -530,6 +547,12 @@ impl ControlApi for NodeApiImpl {
             os: diagnostics.and_then(|d| d.os),
             consent: consent.into(),
             node_version: daemon_common::VERSION.to_string(),
+            model: turn_model,
+            provider: None,
+            end_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            response_content,
             delivered: false,
         };
 

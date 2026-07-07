@@ -60,6 +60,10 @@ pub struct FeedbackEvent {
     pub input_tokens: Option<u64>,
     /// The turn's output/completion tokens (rendered as `gen_ai.usage.output_tokens`).
     pub output_tokens: Option<u64>,
+    /// The rated response text, present only when the submitter consented via `include_content`
+    /// (rendered as `daemon.feedback.content`). This is what makes a response thumb self-describing
+    /// rather than a bare `(session, cursor)` anchor the consumer cannot resolve.
+    pub response_content: Option<String>,
 }
 
 /// The OTel log-event name stamped on every exported feedback record (`LogRecord::event_name`).
@@ -245,6 +249,12 @@ mod imp {
                 AnyValue::Int(i64::try_from(output_tokens).unwrap_or(i64::MAX)),
             ));
         }
+        if let Some(response_content) = &event.response_content {
+            attrs.push((
+                fields::daemon::feedback::CONTENT,
+                response_content.clone().into(),
+            ));
+        }
 
         attrs
     }
@@ -313,6 +323,7 @@ mod tests {
             end_reason: Some("stop".to_string()),
             input_tokens: Some(42),
             output_tokens: Some(7),
+            response_content: Some("the rated reply text".to_string()),
         }
     }
 
@@ -416,6 +427,10 @@ mod tests {
             );
             assert_eq!(as_int(&map[fields::gen_ai::USAGE_INPUT_TOKENS]), Some(42));
             assert_eq!(as_int(&map[fields::gen_ai::USAGE_OUTPUT_TOKENS]), Some(7));
+            assert_eq!(
+                as_str(&map[fields::daemon::feedback::CONTENT]),
+                Some("the rated reply text")
+            );
         }
 
         #[test]
@@ -449,6 +464,7 @@ mod tests {
             assert!(!map.contains_key(fields::gen_ai::RESPONSE_FINISH_REASONS));
             assert!(!map.contains_key(fields::gen_ai::USAGE_INPUT_TOKENS));
             assert!(!map.contains_key(fields::gen_ai::USAGE_OUTPUT_TOKENS));
+            assert!(!map.contains_key(fields::daemon::feedback::CONTENT));
         }
     }
 }

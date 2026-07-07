@@ -159,7 +159,8 @@ use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, AgentEvent, ConvView, DeliveryTarget, Direction, Disposition, HostRequest,
     HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin,
-    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId, UserMsg,
+    OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TranscriptRole,
+    TransportId, UserMsg,
 };
 use daemon_store::{
     FeedbackRecord, SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore,

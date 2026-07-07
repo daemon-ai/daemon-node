@@ -162,5 +162,8 @@ pub mod daemon {
         pub const NODE_VERSION: &str = "daemon.feedback.node_version";
         /// When the feedback was created, in Unix epoch milliseconds.
         pub const CREATED_AT_MS: &str = "daemon.feedback.created_at_ms";
+        /// The rated response text, carried only when the submitter consented via `include_content`
+        /// (per-event consent). Makes a response thumb self-describing rather than a bare anchor.
+        pub const CONTENT: &str = "daemon.feedback.content";
     }
 }

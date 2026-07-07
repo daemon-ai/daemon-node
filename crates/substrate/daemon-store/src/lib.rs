@@ -358,6 +358,29 @@ pub struct FeedbackRecord {
     pub consent: String,
     /// The node version (`daemon_common::VERSION`) that accepted the feedback.
     pub node_version: String,
+    /// The rated turn's model, resolved best-effort at submit time (the session's bound model).
+    /// Rendered as `gen_ai.request.model`. `None` for app feedback or when unresolvable.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The rated turn's provider, when resolvable (best-effort). Rendered as `gen_ai.provider.name`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The rated turn's stop/finish reason, when resolvable. Rendered as
+    /// `gen_ai.response.finish_reasons`. (Per-turn end_reason is currently only journaled as a
+    /// `mgmt.turn_finished` debug string, so this stays `None` pending a structured per-turn summary.)
+    #[serde(default)]
+    pub end_reason: Option<String>,
+    /// The rated turn's prompt tokens, when resolvable. Rendered as `gen_ai.usage.input_tokens`.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// The rated turn's completion tokens, when resolvable. Rendered as `gen_ai.usage.output_tokens`.
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    /// The rated response text, captured (size-capped) at submit time ONLY when the submitter set
+    /// `include_content` (per-event consent). Rendered as `daemon.feedback.content`. This is what
+    /// makes a response thumb self-describing rather than a bare `(session, cursor)` anchor.
+    #[serde(default)]
+    pub response_content: Option<String>,
     /// Whether the exporter has drained + delivered this record (set by `feedback_mark_delivered`).
     pub delivered: bool,
 }

@@ -83,9 +83,9 @@ impl FeedbackDrain {
 /// exporter branches on it), the trace id is rendered as fixed-width hex (matching
 /// [`daemon_common::TraceId`]'s `Display`), and the node version is filled from the record (which
 /// stamped it from [`daemon_common::VERSION`] at accept time), falling back to the live
-/// [`daemon_common::VERSION`] for any record that stored none. The turn-descriptor enrichment
-/// (model/provider/end-reason/usage from the journal at the stored cursor) is out of scope for this
-/// drain and left unset.
+/// [`daemon_common::VERSION`] for any record that stored none. The turn-descriptor + response
+/// content are carried through from the record verbatim — the handler resolved them from the journal
+/// at submit time (see [`NodeApiImpl::rated_response_text`]), so the drain stays a pure map.
 pub(crate) fn feedback_event_from(record: &FeedbackRecord) -> FeedbackEvent {
     FeedbackEvent {
         kind: record.kind.clone(),
@@ -103,11 +103,12 @@ pub(crate) fn feedback_event_from(record: &FeedbackRecord) -> FeedbackEvent {
             record.node_version.clone()
         },
         created_at_ms: u64::try_from(record.created_at_ms).unwrap_or(0),
-        model: None,
-        provider: None,
-        end_reason: None,
-        input_tokens: None,
-        output_tokens: None,
+        model: record.model.clone(),
+        provider: record.provider.clone(),
+        end_reason: record.end_reason.clone(),
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        response_content: record.response_content.clone(),
     }
 }
 
@@ -228,6 +229,86 @@ impl NodeApiImpl {
         let this = self.clone();
         tokio::spawn(async move { this.drain_feedback_outbox().await });
     }
+
+    /// Read the rated turn's assistant text from the durable journal at `cursor` (best-effort,
+    /// size-capped at [`daemon_api::FEEDBACK_COMMENT_MAX`]). This is the response-content half of the
+    /// embodiment fix: when the submitter set `include_content`, the rated response rides the
+    /// exported event so a thumb is self-describing instead of a bare `(session, cursor)` anchor.
+    ///
+    /// The rated turn's blocks are the journal entries at/after the anchor cursor up to the turn
+    /// boundary (a `mgmt.turn_finished` management entry). Returns `None` when journaling is off, the
+    /// cursor is unknown, or the turn produced no assistant text.
+    pub(crate) async fn rated_response_text(
+        &self,
+        session: &SessionId,
+        cursor: u64,
+    ) -> Option<String> {
+        let stream = JournalStreamId::session(session);
+        // `load_journal` returns entries with `cursor > after_cursor`; step back one so the anchor's
+        // own entry is included. A bounded page is plenty for one turn's blocks.
+        let page = self
+            .store
+            .load_journal(&stream, cursor.saturating_sub(1), 64)
+            .await;
+        // Decode each entry to `Some(block)` / `None` (a turn boundary — a management entry like
+        // `mgmt.turn_finished`); undecodable entries/blocks are skipped (not treated as boundaries).
+        let items = page.entries.iter().filter_map(|je| {
+            let view = decode_entry(&je.entry.bytes).ok()?;
+            match view.payload {
+                JournalPayload::Management { .. } => Some(None),
+                JournalPayload::Block { body } => {
+                    match ciborium::from_reader::<TranscriptBlock, _>(&body[..]) {
+                        Ok(block) => Some(Some(block)),
+                        Err(_) => None,
+                    }
+                }
+            }
+        });
+        coalesce_assistant_text(items, daemon_api::FEEDBACK_COMMENT_MAX)
+    }
+}
+
+/// Coalesce a rated turn's assistant text from its journal blocks, in cursor order. A `None` item is
+/// a turn-boundary marker (a management journal entry); collection stops at the first boundary seen
+/// *after* any assistant text (so blocks preceding the anchor's turn don't bleed the next turn in).
+/// Non-assistant blocks are ignored. The result is size-capped on a char boundary (`String::truncate`
+/// panics mid-codepoint). Pure (no store/journal deps) so the coalescing + boundary + cap logic is
+/// unit-testable without building an encoded, sealed journal.
+fn coalesce_assistant_text<I>(items: I, cap: usize) -> Option<String>
+where
+    I: IntoIterator<Item = Option<TranscriptBlock>>,
+{
+    let mut text = String::new();
+    for item in items {
+        match item {
+            None => {
+                if !text.is_empty() {
+                    break;
+                }
+            }
+            Some(TranscriptBlock::Message {
+                role: TranscriptRole::Assistant,
+                text: t,
+            }) => {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&t);
+            }
+            Some(_) => {}
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() > cap {
+        let mut end = cap;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    Some(text)
 }
 
 #[cfg(test)]
@@ -251,6 +332,12 @@ mod tests {
             os: Some("linux".into()),
             consent: consent.into(),
             node_version: "test-ver".into(),
+            model: None,
+            provider: None,
+            end_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            response_content: None,
             delivered: false,
         }
     }
@@ -273,8 +360,83 @@ mod tests {
         );
         assert_eq!(event.kind, "app");
         assert_eq!(event.created_at_ms, 1);
-        // Turn-descriptor enrichment is out of scope for the drain.
+        // This app record carries no turn descriptor / content, so those map through as None.
         assert!(event.model.is_none() && event.input_tokens.is_none());
+        assert!(event.response_content.is_none());
+    }
+
+    fn assistant(text: &str) -> Option<TranscriptBlock> {
+        Some(TranscriptBlock::Message {
+            role: TranscriptRole::Assistant,
+            text: text.into(),
+        })
+    }
+
+    #[test]
+    fn coalesce_joins_assistant_blocks_until_the_turn_boundary() {
+        // assistant text, then a boundary (management) that ends the turn; a later turn's block is
+        // not folded in.
+        let items = vec![
+            assistant("first"),
+            assistant("second"),
+            None,
+            assistant("next turn"),
+        ];
+        assert_eq!(
+            coalesce_assistant_text(items, 4096).as_deref(),
+            Some("first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn coalesce_ignores_non_assistant_and_leading_boundaries() {
+        let items = vec![
+            None, // a boundary before any text is skipped (not a stop)
+            Some(TranscriptBlock::Message {
+                role: TranscriptRole::User,
+                text: "prompt".into(),
+            }),
+            assistant("reply"),
+        ];
+        assert_eq!(
+            coalesce_assistant_text(items, 4096).as_deref(),
+            Some("reply")
+        );
+    }
+
+    #[test]
+    fn coalesce_is_none_when_no_assistant_text() {
+        let items = vec![
+            None,
+            Some(TranscriptBlock::Message {
+                role: TranscriptRole::User,
+                text: "prompt".into(),
+            }),
+        ];
+        assert_eq!(coalesce_assistant_text(items, 4096), None);
+    }
+
+    #[test]
+    fn coalesce_caps_on_a_char_boundary() {
+        // A multibyte char straddling the cap must not panic and must not be split.
+        let items = vec![assistant("aaaé")]; // 'é' is 2 bytes at indices 3..5
+        let out = coalesce_assistant_text(items, 4).unwrap();
+        assert_eq!(out, "aaa"); // cap 4 lands mid-'é' -> backs off to the boundary at 3
+    }
+
+    #[test]
+    fn mapping_carries_descriptor_and_content_when_the_record_has_them() {
+        let mut r = record("fb-embodied", "explicit-one-shot");
+        r.kind = "response".into();
+        r.model = Some("gpt-5".into());
+        r.response_content = Some("the rated reply".into());
+        r.input_tokens = Some(12);
+        r.output_tokens = Some(34);
+        let event = feedback_event_from(&r);
+        assert_eq!(event.model.as_deref(), Some("gpt-5"));
+        assert_eq!(event.response_content.as_deref(), Some("the rated reply"));
+        assert_eq!(event.input_tokens, Some(12));
+        assert_eq!(event.output_tokens, Some(34));
     }
 
     #[test]
