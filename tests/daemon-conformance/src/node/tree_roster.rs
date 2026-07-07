@@ -277,6 +277,114 @@ async fn roster_top_level_excludes_managed_children_across_transports_impl() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The explicit `Archived` scope surfaces archived sessions of EVERY role — `Primary`,
+/// `ManagedChild`, AND `EphemeralSubagent` — not just top-level conversations. An archived
+/// subagent child otherwise has no enumeration path (`TopLevel`/`ByProfile`/`ByTransport` exclude
+/// archived, and `tree()` only drills from a live parent), so restricting `Archived` to `Primary`
+/// would strand it. A non-archived child never leaks into the scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archived_scope_includes_children_of_all_roles() {
+    as_system(archived_scope_includes_children_of_all_roles_impl()).await;
+}
+async fn archived_scope_includes_children_of_all_roles_impl() {
+    use daemon_api::{SessionQuery, SessionScope};
+    use daemon_core::Snapshot;
+    use daemon_store::{SessionMeta, SessionRole as StoreRole};
+
+    let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x74; 32], fast_host_config());
+
+    // Seed four durable rows directly: an archived Primary, an archived ManagedChild, an archived
+    // EphemeralSubagent, and a NON-archived ManagedChild (the negative control). Each row carries
+    // its role + archived flag on the host meta the roster reads.
+    let seed = |id: &str, role: StoreRole, parent: Option<&str>, archived: bool| {
+        let id = SessionId::new(id);
+        let parent = parent.map(SessionId::new);
+        let store = store.clone();
+        async move {
+            let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+            store
+                .create_session(id.clone(), PARTITION, blob)
+                .await
+                .expect("create session");
+            store
+                .set_session_meta(
+                    &id,
+                    SessionMeta {
+                        role: Some(role),
+                        parent,
+                        archived,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("set meta");
+        }
+    };
+    seed("arch-primary", StoreRole::Primary, None, true).await;
+    seed(
+        "arch-primary/child",
+        StoreRole::ManagedChild,
+        Some("arch-primary"),
+        true,
+    )
+    .await;
+    seed(
+        "arch-primary/sub",
+        StoreRole::EphemeralSubagent,
+        Some("arch-primary"),
+        true,
+    )
+    .await;
+    seed(
+        "arch-primary/live-child",
+        StoreRole::ManagedChild,
+        Some("arch-primary"),
+        false,
+    )
+    .await;
+
+    let archived: Vec<SessionId> = node
+        .sessions_query(SessionQuery {
+            scope: SessionScope::Archived,
+            ..Default::default()
+        })
+        .await
+        .sessions
+        .into_iter()
+        .map(|i| i.session)
+        .collect();
+
+    for id in ["arch-primary", "arch-primary/child", "arch-primary/sub"] {
+        assert!(
+            archived.contains(&SessionId::new(id)),
+            "the Archived scope must surface archived role {id}, got {archived:?}"
+        );
+    }
+    assert!(
+        !archived.contains(&SessionId::new("arch-primary/live-child")),
+        "a non-archived child must not appear in the Archived scope, got {archived:?}"
+    );
+
+    // The archived children stay out of the TopLevel inbox.
+    let top: Vec<SessionId> = node
+        .sessions_query(SessionQuery::default())
+        .await
+        .sessions
+        .into_iter()
+        .map(|i| i.session)
+        .collect();
+    for id in ["arch-primary", "arch-primary/child", "arch-primary/sub"] {
+        assert!(
+            !top.contains(&SessionId::new(id)),
+            "archived {id} must not be in the TopLevel inbox, got {top:?}"
+        );
+    }
+
+    handle.shutdown().await;
+}
+
 /// The scoped roster's cursor pagination is *total*: walking `All` one bounded page at a time
 /// visits every session exactly once and terminates (no gaps, no repeats, `next_cursor == None`
 /// on the last page). The order is stable (most-recent-first, id tie-break) so the cursor is
