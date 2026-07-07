@@ -632,7 +632,20 @@ impl WireVersion {
     /// `TurnFinished{Failed}` when a foreign child dies mid-turn (stdout EOF).
     /// Additive (new ops/events/optional fields; `is_self` is required only inside the brand-new
     /// `MembershipChanged` variant; no renames).
-    pub const CURRENT: Self = Self(30);
+    ///
+    /// v31 (user feedback over OpenTelemetry — N1 API contract half): adds the additive
+    /// `FeedbackSubmit { kind, target?, rating?, comment?, include_content, diagnostics?, surface }`
+    /// op -> `FeedbackAck { accepted, queued }` (the ack means accepted+queued to the durable
+    /// feedback outbox, never delivered — export is a separate best-effort drain), with the
+    /// `FeedbackKind` (`response` / `app`), `FeedbackRating` (`up` / `down`), `FeedbackTarget`
+    /// (`{ session, cursor, trace? }`, `cursor` = the rated turn's durable journal cursor) and
+    /// `FeedbackDiagnostics` (`{ app_version?, os? }`) DTOs; plus the node-owned telemetry consent
+    /// surface `TelemetryConsentGet` / `TelemetryConsentSet { enabled }` -> `TelemetryConsent
+    /// { enabled }` (default OFF / opt-in). Explicit feedback is per-event consent — queued even
+    /// when the global toggle is off; passive telemetry stays gated by the toggle. Additive (new
+    /// request/response variants + DTOs), but bumped because `is_compatible` is strict-equal, so an
+    /// older peer cannot decode the new ops (mirrors the additive v15–v30 bumps).
+    pub const CURRENT: Self = Self(31);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

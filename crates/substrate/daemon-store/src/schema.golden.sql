@@ -1,6 +1,7 @@
 CREATE INDEX completion_notices_parent ON completion_notices (parent_session);
 CREATE INDEX cron_jobs_due ON cron_jobs (paused, next_fire_unix);
 CREATE INDEX cron_runs_job ON cron_runs (job_id, rowseq);
+CREATE INDEX feedback_outbox_pending ON feedback_outbox (delivered, created_at_ms);
 CREATE INDEX journal_seals_stream ON journal_seals (stream, id);
 CREATE INDEX pending_session_input_session ON pending_session_input (session_id, rowseq);
 CREATE INDEX room_members_room ON room_members (room_id);
@@ -86,6 +87,12 @@ n              INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE enqueued_jobs (
     job_id TEXT PRIMARY KEY
+);
+CREATE TABLE feedback_outbox (
+id            TEXT PRIMARY KEY,
+created_at_ms INTEGER NOT NULL,
+payload       BLOB NOT NULL,
+delivered     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE job_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,6 +198,10 @@ CREATE TABLE session_usage (
     cost_micros         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE sqlite_sequence(name,seq);
+CREATE TABLE telemetry_consent (
+id      INTEGER PRIMARY KEY CHECK (id = 0),
+enabled INTEGER NOT NULL
+);
 CREATE TABLE tool_overrides (
 tool    TEXT PRIMARY KEY,
 enabled INTEGER NOT NULL

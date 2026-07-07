@@ -73,6 +73,10 @@ use daemon_api::{
     DeliverySink,
     Distribution,
     EventsPage,
+    FeedbackAck,
+    FeedbackKind,
+    FeedbackRating,
+    FeedbackSubmitArgs,
     FleetReport,
     FsContent,
     FsEntry,
@@ -155,7 +159,9 @@ use daemon_protocol::{
     HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, IsolationPolicy, Origin,
     OriginScope, SessionLogEntry, SessionPayload, SinkKind, TranscriptBlock, TransportId, UserMsg,
 };
-use daemon_store::{SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore};
+use daemon_store::{
+    FeedbackRecord, SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore,
+};
 use daemon_telemetry::{
     current_trace, decode_entry, verify_segment, JournalPayload, Metrics, SegmentInput,
     TraceSigner, VerifyingKey, GENESIS_ROOT,

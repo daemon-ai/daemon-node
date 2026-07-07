@@ -1262,6 +1262,51 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         }),
     )?;
 
+    // -- user feedback over OpenTelemetry (N1; wire v31) -----------------------------------------
+    write_cbor(
+        &out,
+        "request-feedback-submit.cbor",
+        &ApiRequest::FeedbackSubmit {
+            kind: daemon_api::FeedbackKind::Response,
+            target: Some(daemon_api::FeedbackTarget {
+                session: "s-fixture".into(),
+                cursor: 42,
+                trace: Some(daemon_common::TraceId(0x1234)),
+            }),
+            rating: Some(daemon_api::FeedbackRating::Up),
+            comment: Some("nailed it".into()),
+            include_content: true,
+            diagnostics: Some(daemon_api::FeedbackDiagnostics {
+                app_version: Some("1.2.3".into()),
+                os: Some("linux".into()),
+            }),
+            surface: "transcript".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-telemetry-consent-get.cbor",
+        &ApiRequest::TelemetryConsentGet,
+    )?;
+    write_cbor(
+        &out,
+        "request-telemetry-consent-set.cbor",
+        &ApiRequest::TelemetryConsentSet { enabled: true },
+    )?;
+    write_cbor(
+        &out,
+        "response-feedback-ack.cbor",
+        &ApiResponse::FeedbackAck(daemon_api::FeedbackAck {
+            accepted: true,
+            queued: true,
+        }),
+    )?;
+    write_cbor(
+        &out,
+        "response-telemetry-consent.cbor",
+        &ApiResponse::TelemetryConsent { enabled: true },
+    )?;
+
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())
 }

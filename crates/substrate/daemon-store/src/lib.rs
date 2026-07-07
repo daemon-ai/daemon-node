@@ -318,6 +318,50 @@ pub struct StoredCronSuggestion {
     pub created_unix: u64,
 }
 
+/// A durable user-feedback record on the feedback outbox (N1: "user feedback over OpenTelemetry").
+///
+/// The store stays protocol-free: every field is a primitive/string the host mapped from the wire
+/// `FeedbackSubmit` (`kind`/`rating`/`consent` are stable lowercase strings). SQLite persists the
+/// whole record as an opaque CBOR blob plus indexed `id`/`created_at_ms`/`delivered` columns; the
+/// exporter (a sibling workstream, wired in the integration phase) drains it via
+/// [`SessionStore::feedback_pending`] and marks each delivered with
+/// [`SessionStore::feedback_mark_delivered`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackRecord {
+    /// The opaque feedback id (primary key; host-minted, e.g. `fb-<hex>`).
+    pub id: String,
+    /// Unix milliseconds the feedback was accepted by the node.
+    pub created_at_ms: i64,
+    /// The feedback flavor (`"response"` / `"app"`).
+    pub kind: String,
+    /// The thumbs rating (`"up"` / `"down"`), when given.
+    pub rating: Option<String>,
+    /// The free-form comment, when given (already length-validated by the host).
+    pub comment: Option<String>,
+    /// Whether the submitter consented to including the rated response content in the export.
+    pub include_content: bool,
+    /// The rated response's session, for response feedback (`None` for app feedback).
+    pub session: Option<String>,
+    /// The rated response's durable journal cursor, for response feedback.
+    pub cursor: Option<u64>,
+    /// The rated turn's trace-context id, when the client supplied it.
+    pub trace: Option<u64>,
+    /// The UI surface the feedback came from (free-form label).
+    pub surface: String,
+    /// The submitting app's version string, when supplied.
+    pub app_version: Option<String>,
+    /// The submitting app's OS/platform string, when supplied.
+    pub os: Option<String>,
+    /// Consent provenance: `"opted-in"` if the global telemetry toggle was on at submit time, else
+    /// `"explicit-one-shot"` (explicit feedback is per-event consent, queued even when the toggle
+    /// is off).
+    pub consent: String,
+    /// The node version (`daemon_common::VERSION`) that accepted the feedback.
+    pub node_version: String,
+    /// Whether the exporter has drained + delivered this record (set by `feedback_mark_delivered`).
+    pub delivered: bool,
+}
+
 /// A background-job command enqueued on the durable job outbox (lifecycle §5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCommand {
@@ -1024,6 +1068,39 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// Enqueue a user-feedback record onto the durable feedback outbox (N1). Idempotent by `id`
+    /// (a re-enqueue of the same id is a no-op). Default: no-op (a store without the outbox).
+    async fn feedback_enqueue(&self, _record: FeedbackRecord) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The oldest undelivered feedback records (by `created_at_ms`), capped at `limit` (`0` = all).
+    ///
+    /// This is the exporter's DRAIN seam: the OpenTelemetry exporter (a sibling workstream, wired in
+    /// the integration phase — N1 leaves it unwired) polls this, ships each record as an OTel log
+    /// event, then calls [`Self::feedback_mark_delivered`]. Default: none (a store without the
+    /// outbox).
+    async fn feedback_pending(&self, _limit: usize) -> Vec<FeedbackRecord> {
+        Vec::new()
+    }
+
+    /// Mark a feedback record delivered (idempotent) so [`Self::feedback_pending`] stops returning
+    /// it. Called by the exporter after a successful ship. Default: no-op.
+    async fn feedback_mark_delivered(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Read the node-owned global telemetry consent toggle (N1). Default OFF (opt-in): a store
+    /// without the setting reports `false`.
+    async fn telemetry_consent_get(&self) -> bool {
+        false
+    }
+
+    /// Set the node-owned global telemetry consent toggle (N1). Default: no-op.
+    async fn telemetry_consent_set(&self, _enabled: bool) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List every durable Room (daemon-rooms-spec.md). The Rooms adapter loads these at bring-up to
     /// reconstruct the loopback transports. Default: none (a store without durable rooms — rooms are
     /// then in-memory only for the process lifetime, mirroring the `routing_*` default).
@@ -1278,6 +1355,12 @@ struct Inner {
     /// Node-wide tool enable/disable overrides (wire v30), keyed by tool name (the in-memory
     /// analogue of the SQLite `tool_overrides` table).
     tool_overrides: HashMap<String, bool>,
+    /// Durable user-feedback outbox (N1), in enqueue order (the in-memory analogue of the SQLite
+    /// `feedback_outbox` table). Keyed-dedup by `id`.
+    feedback_outbox: Vec<FeedbackRecord>,
+    /// The node-owned global telemetry consent toggle (N1; default OFF / opt-in). In-memory analogue
+    /// of the SQLite `telemetry_consent` single-row setting.
+    telemetry_consent: bool,
     /// Durable manually-registered ACP catalog entries, keyed by name (I7; the in-memory analogue of
     /// the SQLite `acp_catalog` table).
     acp_catalog: HashMap<String, AcpEntry>,
@@ -1902,6 +1985,49 @@ impl SessionStore for InMemoryStore {
             .unwrap()
             .tool_overrides
             .insert(tool.to_string(), enabled);
+        Ok(())
+    }
+
+    async fn feedback_enqueue(&self, record: FeedbackRecord) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Idempotent by id: a re-enqueue of the same id is a no-op (mirrors the SQLite PK upsert).
+        if inner.feedback_outbox.iter().any(|r| r.id == record.id) {
+            return Ok(());
+        }
+        inner.feedback_outbox.push(record);
+        Ok(())
+    }
+
+    async fn feedback_pending(&self, limit: usize) -> Vec<FeedbackRecord> {
+        let inner = self.inner.lock().unwrap();
+        let mut pending: Vec<FeedbackRecord> = inner
+            .feedback_outbox
+            .iter()
+            .filter(|r| !r.delivered)
+            .cloned()
+            .collect();
+        // Oldest first (mirrors the SQLite `ORDER BY created_at_ms, id`).
+        pending.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)));
+        if limit != 0 {
+            pending.truncate(limit);
+        }
+        pending
+    }
+
+    async fn feedback_mark_delivered(&self, id: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(rec) = inner.feedback_outbox.iter_mut().find(|r| r.id == id) {
+            rec.delivered = true;
+        }
+        Ok(())
+    }
+
+    async fn telemetry_consent_get(&self) -> bool {
+        self.inner.lock().unwrap().telemetry_consent
+    }
+
+    async fn telemetry_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().telemetry_consent = enabled;
         Ok(())
     }
 

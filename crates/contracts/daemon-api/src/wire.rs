@@ -982,6 +982,41 @@ pub enum ApiRequest {
         /// The grant id to revoke.
         id: String,
     },
+
+    // -- user feedback over OpenTelemetry (N1; wire v31) -----------------------------------------
+    /// [`ControlApi::feedback_submit`] — submit thumbs up/down + optional comment on an agent
+    /// response, or general app feedback. Explicit feedback is per-event consent: it is
+    /// accepted+queued even when the global telemetry toggle is off (passive telemetry stays
+    /// gated). Answered by [`ApiResponse::FeedbackAck`].
+    FeedbackSubmit {
+        /// The feedback flavor (response vs. app).
+        kind: FeedbackKind,
+        /// The rated response, for [`FeedbackKind::Response`] (`None` for app feedback).
+        #[serde(default)]
+        target: Option<FeedbackTarget>,
+        /// The thumbs up/down rating, when given.
+        #[serde(default)]
+        rating: Option<FeedbackRating>,
+        /// A free-form comment, when given (server-capped at [`crate::FEEDBACK_COMMENT_MAX`] bytes).
+        #[serde(default)]
+        comment: Option<String>,
+        /// Whether the client consents to including the rated response content in the exported event.
+        include_content: bool,
+        /// Optional client diagnostics (app version / OS).
+        #[serde(default)]
+        diagnostics: Option<FeedbackDiagnostics>,
+        /// The UI surface the feedback was given from (free-form label, e.g. `"transcript"`).
+        surface: String,
+    },
+    /// [`ControlApi::telemetry_consent_get`] — read the node-owned global telemetry consent toggle
+    /// (default OFF / opt-in). Answered by [`ApiResponse::TelemetryConsent`].
+    TelemetryConsentGet,
+    /// [`ControlApi::telemetry_consent_set`] — set the node-owned global telemetry consent toggle;
+    /// the reply ([`ApiResponse::TelemetryConsent`]) echoes the new state.
+    TelemetryConsentSet {
+        /// The new consent state (`true` opts passive telemetry in).
+        enabled: bool,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -1176,6 +1211,17 @@ pub enum ApiResponse {
     AccessRoles(Vec<RoleInfo>),
     /// The caller's own principal view (who_am_i).
     WhoAmI(PrincipalView),
+
+    // -- user feedback over OpenTelemetry (N1; wire v31) -----------------------------------------
+    /// The acknowledgement for a `FeedbackSubmit` — accepted+queued to the durable feedback outbox
+    /// (NOT delivered; export is a separate best-effort drain).
+    FeedbackAck(FeedbackAck),
+    /// The node-owned global telemetry consent toggle (the reply to both
+    /// `TelemetryConsentGet` and `TelemetryConsentSet`; the latter echoes the new state).
+    TelemetryConsent {
+        /// The current consent state.
+        enabled: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1999,6 +2045,56 @@ mod auth_contract_tests {
             roles: vec!["admin".into()],
             capabilities: vec!["access_admin".into()],
         }));
+    }
+
+    #[test]
+    fn feedback_frames_round_trip() {
+        fn rt_req(req: &ApiRequest) {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(req, &mut bytes).expect("encode ApiRequest");
+            let decoded: ApiRequest = ciborium::from_reader(&bytes[..]).expect("decode ApiRequest");
+            assert_eq!(&decoded, req);
+        }
+        fn rt_res(res: &ApiResponse) {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(res, &mut bytes).expect("encode ApiResponse");
+            let decoded: ApiResponse =
+                ciborium::from_reader(&bytes[..]).expect("decode ApiResponse");
+            assert_eq!(&decoded, res);
+        }
+        rt_req(&ApiRequest::FeedbackSubmit {
+            kind: FeedbackKind::Response,
+            target: Some(FeedbackTarget {
+                session: "s1".into(),
+                cursor: 7,
+                trace: Some(TraceId(0xabc)),
+            }),
+            rating: Some(FeedbackRating::Down),
+            comment: Some("could be better".into()),
+            include_content: true,
+            diagnostics: Some(FeedbackDiagnostics {
+                app_version: Some("2.0".into()),
+                os: None,
+            }),
+            surface: "transcript".into(),
+        });
+        // App feedback: no target, comment-only.
+        rt_req(&ApiRequest::FeedbackSubmit {
+            kind: FeedbackKind::App,
+            target: None,
+            rating: None,
+            comment: Some("great app".into()),
+            include_content: false,
+            diagnostics: None,
+            surface: "settings".into(),
+        });
+        rt_req(&ApiRequest::TelemetryConsentGet);
+        rt_req(&ApiRequest::TelemetryConsentSet { enabled: true });
+        rt_res(&ApiResponse::FeedbackAck(FeedbackAck {
+            accepted: true,
+            queued: true,
+        }));
+        rt_res(&ApiResponse::TelemetryConsent { enabled: false });
     }
 
     #[test]

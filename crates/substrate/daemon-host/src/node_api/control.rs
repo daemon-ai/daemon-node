@@ -445,6 +445,118 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(format!("set tool override: {e}")))
     }
 
+    async fn feedback_submit(&self, args: FeedbackSubmitArgs) -> Result<FeedbackAck, ApiError> {
+        let FeedbackSubmitArgs {
+            kind,
+            target,
+            rating,
+            comment,
+            include_content,
+            diagnostics,
+            surface,
+        } = args;
+
+        // -- server-side validation (the node is the enforcement point; client checks are UX sugar) --
+        if let Some(comment) = &comment {
+            if comment.len() > daemon_api::FEEDBACK_COMMENT_MAX {
+                return Err(ApiError::Other(format!(
+                    "feedback comment exceeds {} bytes",
+                    daemon_api::FEEDBACK_COMMENT_MAX
+                )));
+            }
+        }
+        match kind {
+            // Response feedback rates a specific turn: it needs a target AND a rating.
+            FeedbackKind::Response => {
+                let Some(target) = &target else {
+                    return Err(ApiError::Other(
+                        "response feedback requires a target".into(),
+                    ));
+                };
+                if rating.is_none() {
+                    return Err(ApiError::Other(
+                        "response feedback requires a rating".into(),
+                    ));
+                }
+                // The target session must exist (durable or live).
+                if self.store.status(&target.session).await.is_none() {
+                    return Err(ApiError::UnknownSession(target.session.to_string()));
+                }
+            }
+            // App feedback is free-form: it needs at least a comment or a rating.
+            FeedbackKind::App => {
+                if comment.is_none() && rating.is_none() {
+                    return Err(ApiError::Other(
+                        "app feedback requires a comment or a rating".into(),
+                    ));
+                }
+            }
+        }
+
+        // Consent provenance: explicit feedback is per-event consent (accepted+queued regardless),
+        // but we record WHETHER the global telemetry toggle was on at submit time so the exporter
+        // can distinguish opted-in telemetry from a one-shot explicit grant.
+        let consent = if self.store.telemetry_consent_get().await {
+            "opted-in"
+        } else {
+            "explicit-one-shot"
+        };
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Best-effort enrichment: N1 stores the raw target (session + journal cursor + trace); the
+        // model/provider/end-reason/usage enrichment from the journal at `cursor` is left to the
+        // exporter phase (a sibling workstream) to keep this handler cheap and side-effect-free.
+        let record = FeedbackRecord {
+            id: mint_feedback_id(),
+            created_at_ms,
+            kind: match kind {
+                FeedbackKind::Response => "response".into(),
+                FeedbackKind::App => "app".into(),
+            },
+            rating: rating.map(|r| match r {
+                FeedbackRating::Up => "up".into(),
+                FeedbackRating::Down => "down".into(),
+            }),
+            comment,
+            include_content,
+            session: target.as_ref().map(|t| t.session.to_string()),
+            cursor: target.as_ref().map(|t| t.cursor),
+            trace: target.as_ref().and_then(|t| t.trace).map(|t| t.0),
+            surface,
+            app_version: diagnostics.as_ref().and_then(|d| d.app_version.clone()),
+            os: diagnostics.and_then(|d| d.os),
+            consent: consent.into(),
+            node_version: daemon_common::VERSION.to_string(),
+            delivered: false,
+        };
+
+        self.store
+            .feedback_enqueue(record)
+            .await
+            .map_err(|e| ApiError::Other(format!("enqueue feedback: {e}")))?;
+        // The ack means accepted+queued to the durable outbox — NEVER delivered (export is a
+        // separate, best-effort drain wired in the integration phase).
+        Ok(FeedbackAck {
+            accepted: true,
+            queued: true,
+        })
+    }
+
+    async fn telemetry_consent_get(&self) -> Result<bool, ApiError> {
+        Ok(self.store.telemetry_consent_get().await)
+    }
+
+    async fn telemetry_consent_set(&self, enabled: bool) -> Result<bool, ApiError> {
+        self.store
+            .telemetry_consent_set(enabled)
+            .await
+            .map_err(|e| ApiError::Other(format!("set telemetry consent: {e}")))?;
+        Ok(enabled)
+    }
+
     async fn fingerprint_list(
         &self,
         session: SessionId,
@@ -1851,4 +1963,23 @@ impl NodeApiImpl {
             .capture(sid.as_str(), &call_id, "operator_fs_write", &env)
             .await;
     }
+}
+
+/// Mint a fresh feedback id: `fb-<32 hex>` from 16 random bytes (mirrors `mint_session_id`). A
+/// getrandom failure is astronomically unlikely; fall back to a time-seeded id rather than panicking.
+fn mint_feedback_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes.copy_from_slice(&nanos.to_le_bytes());
+    }
+    let mut hex = String::with_capacity(3 + bytes.len() * 2);
+    hex.push_str("fb-");
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
 }
