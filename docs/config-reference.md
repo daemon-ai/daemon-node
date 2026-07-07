@@ -208,6 +208,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
 | `store` | `DAEMON_STORE` | string | `memory` |
 | `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |
+| `telemetry.feedback_endpoint` | `DAEMON_TELEMETRY__FEEDBACK_ENDPOINT` | optional | _(unset)_ |
 | `vision.base_url` | `DAEMON_VISION__BASE_URL` | optional | _(unset)_ |
 | `vision.credential_key` | `DAEMON_VISION__CREDENTIAL_KEY` | optional | _(unset)_ |
 | `vision.max_base64_mb` | `DAEMON_VISION__MAX_BASE64_MB` | number | `20` |
