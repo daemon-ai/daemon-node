@@ -538,6 +538,11 @@ async fn serve_registry(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespons
         ApiRequest::Caps => ApiResponse::Caps(api.caps().await),
         ApiRequest::ConfigGet => ok_or_err(api.config_get().await, ApiResponse::Config),
         ApiRequest::ConfigSet { config } => unit_or_err(api.config_set(config).await),
+        ApiRequest::GatewayGet => ok_or_err(api.gateway_get().await, ApiResponse::GatewayStatus),
+        ApiRequest::GatewaySet { enabled, addr } => ok_or_err(
+            api.gateway_set(enabled, addr).await,
+            ApiResponse::GatewayStatus,
+        ),
         _ => return None,
     })
 }

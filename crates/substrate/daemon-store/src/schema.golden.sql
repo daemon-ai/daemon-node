@@ -94,6 +94,11 @@ created_at_ms INTEGER NOT NULL,
 payload       BLOB NOT NULL,
 delivered     INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE gateway_config (
+id      INTEGER PRIMARY KEY CHECK (id = 0),
+enabled INTEGER NOT NULL,
+addr    TEXT
+);
 CREATE TABLE job_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id     TEXT NOT NULL,

@@ -362,6 +362,17 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  enabled INTEGER NOT NULL\n\
              );",
         ),
+        // M10 (gateway runtime override): the node-owned OpenAI gateway's wire-configurable
+        // `GatewaySet` state (enable + optional bind addr), layered on top of the boot `[gateway]`
+        // config so a runtime enable/rebind survives a restart. A single-row (`id = 0`) setting
+        // mirroring `telemetry_consent`; absence = the boot config stands. `addr` NULL = keep/none.
+        M::up(
+            "CREATE TABLE gateway_config (\n\
+                 id      INTEGER PRIMARY KEY CHECK (id = 0),\n\
+                 enabled INTEGER NOT NULL,\n\
+                 addr    TEXT\n\
+             );",
+        ),
     ])
 });
 
@@ -1690,6 +1701,33 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn gateway_override(&self) -> Option<(bool, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT enabled, addr FROM gateway_config WHERE id = 0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    async fn set_gateway_override(
+        &self,
+        enabled: bool,
+        addr: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO gateway_config (id, enabled, addr) VALUES (0, ?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET enabled = ?1, addr = ?2",
+            params![enabled as i64, addr],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn room_list(&self) -> Vec<Room> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -2271,10 +2309,11 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (9: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// `user_version` (10: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
     /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, the
-    /// wire-v30 `tool_overrides` table, and the wire-v32 feedback outbox + telemetry-consent seam).
+    /// wire-v30 `tool_overrides` table, the wire-v32 feedback outbox + telemetry-consent seam, and
+    /// the gateway runtime-override `gateway_config` single-row setting).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2285,7 +2324,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 10, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

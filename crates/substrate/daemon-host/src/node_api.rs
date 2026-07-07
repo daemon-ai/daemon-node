@@ -93,6 +93,7 @@ use daemon_api::{
     FsWatchPageView,
     FsWriteArgs,
     FsWriteFromBlobArgs,
+    GatewayStatus,
     HealthReport,
     JournalPageView,
     JournalRecord,
@@ -482,6 +483,16 @@ pub struct NodeApiImpl {
     /// `None` => export is inert (no endpoint configured, or the `otel` feature is off) and records
     /// simply stay queued. Bound via [`NodeApiImpl::with_feedback_endpoint`] at assembly.
     feedback_drain: Option<Arc<feedback::FeedbackDrain>>,
+    /// The node-managed backend resources (the gateway + local inference) surfaced in
+    /// [`ControlApi::health`] alongside the resident-service supervisor's children. Registered
+    /// post-`Arc` by the assembling binary via [`NodeApiImpl::register_managed`]; empty on a node
+    /// with no managed backends wired.
+    managed: Arc<Mutex<Vec<Arc<dyn crate::managed::ManagedResource>>>>,
+    /// The typed gateway control seam backing `gateway_get`/`gateway_set`. `None` => those ops
+    /// resolve to [`ApiError::Unsupported`]. Bound post-`Arc` (the gateway backend needs the
+    /// assembled node) via [`NodeApiImpl::set_gateway`], which also registers it into `managed` so
+    /// the gateway reports its health like any other managed backend.
+    gateway: Arc<Mutex<Option<Arc<dyn crate::managed::GatewayControl>>>>,
 }
 
 impl NodeApiImpl {

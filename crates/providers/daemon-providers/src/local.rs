@@ -20,6 +20,7 @@
 //! is held behind a mutex for the duration of each call.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,94 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::{finalize_output, RawToolCall};
+
+/// The lifecycle state of a local-inference worker, lifted out of [`LocalProvider`] so the node can
+/// report worker liveness in health without changing the provider's recovery behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalInferenceState {
+    /// No worker spawned yet (lazy first-use), or torn down after a recoverable transport failure —
+    /// the next generation respawns it.
+    Idle,
+    /// A worker is spawning / loading the model.
+    Loading,
+    /// A worker is loaded and ready to generate.
+    Loaded,
+    /// The crash-loop meltdown tripped (too many respawns inside the window); the next generation
+    /// fails fatally until the window clears.
+    Crashed,
+}
+
+impl LocalInferenceState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Loading,
+            2 => Self::Loaded,
+            3 => Self::Crashed,
+            _ => Self::Idle,
+        }
+    }
+}
+
+/// A cheap, cloneable, node-observable handle over a local worker's lifecycle state + respawn count.
+///
+/// Threaded from [`SwitchableLocalProvider`] into each [`LocalProvider`] it builds so the node can
+/// register one `"local-inference"` health entry that follows the shared worker. The provider
+/// updates it at its existing lifecycle transitions (lazy spawn, respawn, crash-loop meltdown); it
+/// is a pure observation seam and changes no recovery behavior.
+#[derive(Clone, Default)]
+pub struct LocalInferenceStatus {
+    inner: Arc<LocalStatusInner>,
+}
+
+#[derive(Default)]
+struct LocalStatusInner {
+    /// Encodes [`LocalInferenceState`]: 0 idle, 1 loading, 2 loaded, 3 crashed.
+    state: AtomicU8,
+    /// Total worker spawns; respawns (the reported `restarts`) are spawns beyond the first.
+    spawns: AtomicU32,
+}
+
+impl LocalInferenceStatus {
+    /// A fresh, detached status handle (state `Idle`, zero spawns).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set(&self, state: LocalInferenceState) {
+        self.inner.state.store(state as u8, Ordering::Relaxed);
+    }
+
+    /// Record that a worker (re)spawn is starting: bump the spawn counter and enter `Loading`.
+    pub fn mark_loading(&self) {
+        self.inner.spawns.fetch_add(1, Ordering::Relaxed);
+        self.set(LocalInferenceState::Loading);
+    }
+
+    /// A worker finished loading and is ready.
+    pub fn mark_loaded(&self) {
+        self.set(LocalInferenceState::Loaded);
+    }
+
+    /// The live worker was torn down (recoverable failure) — the next generation respawns it.
+    pub fn mark_idle(&self) {
+        self.set(LocalInferenceState::Idle);
+    }
+
+    /// The crash-loop meltdown tripped.
+    pub fn mark_crashed(&self) {
+        self.set(LocalInferenceState::Crashed);
+    }
+
+    /// The current lifecycle state.
+    pub fn state(&self) -> LocalInferenceState {
+        LocalInferenceState::from_u8(self.inner.state.load(Ordering::Relaxed))
+    }
+
+    /// Worker respawns so far (spawns beyond the first) — the health `restarts` count.
+    pub fn restarts(&self) -> u32 {
+        self.inner.spawns.load(Ordering::Relaxed).saturating_sub(1)
+    }
+}
 
 /// Construction + tuning for a [`LocalProvider`]'s worker.
 #[derive(Clone, Debug)]
@@ -99,11 +188,20 @@ struct LocalInner {
     capabilities: Capabilities,
     worker: Mutex<Option<Worker>>,
     restarts: Mutex<Vec<Instant>>,
+    /// Node-observable worker lifecycle status (idle/loading/loaded/crashed + respawns), updated at
+    /// the existing spawn / teardown / meltdown transitions. Detached by default.
+    status: LocalInferenceStatus,
 }
 
 impl LocalProvider {
     /// Build a provider for `cfg`. The worker is spawned lazily on the first generation.
     pub fn new(cfg: WorkerConfig) -> Self {
+        Self::with_status(cfg, LocalInferenceStatus::new())
+    }
+
+    /// Build a provider for `cfg` reporting its worker lifecycle through the shared `status` handle
+    /// (the node's `"local-inference"` health seam). The worker is still spawned lazily.
+    pub fn with_status(cfg: WorkerConfig, status: LocalInferenceStatus) -> Self {
         let capabilities = default_capabilities(&cfg);
         Self {
             inner: Arc::new(LocalInner {
@@ -111,6 +209,7 @@ impl LocalProvider {
                 capabilities,
                 worker: Mutex::new(None),
                 restarts: Mutex::new(Vec::new()),
+                status,
             }),
         }
     }
@@ -282,6 +381,9 @@ impl LocalInner {
                 if let Some(mut dead) = guard.take() {
                     dead.shutdown().await;
                 }
+                // The live worker was torn down; the next generation respawns it (observation only —
+                // the recovery path is unchanged).
+                self.status.mark_idle();
             }
         }
         result
@@ -294,6 +396,7 @@ impl LocalInner {
             let now = Instant::now();
             restarts.retain(|t| now.duration_since(*t) < self.cfg.restart_window);
             if restarts.len() as u32 >= self.cfg.max_restarts {
+                self.status.mark_crashed();
                 return Err(Failure::Fatal(format!(
                     "daemon-infer worker crash-loop: {} restarts within {:?}",
                     restarts.len(),
@@ -302,7 +405,14 @@ impl LocalInner {
             }
             restarts.push(now);
         }
-        Worker::spawn(&self.cfg).await
+        self.status.mark_loading();
+        let worker = Worker::spawn(&self.cfg).await;
+        match &worker {
+            Ok(_) => self.status.mark_loaded(),
+            // A single spawn failure is not a meltdown: fall back to idle so the next call retries.
+            Err(_) => self.status.mark_idle(),
+        }
+        worker
     }
 }
 
@@ -661,6 +771,9 @@ struct SwitchInner {
     capabilities: Capabilities,
     /// The currently-built provider keyed by the active model (`None` key = the template fallback).
     current: Mutex<Option<(Option<ModelRef>, Arc<LocalProvider>)>>,
+    /// The shared node-observable worker status, threaded into every [`LocalProvider`] this builds
+    /// so a hot-swap keeps reporting through the same `"local-inference"` health handle.
+    status: LocalInferenceStatus,
 }
 
 impl SwitchableLocalProvider {
@@ -680,8 +793,15 @@ impl SwitchableLocalProvider {
                 profile: profile.into(),
                 capabilities,
                 current: Mutex::new(None),
+                status: LocalInferenceStatus::new(),
             }),
         }
+    }
+
+    /// The shared node-observable worker status handle (idle/loading/loaded/crashed + respawns) —
+    /// the seam the node registers as its `"local-inference"` health entry.
+    pub fn status(&self) -> LocalInferenceStatus {
+        self.inner.status.clone()
     }
 }
 
@@ -720,10 +840,13 @@ impl SwitchInner {
                         wc.params.isq = Some(isq);
                     }
                 }
-                Arc::new(LocalProvider::new(wc))
+                Arc::new(LocalProvider::with_status(wc, self.status.clone()))
             }
             // No active model: use the configured fallback model string as-is.
-            None => Arc::new(LocalProvider::new(self.template.clone())),
+            None => Arc::new(LocalProvider::with_status(
+                self.template.clone(),
+                self.status.clone(),
+            )),
         };
         *cur = Some((want, provider.clone()));
         Ok(provider)

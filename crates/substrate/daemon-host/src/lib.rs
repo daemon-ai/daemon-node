@@ -53,6 +53,7 @@ pub mod cut;
 pub mod engine_incarnation;
 pub mod foreign;
 pub mod journal;
+pub mod managed;
 pub mod node_api;
 pub mod process_agent;
 pub mod profiles;
@@ -119,6 +120,7 @@ pub use journal::{
     drain_credential_audit, journal_stream, spawn_credential_audit_drain, CredentialAuditDrain,
     JournalFeeder, JournalSink,
 };
+pub use managed::{GatewayControl, ManagedResource};
 pub use node_api::{
     decode_overlay, encode_overlay, AccountProvisioning, AgentDiscovery, CloudCatalog,
     DeliveryHost, DurableProfileResolver, ForeignSessionFactory, ModelProviderFactory, NodeApiImpl,

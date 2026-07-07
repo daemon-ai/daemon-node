@@ -1083,6 +1083,26 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("config_set".into()))
     }
 
+    /// Read the node-owned OpenAI-compatible gateway's runtime status (enabled/addr/listening/
+    /// last_error). The gateway is a node-managed resident service (also visible as the `"gateway"`
+    /// [`ServiceHealth`] entry); this is its typed control view. Default: unsupported (a transport
+    /// with no gateway seam wired).
+    async fn gateway_get(&self) -> Result<GatewayStatus, ApiError> {
+        Err(ApiError::Unsupported("gateway_get".into()))
+    }
+
+    /// Enable/disable the gateway and optionally rebind its listener. The new state is persisted to
+    /// the durable store (config is the default/fallback) and the listener is hot-(re)bound, then
+    /// the resulting [`GatewayStatus`] is returned. `addr = None` keeps the current/boot address.
+    /// Default: unsupported.
+    async fn gateway_set(
+        &self,
+        _enabled: bool,
+        _addr: Option<String>,
+    ) -> Result<GatewayStatus, ApiError> {
+        Err(ApiError::Unsupported("gateway_set".into()))
+    }
+
     /// Submit user feedback (N1; wire v31) — thumbs up/down + optional comment on an agent
     /// response, or general app feedback. The node validates the submission server-side and, on
     /// success, persists it to the durable feedback outbox (the acknowledgement means
@@ -1964,6 +1984,25 @@ pub struct ServiceHealth {
     pub restarts: u32,
     /// A human-readable detail when not `ok`.
     pub detail: Option<String>,
+}
+
+/// The node-owned OpenAI-compatible gateway's runtime status (the reply to both
+/// [`ControlApi::gateway_get`] and [`ControlApi::gateway_set`]). The gateway is a node-managed
+/// resident service (also surfaced as a [`ServiceHealth`] entry named `"gateway"`); this is its
+/// typed control view: whether it should be serving (`enabled`), the effective bind `addr`
+/// (runtime override on top of boot config), whether the listener is actually bound (`listening`),
+/// and the last bind/serve error if any.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayStatus {
+    /// Whether the gateway is configured to serve (the persisted enable state).
+    pub enabled: bool,
+    /// The effective bind address (`None` when no addr is configured yet).
+    pub addr: Option<String>,
+    /// Whether the listener is currently bound and serving.
+    pub listening: bool,
+    /// The last bind/serve error, if the most recent (re)bind failed.
+    pub last_error: Option<String>,
 }
 
 /// Durable queue depths and live counts (a projection of `StoreStats` + active sessions).

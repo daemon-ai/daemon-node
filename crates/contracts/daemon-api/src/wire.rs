@@ -622,6 +622,16 @@ pub enum ApiRequest {
         /// The replacement config.
         config: NodeConfigView,
     },
+    /// [`ControlApi::gateway_get`] — read the node-owned gateway's runtime status.
+    GatewayGet,
+    /// [`ControlApi::gateway_set`] — enable/disable + optionally rebind the gateway listener.
+    GatewaySet {
+        /// Whether the gateway should be serving.
+        enabled: bool,
+        /// An optional new bind address (loopback recommended); `None` keeps the current/boot addr.
+        #[serde(default)]
+        addr: Option<String>,
+    },
     /// [`ControlApi::cron_list`].
     CronList,
     /// [`ControlApi::cron_create`].
@@ -1149,6 +1159,8 @@ pub enum ApiResponse {
     CommandOutput(CommandOutput),
     /// The node runtime config (config_get).
     Config(NodeConfigView),
+    /// The node-owned gateway's runtime status (gateway_get / gateway_set).
+    GatewayStatus(GatewayStatus),
     /// The read-only delegation guardrail caps (caps; wire v29).
     Caps(CapsReport),
     /// The scheduled cron jobs (cron_list).

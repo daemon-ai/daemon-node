@@ -1128,6 +1128,24 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// Read the node-owned OpenAI-gateway runtime override (`GatewaySet`) as `(enabled, addr)`, if
+    /// one was ever set. The node resolves the effective gateway config as this override layered on
+    /// top of the boot `[gateway]` config, so a runtime enable/rebind survives a restart. Default:
+    /// `None` (a store without the override — the boot config stands).
+    async fn gateway_override(&self) -> Option<(bool, Option<String>)> {
+        None
+    }
+
+    /// Persist the node-owned gateway runtime override (`enabled` + optional bind `addr`). A
+    /// single-row setting (mirroring `telemetry_consent`). Default: no-op.
+    async fn set_gateway_override(
+        &self,
+        _enabled: bool,
+        _addr: Option<&str>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List every durable Room (daemon-rooms-spec.md). The Rooms adapter loads these at bring-up to
     /// reconstruct the loopback transports. Default: none (a store without durable rooms — rooms are
     /// then in-memory only for the process lifetime, mirroring the `routing_*` default).
@@ -1388,6 +1406,9 @@ struct Inner {
     /// The node-owned global telemetry consent toggle (N1; default OFF / opt-in). In-memory analogue
     /// of the SQLite `telemetry_consent` single-row setting.
     telemetry_consent: bool,
+    /// The node-owned gateway runtime override (`GatewaySet`) as `(enabled, addr)`, if ever set.
+    /// In-memory analogue of the SQLite `gateway_config` single-row setting.
+    gateway_override: Option<(bool, Option<String>)>,
     /// Durable manually-registered ACP catalog entries, keyed by name (I7; the in-memory analogue of
     /// the SQLite `acp_catalog` table).
     acp_catalog: HashMap<String, AcpEntry>,
@@ -2055,6 +2076,19 @@ impl SessionStore for InMemoryStore {
 
     async fn telemetry_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
         self.inner.lock().unwrap().telemetry_consent = enabled;
+        Ok(())
+    }
+
+    async fn gateway_override(&self) -> Option<(bool, Option<String>)> {
+        self.inner.lock().unwrap().gateway_override.clone()
+    }
+
+    async fn set_gateway_override(
+        &self,
+        enabled: bool,
+        addr: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().gateway_override = Some((enabled, addr.map(str::to_string)));
         Ok(())
     }
 

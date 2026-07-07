@@ -20,6 +20,7 @@
 
 mod config;
 mod gateway_backend;
+mod managed_backends;
 
 use clap::Parser as _;
 
@@ -594,8 +595,12 @@ fn build_providers(
     provider_kind: Option<ProviderKind>,
     manager: &Arc<ModelManager>,
     active: &ActiveModels,
-) -> ProviderRegistry {
+) -> (
+    ProviderRegistry,
+    Option<daemon_providers::LocalInferenceStatus>,
+) {
     let mut providers = ProviderRegistry::new();
+    let mut local_status: Option<daemon_providers::LocalInferenceStatus> = None;
     let Some(provider_kind) = provider_kind else {
         // Unconfigured boot: the default provider fails every turn with a clear, actionable error
         // (never a silent mock). Discovery + profile creation still work; a configured profile
@@ -603,7 +608,7 @@ fn build_providers(
         providers.set_default(Arc::new(|| {
             Arc::new(UnconfiguredProvider::new()) as Arc<dyn Provider>
         }));
-        return providers;
+        return (providers, None);
     };
     match provider_kind {
         ProviderKind::Scripted => {
@@ -675,16 +680,19 @@ fn build_providers(
             // model lives in VRAM once and serializes generations behind the provider's mutex. The
             // switchable wrapper resolves the profile's *active* model through `daemon-models`
             // (download-on-first-use into the shared cache) and hot-swaps the worker on activation.
-            let provider: Arc<dyn Provider> = Arc::new(SwitchableLocalProvider::new(
+            let switchable = SwitchableLocalProvider::new(
                 local_worker_config(cfg, engine),
                 manager.clone(),
                 active.clone(),
                 cfg.profile.clone(),
-            ));
+            );
+            // Surface the shared worker's lifecycle as the node's `"local-inference"` health entry.
+            local_status = Some(switchable.status());
+            let provider: Arc<dyn Provider> = Arc::new(switchable);
             providers.set_default(Arc::new(move || provider.clone()));
         }
     }
-    providers
+    (providers, local_status)
 }
 
 /// Build a single provider client for a [`ProfileSpec`] — the per-session resolution seam handed to
@@ -2325,7 +2333,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // via `set_default(...)` without touching the engine or the construction sites. The API key
     // flows per-call through the credential broker (the lease secret -> `Request.auth`), so a real
     // provider builder needs only the base URL + model.
-    let providers = build_providers(&cfg, provider_kind, &manager, &active);
+    let (providers, local_inference_status) =
+        build_providers(&cfg, provider_kind, &manager, &active);
 
     // The default context engine (§10, LCM) and memory providers (§11, Mnemosyne) wired into every
     // engine this node builds, with their `mnemosyne_*` tools registered on the shared registry. Both
@@ -2638,39 +2647,34 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("creating workspace root {}: {e}", ws_root.display()))?;
 
     // Gateway (Part D/E): resolve the bearer token — an explicit `[gateway].token`, else a
-    // boot-minted ephemeral (logged once, like the other ephemeral secrets) — BEFORE assembly so
-    // Layer 2 injection can thread it into opted-in foreign agents' env. `None` when the gateway is
-    // off (`[gateway].addr` unset).
-    let gateway_token: Option<String> = match &cfg.gateway.addr {
-        Some(_) => Some(match &cfg.gateway.token {
-            Some(t) => t.clone(),
-            None => {
-                let minted = daemon_auth::generate_secret_hex(32)
-                    .map_err(|e| anyhow::anyhow!("minting gateway bearer token: {e}"))?;
-                tracing::info!(
-                    "gateway: no [gateway].token configured — minted an ephemeral bearer token for \
-                     this run (set [gateway].token to pin it)"
-                );
-                minted
-            }
-        }),
-        None => None,
+    // boot-minted ephemeral (logged once, like the other ephemeral secrets). Minted UNCONDITIONALLY
+    // now that the gateway is a resident, wire-configurable service: a client may enable it at
+    // runtime even when `[gateway].addr` is unset at boot, so a token must already be in hand.
+    let gateway_token: String = match &cfg.gateway.token {
+        Some(t) => t.clone(),
+        None => {
+            let minted = daemon_auth::generate_secret_hex(32)
+                .map_err(|e| anyhow::anyhow!("minting gateway bearer token: {e}"))?;
+            tracing::info!(
+                "gateway: no [gateway].token configured — minted an ephemeral bearer token for \
+                 this run (set [gateway].token to pin it)"
+            );
+            minted
+        }
     };
     // Layer 2 coords: only when the gateway is enabled AND injection is explicitly opted in.
-    let gateway_coords: Option<daemon_node::GatewayCoords> = match (
-        cfg.gateway.inject_foreign,
-        &cfg.gateway.addr,
-        &gateway_token,
-    ) {
-        (true, Some(addr), Some(token)) => Some(daemon_node::GatewayCoords {
-            base_url: gateway_base_url(addr),
-            token: token.clone(),
-        }),
-        _ => None,
-    };
+    let gateway_coords: Option<daemon_node::GatewayCoords> =
+        match (cfg.gateway.inject_foreign, &cfg.gateway.addr) {
+            (true, Some(addr)) => Some(daemon_node::GatewayCoords {
+                base_url: gateway_base_url(addr),
+                token: gateway_token.clone(),
+            }),
+            _ => None,
+        };
     // Capture the gateway backend seams before `provider_resolver` is moved into the assembly; the
-    // node surface is bound after assembly. Keyed on `addr` so it is `None` when the gateway is off.
-    let gateway_seams = cfg.gateway.addr.as_ref().map(|_| {
+    // node surface is bound after assembly. Built UNCONDITIONALLY so the resident gateway resource
+    // can serve whenever it is enabled (at boot via `[gateway].addr`, or at runtime via `GatewaySet`).
+    let gateway_seams = {
         let credentials: Arc<dyn CredentialProvider> =
             Arc::new(BrokeredCredentialProvider::new(owner.clone(), None));
         let cred_map: Vec<(ProviderSelector, String)> = cfg
@@ -2686,7 +2690,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             default_credential_ref: cfg.profile.clone(),
             allowlist: cfg.gateway.models_allowlist.clone(),
         }
-    });
+    };
 
     let AssembledNode {
         node,
@@ -3056,7 +3060,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.rooms.enabled {
         tracing::info!("registering internal rooms transport (daemon-rooms)");
         adapter_registry = adapter_registry.with_adapter(daemon_rooms::RoomsAdapter::new(
-            store,
+            store.clone(),
             signer.clone(),
             cfg.rooms.clone(),
         ));
@@ -3127,28 +3131,35 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     node.set_adapters(adapter_registry);
     let adapter_tasks = node.spawn_adapters();
 
-    // Optionally bind the node-owned OpenAI-compatible gateway (`daemon-gateway`), toggled on by
-    // `[gateway].addr`. It shares the node surface (for the catalog) + the provider-resolution and
-    // credential seams captured above, and is bearer-gated on a loopback listener — distinct from
-    // the `[api]`/`[web]` local-trust surfaces. Bound before the http surface (which moves `node`).
-    let gateway_server = match (&cfg.gateway.addr, gateway_token, gateway_seams) {
-        (Some(addr), Some(token), Some(seams)) => {
-            let backend: Arc<dyn daemon_gateway::GatewayBackend> =
-                Arc::new(seams.into_backend(node.clone()));
-            let gateway_listener = tokio::net::TcpListener::bind(addr).await?;
-            tracing::info!(
-                %addr,
-                inject_foreign = cfg.gateway.inject_foreign,
-                "serving OpenAI-compatible gateway (POST /v1/chat/completions + GET /v1/models, bearer-gated)"
-            );
-            Some(tokio::spawn(async move {
-                if let Err(e) = daemon_gateway::serve(gateway_listener, backend, token).await {
-                    tracing::warn!(error = %e, "gateway surface ended");
-                }
-            }))
-        }
-        _ => None,
-    };
+    // The node-owned OpenAI-compatible gateway (`daemon-gateway`) as a RESIDENT, wire-configurable
+    // managed resource (not a boot-only `tokio::spawn`): it owns its listener's lifecycle, persists
+    // its enable/rebind state to the durable store (boot `[gateway]` config is the default), and is
+    // reported in `HealthReport.services` as the `"gateway"` line. It shares the node surface (for
+    // the catalog) + the provider-resolution/credential seams captured above, bearer-gated on a
+    // loopback listener — distinct from the `[api]`/`[web]` local-trust surfaces. `set_gateway`
+    // registers it for both the `GatewayGet`/`GatewaySet` control ops and health; `activate` binds
+    // it when enabled (boot addr set, or a persisted runtime override). Wired before the http
+    // surface (which moves `node`).
+    let gateway_backend_impl: Arc<dyn daemon_gateway::GatewayBackend> =
+        Arc::new(gateway_seams.into_backend(node.clone()));
+    let gateway_resource = Arc::new(managed_backends::GatewayResource::new(
+        gateway_backend_impl,
+        gateway_token,
+        store.clone(),
+        cfg.gateway.addr.clone(),
+        cfg.gateway.addr.is_some(),
+    ));
+    node.set_gateway(gateway_resource.clone());
+    if let Err(e) = daemon_host::ManagedResource::activate(gateway_resource.as_ref()).await {
+        tracing::warn!(error = %e, "gateway failed to activate at startup (resident; enable/retry via GatewaySet)");
+    }
+    // Local inference (when configured) surfaces its worker liveness as the `"local-inference"`
+    // health line via the status handle lifted out of the provider.
+    if let Some(status) = local_inference_status {
+        node.register_managed(Arc::new(managed_backends::LocalInferenceResource::new(
+            status,
+        )));
+    }
 
     let http_server = match &cfg.http_addr {
         Some(addr) => {
@@ -3184,9 +3195,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if let Some(http_server) = http_server {
         http_server.abort();
     }
-    if let Some(gateway_server) = gateway_server {
-        gateway_server.abort();
-    }
+    // Stop the resident gateway's serve task (idempotent; a no-op if it never bound).
+    daemon_host::ManagedResource::stop(gateway_resource.as_ref()).await;
     for task in &adapter_tasks {
         task.abort();
     }
@@ -3426,7 +3436,7 @@ async fn build_placed_child_provider(cfg: &NodeConfig) -> daemon_core::ProviderB
             active.set(cfg.profile.clone(), model_ref);
         }
     }
-    let providers = build_providers(cfg, Some(provider_kind), &manager, &active);
+    let (providers, _local_status) = build_providers(cfg, Some(provider_kind), &manager, &active);
     providers
         .builder_for(&ProfileRef::new(cfg.profile.clone()))
         .unwrap_or_else(unconfigured)

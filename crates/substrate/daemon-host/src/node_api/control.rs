@@ -51,7 +51,7 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn health(&self) -> HealthReport {
-        let services = self
+        let mut services: Vec<ServiceHealth> = self
             .supervisor
             .service_names()
             .into_iter()
@@ -71,10 +71,17 @@ impl ControlApi for NodeApiImpl {
                 }
             })
             .collect();
-        HealthReport {
-            all_ok: self.supervisor.all_ok(),
-            services,
+        // Node-managed backend resources (the gateway + local inference) report alongside the
+        // resident services. Clone the handles out from under the lock first — a `ManagedResource`
+        // health probe is async and must not be polled while holding a std mutex.
+        let managed: Vec<Arc<dyn crate::managed::ManagedResource>> =
+            self.managed.lock().unwrap().clone();
+        for resource in managed {
+            services.push(resource.health().await);
         }
+        // `all_ok` folds the resident supervisor's health with every managed resource's `ok` bit.
+        let all_ok = self.supervisor.all_ok() && services.iter().all(|s| s.ok);
+        HealthReport { all_ok, services }
     }
 
     async fn stats(&self) -> StatsReport {
@@ -407,6 +414,29 @@ impl ControlApi for NodeApiImpl {
 
     async fn caps(&self) -> daemon_api::CapsReport {
         self.caps
+    }
+
+    async fn gateway_get(&self) -> Result<GatewayStatus, ApiError> {
+        // Forward to the injected gateway control seam (the resident gateway resource owns the
+        // store-backed override + live listener). Clone the handle out from under the lock so the
+        // async `get` is not polled while holding a std mutex.
+        let gateway = self.gateway.lock().unwrap().clone();
+        match gateway {
+            Some(gw) => Ok(gw.get().await),
+            None => Err(ApiError::Unsupported("gateway_get".into())),
+        }
+    }
+
+    async fn gateway_set(
+        &self,
+        enabled: bool,
+        addr: Option<String>,
+    ) -> Result<GatewayStatus, ApiError> {
+        let gateway = self.gateway.lock().unwrap().clone();
+        match gateway {
+            Some(gw) => gw.set(enabled, addr).await,
+            None => Err(ApiError::Unsupported("gateway_set".into())),
+        }
     }
 
     async fn tool_list(&self) -> Vec<daemon_api::ToolInfo> {

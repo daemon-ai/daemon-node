@@ -88,7 +88,27 @@ impl NodeApiImpl {
             revocations: None,
             credential_revoker: None,
             feedback_drain: None,
+            managed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            gateway: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Register a node-managed backend resource ([`ManagedResource`](crate::managed::ManagedResource))
+    /// so it is reported in [`ControlApi::health`](daemon_api::ControlApi::health) alongside the
+    /// resident-service supervisor's children. Bound post-`Arc` by the assembling binary (managed
+    /// backends — the gateway, local inference — are built after the node exists). Idempotent per
+    /// call; the caller registers each resource once.
+    pub fn register_managed(&self, resource: Arc<dyn crate::managed::ManagedResource>) {
+        self.managed.lock().unwrap().push(resource);
+    }
+
+    /// Bind the typed gateway control seam backing `gateway_get`/`gateway_set`, and register it as a
+    /// [`ManagedResource`](crate::managed::ManagedResource) for health. Bound post-`Arc` (the gateway
+    /// backend holds the assembled node). Absent, the gateway control ops resolve to
+    /// [`ApiError::Unsupported`] and no `"gateway"` health line is reported.
+    pub fn set_gateway(&self, gateway: Arc<dyn crate::managed::GatewayControl>) {
+        *self.gateway.lock().unwrap() = Some(gateway.clone());
+        self.register_managed(gateway);
     }
 
     /// Wire the user-feedback outbox drain (N1 → N2): records enqueued by `FeedbackSubmit` are

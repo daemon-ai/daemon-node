@@ -25,7 +25,10 @@ pub use genai_provider::{
     discovery_vendor_ids, genai_listed_models, genai_models_for, genai_models_for_id,
     GenAiEmbedder, GenAiProvider, DAEMON_CLOUD_BASE, DISCOVERY_ADAPTERS,
 };
-pub use local::{LocalEmbedder, LocalProvider, SwitchableLocalProvider, WorkerConfig};
+pub use local::{
+    LocalEmbedder, LocalInferenceState, LocalInferenceStatus, LocalProvider,
+    SwitchableLocalProvider, WorkerConfig,
+};
 
 use daemon_common::UsageDelta;
 use daemon_core::{

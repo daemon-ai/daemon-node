@@ -1228,6 +1228,8 @@ request-command-invoke = { "CommandInvoke": { "invocation": command-invocation }
 request-caps = "Caps"
 request-config-get = "ConfigGet"
 request-config-set = { "ConfigSet": { "config": node-config-view } }
+request-gateway-get = "GatewayGet"
+request-gateway-set = { "GatewaySet": { "enabled": bool, ? "addr": (tstr / null) } }
 request-cron-list = "CronList"
 request-cron-create = { "CronCreate": { "spec": cron-spec } }
 request-cron-update = { "CronUpdate": { "id": tstr, "spec": cron-spec } }
@@ -1422,6 +1424,8 @@ api-request = request-submit
             / request-caps
             / request-config-get
             / request-config-set
+            / request-gateway-get
+            / request-gateway-set
             / request-cron-list
             / request-cron-create
             / request-cron-update
@@ -1557,6 +1561,8 @@ response-tools = { "Tools": [* tool-info] }
 response-commands = { "Commands": [* command-spec] }
 response-command-output = { "CommandOutput": command-output }
 response-config = { "Config": node-config-view }
+gateway-status = { "enabled": bool, "addr": (tstr / null), "listening": bool, "last_error": (tstr / null) }
+response-gateway-status = { "GatewayStatus": gateway-status }
 response-caps = { "Caps": caps-report }
 response-cron-jobs = { "CronJobs": [* cron-job] }
 response-cron-id = { "CronId": tstr }
@@ -1656,6 +1662,7 @@ api-response = response-ok
              / response-commands
              / response-command-output
              / response-config
+             / response-gateway-status
              / response-caps
              / response-cron-jobs
              / response-cron-id
