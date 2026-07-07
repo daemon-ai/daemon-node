@@ -80,5 +80,12 @@ Bump in the monorepo with `just set-version daemon-node X.Y.Z` (writes `VERSION`
 - The default workspace gate builds default features only. The `llama` / `mistralrs` / `hyperon`
   engine lanes need native libs and are deliberately separate flake outputs (e.g.
   `nix build .#daemon-infer-llama`) — do NOT switch the gate to `--all-features`.
+- The devShell exports a prebuilt shared llama.cpp (`LLAMA_PREBUILT_DIR`, including `libmtmd`),
+  so `cargo build -p daemon-infer --features llama,mtmd,dynamic-link` links in seconds without a
+  cmake step. If llama.cpp starts compiling from source inside the devShell, the prebuilt env
+  wiring is broken — stop and investigate rather than waiting it out.
+- The engine flake outputs keep their heavy deps (llama.cpp / candle / hyperon) in per-lane
+  cached `buildDepsOnly` layers: a workspace source change rebuilds only the leaf crates, so
+  don't avoid these lanes on cost grounds.
 - Miri (UB over the FFI/codec `unsafe` surface) and cargo-fuzz use the nightly shell:
   `nix develop .#nightly` (see `just miri` / `just fuzz`).
