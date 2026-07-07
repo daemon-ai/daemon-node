@@ -242,6 +242,7 @@ pub async fn serve(
             me,
             transport: acct.transport.clone(),
             auto_accept: cfg.auto_accept_invites,
+            invite_allowlist: cfg.invite_allowlist.clone(), // [waveA:node-fixes]
         });
         acct.client.add_event_handler(on_stripped_member);
         acct.client.add_event_handler_context(ctx);

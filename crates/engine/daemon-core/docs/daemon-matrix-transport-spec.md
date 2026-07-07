@@ -320,9 +320,14 @@ store_root    = "matrix"          # resolved under data_dir; per-account subdir 
 # Auto-join rooms the bot is invited to (EIO-11). SECURITY TRADEOFF: while true (the default),
 # ANYONE who can invite the account pulls it into a room (mention-gating still governs engagement,
 # but room state/history exposure and DM spam are possible). On public/federated homeservers where
-# strangers can invite the account, set false and join explicitly via ConvJoin. A per-sender
-# allowlist (owner-only) policy is a planned follow-up.
+# strangers can invite the account, set false and join explicitly via ConvJoin, or narrow
+# acceptance with invite_allowlist.
 auto_accept_invites = true
+# Sender allowlist narrowing auto-acceptance (bare user ids). EMPTY (default) = accept any sender
+# (the historical auto_accept_invites behavior); a non-empty list accepts only invites whose sender
+# is listed and leaves every other invite pending. Only consulted when auto_accept_invites is on —
+# so a public/federated homeserver can auto-join its operators' invites while ignoring strangers.
+invite_allowlist = ["@alice:hs.org"]
 
 # the route table = the config surface of the routing registry (5.9.1).
 # NO account secrets here — accounts/tokens come from the credential subsystem,
