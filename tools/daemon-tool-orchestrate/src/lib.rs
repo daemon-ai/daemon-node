@@ -42,6 +42,8 @@ enum GuardrailKind {
     Depth,
     /// The concurrent detached-children cap.
     Fanout,
+    /// The concurrent ephemeral (transient-subagent) children cap.
+    Ephemeral,
 }
 
 /// Map the protocol-level [`DelegationLifetime`] onto the store's [`ChildLifetime`] (the source of
@@ -173,12 +175,20 @@ const DEFAULT_MAX_DEPTH: usize = 8;
 /// counting active children via the durable child index.
 const DEFAULT_MAX_FANOUT: usize = 8;
 
+/// The default ceiling on a session's concurrently-active **ephemeral** (transient-subagent)
+/// children. Distinct from the detached-fanout cap: an ephemeral child may be joining OR detached,
+/// so this bounds the live transient-subagent fan regardless of dispatch mode (the inline/ephemeral
+/// agent-created-agents guardrail). Counted via the durable child index (role `EphemeralSubagent`).
+const DEFAULT_MAX_EPHEMERAL: usize = 8;
+
 /// The agent's handle onto a node's [`FleetRuntime`] (+ optionally the durable session graph).
 pub struct OrchestrateTool {
     fleet: FleetRuntime,
     max_depth: usize,
     /// The ceiling on a parent's concurrently-active detached (`spawn wait:false`) children.
     max_fanout: usize,
+    /// The ceiling on a session's concurrently-active ephemeral (transient-subagent) children.
+    max_ephemeral: usize,
     /// The durable session store backing the `send` + per-child `status` verbs. `None` (tests /
     /// legacy assemblies) keeps `status` on the fleet-wide counts and makes `send` unavailable.
     store: Option<Arc<dyn daemon_store::SessionStore>>,
@@ -197,6 +207,7 @@ impl OrchestrateTool {
             fleet,
             max_depth: DEFAULT_MAX_DEPTH,
             max_fanout: DEFAULT_MAX_FANOUT,
+            max_ephemeral: DEFAULT_MAX_EPHEMERAL,
             store: None,
         }
     }
@@ -212,6 +223,38 @@ impl OrchestrateTool {
     pub fn with_max_fanout(mut self, max_fanout: usize) -> Self {
         self.max_fanout = max_fanout;
         self
+    }
+
+    /// Cap a session's concurrently-active ephemeral (transient-subagent) children at
+    /// `max_ephemeral` (the node's `[orchestrate].max_ephemeral_per_session` policy). An ephemeral
+    /// `spawn` past the cap is declined with a `guardrail` detail.
+    pub fn with_max_ephemeral(mut self, max_ephemeral: usize) -> Self {
+        self.max_ephemeral = max_ephemeral;
+        self
+    }
+
+    /// The count of a parent's currently-active **ephemeral** children: any not-yet-`Completed`
+    /// child in the durable index whose durable role is [`SessionRole::EphemeralSubagent`]. `0` when
+    /// no store is wired. The ephemeral-fan guard's measure — distinct from `active_child_count`
+    /// (which counts every active child for the detached-fanout guard).
+    async fn active_ephemeral_count(&self, parent: &SessionId) -> usize {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let mut active = 0usize;
+        for child in store.children_of(parent).await {
+            if store.status(&child).await == Some(SessionStatus::Completed) {
+                continue;
+            }
+            let meta = store.session_meta(&child).await.unwrap_or_default();
+            if matches!(
+                meta.role,
+                Some(daemon_store::SessionRole::EphemeralSubagent)
+            ) {
+                active += 1;
+            }
+        }
+        active
     }
 
     /// The count of a parent's currently-active children (any not-yet-`Completed` child in the
@@ -274,6 +317,13 @@ impl OrchestrateTool {
                      child to finish before spawning another"
                 ),
             ),
+            GuardrailKind::Ephemeral => (
+                "ephemeral",
+                format!(
+                    "concurrent ephemeral-children cap reached ({limit}); let a transient \
+                     subagent finish before spawning another"
+                ),
+            ),
         };
         let body = serde_json::to_vec(&serde_json::json!({
             "kind": tag,
@@ -284,6 +334,7 @@ impl OrchestrateTool {
         let content = match kind {
             GuardrailKind::Depth => format!("depth-limit:{limit}"),
             GuardrailKind::Fanout => format!("fanout-limit:{limit}"),
+            GuardrailKind::Ephemeral => format!("ephemeral-limit:{limit}"),
         };
         let mut outcome = Self::ok(call, content, Vec::new());
         outcome.detail = Some(ToolDetail::new("guardrail", body));
@@ -395,6 +446,16 @@ impl Tool for OrchestrateTool {
                     }
                 }
                 let lifetime = DelegationLifetime::from(lifetime);
+                // Ephemeral-fan cap (agent-created-agents guardrail): bound a session's concurrent
+                // transient subagents regardless of dispatch mode (joining OR detached). Distinct
+                // from the detached-fanout cap (which counts every active detached child). Declined
+                // with a `guardrail` detail like the depth/fanout guards. Only enforceable with a
+                // durable store to count against.
+                if lifetime == DelegationLifetime::Ephemeral
+                    && self.active_ephemeral_count(&cx.session_id).await >= self.max_ephemeral
+                {
+                    return Self::guardrail(call, GuardrailKind::Ephemeral, self.max_ephemeral);
+                }
                 if wait {
                     // DOWN edge (joining): record the delegation through the host port; the fleet
                     // worker spawns the child when the resulting durable job is processed. Emitting

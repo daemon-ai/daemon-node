@@ -3252,10 +3252,12 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-host",
+ "daemon-protocol",
  "daemon-store",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

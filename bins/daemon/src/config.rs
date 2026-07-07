@@ -1210,6 +1210,13 @@ pub struct OrchestrateConfig {
     /// The concurrent detached-children cap per parent the `orchestrate` tool declines a
     /// `spawn wait:false` past (guardrail; default 8). Surfaced read-only via the `Caps` op.
     pub max_fanout: usize,
+    /// The number of profiles an authoring session may compose (author via `profile_manage`) before
+    /// a further `create` is declined (agent-created-agents guardrail; default 32). Surfaced
+    /// read-only via the `Caps` op.
+    pub max_composed_profiles: usize,
+    /// The concurrent ephemeral (transient-subagent) children per session the `orchestrate` tool
+    /// declines a `spawn` past (guardrail; default 8). Surfaced read-only via the `Caps` op.
+    pub max_ephemeral_per_session: usize,
 }
 
 impl Default for OrchestrateConfig {
@@ -1220,6 +1227,8 @@ impl Default for OrchestrateConfig {
             reaper_interval: Duration::from_secs(60),
             max_depth: 8,
             max_fanout: 8,
+            max_composed_profiles: 32,
+            max_ephemeral_per_session: 8,
         }
     }
 }

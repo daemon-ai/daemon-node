@@ -14,7 +14,7 @@
 //! These are *contract* types: serializable primitives only (no `daemon-core` types), so the
 //! surface never drags the engine's concrete construction types into the wire protocol.
 
-use daemon_common::{SkillBundle, WireVersion};
+use daemon_common::{Author, SkillBundle, WireVersion};
 // Relocated to `daemon-protocol` so the wire types that cannot depend on `daemon-api` can carry
 // them without a contract-crate cycle: `EngineSelector` (wire v29, the fleet tree's `UnitNode`);
 // `ProviderSelector` + `ForeignBackend` (Phase 1, the inline sub-agent spec on the delegation
@@ -168,6 +168,19 @@ pub struct ProfileSpec {
     /// pre-`foreign_backend` encoding decodes to today's behavior (safe migration).
     #[serde(default)]
     pub foreign_backend: ForeignBackend,
+    /// Provenance (Phase 3): who authored this profile — an [`Author::Operator`] (an operator
+    /// `profile_create`/import) or [`Author::Agent`] (the `profile_manage` tool). `None` on a
+    /// pre-provenance encoding (decodes as "unknown", treated as operator-authored). Stamped
+    /// authoritatively by the shared profile surface on create; preserved across updates.
+    #[serde(default)]
+    pub created_by: Option<Author>,
+    /// Provenance (Phase 3): the owning agent SESSION id for an agent-authored profile (the
+    /// `{session}` of its `agent/{session}/{name}` id); `None` for an operator-authored (node-wide)
+    /// profile. Stored explicitly — though derivable from an agent-namespaced id — so subtree-scoped
+    /// visibility resolves even for a re-parented authoring session. `None` on a pre-provenance
+    /// encoding.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl ProfileSpec {
@@ -193,6 +206,8 @@ impl ProfileSpec {
             bound_accounts: Vec::new(),
             engine: EngineSelector::Core,
             foreign_backend: ForeignBackend::default(),
+            created_by: None,
+            owner: None,
         }
     }
 
@@ -298,6 +313,16 @@ pub struct ProfileInfo {
     /// The transport-instance accounts bound to this profile (§5.9.4). Names only, never secrets.
     #[serde(default)]
     pub bound_accounts: Vec<BoundAccount>,
+    /// Provenance (Phase 3): who authored this profile — an operator or the agent tool. `None` for a
+    /// pre-provenance profile (treated as operator-authored). Lets a client badge agent-authored
+    /// profiles distinctly from operator ones.
+    #[serde(default)]
+    pub created_by: Option<Author>,
+    /// Provenance (Phase 3): the owning agent SESSION id for an agent-authored profile; `None` for an
+    /// operator-authored (node-wide) profile. This is the filter key an agent-facing client uses to
+    /// scope the profile list to a session's own subtree.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl ProfileInfo {
@@ -309,6 +334,8 @@ impl ProfileInfo {
             model: spec.model.clone(),
             is_active,
             bound_accounts: spec.bound_accounts.clone(),
+            created_by: spec.created_by.clone(),
+            owner: spec.owner.clone(),
         }
     }
 }
@@ -881,6 +908,47 @@ mod tests {
             spec.foreign_backend,
             ForeignBackend::AgentNative { model: None }
         );
+    }
+
+    #[test]
+    fn provenance_round_trips_and_surfaces_on_info() {
+        // A fully-populated agent-authored provenance round-trips through CBOR (the on-wire encoding)
+        // and surfaces verbatim on the redacted `ProfileInfo` listing view.
+        let spec = ProfileSpec {
+            created_by: Some(Author::Agent("profile_manage".into())),
+            owner: Some("s1/c2".into()),
+            ..ProfileSpec::new("agent/s1/c2/helper", ProviderSelector::Mock, "m")
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&spec, &mut buf).unwrap();
+        let back: ProfileSpec = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back, spec);
+
+        let info = ProfileInfo::from_spec(&spec, false);
+        assert_eq!(
+            info.created_by,
+            Some(Author::Agent("profile_manage".into()))
+        );
+        assert_eq!(info.owner.as_deref(), Some("s1/c2"));
+        let mut ibuf = Vec::new();
+        ciborium::into_writer(&info, &mut ibuf).unwrap();
+        let iback: ProfileInfo = ciborium::from_reader(&ibuf[..]).unwrap();
+        assert_eq!(iback, info);
+    }
+
+    #[test]
+    fn pre_provenance_encodings_decode_as_unknown() {
+        // A profile persisted before provenance existed omits both keys; it must decode with
+        // `created_by: None` (treated as operator-authored) + `owner: None` (node-wide) — the
+        // additive-compat contract for the optional CDDL fields.
+        let legacy = serde_json::json!({
+            "id": "old",
+            "provider": "genai",
+            "model": "claude-opus-4-8"
+        });
+        let spec: ProfileSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(spec.created_by, None);
+        assert_eq!(spec.owner, None);
     }
 
     #[test]

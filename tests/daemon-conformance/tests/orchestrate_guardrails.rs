@@ -67,6 +67,8 @@ fn caps_round_trips() {
     let report = CapsReport {
         orchestrate_max_depth: 3,
         orchestrate_max_fanout: 8,
+        max_composed_profiles: 32,
+        max_ephemeral_per_session: 8,
     };
     assert_eq!(report, from_cbor::<CapsReport>(&to_cbor(&report)).unwrap());
 }
@@ -83,6 +85,9 @@ async fn caps_reports_effective_ceilings() {
             CapsReport {
                 orchestrate_max_depth: 1,
                 orchestrate_max_fanout: 8,
+                // The agent-created-agents caps thread through from the default OrchestrateCaps.
+                max_composed_profiles: 32,
+                max_ephemeral_per_session: 8,
             }
         );
 
@@ -93,6 +98,7 @@ async fn caps_reports_effective_ceilings() {
             OrchestrateCaps {
                 max_depth: 3,
                 max_fanout: 2,
+                ..OrchestrateCaps::default()
             },
         );
         match dispatch(&*node, ApiRequest::Caps).await {
@@ -101,6 +107,8 @@ async fn caps_reports_effective_ceilings() {
                 CapsReport {
                     orchestrate_max_depth: 3,
                     orchestrate_max_fanout: 2,
+                    max_composed_profiles: 32,
+                    max_ephemeral_per_session: 8,
                 }
             ),
             other => panic!("expected Caps, got {other:?}"),

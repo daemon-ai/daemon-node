@@ -2610,6 +2610,16 @@ pub struct CapsReport {
     pub orchestrate_max_depth: u32,
     /// The concurrent detached-children per parent a `spawn wait:false` is declined past.
     pub orchestrate_max_fanout: u32,
+    /// The number of profiles an authoring session may compose (author via `profile_manage`) before
+    /// a further `create` is declined (wire v31): the agent-created-agents guardrail, counted over
+    /// the session's own `agent/{session}/` profile namespace.
+    #[serde(default)]
+    pub max_composed_profiles: u32,
+    /// The concurrent inline/ephemeral children per session a `spawn` is declined past (wire v31):
+    /// bounds a session's live transient-subagent fan, distinct from the persistent detached-fanout
+    /// cap.
+    #[serde(default)]
+    pub max_ephemeral_per_session: u32,
 }
 
 /// A node tool-inventory entry ([`ControlApi::tool_list`]; enriched in wire v29 so a client can
@@ -3971,6 +3981,13 @@ pub enum NodeEvent {
     /// refetches `Tree`. Like `RosterChanged`, a payload-free pointer carrying a coalescing `rev`.
     FleetChanged {
         /// The new fleet revision.
+        rev: u64,
+    },
+    /// The profile set changed (wire v31): a profile was authored/edited/deleted by an operator op
+    /// or the agent `profile_manage` tool; the client refetches the profile list (`ProfileList`).
+    /// Like `RosterChanged`/`FleetChanged`, a payload-free pointer carrying a coalescing `rev`.
+    ProfilesChanged {
+        /// The new profiles revision.
         rev: u64,
     },
     /// An approval is pending operator action.

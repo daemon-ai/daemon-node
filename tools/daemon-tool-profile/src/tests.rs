@@ -6,9 +6,59 @@
 //! validation engine is proved end-to-end in the conformance suite).
 
 use super::*;
+use daemon_common::Budget;
+use daemon_core::events::EventSink;
+use daemon_core::exec::LocalEnvironment;
 use daemon_host::{MemProfileStore, ProfileStore};
+use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
 use daemon_store::{InMemoryStore, SessionMeta};
 use std::sync::Arc;
+
+/// A host that answers nothing meaningful — `profile_manage` never issues a host request, so the
+/// handler only has to exist for `TurnCx` construction.
+struct UnusedHost;
+
+#[async_trait]
+impl HostRequestHandler for UnusedHost {
+    async fn request(&self, req: HostRequest) -> HostResponse {
+        HostResponse {
+            request_id: req.request_id,
+            body: HostResponseBody::Approved {
+                approved: true,
+                allow_permanent: false,
+                reason: None,
+            },
+        }
+    }
+}
+
+/// Drive `Tool::run` as `session` with the given JSON args (the faithful path the guardrail rides).
+async fn run_as(tool: &ProfileManageTool, session: &str, args: &str) -> ToolOutcome {
+    let events = EventSink::discarding();
+    let exec = LocalEnvironment::sandbox("profile-test");
+    let host = UnusedHost;
+    let cx = TurnCx {
+        cancel: tokio_util::sync::CancellationToken::new(),
+        events: &events,
+        host: &host,
+        session_id: SessionId::new(session),
+        profile: None,
+        budget: Budget::unlimited(),
+        exec: &exec,
+        tool_result_budget: 0,
+        approval_policy: daemon_core::ApprovalPolicy::AutoAllow,
+        pre_approved: false,
+        checkpoints: None,
+        tool_timeout: None,
+        session_allow: &[],
+    };
+    let call = ToolCall {
+        call_id: "c1".into(),
+        name: PROFILE_TOOL_NAME.into(),
+        args: args.into(),
+    };
+    tool.run(&call, &cx).await
+}
 
 /// A tool over fresh in-memory stores (no validator wired => store-only, so create/edit persist
 /// without a node); returns the profile store so a test can inspect the persisted spec.
@@ -261,4 +311,80 @@ async fn subtree_walk_fallback_authorizes_a_reparented_authoring_session() {
         .await
         .expect("the parent walk authorizes a re-parented authoring session");
     assert_eq!(profiles.get("agent/orphan/p").unwrap().unwrap().model, "m2");
+}
+
+#[tokio::test]
+async fn list_is_subtree_scoped() {
+    let (tool, profiles, _sessions) = tool_with_stores();
+    // The caller's own profile, a descendant's, a sibling's, and an operator's.
+    for id in [
+        "agent/s1/own",
+        "agent/s1/c2/child",
+        "agent/s1x/sibling",
+        "opus",
+    ] {
+        profiles
+            .create(ProfileSpec::new(id, ProviderSelector::Mock, "m"))
+            .unwrap();
+    }
+    let caller = SessionId::new("s1");
+    let listing = tool
+        .dispatch(
+            &caller,
+            ManageArgs {
+                action: "list".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list");
+    // Sees its own + descendant's profiles...
+    assert!(listing.contains("agent/s1/own"));
+    assert!(listing.contains("agent/s1/c2/child"));
+    // ...never a sibling's (`s1x` is NOT under `s1`) or an operator's.
+    assert!(
+        !listing.contains("agent/s1x/sibling"),
+        "a sibling profile must not be visible: {listing}"
+    );
+    assert!(
+        !listing.contains("opus"),
+        "an operator profile must not be visible: {listing}"
+    );
+}
+
+#[tokio::test]
+async fn composed_profiles_cap_declines_with_a_guardrail() {
+    let profiles: Arc<dyn ProfileStore> = Arc::new(MemProfileStore::new());
+    let ops = Arc::new(ProfileOps::new(profiles.clone()));
+    let sessions = Arc::new(InMemoryStore::new());
+    // A tight cap of 2 composed profiles per authoring session.
+    let tool = ProfileManageTool::new(ops, sessions).with_max_composed(2);
+
+    // The first two creates succeed.
+    for name in ["a", "b"] {
+        let out = run_as(
+            &tool,
+            "s1",
+            &format!(r#"{{"action":"create","name":"{name}","model":"m"}}"#),
+        )
+        .await;
+        assert!(out.result.ok, "{}", out.result.content);
+        assert!(out.result.content.contains("created profile"));
+    }
+
+    // The third is declined at the cap: an `ok` result (a decline, not a failure) carrying the
+    // structured `guardrail` detail — mirroring the orchestrate depth/fanout guards.
+    let capped = run_as(&tool, "s1", r#"{"action":"create","name":"c","model":"m"}"#).await;
+    assert!(capped.result.ok);
+    assert_eq!(capped.result.content, "composed-limit:2");
+    let detail = capped
+        .detail
+        .as_ref()
+        .expect("a guardrail decline carries a detail");
+    assert_eq!(detail.kind, "guardrail");
+    let body: serde_json::Value = serde_json::from_slice(&detail.body).expect("JSON body");
+    assert_eq!(body["kind"], "composed_profiles");
+    assert_eq!(body["limit"], 2);
+    // The capped create authored nothing.
+    assert!(profiles.get("agent/s1/c").unwrap().is_none());
 }

@@ -249,11 +249,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiRequest, ApiResponse,
         ApprovalInfo, CommandInvocation, CommandOutput, ConnectionState, ConvChange,
         CredentialInfo, DisconnectReason, EventsPage, HealthReport, LogPageView, MembershipChange,
-        ModelDescriptor, NodeEvent, PolicyEntry, PresenceState, ProfileSpec, ProviderDescriptor,
-        ProviderKindWire, ProviderSelector, ProviderSignIn, ServiceHealth, SessionPage,
-        TransportInstanceInfo,
+        ModelDescriptor, NodeEvent, PolicyEntry, PresenceState, ProfileInfo, ProfileSpec,
+        ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn, ServiceHealth,
+        SessionPage, TransportInstanceInfo,
     };
-    use daemon_common::{ProfileRef, ReqId, SessionId};
+    use daemon_common::{Author, ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, ToolDetail, TransportId, UserMsg};
 
     let root = workspace_root();
@@ -332,6 +332,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiResponse::Caps(daemon_api::CapsReport {
             orchestrate_max_depth: 1,
             orchestrate_max_fanout: 8,
+            // wire v31: the agent-created-agents guardrail caps.
+            max_composed_profiles: 32,
+            max_ephemeral_per_session: 8,
         }),
     )?;
     // Fingerprint management (wire v29): the allow-list list/revoke ops + the list response, so
@@ -701,6 +704,26 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-profile.cbor",
         &ApiResponse::Profile(Some(fixture_spec)),
     )?;
+    // The profile listing (PRO-1) exercising the wire v31 provenance on `profile-info`: one
+    // operator-authored (created_by "operator", no owner) and one agent-authored
+    // (created_by {agent}, owner = the authoring session) row, so `verify-codec` proves the
+    // generated zcbor C decoder accepts the new optional `created_by`/`owner` fields on both arms.
+    let mut op_info = ProfileInfo::from_spec(
+        &ProfileSpec::new("work", ProviderSelector::GenAi, "claude-opus-4-8"),
+        true,
+    );
+    op_info.created_by = Some(Author::Operator);
+    let mut agent_info = ProfileInfo::from_spec(
+        &ProfileSpec::new("agent/s1/helper", ProviderSelector::Mock, "m"),
+        false,
+    );
+    agent_info.created_by = Some(Author::Agent("profile_manage".into()));
+    agent_info.owner = Some("s1".into());
+    write_cbor(
+        &out,
+        "response-profiles.cbor",
+        &ApiResponse::Profiles(vec![op_info, agent_info]),
+    )?;
     // The daemon-api gateway selector (wire `"daemon_api"`): a full profile-spec exercising the new
     // additive `provider-selector` value so `verify-codec` proves the generated zcbor C decoder
     // accepts it (OpenRouter-style `author/slug` model id + the pinned OpenAI-compatible base URL).
@@ -938,6 +961,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiResponse::EventsPage(EventsPage {
             events: vec![
                 NodeEvent::RosterChanged { rev: 7 },
+                // v31: the profile-list-changed pointer, so verify-codec proves the generated
+                // decoder accepts the new node-event arm.
+                NodeEvent::ProfilesChanged { rev: 3 },
                 NodeEvent::ApprovalPending {
                     session: SessionId::new("fixture-session"),
                     request_id: "req-1".into(),

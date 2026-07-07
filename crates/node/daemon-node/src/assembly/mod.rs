@@ -172,7 +172,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let cron = build_cron_stack(&a, &child_profile, &workspace_roots);
     // The shared profile-authoring surface + `profile_manage` tool (Phase 2), built before the
     // orchestrator profile so the tool is registered onto it. `None` on a node without profile mgmt.
-    let profile_stack = build_profile_stack(&a);
+    let profile_stack = build_profile_stack(&a, &node_events);
 
     // The one orchestrator-capable engine shape, used at *every* durable level: the top session and
     // every delegated child are built from this profile, so a child is itself an orchestrator that
@@ -288,6 +288,8 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     .with_caps(daemon_api::CapsReport {
         orchestrate_max_depth: a.orchestrate.max_depth.min(a.nesting_depth + 1) as u32,
         orchestrate_max_fanout: a.orchestrate.max_fanout as u32,
+        max_composed_profiles: a.orchestrate.max_composed_profiles as u32,
+        max_ephemeral_per_session: a.orchestrate.max_ephemeral_per_session as u32,
     });
     // Background session-title generation (hermes title_generator parity), when the binary resolved
     // an auxiliary provider for it.
@@ -446,6 +448,9 @@ fn build_orchestrator_profile(
             // the default, since the default cap of 8 exceeds it).
             .with_max_depth(a.orchestrate.max_depth.min(a.nesting_depth + 1))
             .with_max_fanout(a.orchestrate.max_fanout)
+            // The ephemeral (transient-subagent) fan cap — the agent-created-agents guardrail, sibling
+            // to fanout but scoped to ephemeral-role children (joining or detached).
+            .with_max_ephemeral(a.orchestrate.max_ephemeral_per_session)
             // The durable session graph backs the tool's `send` (pending-input + wake) and
             // per-child `status` verbs.
             .with_store(a.store.clone()),
@@ -538,17 +543,23 @@ fn build_cron_stack(
 /// facade's engine/inference validator is late-bound to the assembled node (`ProfileValidator =
 /// NodeApiImpl`). The tool holds the durable session store for the subtree-authorization check.
 /// `None` on a node without profile management.
-fn build_profile_stack(a: &NodeAssembly) -> Option<ProfileStack> {
+fn build_profile_stack(a: &NodeAssembly, node_events: &Arc<NodeEventFeed>) -> Option<ProfileStack> {
     let profiles = a.profiles.clone()?;
     let mut ops = ProfileOps::new(profiles);
     if let Some(revisions) = a.revisions.clone() {
         ops = ops.with_revisions(revisions);
     }
+    // The node-wide `ProfilesChanged` emit sink (Phase 3): a create/update/delete through this shared
+    // facade (operator ops OR the agent `profile_manage` tool) pings the feed so a thin client
+    // refetches the profile list. The feed IS the sink (`impl ProfileEvents for NodeEventFeed`).
+    ops = ops.with_events(node_events.clone() as Arc<dyn daemon_host::ProfileEvents>);
     let profile_ops = Arc::new(ops);
-    let profile_tool = Arc::new(daemon_tool_profile::ProfileManageTool::new(
-        profile_ops.clone(),
-        a.store.clone(),
-    )) as Arc<dyn Tool>;
+    let profile_tool = Arc::new(
+        daemon_tool_profile::ProfileManageTool::new(profile_ops.clone(), a.store.clone())
+            // The composed-profiles cap — the agent-created-agents guardrail; the same
+            // `[orchestrate].max_composed_profiles` policy surfaced read-only via `Caps`.
+            .with_max_composed(a.orchestrate.max_composed_profiles),
+    ) as Arc<dyn Tool>;
     Some(ProfileStack {
         profile_ops,
         profile_tool,

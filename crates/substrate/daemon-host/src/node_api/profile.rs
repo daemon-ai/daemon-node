@@ -40,13 +40,18 @@ impl ProfileApi for NodeApiImpl {
         // the agent `profile_manage` tool). The inline fallback is the same three operations for a
         // minimal node that wires no shared facade.
         match &self.profile_ops {
+            // The shared facade stamps provenance + emits `ProfilesChanged` on its own.
             Some(ops) => ops.create(spec, daemon_common::Author::Operator).await?,
             None => {
                 self.validate_engine(&spec).await?;
                 validate_inference(&spec)?;
+                let mut spec = spec;
+                spec.created_by = Some(daemon_common::Author::Operator);
+                spec.owner = None;
                 let id = spec.id.clone();
                 self.profile_store()?.create(spec).map_err(profile_err)?;
                 self.record_profile(&id, daemon_common::Author::Operator, "create");
+                self.emit_profiles_changed();
             }
         }
         // A created profile can declare `bound_accounts`: rebuild the live routing table so its
@@ -57,13 +62,20 @@ impl ProfileApi for NodeApiImpl {
 
     async fn profile_update(&self, spec: ProfileSpec) -> Result<(), ApiError> {
         match &self.profile_ops {
+            // The shared facade preserves provenance + emits `ProfilesChanged` on its own.
             Some(ops) => ops.update(spec, daemon_common::Author::Operator).await?,
             None => {
                 self.validate_engine(&spec).await?;
                 validate_inference(&spec)?;
+                let mut spec = spec;
+                if let Ok(Some(existing)) = self.profile_store()?.get(&spec.id) {
+                    spec.created_by = existing.created_by;
+                    spec.owner = existing.owner;
+                }
                 let id = spec.id.clone();
                 self.profile_store()?.update(spec).map_err(profile_err)?;
                 self.record_profile(&id, daemon_common::Author::Operator, "update");
+                self.emit_profiles_changed();
             }
         }
         // A profile change can alter routing (agent selection / transport patterns): rebuild the
@@ -73,7 +85,16 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_delete(&self, id: String) -> Result<(), ApiError> {
-        self.profile_store()?.delete(&id).map_err(profile_err)?;
+        // Route through the shared facade when wired (it emits `ProfilesChanged`); otherwise delete
+        // store-direct + emit here. An operator may `ProfileDelete` ANY profile (agent-authored
+        // included) — the subtree scoping is only on the agent tool path.
+        match &self.profile_ops {
+            Some(ops) => ops.delete(&id)?,
+            None => {
+                self.profile_store()?.delete(&id).map_err(profile_err)?;
+                self.emit_profiles_changed();
+            }
+        }
         // A deleted profile takes its `bound_accounts` baseline with it (§5.9 hot-reload).
         self.rebuild_routing();
         Ok(())
@@ -90,12 +111,16 @@ impl ProfileApi for NodeApiImpl {
             .map_err(profile_err)?
             .ok_or_else(|| ApiError::UnknownSession(source.clone()))?;
         spec.id = new_id.clone();
+        // A clone is a new operator-authored profile: it inherits none of the source's provenance.
+        spec.created_by = Some(daemon_common::Author::Operator);
+        spec.owner = None;
         store.create(spec).map_err(profile_err)?;
         self.record_profile(
             &new_id,
             daemon_common::Author::Operator,
             &format!("clone of {source}"),
         );
+        self.emit_profiles_changed();
         Ok(())
     }
 
@@ -153,9 +178,14 @@ impl ProfileApi for NodeApiImpl {
         // exporting node's ACP agents do not necessarily exist here.
         self.validate_engine(&spec).await?;
         validate_inference(&spec)?;
+        // An imported profile is operator-authored on THIS node (its origin provenance does not
+        // travel — a distribution carries no owner/created_by that this node would honor).
+        spec.created_by = Some(daemon_common::Author::Operator);
+        spec.owner = None;
         let id = spec.id.clone();
         store.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "import");
+        self.emit_profiles_changed();
         // Materialize the distribution's local skills into the *imported profile's own* skills dir
         // (so a session that resolves this agent actually sees them), attributed to the operator. A
         // skill that already exists is left as-is rather than clobbered.
@@ -208,6 +238,7 @@ impl ProfileApi for NodeApiImpl {
             daemon_common::Author::Operator,
             &format!("revert to {seq}"),
         );
+        self.emit_profiles_changed();
         Ok(())
     }
 
@@ -367,6 +398,17 @@ impl ProfileApi for NodeApiImpl {
 }
 
 impl NodeApiImpl {
+    /// Emit the node-wide `ProfilesChanged` pointer (Phase 3) for an operator write that does NOT
+    /// route through the shared [`ProfileOps`] (clone/import/revert, and the no-facade fallback
+    /// create/update/delete): those store-direct paths do not go through the facade's emit, so they
+    /// ping the feed here. The `ProfileOps` path emits on its own, so this is never double-called.
+    /// A no-op when no node-event feed is wired.
+    pub(crate) fn emit_profiles_changed(&self) {
+        if let Some(feed) = &self.node_events {
+            crate::profile_ops::ProfileEvents::profiles_changed(feed.as_ref());
+        }
+    }
+
     /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.
     pub(crate) fn profile_store(&self) -> Result<&Arc<dyn ProfileStore>, ApiError> {
         self.profiles

@@ -16,11 +16,25 @@
 //! profile is namespaced `agent/{session}/{name}` — so agent-authored profiles are self-evident and
 //! never clobber operator profiles.
 //!
-//! SUBTREE SCOPING: `edit`/`delete` are authorized only when the target profile was authored within
-//! the caller's OWN subtree — the target's authoring session is parsed from its `agent/{session}/…`
+//! SUBTREE SCOPING: `edit`/`delete`/`list` are authorized only over profiles authored within the
+//! caller's OWN subtree — the target's authoring session is parsed from its `agent/{session}/…`
 //! id and gated by the shared [`owns_subtree`](daemon_store::owns_subtree) check (reflexive for the
-//! caller's own profiles). An agent can never touch an ancestor's, a sibling's, or an operator's
-//! profile.
+//! caller's own profiles). An agent can never see or touch an ancestor's, a sibling's, or an
+//! operator's profile through this tool. (Operators, by contrast, see every profile via the
+//! `ProfileList` control op and may `ProfileDelete` any — the operator surface is un-scoped.)
+//!
+//! GATING (mirrors `skill_manage`/`cron`): `profile_manage` is exposed only on the
+//! orchestrator-capable profile shape, which carries a `tool_allowlist`; a profile that omits the
+//! tool from its allowlist never sees it. There is NO separate per-call capability check on this
+//! tool path: an in-turn agent has no principal (it is never an operator), so — exactly as the
+//! `skill_manage` and `cron` tools are gated purely by profile-allowlist + node-side validation +
+//! caps — the tool self-enforces its guardrails (name validation, the subtree-ownership check, and
+//! the [`MAX_COMPOSED`-derived](ProfileManageTool::with_max_composed) composed-profiles cap). The
+//! genuinely SECURITY-WIDENING knobs (an inline sub-agent requesting the full node toolset, or an
+//! autonomy-widening approval mode) stay operator-tier and are rejected on the widening paths
+//! (`SessionOverlay::widens_security_posture` / the orchestrate inline-spec guard) — this tool
+//! cannot author them into a widening posture: it composes a `ProfileSpec` whose `tool_allowlist`
+//! the operator-tier `validate_engine`/posture checks still govern at session open.
 
 #![forbid(unsafe_code)]
 
@@ -29,8 +43,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use daemon_api::{EngineSelector, ForeignBackend, ProfileSpec, ProviderSelector};
 use daemon_common::{Author, SessionId};
-use daemon_core::{Tool, ToolCall, ToolOutcome, TurnCx};
+use daemon_core::{Tool, ToolCall, ToolOutcome, ToolResult, TurnCx};
 use daemon_host::ProfileOps;
+use daemon_protocol::ToolDetail;
 use daemon_store::SessionStore;
 use serde::Deserialize;
 
@@ -41,11 +56,20 @@ pub const PROFILE_TOOL_NAME: &str = "profile_manage";
 /// file, so it is bounded and sanitized (no separators / control chars).
 const MAX_NAME_LEN: usize = 128;
 
+/// The default ceiling on profiles an authoring session may compose (`create`) before a further
+/// create is declined with a `guardrail` tool detail. Counted over the session's own
+/// `agent/{session}/` profile namespace. A generous default (the node's `[orchestrate]` policy may
+/// narrow it) that still bounds a runaway `create` loop from an always-composing model.
+const DEFAULT_MAX_COMPOSED: usize = 32;
+
 /// The agent's handle onto the node's shared [`ProfileOps`], plus the durable session graph the
 /// subtree-authorization check walks.
 pub struct ProfileManageTool {
     ops: Arc<ProfileOps>,
     store: Arc<dyn SessionStore>,
+    /// The composed-profiles cap (the agent-created-agents guardrail): a `create` past this many
+    /// profiles in the caller's `agent/{session}/` namespace is declined with a `guardrail` detail.
+    max_composed: usize,
 }
 
 /// The `profile_manage` tool-call arguments (a `ProfileSpec` shape + the action verb). Optional spec
@@ -147,9 +171,33 @@ fn apply_fields(spec: &mut ProfileSpec, args: &ManageArgs) {
 
 impl ProfileManageTool {
     /// A `profile_manage` tool over the node's shared [`ProfileOps`] + the durable session `store`
-    /// (the subtree-authorization graph).
+    /// (the subtree-authorization graph). Uses the default composed-profiles cap.
     pub fn new(ops: Arc<ProfileOps>, store: Arc<dyn SessionStore>) -> Self {
-        Self { ops, store }
+        Self {
+            ops,
+            store,
+            max_composed: DEFAULT_MAX_COMPOSED,
+        }
+    }
+
+    /// Cap the number of profiles an authoring session may compose (`create`) at `max_composed`
+    /// (the node's `[orchestrate].max_composed_profiles` policy). At the cap a `create` is declined
+    /// with a structured `guardrail` tool detail, mirroring the orchestrate depth/fanout guards.
+    pub fn with_max_composed(mut self, max_composed: usize) -> Self {
+        self.max_composed = max_composed;
+        self
+    }
+
+    /// The count of profiles in the caller's `agent/{session}/` namespace (the composed-profiles
+    /// guard's measure): every profile whose id is prefixed by the caller's authoring namespace,
+    /// which includes the caller's own profiles and any authored deeper in its subtree. `0` on a
+    /// store read error (never blocks authoring on a transient hiccup).
+    fn composed_count(&self, caller: &SessionId) -> usize {
+        let prefix = format!("agent/{}/", caller.as_str());
+        self.ops
+            .list()
+            .map(|specs| specs.iter().filter(|s| s.id.starts_with(&prefix)).count())
+            .unwrap_or(0)
     }
 
     /// The revision author every agent write records (mirrors `SkillStore.default_author`).
@@ -225,6 +273,23 @@ impl ProfileManageTool {
                 self.ops.delete(id).map_err(|e| e.to_string())?;
                 Ok(format!("deleted profile `{id}`"))
             }
+            "list" => {
+                // Subtree-scoped visibility: an agent sees ONLY the profiles authored within its own
+                // subtree (reflexive + descendants), never a sibling's, an ancestor's, or an
+                // operator's. The operator `ProfileList` control op is the un-scoped view.
+                let all = self.ops.list().map_err(|e| e.to_string())?;
+                let mut lines = Vec::new();
+                for spec in &all {
+                    if self.caller_owns(caller, &spec.id).await {
+                        lines.push(format!("{} ({})", spec.id, spec.model));
+                    }
+                }
+                if lines.is_empty() {
+                    return Ok("no profiles authored in this subtree".into());
+                }
+                lines.sort();
+                Ok(format!("profiles ({}):\n{}", lines.len(), lines.join("\n")))
+            }
             other => Err(format!("profile_manage: unknown action `{other}`")),
         }
     }
@@ -237,7 +302,7 @@ impl Tool for ProfileManageTool {
     }
 
     fn schema(&self) -> &str {
-        r#"{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["create","edit","delete"],"description":"author a reusable profile from existing building blocks"},"name":{"type":"string","description":"create: the short profile name (keys the agent/{session}/{name} id)"},"id":{"type":"string","description":"edit/delete: the full profile id (agent/{session}/{name}); only profiles authored within this session's subtree may be managed"},"provider":{"type":"string","description":"the model provider selector (Core engine)"},"model":{"type":"string","description":"the model id (Core engine)"},"base_url":{"type":"string","description":"optional provider API base-URL override"},"system_prompt":{"type":"string","description":"the profile's persona / system prompt"},"tool_allowlist":{"type":"array","items":{"type":"string"},"description":"the tools this profile's engine may use (an allowlist; omit for the full node toolset)"},"engine":{"description":"\"Core\" (default) or {\"Foreign\":{\"agent\":\"name\"}} referencing a registered agent"},"foreign_backend":{"description":"for a Foreign engine: how it sources its model backend (AgentNative or NodeProvider)"},"credential_ref":{"type":"string","description":"the credential profile this engine acquires from (defaults to the id)"}}}"#
+        r#"{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["create","edit","delete","list"],"description":"author a reusable profile from existing building blocks, or list the profiles authored in this session's subtree"},"name":{"type":"string","description":"create: the short profile name (keys the agent/{session}/{name} id)"},"id":{"type":"string","description":"edit/delete: the full profile id (agent/{session}/{name}); only profiles authored within this session's subtree may be managed"},"provider":{"type":"string","description":"the model provider selector (Core engine)"},"model":{"type":"string","description":"the model id (Core engine)"},"base_url":{"type":"string","description":"optional provider API base-URL override"},"system_prompt":{"type":"string","description":"the profile's persona / system prompt"},"tool_allowlist":{"type":"array","items":{"type":"string"},"description":"the tools this profile's engine may use (an allowlist; omit for the full node toolset)"},"engine":{"description":"\"Core\" (default) or {\"Foreign\":{\"agent\":\"name\"}} referencing a registered agent"},"foreign_backend":{"description":"for a Foreign engine: how it sources its model backend (AgentNative or NodeProvider)"},"credential_ref":{"type":"string","description":"the credential profile this engine acquires from (defaults to the id)"}}}"#
     }
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
@@ -251,9 +316,44 @@ impl Tool for ProfileManageTool {
                 )
             }
         };
+        // Composed-profiles guardrail: a `create` past the cap is declined (not a failure) with a
+        // structured `guardrail` detail, mirroring the orchestrate depth/fanout guards. Checked
+        // before dispatch so the cap is enforced tool-side (the store never even sees the create).
+        if args.action == "create" && self.composed_count(&cx.session_id) >= self.max_composed {
+            return Self::composed_guardrail(call, self.max_composed);
+        }
         match self.dispatch(&cx.session_id, args).await {
             Ok(msg) => ToolOutcome::text(call.call_id.clone(), true, msg),
             Err(e) => ToolOutcome::text(call.call_id.clone(), false, e),
+        }
+    }
+}
+
+impl ProfileManageTool {
+    /// A composed-profiles guardrail decline: `ok: true` (a decline is a normal outcome, the turn
+    /// keeps flowing) with the human-readable content AND a structured `guardrail` [`ToolDetail`]
+    /// (`{ "kind": "composed_profiles", "limit": N, "reason": … }` — the SAME JSON-body convention
+    /// the orchestrate depth/fanout guards use), so a rich client renders the cap uniformly.
+    fn composed_guardrail(call: &ToolCall, limit: usize) -> ToolOutcome {
+        let reason = format!(
+            "composed-profiles cap reached ({limit}); reuse or delete an existing profile instead \
+             of authoring another"
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "composed_profiles",
+            "limit": limit,
+            "reason": reason,
+        }))
+        .unwrap_or_default();
+        ToolOutcome {
+            result: ToolResult {
+                call_id: call.call_id.clone(),
+                ok: true,
+                content: format!("composed-limit:{limit}"),
+            },
+            effects: Vec::new(),
+            detail: Some(ToolDetail::new("guardrail", body)),
+            untrusted: false,
         }
     }
 }

@@ -550,6 +550,7 @@ node-event = node-event-session-advanced
            / node-event-session-meta-changed
            / node-event-roster-changed
            / node-event-fleet-changed
+           / node-event-profiles-changed
            / node-event-approval-pending
            / node-event-download-progress
            / node-event-catalog-changed
@@ -561,6 +562,9 @@ node-event-session-advanced     = { "SessionAdvanced":    { "session": session-i
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
 node-event-fleet-changed        = { "FleetChanged":       { "rev": uint64 } }
+; v31: the profile set changed (author/edit/delete via operator op or the profile_manage tool) ->
+; refetch ProfileList. Like RosterChanged/FleetChanged, a payload-free pointer with a coalescing rev.
+node-event-profiles-changed     = { "ProfilesChanged":   { "rev": uint64 } }
 node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
 ; v26: byte counters ride the event (throttled byte-level emission node-side).
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64 } }
@@ -773,9 +777,14 @@ agent-entry = {
 ; ----- long-tail surface stub DTOs (wire v14; tool-info enriched in v29) -----
 ; the read-only delegation guardrail caps (wire v29; ControlApi::caps): the EFFECTIVE orchestrate
 ; ceilings the node enforces, so a client renders "why was this spawn declined" without probing.
+; max_composed_profiles / max_ephemeral_per_session (wire v31): the agent-created-agents guardrail
+; ceilings — profiles authored per session, and concurrent inline/ephemeral children per session.
+; Optional: a pre-v31 encoding omits them and decodes as 0.
 caps-report = {
   "orchestrate_max_depth": uint,
   "orchestrate_max_fanout": uint,
+  ? "max_composed_profiles": uint,
+  ? "max_ephemeral_per_session": uint,
 }
 provider-info    = { "name": tstr, ? "base_url": (tstr / null), ? "available": bool }
 ; enabled/requires (wire v29): whether the tool is registered on this node, and — for a disabled
@@ -932,9 +941,16 @@ profile-spec = {
   "bound_accounts": [* bound-account],
   ? "engine": engine-selector,
   ? "foreign_backend": foreign-backend,
+  ; provenance (wire v31): who authored the profile + the owning agent session id (for an
+  ; agent-authored `agent/{session}/{name}` profile; null for operator-authored). Optional: a
+  ; pre-provenance encoding omits both and decodes as null/null (treated as operator-authored).
+  ? "created_by": (author / null),
+  ? "owner": (tstr / null),
 }
 bound-account = { "transport_instance": tstr, "credential_ref": tstr }
-profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account] }
+; profile-info provenance (wire v31): mirrors profile-spec's created_by/owner so a client can badge +
+; subtree-filter the profile list. Optional (pre-provenance encodings omit both).
+profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null) }
 credential-info = { "profile": tstr, "present": bool, "hint": tstr }
 provider-selector = "mock"
                   / "genai"

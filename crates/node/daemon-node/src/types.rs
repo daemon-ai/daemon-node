@@ -299,6 +299,13 @@ pub struct OrchestrateCaps {
     pub max_depth: usize,
     /// The concurrent detached-children ceiling per parent a `spawn wait:false` is declined past.
     pub max_fanout: usize,
+    /// The number of profiles an authoring session may compose (author via `profile_manage`) before
+    /// a further `create` is declined (the agent-created-agents guardrail). Surfaced read-only via
+    /// the `Caps` op and enforced tool-side by `profile_manage`.
+    pub max_composed_profiles: usize,
+    /// The concurrent ephemeral (transient-subagent) children per session a `spawn` is declined
+    /// past. Surfaced read-only via the `Caps` op and enforced tool-side by `orchestrate`.
+    pub max_ephemeral_per_session: usize,
 }
 
 impl Default for OrchestrateCaps {
@@ -306,6 +313,8 @@ impl Default for OrchestrateCaps {
         Self {
             max_depth: 8,
             max_fanout: 8,
+            max_composed_profiles: 32,
+            max_ephemeral_per_session: 8,
         }
     }
 }

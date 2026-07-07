@@ -12,6 +12,9 @@ daemon-core = { workspace = true }
 daemon-host = { workspace = true }
 daemon-api = { workspace = true }
 daemon-common = { workspace = true }
+# The `ToolDetail` carried on a `guardrail` decline (the composed-profiles cap), matching the
+# structured detail the orchestrate depth/fanout guards emit.
+daemon-protocol = { workspace = true }
 # The durable session graph backing the shared subtree-authorization check (`owns_subtree`).
 daemon-store = { workspace = true }
 async-trait = { workspace = true }
@@ -21,6 +24,9 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Build a minimal `TurnCx` to drive `Tool::run` (the composed-profiles guardrail path).
+tokio-util = { workspace = true }
+daemon-protocol = { workspace = true }
 
 [lints]
 workspace = true

@@ -603,6 +603,61 @@ async fn detached_fanout_cap_declines_at_the_limit() {
     );
 }
 
+#[tokio::test]
+async fn ephemeral_cap_declines_at_the_limit() {
+    let store = Arc::new(InMemoryStore::new());
+    let parent = SessionId::new("parent");
+    // Two active ephemeral children plus one managed (persistent) child under the parent, each
+    // registered in the durable child index via its delegation edge (what `children_of` reads).
+    for (child, role) in [
+        ("parent/e1", SessionRole::EphemeralSubagent),
+        ("parent/e2", SessionRole::EphemeralSubagent),
+        ("parent/c3", SessionRole::ManagedChild),
+    ] {
+        seed_child(&store, "parent", child, role, "t").await;
+        store
+            .bind_delegation(
+                SessionId::new(child),
+                daemon_store::JobCommand {
+                    job_id: daemon_common::JobId::new(format!("{child}:job")),
+                    session_id: parent.clone(),
+                    epoch: daemon_common::Epoch(1),
+                    payload: Vec::new(),
+                    lifetime: daemon_store::ChildLifetime::Persistent,
+                    child: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let tool = OrchestrateTool::new(fleet(store.clone()))
+        .with_store(store.clone())
+        .with_max_ephemeral(2);
+    // A third EPHEMERAL spawn is declined at the cap (ok result, no delegation effect).
+    let capped = run_as(
+        &tool,
+        "parent",
+        r#"{"verb":"spawn","lifetime":"ephemeral","task":"x"}"#,
+    )
+    .await;
+    assert!(capped.result.ok);
+    assert_eq!(capped.result.content, "ephemeral-limit:2");
+    assert!(capped.effects.is_empty());
+    let detail = capped
+        .detail
+        .as_ref()
+        .expect("a guardrail decline carries a detail");
+    assert_eq!(detail.kind, "guardrail");
+    let body: serde_json::Value = serde_json::from_slice(&detail.body).expect("JSON body");
+    assert_eq!(body["kind"], "ephemeral");
+    assert_eq!(body["limit"], 2);
+
+    // A PERSISTENT spawn is unaffected by the ephemeral cap (a different axis).
+    let persistent = run_as(&tool, "parent", r#"{"verb":"spawn","task":"x"}"#).await;
+    assert!(persistent.result.ok);
+    assert!(persistent.result.content.starts_with("spawned:"));
+}
+
 #[test]
 fn per_verb_concurrency_and_mutation_classes() {
     let call = |args: &str| ToolCall {

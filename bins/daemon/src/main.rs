@@ -841,6 +841,11 @@ fn default_profile_spec(
         engine: daemon_api::EngineSelector::Core,
         // Core engine: the foreign backend is inert (default). A foreign profile sets it explicitly.
         foreign_backend: daemon_api::ForeignBackend::default(),
+        // The launch-config seed carries no authoring provenance (it is a node-seeded placeholder,
+        // not an operator/agent create through ProfileOps); a null `created_by` reads as
+        // operator-authored / node-wide.
+        created_by: None,
+        owner: None,
     }
 }
 
@@ -2748,6 +2753,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         orchestrate: daemon_node::OrchestrateCaps {
             max_depth: cfg.orchestrate.max_depth,
             max_fanout: cfg.orchestrate.max_fanout,
+            max_composed_profiles: cfg.orchestrate.max_composed_profiles,
+            max_ephemeral_per_session: cfg.orchestrate.max_ephemeral_per_session,
         },
         foreign_gateway: gateway_coords,
     });

@@ -131,7 +131,7 @@ pub use node_api::{
     SessionEngineBuilder,
 };
 pub use process_agent::ProcessAgentUnit;
-pub use profile_ops::{ProfileOps, ProfileValidator};
+pub use profile_ops::{ProfileEvents, ProfileOps, ProfileValidator};
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use request_context::{
     current_context, current_principal, with_request_context, AuthMethod, RequestContext,

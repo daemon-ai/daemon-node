@@ -207,6 +207,9 @@ pub(crate) struct NodeFeedInner {
     /// The monotonic fleet revision: bumped on every fleet/tree change and stamped onto
     /// `FleetChanged` (its coalescing key; the client re-fetches `Tree` regardless of the value).
     fleet_rev: u64,
+    /// The monotonic profiles revision (Phase 3): bumped on every profile author/edit/delete and
+    /// stamped onto `ProfilesChanged` (its coalescing key; the client re-fetches the profile list).
+    profiles_rev: u64,
 }
 
 impl NodeEventFeed {
@@ -219,6 +222,7 @@ impl NodeEventFeed {
                 changed: HashMap::new(),
                 removed: VecDeque::new(),
                 fleet_rev: 0,
+                profiles_rev: 0,
             }),
             tx,
         })
@@ -275,6 +279,15 @@ impl NodeEventFeed {
         g.fleet_rev
     }
 
+    /// Bump the profiles revision and return it (Phase 3). The profile author/delete paths call this
+    /// then stamp the returned `rev` onto a `ProfilesChanged`, so a burst of profile writes collapses
+    /// to one profile-list refetch.
+    pub fn note_profiles_change(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.profiles_rev += 1;
+        g.profiles_rev
+    }
+
     /// Assign a cursor, retain in the bounded ring, and broadcast live. Consecutive
     /// `SessionAdvanced` for the same session are coalesced in the *backlog* (latest wins) so a
     /// reconnecting reader isn't flooded; the live broadcast still fires per emit (the client
@@ -300,6 +313,13 @@ impl NodeEventFeed {
         // catalog), so a burst of installs/deletes is one client refetch.
         if matches!(&event, NodeEvent::CatalogChanged) {
             g.ring.coalesce(|e| matches!(e, NodeEvent::CatalogChanged));
+        }
+        // ProfilesChanged coalesces globally (a refetch reads the whole profile list), so a burst of
+        // profile writes is one client refetch. Floor-exempt: collapsing superseded pings loses no
+        // information.
+        if matches!(&event, NodeEvent::ProfilesChanged { .. }) {
+            g.ring
+                .coalesce(|e| matches!(e, NodeEvent::ProfilesChanged { .. }));
         }
         // push assigns the cursor + raises the floor on a capacity eviction.
         let cursor = g.ring.push(event.clone());
@@ -374,6 +394,17 @@ impl NodeEventFeed {
             },
         });
         stream::iter(backlog).chain(live).boxed()
+    }
+}
+
+/// The node feed IS the profile-change sink (Phase 3): a profile author/edit/delete bumps the
+/// profiles revision and emits the coalesced `ProfilesChanged` pointer, so a thin client refetches
+/// the profile list without polling. Wired into the shared [`ProfileOps`](crate::ProfileOps) so both
+/// the operator ops and the agent `profile_manage` tool emit through one path.
+impl crate::ProfileEvents for NodeEventFeed {
+    fn profiles_changed(&self) {
+        let rev = self.note_profiles_change();
+        self.emit(NodeEvent::ProfilesChanged { rev });
     }
 }
 
