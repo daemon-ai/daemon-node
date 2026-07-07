@@ -30,7 +30,7 @@ pub use daemon_common::{
 use daemon_common::{
     ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile,
     ModelId, ModelRef, ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage,
-    SearchQuery, SessionId, UnitId, UsageDelta, WireVersion,
+    SearchQuery, SessionId, TraceId, UnitId, UsageDelta, WireVersion,
 };
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
@@ -134,6 +134,98 @@ impl ApprovalMode {
         ApprovalMode::AutoAllow,
         ApprovalMode::Deny,
     ];
+}
+
+// ---------------------------------------------------------------------------
+// User feedback over OpenTelemetry (N1: API contract + node-owned consent)
+// ---------------------------------------------------------------------------
+
+/// The server-side cap on a feedback `comment`'s length, in bytes. The node rejects an over-long
+/// comment ([`ApiError::Other`]) rather than truncating, so a client sees the failure.
+pub const FEEDBACK_COMMENT_MAX: usize = 4096;
+
+/// Which flavor of feedback a [`ApiRequest::FeedbackSubmit`] carries (wire v31): a reaction to a
+/// specific agent response, or general free-form feedback about the app.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    /// Feedback on a specific assistant response/turn (requires `target` + `rating`).
+    Response,
+    /// General app feedback (requires a `comment` or a `rating`).
+    App,
+}
+
+/// A thumbs up / down reaction (wire v31).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackRating {
+    /// Thumbs up (positive).
+    Up,
+    /// Thumbs down (negative).
+    Down,
+}
+
+/// What a [`FeedbackKind::Response`] feedback points at (wire v31): the rated assistant
+/// message/turn, addressed by its durable journal `cursor` within a session, plus an optional
+/// trace-context handle for correlation with the emitted OTel log event.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackTarget {
+    /// The session the rated response belongs to.
+    pub session: SessionId,
+    /// The durable journal cursor of the rated assistant message/turn.
+    pub cursor: u64,
+    /// The trace context of the rated turn, when the client has it (`None` otherwise).
+    #[serde(default)]
+    pub trace: Option<TraceId>,
+}
+
+/// Optional client-supplied diagnostics attached to a feedback submission (wire v31). Every field
+/// is optional so a privacy-conscious client can omit it.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackDiagnostics {
+    /// The submitting app's version string.
+    #[serde(default)]
+    pub app_version: Option<String>,
+    /// The submitting app's OS/platform string.
+    #[serde(default)]
+    pub os: Option<String>,
+}
+
+/// The interface arg bundle for [`ControlApi::feedback_submit`] (C1: multi-field ops carry a struct
+/// rather than a long positional list). Mirrors the [`ApiRequest::FeedbackSubmit`] wire fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedbackSubmitArgs {
+    /// The feedback flavor (response vs. app).
+    pub kind: FeedbackKind,
+    /// The rated response, for [`FeedbackKind::Response`] (`None` for app feedback).
+    pub target: Option<FeedbackTarget>,
+    /// The thumbs up/down rating, when given.
+    pub rating: Option<FeedbackRating>,
+    /// A free-form comment, when given.
+    pub comment: Option<String>,
+    /// Whether the client consents to including the rated response content in the exported event.
+    pub include_content: bool,
+    /// Optional client diagnostics (app version / OS).
+    pub diagnostics: Option<FeedbackDiagnostics>,
+    /// The UI surface the feedback was given from (free-form label, e.g. `"transcript"`).
+    pub surface: String,
+}
+
+/// The acknowledgement returned by [`ControlApi::feedback_submit`] and carried on the wire by
+/// [`ApiResponse::FeedbackAck`]. `accepted`/`queued` mean the node validated the submission and
+/// persisted it to the durable feedback outbox; it does **not** mean the OTel event was delivered
+/// (export is a separate, best-effort drain).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackAck {
+    /// The node validated + accepted the submission.
+    pub accepted: bool,
+    /// The submission was persisted to the durable feedback outbox.
+    pub queued: bool,
 }
 
 /// An **in-process** outbound delivery sink: where the host pushes a session's outbound entries for
@@ -989,6 +1081,27 @@ pub trait ControlApi: Send + Sync {
     /// Write the node's runtime config (I13). Default: unsupported.
     async fn config_set(&self, _config: NodeConfigView) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("config_set".into()))
+    }
+
+    /// Submit user feedback (N1; wire v31) — thumbs up/down + optional comment on an agent
+    /// response, or general app feedback. The node validates the submission server-side and, on
+    /// success, persists it to the durable feedback outbox (the acknowledgement means
+    /// accepted+queued, never delivered). Explicit feedback is per-event consent: it is queued even
+    /// when the global telemetry toggle is off. Default: unsupported (a transport with no store).
+    async fn feedback_submit(&self, _args: FeedbackSubmitArgs) -> Result<FeedbackAck, ApiError> {
+        Err(ApiError::Unsupported("feedback_submit".into()))
+    }
+
+    /// Read the node-owned global telemetry consent toggle (N1; wire v31). Default OFF (opt-in).
+    /// Default: unsupported (a transport with no store).
+    async fn telemetry_consent_get(&self) -> Result<bool, ApiError> {
+        Err(ApiError::Unsupported("telemetry_consent_get".into()))
+    }
+
+    /// Set the node-owned global telemetry consent toggle (N1; wire v31); returns the new state.
+    /// Default: unsupported (a transport with no store).
+    async fn telemetry_consent_set(&self, _enabled: bool) -> Result<bool, ApiError> {
+        Err(ApiError::Unsupported("telemetry_consent_set".into()))
     }
 
     /// List scheduled cron jobs (I15). Default: empty (the scheduler is PLANNED; builds on the

@@ -417,6 +417,13 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ResourceGrantCreate { .. }
         | ResourceGrantList { .. }
         | ResourceGrantRevoke { .. } => NotSessionTouching,
+        // -- user feedback + node-owned telemetry consent (N1): the coarse capability gate governs
+        // (FeedbackSubmit -> SessionWrite, consent -> ControlRead/ControlWrite). FeedbackSubmit reads
+        // a session's existence for response feedback but does not touch per-owner session state, so
+        // it is not per-owner ownership-gated; consent is node-wide.
+        FeedbackSubmit { .. } | TelemetryConsentGet | TelemetryConsentSet { .. } => {
+            NotSessionTouching
+        }
     }
 }
 
