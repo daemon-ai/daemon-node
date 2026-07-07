@@ -1,0 +1,34 @@
+[package]
+name = "daemon-discord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Discord chat transport (Phase 1 of the multi-protocol messaging plan): an in-process
+# `NodeApi`-client adapter, structurally a sibling of `daemon-matrix`. It isolates the `serenity_self`
+# Discord SDK and drives *our* engine as a client — normalising Discord gateway messages into
+# `Origin`s and handing them to the reusable `daemon-ingest` gate (inbound), and projecting the
+# session's outbound merged log to channel messages via a `daemon-delivery` `Projector` (outbound).
+# All serenity/Discord types stay confined to this crate (mirrors the matrix-sdk isolation).
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+daemon-host = { workspace = true }
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# serenity_self: a fork of serenity (~0.13) that accepts BOTH user and bot tokens (a superset of
+# serenity's API), so one client type serves the dual user|bot account mode. rustls TLS backend to
+# match the rest of the tree (no second TLS stack). All serenity types stay inside this crate.
+serenity_self = { version = "0.13", default-features = false, features = ["client", "gateway", "cache", "model", "http", "builder", "utils", "rustls_backend"] }
+
+[lints]
+workspace = true
