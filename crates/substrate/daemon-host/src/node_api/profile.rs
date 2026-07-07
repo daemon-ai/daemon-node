@@ -36,11 +36,19 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
-        self.validate_engine(&spec).await?;
-        validate_inference(&spec)?;
-        let id = spec.id.clone();
-        self.profile_store()?.create(spec).map_err(profile_err)?;
-        self.record_profile(&id, daemon_common::Author::Operator, "create");
+        // Author through the shared `ProfileOps` (one validation + persistence + revision path with
+        // the agent `profile_manage` tool). The inline fallback is the same three operations for a
+        // minimal node that wires no shared facade.
+        match &self.profile_ops {
+            Some(ops) => ops.create(spec, daemon_common::Author::Operator).await?,
+            None => {
+                self.validate_engine(&spec).await?;
+                validate_inference(&spec)?;
+                let id = spec.id.clone();
+                self.profile_store()?.create(spec).map_err(profile_err)?;
+                self.record_profile(&id, daemon_common::Author::Operator, "create");
+            }
+        }
         // A created profile can declare `bound_accounts`: rebuild the live routing table so its
         // account baseline takes effect without a restart (§5.9 hot-reload).
         self.rebuild_routing();
@@ -48,11 +56,16 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_update(&self, spec: ProfileSpec) -> Result<(), ApiError> {
-        self.validate_engine(&spec).await?;
-        validate_inference(&spec)?;
-        let id = spec.id.clone();
-        self.profile_store()?.update(spec).map_err(profile_err)?;
-        self.record_profile(&id, daemon_common::Author::Operator, "update");
+        match &self.profile_ops {
+            Some(ops) => ops.update(spec, daemon_common::Author::Operator).await?,
+            None => {
+                self.validate_engine(&spec).await?;
+                validate_inference(&spec)?;
+                let id = spec.id.clone();
+                self.profile_store()?.update(spec).map_err(profile_err)?;
+                self.record_profile(&id, daemon_common::Author::Operator, "update");
+            }
+        }
         // A profile change can alter routing (agent selection / transport patterns): rebuild the
         // live table so routed submits pick up the change without a restart (§5.9 hot-reload).
         self.rebuild_routing();
@@ -561,6 +574,18 @@ impl NodeApiImpl {
                 reason,
             );
         }
+    }
+}
+
+/// The node IS the profile validator the shared [`ProfileOps`](crate::profile_ops::ProfileOps) runs:
+/// it owns the agent catalog / model / credential handles [`validate_engine`](NodeApiImpl::validate_engine)
+/// consults. Late-bound into `ProfileOps` after the node is `Arc`-wrapped, so the operator ops and
+/// the agent `profile_manage` tool share the exact same `validate_engine` + `validate_inference`.
+#[async_trait]
+impl crate::profile_ops::ProfileValidator for NodeApiImpl {
+    async fn validate_profile(&self, spec: &ProfileSpec) -> Result<(), ApiError> {
+        self.validate_engine(spec).await?;
+        validate_inference(spec)
     }
 }
 

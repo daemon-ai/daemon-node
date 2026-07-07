@@ -90,6 +90,7 @@ impl NodeApiImpl {
             feedback_drain: None,
             managed: Arc::new(std::sync::Mutex::new(Vec::new())),
             gateway: Arc::new(std::sync::Mutex::new(None)),
+            profile_ops: None,
         }
     }
 
@@ -474,6 +475,17 @@ impl NodeApiImpl {
     /// Attach the durable profile store backing the `ProfileApi` sub-surface. Call during assembly.
     pub fn with_profiles(mut self, profiles: Arc<dyn ProfileStore>) -> Self {
         self.profiles = Some(profiles);
+        self
+    }
+
+    /// Attach the shared [`ProfileOps`](crate::profile_ops::ProfileOps) facade backing the operator
+    /// `profile_create`/`profile_update` ops. The **same** `ProfileOps` is shared with the agent
+    /// `profile_manage` tool so both author through one validation + persistence + revision path. The
+    /// facade's validator is late-bound to this node after it is `Arc`-wrapped (see
+    /// [`ProfileOps::set_validator`](crate::profile_ops::ProfileOps::set_validator)). Call during
+    /// assembly; absent, the operator path uses its inline validate+persist+record.
+    pub fn with_profile_ops(mut self, profile_ops: Arc<crate::profile_ops::ProfileOps>) -> Self {
+        self.profile_ops = Some(profile_ops);
         self
     }
 

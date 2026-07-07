@@ -166,11 +166,6 @@ fn parse_args(args: &str) -> Result<Verb, String> {
 /// child minter encodes the tree path with `/`), so it needs no extra protocol field.
 const DEFAULT_MAX_DEPTH: usize = 8;
 
-/// The bound on the ancestor walk `send`'s subtree-authorization check performs (defense against a
-/// pathological/cyclic parent chain in the meta rows; the id-prefix fast path covers the common
-/// case without any walk).
-const MAX_LINEAGE_WALK: usize = 16;
-
 /// The default ceiling on a parent's concurrently-active **detached** children (`spawn wait:false`).
 /// Detached spawns do not suspend the parent, so — unlike joining delegation, which is naturally
 /// serialized by the parent's suspension — a fan-out loop could otherwise mint unbounded background
@@ -306,34 +301,6 @@ impl OrchestrateTool {
             detail: None,
             untrusted: false,
         }
-    }
-
-    /// Whether `target` sits in the subtree `parent` owns. Fast path: the durable child minter
-    /// encodes lineage in the id (`{parent}/c{epoch}[/c…]`), so a `{parent}/` prefix proves
-    /// descent. Fallback: walk the durable `SessionMeta.parent` chain upward (bounded), so a child
-    /// whose id does not embed the caller (e.g. a re-parented session) still authorizes.
-    async fn owns_subtree(&self, parent: &SessionId, target: &SessionId) -> bool {
-        if target
-            .as_str()
-            .starts_with(&format!("{}/", parent.as_str()))
-        {
-            return true;
-        }
-        let Some(store) = &self.store else {
-            return false;
-        };
-        let mut cursor = target.clone();
-        for _ in 0..MAX_LINEAGE_WALK {
-            let Some(meta) = store.session_meta(&cursor).await else {
-                return false;
-            };
-            match meta.parent {
-                Some(p) if p == *parent => return true,
-                Some(p) => cursor = p,
-                None => return false,
-            }
-        }
-        false
     }
 
     /// Render one per-child status line from the durable graph: id, role, state, resolved profile
@@ -537,7 +504,7 @@ impl Tool for OrchestrateTool {
                 };
                 let child = SessionId::new(target.clone());
                 // Parent-owns-subtree authorization: an agent may only message its own descendants.
-                if !self.owns_subtree(&cx.session_id, &child).await {
+                if !daemon_store::owns_subtree(store.as_ref(), &cx.session_id, &child).await {
                     return Self::err(
                         call,
                         format!("send denied: {target} is not a child of this session"),

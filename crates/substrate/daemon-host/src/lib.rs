@@ -56,6 +56,7 @@ pub mod journal;
 pub mod managed;
 pub mod node_api;
 pub mod process_agent;
+pub mod profile_ops;
 pub mod profiles;
 pub mod request_context;
 pub mod revision;
@@ -130,6 +131,7 @@ pub use node_api::{
     SessionEngineBuilder,
 };
 pub use process_agent::ProcessAgentUnit;
+pub use profile_ops::{ProfileOps, ProfileValidator};
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};
 pub use request_context::{
     current_context, current_principal, with_request_context, AuthMethod, RequestContext,

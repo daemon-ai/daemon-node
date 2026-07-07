@@ -1,0 +1,26 @@
+[package]
+name = "daemon-tool-profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daemon-core = { workspace = true }
+# The shared profile create/validate/persist/version surface; the tool is a thin agent veneer over it
+# (the exact validation + store + revision path the operator `profile_create` op uses).
+daemon-host = { workspace = true }
+daemon-api = { workspace = true }
+daemon-common = { workspace = true }
+# The durable session graph backing the shared subtree-authorization check (`owns_subtree`).
+daemon-store = { workspace = true }
+async-trait = { workspace = true }
+# Parse the JSON tool-call args into a ProfileSpec shape.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

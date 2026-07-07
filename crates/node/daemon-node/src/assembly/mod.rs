@@ -22,8 +22,9 @@ use daemon_core::{ApprovalPolicy, Config, EngineProfile, StablePromptSource, Sys
 use daemon_host::{
     BackgroundSpawner, BlobStore, BlueprintSource, CoreEngineFactory, CronFiring, CronOps,
     CronScheduler, DurableProfileResolver, FileBlobStore, FleetControl, Host, JournalConfig,
-    ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileStore, RoutingBuilder,
-    RoutingRegistry, SessionBackend, SessionEngineBuilder, WorkspaceFs, WorkspaceRoots,
+    ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileOps, ProfileStore,
+    RoutingBuilder, RoutingRegistry, SessionBackend, SessionEngineBuilder, WorkspaceFs,
+    WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_supervision::ManageRequestHandler;
@@ -73,6 +74,18 @@ struct CronStack {
     cron_ops: Arc<CronOps>,
     /// The agent veneer over [`CronStack::cron_ops`], registered into the agent-facing profiles.
     cron_tool: Arc<dyn Tool>,
+}
+
+/// The shared profile-authoring surface (Phase 2) + its agent veneer, built BEFORE the orchestrator
+/// profile so the agent `profile_manage` tool wraps the same [`ProfileOps`] the operator
+/// `profile_create` op uses (one validation + persistence + revision path, not two). Present only
+/// when the node hosts profile management (`NodeAssembly.profiles`).
+struct ProfileStack {
+    /// The shared profile ops surface backing both the operator ops and the agent tool. Its
+    /// validator is late-bound to the assembled node (`ProfileValidator = NodeApiImpl`).
+    profile_ops: Arc<ProfileOps>,
+    /// The agent veneer over [`ProfileStack::profile_ops`], registered onto the orchestrator profile.
+    profile_tool: Arc<dyn Tool>,
 }
 
 /// Assemble and start the default host node: durable substrate + resident services, the
@@ -157,6 +170,9 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     .with_event_sink(fleet_events.clone());
 
     let cron = build_cron_stack(&a, &child_profile, &workspace_roots);
+    // The shared profile-authoring surface + `profile_manage` tool (Phase 2), built before the
+    // orchestrator profile so the tool is registered onto it. `None` on a node without profile mgmt.
+    let profile_stack = build_profile_stack(&a);
 
     // The one orchestrator-capable engine shape, used at *every* durable level: the top session and
     // every delegated child are built from this profile, so a child is itself an orchestrator that
@@ -167,6 +183,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &launch_skill_tools,
         launch_index,
         &cron.cron_tool,
+        profile_stack.as_ref().map(|s| &s.profile_tool),
         autonomous_config,
         &workspace_roots,
         &procs,
@@ -281,8 +298,22 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // routing/cloud/acp/model-factory/background/checkpoints) + the fleet-change bridge. Order
     // preserved from the original inline block.
     node_api = bind_node_api_surfaces(node_api, &a, &cron.cron_ops, &shared);
+    // Bind the shared profile-authoring surface (Phase 2): the SAME `ProfileOps` the agent
+    // `profile_manage` tool wraps, so the operator create/update ops and the tool author through one
+    // validation + persistence + revision path.
+    if let Some(stack) = &profile_stack {
+        node_api = node_api.with_profile_ops(stack.profile_ops.clone());
+    }
 
     let node = Arc::new(node_api);
+    // Late-bind the profile-ops validator now that the node exists: the node IS the engine/inference
+    // validator (`validate_engine` + `validate_inference`), so the operator ops and the agent tool
+    // share the exact same validation. (No profile_create is reachable before serving starts.)
+    if let Some(stack) = &profile_stack {
+        stack
+            .profile_ops
+            .set_validator(node.clone() as Arc<dyn daemon_host::ProfileValidator>);
+    }
     // Late-bind the cron post-settle delivery handle now that the `NodeApiImpl` exists: it implements
     // `CronDelivery` over its `DeliverySink` registry, so a finished cron run's `deliver` pushes
     // through the same outbound path live replies use.
@@ -400,6 +431,7 @@ fn build_orchestrator_profile(
     launch_skill_tools: &[Arc<dyn Tool>],
     launch_index: Option<&Arc<dyn StablePromptSource>>,
     cron_tool: &Arc<dyn Tool>,
+    profile_tool: Option<&Arc<dyn Tool>>,
     autonomous_config: Config,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
     procs: &ProcessToolkit,
@@ -419,6 +451,12 @@ fn build_orchestrator_profile(
             .with_store(a.store.clone()),
     ));
     registry.register(cron_tool.clone());
+    // Phase 2: the `profile_manage` tool goes on the orchestrator-capable profile (alongside
+    // `orchestrate`/`cron`), so an authored profile id can feed a later `spawn { source: Profile }`.
+    // Absent on a node without profile management. Constrained child/cron-run profiles never get it.
+    if let Some(profile_tool) = profile_tool {
+        registry.register(profile_tool.clone());
+    }
     root_profile(
         dress(
             EngineProfile::new(
@@ -492,6 +530,29 @@ fn build_cron_stack(
         cron_ops,
         cron_tool,
     }
+}
+
+/// The shared profile-authoring surface (Phase 2): one [`ProfileOps`] over the node's profile store
+/// (+ revision log) backing BOTH the operator `profile_create`/`profile_update` ops and the agent
+/// `profile_manage` tool, so both author through one validation + persistence + revision path. The
+/// facade's engine/inference validator is late-bound to the assembled node (`ProfileValidator =
+/// NodeApiImpl`). The tool holds the durable session store for the subtree-authorization check.
+/// `None` on a node without profile management.
+fn build_profile_stack(a: &NodeAssembly) -> Option<ProfileStack> {
+    let profiles = a.profiles.clone()?;
+    let mut ops = ProfileOps::new(profiles);
+    if let Some(revisions) = a.revisions.clone() {
+        ops = ops.with_revisions(revisions);
+    }
+    let profile_ops = Arc::new(ops);
+    let profile_tool = Arc::new(daemon_tool_profile::ProfileManageTool::new(
+        profile_ops.clone(),
+        a.store.clone(),
+    )) as Arc<dyn Tool>;
+    Some(ProfileStack {
+        profile_ops,
+        profile_tool,
+    })
 }
 
 /// The one per-session resolution context, shared by the live session builder and the durable

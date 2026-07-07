@@ -337,6 +337,7 @@ daemon-tool-session-search = { version = "0", path = "tools/daemon-tool-session-
 daemon-tool-semantic-search = { version = "0", path = "tools/daemon-tool-semantic-search" }
 daemon-skills = { version = "0", path = "crates/skills/daemon-skills" }
 daemon-tool-skill = { version = "0", path = "tools/daemon-tool-skill" }
+daemon-tool-profile = { version = "0", path = "tools/daemon-tool-profile" }
 
 # Size-tuned release profile (the flake's crane buildPackage builds --release, so Nix outputs
 # inherit this). Measured on the full workspace: together these take the `daemon` binary

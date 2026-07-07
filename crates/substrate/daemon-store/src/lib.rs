@@ -139,6 +139,42 @@ pub struct SessionMeta {
     pub inline_profile: Vec<u8>,
 }
 
+/// The bound on the ancestor walk [`owns_subtree`] performs — defense against a pathological/cyclic
+/// parent chain in the meta rows. The id-prefix fast path covers the common case without any walk.
+pub const MAX_LINEAGE_WALK: usize = 16;
+
+/// Whether `target` sits in the subtree `parent` owns — the shared subtree-authorization check
+/// reused by the orchestrate tool (`send`/`cancel`) and the `profile_manage` tool (view/edit/delete
+/// scoping). Fast path: the durable child minter encodes lineage in the id (`{parent}/c{epoch}[/c…]`),
+/// so a `{parent}/` prefix proves descent without any store read. Fallback: walk the durable
+/// [`SessionMeta::parent`] chain upward (bounded by [`MAX_LINEAGE_WALK`]), so a child whose id does
+/// not embed the caller (e.g. a re-parented session) still authorizes. NOT reflexive: `parent ==
+/// target` is not a descent (a caller manages its OWN artifacts by an explicit equality check).
+pub async fn owns_subtree(
+    store: &dyn SessionStore,
+    parent: &SessionId,
+    target: &SessionId,
+) -> bool {
+    if target
+        .as_str()
+        .starts_with(&format!("{}/", parent.as_str()))
+    {
+        return true;
+    }
+    let mut cursor = target.clone();
+    for _ in 0..MAX_LINEAGE_WALK {
+        let Some(meta) = store.session_meta(&cursor).await else {
+            return false;
+        };
+        match meta.parent {
+            Some(p) if p == *parent => return true,
+            Some(p) => cursor = p,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// A session's hierarchy role (the GUI roster/tree taxonomy). `Primary` conversations are the inbox;
 /// child roles are reached only by walking the tree. The `ManagedChild` vs `EphemeralSubagent` split
 /// lets clients keep long-lived children stable while coalescing transient-subagent churn.

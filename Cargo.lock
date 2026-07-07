@@ -2829,6 +2829,7 @@ dependencies = [
  "daemon-tool-fs",
  "daemon-tool-orchestrate",
  "daemon-tool-process",
+ "daemon-tool-profile",
  "daemon-tool-shell",
  "serde_json",
  "tokio",
@@ -3240,6 +3241,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "daemon-tool-profile"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-common",
+ "daemon-core",
+ "daemon-host",
+ "daemon-store",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

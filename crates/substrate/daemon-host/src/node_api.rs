@@ -500,6 +500,12 @@ pub struct NodeApiImpl {
     /// assembled node) via [`NodeApiImpl::set_gateway`], which also registers it into `managed` so
     /// the gateway reports its health like any other managed backend.
     gateway: Arc<Mutex<Option<Arc<dyn crate::managed::GatewayControl>>>>,
+    /// The shared profile create/validate/persist/version surface (I15-style) backing the operator
+    /// `profile_create`/`profile_update` ops AND the agent `profile_manage` tool, so both author
+    /// profiles through one validation + persistence + revision path. Its validator is late-bound to
+    /// this node (`ProfileValidator = NodeApiImpl`). `None` => the operator path falls back to the
+    /// inline validate+persist+record (a minimal node with no shared facade / no agent tool).
+    profile_ops: Option<Arc<crate::profile_ops::ProfileOps>>,
 }
 
 impl NodeApiImpl {

@@ -24,6 +24,9 @@ daemon-acp = { workspace = true }
 daemon-orchestration = { workspace = true }
 daemon-tool-orchestrate = { workspace = true }
 daemon-tool-cron = { workspace = true }
+# The agent `profile_manage` tool: authors reusable profiles through the shared `ProfileOps` the
+# operator create path uses; registered onto the orchestrator-capable profile.
+daemon-tool-profile = { workspace = true }
 daemon-tool-fs = { workspace = true }
 daemon-tool-shell = { workspace = true }
 daemon-tool-process = { workspace = true }
