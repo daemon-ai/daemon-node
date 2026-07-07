@@ -3618,6 +3618,64 @@ mod tests {
         }
     }
 
+    /// [integration-a] Catalog↔factory contract lock (CON-15, both wave-A node halves stitched):
+    /// the node-v30 provider-catalog OpenRouter row must advertise the SAME auth family the
+    /// node-fixes descriptor-driven factory serves. Both streams built their halves against the
+    /// literal `"provider/openrouter"`; this locks them together. Proves (1) the catalog row's
+    /// `sign_in.family` equals `daemon_oauth::OPENROUTER_FAMILY` (v30 literal == fixes constant),
+    /// and (2) the auth factories registered exactly as `main` builds them serve that family
+    /// through the very backing of `NodeApi::auth_providers` (`PendingAuthFlows::providers`) with
+    /// an EMPTY `params_schema` (the node owns every parameter). If either half drifts off the
+    /// shared family string, this fails.
+    #[tokio::test] // [integration-a]
+    async fn openrouter_catalog_row_matches_registered_auth_factory() {
+        use daemon_host::{AuthFlowFactory, PendingAuthFlows};
+
+        // (1) Catalog side (node-v30): the OpenRouter row advertises the exact family constant.
+        let catalog = GenAiCloudCatalog;
+        let providers = CloudCatalog::providers(&catalog).await;
+        let openrouter = providers
+            .iter()
+            .find(|p| p.id == "open_router")
+            .expect("openrouter row present");
+        let sign_in = openrouter
+            .sign_in
+            .as_ref()
+            .expect("openrouter advertises interactive sign-in");
+        assert_eq!(
+            sign_in.family,
+            daemon_oauth::OPENROUTER_FAMILY,
+            "the catalog row must advertise the family the auth engine serves"
+        );
+
+        // (2) Factory side (node-fixes): the registered factories — built exactly as `main` does —
+        // serve that family via the `auth_providers()` backing, with an empty params schema.
+        let auth_factories: Vec<Arc<dyn AuthFlowFactory>> = vec![
+            Arc::new(
+                daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::generic_oauth2())
+                    .expect("build the oauth2 factory"),
+            ),
+            Arc::new(
+                daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::openrouter())
+                    .expect("build the openrouter factory"),
+            ),
+        ];
+        let served = PendingAuthFlows::new(auth_factories).providers();
+        let info = served
+            .iter()
+            .find(|p| p.family == daemon_oauth::OPENROUTER_FAMILY)
+            .expect("the openrouter family is served by the registered factories");
+        assert_eq!(
+            info.family, sign_in.family,
+            "catalog and factory must agree on the family string"
+        );
+        assert!(
+            info.params_schema.is_empty(),
+            "the provider-bound family owns every parameter (empty schema), got {:?}",
+            info.params_schema
+        );
+    }
+
     /// `ProviderModels(daemon_cloud)` lists the gateway's `author/slug` models keyless via
     /// `GET {base}/models`, against a mock upstream (OpenAI `{ "data": [..] }` envelope).
     #[tokio::test]
