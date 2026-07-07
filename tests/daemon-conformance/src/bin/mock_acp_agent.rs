@@ -21,12 +21,12 @@
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionRequest,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Responder, Result, Stdio};
 
@@ -102,6 +102,11 @@ async fn main() -> Result<()> {
                 // dispatch-loop handler would deadlock (the response can't be processed).
                 let cx2 = cx.clone();
                 let last = last_set_prompt.clone();
+                // Whether this prompt asks the agent to autonomously switch its model (Phase 3): a
+                // test sends "switch-model" to exercise the `config_option_update` capture path.
+                let wants_switch = prompt.prompt.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(t) if t.text.contains("switch-model"))
+                });
                 cx.spawn(async move {
                     let sid = prompt.session_id.clone();
                     cx2.send_notification(SessionNotification::new(
@@ -122,6 +127,17 @@ async fn main() -> Result<()> {
                             TextContent::new(observed),
                         ))),
                     ))?;
+                    // Phase 3: on request, emit an unsolicited `config_option_update` flipping the
+                    // current model to MODEL_B, so a test can assert the adapter captures the
+                    // notification into the node's live selector state.
+                    if wants_switch {
+                        cx2.send_notification(SessionNotification::new(
+                            sid.clone(),
+                            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![
+                                model_option(MODEL_B),
+                            ])),
+                        ))?;
+                    }
                     let _ = cx2
                         .send_request(RequestPermissionRequest::new(
                             sid.clone(),

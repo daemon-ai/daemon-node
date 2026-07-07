@@ -83,11 +83,16 @@ impl NodeApiImpl {
         overlay: &SessionOverlay,
     ) -> Result<(), ApiError> {
         let foreign = self.live.resident_is_foreign(session) == Some(true);
-        if foreign && (overlay.model.is_some() || overlay.provider.is_some()) {
+        // A foreign engine has no genai provider knob (its provider is fixed by the profile's
+        // foreign backend); a provider override is meaningless. A model override IS honored below,
+        // routed to the live foreign backend rather than the provider factory.
+        if foreign && overlay.provider.is_some() {
             return Err(ApiError::Unsupported(
                 "a foreign-engine (ACP) session has no model provider to override".into(),
             ));
         }
+        // Edit-approval mode is honored for both backend kinds (the shared `session_modes` map is
+        // what the live ParkingHandler consults).
         if let Some(mode) = overlay.approval_mode {
             let policy = approval_mode_to_policy(mode);
             if let Some(handle) = self.live.handle_if_live(session) {
@@ -96,6 +101,16 @@ impl NodeApiImpl {
             if self.live.is_resident(session) {
                 self.session_modes.insert(session.clone(), policy);
             }
+        }
+        // Foreign model override (Phase 3): route the change to the live backend — a foreign ACP
+        // `AgentNative` session issues a `set_config_option`; a gateway-routed `NodeProvider` session
+        // re-binds its per-session token. The persisted `overlay.model` already re-steers the backend
+        // on the next (re)open, so this is the *live* half.
+        if foreign {
+            if let Some(model) = &overlay.model {
+                self.live.set_foreign_model(session, model.clone()).await?;
+            }
+            return Ok(());
         }
         let Some(handle) = self.live.handle_if_live(session) else {
             return Ok(());

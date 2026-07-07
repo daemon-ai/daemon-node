@@ -233,6 +233,12 @@ pub trait GatewayTokenMinter: Send + Sync {
     /// agent's `OPENAI_API_KEY`.
     fn mint(&self, binding: GatewayBinding) -> String;
 
+    /// Re-bind an already-minted `token` to a new `binding` in place (Phase 3): the token string is
+    /// unchanged (the agent keeps presenting the same bearer), but its routed `{provider, model,
+    /// credential_ref}` is replaced, so a live model change on a `NodeProvider` foreign session takes
+    /// effect on the agent's next request without a re-spawn. A no-op for an unknown token.
+    fn rebind(&self, token: &str, binding: GatewayBinding);
+
     /// Revoke a previously-minted token (idempotent), dropping its binding from the registry.
     fn revoke(&self, token: &str);
 }
@@ -244,12 +250,37 @@ pub trait GatewayTokenMinter: Send + Sync {
 pub struct GatewayLease {
     minter: Arc<dyn GatewayTokenMinter>,
     token: String,
+    /// The token's current routing (Phase 3): a live model change re-binds the same token with this
+    /// template's `provider`/`credential_ref` and the new model. Also the source of `revoke`'s token.
+    binding: GatewayBinding,
 }
 
 impl GatewayLease {
-    /// Build a lease over a freshly-minted `token`; dropping it revokes via `minter`.
-    pub fn new(minter: Arc<dyn GatewayTokenMinter>, token: String) -> Self {
-        Self { minter, token }
+    /// Build a lease over a freshly-minted `token` bound to `binding`; dropping it revokes via
+    /// `minter`.
+    pub fn new(
+        minter: Arc<dyn GatewayTokenMinter>,
+        token: String,
+        binding: GatewayBinding,
+    ) -> Self {
+        Self {
+            minter,
+            token,
+            binding,
+        }
+    }
+
+    /// Re-bind the leased token to `model` in place (Phase 3), keeping the token's provider +
+    /// credential and the same opaque bearer — so a live model change on a `NodeProvider` foreign
+    /// session routes to the new model on the agent's next request.
+    pub fn rebind_model(&self, model: String) {
+        self.minter.rebind(
+            &self.token,
+            GatewayBinding {
+                model,
+                ..self.binding.clone()
+            },
+        );
     }
 }
 

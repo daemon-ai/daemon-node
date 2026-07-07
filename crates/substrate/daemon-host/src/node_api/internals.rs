@@ -467,6 +467,37 @@ pub(crate) struct LiveSessions {
     /// Sessions this residency already attempted title generation for (once-per-residency guard, so
     /// a failed aux call is not retried on every subsequent turn).
     titled: Arc<DashMap<SessionId, ()>>,
+    /// Per-session live model selector (Phase 3): the last-seen `Model` selector a resident foreign
+    /// (ACP) session's agent advertised, mirrored from the backend's push feed. Read by `session_get`
+    /// (surfaced as `SessionDetail.model_selector`); populated by the per-session watcher spawned in
+    /// `ensure` and cleared when the session is shut down. Empty for native + non-advertising sessions.
+    selectors: Arc<DashMap<SessionId, daemon_api::ModelSelector>>,
+}
+
+/// Record a foreign session's freshly-captured `Model` selector in the sidecar and, when the current
+/// selection or choice set actually changed, emit a `SessionMetaChanged` pointer so thin clients
+/// refetch `session_get` (dedup keeps a re-report of the same selector event-free). Shared by the
+/// per-session watcher and the live set path so both update the surface identically.
+fn emit_selector_change(
+    selectors: &DashMap<SessionId, daemon_api::ModelSelector>,
+    feed: &Option<Arc<NodeEventFeed>>,
+    session: &SessionId,
+    selector: daemon_api::ModelSelector,
+) {
+    let changed = selectors
+        .get(session)
+        .map(|e| *e != selector)
+        .unwrap_or(true);
+    selectors.insert(session.clone(), selector);
+    if changed {
+        if let Some(feed) = feed {
+            let rev = feed.note_roster_change(session);
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session: session.clone(),
+                rev,
+            });
+        }
+    }
 }
 
 impl LiveSessions {
@@ -487,6 +518,7 @@ impl LiveSessions {
             node_events: Mutex::new(None),
             title_aux: Mutex::new(None),
             titled: Arc::new(DashMap::new()),
+            selectors: Arc::new(DashMap::new()),
         }
     }
 
@@ -537,6 +569,38 @@ impl LiveSessions {
     /// sessions have no model provider to swap and are not rewindable.
     pub(crate) fn resident_is_foreign(&self, session: &SessionId) -> Option<bool> {
         self.sessions.get(session).map(|s| s.handle.is_foreign())
+    }
+
+    /// The last-seen live `Model` selector for a resident foreign session (Phase 3), or `None` for a
+    /// native session, a foreign agent that advertises no Model selector, or a non-resident session.
+    /// Read by `session_get` to surface `SessionDetail.model_selector`.
+    pub(crate) fn model_selector(&self, session: &SessionId) -> Option<daemon_api::ModelSelector> {
+        self.selectors.get(session).map(|s| s.clone())
+    }
+
+    /// Route a live model change to a resident foreign session's backend (Phase 3): a foreign ACP
+    /// `AgentNative` session issues a `set_config_option`; a gateway-routed `NodeProvider` session
+    /// re-binds its per-session token. Refreshes the sidecar + emits `SessionMetaChanged` when the
+    /// backend reports a resulting selector. `Unsupported` when the session is not foreign/resident
+    /// or the backend cannot select a model (e.g. no advertised selector).
+    pub(crate) async fn set_foreign_model(
+        &self,
+        session: &SessionId,
+        model: String,
+    ) -> Result<(), ApiError> {
+        let LiveHandle::Foreign(backend) = self.existing(session)? else {
+            return Err(ApiError::Unsupported(
+                "per-session model select targets a foreign-engine session".into(),
+            ));
+        };
+        match backend.set_model(model).await {
+            Ok(Some(selector)) => {
+                emit_selector_change(&self.selectors, &self.node_feed(), session, selector);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(ApiError::Unsupported(e)),
+        }
     }
 
     /// A resident session's read-only conversation view, obtained by round-tripping an internal
@@ -655,6 +719,29 @@ impl LiveSessions {
             SessionBackend::Core(engine) => LiveHandle::Core(spawn_agent_session(engine, host)),
             SessionBackend::Foreign(factory) => LiveHandle::Foreign(factory(host).await?),
         };
+
+        // Phase 3: mirror a foreign backend's live `Model` selector into the per-session sidecar so
+        // `session_get` surfaces it, refreshing on every change (session/new, set_config_option,
+        // config_option_update) and emitting `SessionMetaChanged` on a real change. The watcher ends
+        // when the backend's selector feed closes (the session dropped).
+        if let LiveHandle::Foreign(backend) = &handle {
+            if let Some(mut updates) = backend.selector_updates() {
+                let selectors = self.selectors.clone();
+                let feed = self.node_feed();
+                let sess = session.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match updates.recv().await {
+                            Ok(selector) => {
+                                emit_selector_change(&selectors, &feed, &sess, selector)
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+        }
 
         // Pump §17 events from the actor broadcast into the destructive drain queue (lossless until
         // polled), record them on the non-destructive merged log (outbound / Context), and feed the
@@ -856,6 +943,8 @@ impl LiveSessions {
                     },
                 );
                 if let Some((_, s)) = self.sessions.remove(&session) {
+                    // Drop the live model-selector sidecar for the closing session (Phase 3).
+                    self.selectors.remove(&session);
                     match &s.handle {
                         LiveHandle::Core(handle) => handle.shutdown().await,
                         LiveHandle::Foreign(session) => {

@@ -25,14 +25,16 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, ContentChunk, EnvVariable, InitializeRequest, McpServer,
     McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall,
-    ToolCallStatus, ToolCallUpdate,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
+    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall, ToolCallStatus,
+    ToolCallUpdate,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use async_trait::async_trait;
+use daemon_api::{ModelChoice, ModelSelector};
 use daemon_common::env_policy::EnvPolicy;
 use daemon_common::{ReqId, UnitId};
 use daemon_host::{AgentSession, AgentUnit, JournalFeeder};
@@ -42,8 +44,8 @@ use daemon_protocol::{
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// How to spawn the foreign ACP agent subprocess (program + args + environment + working dir).
 #[derive(Clone, Debug)]
@@ -445,11 +447,34 @@ impl daemon_host::AgentDiscovery for AcpDiscoverer {
     }
 }
 
+/// A mid-session control op issued to the ACP driver out-of-band from the §17 [`AgentCommand`]
+/// queue (Phase 3): a live model set, which must run on the connection's `cx` inside [`drive`].
+enum AcpControl {
+    /// Set the agent's model via `session/set_config_option` on the `Model` category, replying with
+    /// the resulting [`ModelSelector`] (or an error string when no selector is advertised / the set
+    /// fails).
+    SetModel {
+        /// The model value id (or display name) to select.
+        model: String,
+        /// Where the outcome is delivered back to the caller.
+        reply: oneshot::Sender<Result<Option<ModelSelector>, String>>,
+    },
+}
+
 /// A §17 session over a foreign ACP agent. Construct via [`acp_unit`] to present it as a managed
 /// engine unit; the connection runs on a dedicated task and is fed commands through an mpsc queue.
 pub struct AcpSession {
     commands: mpsc::UnboundedSender<AgentCommand>,
     events: broadcast::Sender<AgentEvent>,
+    /// Out-of-band control ops (live model set) delivered into [`drive`]'s connection loop.
+    control: mpsc::UnboundedSender<AcpControl>,
+    /// The last-seen advertised `Model` selector (Phase 3), updated by [`drive`] at `session/new`,
+    /// after a `set_config_option`, and on a `config_option_update` notification. `None` until the
+    /// agent reports one (or if it advertises none). The pull half of the node's live selector state.
+    selector: Arc<Mutex<Option<ModelSelector>>>,
+    /// The push half: every selector change is fan-out here so the host updates its per-session
+    /// sidecar + emits a pointer event without polling.
+    selector_updates: broadcast::Sender<ModelSelector>,
 }
 
 /// Present a foreign ACP agent as a `UnitKind::Engine` managed unit identified by `id`, journaling
@@ -465,12 +490,30 @@ impl AcpSession {
     /// permission callbacks the agent raises.
     pub fn connect(launch: AcpLaunch, host: Arc<dyn HostRequestHandler>) -> Arc<dyn AgentSession> {
         let (commands, command_rx) = mpsc::unbounded_channel::<AgentCommand>();
+        let (control, control_rx) = mpsc::unbounded_channel::<AcpControl>();
         let (events, _) = broadcast::channel::<AgentEvent>(256);
+        let (selector_updates, _) = broadcast::channel::<ModelSelector>(64);
+        let selector: Arc<Mutex<Option<ModelSelector>>> = Arc::new(Mutex::new(None));
         let seq = Arc::new(AtomicU64::new(0));
 
-        tokio::spawn(drive(launch, host, events.clone(), seq, command_rx));
+        tokio::spawn(drive(DriveCtx {
+            launch,
+            host,
+            events: events.clone(),
+            seq,
+            command_rx,
+            control_rx,
+            selector: selector.clone(),
+            selector_updates: selector_updates.clone(),
+        }));
 
-        Arc::new(AcpSession { commands, events })
+        Arc::new(AcpSession {
+            commands,
+            events,
+            control,
+            selector,
+            selector_updates,
+        })
     }
 }
 
@@ -489,23 +532,65 @@ impl AgentSession for AcpSession {
     fn rewindable(&self) -> bool {
         false
     }
+
+    fn model_selector(&self) -> Option<ModelSelector> {
+        self.selector.lock().unwrap().clone()
+    }
+
+    fn selector_updates(&self) -> Option<broadcast::Receiver<ModelSelector>> {
+        Some(self.selector_updates.subscribe())
+    }
+
+    async fn set_model(&self, model: String) -> Result<Option<ModelSelector>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.control
+            .send(AcpControl::SetModel { model, reply })
+            .map_err(|_| "acp session is closed".to_string())?;
+        rx.await
+            .map_err(|_| "acp session ended before applying the model".to_string())?
+    }
 }
 
-/// Drive the ACP connection for the lifetime of the session: initialize, open a session, then relay
-/// each queued §17 command as a prompt / cancel until the queue closes or `Shutdown` arrives.
-async fn drive(
+/// The inputs [`drive`] needs for the lifetime of one ACP connection, grouped so the driver takes a
+/// single value rather than a long argument list.
+struct DriveCtx {
     launch: AcpLaunch,
     host: Arc<dyn HostRequestHandler>,
     events: broadcast::Sender<AgentEvent>,
     seq: Arc<AtomicU64>,
-    mut command_rx: mpsc::UnboundedReceiver<AgentCommand>,
-) {
+    command_rx: mpsc::UnboundedReceiver<AgentCommand>,
+    control_rx: mpsc::UnboundedReceiver<AcpControl>,
+    /// The shared last-seen `Model` selector (the pull half of the session's live selector state).
+    selector: Arc<Mutex<Option<ModelSelector>>>,
+    /// The push half: a new selector snapshot is fan-out here on every change.
+    selector_updates: broadcast::Sender<ModelSelector>,
+}
+
+/// Drive the ACP connection for the lifetime of the session: initialize, open a session, then relay
+/// each queued §17 command as a prompt / cancel until the queue closes or `Shutdown` arrives. Also
+/// captures the agent's advertised `Model` selector (Phase 3) at `session/new`, after a
+/// `set_config_option`, and on a `config_option_update` notification, and applies live model sets
+/// arriving on the control queue.
+async fn drive(ctx: DriveCtx) {
+    let DriveCtx {
+        launch,
+        host,
+        events,
+        seq,
+        mut command_rx,
+        mut control_rx,
+        selector,
+        selector_updates,
+    } = ctx;
     let desired_model = launch.desired_model.clone();
     let (agent, cwd) = launch.into_agent();
 
-    // Notification handler: stream `session/update`s up as §17 events.
+    // Notification handler: stream `session/update`s up as §17 events, and capture a
+    // `config_option_update`'s Model selector into the shared live state (Phase 3).
     let notif_events = events.clone();
     let notif_seq = seq.clone();
+    let notif_selector = selector.clone();
+    let notif_selector_tx = selector_updates.clone();
     // Permission handler: bridge `session/request_permission` to a §17 blocking host request.
     let perm_host = host.clone();
     let perm_req_ids = Arc::new(AtomicU64::new(1));
@@ -513,6 +598,8 @@ async fn drive(
     // Loop body captures: drive prompts and emit turn lifecycle events.
     let loop_events = events.clone();
     let loop_seq = seq.clone();
+    let loop_selector = selector.clone();
+    let loop_selector_tx = selector_updates.clone();
 
     let result = Client
         .builder()
@@ -521,7 +608,16 @@ async fn drive(
             move |notif: SessionNotification, _cx| {
                 let events = notif_events.clone();
                 let seq = notif_seq.clone();
+                let selector = notif_selector.clone();
+                let selector_tx = notif_selector_tx.clone();
                 async move {
+                    // Phase 3: the agent autonomously changed its config — refresh the live Model
+                    // selector before mapping the update to §17 events (which ignore this variant).
+                    if let SessionUpdate::ConfigOptionUpdate(update) = &notif.update {
+                        if let Some(sel) = selector_from_options(Some(&update.config_options)) {
+                            store_and_broadcast(&selector, &selector_tx, sel);
+                        }
+                    }
                     for ev in map_update(notif.update, &seq) {
                         let _ = events.send(ev);
                     }
@@ -553,14 +649,52 @@ async fn drive(
                 .await?;
             let session_id = session.session_id;
 
+            // Phase 3: capture the agent's advertised Model selector as live session state, so a
+            // thin client sees the choices/current even before any set.
+            if let Some(sel) = selector_from_options(session.config_options.as_deref()) {
+                store_and_broadcast(&loop_selector, &loop_selector_tx, sel);
+            }
+
             // Layer 1: best-effort model selection over the agent's advertised config options.
             // Any failure or missing selector is logged and the session proceeds on the agent's
             // default model — model selection never aborts the session.
             if let Some(wanted) = desired_model.as_deref() {
-                apply_model(&cx, &session_id, session.config_options.as_deref(), wanted).await;
+                let _ = set_model_via_acp(
+                    &cx,
+                    &session_id,
+                    &loop_selector,
+                    &loop_selector_tx,
+                    wanted,
+                )
+                .await;
             }
 
-            while let Some(cmd) = command_rx.recv().await {
+            loop {
+                let cmd = tokio::select! {
+                    cmd = command_rx.recv() => cmd,
+                    ctrl = control_rx.recv() => {
+                        match ctrl {
+                            // A live model set (Phase 3): run `set_config_option` on the Model
+                            // category, updating the shared selector state, and reply to the caller.
+                            Some(AcpControl::SetModel { model, reply }) => {
+                                let outcome = set_model_via_acp(
+                                    &cx,
+                                    &session_id,
+                                    &loop_selector,
+                                    &loop_selector_tx,
+                                    &model,
+                                )
+                                .await;
+                                let _ = reply.send(outcome);
+                                continue;
+                            }
+                            // The control queue closed: the session's `AcpSession` was dropped (it
+                            // owns both senders), so the session is over — stop the driver.
+                            None => break,
+                        }
+                    }
+                };
+                let Some(cmd) = cmd else { break };
                 match cmd {
                     AgentCommand::StartTurn { input, .. } => {
                         let _ = loop_events.send(AgentEvent::TurnStarted {
@@ -635,20 +769,22 @@ async fn drive(
     }
 }
 
-/// Layer 1 best-effort model selection: after `session/new`, if the agent advertised a
-/// `Model`-category `Select` config option, try to switch it to the node-validated profile model
-/// `wanted` via `session/set_config_option`. Matching prefers the option value's id, then its
-/// display name case-insensitively. Every outcome is logged (`applied` / `already-current` /
-/// `not-offered` / `no-selector`) and the function never returns an error that aborts the session —
-/// on any miss or failure the agent keeps its own default model.
-async fn apply_model(
-    cx: &ConnectionTo<Agent>,
-    session_id: &SessionId,
-    config_options: Option<&[SessionConfigOption]>,
-    wanted: &str,
+/// Store a freshly-captured `Model` selector as the session's live state and fan it out to
+/// subscribers (the host's per-session sidecar watcher). A send error only means no live watcher.
+fn store_and_broadcast(
+    selector: &Arc<Mutex<Option<ModelSelector>>>,
+    selector_tx: &broadcast::Sender<ModelSelector>,
+    value: ModelSelector,
 ) {
-    // Locate the Model-category Select selector, if the agent advertised one.
-    let selector = config_options.into_iter().flatten().find_map(|opt| {
+    *selector.lock().unwrap() = Some(value.clone());
+    let _ = selector_tx.send(value);
+}
+
+/// Project the agent's advertised `Model`-category `Select` config option into the node's wire
+/// [`ModelSelector`] (option id + current value + flattened choices), or `None` when the agent
+/// advertises no Model selector (native/no-selector agents keep the surface empty).
+fn selector_from_options(config_options: Option<&[SessionConfigOption]>) -> Option<ModelSelector> {
+    let (option, select) = config_options.into_iter().flatten().find_map(|opt| {
         if opt.category != Some(SessionConfigOptionCategory::Model) {
             return None;
         }
@@ -656,82 +792,120 @@ async fn apply_model(
             SessionConfigKind::Select(select) => Some((opt, select)),
             _ => None,
         }
-    });
-    let Some((option, select)) = selector else {
+    })?;
+    let choices = select_options(&select.options)
+        .map(|v| ModelChoice {
+            id: v.value.0.to_string(),
+            label: v.name.clone(),
+        })
+        .collect();
+    Some(ModelSelector {
+        option_id: option.id.0.to_string(),
+        current: select.current_value.0.to_string(),
+        choices,
+    })
+}
+
+/// Best-effort live model selection over the agent's advertised `Model` selector: switch it to
+/// `wanted` via `session/set_config_option`, refreshing the shared live selector state on success.
+/// Matching prefers the choice's value id, then its display name case-insensitively. Returns the
+/// resulting [`ModelSelector`] (unchanged when already-current), or an error string when the agent
+/// advertises no Model selector / does not offer the model / the set fails. Every outcome is logged;
+/// at `session/new` (the Layer-1 steer) the caller ignores the result so a miss never aborts the
+/// session.
+async fn set_model_via_acp(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    selector: &Arc<Mutex<Option<ModelSelector>>>,
+    selector_tx: &broadcast::Sender<ModelSelector>,
+    wanted: &str,
+) -> Result<Option<ModelSelector>, String> {
+    let Some(snapshot) = selector.lock().unwrap().clone() else {
         tracing::info!(
             requested_model = wanted,
             outcome = "no-selector",
             "foreign ACP agent advertised no Model selector; keeping its default model"
         );
-        return;
+        return Err("the agent advertises no Model selector".to_string());
     };
 
     // id-exact first, then a case-insensitive display-name fallback.
-    let matched = select_options(&select.options)
-        .find(|v| v.value.0.as_ref() == wanted)
-        .or_else(|| select_options(&select.options).find(|v| v.name.eq_ignore_ascii_case(wanted)));
-    let Some(value) = matched else {
+    let matched = snapshot
+        .choices
+        .iter()
+        .find(|c| c.id == wanted)
+        .or_else(|| {
+            snapshot
+                .choices
+                .iter()
+                .find(|c| c.label.eq_ignore_ascii_case(wanted))
+        });
+    let Some(choice) = matched else {
         tracing::info!(
             requested_model = wanted,
             outcome = "not-offered",
             "foreign ACP agent's Model selector does not offer the requested model; keeping default"
         );
-        return;
+        return Err(format!(
+            "the agent's Model selector does not offer `{wanted}`"
+        ));
     };
+    // Own the matched value id + option id so the borrow of `snapshot.choices` ends before the
+    // fallback below moves `snapshot`.
+    let value_id = choice.id.clone();
+    let option_id = snapshot.option_id.clone();
 
-    if value.value == select.current_value {
+    if value_id == snapshot.current {
         tracing::info!(
             requested_model = wanted,
-            model = %value.value.0,
+            model = %value_id,
             outcome = "already-current",
             "foreign ACP agent's Model selector is already on the requested model"
         );
-        return;
+        return Ok(Some(snapshot));
     }
 
     match cx
         .send_request(SetSessionConfigOptionRequest::new(
             session_id.clone(),
-            option.id.clone(),
-            value.value.clone(),
+            SessionConfigId::new(option_id),
+            SessionConfigValueId::new(value_id.clone()),
         ))
         .block_task()
         .await
     {
         Ok(resp) => {
-            // Read back the resulting current_value for the same option, falling back to the value
-            // we requested when the agent does not echo the option in its response.
-            let current = resp
-                .config_options
-                .iter()
-                .find(|o| o.id == option.id)
-                .and_then(|o| match &o.kind {
-                    SessionConfigKind::Select(s) => Some(s.current_value.0.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| value.value.0.to_string());
+            // Prefer the agent's echoed option set; fall back to the pre-set snapshot with the
+            // requested value marked current when it does not echo the Model option.
+            let updated =
+                selector_from_options(Some(&resp.config_options)).unwrap_or(ModelSelector {
+                    current: value_id,
+                    ..snapshot
+                });
             tracing::info!(
                 requested_model = wanted,
-                model = %value.value.0,
-                current_value = %current,
+                current_value = %updated.current,
                 outcome = "applied",
                 "selected model on foreign ACP agent"
             );
+            store_and_broadcast(selector, selector_tx, updated.clone());
+            Ok(Some(updated))
         }
         Err(err) => {
             tracing::warn!(
                 requested_model = wanted,
-                model = %value.value.0,
+                model = %choice.id,
                 error = %err,
                 outcome = "error",
                 "failed to set model on foreign ACP agent; keeping its default"
             );
+            Err(format!("set_config_option failed: {err}"))
         }
     }
 }
 
 /// Flatten a select option's (possibly grouped) choices into one iterator of value entries, so the
-/// id/name matching in [`apply_model`] treats ungrouped and grouped selectors uniformly.
+/// id/name matching in [`set_model_via_acp`] treats ungrouped and grouped selectors uniformly.
 fn select_options(
     options: &SessionConfigSelectOptions,
 ) -> Box<dyn Iterator<Item = &SessionConfigSelectOption> + '_> {

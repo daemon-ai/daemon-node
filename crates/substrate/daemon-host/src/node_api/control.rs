@@ -251,6 +251,9 @@ impl ControlApi for NodeApiImpl {
                 daemon_api::ForeignBackend::default(),
             ),
         };
+        // Phase 3: a resident foreign session's live `Model` selector (choices + current), so a
+        // detail pane can render a foreign model picker without a side channel.
+        let model_selector = self.live.model_selector(&session);
         Some(SessionDetail {
             info,
             overlay,
@@ -260,6 +263,7 @@ impl ControlApi for NodeApiImpl {
             checkpoints,
             engine,
             foreign_backend,
+            model_selector,
         })
     }
 

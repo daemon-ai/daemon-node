@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use daemon_api::{from_cbor, AgentEntry, AgentProtocol, ApiError};
+use daemon_api::{from_cbor, AgentEntry, AgentProtocol, ApiError, ModelSelector};
 use daemon_common::SessionId;
 use daemon_host::{
     AgentDiscovery, AgentSession, CodecSession, ForeignSessionFactory, StreamJsonCodec,
@@ -36,8 +36,9 @@ use crate::{GatewayBinding, GatewayCoords, GatewayLease};
 /// touching the protocol-specific `AcpSession`/`CodecSession` backends.
 struct GatewayLeasedSession {
     inner: Arc<dyn AgentSession>,
-    /// Revokes the per-session gateway token on drop. Never read; held for its `Drop`.
-    _lease: GatewayLease,
+    /// Revokes the per-session gateway token on drop, and re-binds it on a live model change (Phase
+    /// 3). Held for its `Drop` and its `rebind_model`.
+    lease: GatewayLease,
 }
 
 #[async_trait::async_trait]
@@ -53,17 +54,25 @@ impl AgentSession for GatewayLeasedSession {
     fn rewindable(&self) -> bool {
         self.inner.rewindable()
     }
+
+    // A `NodeProvider`-routed session's model is chosen node-side by the gateway, not by the agent's
+    // own selector — so the inner backend's selector is deliberately hidden (the node's routed model
+    // is authoritative), and a live model change re-binds the gateway token instead of issuing an
+    // ACP `set_config_option` to the agent. `model_selector`/`selector_updates` fall through to the
+    // trait defaults (`None`).
+    async fn set_model(&self, model: String) -> Result<Option<ModelSelector>, String> {
+        self.lease.rebind_model(model);
+        // No agent-visible selector to surface for a routed session (the routing is node-side).
+        Ok(None)
+    }
 }
 
 /// Wrap a produced foreign session in a [`GatewayLeasedSession`] when a per-session gateway lease
-/// was minted for it, so the token is revoked when the session drops; a `None` lease (AgentNative,
-/// or a non-routed session) returns the session unchanged.
+/// was minted for it, so the token is revoked when the session drops (and can be re-bound on a live
+/// model change); a `None` lease (AgentNative, or a non-routed session) returns the session unchanged.
 fn with_lease(inner: Arc<dyn AgentSession>, lease: Option<GatewayLease>) -> Arc<dyn AgentSession> {
     match lease {
-        Some(lease) => Arc::new(GatewayLeasedSession {
-            inner,
-            _lease: lease,
-        }),
+        Some(lease) => Arc::new(GatewayLeasedSession { inner, lease }),
         None => inner,
     }
 }
@@ -186,7 +195,9 @@ pub(crate) fn node_provider_injection(
         return (Vec::new(), None);
     }
     let model = binding.model.clone();
-    let token = coords.minter.mint(binding);
+    // The lease keeps a copy of the routing so a live model change (Phase 3) can re-bind the same
+    // token with a new model while the token/provider/credential stay put.
+    let token = coords.minter.mint(binding.clone());
     let mut env = vec![
         ("OPENAI_BASE_URL".to_string(), coords.base_url.clone()),
         ("OPENAI_API_KEY".to_string(), token.clone()),
@@ -194,7 +205,7 @@ pub(crate) fn node_provider_injection(
     if !model.is_empty() {
         env.push(("OPENAI_MODEL".to_string(), model));
     }
-    let lease = GatewayLease::new(coords.minter.clone(), token);
+    let lease = GatewayLease::new(coords.minter.clone(), token, binding);
     (env, Some(lease))
 }
 
@@ -240,6 +251,12 @@ mod tests {
             let token = format!("sess-token-{n}");
             self.table.lock().unwrap().insert(token.clone(), binding);
             token
+        }
+
+        fn rebind(&self, token: &str, binding: GatewayBinding) {
+            if let Some(slot) = self.table.lock().unwrap().get_mut(token) {
+                *slot = binding;
+            }
         }
 
         fn revoke(&self, token: &str) {
@@ -325,5 +342,33 @@ mod tests {
         assert!(map.contains_key("OPENAI_API_KEY"));
         // No model hint when the routing carries no model.
         assert!(!map.contains_key("OPENAI_MODEL"));
+    }
+
+    #[test]
+    fn node_provider_lease_rebinds_the_routed_model_in_place() {
+        // Phase 3: a live model change on a routed session re-binds the SAME token to the new model,
+        // keeping provider + credential; the agent's next request then routes to `gpt-4o-mini`.
+        let minter = Arc::new(RecordingMinter::default());
+        let (env, lease) =
+            node_provider_injection("codex", &coords(minter.clone()), binding("gpt-4o"));
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        let token = map
+            .get("OPENAI_API_KEY")
+            .cloned()
+            .expect("a token is minted");
+        let lease = lease.expect("a routed session mints a lease");
+
+        lease.rebind_model("gpt-4o-mini".into());
+        assert_eq!(
+            minter.table.lock().unwrap().get(&token),
+            Some(&binding("gpt-4o-mini")),
+            "rebind updates the token's routed model in place (same token, new model)"
+        );
+        // Dropping the lease still revokes the same token.
+        drop(lease);
+        assert!(
+            !minter.table.lock().unwrap().contains_key(&token),
+            "dropping the lease after a rebind still revokes the token"
+        );
     }
 }

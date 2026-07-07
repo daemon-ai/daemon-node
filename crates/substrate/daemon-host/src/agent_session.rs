@@ -80,6 +80,34 @@ pub trait AgentSession: Send + Sync {
     fn rewindable(&self) -> bool {
         true
     }
+
+    /// The agent's advertised model selector for this live session, when it exposes one and has
+    /// reported it (foreign ACP `AgentNative` sessions only). `None` for the native engine, agents
+    /// with no `Model` config option, and gateway-routed sessions (whose model is chosen node-side).
+    /// The last-seen snapshot; a live consumer watches [`Self::selector_updates`].
+    fn model_selector(&self) -> Option<daemon_api::ModelSelector> {
+        None
+    }
+
+    /// A live subscription to this session's model-selector changes (captured at `session/new`,
+    /// after a `set_config_option`, and on a `config_option_update` notification). `None` when the
+    /// backend has no live selector (native engine, non-ACP, gateway-routed). Each item is the full
+    /// new [`ModelSelector`](daemon_api::ModelSelector) snapshot.
+    fn selector_updates(&self) -> Option<broadcast::Receiver<daemon_api::ModelSelector>> {
+        None
+    }
+
+    /// Set the session's model on the LIVE backend: a foreign ACP `AgentNative` session issues an
+    /// ACP `set_config_option` on its `Model` category; a gateway-routed `NodeProvider` session
+    /// re-binds its per-session gateway token to the new model. Returns the resulting
+    /// [`ModelSelector`](daemon_api::ModelSelector) when the backend tracks one (so the caller can
+    /// refresh its sidecar), or `None` when there is no agent-visible selector (the routed case).
+    /// The native engine does not use this seam (its model swap goes through the provider factory);
+    /// the default is unsupported.
+    async fn set_model(&self, model: String) -> Result<Option<daemon_api::ModelSelector>, String> {
+        let _ = model;
+        Err("this session backend does not support live model selection".to_string())
+    }
 }
 
 /// An engine (in-process or foreign) presented to its supervisor as a `UnitKind::Engine`

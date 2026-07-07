@@ -426,6 +426,187 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
     assert!(err.to_string().contains("no-such-agent"));
 }
 
+/// Poll `session_get` until the resident foreign session's live `model_selector.current` reaches
+/// `expected` (the sidecar is refreshed asynchronously off the backend's push feed), then return it.
+async fn wait_for_selector_current(
+    node: &Arc<NodeApiImpl>,
+    session: &daemon_common::SessionId,
+    expected: &str,
+) -> daemon_api::ModelSelector {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(detail) = node.session_get(session.clone()).await {
+            if let Some(selector) = detail.model_selector {
+                if selector.current == expected {
+                    return selector;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for model_selector.current == {expected}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Phase 3 (read): a resident foreign session surfaces its agent's advertised `Model` selector as
+/// live `SessionDetail.model_selector` — captured at `session/new` — so a thin client can render a
+/// foreign model picker without a side channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_session_detail_surfaces_the_model_selector() {
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        acp_session_detail_surfaces_the_model_selector_impl(),
+    )
+    .await;
+}
+
+async fn acp_session_detail_surfaces_the_model_selector_impl() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+    node.profile_create(foreign_profile("acp-selector", "fake-echo"))
+        .await
+        .expect("create a foreign profile");
+    let session = node
+        .session_create(None, Some(ProfileRef::new("acp-selector")))
+        .await
+        .expect("create a session bound to the ACP profile");
+    // One turn makes the session resident (spawns the ACP backend → session/new captures the selector).
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hello foreign agent"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit a turn");
+    drain_turn(&node, &session).await;
+
+    // The mock advertises a Model selector with two choices, current = mock-model-a.
+    let selector = wait_for_selector_current(&node, &session, "mock-model-a").await;
+    assert_eq!(selector.option_id, "model");
+    let ids: Vec<&str> = selector.choices.iter().map(|c| c.id.as_str()).collect();
+    assert!(
+        ids.contains(&"mock-model-a") && ids.contains(&"mock-model-b"),
+        "the selector surfaces both advertised choices: {selector:?}"
+    );
+    let label_b = selector
+        .choices
+        .iter()
+        .find(|c| c.id == "mock-model-b")
+        .map(|c| c.label.as_str());
+    assert_eq!(
+        label_b,
+        Some("Mock Model B"),
+        "each choice carries its human-readable label"
+    );
+}
+
+/// Phase 3 (write): a foreign-aware `SetSessionModel` on a resident `AgentNative` session is no
+/// longer `Unsupported` — it drives a live ACP `set_config_option` (the mock reflects it in-band on
+/// the next turn) and the surfaced `model_selector.current` advances to the new model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_set_session_model_drives_a_live_set_config_option() {
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        foreign_set_session_model_drives_a_live_set_config_option_impl(),
+    )
+    .await;
+}
+
+async fn foreign_set_session_model_drives_a_live_set_config_option_impl() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+    node.profile_create(foreign_profile("acp-set", "fake-echo"))
+        .await
+        .expect("create a foreign profile (no steered model — starts on mock-model-a)");
+    let session = node
+        .session_create(None, Some(ProfileRef::new("acp-set")))
+        .await
+        .expect("create a session bound to the ACP profile");
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hello foreign agent"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit the opening turn");
+    drain_turn(&node, &session).await;
+    // The session starts on the agent's default (mock-model-a).
+    wait_for_selector_current(&node, &session, "mock-model-a").await;
+
+    // The foreign-aware set: previously `Unsupported`, now routed to the live ACP session.
+    node.set_session_model(session.clone(), "mock-model-b".into(), None)
+        .await
+        .expect("a foreign-aware SetSessionModel must not be Unsupported");
+
+    // The surfaced selector advanced to the new model...
+    let selector = wait_for_selector_current(&node, &session, "mock-model-b").await;
+    assert_eq!(selector.current, "mock-model-b");
+
+    // ...and the agent actually received the set_config_option (mock reflects it on the next turn).
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("second turn"),
+            request_id: ReqId(2),
+        },
+    )
+    .await
+    .expect("submit a second turn");
+    let items = drain_turn(&node, &session).await;
+    let reflected = items.iter().any(|o| {
+        matches!(o, Outbound::Event(AgentEvent::TextDelta { text, .. })
+                 if text.contains("set:model=mock-model-b"))
+    });
+    assert!(
+        reflected,
+        "the live SetSessionModel must drive an ACP set_config_option: {items:?}"
+    );
+}
+
+/// Phase 3 (notification): an unsolicited `config_option_update` from the agent updates the node's
+/// surfaced `model_selector` without any client set — the adapter captures the notification and the
+/// sidecar reflects the agent's autonomous model change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_option_update_notification_updates_the_surfaced_state() {
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        config_option_update_notification_updates_the_surfaced_state_impl(),
+    )
+    .await;
+}
+
+async fn config_option_update_notification_updates_the_surfaced_state_impl() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+    node.profile_create(foreign_profile("acp-notify", "fake-echo"))
+        .await
+        .expect("create a foreign profile");
+    let session = node
+        .session_create(None, Some(ProfileRef::new("acp-notify")))
+        .await
+        .expect("create a session bound to the ACP profile");
+    // The "switch-model" sentinel makes the mock emit a `config_option_update` flipping to model-b.
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("switch-model please"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit a turn that triggers the config_option_update");
+    drain_turn(&node, &session).await;
+
+    // No client set was issued — the surfaced selector advanced purely from the agent notification.
+    let selector = wait_for_selector_current(&node, &session, "mock-model-b").await;
+    assert_eq!(selector.current, "mock-model-b");
+}
+
 /// A `Foreign` profile whose backend routes through the node gateway (`NodeProvider`): the
 /// installed-agent check still applies, and the `NodeProvider` arm additionally rejects an empty
 /// routed model while accepting a well-formed one (a `Mock` provider needs neither an installed

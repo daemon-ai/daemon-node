@@ -74,6 +74,14 @@ impl GatewayTokenMinter for GatewayTokenRegistry {
         token
     }
 
+    fn rebind(&self, token: &str, binding: GatewayBinding) {
+        // Update the routed binding in place for a live model change (Phase 3); a no-op for an
+        // unknown/revoked token (never resurrect one).
+        if let Some(slot) = self.table.lock().unwrap().get_mut(token) {
+            *slot = binding;
+        }
+    }
+
     fn revoke(&self, token: &str) {
         self.table.lock().unwrap().remove(token);
     }

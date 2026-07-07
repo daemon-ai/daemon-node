@@ -2196,6 +2196,33 @@ pub struct SessionMetaPatch {
     pub archived: Option<bool>,
 }
 
+/// One choice a foreign agent's [`ModelSelector`] offers: the opaque value id the set intent
+/// carries plus a human-readable label.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// The choice's value id — what a [`SessionApi::set_session_model`] carries (opaque to the node).
+    pub id: String,
+    /// The choice's human-readable label (the agent's display name for the model).
+    pub label: String,
+}
+
+/// A foreign (ACP) session's advertised model selector, surfaced as live session state (wire v30,
+/// Phase 3): the agent's own `Model`-category config option, captured by `daemon-acp` at
+/// `session/new`, after a `set_config_option`, and on a `config_option_update` notification. Present
+/// only for a resident foreign session whose agent advertises a Model selector — a native (`Core`)
+/// session and a gateway-routed `NodeProvider` session (whose model is chosen node-side) have none.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelector {
+    /// The ACP config-option id of the Model selector (opaque; echoed back on a set intent).
+    pub option_id: String,
+    /// The currently-selected model value id (one of `choices`' ids).
+    pub current: String,
+    /// The models the agent offers, flattened across any groups.
+    pub choices: Vec<ModelChoice>,
+}
+
 /// The full detail of one session — the single round-trip a GUI detail pane reads: roster `info`
 /// plus the resolved overlay/model/provider, delivery targets, parent/children ids, and a
 /// checkpoint count.
@@ -2229,6 +2256,12 @@ pub struct SessionDetail {
     /// `AgentNative { model: None }` for `Core` sessions and pre-v30 encodings.
     #[serde(default)]
     pub foreign_backend: ForeignBackend,
+    /// For a resident foreign (ACP) session whose agent advertises a `Model` selector: its live
+    /// model choices + current selection (wire v30, Phase 3), so a thin client can render + drive a
+    /// foreign model picker. `None` for native sessions, foreign agents with no Model selector, and
+    /// gateway-routed `NodeProvider` sessions (whose model is chosen node-side).
+    #[serde(default)]
+    pub model_selector: Option<ModelSelector>,
 }
 
 /// One full-text session-search hit — the transport-stable mirror of the store's `SessionSearchHit`
@@ -4729,6 +4762,20 @@ mod tests {
                     model: "gpt-4o".into(),
                     credential_ref: None,
                 },
+                model_selector: Some(ModelSelector {
+                    option_id: "model".into(),
+                    current: "mock-model-a".into(),
+                    choices: vec![
+                        ModelChoice {
+                            id: "mock-model-a".into(),
+                            label: "Mock Model A".into(),
+                        },
+                        ModelChoice {
+                            id: "mock-model-b".into(),
+                            label: "Mock Model B".into(),
+                        },
+                    ],
+                }),
             })),
             ApiResponse::SessionSearch(vec![SessionSearchHit {
                 session: SessionId::new("s1"),

@@ -281,7 +281,14 @@ session-detail = {
   ? "checkpoints": uint,
   ? "engine": engine-selector,
   ? "foreign_backend": foreign-backend,
+  ? "model_selector": (model-selector / null),
 }
+
+; A resident foreign (ACP) session's advertised Model selector, surfaced as live session state
+; (Phase 3): the option id, the current value, and the offered choices (flattened across groups).
+; Only present for a foreign session whose agent advertises a Model config option.
+model-choice = { "id": tstr, "label": tstr }
+model-selector = { "option_id": tstr, "current": tstr, "choices": [* model-choice] }
 
 session-search-hit = { "session": session-id, "title": tstr, "snippet": tstr }
 
