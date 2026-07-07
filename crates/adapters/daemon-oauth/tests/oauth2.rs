@@ -17,12 +17,34 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use daemon_host::{AuthFlowFactory, CredentialSlotKind};
+use daemon_api::{ApiError, AuthChallenge, AuthStepInput};
+use daemon_host::{
+    AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
+};
 use daemon_oauth::{
     generic_oauth2, openrouter, DescriptorFlowFactory, FAMILY, OPENROUTER_FAMILY,
     PARAM_ACCOUNT_LABEL, PARAM_AUTHORIZATION_ENDPOINT, PARAM_CLIENT_ID, PARAM_SCOPES,
     PARAM_TOKEN_ENDPOINT,
 };
+
+/// The authorization URL a redirect flow presents as its initial challenge.
+fn redirect_url(flow: &dyn PendingAuthFlow) -> String {
+    match flow.initial_challenge() {
+        AuthChallenge::Redirect { authorization_url } => authorization_url,
+        other => panic!("expected a redirect challenge, got {other:?}"),
+    }
+}
+
+/// Drive a single-redirect flow to completion via the captured callback (the `auth_complete` shape).
+async fn complete(flow: &dyn PendingAuthFlow, callback: &str) -> Result<AuthOutcome, ApiError> {
+    match flow
+        .step(AuthStepInput::Callback(callback.to_string()))
+        .await?
+    {
+        AuthStepOutcome::Completed(outcome) => Ok(outcome),
+        AuthStepOutcome::Challenge(_) => panic!("expected the flow to complete in one step"),
+    }
+}
 
 fn params_for(server_uri: &str, label: Option<&str>) -> BTreeMap<String, String> {
     let mut p = BTreeMap::new();
@@ -85,16 +107,16 @@ async fn begin_complete_exchanges_the_code_with_a_bound_verifier() {
         )
         .await
         .expect("begin");
-    let auth_url = flow.authorization_url().to_string();
+    let auth_url = redirect_url(flow.as_ref());
     let challenge = query_param(&auth_url, "code_challenge").expect("challenge advertised");
     let state = query_param(&auth_url, "state").expect("state minted");
 
-    let outcome = flow
-        .complete(&format!(
-            "http://127.0.0.1:7777/cb?code=the-code&state={state}"
-        ))
-        .await
-        .expect("complete");
+    let outcome = complete(
+        flow.as_ref(),
+        &format!("http://127.0.0.1:7777/cb?code=the-code&state={state}"),
+    )
+    .await
+    .expect("complete");
 
     // The identity: explicit label wins; refs/instance are family-qualified.
     assert_eq!(outcome.account_label, "work");
@@ -147,11 +169,13 @@ async fn id_token_sub_names_the_account_when_no_label_is_given() {
         .begin(&params_for(&server.uri(), None), "http://127.0.0.1:7777/cb")
         .await
         .expect("begin");
-    let state = query_param(flow.authorization_url(), "state").unwrap();
-    let outcome = flow
-        .complete(&format!("http://127.0.0.1:7777/cb?code=c&state={state}"))
-        .await
-        .expect("complete");
+    let state = query_param(&redirect_url(flow.as_ref()), "state").unwrap();
+    let outcome = complete(
+        flow.as_ref(),
+        &format!("http://127.0.0.1:7777/cb?code=c&state={state}"),
+    )
+    .await
+    .expect("complete");
     assert_eq!(outcome.account_label, "alice@idp");
     assert_eq!(outcome.credential_ref, "oauth2/alice@idp");
 }
@@ -175,11 +199,13 @@ async fn a_failed_token_exchange_is_surfaced() {
         .begin(&params_for(&server.uri(), None), "http://127.0.0.1:7777/cb")
         .await
         .expect("begin");
-    let state = query_param(flow.authorization_url(), "state").unwrap();
+    let state = query_param(&redirect_url(flow.as_ref()), "state").unwrap();
     // `AuthOutcome` deliberately has no `Debug` (it carries the secret blob), so match by hand.
-    let err = match flow
-        .complete(&format!("http://127.0.0.1:7777/cb?code=c&state={state}"))
-        .await
+    let err = match complete(
+        flow.as_ref(),
+        &format!("http://127.0.0.1:7777/cb?code=c&state={state}"),
+    )
+    .await
     {
         Err(e) => e,
         Ok(_) => panic!("a 400 exchange must fail the completion"),
@@ -199,9 +225,11 @@ async fn state_mismatch_is_rejected_before_any_exchange() {
         )
         .await
         .expect("begin");
-    let err = match flow
-        .complete("http://127.0.0.1:7777/cb?code=abc&state=WRONG")
-        .await
+    let err = match complete(
+        flow.as_ref(),
+        "http://127.0.0.1:7777/cb?code=abc&state=WRONG",
+    )
+    .await
     {
         Err(e) => e,
         Ok(_) => panic!("a state mismatch must be rejected"),
@@ -224,7 +252,8 @@ async fn openrouter_begin_targets_the_fixed_endpoint_pkce_only() {
         .begin(&BTreeMap::new(), "http://127.0.0.1:7777/cb")
         .await
         .expect("begin");
-    let url = flow.authorization_url();
+    let url = redirect_url(flow.as_ref());
+    let url = url.as_str();
     assert!(url.starts_with("https://openrouter.ai/auth?"), "{url}");
     assert_eq!(
         query_param(url, "callback_url").as_deref(),
@@ -291,11 +320,10 @@ async fn provider_key_json_mint_stores_the_bare_key_and_slot() {
         .await
         .expect("begin");
     let challenge =
-        query_param(flow.authorization_url(), "code_challenge").expect("challenge advertised");
+        query_param(&redirect_url(flow.as_ref()), "code_challenge").expect("challenge advertised");
 
     // No `state` on the callback — the PKCE-only descriptor accepts it.
-    let outcome = flow
-        .complete("http://127.0.0.1:7777/cb?code=or-code")
+    let outcome = complete(flow.as_ref(), "http://127.0.0.1:7777/cb?code=or-code")
         .await
         .expect("complete");
     // The BARE minted key is the blob (not the JSON envelope), and it is slotted as a provider key.

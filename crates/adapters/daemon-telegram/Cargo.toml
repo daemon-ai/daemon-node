@@ -1,0 +1,41 @@
+[package]
+name = "daemon-telegram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Telegram chat transport (Phase 1 of the multi-protocol messaging plan): an in-process
+# `NodeApi`-client adapter, structurally the twin of `daemon-matrix`. It isolates the `grammers`
+# MTProto SDK (user + bot accounts under one crate family) and drives *our* engine as a client —
+# normalising Telegram messages into `Origin`s and handing them to the reusable `daemon-ingest`
+# gate (inbound), and projecting the session's outbound merged log back to Telegram messages via a
+# `daemon-delivery` `Projector` (outbound). All grammers types stay confined to this crate (they
+# live only in `client.rs`); it leaks no Telegram/MTProto type into host/core.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# in-process bring-up seams (not wire): AccountProvisioning (enumerate bound telegram accounts +
+# resolve/write-back session blobs) and the interactive-auth host surface the login flow plugs into.
+daemon-host = { workspace = true }
+# the two reusable transport-agnostic halves this adapter plugs into.
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# The grammers MTProto client family — one crate family covers BOTH user and bot accounts. All
+# grammers types are confined to `client.rs`; the rest of the crate is SDK-agnostic.
+grammers-client = "0.10"
+grammers-session = { version = "0.10", features = ["sqlite-storage"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

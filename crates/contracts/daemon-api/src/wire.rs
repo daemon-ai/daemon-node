@@ -400,6 +400,8 @@ pub enum ApiRequest {
     },
     /// [`AuthApi::auth_begin`].
     AuthBegin(AuthBeginRequest),
+    /// [`AuthApi::auth_step`].
+    AuthStep(AuthStepRequest),
     /// [`AuthApi::auth_complete`].
     AuthComplete(AuthCompleteRequest),
     /// [`AuthApi::auth_cancel`].
@@ -1064,6 +1066,8 @@ pub enum ApiResponse {
     Credentials(Vec<CredentialInfo>),
     /// A begun interactive-auth flow handle (`auth_begin`).
     AuthBegun(AuthBeginResponse),
+    /// A step result: the next challenge or the completed outcome (`auth_step`).
+    AuthStepped(AuthStepResult),
     /// A completed interactive-auth flow outcome (`auth_complete`).
     AuthCompleted(AuthCompleteResponse),
     /// The registered interactive-auth providers (`auth_providers`).
@@ -1999,6 +2003,105 @@ mod auth_contract_tests {
             roles: vec!["admin".into()],
             capabilities: vec!["access_admin".into()],
         }));
+    }
+
+    /// The multi-step interactive-auth wire surface (wire v31): the `AuthStep` request + `AuthStepped`
+    /// response, every `AuthChallenge` / `AuthStepInput` / `AuthStepResult` arm, the reshaped
+    /// `AuthBeginResponse`, and the extended `AuthFlowKind`, all round-trip through ciborium.
+    #[test]
+    fn interactive_auth_multistep_round_trips() {
+        fn rt_req(req: &ApiRequest) {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(req, &mut bytes).expect("encode ApiRequest");
+            let decoded: ApiRequest = ciborium::from_reader(&bytes[..]).expect("decode ApiRequest");
+            assert_eq!(&decoded, req);
+        }
+        fn rt_res(res: &ApiResponse) {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(res, &mut bytes).expect("encode ApiResponse");
+            let decoded: ApiResponse =
+                ciborium::from_reader(&bytes[..]).expect("decode ApiResponse");
+            assert_eq!(&decoded, res);
+        }
+
+        // Every AuthFlowKind variant (the 4 new ones + the 2 originals).
+        for kind in [
+            AuthFlowKind::MatrixSso,
+            AuthFlowKind::OAuth2Pkce,
+            AuthFlowKind::BotToken,
+            AuthFlowKind::UserToken,
+            AuthFlowKind::PhoneOtp,
+            AuthFlowKind::QrPairing,
+        ] {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&kind, &mut bytes).expect("encode AuthFlowKind");
+            let back: AuthFlowKind = ciborium::from_reader(&bytes[..]).expect("decode");
+            assert_eq!(back, kind);
+        }
+
+        // Every AuthChallenge arm inside a reshaped AuthBeginResponse.
+        let challenges = vec![
+            AuthChallenge::Redirect {
+                authorization_url: "https://idp.example/authorize?x=1".into(),
+            },
+            AuthChallenge::Form {
+                title: "Enter the code".into(),
+                fields: vec![AuthParamField {
+                    key: "otp".into(),
+                    label: "One-time code".into(),
+                    required: true,
+                }],
+            },
+            AuthChallenge::Qr {
+                payload: "wa://link?tok=abc".into(),
+                image: Some(vec![0x89, 0x50, 0x4e, 0x47]),
+                poll_interval_ms: 2000,
+            },
+            AuthChallenge::Qr {
+                payload: "sig://link".into(),
+                image: None,
+                poll_interval_ms: 1500,
+            },
+            AuthChallenge::Message {
+                text: "Approve on your other device".into(),
+            },
+        ];
+        for challenge in &challenges {
+            rt_res(&ApiResponse::AuthBegun(AuthBeginResponse {
+                flow_id: "flow-1".into(),
+                challenge: challenge.clone(),
+                expires_at: 1_700_000_000,
+            }));
+        }
+
+        // Every AuthStepInput arm on the AuthStep request.
+        let inputs = vec![
+            AuthStepInput::Fields(BTreeMap::from([(
+                "phone".to_string(),
+                "+15551234".to_string(),
+            )])),
+            AuthStepInput::Callback("https://cb.example/?code=xyz&state=s".into()),
+            AuthStepInput::Poll,
+        ];
+        for input in inputs {
+            rt_req(&ApiRequest::AuthStep(AuthStepRequest {
+                flow_id: "flow-1".into(),
+                input,
+            }));
+        }
+
+        // Both AuthStepResult arms on the AuthStepped response.
+        rt_res(&ApiResponse::AuthStepped(AuthStepResult::Challenge(
+            challenges[1].clone(),
+        )));
+        rt_res(&ApiResponse::AuthStepped(AuthStepResult::Completed(
+            AuthCompleteResponse {
+                credential_ref: "matrix/@bot:hs.org".into(),
+                account_label: "@bot:hs.org".into(),
+                transport_instance: TransportId::new("matrix/@bot:hs.org"),
+                bound_profile: Some(ProfileRef::new("default")),
+            },
+        )));
     }
 
     #[test]

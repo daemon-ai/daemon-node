@@ -4,7 +4,41 @@
 //! Profile/credential-surface responses: profile roster/detail, credentials, auth flows,
 //! distribution bundles, imports, revisions, and skill bundles.
 
-use daemon_api::ApiResponse;
+use daemon_api::{ApiResponse, AuthChallenge, AuthStepResult};
+
+/// A one-line human description of a challenge the client must present.
+fn describe_challenge(challenge: &AuthChallenge) {
+    match challenge {
+        AuthChallenge::Redirect { authorization_url } => {
+            println!("  open this URL in a browser:\n    {authorization_url}");
+        }
+        AuthChallenge::Form { title, fields } => {
+            let keys: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    if f.required {
+                        format!("{}*", f.key)
+                    } else {
+                        f.key.clone()
+                    }
+                })
+                .collect();
+            println!("  form: \"{title}\" fields=[{}]", keys.join(", "));
+        }
+        AuthChallenge::Qr {
+            payload,
+            image,
+            poll_interval_ms,
+        } => {
+            let img = image.as_ref().map(|b| format!("{} bytes", b.len()));
+            println!(
+                "  scan this QR (poll every {poll_interval_ms}ms): payload={payload} image={}",
+                img.as_deref().unwrap_or("(render payload)")
+            );
+        }
+        AuthChallenge::Message { text } => println!("  {text}"),
+    }
+}
 
 pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
     match resp {
@@ -39,13 +73,31 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
             }
         }
         ApiResponse::AuthBegun(b) => {
-            println!("auth begun: flow_id={} ({:?})", b.flow_id, b.flow_kind);
-            println!("  open this URL in a browser:\n    {}", b.authorization_url);
             println!(
-                "  redirect_uri={} expires_at={}",
-                b.redirect_uri, b.expires_at
+                "auth begun: flow_id={} expires_at={}",
+                b.flow_id, b.expires_at
             );
+            describe_challenge(&b.challenge);
         }
+        ApiResponse::AuthStepped(result) => match result {
+            AuthStepResult::Challenge(challenge) => {
+                println!("auth step: next challenge");
+                describe_challenge(&challenge);
+            }
+            AuthStepResult::Completed(c) => {
+                let bound = c
+                    .bound_profile
+                    .map(|p| format!(" bound_profile={p}"))
+                    .unwrap_or_default();
+                println!(
+                    "auth completed: account={} credential_ref={} instance={}{}",
+                    c.account_label,
+                    c.credential_ref,
+                    c.transport_instance.as_str(),
+                    bound
+                );
+            }
+        },
         ApiResponse::AuthCompleted(c) => {
             let bound = c
                 .bound_profile

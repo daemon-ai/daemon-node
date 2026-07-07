@@ -1,0 +1,63 @@
+[package]
+name = "daemon-whatsapp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The WhatsApp chat transport (Phase 1 of the multi-protocol messaging plan): an in-process
+# `NodeApi`-client adapter modelled on `daemon-matrix`. It normalises inbound WhatsApp messages into
+# `Origin`s and hands them to the reusable `daemon-ingest` gate, and projects the outbound merged log
+# to WhatsApp messages via a `daemon-delivery` `Projector`. Two backends selected per account mode:
+#   * user (`mode = "user"`): `whatsapp-rust` (unofficial WhatsApp Web reimplementation, QR/pair-code
+#     linking) — ToS / account-ban risk, user-accepted.
+#   * bot  (`mode = "bot"`):  `wacloudapi` (official Meta Cloud API, bearer token).
+# All SDK types stay confined to this crate (mirrors matrix-sdk/genai/rmcp isolation).
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# in-process bring-up seams (not wire): AccountProvisioning + the interactive-auth host traits.
+daemon-host = { workspace = true }
+# the two reusable transport-agnostic halves this adapter plugs into.
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# WhatsApp Web (user accounts): QR / pair-code linking + E2E messaging. default-features off drops the
+# `simd` + `moka-cache` + `signal` defaults (smaller tree, stable-only). We deliberately do NOT enable
+# `sqlite-storage`: its `libsqlite3-sys 0.36` (`links = "sqlite3"`) collides with the workspace's
+# rusqlite 0.37 -> libsqlite3-sys 0.35 (one native `sqlite3` link per graph). Instead the user backend
+# uses `wacore`'s `InMemoryBackend` and persists the paired `Device` snapshot into the daemon credential
+# store (the authoritative session blob). We keep the Tokio WebSocket transport, the ureq HTTP client,
+# and the Tokio runtime (all rustls). Unofficial WhatsApp Web reimplementation — see the crate header.
+whatsapp-rust = { version = "0.6", default-features = false, features = [
+    "tokio-transport",
+    "ureq-client",
+    "tokio-runtime",
+    "tokio-native",
+] }
+# `wacore` (whatsapp-rust's platform-agnostic core, same 0.6 line) for the `InMemoryBackend` storage
+# backend + the serde-serializable `Device` snapshot we persist as the session blob. default-features
+# off drops its `simd` default. Already in-tree transitively via whatsapp-rust; declared directly so we
+# name `InMemoryBackend`/`Device`/`DeviceStore` without leaning on a re-export.
+wacore = { version = "0.6", default-features = false }
+# WhatsApp Cloud API (bot accounts): Meta Business Platform bearer-token send. SDK-internal HTTP only.
+wacloudapi = "0.1.0"
+# `wacloudapi` pulls `reqwest` with its default `native-tls` (→ `openssl-sys`), and the rustls-only Nix
+# devshell ships no system OpenSSL. Enabling `openssl-sys/vendored` (additive, graph-wide) makes that
+# transitive `openssl-sys` build OpenSSL from vendored source instead of probing pkg-config — the only
+# openssl-sys in the graph is this one, so nothing else is affected. Not referenced from our code; the
+# dependency exists solely to flip the feature.
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

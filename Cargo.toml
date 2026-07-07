@@ -299,6 +299,14 @@ daemon-ingest = { version = "0", path = "crates/adapters/daemon-ingest" }
 daemon-matrix = { version = "0", path = "crates/adapters/daemon-matrix" }
 daemon-oauth = { version = "0", path = "crates/adapters/daemon-oauth" }
 daemon-rooms = { version = "0", path = "crates/adapters/daemon-rooms" }
+# [waveB:msg-adapters] Six additional chat-transport adapters (Phase 2 integration). Each isolates
+# its heavy external SDK deps; the daemon binary only references its `Adapter`/`AuthFlowFactory`/`Config`.
+daemon-telegram = { version = "0", path = "crates/adapters/daemon-telegram" }
+daemon-whatsapp = { version = "0", path = "crates/adapters/daemon-whatsapp" }
+daemon-discord = { version = "0", path = "crates/adapters/daemon-discord" }
+daemon-wechat = { version = "0", path = "crates/adapters/daemon-wechat" }
+daemon-line = { version = "0", path = "crates/adapters/daemon-line" }
+daemon-slack = { version = "0", path = "crates/adapters/daemon-slack" }
 daemon-transport = { version = "0", path = "crates/substrate/daemon-transport" }
 daemon-orchestration = { version = "0", path = "crates/orchestration/daemon-orchestration" }
 daemon-node = { version = "0", path = "crates/node/daemon-node" }

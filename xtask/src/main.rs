@@ -565,6 +565,91 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             profile: "default".into(),
         },
     )?;
+    // Multi-step interactive auth (wire v31): the AuthStep op across every AuthStepInput arm, the
+    // reshaped AuthBegun (initial challenge), and AuthStepped across every AuthChallenge +
+    // AuthStepResult arm — so verify-codec proves the generated zcbor decoder accepts the new shapes.
+    {
+        use daemon_api::{
+            AuthBeginResponse, AuthChallenge, AuthCompleteResponse, AuthParamField, AuthStepInput,
+            AuthStepRequest, AuthStepResult,
+        };
+        write_cbor(
+            &out,
+            "request-auth-step-fields.cbor",
+            &ApiRequest::AuthStep(AuthStepRequest {
+                flow_id: "flow-1".into(),
+                input: AuthStepInput::Fields(std::collections::BTreeMap::from([(
+                    "otp".to_string(),
+                    "123456".to_string(),
+                )])),
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "request-auth-step-callback.cbor",
+            &ApiRequest::AuthStep(AuthStepRequest {
+                flow_id: "flow-1".into(),
+                input: AuthStepInput::Callback("https://cb.example/?code=xyz&state=s".into()),
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "request-auth-step-poll.cbor",
+            &ApiRequest::AuthStep(AuthStepRequest {
+                flow_id: "flow-1".into(),
+                input: AuthStepInput::Poll,
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "response-auth-begun.cbor",
+            &ApiResponse::AuthBegun(AuthBeginResponse {
+                flow_id: "flow-1".into(),
+                challenge: AuthChallenge::Redirect {
+                    authorization_url: "https://idp.example/authorize?state=s".into(),
+                },
+                expires_at: 1_700_000_600,
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "response-auth-stepped-form.cbor",
+            &ApiResponse::AuthStepped(AuthStepResult::Challenge(AuthChallenge::Form {
+                title: "Enter the code we texted you".into(),
+                fields: vec![AuthParamField {
+                    key: "otp".into(),
+                    label: "One-time code".into(),
+                    required: true,
+                }],
+            })),
+        )?;
+        write_cbor(
+            &out,
+            "response-auth-stepped-qr.cbor",
+            &ApiResponse::AuthStepped(AuthStepResult::Challenge(AuthChallenge::Qr {
+                payload: "wa://link?token=abc".into(),
+                image: Some(vec![0x89, 0x50, 0x4e, 0x47]),
+                poll_interval_ms: 2000,
+            })),
+        )?;
+        write_cbor(
+            &out,
+            "response-auth-stepped-message.cbor",
+            &ApiResponse::AuthStepped(AuthStepResult::Challenge(AuthChallenge::Message {
+                text: "Approve the login on your other device".into(),
+            })),
+        )?;
+        write_cbor(
+            &out,
+            "response-auth-stepped-completed.cbor",
+            &ApiResponse::AuthStepped(AuthStepResult::Completed(AuthCompleteResponse {
+                credential_ref: "matrix/@bot:hs.org".into(),
+                account_label: "@bot:hs.org".into(),
+                transport_instance: daemon_protocol::TransportId::new("matrix/@bot:hs.org"),
+                bound_profile: Some(ProfileRef::new("default")),
+            })),
+        )?;
+    }
     write_cbor(
         &out,
         "request-models.cbor",
