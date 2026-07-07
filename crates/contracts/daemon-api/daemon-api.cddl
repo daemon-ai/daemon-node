@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 30)
+wire_version = uint                 ; daemon-common WireVersion (current = 32)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -41,6 +41,7 @@ unit-id     = tstr
 req-id      = uint64
 job-id      = tstr
 profile-ref = tstr
+trace-id    = uint64   ; daemon-common TraceId (newtype over u64, serialized transparently)
 
 ; ----- usage (daemon-common UsageDelta) -----
 usage-delta = {
@@ -1302,6 +1303,19 @@ request-session-revoke     = { "SessionRevoke": { "user_id": tstr } }
 request-resource-grant-create = { "ResourceGrantCreate": { "user_id": tstr, "resource_kind": tstr, "resource_id": tstr, "capability": tstr } }
 request-resource-grant-list   = { "ResourceGrantList": { ? "user_id": (tstr / null) } }
 request-resource-grant-revoke = { "ResourceGrantRevoke": { "id": tstr } }
+
+; ----- user feedback over OpenTelemetry (N1; wire v32) -----
+; Explicit feedback is per-event consent (queued even when the global telemetry toggle is off);
+; the ack means accepted+queued to the durable outbox, never delivered. Optional fields mirror
+; serde `#[serde(default)] Option<T>` as `? "k": (T / null)`.
+feedback-kind = "response" / "app"
+feedback-rating = "up" / "down"
+feedback-target = { "session": session-id, "cursor": uint64, ? "trace": (trace-id / null) }
+feedback-diagnostics = { ? "app_version": (tstr / null), ? "os": (tstr / null) }
+request-feedback-submit = { "FeedbackSubmit": { "kind": feedback-kind, ? "target": (feedback-target / null), ? "rating": (feedback-rating / null), ? "comment": (tstr / null), "include_content": bool, ? "diagnostics": (feedback-diagnostics / null), "surface": tstr } }
+request-telemetry-consent-get = "TelemetryConsentGet"
+request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
+
 api-request = request-submit
             / request-submit-routed
             / request-poll
@@ -1471,6 +1485,9 @@ api-request = request-submit
             / request-resource-grant-create
             / request-resource-grant-list
             / request-resource-grant-revoke
+            / request-feedback-submit
+            / request-telemetry-consent-get
+            / request-telemetry-consent-set
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
@@ -1577,6 +1594,11 @@ response-access-user  = { "AccessUser": access-user }
 response-access-users = { "AccessUsers": [* access-user] }
 response-access-roles = { "AccessRoles": [* role-info] }
 response-who-am-i     = { "WhoAmI": principal-view }
+
+; ----- user feedback over OpenTelemetry (N1; wire v32) -----
+feedback-ack = { "accepted": bool, "queued": bool }
+response-feedback-ack = { "FeedbackAck": feedback-ack }
+response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
 api-response = response-ok
              / response-routed
              / response-session-created
@@ -1666,6 +1688,8 @@ api-response = response-ok
              / response-access-users
              / response-access-roles
              / response-who-am-i
+             / response-feedback-ack
+             / response-telemetry-consent
 
 ; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
 ; Wraps api-request/api-response so one connection carries many correlated exchanges, with

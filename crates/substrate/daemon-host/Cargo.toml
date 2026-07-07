@@ -10,6 +10,13 @@ license.workspace = true
 # folds unit `Usage` into a resident `Metrics`, and (6b) drives the verifiable trace journal. The
 # remaining deferred deps (daemon-credentials, daemon-transport) land with credential authority /
 # cross-node distribution.
+[features]
+default = []
+# Wire the user-feedback outbox drain to daemon-telemetry's real OTLP log exporter. OFF by default
+# (the drain then stays inert and records queue). Forwarded from `bins/daemon`'s own `otel` feature,
+# mirroring how `daemon-core/otel` is forwarded there.
+otel = ["daemon-telemetry/otel"]
+
 [dependencies]
 daemon-common = { workspace = true, features = ["governor"] }
 daemon-protocol = { workspace = true }

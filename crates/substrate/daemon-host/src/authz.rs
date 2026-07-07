@@ -89,6 +89,13 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ApprovalDecide { .. }
         | FingerprintRevoke { .. }
         | SessionUpdateMeta { .. } => C::SessionWrite,
+        // User feedback (N1) is a user-owned write, like an approval decision on one's own session
+        // (analogous to ApprovalDecide / SetSessionMode -> SessionWrite): any User may submit it.
+        FeedbackSubmit { .. } => C::SessionWrite,
+        // Reading the node-owned telemetry consent toggle is a control-plane read; flipping it is a
+        // node-wide control-plane write (operator tier), mirroring Telemetry -> ControlRead.
+        TelemetryConsentGet => C::ControlRead,
+        TelemetryConsentSet { .. } => C::ControlWrite,
 
         // -- serve_fleet: orchestration tree ----------------------------------------------------
         Fleet

@@ -2829,8 +2829,14 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             .with_revocations(revocations.clone())
             // Cluster F (Part B): the same per-profile broker the engine leases through, so
             // credential_remove/credential_set bump the profile authority's lease epoch.
-            .with_credential_revoker(owner_broker.clone()),
+            .with_credential_revoker(owner_broker.clone())
+            // N1 → N2: wire the user-feedback outbox drain to the OTLP exporter. `None` endpoint —
+            // or a build without the `otel` feature — leaves it inert (records stay queued).
+            .with_feedback_endpoint(cfg.telemetry.feedback_endpoint.clone()),
     );
+    // Drain any feedback records left queued by a previous run (best-effort, detached). No-op when
+    // export is inert. Per-submit drains ride the `FeedbackSubmit` handler.
+    node.spawn_feedback_drain();
     // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
     // keeps its own reference for the auth check.
     let authenticator = Arc::new(

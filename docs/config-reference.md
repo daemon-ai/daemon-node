@@ -220,6 +220,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `telegram.enabled` | `DAEMON_TELEGRAM__ENABLED` | bool | `false` |
 | `telegram.route` | `DAEMON_TELEGRAM__ROUTE` | array | `[]` |
 | `telegram.store_root` | `DAEMON_TELEGRAM__STORE_ROOT` | string | `telegram` |
+| `telemetry.feedback_endpoint` | `DAEMON_TELEMETRY__FEEDBACK_ENDPOINT` | optional | _(unset)_ |
 | `vision.base_url` | `DAEMON_VISION__BASE_URL` | optional | _(unset)_ |
 | `vision.credential_key` | `DAEMON_VISION__CREDENTIAL_KEY` | optional | _(unset)_ |
 | `vision.max_base64_mb` | `DAEMON_VISION__MAX_BASE64_MB` | number | `20` |

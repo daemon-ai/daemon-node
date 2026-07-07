@@ -135,4 +135,35 @@ pub mod daemon {
     pub const USAGE_COST_MICROS: &str = "daemon.usage.cost_micros";
     /// Provider API calls made by a model call/turn.
     pub const USAGE_API_CALLS: &str = "daemon.usage.api_calls";
+
+    /// User-feedback attribute names for the `app.feedback` OTel log event (see
+    /// [`crate::feedback`]). Feedback-specific fields have no OpenTelemetry semantic-convention
+    /// home, so they live under `daemon.feedback.*`; the fields that DO map to a convention
+    /// (session id, turn model/provider/finish-reason/token usage) reuse the `gen_ai.*` +
+    /// [`TRACE_ID`](super::TRACE_ID) names instead of duplicating them here.
+    pub mod feedback {
+        /// The feedback category: `response` (on a specific agent turn) or `app` (general).
+        pub const KIND: &str = "daemon.feedback.kind";
+        /// The thumbs rating, when given: `up` or `down`.
+        pub const RATING: &str = "daemon.feedback.rating";
+        /// The free-form comment body, when supplied (may carry user-authored text).
+        pub const COMMENT: &str = "daemon.feedback.comment";
+        /// The UI surface the feedback was submitted from (e.g. a page/panel identifier).
+        pub const SURFACE: &str = "daemon.feedback.surface";
+        /// The consent posture under which this event is exported: `opted-in` (telemetry enabled,
+        /// a long-lived provider is reused) or `explicit-one-shot` (telemetry otherwise disabled;
+        /// the user explicitly submitted, so a scoped provider is built, flushed, and shut down).
+        pub const CONSENT: &str = "daemon.feedback.consent";
+        /// The submitting client/app version, when known.
+        pub const APP_VERSION: &str = "daemon.feedback.app_version";
+        /// The submitting client operating system, when known.
+        pub const OS: &str = "daemon.feedback.os";
+        /// The node (`daemon-node`) version that exported the event.
+        pub const NODE_VERSION: &str = "daemon.feedback.node_version";
+        /// When the feedback was created, in Unix epoch milliseconds.
+        pub const CREATED_AT_MS: &str = "daemon.feedback.created_at_ms";
+        /// The rated response text, carried only when the submitter consented via `include_content`
+        /// (per-event consent). Makes a response thumb self-describing rather than a bare anchor.
+        pub const CONTENT: &str = "daemon.feedback.content";
+    }
 }

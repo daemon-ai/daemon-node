@@ -208,12 +208,15 @@ tokio-tungstenite = "0.29"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-# OpenTelemetry OTLP trace export (feature-gated `otel` in daemon-telemetry; never in the default
-# workspace gate). Traces only; exported over OTLP/HTTP+protobuf via the tree's existing rustls
-# reqwest (no gRPC/tonic). `tracing-opentelemetry` 0.33 pins `opentelemetry` 0.32 — bump in lockstep.
+# OpenTelemetry OTLP export (feature-gated `otel` in daemon-telemetry; never in the default
+# workspace gate). Traces AND user-feedback log events, exported over OTLP/HTTP+protobuf via the
+# tree's existing rustls reqwest (no gRPC/tonic). The `logs` signal (opentelemetry-otlp `logs`
+# feature) backs `daemon-telemetry::feedback`; `opentelemetry` / `opentelemetry_sdk` carry the logs
+# API in their default feature sets already. `tracing-opentelemetry` 0.33 pins `opentelemetry` 0.32
+# — bump in lockstep.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-client", "reqwest-rustls"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-client", "reqwest-rustls"] }
 tracing-opentelemetry = "0.33"
 # read-mostly immutable snapshot publishing (routing/model catalog handles)
 arc-swap = "1"

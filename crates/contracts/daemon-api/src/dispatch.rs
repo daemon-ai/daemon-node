@@ -179,6 +179,38 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             unit_or_err(api.session_update_meta(session, patch).await)
         }
         ApiRequest::Rewind { session, point } => unit_or_err(api.rewind(session, point).await),
+        // -- user feedback + node-owned telemetry consent (N1; wire v31) ------------------------
+        ApiRequest::FeedbackSubmit {
+            kind,
+            target,
+            rating,
+            comment,
+            include_content,
+            diagnostics,
+            surface,
+        } => ok_or_err(
+            api.feedback_submit(FeedbackSubmitArgs {
+                kind,
+                target,
+                rating,
+                comment,
+                include_content,
+                diagnostics,
+                surface,
+            })
+            .await,
+            ApiResponse::FeedbackAck,
+        ),
+        ApiRequest::TelemetryConsentGet => {
+            ok_or_err(api.telemetry_consent_get().await, |enabled| {
+                ApiResponse::TelemetryConsent { enabled }
+            })
+        }
+        ApiRequest::TelemetryConsentSet { enabled } => {
+            ok_or_err(api.telemetry_consent_set(enabled).await, |enabled| {
+                ApiResponse::TelemetryConsent { enabled }
+            })
+        }
         _ => return None,
     })
 }

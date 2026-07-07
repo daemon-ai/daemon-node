@@ -1252,6 +1252,27 @@ pub struct OAuthConfig {
     pub huggingface_client_id: Option<String>,
 }
 
+/// Telemetry / feedback export tuning (`[telemetry]` / `DAEMON_TELEMETRY__*`).
+///
+/// This is *product* configuration, deliberately distinct from the operator env var
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` that gates the trace layer ([`daemon_telemetry::init_telemetry`]).
+/// The trace layer ships spans for operators; the feedback endpoint here ships user thumbs-up/down
+/// + comments as `app.feedback` OTLP log events ([`daemon_telemetry::feedback`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    /// The OTLP/HTTP base URL (e.g. `http://localhost:4318`) user feedback is exported to. `None`
+    /// (the default) leaves feedback export inert — the feature is opt-in per deployment.
+    ///
+    /// Integration phase (sibling workstream owns the `FeedbackSubmit` API + the daemon-store
+    /// outbox): the handler drains the outbox and, for each record, maps it into a
+    /// [`daemon_telemetry::feedback::FeedbackEvent`] and hands this endpoint to a
+    /// [`daemon_telemetry::feedback::FeedbackExporter`] (reused when telemetry is opted-in) or to
+    /// [`daemon_telemetry::feedback::emit_one_shot`] (the consent-off explicit path). This config
+    /// only surfaces the value on [`NodeConfig::telemetry`]; no host/assembly wiring is done here.
+    pub feedback_endpoint: Option<String>,
+}
+
 // --- the node configuration -------------------------------------------------------------------
 
 /// The node configuration: the single source of truth, deserialized by [`figment`] from
@@ -1390,6 +1411,9 @@ pub struct NodeConfig {
     /// Background-process registry limits (`[processes]` / `DAEMON_PROCESSES__*`): output ring,
     /// tracked cap + TTL, PTY size, watch rate limits.
     pub processes: daemon_processes::RegistryConfig,
+    /// Telemetry / feedback export tuning (`[telemetry]`): the OTLP feedback log-event endpoint
+    /// (off by default). Distinct from the operator `OTEL_EXPORTER_OTLP_ENDPOINT` trace gate.
+    pub telemetry: TelemetryConfig,
 }
 
 impl Default for NodeConfig {
@@ -1450,6 +1474,7 @@ impl Default for NodeConfig {
             api: ApiConfig::default(),
             shell: daemon_processes::ShellConfig::default(),
             processes: daemon_processes::RegistryConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 }
@@ -1855,6 +1880,36 @@ mod tests {
             assert!(
                 !cfg.web.enable,
                 "the listener is independent of the web tools"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn telemetry_feedback_endpoint_defaults_off() {
+        let cfg =
+            NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
+                .expect("defaults must extract");
+        assert_eq!(
+            cfg.telemetry.feedback_endpoint, None,
+            "feedback export is opt-in per deployment; default is inert"
+        );
+    }
+
+    // The feedback endpoint rides the standard `DAEMON_TELEMETRY__*` env mapping.
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    #[test]
+    fn telemetry_feedback_endpoint_env_override_extracts() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env(
+                "DAEMON_TELEMETRY__FEEDBACK_ENDPOINT",
+                "http://localhost:4318",
+            );
+            let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
+                .unwrap_or_else(|e| panic!("env layer must extract: {e:#}"));
+            assert_eq!(
+                cfg.telemetry.feedback_endpoint.as_deref(),
+                Some("http://localhost:4318")
             );
             Ok(())
         });

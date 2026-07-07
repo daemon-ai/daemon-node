@@ -16,10 +16,10 @@
 
 use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, CompletionNotice,
-    FaultPoint, JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal, ParkedApproval,
-    Room, RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
-    StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion, TraceEntry,
-    TraceSegment, CRON_RUN_RETENTION,
+    FaultPoint, FeedbackRecord, JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal,
+    ParkedApproval, Room, RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus,
+    SessionStore, StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion,
+    TraceEntry, TraceSegment, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -341,6 +341,24 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(
             "CREATE TABLE tool_overrides (\n\
                  tool    TEXT PRIMARY KEY,\n\
+                 enabled INTEGER NOT NULL\n\
+             );",
+        ),
+        // M9 (wire v32 — user feedback over OpenTelemetry, N1): the durable feedback outbox and the
+        // node-owned global telemetry consent toggle. `feedback_outbox.payload` is the opaque CBOR
+        // of the whole `FeedbackRecord` (protocol-free, mirroring `cron_jobs.spec`); `id`,
+        // `created_at_ms`, and `delivered` are indexed so the exporter's pending-drain query is
+        // cheap. `telemetry_consent` is a single-row (`id = 0`) setting; absence = OFF (opt-in).
+        M::up(
+            "CREATE TABLE feedback_outbox (\n\
+                 id            TEXT PRIMARY KEY,\n\
+                 created_at_ms INTEGER NOT NULL,\n\
+                 payload       BLOB NOT NULL,\n\
+                 delivered     INTEGER NOT NULL DEFAULT 0\n\
+             );\n\
+             CREATE INDEX feedback_outbox_pending ON feedback_outbox (delivered, created_at_ms);\n\
+             CREATE TABLE telemetry_consent (\n\
+                 id      INTEGER PRIMARY KEY CHECK (id = 0),\n\
                  enabled INTEGER NOT NULL\n\
              );",
         ),
@@ -1596,6 +1614,82 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn feedback_enqueue(&self, record: FeedbackRecord) -> Result<(), StoreError> {
+        // The whole record is persisted as an opaque CBOR blob; id/created_at_ms/delivered are
+        // mirrored into indexed columns for the exporter's pending-drain query. Idempotent by id.
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&record, &mut payload)
+            .map_err(|e| StoreError::Common(DaemonError::Other(format!("feedback encode: {e}"))))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO feedback_outbox (id, created_at_ms, payload, delivered) \
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO NOTHING",
+            params![
+                record.id,
+                record.created_at_ms,
+                payload,
+                record.delivered as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn feedback_pending(&self, limit: usize) -> Vec<FeedbackRecord> {
+        let conn = self.conn.lock().unwrap();
+        // `limit = 0` means "all"; SQLite treats a negative LIMIT as unbounded.
+        let sql_limit: i64 = if limit == 0 { -1 } else { limit as i64 };
+        let mut stmt = match conn.prepare(
+            "SELECT payload FROM feedback_outbox WHERE delivered = 0 \
+             ORDER BY created_at_ms, id LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![sql_limit], |row| row.get::<_, Vec<u8>>(0));
+        let Ok(iter) = rows else {
+            return Vec::new();
+        };
+        iter.filter_map(Result::ok)
+            .filter_map(|bytes| ciborium::de::from_reader::<FeedbackRecord, _>(&bytes[..]).ok())
+            .collect()
+    }
+
+    async fn feedback_mark_delivered(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE feedback_outbox SET delivered = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn telemetry_consent_get(&self) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT enabled FROM telemetry_consent WHERE id = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|v| v != 0)
+        .unwrap_or(false)
+    }
+
+    async fn telemetry_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO telemetry_consent (id, enabled) VALUES (0, ?1) \
+             ON CONFLICT(id) DO UPDATE SET enabled = ?1",
+            params![enabled as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn room_list(&self) -> Vec<Room> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -2177,10 +2271,10 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (8: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// `user_version` (9: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
-    /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, and the
-    /// wire-v30 `tool_overrides` table).
+    /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, the
+    /// wire-v30 `tool_overrides` table, and the wire-v32 feedback outbox + telemetry-consent seam).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2191,7 +2285,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 9, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

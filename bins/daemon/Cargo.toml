@@ -15,7 +15,7 @@ default = []
 browser = ["dep:daemon-tool-browser", "daemon-tool-browser/cdp"]
 # Compile the OpenTelemetry OTLP trace exporter + GenAI span enrichment. OFF by default; when on,
 # the daemon exports session traces to `OTEL_EXPORTER_OTLP_ENDPOINT` (see `daemon-telemetry`).
-otel = ["daemon-telemetry/otel", "daemon-core/otel"]
+otel = ["daemon-telemetry/otel", "daemon-core/otel", "daemon-host/otel"]
 # Compile + register the Discord chat transport (`daemon-discord`, self-bot capable). OFF by default:
 # its `serenity_self` SDK pins an old reqwest/rustls stack carrying live rustls-webpki advisories
 # (see `deny.toml`), so it is excluded from the default binary. Enable with `--features discord`.

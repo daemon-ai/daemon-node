@@ -11,7 +11,8 @@ use daemon_common::{PartitionId, SessionId};
 use daemon_core::Snapshot;
 use daemon_host::CoreEngineFactory;
 use daemon_store::{
-    FaultPoint, InMemoryStore, JobCompletion, SessionStatus, SessionStore, SqliteStore, StoreError,
+    FaultPoint, FeedbackRecord, InMemoryStore, JobCompletion, SessionStatus, SessionStore,
+    SqliteStore, StoreError,
 };
 use std::sync::Arc;
 
@@ -344,6 +345,109 @@ async fn in_memory_child_edge() {
 #[tokio::test]
 async fn sqlite_child_edge() {
     child_edge_suite(Arc::new(
+        SqliteStore::open_in_memory().expect("open sqlite"),
+    ))
+    .await;
+}
+
+/// N1: the durable feedback outbox + node-owned telemetry consent behave identically on both
+/// backends — enqueue -> pending (oldest first) -> mark_delivered removes from pending, enqueue is
+/// idempotent by id, and consent defaults OFF then round-trips through get/set.
+async fn feedback_suite<S: SessionStore>(store: Arc<S>) {
+    fn rec(id: &str, created_at_ms: i64) -> FeedbackRecord {
+        FeedbackRecord {
+            id: id.into(),
+            created_at_ms,
+            kind: "app".into(),
+            rating: Some("up".into()),
+            comment: Some("nice".into()),
+            include_content: false,
+            session: None,
+            cursor: None,
+            trace: None,
+            surface: "settings".into(),
+            app_version: Some("1.0.0".into()),
+            os: Some("linux".into()),
+            consent: "explicit-one-shot".into(),
+            node_version: "test".into(),
+            model: None,
+            provider: None,
+            end_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            response_content: None,
+            delivered: false,
+        }
+    }
+
+    // Consent defaults OFF (opt-in) and round-trips.
+    assert!(!store.telemetry_consent_get().await, "consent defaults OFF");
+    store
+        .telemetry_consent_set(true)
+        .await
+        .expect("set consent");
+    assert!(store.telemetry_consent_get().await, "consent persisted on");
+    store
+        .telemetry_consent_set(false)
+        .await
+        .expect("clear consent");
+    assert!(!store.telemetry_consent_get().await, "consent cleared");
+
+    // Enqueue two records out of created order; pending returns oldest first.
+    store
+        .feedback_enqueue(rec("fb-b", 200))
+        .await
+        .expect("enq b");
+    store
+        .feedback_enqueue(rec("fb-a", 100))
+        .await
+        .expect("enq a");
+    let pending = store.feedback_pending(0).await;
+    assert_eq!(
+        pending.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec!["fb-a", "fb-b"],
+        "pending is oldest-first"
+    );
+    // The record round-trips through the opaque CBOR blob faithfully.
+    assert_eq!(pending[0].rating.as_deref(), Some("up"));
+    assert_eq!(pending[0].surface, "settings");
+    assert_eq!(pending[0].consent, "explicit-one-shot");
+
+    // Idempotent by id: a re-enqueue of fb-a does not duplicate.
+    store
+        .feedback_enqueue(rec("fb-a", 100))
+        .await
+        .expect("re-enq");
+    assert_eq!(store.feedback_pending(0).await.len(), 2, "no duplicate id");
+
+    // limit caps the page.
+    assert_eq!(store.feedback_pending(1).await.len(), 1);
+
+    // mark_delivered removes it from the pending drain (idempotent).
+    store
+        .feedback_mark_delivered("fb-a")
+        .await
+        .expect("deliver a");
+    store
+        .feedback_mark_delivered("fb-a")
+        .await
+        .expect("deliver a again");
+    let pending = store.feedback_pending(0).await;
+    assert_eq!(
+        pending.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec!["fb-b"],
+        "delivered records drop out of pending"
+    );
+}
+
+#[tokio::test]
+async fn in_memory_feedback_outbox() {
+    feedback_suite(Arc::new(InMemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_feedback_outbox() {
+    feedback_suite(Arc::new(
         SqliteStore::open_in_memory().expect("open sqlite"),
     ))
     .await;
