@@ -87,6 +87,15 @@ daemon-oauth = { workspace = true }
 # The internal Rooms loopback transport, toggled on at launch by `[rooms].enabled`. The daemon binary
 # only references `serve` / `RoomsConfig`; it reuses the same `daemon-ingest`/`daemon-delivery` halves.
 daemon-rooms = { workspace = true }
+# [waveB:msg-adapters] Six additional chat transports, each toggled on at launch by its own
+# `[<p>].enabled` flag. Each crate confines its external SDK; the daemon binary only references the
+# adapter's `Adapter` / `AuthFlowFactory` / `Config` types.
+daemon-telegram = { workspace = true }
+daemon-whatsapp = { workspace = true }
+daemon-discord = { workspace = true }
+daemon-wechat = { workspace = true }
+daemon-line = { workspace = true }
+daemon-slack = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }

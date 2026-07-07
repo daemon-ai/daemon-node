@@ -1314,6 +1314,26 @@ pub struct NodeConfig {
     pub routing: RoutingConfig,
     /// The Matrix chat transport config (`enabled = false` by default).
     pub matrix: daemon_matrix::MatrixConfig,
+    // [waveB:msg-adapters] The six additional chat transports, each `enabled = false` by default and
+    // deserialized as its own `[<p>]` table / `DAEMON_<P>__*` env (same shape as `[matrix]`).
+    /// The Telegram chat transport config (`enabled = false` by default).
+    #[serde(default)]
+    pub telegram: daemon_telegram::TelegramConfig,
+    /// The WhatsApp chat transport config (`enabled = false` by default).
+    #[serde(default)]
+    pub whatsapp: daemon_whatsapp::WhatsappConfig,
+    /// The Discord chat transport config (`enabled = false` by default).
+    #[serde(default)]
+    pub discord: daemon_discord::DiscordConfig,
+    /// The WeChat chat transport config (`enabled = false` by default).
+    #[serde(default)]
+    pub wechat: daemon_wechat::WeChatConfig,
+    /// The LINE chat transport config (`enabled = false` by default).
+    #[serde(default)]
+    pub line: daemon_line::LineConfig,
+    /// The Slack chat transport config (`enabled = false` by default).
+    #[serde(default)]
+    pub slack: daemon_slack::SlackConfig,
     /// The internal Rooms loopback transport config (`enabled = false` by default).
     pub rooms: daemon_rooms::RoomsConfig,
     /// Interactive-auth (OAuth2 login) config: gates the provider-bound families that need
@@ -1373,6 +1393,13 @@ impl Default for NodeConfig {
             orchestrate: OrchestrateConfig::default(),
             routing: RoutingConfig::default(),
             matrix: daemon_matrix::MatrixConfig::default(),
+            // [waveB:msg-adapters]
+            telegram: daemon_telegram::TelegramConfig::default(),
+            whatsapp: daemon_whatsapp::WhatsappConfig::default(),
+            discord: daemon_discord::DiscordConfig::default(),
+            wechat: daemon_wechat::WeChatConfig::default(),
+            line: daemon_line::LineConfig::default(),
+            slack: daemon_slack::SlackConfig::default(),
             rooms: daemon_rooms::RoomsConfig::default(),
             oauth: OAuthConfig::default(),
             api: ApiConfig::default(),
@@ -1416,6 +1443,12 @@ impl NodeConfig {
         // is preserved: `Path::join` with an absolute right-hand side replaces the left).
         let store_root = self.data_dir.join(&self.matrix.store_root);
         self.matrix.store_root = store_root;
+
+        // [waveB:msg-adapters] Telegram is the only new adapter with a per-account on-disk session
+        // store; resolve its `store_root` against the data dir exactly like Matrix. The other five
+        // adapters are in-memory / token / webhook based and have no path to resolve.
+        let tg_store_root = self.data_dir.join(&self.telegram.store_root);
+        self.telegram.store_root = tg_store_root;
 
         // Local trust: an explicit empty / `off` / `none` / `false` disables the synthetic principal.
         if let Some(v) = &self.api.local_trust {
