@@ -1199,6 +1199,21 @@ impl Default for OrchestrateConfig {
     }
 }
 
+/// Interactive-auth (`[oauth]` / `DAEMON_OAUTH__*`) config. Only the provider-bound families that
+/// require operator-supplied identity have a knob here; the generic `oauth2` family (client-supplied
+/// endpoints) and OpenRouter (fully node-owned) register unconditionally.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OAuthConfig {
+    /// The OAuth client id of an operator-registered Hugging Face OAuth app. `None` (the default)
+    /// leaves the `provider/huggingface` auth family UNregistered — HF requires the operator to
+    /// register an OAuth app and supply its client id (an unconfigured node never advertises it, so
+    /// a wrong endpoint cannot affect anyone by default). When set, the family is registered
+    /// (standard OIDC, `inference-api` scope) and a client drives `auth_begin { family:
+    /// "provider/huggingface", params: {} }`.
+    pub huggingface_client_id: Option<String>,
+}
+
 // --- the node configuration -------------------------------------------------------------------
 
 /// The node configuration: the single source of truth, deserialized by [`figment`] from
@@ -1301,6 +1316,9 @@ pub struct NodeConfig {
     pub matrix: daemon_matrix::MatrixConfig,
     /// The internal Rooms loopback transport config (`enabled = false` by default).
     pub rooms: daemon_rooms::RoomsConfig,
+    /// Interactive-auth (OAuth2 login) config: gates the provider-bound families that need
+    /// operator-supplied config. The generic `oauth2` family and OpenRouter need no config.
+    pub oauth: OAuthConfig,
     /// The `[api]` transport surface: the networked TLS/TCP listener + identity-store path.
     pub api: ApiConfig,
     /// Shell-tool limits (`[shell]` / `DAEMON_SHELL__*`): foreground timeouts, output truncation,
@@ -1356,6 +1374,7 @@ impl Default for NodeConfig {
             routing: RoutingConfig::default(),
             matrix: daemon_matrix::MatrixConfig::default(),
             rooms: daemon_rooms::RoomsConfig::default(),
+            oauth: OAuthConfig::default(),
             api: ApiConfig::default(),
             shell: daemon_processes::ShellConfig::default(),
             processes: daemon_processes::RegistryConfig::default(),

@@ -7,15 +7,16 @@
 //! parent-only; the one-lifecycle-owner guard only rejects ids *claimed* by the durable control
 //! surface (`assign`), and delegated children are materialized store-side without a wire claim.
 //!
-//! HONEST SCOPE BOUNDARY (read before extending): an operator `Submit` to a delegated child opens
-//! a **fresh live incarnation** over the child's session id (`LiveSessions::ensure` builds a new
-//! engine; it does NOT hydrate the child's durable delegated conversation). The child session id
-//! receives and executes the operator's command — which is what these tests prove — but the turn
-//! runs beside, not inside, the durable transcript the delegation produced. A *durable resume*
-//! ("fold operator input into the child's existing conversation, then wake it") is the
-//! `inject_session_input` + wake seam the parked test below drives store-side; exposing that as a
-//! first-class operator op is a recorded node-first follow-up (see .stream-plan.md), not something
-//! to fake here.
+//! SCOPE BOUNDARY (read before extending): an operator `Submit` to a delegated child that is
+//! **not** parked-durable (e.g. a `Completed` child) opens a **fresh live incarnation** over the
+//! child's session id (`LiveSessions::ensure` builds a new engine; it does NOT hydrate the child's
+//! durable delegated conversation) — the turn runs beside, not inside, the durable transcript the
+//! delegation produced (proven by `operator_steers_a_delegated_child_by_session_id`). F4 durable
+//! resume closes the gap for a **parked-durable** child: a `Submit { StartTurn | Steer }` at a
+//! durable session that is live-but-dormant (`Active|Suspended|Ready`) now rides the
+//! `enqueue_session_input` + wake rail so the operator's text folds INTO the durable transcript
+//! (proven by `submit_steer_lands_in_the_parked_durable_transcript`), rather than opening a
+//! divergent incarnation.
 
 use super::harness::*;
 
@@ -271,6 +272,114 @@ async fn operator_assign_wakes_a_parked_durable_child_impl() {
     }
 
     // The child stayed parked: the wake folded the input in but did NOT fast-forward the approval.
+    assert!(matches!(
+        store.status(&child).await,
+        Some(SessionStatus::Suspended { .. } | SessionStatus::Active)
+    ));
+
+    handle.shutdown().await;
+}
+
+/// THE F4 DURABLE-RESUME GATE: a wire `Submit { StartTurn | Steer }` addressed at a PARKED-DURABLE
+/// session rides the durable pending-input rail — the operator's text folds INTO the durable
+/// transcript on the next wake — instead of opening a divergent fresh live incarnation over the
+/// durable state. Seeded exactly like `operator_assign_wakes_a_parked_durable_child`: a durable
+/// child parked (`Suspended`) on an unanswered approval. Two operator submits (a `StartTurn` and a
+/// `Steer`) enqueue their messages; the wake drains them into the child's re-checkpointed
+/// conversation while it stays parked on its approval. Assign is re-nudged each pass to recover a
+/// wake a concurrent recovery-scanner activation benignly absorbed (same discipline as the parked
+/// gate above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_steer_lands_in_the_parked_durable_transcript() {
+    as_system(submit_steer_lands_in_the_parked_durable_transcript_impl()).await;
+}
+async fn submit_steer_lands_in_the_parked_durable_transcript_impl() {
+    let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x73; 32], fast_host_config());
+
+    // Seed a durable child parked on an unanswered edit approval (the stable dormant durable
+    // state), the same shape the parked-assign gate uses.
+    let child = SessionId::new("f4-steer/c1");
+    let job_id = JobId::new(format!("{child}:1:approval:0"));
+    let mut snapshot = Snapshot::fresh(child.clone());
+    snapshot.waiting_for = vec![job_id.clone()];
+    snapshot.pending_approvals = vec![PendingApproval {
+        job_id,
+        call: ToolCall {
+            call_id: "c1".into(),
+            name: "fs".into(),
+            args: r#"{"op":"write","path":"gated.txt","content":"hi"}"#.into(),
+        },
+        prompt: "approve write to gated.txt".into(),
+        path: Some("gated.txt".into()),
+        fingerprint: None,
+    }];
+    store
+        .create_session(child.clone(), PARTITION, snapshot.encode().expect("encode"))
+        .await
+        .expect("create parked child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        store.status(&child).await,
+        Some(SessionStatus::Suspended { .. })
+    ) {
+        assert!(Instant::now() < deadline, "the child never parked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // F4: the operator submits a StartTurn then a Steer AT the parked-durable child. Neither opens
+    // a fresh live incarnation (no lifecycle conflict, no divergent engine) — each rides the
+    // durable pending-input rail (enqueue + wake).
+    node.submit(
+        child.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("F4-STARTTURN-PING"),
+            request_id: ReqId(51),
+        },
+    )
+    .await
+    .expect("Submit StartTurn at a parked-durable session must be accepted (durable-resume)");
+    node.submit(
+        child.clone(),
+        AgentCommand::Steer {
+            text: "F4-STEER-NUDGE".into(),
+            request_id: ReqId(52),
+        },
+    )
+    .await
+    .expect("Submit Steer at a parked-durable session must be accepted (durable-resume)");
+
+    // Submit's own durable-rail wake drives the drain: the woken incarnation folds both messages
+    // into the durable conversation. (No competing `assign` nudge here — that would race submit's
+    // enqueued wake and can overwrite the folded checkpoint.)
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let both = store
+            .peek_snapshot(&child)
+            .await
+            .and_then(|blob| Snapshot::decode(&blob).ok())
+            .map(|s| {
+                let has = |needle: &str| {
+                    s.conversation.turns.iter().any(
+                        |t| matches!(t, daemon_core::Turn::User(msg) if msg.text.contains(needle)),
+                    )
+                };
+                has("F4-STARTTURN-PING") && has("F4-STEER-NUDGE")
+            })
+            .unwrap_or(false);
+        if both {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the operator's Submit StartTurn+Steer never landed in the durable transcript"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The child stayed parked: the resume folded the input in but did NOT fast-forward the approval
+    // (F4 is a durable resume, not an operator approval).
     assert!(matches!(
         store.status(&child).await,
         Some(SessionStatus::Suspended { .. } | SessionStatus::Active)

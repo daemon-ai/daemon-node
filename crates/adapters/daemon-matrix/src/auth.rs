@@ -245,6 +245,7 @@ impl PendingAuthFlow for MatrixPendingFlow {
             credential_ref: login.credential_ref,
             account_label: login.user_id,
             transport_instance: login.transport_instance,
+            slot: daemon_host::CredentialSlotKind::Derived,
         })
     }
 }

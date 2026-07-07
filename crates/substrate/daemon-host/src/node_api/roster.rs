@@ -412,7 +412,11 @@ pub(crate) fn session_in_scope(
         SessionScope::TopLevel => i.role == SessionRole::Primary && !i.archived,
         SessionScope::ByProfile(p) => i.bound_profile.as_ref() == Some(p) && !i.archived,
         SessionScope::ByTransport(_) => owned.contains(&i.session) && !i.archived,
-        SessionScope::Archived => i.role == SessionRole::Primary && i.archived,
+        // The explicit archived view surfaces archived sessions of ANY role: an archived subagent
+        // child (`ManagedChild`/`EphemeralSubagent`) has no other enumeration path — `TopLevel`/
+        // `ByProfile`/`ByTransport` exclude archived, and `tree()` only drills from a live parent —
+        // so restricting to `Primary` here would strand them. This is the opt-in complete view.
+        SessionScope::Archived => i.archived,
         SessionScope::All => true,
     }
 }

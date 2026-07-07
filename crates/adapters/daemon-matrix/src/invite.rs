@@ -16,8 +16,10 @@
 //! `m.room.message`s flow through the normal inbound gate ([`crate::on_room_message`]).
 //!
 //! Policy: gated by [`MatrixConfig::auto_accept_invites`](crate::MatrixConfig) (default **on**;
-//! see the field docs for the security tradeoff). A finer sender allowlist / owner-only policy is
-//! a recorded follow-up.
+//! see the field docs for the security tradeoff), then narrowed by
+//! [`MatrixConfig::invite_allowlist`](crate::MatrixConfig): an empty allowlist accepts any sender
+//! (the historical behavior), a non-empty one accepts only invites from a listed sender and leaves
+//! the rest pending.
 
 use std::time::Duration;
 
@@ -37,6 +39,9 @@ pub struct InviteCtx {
     pub transport: TransportId,
     /// Whether to accept invites at all ([`crate::MatrixConfig::auto_accept_invites`]).
     pub auto_accept: bool,
+    /// The sender allowlist ([`crate::MatrixConfig::invite_allowlist`], bare user ids). Empty =
+    /// accept any sender; non-empty = accept only invites whose `sender` is listed.
+    pub invite_allowlist: Vec<String>,
 }
 
 /// The registered stripped `m.room.member` handler: accept an invite addressed to this account by
@@ -59,6 +64,19 @@ pub async fn on_stripped_member(ev: StrippedRoomMemberEvent, room: Room, ctx: Ct
             room = %room.room_id(),
             sender = %ev.sender,
             "matrix: invite received but auto_accept_invites is off; leaving it pending"
+        );
+        return;
+    }
+    // Sender allowlist: an empty list accepts any sender (historical behavior); a non-empty list
+    // accepts only invites from a listed sender and leaves every other invite pending.
+    if !ctx.invite_allowlist.is_empty()
+        && !ctx.invite_allowlist.iter().any(|s| s == ev.sender.as_str())
+    {
+        tracing::info!(
+            instance = %ctx.transport.as_str(),
+            room = %room.room_id(),
+            sender = %ev.sender,
+            "matrix: invite sender not in invite_allowlist; leaving it pending"
         );
         return;
     }

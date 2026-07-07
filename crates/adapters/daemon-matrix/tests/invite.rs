@@ -8,7 +8,8 @@
 //! stripped `m.room.member` invite for the bot arriving on sync drives `Room::join` (the adapter's
 //! `on_stripped_member` handler), the joined room then enumerates through the adapter's
 //! `SupportsConversations::list` (the wire `ConvList` surfacing), and the `auto_accept_invites:
-//! false` policy leaves the invite pending (join endpoint never hit).
+//! false` policy leaves the invite pending (join endpoint never hit), and the `invite_allowlist`
+//! narrows acceptance to listed senders (an unlisted sender stays pending).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,8 +25,14 @@ use daemon_api::SupportsConversations;
 use daemon_matrix::{InviteCtx, MatrixAdapter, MatrixConfig};
 use daemon_protocol::TransportId;
 
-/// Register the invite handler on `client` for `transport`, with the given accept policy.
-fn register_invite_handler(client: &Client, transport: &TransportId, auto_accept: bool) {
+/// Register the invite handler on `client` for `transport`, with the given accept policy and
+/// (possibly empty) sender allowlist.
+fn register_invite_handler(
+    client: &Client,
+    transport: &TransportId,
+    auto_accept: bool,
+    invite_allowlist: Vec<String>,
+) {
     let me = client
         .user_id()
         .expect("mock client is logged in")
@@ -34,6 +41,7 @@ fn register_invite_handler(client: &Client, transport: &TransportId, auto_accept
         me,
         transport: transport.clone(),
         auto_accept,
+        invite_allowlist,
     });
     client.add_event_handler(daemon_matrix::on_stripped_member);
 }
@@ -101,7 +109,7 @@ async fn invite_is_auto_accepted_and_room_reaches_conv_list() {
         .await;
 
     let transport = TransportId::new("matrix/@bot:localhost");
-    register_invite_handler(&client, &transport, true);
+    register_invite_handler(&client, &transport, true, Vec::new());
 
     sync_invite(&server, &client, room).await;
 
@@ -145,7 +153,7 @@ async fn invite_is_left_pending_when_auto_accept_is_off() {
         .await;
 
     let transport = TransportId::new("matrix/@bot:localhost");
-    register_invite_handler(&client, &transport, false);
+    register_invite_handler(&client, &transport, false, Vec::new());
 
     sync_invite(&server, &client, room).await;
 
@@ -155,6 +163,81 @@ async fn invite_is_left_pending_when_auto_accept_is_off() {
         client.get_room(room).map(|r| r.state()),
         Some(RoomState::Invited),
         "the invite must stay pending when auto-accept is off"
+    );
+    server.server().verify().await;
+}
+
+/// A non-empty `invite_allowlist` that INCLUDES the inviter (`@alice:localhost`, per `sync_invite`)
+/// still auto-accepts: the join endpoint is hit and the room flips to `Joined`.
+#[tokio::test]
+async fn invite_from_allowlisted_sender_is_accepted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = room_id!("!allowed:localhost");
+    server
+        .mock_room_join(room)
+        .ok()
+        .expect(1)
+        .named("join-allowed")
+        .mount()
+        .await;
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    register_invite_handler(
+        &client,
+        &transport,
+        true,
+        vec!["@alice:localhost".to_string()],
+    );
+
+    sync_invite(&server, &client, room).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if client.get_room(room).map(|r| r.state()) == Some(RoomState::Joined) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an allowlisted invite never became Joined (state: {:?})",
+            client.get_room(room).map(|r| r.state())
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    server.server().verify().await;
+}
+
+/// A non-empty `invite_allowlist` that EXCLUDES the inviter leaves the invite pending even with
+/// `auto_accept_invites: true`: the join endpoint is never hit and the room stays `Invited`.
+#[tokio::test]
+async fn invite_from_non_allowlisted_sender_is_left_pending() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = room_id!("!blocked:localhost");
+    server
+        .mock_room_join(room)
+        .ok()
+        .expect(0)
+        .named("join-blocked")
+        .mount()
+        .await;
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    register_invite_handler(
+        &client,
+        &transport,
+        true,
+        vec!["@trusted:localhost".to_string()],
+    );
+
+    sync_invite(&server, &client, room).await;
+
+    // Give a (wrong) spawned join ample time to fire before verifying nothing did.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        client.get_room(room).map(|r| r.state()),
+        Some(RoomState::Invited),
+        "an invite from a non-allowlisted sender must stay pending"
     );
     server.server().verify().await;
 }

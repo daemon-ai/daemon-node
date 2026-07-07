@@ -475,14 +475,26 @@ impl Tool for OrchestrateTool {
                     detached: false,
                 }
                 .encode();
-                Self::ok(
+                // A structured `delegation-spawn` detail (opaque kind+body, no wire bump) a rich
+                // client renders as a spawn card. The joining child's session id is minted
+                // node-side (`{parent}/c{epoch}`) only when the durable Delegate job is processed,
+                // so it is not knowable here — the detail carries the `job` handle, correlatable to
+                // the child later via the children/roster surfaces.
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "job": job_id.as_str(),
+                    "detached": false,
+                }))
+                .unwrap_or_default();
+                let mut outcome = Self::ok(
                     call,
                     format!("spawned:{job_id}"),
                     vec![Effect::Delegate {
                         job: job_id,
                         payload,
                     }],
-                )
+                );
+                outcome.detail = Some(ToolDetail::new("delegation-spawn", body));
+                outcome
             }
             // DETACHED (non-joining): enqueue the child directly onto the durable job outbox — no
             // Effect::Delegate, so the parent's turn does NOT suspend and keeps running. The child's
@@ -540,7 +552,17 @@ impl Tool for OrchestrateTool {
                 {
                     return Self::err(call, format!("detached spawn failed: {e}"));
                 }
-                Self::ok(call, format!("spawned-detached:{child}"), Vec::new())
+                // A structured `delegation-spawn` detail (opaque kind+body, no wire bump): the
+                // detached child's session id is known here (the store minted it), so the detail
+                // carries the concrete `child`.
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "child": child.as_str(),
+                    "detached": true,
+                }))
+                .unwrap_or_default();
+                let mut outcome = Self::ok(call, format!("spawned-detached:{child}"), Vec::new());
+                outcome.detail = Some(ToolDetail::new("delegation-spawn", body));
+                outcome
             }
             Verb::Send { target, text } => {
                 let Some(store) = &self.store else {

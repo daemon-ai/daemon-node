@@ -134,6 +134,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `lcm.summary_timeout_ms` | `DAEMON_LCM__SUMMARY_TIMEOUT_MS` | number | `60000` |
 | `matrix.auto_accept_invites` | `DAEMON_MATRIX__AUTO_ACCEPT_INVITES` | bool | `true` |
 | `matrix.enabled` | `DAEMON_MATRIX__ENABLED` | bool | `false` |
+| `matrix.invite_allowlist` | `DAEMON_MATRIX__INVITE_ALLOWLIST` | array | `[]` |
 | `matrix.route` | `DAEMON_MATRIX__ROUTE` | array | `[]` |
 | `matrix.store_root` | `DAEMON_MATRIX__STORE_ROOT` | string | `matrix` |
 | `mcp.servers` | `DAEMON_MCP__SERVERS` | array | `[]` |
@@ -159,6 +160,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `models.endpoint` | `DAEMON_MODELS__ENDPOINT` | optional | _(unset)_ |
 | `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
 | `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
+| `oauth.huggingface_client_id` | `DAEMON_OAUTH__HUGGINGFACE_CLIENT_ID` | optional | _(unset)_ |
 | `orchestrate.max_depth` | `DAEMON_ORCHESTRATE__MAX_DEPTH` | number | `8` |
 | `orchestrate.max_fanout` | `DAEMON_ORCHESTRATE__MAX_FANOUT` | number | `8` |
 | `orchestrate.reaper_enabled` | `DAEMON_ORCHESTRATE__REAPER_ENABLED` | bool | `true` |

@@ -70,6 +70,9 @@ reqwest = { workspace = true }
 # Auth-4 ownership: the HTTP transport's session-log routes must keep working under `[api].local_trust`
 # after the None-principal flip (they now dispatch inside a `RequestContext::system()` scope). Test-only.
 daemon-http = { workspace = true }
+# CON-15 node half: the descriptor-driven OAuth engine, so the conformance suite proves the
+# provider-bound family registration + the provider-key slot mapping end to end. Test-only.
+daemon-oauth = { workspace = true }
 
 [lints]
 workspace = true

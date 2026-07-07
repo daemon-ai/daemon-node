@@ -118,6 +118,18 @@ async fn spawn_plumbs_task_lifetime_and_profile_into_the_payload() {
     assert_eq!(input.lifetime, DelegationLifetime::Ephemeral);
     assert_eq!(input.profile.as_deref(), Some("opus"));
     assert_eq!(input.attachments, vec!["notes.md".to_string()]);
+
+    // The joining spawn carries a `delegation-spawn` detail whose body names the durable `job`
+    // handle (the child id is minted node-side later) and is flagged non-detached.
+    let detail = out
+        .detail
+        .as_ref()
+        .expect("a joining spawn carries a delegation-spawn detail");
+    assert_eq!(detail.kind, "delegation-spawn");
+    let body: serde_json::Value = serde_json::from_slice(&detail.body).expect("JSON body");
+    assert_eq!(body["job"], "job-1");
+    assert_eq!(body["detached"], false);
+    assert!(body.get("child").is_none(), "joining arm has no child yet");
 }
 
 #[tokio::test]
@@ -382,6 +394,17 @@ async fn detached_spawn_enqueues_a_bare_job_and_notice_edge_without_an_effect() 
         out.effects.is_empty(),
         "a detached spawn never emits Effect::Delegate (the parent does not suspend)"
     );
+
+    // The detached spawn carries a `delegation-spawn` detail whose body names the concrete `child`
+    // session id the store minted, flagged detached.
+    let detail = out
+        .detail
+        .as_ref()
+        .expect("a detached spawn carries a delegation-spawn detail");
+    assert_eq!(detail.kind, "delegation-spawn");
+    let body: serde_json::Value = serde_json::from_slice(&detail.body).expect("JSON body");
+    assert_eq!(body["child"], "parent/d1");
+    assert_eq!(body["detached"], true);
 
     // The bare job landed on the durable outbox with the store-minted child and detached payload.
     let job = store

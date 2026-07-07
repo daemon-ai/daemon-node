@@ -38,11 +38,19 @@ pub struct MatrixConfig {
     /// **Security tradeoff:** with this on, *anyone who can invite the bot pulls it into a room*
     /// (and its route table then decides engagement — mention-gating still applies, but room
     /// state/history exposure and DM spam are possible). On public/federated homeservers where
-    /// strangers can invite the account, set this to `false` and join rooms explicitly via
-    /// `ConvJoin` / `conv_join`. A finer per-sender allowlist (e.g. owner-only) is a planned
-    /// follow-up policy.
+    /// strangers can invite the account, either set this to `false` and join rooms explicitly via
+    /// `ConvJoin` / `conv_join`, or narrow acceptance with [`invite_allowlist`](Self::invite_allowlist).
     #[serde(with = "daemon_common::flex_bool")]
     pub auto_accept_invites: bool,
+    /// The sender allowlist that narrows auto-acceptance to trusted inviters (bare Matrix user ids,
+    /// e.g. `@alice:hs.org`). **Empty (the default) = accept an invite from ANY sender** (the
+    /// historical `auto_accept_invites` behavior); a non-empty list accepts only invites whose
+    /// sender is listed and leaves every other invite pending. Only consulted when
+    /// `auto_accept_invites` is on — a finer gate over the coarse toggle, so a public/federated
+    /// homeserver can auto-join invites from its operators while ignoring strangers. TOML key
+    /// `invite_allowlist` (`DAEMON_MATRIX__INVITE_ALLOWLIST`).
+    #[serde(default)]
+    pub invite_allowlist: Vec<String>,
 }
 
 impl Default for MatrixConfig {
@@ -52,6 +60,7 @@ impl Default for MatrixConfig {
             store_root: std::path::PathBuf::from("matrix"),
             routes: Vec::new(),
             auto_accept_invites: true,
+            invite_allowlist: Vec::new(),
         }
     }
 }

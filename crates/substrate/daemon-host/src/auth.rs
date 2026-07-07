@@ -66,6 +66,26 @@ fn fresh_flow_id() -> String {
     out
 }
 
+/// How the node maps a completed flow's credential into the [`CredentialStore`] (non-wire; the node
+/// decides the slot, never the client). Selected by the completing flow (an OAuth descriptor sets
+/// it) and honored by the node's `auth_complete`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CredentialSlotKind {
+    /// The historical transport-account shape: store the opaque blob under the flow's
+    /// `credential_ref` (a bind-supplied `credential_ref` may override), and — when a bind was
+    /// requested — attach a `BoundAccount { transport_instance, credential_ref }` to the profile.
+    /// Used by Matrix SSO and the generic operator-facing `oauth2` family.
+    #[default]
+    Derived,
+    /// A minted **model-provider API key**: store the BARE key under the bound profile's credential
+    /// slot (the profile id the credential broker reads), so it rides the exact same downstream
+    /// path as a pasted API key, and DO NOT attach a `BoundAccount` (a provider key is not a
+    /// transport account). Requires a bind naming the target profile — a provider key with no bind
+    /// target would be stranded where no broker reads it, so `auth_complete` rejects the no-bind
+    /// case. Used by the provider-bound OAuth families (OpenRouter, Hugging Face).
+    ProviderKeyForProfile,
+}
+
 /// The product of completing an interactive-auth flow: the opaque credential blob to persist plus the
 /// identity needed to label + bind the account. The host writes the blob into the `CredentialStore`
 /// and (when a bind was requested) attaches a `BoundAccount` to the target profile.
@@ -79,6 +99,9 @@ pub struct AuthOutcome {
     pub account_label: String,
     /// The instance-qualified transport id this account resolves to (e.g. `matrix/@user:hs.org`).
     pub transport_instance: TransportId,
+    /// How the node slots this credential (the node decides, never the client). Defaults to
+    /// [`CredentialSlotKind::Derived`] (today's transport-account behavior).
+    pub slot: CredentialSlotKind,
 }
 
 /// One in-flight interactive-auth flow: a family-specific object holding the secret continuation state

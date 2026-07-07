@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Vertical tests for the OAuth2 PKCE factory over a wiremock token endpoint: the full
-//! begin → (browser hop) → complete exchange, including the PKCE consistency proof — the
-//! `code_verifier` POSTed to the token endpoint hashes (S256) to exactly the `code_challenge`
-//! the authorization URL advertised — plus the identity-derivation order and the failure path.
-//! (The generic node-side orchestration — parking, credential write, profile bind — is proven by
-//! the conformance suite's stub-factory test; these tests own the real family's protocol slice.)
+//! Vertical tests for the descriptor-driven OAuth engine over a wiremock token endpoint: the
+//! generic `oauth2` family's full begin → (browser hop) → complete form-post exchange (the PKCE
+//! consistency proof — the `code_verifier` POSTed hashes (S256) to exactly the advertised
+//! `code_challenge` — plus the identity-derivation order and the failure path), the CSRF `state`
+//! gate for `use_state` true/false, and the provider-key JSON key-mint exchange (bare key stored,
+//! slotted as a provider key). (The node-side orchestration — parking, credential write, profile
+//! bind, provider-key slotting — is proven by the conformance suite; these own the protocol slice.)
 
 use std::collections::BTreeMap;
 
@@ -16,10 +17,11 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use daemon_host::AuthFlowFactory;
+use daemon_host::{AuthFlowFactory, CredentialSlotKind};
 use daemon_oauth::{
-    OAuth2PkceFlowFactory, FAMILY, PARAM_ACCOUNT_LABEL, PARAM_AUTHORIZATION_ENDPOINT,
-    PARAM_CLIENT_ID, PARAM_SCOPES, PARAM_TOKEN_ENDPOINT,
+    generic_oauth2, openrouter, DescriptorFlowFactory, FAMILY, OPENROUTER_FAMILY,
+    PARAM_ACCOUNT_LABEL, PARAM_AUTHORIZATION_ENDPOINT, PARAM_CLIENT_ID, PARAM_SCOPES,
+    PARAM_TOKEN_ENDPOINT,
 };
 
 fn params_for(server_uri: &str, label: Option<&str>) -> BTreeMap<String, String> {
@@ -75,7 +77,7 @@ async fn begin_complete_exchanges_the_code_with_a_bound_verifier() {
         .mount(&server)
         .await;
 
-    let factory = OAuth2PkceFlowFactory::new().expect("build factory");
+    let factory = DescriptorFlowFactory::new(generic_oauth2()).expect("build factory");
     let flow = factory
         .begin(
             &params_for(&server.uri(), Some("work")),
@@ -140,7 +142,7 @@ async fn id_token_sub_names_the_account_when_no_label_is_given() {
         .mount(&server)
         .await;
 
-    let factory = OAuth2PkceFlowFactory::new().expect("build factory");
+    let factory = DescriptorFlowFactory::new(generic_oauth2()).expect("build factory");
     let flow = factory
         .begin(&params_for(&server.uri(), None), "http://127.0.0.1:7777/cb")
         .await
@@ -168,7 +170,7 @@ async fn a_failed_token_exchange_is_surfaced() {
         .mount(&server)
         .await;
 
-    let factory = OAuth2PkceFlowFactory::new().expect("build factory");
+    let factory = DescriptorFlowFactory::new(generic_oauth2()).expect("build factory");
     let flow = factory
         .begin(&params_for(&server.uri(), None), "http://127.0.0.1:7777/cb")
         .await
@@ -183,4 +185,137 @@ async fn a_failed_token_exchange_is_surfaced() {
         Ok(_) => panic!("a 400 exchange must fail the completion"),
     };
     assert!(err.to_string().contains("invalid_grant"), "{err}");
+}
+
+/// The generic (`use_state: true`) family enforces the CSRF `state` echo BEFORE any network I/O: a
+/// callback whose `state` does not match the minted one is rejected without touching the endpoint.
+#[tokio::test]
+async fn state_mismatch_is_rejected_before_any_exchange() {
+    let factory = DescriptorFlowFactory::new(generic_oauth2()).expect("build factory");
+    let flow = factory
+        .begin(
+            &params_for("https://idp.example", None),
+            "http://127.0.0.1:7777/cb",
+        )
+        .await
+        .expect("begin");
+    let err = match flow
+        .complete("http://127.0.0.1:7777/cb?code=abc&state=WRONG")
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("a state mismatch must be rejected"),
+    };
+    assert!(err.to_string().contains("state mismatch"), "{err}");
+}
+
+/// The real OpenRouter descriptor's begin URL is PKCE-only against the fixed OpenRouter endpoint,
+/// carries the callback under `callback_url`, and advertises the S256 challenge — with no
+/// `client_id`/`state`/`response_type`. (The static shape; the exchange path is proven below.)
+#[tokio::test]
+async fn openrouter_begin_targets_the_fixed_endpoint_pkce_only() {
+    let factory = DescriptorFlowFactory::new(openrouter()).expect("build factory");
+    assert_eq!(factory.family(), OPENROUTER_FAMILY);
+    assert!(
+        factory.provider_info().params_schema.is_empty(),
+        "the OpenRouter family owns every parameter (empty schema)"
+    );
+    let flow = factory
+        .begin(&BTreeMap::new(), "http://127.0.0.1:7777/cb")
+        .await
+        .expect("begin");
+    let url = flow.authorization_url();
+    assert!(url.starts_with("https://openrouter.ai/auth?"), "{url}");
+    assert_eq!(
+        query_param(url, "callback_url").as_deref(),
+        Some("http://127.0.0.1:7777/cb")
+    );
+    assert_eq!(
+        query_param(url, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert!(query_param(url, "client_id").is_none());
+    assert!(query_param(url, "state").is_none());
+}
+
+/// The provider-key JSON key-mint exchange (OpenRouter's shape) over a wiremock endpoint: the flow
+/// JSON-POSTs `{code, code_verifier, code_challenge_method}` (the PKCE verifier hashing to the
+/// advertised challenge), the mock returns `{"key": ...}`, and the outcome carries the BARE key as
+/// the blob with the `ProviderKeyForProfile` slot (`use_state: false` → no CSRF echo required).
+/// The token endpoint is injected via a param so the engine's real JSON key-mint path is exercised
+/// against the mock (the real descriptor's fixed endpoint is proven above).
+#[tokio::test]
+async fn provider_key_json_mint_stores_the_bare_key_and_slot() {
+    use daemon_oauth::{
+        CallbackParam, CredentialShape, ExchangeStyle, OAuthFlowDescriptor, Source,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/keys"))
+        .and(body_string_contains("code_challenge_method"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "sk-or-minted-test-key",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // OpenRouter's descriptor shape, but the token endpoint points at the mock (a param) so the
+    // engine's JSON key-mint path runs against wiremock.
+    let descriptor = OAuthFlowDescriptor {
+        family: "provider/openrouter",
+        display_name: "OpenRouter (test)",
+        authorization_endpoint: Source::Fixed("https://openrouter.ai/auth"),
+        token_endpoint: Source::Param("token_endpoint"),
+        client_id: None,
+        client_secret_param: None,
+        scopes: None,
+        callback_param: CallbackParam::CallbackUrl,
+        use_state: false,
+        exchange: ExchangeStyle::JsonPost { key_field: "key" },
+        credential: CredentialShape::ProviderKey {
+            account_label: "openrouter",
+        },
+        params_schema: Vec::new(),
+    };
+    let factory = DescriptorFlowFactory::new(descriptor).expect("build factory");
+    let mut params = BTreeMap::new();
+    params.insert(
+        "token_endpoint".to_string(),
+        format!("{}/keys", server.uri()),
+    );
+
+    let flow = factory
+        .begin(&params, "http://127.0.0.1:7777/cb")
+        .await
+        .expect("begin");
+    let challenge =
+        query_param(flow.authorization_url(), "code_challenge").expect("challenge advertised");
+
+    // No `state` on the callback — the PKCE-only descriptor accepts it.
+    let outcome = flow
+        .complete("http://127.0.0.1:7777/cb?code=or-code")
+        .await
+        .expect("complete");
+    // The BARE minted key is the blob (not the JSON envelope), and it is slotted as a provider key.
+    assert_eq!(outcome.credential_blob, "sk-or-minted-test-key");
+    assert_eq!(outcome.slot, CredentialSlotKind::ProviderKeyForProfile);
+    assert_eq!(outcome.account_label, "openrouter");
+
+    // The JSON exchange body carried the PKCE verifier that hashes to the advertised challenge.
+    let requests = server.received_requests().await.expect("recording on");
+    let exchange = requests
+        .iter()
+        .find(|r| r.url.path() == "/keys")
+        .expect("the key-mint endpoint was called");
+    let body: serde_json::Value = serde_json::from_slice(&exchange.body).expect("JSON body");
+    assert_eq!(body["code"], "or-code");
+    assert_eq!(body["code_challenge_method"], "S256");
+    let verifier = body["code_verifier"].as_str().expect("verifier posted");
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+        challenge,
+        "sha256(code_verifier) must equal the advertised code_challenge (the PKCE bond)"
+    );
 }

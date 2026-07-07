@@ -2565,14 +2565,30 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         as Arc<dyn daemon_core::CheckpointStore>);
 
     // Register the interactive-auth families this node exposes over the wire `AuthApi` (the
-    // client-driven SSO/OAuth2 login seam). The generic OAuth2 PKCE factory is always registered
-    // (params-driven — endpoints/client_id arrive in `auth_begin.params`, so it needs no config);
-    // the Matrix SSO factory rides whenever the matrix transport is enabled, keyed by the same
-    // per-account store root the transport's `serve` uses.
-    let mut auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>> = vec![Arc::new(
-        daemon_oauth::OAuth2PkceFlowFactory::new()
-            .map_err(|e| anyhow::anyhow!("registering the oauth2 auth factory: {e}"))?,
-    )];
+    // client-driven SSO/OAuth2 login seam). Every OAuth family is one instantiation of the single
+    // descriptor-driven engine (daemon-oauth): the generic `oauth2` family (params-driven —
+    // endpoints/client_id arrive in `auth_begin.params`, needs no config) + the fully node-owned
+    // OpenRouter provider family register unconditionally; the Hugging Face provider family rides
+    // only when the operator supplied its OAuth client id. The Matrix SSO factory rides whenever
+    // the matrix transport is enabled, keyed by the same per-account store root `serve` uses.
+    // [waveA:node-fixes] descriptor-driven OAuth families
+    let mut auth_factories: Vec<Arc<dyn daemon_host::AuthFlowFactory>> = vec![
+        Arc::new(
+            daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::generic_oauth2())
+                .map_err(|e| anyhow::anyhow!("registering the oauth2 auth factory: {e}"))?,
+        ),
+        Arc::new(
+            daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::openrouter())
+                .map_err(|e| anyhow::anyhow!("registering the openrouter auth factory: {e}"))?,
+        ),
+    ];
+    if let Some(client_id) = cfg.oauth.huggingface_client_id.clone() {
+        auth_factories.push(Arc::new(
+            daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::huggingface(client_id))
+                .map_err(|e| anyhow::anyhow!("registering the huggingface auth factory: {e}"))?,
+        ));
+    }
+    // [waveA:node-fixes] end
     if cfg.matrix.enabled {
         auth_factories.push(Arc::new(daemon_matrix::MatrixAuthFlowFactory::new(
             cfg.matrix.store_root.clone(),

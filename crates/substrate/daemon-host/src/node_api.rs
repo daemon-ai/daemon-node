@@ -539,11 +539,7 @@ impl NodeApiImpl {
                 }
                 Some(_) => {}
             }
-            let mut payload = Vec::new();
-            ciborium::into_writer(&msg, &mut payload)
-                .map_err(|e| ApiError::Other(format!("encode injected input: {e}")))?;
-            self.store.enqueue_session_input(session, payload).await;
-            self.store.enqueue_wake(session.clone()).await;
+            self.enqueue_durable_input(session, &msg).await?;
             return Ok(());
         }
         // `self.submit` is the `SessionApi` trait method (Auth 4 ownership-gated). This seam is
@@ -561,6 +557,60 @@ impl NodeApiImpl {
             ),
         )
         .await
+    }
+
+    /// The shared durable pending-input rail: encode `msg`, enqueue it on the durable session's
+    /// FIFO pending-input queue ([`SessionStore::enqueue_session_input`]) + a wake. The woken
+    /// incarnation drains it into the conversation at hydrate. Used by both the host-originated
+    /// injection seam ([`Self::inject_session_msg`]) and the F4 durable-resume submit gate
+    /// ([`Self::durable_resume_input`]).
+    async fn enqueue_durable_input(
+        &self,
+        session: &SessionId,
+        msg: &UserMsg,
+    ) -> Result<(), ApiError> {
+        let mut payload = Vec::new();
+        ciborium::into_writer(msg, &mut payload)
+            .map_err(|e| ApiError::Other(format!("encode injected input: {e}")))?;
+        self.store.enqueue_session_input(session, payload).await;
+        self.store.enqueue_wake(session.clone()).await;
+        Ok(())
+    }
+
+    /// The F4 durable-resume gate: whether a wire `Submit { StartTurn | Steer }` addressed at
+    /// `session` must ride the durable pending-input rail instead of opening a fresh live
+    /// incarnation. Returns `Some(msg)` — the [`UserMsg`] to fold into the durable transcript —
+    /// only for a **parked-durable** session: the durable lifecycle owns it (or, when unclaimed
+    /// after a restart, a durable activation row evidences it) AND it is live-but-dormant
+    /// (`Active | Suspended | Ready`, never `Completed`/absent). A `Completed` durable session
+    /// keeps today's fresh-incarnation behavior (its durable owner is gone), and any non-
+    /// `StartTurn`/`Steer` command falls through to the live path (`None`). The caller enforces
+    /// ownership (Auth 4) before enqueuing.
+    async fn durable_resume_input(
+        &self,
+        session: &SessionId,
+        command: &AgentCommand,
+    ) -> Option<UserMsg> {
+        let msg = match command {
+            AgentCommand::StartTurn { input, .. } => input.clone(),
+            AgentCommand::Steer { text, .. } => UserMsg::new(text.clone()),
+            _ => return None,
+        };
+        let durable = match self.owners.get(session).map(|o| *o.value()) {
+            Some(Lifecycle::Live) => false,
+            Some(Lifecycle::Durable) => true,
+            None => self.store.status(session).await.is_some(),
+        };
+        if !durable {
+            return None;
+        }
+        match self.store.status(session).await {
+            Some(
+                SessionStatus::Active | SessionStatus::Suspended { .. } | SessionStatus::Ready,
+            ) => Some(msg),
+            // Completed / absent: not parked-durable — fall through to the live path.
+            _ => None,
+        }
     }
 }
 
