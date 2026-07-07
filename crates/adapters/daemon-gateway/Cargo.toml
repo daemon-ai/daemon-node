@@ -1,0 +1,32 @@
+[package]
+name = "daemon-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The optional node-owned OpenAI-compatible HTTP gateway. It exposes `POST /v1/chat/completions`
+# (stream + non-stream) and `GET /v1/models` backed by the node's existing provider stack, so a
+# foreign OpenAI-wire agent can be pointed at a node-configured provider (local or cloud) without
+# ever holding a real API key. The crate carries only the wire types + routes + a `GatewayBackend`
+# injection trait; the binary implements the backend (provider/credential resolution). Isolated
+# here so axum never leaks into `daemon-core`, and the OpenAI wire types stay out of the contract.
+[dependencies]
+daemon-core = { workspace = true }
+daemon-api = { workspace = true }
+daemon-common = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+
+[lints]
+workspace = true

@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod gateway_backend;
 
 use clap::Parser as _;
 
@@ -2636,6 +2637,57 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&ws_root)
         .map_err(|e| anyhow::anyhow!("creating workspace root {}: {e}", ws_root.display()))?;
 
+    // Gateway (Part D/E): resolve the bearer token — an explicit `[gateway].token`, else a
+    // boot-minted ephemeral (logged once, like the other ephemeral secrets) — BEFORE assembly so
+    // Layer 2 injection can thread it into opted-in foreign agents' env. `None` when the gateway is
+    // off (`[gateway].addr` unset).
+    let gateway_token: Option<String> = match &cfg.gateway.addr {
+        Some(_) => Some(match &cfg.gateway.token {
+            Some(t) => t.clone(),
+            None => {
+                let minted = daemon_auth::generate_secret_hex(32)
+                    .map_err(|e| anyhow::anyhow!("minting gateway bearer token: {e}"))?;
+                tracing::info!(
+                    "gateway: no [gateway].token configured — minted an ephemeral bearer token for \
+                     this run (set [gateway].token to pin it)"
+                );
+                minted
+            }
+        }),
+        None => None,
+    };
+    // Layer 2 coords: only when the gateway is enabled AND injection is explicitly opted in.
+    let gateway_coords: Option<daemon_node::GatewayCoords> = match (
+        cfg.gateway.inject_foreign,
+        &cfg.gateway.addr,
+        &gateway_token,
+    ) {
+        (true, Some(addr), Some(token)) => Some(daemon_node::GatewayCoords {
+            base_url: gateway_base_url(addr),
+            token: token.clone(),
+        }),
+        _ => None,
+    };
+    // Capture the gateway backend seams before `provider_resolver` is moved into the assembly; the
+    // node surface is bound after assembly. Keyed on `addr` so it is `None` when the gateway is off.
+    let gateway_seams = cfg.gateway.addr.as_ref().map(|_| {
+        let credentials: Arc<dyn CredentialProvider> =
+            Arc::new(BrokeredCredentialProvider::new(owner.clone(), None));
+        let cred_map: Vec<(ProviderSelector, String)> = cfg
+            .gateway
+            .credentials
+            .iter()
+            .map(|c| (c.provider, c.credential_ref.clone()))
+            .collect();
+        gateway_backend::GatewaySeams {
+            provider_resolver: provider_resolver.clone(),
+            credentials,
+            cred_map,
+            default_credential_ref: cfg.profile.clone(),
+            allowlist: cfg.gateway.models_allowlist.clone(),
+        }
+    });
+
     let AssembledNode {
         node,
         handle,
@@ -2686,6 +2738,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             max_depth: cfg.orchestrate.max_depth,
             max_fanout: cfg.orchestrate.max_fanout,
         },
+        foreign_gateway: gateway_coords,
     });
     // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
     // conversations are readable through the tool (the node did not exist when the tool was built).
@@ -3068,6 +3121,29 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     node.set_adapters(adapter_registry);
     let adapter_tasks = node.spawn_adapters();
 
+    // Optionally bind the node-owned OpenAI-compatible gateway (`daemon-gateway`), toggled on by
+    // `[gateway].addr`. It shares the node surface (for the catalog) + the provider-resolution and
+    // credential seams captured above, and is bearer-gated on a loopback listener — distinct from
+    // the `[api]`/`[web]` local-trust surfaces. Bound before the http surface (which moves `node`).
+    let gateway_server = match (&cfg.gateway.addr, gateway_token, gateway_seams) {
+        (Some(addr), Some(token), Some(seams)) => {
+            let backend: Arc<dyn daemon_gateway::GatewayBackend> =
+                Arc::new(seams.into_backend(node.clone()));
+            let gateway_listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                %addr,
+                inject_foreign = cfg.gateway.inject_foreign,
+                "serving OpenAI-compatible gateway (POST /v1/chat/completions + GET /v1/models, bearer-gated)"
+            );
+            Some(tokio::spawn(async move {
+                if let Err(e) = daemon_gateway::serve(gateway_listener, backend, token).await {
+                    tracing::warn!(error = %e, "gateway surface ended");
+                }
+            }))
+        }
+        _ => None,
+    };
+
     let http_server = match &cfg.http_addr {
         Some(addr) => {
             let http_listener = tokio::net::TcpListener::bind(addr).await?;
@@ -3101,6 +3177,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     }
     if let Some(http_server) = http_server {
         http_server.abort();
+    }
+    if let Some(gateway_server) = gateway_server {
+        gateway_server.abort();
     }
     for task in &adapter_tasks {
         task.abort();
@@ -3201,6 +3280,20 @@ fn build_owner_broker(
 /// all sharing one node signer). Returned as the concrete type so the caller can coerce it to both
 /// the engine-facing `CredentialBroker` and the audit-drain `CredentialAuditDrain`. Bearer mode +
 /// the launch-configured `fallback_key` for any profile with no stored key (zero-config bootstrap).
+/// The loopback base URL an injected foreign agent's `OPENAI_BASE_URL` points at, derived from the
+/// gateway bind `addr`. A wildcard bind host (`0.0.0.0` / `::`) is rewritten to loopback so the
+/// in-node agent reaches the gateway locally; anything else is used verbatim. Always suffixed
+/// `/v1` (the OpenAI base path the `chat/completions` + `models` routes hang off).
+fn gateway_base_url(addr: &str) -> String {
+    let normalized = match addr.rsplit_once(':') {
+        Some((host, port)) if host == "0.0.0.0" || host == "::" || host == "[::]" => {
+            format!("127.0.0.1:{port}")
+        }
+        _ => addr.to_string(),
+    };
+    format!("http://{normalized}/v1")
+}
+
 fn build_multi_profile_broker(
     fallback_key: &str,
     store: Arc<dyn CredentialStore>,

@@ -231,7 +231,12 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &shared.workspace_roots,
         &procs,
     );
-    let session_builder = build_session_builder(&session_ctx, session_profile, a.store.clone());
+    let session_builder = build_session_builder(
+        &session_ctx,
+        session_profile,
+        a.store.clone(),
+        a.foreign_gateway.clone(),
+    );
 
     let mut node_api = NodeApiImpl::new(NodeApiParts {
         supervisor: handle.observer(),
@@ -626,6 +631,7 @@ fn build_session_builder(
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     session_profile: EngineProfile,
     session_store: Arc<dyn daemon_store::SessionStore>,
+    foreign_gateway: Option<crate::GatewayCoords>,
 ) -> SessionEngineBuilder {
     match session_ctx {
         Some((store, ctx)) => {
@@ -651,10 +657,25 @@ fn build_session_builder(
                             ),
                             daemon_api::EngineSelector::Foreign { agent } => {
                                 // Compute the effective model the same way the Core path does:
-                                // clone the spec, apply the session overlay (so a per-session model
-                                // override propagates), and pass a non-empty model into the factory.
+                                // clone the spec and apply the session overlay (so a per-session
+                                // model override propagates). It feeds both the ACP model selector
+                                // and the gateway-injected OPENAI_MODEL.
                                 let mut effective = spec.clone();
                                 overlay.apply_to(&mut effective);
+                                // Layer 2: when the gateway is enabled + injecting, build the
+                                // per-agent OpenAI-wire env (empty for a non-OpenAI-wire agent) so
+                                // the spawn is repointed at the node gateway. Env-only — the recipe
+                                // still comes from the catalog by name.
+                                let extra_env = foreign_gateway
+                                    .as_ref()
+                                    .map(|coords| {
+                                        crate::fleet::foreign_live::foreign_gateway_env(
+                                            agent,
+                                            coords,
+                                            &effective.model,
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                 let model = Some(effective.model).filter(|m| !m.trim().is_empty());
                                 SessionBackend::Foreign(
                                     crate::fleet::foreign_live::foreign_session_factory(
@@ -662,6 +683,7 @@ fn build_session_builder(
                                         model,
                                         id,
                                         session_store.clone(),
+                                        extra_env,
                                     ),
                                 )
                             }

@@ -2218,6 +2218,7 @@ dependencies = [
  "daemon-credentials",
  "daemon-discord",
  "daemon-egress",
+ "daemon-gateway",
  "daemon-host",
  "daemon-http",
  "daemon-infer",
@@ -2258,10 +2259,12 @@ dependencies = [
  "daemon-whatsapp",
  "daemon-workspace-index",
  "figment",
+ "futures",
  "nix 0.31.3",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
 ]
@@ -2539,6 +2542,25 @@ dependencies = [
  "daemon-store",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "daemon-gateway"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "daemon-api",
+ "daemon-common",
+ "daemon-core",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

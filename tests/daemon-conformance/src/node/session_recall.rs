@@ -291,6 +291,7 @@ fn assemble_with_store_for_recall(
         title_aux,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     (node, handle, store)
 }

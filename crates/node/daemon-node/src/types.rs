@@ -178,6 +178,25 @@ pub struct NodeAssembly {
     /// recursion budget): the tool declines past `min(max_depth, nesting_depth + 1)`, so the
     /// policy cap can narrow the structural budget but never widen it.
     pub orchestrate: OrchestrateCaps,
+    /// The node gateway's loopback coordinates for Layer 2 injection into opted-in OpenAI-wire
+    /// foreign agents. `None` (the default) leaves foreign agents on their own backend.
+    pub foreign_gateway: Option<GatewayCoords>,
+}
+
+/// The loopback coordinates of the node's OpenAI-compatible gateway (`daemon-gateway`), threaded
+/// into the interactive session builder so an opted-in OpenAI-wire foreign agent (codex/opencode)
+/// is spawned pointed at the gateway (`OPENAI_BASE_URL`/`OPENAI_API_KEY`) instead of holding a real
+/// provider key. `None` on [`NodeAssembly::foreign_gateway`] leaves foreign agents on their own
+/// backend (the default); the binary sets it only when the gateway is enabled AND
+/// `[gateway].inject_foreign` is on. Injection is env-only — the launch recipe still comes from the
+/// catalog by name, preserving the foreign-engine security invariant.
+#[derive(Clone, Debug)]
+pub struct GatewayCoords {
+    /// The gateway base URL an agent's `OPENAI_BASE_URL` is set to (e.g. `http://127.0.0.1:8081/v1`).
+    pub base_url: String,
+    /// The gateway bearer token an agent's `OPENAI_API_KEY` is set to (a loopback capability, not a
+    /// real provider key).
+    pub token: String,
 }
 
 /// The delegation guardrail caps (`[orchestrate].max_depth` / `.max_fanout`) threaded into the

@@ -67,6 +67,7 @@ fn assemble_versioning(
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     (node, handle, skills)
 }

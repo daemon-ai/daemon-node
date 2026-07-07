@@ -54,6 +54,7 @@ fn assemble_min() -> AssembledNode {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     })
 }
 

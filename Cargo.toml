@@ -292,6 +292,7 @@ daemon-credentials = { version = "0", path = "crates/substrate/daemon-credential
 daemon-telemetry = { version = "0", path = "crates/substrate/daemon-telemetry" }
 daemon-host = { version = "0", path = "crates/substrate/daemon-host" }
 daemon-acp = { version = "0", path = "crates/adapters/daemon-acp" }
+daemon-gateway = { version = "0", path = "crates/adapters/daemon-gateway" }
 daemon-http = { version = "0", path = "crates/adapters/daemon-http" }
 daemon-mcp-client = { version = "0", path = "crates/adapters/daemon-mcp-client" }
 daemon-delivery = { version = "0", path = "crates/adapters/daemon-delivery" }

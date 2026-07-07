@@ -82,6 +82,7 @@ fn assemble_core_tools(store: Arc<dyn SessionStore>) -> AssembledNode {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     })
 }
 
@@ -278,6 +279,7 @@ fn assemble_core_approval(store: Arc<dyn SessionStore>) -> AssembledNode {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     })
 }
 

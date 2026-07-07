@@ -36,10 +36,17 @@ pub(crate) fn foreign_session_factory(
     model: Option<String>,
     session: SessionId,
     store: Arc<dyn SessionStore>,
+    extra_env: Vec<(String, String)>,
 ) -> ForeignSessionFactory {
     Box::new(move |host| {
         Box::pin(async move {
-            let entry = resolve_entry(&agent, &store).await?;
+            let mut entry = resolve_entry(&agent, &store).await?;
+            // Layer 2 injection: append the operator-opted-in gateway env (never replacing the
+            // catalog recipe — only adding env). Empty when the gateway is off or the agent is not
+            // an OpenAI-wire agent, so the recipe-by-name security invariant is preserved.
+            if !extra_env.is_empty() {
+                entry.recipe.env.extend(extra_env);
+            }
             // Spawn-time re-check: validation at create/update proved installed-ness THEN; the
             // binary can have been removed since. `recipe_installed` is a cheap PATH/file probe
             // (protocol-independent — both ACP and stream-json agents are PATH binaries).
@@ -101,6 +108,36 @@ pub(crate) fn foreign_session_factory(
     })
 }
 
+/// The OpenAI-wire foreign agents that honor `OPENAI_BASE_URL` / `OPENAI_API_KEY` env repointing.
+/// Deliberately a small, explicit allowlist (start with codex + opencode): a non-OpenAI-wire agent
+/// (claude/gemini) is never repointed here — its native backend is left untouched (the Anthropic
+/// `/v1/messages` route is a documented follow-up).
+fn is_openai_wire_agent(agent: &str) -> bool {
+    matches!(agent, "codex" | "opencode")
+}
+
+/// The gateway env vars to inject for `agent`, given the node gateway [`GatewayCoords`] and the
+/// profile `model`. Empty for a non-OpenAI-wire agent (no injection). This is the per-agent mapping
+/// table: OpenAI-wire agents read `OPENAI_BASE_URL` + `OPENAI_API_KEY` (and `OPENAI_MODEL` as a
+/// hint) so they run on the node-configured provider without holding a real key.
+pub(crate) fn foreign_gateway_env(
+    agent: &str,
+    coords: &crate::GatewayCoords,
+    model: &str,
+) -> Vec<(String, String)> {
+    if !is_openai_wire_agent(agent) {
+        return Vec::new();
+    }
+    let mut env = vec![
+        ("OPENAI_BASE_URL".to_string(), coords.base_url.clone()),
+        ("OPENAI_API_KEY".to_string(), coords.token.clone()),
+    ];
+    if !model.is_empty() {
+        env.push(("OPENAI_MODEL".to_string(), model.to_string()));
+    }
+    env
+}
+
 /// Resolve `agent` to its catalog entry: durable manual registrations take precedence over the
 /// curated builtin table (mirrors the `agent_catalog` merge order — Manual wins over Builtin).
 async fn resolve_entry(agent: &str, store: &Arc<dyn SessionStore>) -> Result<AgentEntry, ApiError> {
@@ -120,4 +157,61 @@ async fn resolve_entry(agent: &str, store: &Arc<dyn SessionStore>) -> Result<Age
                  agent_register or run AgentDiscover first"
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GatewayCoords;
+
+    fn coords() -> GatewayCoords {
+        GatewayCoords {
+            base_url: "http://127.0.0.1:8081/v1".into(),
+            token: "gw-token".into(),
+        }
+    }
+
+    #[test]
+    fn openai_wire_agents_get_gateway_env() {
+        for agent in ["codex", "opencode"] {
+            let env = foreign_gateway_env(agent, &coords(), "gpt-4o");
+            let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+            assert_eq!(
+                map.get("OPENAI_BASE_URL").map(String::as_str),
+                Some("http://127.0.0.1:8081/v1"),
+                "{agent} should get OPENAI_BASE_URL"
+            );
+            assert_eq!(
+                map.get("OPENAI_API_KEY").map(String::as_str),
+                Some("gw-token"),
+                "{agent} should get OPENAI_API_KEY"
+            );
+            assert_eq!(
+                map.get("OPENAI_MODEL").map(String::as_str),
+                Some("gpt-4o"),
+                "{agent} should get OPENAI_MODEL"
+            );
+        }
+    }
+
+    #[test]
+    fn non_openai_wire_agents_are_not_repointed() {
+        // claude (Anthropic) / gemini and unknown agents keep their own backend — no injection.
+        for agent in ["claude", "gemini", "goose", "unknown"] {
+            assert!(
+                foreign_gateway_env(agent, &coords(), "gpt-4o").is_empty(),
+                "{agent} must not be repointed"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_model_omits_model_hint() {
+        let env = foreign_gateway_env("codex", &coords(), "");
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert!(map.contains_key("OPENAI_BASE_URL"));
+        assert!(map.contains_key("OPENAI_API_KEY"));
+        // No model hint when the profile carries no model.
+        assert!(!map.contains_key("OPENAI_MODEL"));
+    }
 }

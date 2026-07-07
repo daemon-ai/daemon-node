@@ -210,6 +210,7 @@ async fn observe_appends_context_without_starting_a_turn_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     let busy = SessionId::new("obs-busy");
 
@@ -515,6 +516,7 @@ async fn ingest_gate_queues_addressed_while_busy_then_flushes_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
     let origin = Origin::new(
@@ -669,6 +671,7 @@ async fn ingest_gate_routes_distinct_origins_to_bound_profiles_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     let ing = Ingestor::new(node.clone() as Arc<dyn NodeApi>);
 
