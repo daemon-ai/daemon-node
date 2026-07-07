@@ -49,6 +49,7 @@ async fn filesystem_surface_round_trips_and_gates() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     // The node advertises at least the writable workspace root.
@@ -168,6 +169,7 @@ async fn fs_list_pages_over_the_wire() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);
@@ -266,6 +268,7 @@ async fn content_store_round_trips_and_materializes() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     // put -> get round-trip.
@@ -384,6 +387,7 @@ async fn inbound_attachment_materializes_into_session_inbox_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     // The client stages the attachment in the content store, then names it on the turn.

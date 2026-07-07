@@ -82,6 +82,10 @@ daemon-api = { workspace = true }
 daemon-protocol = { workspace = true }
 # Optional in-process HTTP/WS surface, toggled on at launch by a configured bind address.
 daemon-http = { workspace = true }
+# The optional node-owned OpenAI-compatible gateway, toggled on at launch by `[gateway].addr`. The
+# binary implements its `GatewayBackend` (provider + credential resolution); the crate holds the
+# axum surface + wire types.
+daemon-gateway = { workspace = true }
 # The Matrix chat transport, toggled on at launch by `[matrix].enabled`. It isolates the heavy
 # matrix-sdk deps; the daemon binary only references `serve` / `login` / `MatrixConfig`.
 daemon-matrix = { workspace = true }
@@ -111,6 +115,9 @@ daemon-transport = { workspace = true }
 tokio = { workspace = true }
 # The workspace-index background task's cooperative-shutdown token.
 tokio-util = { workspace = true }
+# The gateway backend's SSE forwarding (ReceiverStream) + provider stream driving.
+tokio-stream = { workspace = true }
+futures = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

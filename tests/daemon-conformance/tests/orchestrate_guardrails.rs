@@ -55,6 +55,7 @@ fn assemble_with_caps(nesting_depth: usize, caps: OrchestrateCaps) -> AssembledN
         title_aux: None,
         reaper: Default::default(),
         orchestrate: caps,
+        foreign_gateway: None,
     })
 }
 

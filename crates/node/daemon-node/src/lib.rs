@@ -38,5 +38,6 @@ pub use fleet::{
     ProfileChildSpawner, ReaperConfig,
 };
 pub use types::{
-    AssembledNode, NodeAssembly, OrchestrateCaps, ProviderResolver, ResolvedSkills, SkillsResolver,
+    AssembledNode, GatewayCoords, NodeAssembly, OrchestrateCaps, ProviderResolver, ResolvedSkills,
+    SkillsResolver,
 };

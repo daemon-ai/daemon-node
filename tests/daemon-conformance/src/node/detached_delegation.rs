@@ -155,6 +155,7 @@ fn assemble_with_orchestrator(
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     })
 }
 

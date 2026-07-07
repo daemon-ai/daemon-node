@@ -231,7 +231,12 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &shared.workspace_roots,
         &procs,
     );
-    let session_builder = build_session_builder(&session_ctx, session_profile, a.store.clone());
+    let session_builder = build_session_builder(
+        &session_ctx,
+        session_profile,
+        a.store.clone(),
+        a.foreign_gateway.clone(),
+    );
 
     let mut node_api = NodeApiImpl::new(NodeApiParts {
         supervisor: handle.observer(),
@@ -626,6 +631,7 @@ fn build_session_builder(
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     session_profile: EngineProfile,
     session_store: Arc<dyn daemon_store::SessionStore>,
+    foreign_gateway: Option<crate::GatewayCoords>,
 ) -> SessionEngineBuilder {
     match session_ctx {
         Some((store, ctx)) => {
@@ -650,11 +656,26 @@ fn build_session_builder(
                                 ctx.resolve_effective(&spec, overlay).fresh(id),
                             ),
                             daemon_api::EngineSelector::Foreign { agent } => {
+                                // Layer 2: when the gateway is enabled + injecting, build the
+                                // per-agent OpenAI-wire env (empty for a non-OpenAI-wire agent) so
+                                // the spawn is repointed at the node gateway. Env-only — the recipe
+                                // still comes from the catalog by name.
+                                let extra_env = foreign_gateway
+                                    .as_ref()
+                                    .map(|coords| {
+                                        crate::fleet::foreign_live::foreign_gateway_env(
+                                            agent,
+                                            coords,
+                                            &spec.model,
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                 SessionBackend::Foreign(
                                     crate::fleet::foreign_live::foreign_session_factory(
                                         agent.clone(),
                                         id,
                                         session_store.clone(),
+                                        extra_env,
                                     ),
                                 )
                             }

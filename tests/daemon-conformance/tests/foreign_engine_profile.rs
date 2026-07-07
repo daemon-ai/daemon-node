@@ -83,6 +83,7 @@ fn assemble_acp_node() -> (
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     (node, resolver_called, handle)
 }

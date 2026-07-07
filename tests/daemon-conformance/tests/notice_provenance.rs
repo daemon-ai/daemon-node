@@ -61,6 +61,7 @@ fn assemble_min(store: Arc<dyn SessionStore>) -> AssembledNode {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     })
 }
 

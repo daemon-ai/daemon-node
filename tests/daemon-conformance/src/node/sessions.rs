@@ -536,6 +536,7 @@ async fn session_overlay_persists_and_restores_on_respawn_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     let origin = Origin::new(

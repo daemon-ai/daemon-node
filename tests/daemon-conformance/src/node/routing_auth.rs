@@ -172,6 +172,7 @@ async fn routed_submit_resolves_profile_and_delivery_per_origin_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     // Drive a routed submit for `origin` and return (resolved session, final text).
@@ -404,6 +405,7 @@ async fn bound_accounts_derive_instance_profile_binding_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     let text_a = route_text(&node, origin("@a:hs")).await;
@@ -473,6 +475,7 @@ async fn bound_accounts_derive_instance_profile_binding_impl() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
     let text_override = route_text(&node, origin("@a:hs")).await;
     assert!(
@@ -608,6 +611,7 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     // (1) discovery: the stub family is listed.
@@ -760,6 +764,7 @@ async fn provider_openrouter_family_registered_with_empty_schema() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     let providers = node.auth_providers().await;
@@ -872,6 +877,7 @@ async fn provider_key_slots_under_bound_profile_and_requires_bind() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     let params = || {
@@ -1020,6 +1026,7 @@ async fn account_provisioning_enumerates_resolves_and_refreshes() {
         title_aux: None,
         reaper: Default::default(),
         orchestrate: Default::default(),
+        foreign_gateway: None,
     });
 
     // 1. Enumerate by family: exactly the two matrix accounts, excluding slack.
