@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod feedback;
 pub mod fields;
 pub mod journal;
 pub mod metrics;
