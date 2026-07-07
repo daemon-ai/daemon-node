@@ -1,0 +1,53 @@
+[package]
+name = "daemon-line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The LINE chat transport (Phase 1 of the multi-protocol messaging plan): an in-process
+# `NodeApi`-client adapter, structurally a sibling of `daemon-matrix`. It isolates the
+# `line-bot-sdk-rust` Messaging-API SDK and drives *our* engine as a client — verifying + normalising
+# LINE webhook events into `Origin`s and handing them to the reusable `daemon-ingest` gate (inbound),
+# and projecting the session's outbound merged log to LINE push messages via a `daemon-delivery`
+# `Projector` (outbound). BOT-ONLY (channel access token + channel secret): no mature Rust LINE user
+# client exists. LINE is webhook-push, so inbound rides an adapter-owned HTTP listener (see
+# `inbound.rs`); all line-bot-sdk-rust types stay confined to this crate.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# the in-process bring-up seam (not wire): AccountProvisioning enumerates bound line accounts +
+# resolves their opaque credential blobs; the interactive-auth traits the BotToken flow plugs into.
+daemon-host = { workspace = true }
+# the two reusable transport-agnostic halves this adapter plugs into.
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# the LINE Messaging API SDK (bot-only): push send, webhook event models, and constant-time HMAC-SHA256
+# signature validation. `default` features only — the axum/actix/rocket extractor integrations stay off
+# (this crate owns its own axum listener seam). SDK-internal HTTP is hyper (not reqwest); no egress ban.
+line-bot-sdk-rust = { version = "3", default-features = false }
+# inbound webhook listener seam (LINE pushes events to a public HTTP endpoint). The sanctioned
+# workspace HTTP server dep (same one `daemon-http` uses); isolated to the inbound path.
+axum = { workspace = true }
+# stable, non-secret account handle derivation (short hash of the channel secret) when the operator
+# supplies no explicit channel id — keeps interactive auth network-free + deterministic.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# compute a valid `x-line-signature` fixture in the webhook-verify test (HMAC-SHA256 + base64), so no
+# real channel secret or live network is needed. Test-only.
+hmac = "0.12"
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+[lints]
+workspace = true
