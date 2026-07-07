@@ -3,10 +3,14 @@
 
   # Pull built closures from the daemon-ai Cachix cache (public pull). CI feeds the cache via
   # cachix-action; humans/other machines opt in with --accept-flake-config (or as a trusted-user).
-  # Public pull key only — no secret lives here.
+  # Public pull key only — no secret lives here. The numtide cache serves the `llm-agents.nix`
+  # coding-agent binaries (the `e2e` devShell) prebuilt, so the e2e lane never compiles them.
   nixConfig = {
-    extra-substituters = [ "https://daemon-ai.cachix.org" ];
-    extra-trusted-public-keys = [ "daemon-ai.cachix.org-1:jzeLmFDfgE5dzGT0RXF70IEU/tKsWdDV9LQ5zPGAnQs=" ];
+    extra-substituters = [ "https://daemon-ai.cachix.org" "https://cache.numtide.com" ];
+    extra-trusted-public-keys = [
+      "daemon-ai.cachix.org-1:jzeLmFDfgE5dzGT0RXF70IEU/tKsWdDV9LQ5zPGAnQs="
+      "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+    ];
   };
 
   inputs = {
@@ -26,6 +30,14 @@
       url = "github:ggml-org/llama.cpp/94a220cd6745e6e3f8de62870b66fd5b9bc92700";
       flake = false;
     };
+
+    # Prebuilt coding-agent CLIs (claude-code, gemini-cli, codex, goose, opencode, qwen, cursor,
+    # amp, ...) for the `e2e` devShell, which puts them on PATH so the node's foreign-agent
+    # discovery (AcpDiscoverer) can probe them for real. Deliberately NOT `inputs.nixpkgs.follows`:
+    # llm-agents.nix is built and cache-populated against its own pinned nixpkgs-unstable, so
+    # following our `logos-co/nixpkgs` fork would break its eval and forfeit the numtide binary
+    # cache. The cost is a second nixpkgs evaluation, paid only when the `e2e` shell is entered.
+    llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
   outputs =
@@ -36,6 +48,7 @@
       crane,
       fenix,
       llama-cpp-src,
+      llm-agents,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -933,6 +946,54 @@
               pkgs.cargo-fuzz
             ] ++ engineNativeInputs;
           };
+        }
+        // {
+          # Real foreign-agent e2e lane: put the prebuilt coding-agent CLIs on PATH (from the
+          # `llm-agents.nix` flake + its numtide binary cache) so the node's discovery
+          # (`daemon_acp::AcpDiscoverer`) can probe the real binaries — the ACP ones confirm via the
+          # `initialize` handshake (verified), the stream-json ones (claude/amp) report installed-but-
+          # unverified. The default `cargo test --workspace` gate stays mock-only and offline; the
+          # real-agent discovery test is env-gated (`DAEMON_E2E_AGENTS=1`) and runs in here.
+          #
+          # The `want` set is filtered against what `llm-agents` actually exposes for this system, so
+          # an absent attr (or a platform the flake doesn't build) is skipped rather than breaking
+          # eval. Unfree agents (claude-code, amp, cursor-agent, copilot-cli, droid, ...) are
+          # instantiated by `llm-agents`' own (unfree-permitting) nixpkgs, so referencing their
+          # prebuilt outputs here does not require an allowUnfree flag on our nixpkgs; if a future
+          # `llm-agents` change forces the check onto the consumer, enter with `NIXPKGS_ALLOW_UNFREE=1`.
+          e2e =
+            let
+              a = llm-agents.packages.${system} or { };
+              want = [
+                # ACP direct-binary targets (best-effort acp-mode flags in the curated table)
+                "gemini-cli"
+                "qwen-code"
+                "goose-cli"
+                "opencode"
+                "codex"
+                "cursor-agent"
+                "copilot-cli"
+                "droid"
+                "iflow-cli"
+                "qoder-cli"
+                "kilocode-cli"
+                "mistral-vibe"
+                "junie"
+                "eca"
+                # stream-json direct-binary targets (no handshake -> surfaced unverified)
+                "claude-code"
+                "amp"
+              ];
+              agents = map (n: a.${n}) (builtins.filter (n: a ? ${n}) want);
+            in
+            pkgs.mkShell {
+              SSL_CERT_FILE = caBundle;
+              NIX_SSL_CERT_FILE = caBundle;
+              packages = [
+                rustToolchain
+                pkgs.cargo-nextest
+              ] ++ agents;
+            };
         }
         # Optional GPU lanes for building/exercising the worker with an accelerated backend
         # (`cargo build -p daemon-infer --features cuda` / `--features vulkan`). Linux-only; the CUDA

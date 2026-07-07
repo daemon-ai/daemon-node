@@ -233,22 +233,113 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The curated direct-binary ACP recipe table (I7): `(name, program, acp-mode args)`. Only
-/// **direct-binary** agents that speak ACP on stdio are auto-detected here; adapter-wrapped agents
-/// (Claude-via-Zed, Bub, Pi, Codex-via-Zed) and IDE-embedded agents (Cursor, Copilot, Junie) stay
-/// manual-register entries (`source = Manual`). The ACP-mode invocation flags are best-effort; a
-/// mis-curated flag simply means the `initialize` probe does not confirm (the binary still shows as
-/// installed-on-PATH, just unverified).
-const CURATED: &[(&str, &str, &[&str])] = &[
-    ("gemini", "gemini", &["--experimental-acp"]),
-    ("qwen", "qwen", &["--experimental-acp"]),
-    ("goose", "goose", &["acp"]),
-    ("opencode", "opencode", &[]),
-    ("codex", "codex", &["acp"]),
-    ("kimi", "kimi", &[]),
-    ("crow-cli", "crow-cli", &[]),
-    ("cursor-agent", "cursor-agent", &[]),
+/// One row of the curated direct-binary recipe table (I7): a display name, the program to exec, the
+/// protocol-mode args, and the wire protocol the daemon drives it with.
+struct Curated {
+    /// Catalog display name / key (e.g. `"gemini"`, `"claude"`).
+    name: &'static str,
+    /// The program to exec (resolved on `$PATH`).
+    program: &'static str,
+    /// Protocol-mode invocation args (best-effort; see the table doc-comment).
+    args: &'static [&'static str],
+    /// The wire protocol this agent speaks (selects the adapter + whether discovery handshakes).
+    protocol: daemon_api::AgentProtocol,
+}
+
+/// The curated **direct-binary** foreign-agent recipe table (I7): agents whose own CLI speaks a wire
+/// protocol the daemon drives on stdio, so they auto-detect on `$PATH`. Two protocols are covered:
+///
+/// * [`AgentProtocol::Acp`](daemon_api::AgentProtocol::Acp) — a symmetric JSON-RPC handshake, so
+///   discovery **confirms** the agent by completing an `initialize` exchange (fills `version` /
+///   `capabilities` → *verified*). The acp-mode flags are best-effort and self-correcting: a
+///   mis-curated flag (or an agent that doesn't actually speak ACP) simply means the probe does not
+///   confirm, and the entry shows installed-on-PATH but *unverified* rather than failing.
+/// * [`AgentProtocol::StreamJson`](daemon_api::AgentProtocol::StreamJson) — the Claude-Code NDJSON
+///   dialect (also Amp). There is **no handshake**, so discovery is PATH-only and the entry is always
+///   surfaced *unverified* (`version` stays `None`); the `args` are the streaming-input invocation
+///   used when the agent is actually spawned.
+///
+/// Adapter-wrapped agents that only speak ACP through a separate shim (`npx pi-acp`,
+/// `@agentclientprotocol/claude-agent-acp`, `codex-acp`, ...) and IDE-embedded agents are **not**
+/// listed here — they stay manual-register entries (`source = Manual`).
+const CURATED: &[Curated] = &[
+    // --- ACP direct-binary agents (best-effort acp-mode flags, confirmed via `initialize`) -------
+    acp("gemini", "gemini", &["--experimental-acp"]),
+    acp("qwen", "qwen", &["--acp"]),
+    acp("goose", "goose", &["acp"]),
+    acp("opencode", "opencode", &["acp"]),
+    acp("codex", "codex", &["acp"]),
+    acp("kimi", "kimi", &["acp"]),
+    acp("crow-cli", "crow-cli", &[]),
+    acp("cursor-agent", "cursor-agent", &["acp"]),
+    acp("copilot", "copilot", &["--acp", "--stdio"]),
+    acp("droid", "droid", &["exec", "--output-format", "acp"]),
+    acp("iflow", "iflow", &["--experimental-acp"]),
+    acp("qoder", "qodercli", &["--acp"]),
+    acp("kilocode", "kilocode", &["acp"]),
+    acp("mistral-vibe", "mistral-vibe", &[]),
+    acp("junie", "junie", &[]),
+    acp("eca", "eca", &[]),
+    // --- stream-json direct-binary agents (no handshake → always surfaced unverified) -------------
+    stream_json(
+        "claude",
+        "claude",
+        &[
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ],
+    ),
+    stream_json("amp", "amp", &["--stream-json", "--stream-json-input"]),
 ];
+
+/// Build an [`AgentProtocol::Acp`](daemon_api::AgentProtocol::Acp) curated row (const-fn so the
+/// table stays a compile-time constant).
+const fn acp(name: &'static str, program: &'static str, args: &'static [&'static str]) -> Curated {
+    Curated {
+        name,
+        program,
+        args,
+        protocol: daemon_api::AgentProtocol::Acp,
+    }
+}
+
+/// Build an [`AgentProtocol::StreamJson`](daemon_api::AgentProtocol::StreamJson) curated row.
+const fn stream_json(
+    name: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+) -> Curated {
+    Curated {
+        name,
+        program,
+        args,
+        protocol: daemon_api::AgentProtocol::StreamJson,
+    }
+}
+
+/// Build an unprobed [`daemon_api::AgentEntry`] from a curated row: the recipe, its protocol, and a
+/// cheap PATH `installed` check. Shared by `discover` (which then handshakes ACP entries) and
+/// `builtin` (which never handshakes) so both stay in lockstep on recipe + protocol shape.
+fn curated_entry(row: &Curated) -> daemon_api::AgentEntry {
+    let recipe = daemon_api::AgentRecipe {
+        program: Some(row.program.to_string()),
+        args: row.args.iter().map(|s| (*s).to_string()).collect(),
+        env: Vec::new(),
+        endpoint: None,
+    };
+    daemon_api::AgentEntry {
+        name: row.name.to_string(),
+        installed: recipe_installed(&recipe),
+        recipe,
+        source: daemon_api::AgentSource::Builtin,
+        protocol: row.protocol,
+        version: None,
+        capabilities: Vec::new(),
+    }
+}
 
 /// The server-side ACP discoverer (I7): probes the curated direct-binary recipe table on `$PATH` via
 /// the ACP `initialize` handshake. Implements [`daemon_host::AgentDiscovery`] so the host's
@@ -293,25 +384,12 @@ pub fn recipe_installed(recipe: &daemon_api::AgentRecipe) -> bool {
 impl daemon_host::AgentDiscovery for AcpDiscoverer {
     async fn discover(&self) -> Vec<daemon_api::AgentEntry> {
         let mut out = Vec::with_capacity(CURATED.len());
-        for (name, program, args) in CURATED {
-            let installed = which(program).is_some();
-            let recipe = daemon_api::AgentRecipe {
-                program: Some((*program).to_string()),
-                args: args.iter().map(|s| (*s).to_string()).collect(),
-                env: Vec::new(),
-                endpoint: None,
-            };
-            let mut entry = daemon_api::AgentEntry {
-                name: (*name).to_string(),
-                recipe,
-                source: daemon_api::AgentSource::Builtin,
-                protocol: daemon_api::AgentProtocol::Acp,
-                installed,
-                version: None,
-                capabilities: Vec::new(),
-            };
-            // Confirm it really speaks ACP (and capture metadata) only when the binary is present.
-            if installed {
+        for row in CURATED {
+            let mut entry = curated_entry(row);
+            // Confirm ACP agents (and capture metadata) via the `initialize` handshake only when the
+            // binary is present. Stream-json agents have no handshake, so their `version`/`caps`
+            // stay empty — installed-on-PATH is the whole probe, and they surface as unverified.
+            if entry.installed && row.protocol == daemon_api::AgentProtocol::Acp {
                 if let Some(launch) = launch_from_recipe(&entry.recipe) {
                     if let Some(p) = probe(launch).await {
                         entry.version = Some(p.protocol_version);
@@ -345,23 +423,11 @@ impl daemon_host::AgentDiscovery for AcpDiscoverer {
 
     fn builtin(&self, name: &str) -> Option<daemon_api::AgentEntry> {
         // Recipe + PATH check only — deliberately NO initialize probe, so the validation /
-        // spawn-resolution fast path never spawns candidate processes.
-        let (agent, program, args) = CURATED.iter().find(|(agent, _, _)| *agent == name)?;
-        let recipe = daemon_api::AgentRecipe {
-            program: Some((*program).to_string()),
-            args: args.iter().map(|s| (*s).to_string()).collect(),
-            env: Vec::new(),
-            endpoint: None,
-        };
-        Some(daemon_api::AgentEntry {
-            name: (*agent).to_string(),
-            installed: recipe_installed(&recipe),
-            recipe,
-            source: daemon_api::AgentSource::Builtin,
-            protocol: daemon_api::AgentProtocol::Acp,
-            version: None,
-            capabilities: Vec::new(),
-        })
+        // spawn-resolution fast path never spawns candidate processes. The protocol comes from the
+        // curated row (so a stream-json builtin like `claude`/`amp` is spawnable-by-name via the
+        // fleet's StreamJson branch, not just ACP entries).
+        let row = CURATED.iter().find(|row| row.name == name)?;
+        Some(curated_entry(row))
     }
 }
 
