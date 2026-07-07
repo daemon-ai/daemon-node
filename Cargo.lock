@@ -2808,6 +2808,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-acp",
+ "daemon-activation",
  "daemon-api",
  "daemon-common",
  "daemon-context-lcm",

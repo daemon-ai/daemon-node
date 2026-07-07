@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The tool trait, registry, and the one bundled tool (§12).
+//! The tool trait and registry (§12).
 //!
 //! A [`Tool`] is a capability the engine invokes during a turn. It runs against the [`TurnCx`] and
 //! returns a [`ToolOutcome`] — a result slot plus the [`Effect`]s its execution produced. The
-//! [`ToolRegistry`] resolves a call's name to its handler. Phase 3 ships exactly one real tool,
-//! [`DelegateTool`], which exercises the full pipeline: it raises a blocking `HostRequest::Delegate`
-//! and yields the durable [`Effect::Delegate`] the engine suspends on.
+//! [`ToolRegistry`] resolves a call's name to its handler. `daemon-core` bundles no concrete tool
+//! of its own: delegation now flows through the node's `orchestrate` tool (which yields the same
+//! durable [`Effect::Delegate`] the engine suspends on), and every other capability is injected by
+//! the composition root.
 
 use crate::conversation::{ToolCall, ToolResult};
 use crate::turn::{Effect, TurnCx};
-use daemon_common::{JobId, ReqId};
-use daemon_protocol::{HostRequest, HostRequestKind, HostResponseBody, ToolDetail};
+use daemon_protocol::ToolDetail;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -345,71 +345,5 @@ fn def_of(t: &Arc<dyn Tool>) -> ToolDef {
     ToolDef {
         name: t.name().to_owned(),
         schema: t.schema().to_owned(),
-    }
-}
-
-/// The one bundled tool: delegate background work to the host.
-///
-/// Running it raises a blocking `HostRequest::Delegate`; the host answers with the durable `JobId`
-/// the engine will wait on. The tool returns that id as its result and emits [`Effect::Delegate`],
-/// which the engine's applier records into `waiting_for` before suspending (§16.2 / lifecycle §3.1).
-pub struct DelegateTool {
-    label: String,
-}
-
-impl DelegateTool {
-    /// A delegate tool that labels its delegated work with `label`.
-    pub fn new(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-        }
-    }
-}
-
-impl Default for DelegateTool {
-    fn default() -> Self {
-        Self::new("background-work")
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for DelegateTool {
-    fn name(&self) -> &str {
-        "delegate"
-    }
-
-    fn schema(&self) -> &str {
-        r#"{"type":"object","properties":{}}"#
-    }
-
-    async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
-        let req = HostRequest {
-            request_id: ReqId(0),
-            kind: HostRequestKind::Delegate {
-                label: self.label.clone(),
-                budget: cx.budget,
-            },
-        };
-        let resp = cx.host.request(req).await;
-        let job_id = match resp.body {
-            HostResponseBody::Delegated(job) => job,
-            _ => JobId::new(format!("{}:unresolved", cx.session_id)),
-        };
-        // Carry the task as the structured job payload (no attachments from this core tool); the
-        // node-side worker decodes it to seed the child. Replaces the historical fixed marker.
-        let payload = daemon_protocol::DelegationInput::task(self.label.clone()).encode();
-        ToolOutcome {
-            result: ToolResult {
-                call_id: call.call_id.clone(),
-                ok: true,
-                content: format!("delegated:{job_id}"),
-            },
-            effects: vec![Effect::Delegate {
-                job: job_id,
-                payload,
-            }],
-            detail: None,
-            untrusted: false,
-        }
     }
 }

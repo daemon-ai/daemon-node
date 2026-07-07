@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use daemon_activation::EngineFactory;
 use daemon_api::{SessionOverlay, TreeEvent};
 use daemon_common::{ProfileRef, SessionId};
 use daemon_core::{ApprovalPolicy, Config, EngineProfile, StablePromptSource, SystemPrompt, Tool};
@@ -29,6 +30,7 @@ use daemon_supervision::ManageRequestHandler;
 use daemon_telemetry::TraceSigner;
 
 use crate::cron::worker::{CronSkillLoader, CronWorker};
+use crate::fleet::foreign_incarnation::{DispatchingEngineFactory, ForeignConfig};
 use crate::fleet::job_worker::FleetJobWorker;
 use crate::fleet::spawner::ProfileChildSpawner;
 use crate::fleet::view::FleetViewImpl;
@@ -217,7 +219,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // parent-bound durable child session seeded from the same orchestrator profile (moved in here).
     let job_worker = build_job_worker(&a, orchestrator_profile, &shared);
     // The resident cron scheduler (`cron.cron_worker`, built above) drives the 5th supervised service.
-    let host = Host::new(a.store.clone(), Arc::new(factory), a.host_config)
+    let host = Host::new(a.store.clone(), factory, a.host_config)
         .with_job_worker(Arc::new(job_worker))
         .with_cron_scheduler(cron.cron_worker.clone() as Arc<dyn CronScheduler>);
     let handle = host.start();
@@ -531,13 +533,18 @@ fn build_session_ctx(
 /// The durable engine factory: journals per turn into the shared store, wires the background-review
 /// spawner + the constrained cron profile, optionally re-resolves a durable session from its bound
 /// profile + overlay on rehydration, and threads the content store + workspace roots.
+///
+/// When the node hosts profiles, the Core factory is wrapped in a [`DispatchingEngineFactory`] so a
+/// delegated child whose bound profile is `Foreign{agent}` runs as that ACP / stream-json agent (via
+/// [`ForeignIncarnation`](crate::fleet::foreign_incarnation)) instead of silently falling back to
+/// Core. Without a profile store there are no foreign bindings, so the plain Core factory is used.
 fn build_factory(
     a: &NodeAssembly,
     orchestrator_profile: &EngineProfile,
     cron_run_profile: &EngineProfile,
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     shared: &Shared,
-) -> CoreEngineFactory {
+) -> Arc<dyn EngineFactory> {
     let mut factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
         .with_journal(a.store.clone(), shared.signer.clone())
         .with_background(shared.background.clone())
@@ -549,18 +556,12 @@ fn build_factory(
         let ctx = ctx.clone();
         // Re-resolve a durable session from its bound profile + overlay; no recorded binding (e.g. a
         // delegated orchestrator child) yields `None`, so the factory keeps its orchestrator profile.
+        // `resolve_effective` stays Core-only: a `Foreign{agent}` binding is routed to the
+        // dispatching factory's foreign incarnation, so the resolver only ever sees Core specs.
         let resolver: DurableProfileResolver =
             Arc::new(move |bound: Option<ProfileRef>, overlay: &SessionOverlay| {
                 let bound = bound?;
                 let spec = store.get(bound.as_str()).ok().flatten()?;
-                // The durable incarnation path is core-only: a FOREIGN-engine profile must
-                // never resolve a core `EngineProfile` here (its provider/model fields are inert
-                // and the recipe belongs to the live foreign seam). Decline so the factory keeps
-                // its default profile for whatever durable bookkeeping touches the session; turns
-                // on foreign-engine sessions run through the live surface.
-                if !matches!(spec.engine, daemon_api::EngineSelector::Core) {
-                    return None;
-                }
                 Some(ctx.resolve_effective(&spec, overlay))
             });
         factory = factory.with_session_resolver(resolver);
@@ -570,7 +571,20 @@ fn build_factory(
     if let (Some(roots), Some(blobs)) = (&shared.workspace_roots, &shared.blob_store) {
         factory = factory.with_content(blobs.clone(), roots.clone());
     }
-    factory
+    match session_ctx {
+        // Profiles present: dispatch Core vs `Foreign{agent}` per delegated child at hydrate.
+        Some((profiles, _)) => Arc::new(DispatchingEngineFactory::new(
+            factory,
+            ForeignConfig {
+                profiles: profiles.clone(),
+                store: a.store.clone(),
+                signer: shared.signer.clone(),
+                gateway: a.foreign_gateway.clone(),
+            },
+        )),
+        // No profile store: no foreign bindings are possible, so the plain Core factory suffices.
+        None => Arc::new(factory),
+    }
 }
 
 /// One durable job worker for the whole node: every delegation (top or nested) materializes a
@@ -586,6 +600,11 @@ fn build_job_worker(
     // attachments from the parent's workspace into the child's inbox/ (node-mediated).
     if let (Some(roots), Some(blobs)) = (&shared.workspace_roots, &shared.blob_store) {
         job_worker = job_worker.with_workspace(roots.clone(), blobs.clone());
+    }
+    // Give the worker the profile store so a delegated child bound to a `Foreign{agent}` profile is
+    // seeded for the durable foreign path (empty snapshot + task on the input seam).
+    if let Some(profiles) = a.profiles.clone() {
+        job_worker = job_worker.with_profiles(profiles);
     }
     job_worker
 }
@@ -659,66 +678,29 @@ fn build_session_builder(
                                 // A persisted per-session model override still steers a foreign
                                 // session at open (Phase 3 makes `SetSessionModel` fully
                                 // foreign-aware); it takes precedence over the profile's foreign
-                                // backend model for both arms.
+                                // backend model. The shared `spawn_foreign_session` helper (reused by
+                                // the durable foreign incarnation) resolves the recipe node-side and
+                                // applies the AgentNative/NodeProvider backend policy + gateway token.
                                 let overlay_model =
                                     overlay.model.clone().filter(|m| !m.trim().is_empty());
-                                match &spec.foreign_backend {
-                                    // AgentNative: steer only the agent's OWN model via ACP; no
-                                    // gateway env, no token — the agent keeps its native backend.
-                                    daemon_api::ForeignBackend::AgentNative { model } => {
-                                        let steer = overlay_model
-                                            .or_else(|| model.clone())
-                                            .filter(|m| !m.trim().is_empty());
-                                        SessionBackend::Foreign(
-                                            crate::fleet::foreign_live::foreign_session_factory(
-                                                agent.clone(),
-                                                steer,
-                                                id,
-                                                session_store.clone(),
-                                                Vec::new(),
-                                                None,
-                                            ),
+                                let agent = agent.clone();
+                                let backend = spec.foreign_backend.clone();
+                                let store = session_store.clone();
+                                let gateway = foreign_gateway.clone();
+                                SessionBackend::Foreign(Box::new(move |host| {
+                                    Box::pin(async move {
+                                        crate::fleet::foreign_live::spawn_foreign_session(
+                                            agent,
+                                            backend,
+                                            overlay_model,
+                                            id,
+                                            store,
+                                            gateway,
+                                            host,
                                         )
-                                    }
-                                    // NodeProvider: route through the node gateway. Mint a
-                                    // per-session token bound to this {provider, model,
-                                    // credential_ref} and inject the OpenAI-wire env; the agent's
-                                    // own model selector stays unset (the model is chosen node-side
-                                    // by the gateway). Env-only — the recipe still comes from the
-                                    // catalog by name, preserving the security invariant.
-                                    daemon_api::ForeignBackend::NodeProvider {
-                                        provider,
-                                        model,
-                                        credential_ref,
-                                    } => {
-                                        let routed_model =
-                                            overlay_model.unwrap_or_else(|| model.clone());
-                                        let (extra_env, lease) = match &foreign_gateway {
-                                            Some(coords) => {
-                                                crate::fleet::foreign_live::node_provider_injection(
-                                                    agent,
-                                                    coords,
-                                                    crate::GatewayBinding {
-                                                        provider: *provider,
-                                                        model: routed_model,
-                                                        credential_ref: credential_ref.clone(),
-                                                    },
-                                                )
-                                            }
-                                            None => (Vec::new(), None),
-                                        };
-                                        SessionBackend::Foreign(
-                                            crate::fleet::foreign_live::foreign_session_factory(
-                                                agent.clone(),
-                                                None,
-                                                id,
-                                                session_store.clone(),
-                                                extra_env,
-                                                lease,
-                                            ),
-                                        )
-                                    }
-                                }
+                                        .await
+                                    })
+                                }))
                             }
                         },
                         None => SessionBackend::Core(fallback.fresh(id)),

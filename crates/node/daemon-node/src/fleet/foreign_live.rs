@@ -17,12 +17,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use daemon_api::{from_cbor, AgentEntry, AgentProtocol, ApiError, ModelSelector};
+use daemon_api::{from_cbor, AgentEntry, AgentProtocol, ApiError, ForeignBackend, ModelSelector};
 use daemon_common::SessionId;
 use daemon_host::{
     AgentDiscovery, AgentSession, CodecSession, ForeignSessionFactory, StreamJsonCodec,
 };
-use daemon_protocol::{AgentCommand, AgentEvent};
+use daemon_protocol::{AgentCommand, AgentEvent, HostRequestHandler};
 use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
 use daemon_store::SessionStore;
 use tokio::sync::broadcast;
@@ -167,6 +167,76 @@ pub(crate) fn foreign_session_factory(
             }
         })
     })
+}
+
+/// Compute the model steer + gateway env + lease for a foreign session from its `ForeignBackend`,
+/// honoring an optional per-session `overlay_model` override (the live surface's persisted session
+/// model; `None` on the durable path). The AgentNative arm returns the model the agent's own backend
+/// is steered to (ACP `set_config_option`); the NodeProvider arm mints the per-session gateway token
+/// plus OpenAI-wire env (via [`node_provider_injection`]) and returns its revoke-on-drop
+/// [`GatewayLease`]. This is the shared policy behind both the live session builder Foreign arm and
+/// the durable foreign incarnation.
+fn foreign_env_and_model(
+    agent: &str,
+    backend: &ForeignBackend,
+    overlay_model: Option<String>,
+    gateway: &Option<GatewayCoords>,
+) -> (Vec<(String, String)>, Option<String>, Option<GatewayLease>) {
+    match backend {
+        // AgentNative: steer only the agent's OWN model via ACP; no gateway env, no token.
+        ForeignBackend::AgentNative { model } => {
+            let steer = overlay_model
+                .or_else(|| model.clone())
+                .filter(|m| !m.trim().is_empty());
+            (Vec::new(), steer, None)
+        }
+        // NodeProvider: route through the node gateway. Mint a per-session token bound to this
+        // {provider, model, credential_ref} and inject the OpenAI-wire env; the agent's own model
+        // selector stays unset (the model is chosen node-side by the gateway).
+        ForeignBackend::NodeProvider {
+            provider,
+            model,
+            credential_ref,
+        } => {
+            let routed_model = overlay_model.unwrap_or_else(|| model.clone());
+            match gateway {
+                Some(coords) => {
+                    let (env, lease) = node_provider_injection(
+                        agent,
+                        coords,
+                        GatewayBinding {
+                            provider: *provider,
+                            model: routed_model,
+                            credential_ref: credential_ref.clone(),
+                        },
+                    );
+                    (env, None, lease)
+                }
+                None => (Vec::new(), None, None),
+            }
+        }
+    }
+}
+
+/// Spawn a foreign [`AgentSession`] from a profile's foreign `backend` + catalog `agent` name,
+/// resolving the recipe node-side and honoring the per-session gateway token wiring. Shared by the
+/// live interactive builder (the `SessionBackend::Foreign` factory) and the durable foreign
+/// incarnation, so both spawn an ACP / stream-json backend identically from a `ProfileSpec`'s
+/// `engine = Foreign{agent}` + `foreign_backend`. `host` answers the agent's blocking §17 requests
+/// (permission prompts): the live path passes its parking handler, the durable path an auto-allow.
+pub(crate) async fn spawn_foreign_session(
+    agent: String,
+    backend: ForeignBackend,
+    overlay_model: Option<String>,
+    session: SessionId,
+    store: Arc<dyn SessionStore>,
+    gateway: Option<GatewayCoords>,
+    host: Arc<dyn HostRequestHandler>,
+) -> Result<Arc<dyn AgentSession>, ApiError> {
+    let (extra_env, model, lease) =
+        foreign_env_and_model(&agent, &backend, overlay_model, &gateway);
+    let factory = foreign_session_factory(agent, model, session, store, extra_env, lease);
+    factory(host).await
 }
 
 /// The OpenAI-wire foreign agents that honor `OPENAI_BASE_URL` / `OPENAI_API_KEY` env repointing.

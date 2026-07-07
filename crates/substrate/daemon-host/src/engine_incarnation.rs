@@ -25,10 +25,11 @@ use crate::node_api::{decode_overlay, DurableProfileResolver};
 use crate::workspace_fs::WorkspaceRoots;
 use async_trait::async_trait;
 use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
-use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, SessionId};
+use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, ReqId, SessionId};
 use daemon_core::{
-    Completion, Conversation, DelegateTool, Engine, EngineProfile, EventSink, Failure,
-    MockProvider, Provider, Snapshot, SystemPrompt, ToolRegistry, TurnControl, TurnOutcome,
+    Completion, Conversation, Effect, Engine, EngineProfile, EventSink, Failure, MockProvider,
+    Provider, Snapshot, SystemPrompt, Tool, ToolCall, ToolOutcome, ToolRegistry, ToolResult,
+    TurnControl, TurnCx, TurnOutcome,
 };
 use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, Outbound,
@@ -86,15 +87,78 @@ struct ContentTransfer {
     roots: Arc<WorkspaceRoots>,
 }
 
+/// A minimal conformance/test delegation tool standing in for the node's `orchestrate` tool on the
+/// pure-`daemon-core` paths (the substrate conformance harness + the §17 ⇄ management translation
+/// gate), which cannot link the real `daemon-tool-orchestrate` (a higher-level crate). Its `spawn`
+/// raises the blocking `HostRequest::Delegate` and yields the durable [`Effect::Delegate`] the
+/// engine suspends on, carrying the same `DelegationInput::task(label)` payload the real tool
+/// encodes — so the "delegate → suspend → resume → complete" cycle is exercised without the retired
+/// `daemon-core` `delegate` tool.
+pub struct OrchestrateShim {
+    label: String,
+}
+
+impl OrchestrateShim {
+    /// A shim that labels its delegated work with `label`.
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for OrchestrateShim {
+    fn name(&self) -> &str {
+        "orchestrate"
+    }
+
+    fn schema(&self) -> &str {
+        r#"{"type":"object","properties":{}}"#
+    }
+
+    async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
+        let req = HostRequest {
+            request_id: ReqId(0),
+            kind: HostRequestKind::Delegate {
+                label: self.label.clone(),
+                budget: cx.budget,
+            },
+        };
+        let resp = cx.host.request(req).await;
+        let job_id = match resp.body {
+            HostResponseBody::Delegated(job) => job,
+            _ => JobId::new(format!("{}:unresolved", cx.session_id)),
+        };
+        // The same structured job payload the real orchestrate tool encodes (task only, no
+        // attachments), so the node-side worker seeds the child identically.
+        let payload = daemon_protocol::DelegationInput::task(self.label.clone()).encode();
+        ToolOutcome {
+            result: ToolResult {
+                call_id: call.call_id.clone(),
+                ok: true,
+                content: format!("delegated:{job_id}"),
+            },
+            effects: vec![Effect::Delegate {
+                job: job_id,
+                payload,
+            }],
+            detail: None,
+            untrusted: false,
+        }
+    }
+}
+
 impl CoreEngineFactory {
     /// A factory whose engines delegate one unit of background work and then complete — the durable
     /// "delegate → suspend → resume → complete" cycle the substrate conformance suite drives.
     pub fn delegating() -> Self {
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(DelegateTool::new("background-work")));
+        registry.register(Arc::new(OrchestrateShim::new("background-work")));
         let profile = EngineProfile::new(
             Arc::new(|| {
-                Arc::new(MockProvider::delegating("delegate", "work complete")) as Arc<dyn Provider>
+                Arc::new(MockProvider::delegating("orchestrate", "work complete"))
+                    as Arc<dyn Provider>
             }),
             Arc::new(registry),
             SystemPrompt::new("daemon-core conformance engine"),

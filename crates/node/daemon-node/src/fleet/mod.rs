@@ -12,6 +12,7 @@
 //! - [`view`]: the durable-graph projection of the management tree ([`FleetViewImpl`]).
 //! - [`reaper`]: the ephemeral-subagent reaper ([`EphemeralReaper`]).
 
+pub(crate) mod foreign_incarnation;
 pub(crate) mod foreign_live;
 pub mod job_worker;
 pub mod notice_worker;

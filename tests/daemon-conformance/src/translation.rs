@@ -9,8 +9,8 @@
 
 use async_trait::async_trait;
 use daemon_common::{Budget, ReqId, SessionId, UnitId};
-use daemon_core::{DelegateTool, Engine, MockProvider, Provider, SystemPrompt, ToolRegistry};
-use daemon_host::EngineUnit;
+use daemon_core::{Engine, MockProvider, Provider, SystemPrompt, Tool, ToolRegistry};
+use daemon_host::{EngineUnit, OrchestrateShim};
 use daemon_supervision::{
     Ack, Concurrency, EndReason, ManageCommand, ManageEvent, ManageRequest, ManageRequestHandler,
     ManageRequestKind, ManageResponse, ManageResponseBody, ManagedUnit, ProgressDelta,
@@ -22,7 +22,7 @@ use std::time::Duration;
 /// Build a managed unit over a real engine driven by `provider`.
 fn engine_unit(provider: Arc<dyn Provider>) -> daemon_host::AgentUnit {
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(DelegateTool::new("background-work")));
+    registry.register(Arc::new(OrchestrateShim::new("background-work")));
     let engine = Engine::fresh(
         SessionId::new("u1"),
         SystemPrompt::new("translation gate engine"),
@@ -30,6 +30,17 @@ fn engine_unit(provider: Arc<dyn Provider>) -> daemon_host::AgentUnit {
         Arc::new(registry),
     );
     EngineUnit::spawn(UnitId::new("u1"), engine)
+}
+
+/// The legacy `daemon-core` `delegate` tool is retired: the conformance delegation surface is the
+/// `orchestrate` shim (named for the node tool it stands in for), so the mock provider that drives
+/// the delegation cycle below must call `orchestrate`, never `delegate`.
+#[test]
+fn delegate_tool_is_retired_in_favor_of_orchestrate() {
+    assert_eq!(
+        OrchestrateShim::new("background-work").name(),
+        "orchestrate"
+    );
 }
 
 /// `Assign` drives a turn whose §17 events surface as `Started → Progress → Finished` upward.
@@ -112,7 +123,7 @@ async fn host_request_maps_to_manage_request() {
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let unit = engine_unit(Arc::new(MockProvider::delegating("delegate", "done")));
+    let unit = engine_unit(Arc::new(MockProvider::delegating("orchestrate", "done")));
     unit.install_request_handler(Arc::new(Recorder { tx }));
 
     let ack = unit

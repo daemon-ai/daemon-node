@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use daemon_api::{ManageEventView, SubagentPhase, TreeEvent};
+use daemon_api::{EngineSelector, ManageEventView, SubagentPhase, TreeEvent};
 use daemon_common::{PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::EngineProfile;
-use daemon_host::{BlobStore, JobWorker, ServiceError, WorkspaceRoots};
+use daemon_host::{BlobStore, JobWorker, ProfileStore, ServiceError, WorkspaceRoots};
 
 /// Drives the durable job outbox by materializing each delegation as a *durable child session*:
 /// seed a fresh orchestrator-capable engine snapshot with the delegated work, create the child row,
@@ -37,6 +37,11 @@ pub struct FleetJobWorker {
     workspace_roots: Option<Arc<WorkspaceRoots>>,
     /// The content store used to put/fetch delegated attachment bytes. `None` disables transfer.
     blobs: Option<Arc<dyn BlobStore>>,
+    /// The profile store, consulted to detect a delegated child bound to a `Foreign{agent}` profile:
+    /// such a child is seeded with an empty snapshot + the task on the durable input seam (the
+    /// foreign backend, not a Core engine, runs the turn). `None` (no profile store) keeps every
+    /// child on the Core seeding path.
+    profiles: Option<Arc<dyn ProfileStore>>,
 }
 
 impl FleetJobWorker {
@@ -54,7 +59,26 @@ impl FleetJobWorker {
             bus_seq: std::sync::atomic::AtomicU64::new(0),
             workspace_roots: None,
             blobs: None,
+            profiles: None,
         }
+    }
+
+    /// Give the worker the profile store so a delegated child bound to a `Foreign{agent}` profile is
+    /// seeded for the foreign durable path (empty snapshot + task on the input seam) rather than the
+    /// Core engine path. No-op detection (every child stays Core) when unset.
+    pub fn with_profiles(mut self, profiles: Arc<dyn ProfileStore>) -> Self {
+        self.profiles = Some(profiles);
+        self
+    }
+
+    /// Whether `profile` names a `Foreign{agent}` engine in the profile store. `false` when no store
+    /// is wired, the profile is unknown, or it is a Core profile — the Core seeding path.
+    fn is_foreign_profile(&self, profile: &str) -> bool {
+        self.profiles
+            .as_ref()
+            .and_then(|store| store.get(profile).ok().flatten())
+            .map(|spec| matches!(spec.engine, EngineSelector::Foreign { .. }))
+            .unwrap_or(false)
     }
 
     /// Give the worker the workspace roots + content store so it materializes a delegation's
@@ -185,15 +209,40 @@ impl JobWorker for FleetJobWorker {
                 // before the first turn.
                 self.materialize_attachments(&job.session_id, &child, &input.attachments)
                     .await;
-                // Captured before the task moves into the seed turn: the child's roster/tree title.
+                // Captured before the task moves into the seed: the child's roster/tree title.
                 let child_title: String = input.task.chars().take(80).collect();
-                let mut engine = self.profile.fresh(child.clone());
-                engine.push_user(daemon_protocol::UserMsg::new(input.task));
-                let blob = engine.snapshot().encode().map_err(ServiceError::new)?;
+                // A child bound to a `Foreign{agent}` profile runs its turn in the foreign backend
+                // process, not a Core engine: seed a minimal id-carrying snapshot and hand the task
+                // down the durable input seam (the `ForeignIncarnation` drains it at hydrate). A Core
+                // child keeps the existing path: a fresh orchestrator-engine snapshot with the task
+                // pushed as its first user turn.
+                let is_foreign = input
+                    .profile
+                    .as_deref()
+                    .is_some_and(|p| self.is_foreign_profile(p));
+                let blob = if is_foreign {
+                    daemon_core::Snapshot::fresh(child.clone())
+                        .encode()
+                        .map_err(ServiceError::new)?
+                } else {
+                    let mut engine = self.profile.fresh(child.clone());
+                    engine.push_user(daemon_protocol::UserMsg::new(input.task.clone()));
+                    engine.snapshot().encode().map_err(ServiceError::new)?
+                };
                 self.store
                     .create_session(child.clone(), self.partition, blob)
                     .await
                     .map_err(ServiceError::new)?;
+                // The foreign child has no Core-seeded first turn, so its task rides the durable
+                // pending-input seam the `ForeignIncarnation` drains at hydrate.
+                if is_foreign {
+                    self.store
+                        .enqueue_session_input(
+                            &child,
+                            daemon_protocol::UserMsg::new(input.task.clone()).encode(),
+                        )
+                        .await;
+                }
                 // Stamp the hierarchy edge so the child is excluded from the `TopLevel` roster and
                 // reached only by walking the tree: it is a non-`Primary` child of the delegating
                 // session. Read-modify-write preserves any bound profile/overlay; the role is

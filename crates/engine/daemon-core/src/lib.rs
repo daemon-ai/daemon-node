@@ -101,7 +101,6 @@ pub use safety::{check_url, check_url_resolved, check_url_resolved_with, Checked
 pub use snapshot::{PendingApproval, ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;
 pub use tools::{
-    DelegateTool, Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError,
-    ToolRegistry,
+    Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError, ToolRegistry,
 };
 pub use turn::{approve_command, approve_path, approve_shell_command, Effect, Gate, TurnCx};

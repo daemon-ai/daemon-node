@@ -14,6 +14,9 @@ license.workspace = true
 daemon-common = { workspace = true }
 daemon-core = { workspace = true }
 daemon-store = { workspace = true }
+# The durable activation seam (Incarnation / EngineFactory): the node's dispatching engine factory
+# routes a delegated child to a Core or foreign incarnation on this path.
+daemon-activation = { workspace = true }
 daemon-schedule = { workspace = true }
 daemon-host = { workspace = true }
 daemon-protocol = { workspace = true }

@@ -114,7 +114,9 @@ pub use cut::{
     CutCredentialClient, CutFrame, PlacedUnit, RemoteCredentialClient, RemoteStoreClient,
     StoreCall, StoreReplyBody,
 };
-pub use engine_incarnation::{CoreEngineFactory, CoreIncarnation, JournalConfig, ProviderBuilder};
+pub use engine_incarnation::{
+    CoreEngineFactory, CoreIncarnation, JournalConfig, OrchestrateShim, ProviderBuilder,
+};
 pub use foreign::{decode_outbound, encode_inbound, Codec, CodecSession, NativeCutCodec};
 pub use journal::{
     drain_credential_audit, journal_stream, spawn_credential_audit_drain, CredentialAuditDrain,
