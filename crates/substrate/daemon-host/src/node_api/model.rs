@@ -262,6 +262,7 @@ impl NodeApiImpl {
                 requires_key: false,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
             ProviderDescriptor {
                 id: "mistral_rs".into(),
@@ -271,6 +272,7 @@ impl NodeApiImpl {
                 requires_key: false,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
             ProviderDescriptor {
                 id: "daemon_cloud".into(),
@@ -282,6 +284,7 @@ impl NodeApiImpl {
                 requires_key: true,
                 supports_model_discovery: true,
                 default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
+                sign_in: None,
             },
         ]
     }

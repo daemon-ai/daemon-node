@@ -170,7 +170,11 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | TransportRooms { .. }
         | TransportAdapters
         | TransportInstances => C::RoutingRead,
-        RoutingSet { .. } | RoutingBindChat { .. } | RoutingUnbindChat { .. } => C::RoutingWrite,
+        RoutingSet { .. }
+        | RoutingBindChat { .. }
+        | RoutingUnbindChat { .. }
+        | TransportDisconnect { .. }
+        | TransportRemove { .. } => C::RoutingWrite,
 
         // -- serve_messaging: conversations, membership, contacts -------------------------------
         ConvList { .. }
@@ -207,6 +211,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | AgentRemove { .. }
         | ProviderRegister { .. }
         | ToolRegister { .. }
+        | ToolSetEnabled { .. }
         | ConfigSet { .. } => C::RegistryWrite,
 
         // -- serve_fs: filesystem surface + blob store ------------------------------------------

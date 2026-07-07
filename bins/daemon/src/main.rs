@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use daemon_api::{
     BudgetSpec, ContextEngineSel, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileSpec,
-    ProviderDescriptor, ProviderKindWire, ProviderSelector,
+    ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn,
 };
 use daemon_common::{
     CredMode, CredScope, JournalStreamId, ModelEngine, ModelRef, ModelSource, ProfileRef,
@@ -389,6 +389,7 @@ impl CloudCatalog for GenAiCloudCatalog {
                 requires_key: false,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
             ProviderDescriptor {
                 id: "mistral_rs".into(),
@@ -398,11 +399,19 @@ impl CloudCatalog for GenAiCloudCatalog {
                 requires_key: false,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in: None,
             },
         ];
         // One row per genai cloud vendor (all bind `ProviderSelector::GenAi`; the vendor dimension is
         // carried by `id`). Listing their models needs a key.
         for (id, display_name) in discovery_vendor_ids() {
+            // [waveA:node-v30] CON-15: the OpenRouter genai row advertises interactive sign-in via
+            // the `provider/openrouter` auth family (the sibling registers the factory under it);
+            // every other vendor carries `None`.
+            let sign_in = (id == "open_router").then(|| ProviderSignIn {
+                family: "provider/openrouter".into(),
+                label: "Sign in with OpenRouter".into(),
+            });
             out.push(ProviderDescriptor {
                 id,
                 display_name,
@@ -411,6 +420,7 @@ impl CloudCatalog for GenAiCloudCatalog {
                 requires_key: true,
                 supports_model_discovery: true,
                 default_base_url: None,
+                sign_in,
             });
         }
         // Daemon Cloud (OpenRouter clone). Needs a key to RUN TURNS (its
@@ -425,6 +435,7 @@ impl CloudCatalog for GenAiCloudCatalog {
             requires_key: true,
             supports_model_discovery: true,
             default_base_url: Some(DAEMON_CLOUD_BASE.to_string()),
+            sign_in: None,
         });
         out
     }
@@ -2944,9 +2955,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.matrix.enabled {
         tracing::info!("registering matrix transport (daemon-matrix)");
         let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        // [waveA:node-v30] hand the adapter the node's lifecycle sink so its membership/conversation
+        // handlers (item 3) and disconnect-cause reporting (item 2) reach the node.
         adapter_registry = adapter_registry.with_adapter(daemon_matrix::MatrixAdapter::new(
             provisioning,
             cfg.matrix.clone(),
+            Some(node.lifecycle_sink()),
         ));
     }
     node.set_adapters(adapter_registry);

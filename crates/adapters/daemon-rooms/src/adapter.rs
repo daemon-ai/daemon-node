@@ -480,6 +480,8 @@ impl TransportAdapter for RoomsAdapter {
                 interactive_auth: false,
             },
             account_schema: AccountSettingsSchema::default(),
+            // The internal loopback transport has no operator-facing policies (wire v30).
+            policies: Vec::new(),
         }
     }
 
@@ -491,6 +493,10 @@ impl TransportAdapter for RoomsAdapter {
             connection: ConnectionState::Connected,
             presence: PresenceState::default(),
             bound_profile: None,
+            // The loopback transport is always connected; no disconnect provenance (wire v30).
+            reason: None,
+            message: None,
+            fatal: false,
         }]
     }
 

@@ -68,6 +68,8 @@ impl NodeApiImpl {
             adapters: Arc::new(ArcSwap::from_pointee(
                 crate::adapters::AdapterRegistry::new(),
             )),
+            adapter_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            disconnect_fatal: Arc::new(dashmap::DashMap::new()),
             mgmt_journal: Arc::new(std::sync::Mutex::new(None)),
             agents: None,
             last_agents: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -224,49 +226,122 @@ impl NodeApiImpl {
     /// `TransportInstances`. Deliberately not a presence state machine: adapters that never
     /// transition simply never re-emit.
     pub fn spawn_adapters(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
-        use futures::FutureExt as _;
         let registry = self.adapters.load_full();
-        registry
-            .adapters()
-            .iter()
-            .map(|adapter| {
-                let adapter = adapter.clone();
-                let api: Arc<dyn daemon_api::NodeApi> = self.clone();
-                let feed = self.node_events.clone();
-                tokio::spawn(async move {
-                    // Baseline push at serve start: each configured instance's reported state
-                    // (a credentialed account reports Connected — the "serve start" transition).
-                    if let Some(feed) = &feed {
-                        for i in adapter.clone().instances().await {
-                            feed.emit(daemon_api::NodeEvent::TransportChanged {
-                                transport: i.transport,
-                                connection: i.connection,
-                                presence: i.presence,
-                            });
-                        }
-                    }
-                    let crashed = std::panic::AssertUnwindSafe(adapter.clone().serve(api))
-                        .catch_unwind()
-                        .await
-                        .is_err();
-                    // Teardown push: a clean serve exit is Offline; a crashed loop is Error.
-                    if let Some(feed) = &feed {
-                        let connection = if crashed {
-                            daemon_api::ConnectionState::Error
-                        } else {
-                            daemon_api::ConnectionState::Offline
-                        };
-                        for i in adapter.clone().instances().await {
-                            feed.emit(daemon_api::NodeEvent::TransportChanged {
-                                transport: i.transport,
-                                connection,
-                                presence: daemon_api::PresenceState::Offline,
-                            });
-                        }
-                    }
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        for adapter in registry.adapters() {
+            let adapter = adapter.clone();
+            let node = self.clone();
+            let family = adapter.family().to_string();
+            let handle = tokio::spawn(node.clone().supervise_adapter(adapter));
+            // Record the supervised serve task so `transport_disconnect`/`transport_remove` can
+            // abort a single adapter's serve loop (wire v30, item 1). Replaces any prior handle.
+            self.adapter_handles
+                .lock()
+                .unwrap()
+                .insert(family, handle.abort_handle());
+            out.push(handle);
+        }
+        out
+    }
+
+    /// The per-adapter reconnect supervisor (wire v30, item 2): run the adapter's serve loop,
+    /// emitting a `TransportChanged` at the serve-start and teardown transitions, and — on a
+    /// TRANSIENT (`fatal:false`) exit — retry with bounded exponential backoff, emitting a
+    /// per-attempt `Disconnecting`/reconnect. A clean shutdown, a fatal disconnect (auth/settings/
+    /// cert, reported by the adapter through [`daemon_api::LifecycleSink`]), or exhausting the
+    /// attempt budget stops the loop. Aborting the task (item 1 disconnect) cancels it entirely.
+    async fn supervise_adapter(self: Arc<Self>, adapter: Arc<dyn daemon_api::TransportAdapter>) {
+        use futures::FutureExt as _;
+        // Bounded backoff: 1s, 2s, 4s, … capped at 30s, at most 6 transient retries per drop.
+        const MAX_RETRIES: u32 = 6;
+        const BACKOFF_CAP_MS: u64 = 30_000;
+        let feed = self.node_events.clone();
+        let mut attempt: u32 = 0;
+        loop {
+            let instances = adapter.clone().instances().await;
+            // Clear any stale disconnect markers for this adapter's instances before the run so the
+            // post-run fatal check reflects only this incarnation.
+            for i in &instances {
+                self.disconnect_fatal.remove(&i.transport);
+            }
+            // Serve-start push: each instance's reported state (a credentialed account => Connected).
+            if let Some(feed) = &feed {
+                for i in &instances {
+                    feed.emit(daemon_api::NodeEvent::TransportChanged {
+                        transport: i.transport.clone(),
+                        connection: i.connection,
+                        presence: i.presence,
+                        reason: None,
+                        message: None,
+                        fatal: false,
+                    });
+                }
+            }
+            let api: Arc<dyn daemon_api::NodeApi> = self.clone();
+            let crashed = std::panic::AssertUnwindSafe(adapter.clone().serve(api))
+                .catch_unwind()
+                .await
+                .is_err();
+            // A fatal disconnect reported via the LifecycleSink short-circuits the retry loop.
+            let fatal = instances.iter().any(|i| {
+                self.disconnect_fatal
+                    .get(&i.transport)
+                    .map(|v| *v)
+                    .unwrap_or(false)
+            });
+            let reported = instances
+                .iter()
+                .any(|i| self.disconnect_fatal.contains_key(&i.transport));
+            // Teardown push: fatal => Error (+fatal); crash/reported transient => Error; else Offline.
+            if let Some(feed) = &feed {
+                let (connection, reason) = if fatal {
+                    (
+                        daemon_api::ConnectionState::Error,
+                        Some(daemon_api::DisconnectReason::AuthenticationFailed),
+                    )
+                } else if crashed {
+                    (
+                        daemon_api::ConnectionState::Error,
+                        Some(daemon_api::DisconnectReason::NetworkError),
+                    )
+                } else {
+                    (daemon_api::ConnectionState::Offline, None)
+                };
+                for i in &instances {
+                    feed.emit(daemon_api::NodeEvent::TransportChanged {
+                        transport: i.transport.clone(),
+                        connection,
+                        presence: daemon_api::PresenceState::Offline,
+                        reason,
+                        message: None,
+                        fatal,
+                    });
+                }
+            }
+            // Stop on a fatal disconnect, a clean shutdown with no reported drop, or budget exhaustion.
+            let transient = crashed || reported;
+            if fatal || !transient {
+                break;
+            }
+            attempt += 1;
+            if attempt > MAX_RETRIES {
+                break;
+            }
+            let backoff_ms = (1_000u64 << (attempt - 1).min(20)).min(BACKOFF_CAP_MS);
+            if let Some(feed) = &feed {
+                for i in &instances {
+                    feed.emit(daemon_api::NodeEvent::TransportChanged {
+                        transport: i.transport.clone(),
+                        connection: daemon_api::ConnectionState::Disconnecting,
+                        presence: daemon_api::PresenceState::Offline,
+                        reason: Some(daemon_api::DisconnectReason::NetworkError),
+                        message: None,
+                        fatal: false,
+                    });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
     }
 
     /// Install the routing *rebuild hook* (the §5.9 hot-reload seam): a closure that rebuilds the

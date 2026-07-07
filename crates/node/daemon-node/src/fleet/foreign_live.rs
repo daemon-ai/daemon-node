@@ -88,6 +88,7 @@ pub(crate) fn foreign_session_factory(
                         Some(child),
                         host,
                         StreamJsonCodec::new(),
+                        Some(agent.clone()),
                     )) as Arc<dyn AgentSession>)
                 }
             }

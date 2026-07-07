@@ -49,16 +49,26 @@ pub struct MatrixAdapter {
     provisioning: Arc<dyn AccountProvisioning>,
     cfg: MatrixConfig,
     clients: LiveClients,
+    /// The node-owned lifecycle sink (wire v30): the adapter reports conversation/membership changes
+    /// and disconnect causes through it. `None` in unit tests that never wire the node.
+    sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
 }
 
 impl MatrixAdapter {
     /// Construct the adapter over the host `provisioning` seam and resolved Matrix `cfg`. The live
-    /// client registry starts empty and is filled by [`serve`](TransportAdapter::serve).
-    pub fn new(provisioning: Arc<dyn AccountProvisioning>, cfg: MatrixConfig) -> Arc<Self> {
+    /// client registry starts empty and is filled by [`serve`](TransportAdapter::serve). `sink` is
+    /// the node's [`LifecycleSink`](daemon_api::LifecycleSink) (wire v30) the membership/disconnect
+    /// handlers report through; pass `None` where the node is not wired (unit tests).
+    pub fn new(
+        provisioning: Arc<dyn AccountProvisioning>,
+        cfg: MatrixConfig,
+        sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             provisioning,
             cfg,
             clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            sink,
         })
     }
 
@@ -129,6 +139,13 @@ impl TransportAdapter for MatrixAdapter {
                 interactive_auth: true,
             },
             account_schema: AccountSettingsSchema::default(),
+            // Display-oriented adapter policies (wire v30, item 4): the node decides the label; the
+            // app renders it read-only. Matrix reports its invite-auto-accept policy.
+            policies: vec![daemon_api::PolicyEntry {
+                key: "auto_accept_invites".to_string(),
+                label: "Automatically accept room invites".to_string(),
+                value: self.cfg.auto_accept_invites.to_string(),
+            }],
         }
     }
 
@@ -153,6 +170,11 @@ impl TransportAdapter for MatrixAdapter {
                     connection,
                     presence: PresenceState::default(),
                     bound_profile: None,
+                    // Disconnect provenance is pushed live via the LifecycleSink (wire v30); the
+                    // point-in-time instance snapshot carries none.
+                    reason: None,
+                    message: None,
+                    fatal: false,
                 }
             })
             .collect()
@@ -164,6 +186,7 @@ impl TransportAdapter for MatrixAdapter {
             self.provisioning.clone(),
             self.cfg.clone(),
             self.clients.clone(),
+            self.sink.clone(),
         )
         .await
     }
@@ -516,7 +539,7 @@ mod tests {
     /// Build an adapter and seed its live-client registry with `client` under `transport` (the seam
     /// `serve` performs at bring-up), so the `&self` verb bodies can resolve it.
     async fn adapter_with(transport: &TransportId, client: Client) -> Arc<MatrixAdapter> {
-        let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), MatrixConfig::default());
+        let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), MatrixConfig::default(), None);
         adapter
             .clients
             .write()
@@ -527,7 +550,7 @@ mod tests {
 
     #[test]
     fn supported_reports_the_matrix_subset_plus_extras() {
-        let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), MatrixConfig::default());
+        let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), MatrixConfig::default(), None);
         let conv = SupportsConversations::supported(&*adapter);
         assert!(conv.create && conv.join_channel && conv.leave && conv.send);
         assert!(conv.set_topic && conv.set_title);

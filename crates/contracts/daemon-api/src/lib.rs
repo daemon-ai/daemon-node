@@ -2918,6 +2918,44 @@ pub struct TransportInstanceInfo {
     pub fatal: bool,
 }
 
+/// The node-owned lifecycle sink an events-IO adapter reports coarse lifecycle signals through
+/// (wire v30). The single seam that keeps `NodeApi` clean: the assembling binary hands the adapter
+/// an `Arc<dyn LifecycleSink>` (the node itself), and the adapter calls it when it observes a
+/// disconnect cause or a conversation/membership change. The node owns the consequences: it maps a
+/// reported `reason` onto `fatal` and pushes `TransportChanged` (item 2), and on an `is_self`
+/// removal it reconciles its own routing (drops the dangling `ChatRoute` pin) before pushing the
+/// membership event (item 3). Adapters that never observe these simply never call it.
+#[async_trait]
+pub trait LifecycleSink: Send + Sync {
+    /// Report that `transport` disconnected with a coarse `reason` (+ optional detail `message`).
+    /// The NODE decides `fatal` from the reason and pushes the resulting `TransportChanged`; the
+    /// adapter never re-derives whether the disconnect is terminal.
+    async fn transport_disconnected(
+        &self,
+        transport: TransportId,
+        reason: DisconnectReason,
+        message: Option<String>,
+    );
+
+    /// Report that a conversation was added/removed on `transport` (coarse tier; retires client
+    /// `ConvList` re-polling).
+    async fn conversations_changed(&self, transport: TransportId, conv: String, change: ConvChange);
+
+    /// Report a membership transition (granular tier). On a self `Left`/`Kicked`/`Banned` the node
+    /// reconciles its routing (drops the now-dangling pin) before emitting.
+    #[allow(clippy::too_many_arguments)]
+    async fn membership_changed(
+        &self,
+        transport: TransportId,
+        conv: String,
+        member: String,
+        change: MembershipChange,
+        actor: Option<String>,
+        reason: Option<String>,
+        is_self: bool,
+    );
+}
+
 /// A self-describing events-IO transport adapter — the declarative analogue of libpurple's
 /// `PurpleProtocol`, Kopete's `Kopete::Protocol`, and Adium's `AIService`
 /// (daemon-transport-adapter-spec.md §3.1). It adds *identity + capabilities + a lifecycle entry
@@ -3963,12 +4001,16 @@ mod tests {
                 connection: ConnectionState::Connected,
                 presence: PresenceState::Unknown,
                 bound_profile: None,
+                reason: None,
+                message: None,
+                fatal: false,
             }]),
             ApiResponse::Adapters(vec![AdapterInfo {
                 family: "room".into(),
                 display_name: "Rooms".into(),
                 capabilities: AdapterCapabilities::default(),
                 account_schema: AccountSettingsSchema::default(),
+                policies: Vec::new(),
             }]),
             ApiResponse::ContactProfile("display_name: Alice".into()),
             ApiResponse::Contacts(vec![info.members[0].contact.clone()]),

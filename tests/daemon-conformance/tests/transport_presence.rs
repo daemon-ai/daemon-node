@@ -39,6 +39,7 @@ impl TransportAdapter for MockTransport {
             display_name: "Mock transport".to_string(),
             capabilities: AdapterCapabilities::default(),
             account_schema: AccountSettingsSchema::default(),
+            policies: Vec::new(),
         }
     }
 
@@ -54,6 +55,9 @@ impl TransportAdapter for MockTransport {
             connection: ConnectionState::Connected,
             presence: PresenceState::Unknown,
             bound_profile: None,
+            reason: None,
+            message: None,
+            fatal: false,
         }]
     }
 }
@@ -107,6 +111,9 @@ fn transport_changed_round_trips() {
         transport: TransportId::new("mock/acct"),
         connection: ConnectionState::Connected,
         presence: PresenceState::Unknown,
+        reason: None,
+        message: None,
+        fatal: false,
     };
     assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
 }

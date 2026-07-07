@@ -60,7 +60,7 @@ impl daemon_host::AccountProvisioning for NoProvisioning {
 /// An adapter whose live-clients registry maps `transport` to `client` (the shape `serve`
 /// publishes at bring-up), so `SupportsConversations::list` resolves the mock client.
 async fn adapter_over(transport: &TransportId, client: Client) -> Arc<MatrixAdapter> {
-    let adapter = MatrixAdapter::new(Arc::new(NoProvisioning), MatrixConfig::default());
+    let adapter = MatrixAdapter::new(Arc::new(NoProvisioning), MatrixConfig::default(), None);
     adapter
         .register_live_client(transport.clone(), client)
         .await;

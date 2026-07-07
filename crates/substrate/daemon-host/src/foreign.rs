@@ -19,7 +19,10 @@
 
 use crate::agent_session::AgentSession;
 use async_trait::async_trait;
-use daemon_protocol::{AgentCommand, AgentEvent, HostRequestHandler, Inbound, Outbound};
+use daemon_protocol::{
+    AgentCommand, AgentEvent, ForeignFailure, ForeignStage, HostRequestHandler, Inbound, Outbound,
+    TurnSummary,
+};
 use daemon_provision::{ChildGuard, CutChannel, CutWriter};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -59,11 +62,22 @@ pub struct CodecSession<C: Codec> {
 impl<C: Codec> CodecSession<C> {
     /// Start pumping a foreign agent over `channel` with `codec`: spawn the reader task and retain
     /// the writer for `submit`. `child`, when present, is the owned OS process (killed on drop).
+    /// `agent` is the foreign agent's catalog name (for failure attribution; `None` in tests).
+    ///
+    /// Mid-turn death (wire v30, C6): the reader loop translates framed messages into §17 frames;
+    /// when the agent's stdout closes (`recv` returns `None`) WITHOUT a clean `TurnFinished` having
+    /// been seen, the child died mid-turn. Previously the loop just ended silently and a `poll` /
+    /// `subscribe` consumer hung forever. Now it synthesizes a terminal `TurnFinished{Failed}`
+    /// carrying a [`ForeignFailure`] so the consumer unblocks and can render the crash. The
+    /// synthetic event's `seq` is `last_observed_seq + 1` — monotonic without threading the codec's
+    /// internal counter (equivalent to the shared-counter approach, sourced from the events the
+    /// codec already emitted).
     pub fn from_channel(
         channel: CutChannel,
         child: Option<ChildGuard>,
         host: Arc<dyn HostRequestHandler>,
         codec: C,
+        agent: Option<String>,
     ) -> Self {
         let (writer, mut reader) = channel.split();
         let (events, _) = broadcast::channel::<AgentEvent>(256);
@@ -73,12 +87,20 @@ impl<C: Codec> CodecSession<C> {
         let reply_writer = writer.clone();
         let codec_task = codec.clone();
         tokio::spawn(async move {
+            // Track the highest event seq seen + whether a clean turn boundary closed, so an EOF
+            // mid-turn can synthesize a monotonic, non-duplicate terminal failure.
+            let mut last_seq: u64 = 0;
+            let mut saw_turn_finished = false;
             while let Some(bytes) = reader.recv().await {
                 // Decode under the lock (pure CPU), release before awaiting the host / the writer.
                 let frames = codec_task.lock().unwrap().decode(&bytes);
                 for frame in frames {
                     match frame {
                         Outbound::Event(ev) => {
+                            last_seq = last_seq.max(ev.seq());
+                            if matches!(ev, AgentEvent::TurnFinished { .. }) {
+                                saw_turn_finished = true;
+                            }
                             let _ = events_relay.send(ev);
                         }
                         Outbound::Request(req) => {
@@ -93,6 +115,17 @@ impl<C: Codec> CodecSession<C> {
                         _ => {}
                     }
                 }
+            }
+            // stdout closed. If no clean TurnFinished was seen, the child died mid-turn: synthesize a
+            // terminal TurnFinished{Failed} so a poll/subscribe consumer unblocks (wire v30, C6).
+            if !saw_turn_finished {
+                let _ = events_relay.send(AgentEvent::TurnFinished {
+                    seq: last_seq.saturating_add(1),
+                    summary: TurnSummary::foreign_failed(ForeignFailure {
+                        stage: ForeignStage::Turn,
+                        agent,
+                    }),
+                });
             }
         });
 
