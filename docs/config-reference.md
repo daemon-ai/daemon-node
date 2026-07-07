@@ -81,6 +81,11 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `fs.max_read_chars` | `DAEMON_FS__MAX_READ_CHARS` | number | `100000` |
 | `fs.max_read_lines` | `DAEMON_FS__MAX_READ_LINES` | number | `2000` |
 | `fs.search_result_cap` | `DAEMON_FS__SEARCH_RESULT_CAP` | number | `200` |
+| `gateway.addr` | `DAEMON_GATEWAY__ADDR` | optional | _(unset)_ |
+| `gateway.credentials` | `DAEMON_GATEWAY__CREDENTIALS` | array | `[]` |
+| `gateway.inject_foreign` | `DAEMON_GATEWAY__INJECT_FOREIGN` | bool | `false` |
+| `gateway.models_allowlist` | `DAEMON_GATEWAY__MODELS_ALLOWLIST` | optional | _(unset)_ |
+| `gateway.token` | `DAEMON_GATEWAY__TOKEN` | optional | _(unset)_ |
 | `http_addr` | `DAEMON_HTTP_ADDR` | optional | _(unset)_ |
 | `infer.flash_attn` | `DAEMON_INFER__FLASH_ATTN` | bool | `false` |
 | `infer.inter_token_timeout_ms` | `DAEMON_INFER__INTER_TOKEN_TIMEOUT_MS` | number | `30000` |
