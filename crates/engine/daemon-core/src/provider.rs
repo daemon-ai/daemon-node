@@ -504,6 +504,10 @@ pub struct MockProvider {
     behaviour: Behaviour,
     final_text: String,
     delegate_tool: String,
+    /// The JSON args emitted with the delegate tool call (default `{}`). Callers driving the real
+    /// `orchestrate` tool set this to a valid `spawn` object (its serde args reject `{}`); tools
+    /// that ignore their args (e.g. the `OrchestrateShim`, the `gate`/`wait` test tools) leave it.
+    delegate_args: String,
     calls: AtomicU64,
 }
 
@@ -514,6 +518,7 @@ impl MockProvider {
             behaviour: Behaviour::Completing,
             final_text: final_text.into(),
             delegate_tool: "delegate".into(),
+            delegate_args: "{}".into(),
             calls: AtomicU64::new(0),
         }
     }
@@ -524,8 +529,16 @@ impl MockProvider {
             behaviour: Behaviour::Delegating,
             final_text: final_text.into(),
             delegate_tool: delegate_tool.into(),
+            delegate_args: "{}".into(),
             calls: AtomicU64::new(0),
         }
+    }
+
+    /// Override the JSON args the delegate tool call carries (default `{}`). Use this when the
+    /// delegate tool validates its args — e.g. the real `orchestrate` tool needs a `spawn` object.
+    pub fn with_delegate_args(mut self, args: impl Into<String>) -> Self {
+        self.delegate_args = args.into();
+        self
     }
 
     /// How many model calls this provider has served (test observability).
@@ -561,7 +574,7 @@ impl Provider for MockProvider {
                 tool_calls: vec![ToolCall {
                     call_id: format!("call-{n}"),
                     name: self.delegate_tool.clone(),
-                    args: "{}".into(),
+                    args: self.delegate_args.clone(),
                 }],
                 usage,
                 ..Default::default()

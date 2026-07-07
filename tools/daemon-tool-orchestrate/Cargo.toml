@@ -13,7 +13,8 @@ daemon-protocol = { workspace = true }
 # The durable session graph backing the `send` (pending-input + wake) and per-child `status` verbs.
 daemon-store = { workspace = true }
 async-trait = { workspace = true }
-# Parse the optional `attachments` arg (paths to hand down) from a JSON tool call.
+# The serde-derived args (verb-tagged enum + deny_unknown_fields) validated from the tool-call JSON.
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

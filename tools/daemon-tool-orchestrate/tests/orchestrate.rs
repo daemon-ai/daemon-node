@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Orchestrate-tool v2 coverage: the `spawn` verb plumbs the agent's task/lifetime/profile into the
-//! delegation payload (fixing the static-label-only behavior), `send` queues input into an owned
-//! child (and only an owned child), `status` reports per-child durable state, validation errors
-//! surface as failed results, and the per-verb concurrency/mutation classes hold.
+//! Orchestrate-tool coverage: the `spawn` verb plumbs the agent's task/lifetime/profile into the
+//! delegation payload, `send` queues its `message` into an owned child (and only an owned child),
+//! `status` reports per-child durable state, the serde-derived args reject unknown verbs/fields and
+//! missing required fields as failed results, and the per-verb concurrency/mutation classes hold.
+//! The args are strict JSON now (no `delegate` alias, no bare-`{}` label fallback, no word forms,
+//! no stringly-typed `wait`).
 
 use std::sync::Arc;
 
@@ -133,19 +135,23 @@ async fn spawn_plumbs_task_lifetime_and_profile_into_the_payload() {
 }
 
 #[tokio::test]
-async fn bare_args_spawn_with_label_fallback_and_defaults() {
-    // The mock provider emits `{}`; the legacy `delegate` alias and bare words behave the same:
-    // a spawn seeded from the tool's static label with default lifetime/profile.
+async fn spawn_defaults_lifetime_profile_and_joining_wait() {
+    // A spawn with only the required `task` defaults to persistent lifetime, no profile, and a
+    // joining (wait:true) delegation.
     let store = Arc::new(InMemoryStore::new());
-    let tool = OrchestrateTool::with_label(fleet(store), "background-work");
-    for args in ["{}", r#"{"verb":"delegate"}"#, "go"] {
-        let out = run_as(&tool, "parent", args).await;
-        assert!(out.result.ok, "args {args:?} should spawn");
-        let input = delegation_payload(&out);
-        assert_eq!(input.task, "background-work");
-        assert_eq!(input.lifetime, DelegationLifetime::Persistent);
-        assert!(input.profile.is_none());
-    }
+    let tool = OrchestrateTool::new(fleet(store));
+    let out = run_as(&tool, "parent", r#"{"verb":"spawn","task":"do the work"}"#).await;
+    assert!(out.result.ok, "{}", out.result.content);
+    assert!(out.result.content.starts_with("spawned:"));
+    assert!(
+        matches!(out.effects.first(), Some(Effect::Delegate { .. })),
+        "the default (wait omitted) is a joining delegation"
+    );
+    let input = delegation_payload(&out);
+    assert_eq!(input.task, "do the work");
+    assert_eq!(input.lifetime, DelegationLifetime::Persistent);
+    assert!(input.profile.is_none());
+    assert!(!input.detached, "the default payload is joining");
 }
 
 #[tokio::test]
@@ -169,15 +175,44 @@ async fn depth_guard_still_caps_nested_spawns() {
 async fn invalid_calls_fail_with_reasons() {
     let store = Arc::new(InMemoryStore::new());
     let tool = OrchestrateTool::new(fleet(store));
+    // The serde-derived args surface unknown verbs (`unknown variant`), typo'd/unknown keys
+    // (`unknown field`, from `deny_unknown_fields`), missing required fields (`missing field`), and
+    // wrong value types (`invalid type`) — all as failed results.
     for (args, needle) in [
-        (r#"{"verb":"bogus"}"#, "unknown verb"),
+        // Unknown verb tag.
+        (r#"{"verb":"bogus"}"#, "unknown variant"),
+        // Retired back-compat forms are now just unknown verbs.
+        (r#"{"verb":"delegate","task":"t"}"#, "unknown variant"),
+        // spawn requires `task`.
+        (r#"{"verb":"spawn"}"#, "missing field `task`"),
+        // An unknown lifetime value.
         (
-            r#"{"verb":"spawn","lifetime":"forever"}"#,
-            "unknown lifetime",
+            r#"{"verb":"spawn","task":"t","lifetime":"forever"}"#,
+            "unknown variant",
         ),
-        (r#"{"verb":"send","task":"hi"}"#, "requires a `target`"),
-        (r#"{"verb":"send","target":"parent/c1"}"#, "message text"),
-        (r#"{"verb":"cancel"}"#, "requires a `target`"),
+        // deny_unknown_fields rejects a stray/typo'd key.
+        (r#"{"verb":"spawn","task":"t","bogus":1}"#, "unknown field"),
+        // `wait` must be a JSON bool (no stringly-typed coercion).
+        (
+            r#"{"verb":"spawn","task":"t","wait":"true"}"#,
+            "invalid type",
+        ),
+        // send requires both `target` and `message`.
+        (
+            r#"{"verb":"send","message":"hi"}"#,
+            "missing field `target`",
+        ),
+        (
+            r#"{"verb":"send","target":"parent/c1"}"#,
+            "missing field `message`",
+        ),
+        // send's message field is `message`, not the spawn `task`.
+        (
+            r#"{"verb":"send","target":"parent/c1","task":"hi"}"#,
+            "unknown field",
+        ),
+        // cancel requires `target`.
+        (r#"{"verb":"cancel"}"#, "missing field `target`"),
     ] {
         let out = run_as(&tool, "parent", args).await;
         assert!(!out.result.ok, "args {args:?} must fail");
@@ -228,7 +263,7 @@ async fn send_queues_input_and_wakes_an_owned_child() {
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"send","target":"parent/c1","task":"also check the docs"}"#,
+        r#"{"verb":"send","target":"parent/c1","message":"also check the docs"}"#,
     )
     .await;
     assert!(out.result.ok, "{}", out.result.content);
@@ -253,7 +288,7 @@ async fn send_rejects_targets_outside_the_callers_subtree() {
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"send","target":"other/c1","task":"pssst"}"#,
+        r#"{"verb":"send","target":"other/c1","message":"pssst"}"#,
     )
     .await;
     assert!(!out.result.ok);
@@ -284,7 +319,7 @@ async fn send_authorizes_via_the_durable_parent_link_when_ids_do_not_nest() {
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"send","target":"detached-child","task":"hello"}"#,
+        r#"{"verb":"send","target":"detached-child","message":"hello"}"#,
     )
     .await;
     assert!(out.result.ok, "{}", out.result.content);
@@ -298,7 +333,7 @@ async fn send_to_an_unknown_child_fails() {
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"send","target":"parent/c9","task":"hi"}"#,
+        r#"{"verb":"send","target":"parent/c9","message":"hi"}"#,
     )
     .await;
     assert!(!out.result.ok);
@@ -358,13 +393,13 @@ async fn status_reports_per_child_state_from_the_durable_graph() {
 async fn status_without_children_or_store_still_answers() {
     let store = Arc::new(InMemoryStore::new());
     let with_store = OrchestrateTool::new(fleet(store.clone())).with_store(store.clone());
-    let out = run_as(&with_store, "parent", "status").await;
+    let out = run_as(&with_store, "parent", r#"{"verb":"status"}"#).await;
     assert!(out.result.ok);
     assert_eq!(out.result.content, "no children");
 
     // No store wired: the legacy fleet-wide counts.
     let legacy = OrchestrateTool::new(fleet(store));
-    let out = run_as(&legacy, "parent", "status").await;
+    let out = run_as(&legacy, "parent", r#"{"verb":"status"}"#).await;
     assert!(out.result.ok);
     assert!(out.result.content.starts_with("fleet: 0 children"));
 }
@@ -373,7 +408,7 @@ async fn status_without_children_or_store_still_answers() {
 async fn cancel_reports_unknown_children_as_false() {
     let store = Arc::new(InMemoryStore::new());
     let tool = OrchestrateTool::new(fleet(store));
-    let out = run_as(&tool, "parent", "cancel:ghost").await;
+    let out = run_as(&tool, "parent", r#"{"verb":"cancel","target":"ghost"}"#).await;
     assert!(out.result.ok);
     assert_eq!(out.result.content, "cancel:ghost:false");
 }
@@ -429,16 +464,14 @@ async fn detached_spawn_enqueues_a_bare_job_and_notice_edge_without_an_effect() 
 }
 
 #[tokio::test]
-async fn wait_true_and_bare_and_alias_stay_joining_delegations() {
+async fn wait_true_and_default_stay_joining_delegations() {
     let store = Arc::new(InMemoryStore::new());
-    let tool = OrchestrateTool::with_label(fleet(store), "bg");
-    // Explicit wait:true, the bare `{}`, the string "true", and the `delegate` alias all emit a
-    // joining Effect::Delegate with a non-detached payload.
+    let tool = OrchestrateTool::new(fleet(store));
+    // Explicit wait:true and the default (wait omitted) both emit a joining Effect::Delegate with a
+    // non-detached payload; only a JSON `wait:false` bool detaches.
     for args in [
         r#"{"verb":"spawn","wait":true,"task":"t"}"#,
-        r#"{"verb":"spawn","wait":"true","task":"t"}"#,
-        "{}",
-        r#"{"verb":"delegate"}"#,
+        r#"{"verb":"spawn","task":"t"}"#,
     ] {
         let out = run_as(&tool, "parent", args).await;
         assert!(out.result.ok, "args {args:?}: {}", out.result.content);
@@ -456,20 +489,6 @@ async fn wait_true_and_bare_and_alias_stay_joining_delegations() {
             "args {args:?} payload must be joining"
         );
     }
-}
-
-#[tokio::test]
-async fn detached_spawn_accepts_the_string_false_form() {
-    let store = Arc::new(InMemoryStore::new());
-    let tool = OrchestrateTool::new(fleet(store.clone())).with_store(store);
-    let out = run_as(
-        &tool,
-        "parent",
-        r#"{"verb":"spawn","wait":"false","task":"t"}"#,
-    )
-    .await;
-    assert!(out.result.ok, "{}", out.result.content);
-    assert_eq!(out.result.content, "spawned-detached:parent/d1");
 }
 
 #[tokio::test]
@@ -552,12 +571,11 @@ fn per_verb_concurrency_and_mutation_classes() {
         ToolConcurrency::Parallel
     );
     assert!(!tool.mutates_for(&call(r#"{"verb":"status"}"#)));
-    // spawn/send/cancel (and the bare legacy forms): exclusive + mutating.
+    // spawn/send/cancel: exclusive + mutating.
     for args in [
-        "{}",
         r#"{"verb":"spawn","task":"t"}"#,
-        r#"{"verb":"send","target":"parent/c1","task":"t"}"#,
-        "cancel:parent/c1",
+        r#"{"verb":"send","target":"parent/c1","message":"t"}"#,
+        r#"{"verb":"cancel","target":"parent/c1"}"#,
     ] {
         assert_eq!(
             tool.concurrency_for(&call(args)),

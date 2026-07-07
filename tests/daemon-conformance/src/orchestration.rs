@@ -66,7 +66,10 @@ fn orchestrating_manager(store: Arc<InMemoryStore>, fleet: FleetRuntime) -> Acti
     registry.register(Arc::new(OrchestrateTool::new(fleet)));
     let factory = CoreEngineFactory::with_provider(
         Arc::new(|| {
-            Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
+            Arc::new(
+                MockProvider::delegating("orchestrate", "fleet done")
+                    .with_delegate_args(r#"{"verb":"spawn","task":"background work"}"#),
+            ) as Arc<dyn Provider>
         }),
         Arc::new(registry),
         SystemPrompt::new("parent orchestrator"),

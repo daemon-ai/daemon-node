@@ -31,7 +31,10 @@ pub fn gate_providers() -> ProviderRegistry {
     providers.register(
         "orchestrator",
         Arc::new(|| {
-            Arc::new(MockProvider::delegating("orchestrate", "fleet done")) as Arc<dyn Provider>
+            Arc::new(
+                MockProvider::delegating("orchestrate", "fleet done")
+                    .with_delegate_args(r#"{"verb":"spawn","task":"background work"}"#),
+            ) as Arc<dyn Provider>
         }),
     );
     providers.register(

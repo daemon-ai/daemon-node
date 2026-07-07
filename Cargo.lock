@@ -3221,6 +3221,7 @@ dependencies = [
  "daemon-protocol",
  "daemon-store",
  "daemon-supervision",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
