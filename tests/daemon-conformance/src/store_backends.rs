@@ -370,6 +370,12 @@ async fn feedback_suite<S: SessionStore>(store: Arc<S>) {
             os: Some("linux".into()),
             consent: "explicit-one-shot".into(),
             node_version: "test".into(),
+            model: None,
+            provider: None,
+            end_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            response_content: None,
             delivered: false,
         }
     }
