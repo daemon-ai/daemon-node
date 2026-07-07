@@ -2594,6 +2594,40 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             cfg.matrix.store_root.clone(),
         )));
     }
+    // [waveB:msg-adapters] Each chat transport's interactive-auth factory rides only when its
+    // transport is enabled, mirroring the Matrix gate. Telegram's factory is keyed by the same
+    // data_dir-resolved store root + node-wide app credentials `serve` uses; the token/QR/OAuth
+    // families take no config. Slack registers its bot (Socket Mode / app-token) factory; the
+    // user "stealth" (xoxc/xoxd) factory rides only under the off-by-default `stealth` feature
+    // (its live conn can't be built otherwise) and is left as a Phase-2 follow-up.
+    if cfg.telegram.enabled {
+        auth_factories.push(Arc::new(daemon_telegram::TelegramAuthFlowFactory::new(
+            cfg.telegram.store_root.clone(),
+            cfg.telegram.api_id,
+            cfg.telegram.api_hash.clone(),
+        )));
+    }
+    if cfg.whatsapp.enabled {
+        auth_factories.push(Arc::new(daemon_whatsapp::WhatsappAuthFlowFactory::new()));
+    }
+    #[cfg(feature = "discord")]
+    if cfg.discord.enabled {
+        auth_factories.push(Arc::new(daemon_discord::DiscordAuthFlowFactory::new(
+            cfg.discord.mode,
+        )));
+    }
+    if cfg.wechat.enabled {
+        auth_factories.push(Arc::new(daemon_wechat::WeChatAuthFlowFactory::new()));
+    }
+    if cfg.line.enabled {
+        auth_factories.push(Arc::new(daemon_line::LineAuthFlowFactory::new()));
+    }
+    if cfg.slack.enabled {
+        auth_factories.push(Arc::new(
+            daemon_slack::SlackBotAuthFlowFactory::new()
+                .map_err(|e| anyhow::anyhow!("registering the slack bot auth factory: {e}"))?,
+        ));
+    }
 
     // Materialize the workspace root eagerly (the way FileBlobStore::open creates its own dir):
     // nothing else creates it, so after a state wipe every `fs_list` on the advertised `workspace`
@@ -2983,6 +3017,58 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             provisioning,
             cfg.matrix.clone(),
             Some(node.lifecycle_sink()),
+        ));
+    }
+    // [waveB:msg-adapters] The six additional chat transports register the same way as Matrix: each
+    // consumes the host's in-process `AccountProvisioning` seam (the node itself) plus its resolved
+    // `[<p>]` config, and rides only when its `enabled` flag is set.
+    if cfg.telegram.enabled {
+        tracing::info!("registering telegram transport (daemon-telegram)");
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        adapter_registry = adapter_registry.with_adapter(daemon_telegram::TelegramAdapter::new(
+            provisioning,
+            cfg.telegram.clone(),
+        ));
+    }
+    if cfg.whatsapp.enabled {
+        tracing::info!("registering whatsapp transport (daemon-whatsapp)");
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        adapter_registry = adapter_registry.with_adapter(daemon_whatsapp::WhatsappAdapter::new(
+            provisioning,
+            cfg.whatsapp.clone(),
+        ));
+    }
+    #[cfg(feature = "discord")]
+    if cfg.discord.enabled {
+        tracing::info!("registering discord transport (daemon-discord)");
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        adapter_registry = adapter_registry.with_adapter(daemon_discord::DiscordAdapter::new(
+            provisioning,
+            cfg.discord.clone(),
+        ));
+    }
+    if cfg.wechat.enabled {
+        tracing::info!("registering wechat transport (daemon-wechat)");
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        adapter_registry = adapter_registry.with_adapter(daemon_wechat::WeChatAdapter::new(
+            provisioning,
+            cfg.wechat.clone(),
+        ));
+    }
+    if cfg.line.enabled {
+        tracing::info!("registering line transport (daemon-line)");
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        adapter_registry = adapter_registry.with_adapter(daemon_line::LineAdapter::new(
+            provisioning,
+            cfg.line.clone(),
+        ));
+    }
+    if cfg.slack.enabled {
+        tracing::info!("registering slack transport (daemon-slack)");
+        let provisioning: Arc<dyn daemon_host::AccountProvisioning> = node.clone();
+        adapter_registry = adapter_registry.with_adapter(daemon_slack::SlackAdapter::new(
+            provisioning,
+            cfg.slack.clone(),
         ));
     }
     node.set_adapters(adapter_registry);

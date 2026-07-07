@@ -20,12 +20,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApiError, AuthBeginRequest, AuthBeginResponse, AuthBindRequest, AuthFlowKind, AuthProviderInfo,
+    ApiError, AuthBeginRequest, AuthBeginResponse, AuthBindRequest, AuthChallenge,
+    AuthProviderInfo, AuthStepInput,
 };
 use daemon_protocol::TransportId;
 
@@ -104,19 +105,32 @@ pub struct AuthOutcome {
     pub slot: CredentialSlotKind,
 }
 
-/// One in-flight interactive-auth flow: a family-specific object holding the secret continuation state
-/// between `begin` and `complete`. Parked in the [`PendingAuthFlows`] registry under a `flow_id`.
+/// The host-side result of advancing a [`PendingAuthFlow`] one step: either the next challenge to
+/// relay to the client, or the completed [`AuthOutcome`] the node persists. The flow-facing sibling
+/// of the wire [`daemon_api::AuthStepResult`] — it carries the raw [`AuthOutcome`] (credential blob +
+/// [`CredentialSlotKind`]) rather than the post-store [`daemon_api::AuthCompleteResponse`], because
+/// the credential-store write + profile bind are the node's job, not the flow's.
+pub enum AuthStepOutcome {
+    /// The flow needs more input: relay this challenge and step again. The flow stays parked.
+    Challenge(AuthChallenge),
+    /// The flow finished: the node persists the blob + optional bind and evicts the flow.
+    Completed(AuthOutcome),
+}
+
+/// One in-flight interactive-auth flow: a family-specific object holding the secret continuation
+/// state across the challenge/response steps. Parked in the [`PendingAuthFlows`] registry under a
+/// single-use `flow_id`. A flow is a small state machine: [`initial_challenge`](Self::initial_challenge)
+/// is what `auth_begin` presents; each [`step`](Self::step) advances it (a single-redirect flow maps
+/// `step(Callback(cb))` -> `Completed` in one hop). `step` takes `&self` (flows advance in place via
+/// interior mutability where they carry state) so the registry can keep a flow parked across steps.
 #[async_trait]
 pub trait PendingAuthFlow: Send + Sync {
-    /// The authorization URL the client opens in a browser.
-    fn authorization_url(&self) -> &str;
+    /// The first challenge to present when the flow is begun (redirect URL, form, QR, message).
+    fn initial_challenge(&self) -> AuthChallenge;
 
-    /// The flow kind (informs the client how to capture the redirect).
-    fn flow_kind(&self) -> AuthFlowKind;
-
-    /// Finish from the captured `callback` (the full redirect URL or just its query string), producing
-    /// the credential blob + account identity. Consumes the flow (single-use).
-    async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError>;
+    /// Advance the flow with the client's `input`, returning the next challenge or the completed
+    /// outcome. Called once per `auth_step`; a completing step produces the credential blob + identity.
+    async fn step(&self, input: AuthStepInput) -> Result<AuthStepOutcome, ApiError>;
 }
 
 /// A factory minting flows for one transport/provider family (e.g. `"matrix"`). Stateless beyond the
@@ -137,11 +151,27 @@ pub trait AuthFlowFactory: Send + Sync {
     ) -> Result<Box<dyn PendingAuthFlow>, ApiError>;
 }
 
-/// A parked flow plus the bind request to honor (if any) and its expiry.
+/// A parked flow plus the bind request to honor (if any) and its expiry. The flow is held behind an
+/// `Arc` so a `step` can borrow it across the family's `await` without holding the registry lock, and
+/// a non-completing (challenge) step can leave it parked for the next step.
 struct ParkedFlow {
-    flow: Box<dyn PendingAuthFlow>,
+    flow: Arc<dyn PendingAuthFlow>,
     bind: Option<AuthBindRequest>,
     expires_at: u64,
+}
+
+/// The registry-level result of stepping a parked flow: the next challenge (the flow stays parked),
+/// or the completed outcome + the parked bind request (the flow has been evicted).
+pub enum FlowStep {
+    /// The flow issued another challenge; it remains parked under the same `flow_id`.
+    Challenge(AuthChallenge),
+    /// The flow completed and has been removed. Carries the outcome to persist + the parked bind.
+    Completed {
+        /// The credential blob + account identity + slot the node persists.
+        outcome: AuthOutcome,
+        /// The bind request parked at `begin` (honored by the node on completion), if any.
+        bind: Option<AuthBindRequest>,
+    },
 }
 
 /// The registry of interactive-auth factories + parked flows. Family factories are fixed at assembly;
@@ -194,16 +224,17 @@ impl PendingAuthFlows {
             .get(&req.family)
             .ok_or_else(|| ApiError::Unsupported(format!("auth family: {}", req.family)))?
             .clone();
-        let flow = factory.begin(&req.params, &req.redirect_uri).await?;
+        // Box -> Arc so the flow can be parked and borrowed across `step`'s await (multi-step flows
+        // stay parked between challenges).
+        let flow: Arc<dyn PendingAuthFlow> =
+            Arc::from(factory.begin(&req.params, &req.redirect_uri).await?);
 
         let flow_id = fresh_flow_id();
         let expires_at = now_secs().saturating_add(self.ttl_secs);
         let response = AuthBeginResponse {
             flow_id: flow_id.clone(),
-            authorization_url: flow.authorization_url().to_string(),
-            redirect_uri: req.redirect_uri,
+            challenge: flow.initial_challenge(),
             expires_at,
-            flow_kind: flow.flow_kind(),
         };
 
         let mut parked = self.parked.lock().unwrap();
@@ -220,22 +251,33 @@ impl PendingAuthFlows {
         Ok(response)
     }
 
-    /// Remove and return a parked flow (with its bind request) by `flow_id`, erroring if it is unknown
-    /// or expired. The caller awaits [`PendingAuthFlow::complete`] outside the registry lock.
-    pub fn take(
-        &self,
-        flow_id: &str,
-    ) -> Result<(Box<dyn PendingAuthFlow>, Option<AuthBindRequest>), ApiError> {
-        let parked = {
+    /// Advance the parked flow `flow_id` one step with `input`. A challenge result leaves the flow
+    /// parked for the next step; a completion evicts it and returns the outcome + the parked bind.
+    /// Errors if the flow is unknown or expired. The family's `step` is awaited OUTSIDE the registry
+    /// lock (the flow is `Arc`-cloned out first), so a network round-trip never blocks the registry.
+    pub async fn step(&self, flow_id: &str, input: AuthStepInput) -> Result<FlowStep, ApiError> {
+        let flow = {
             let mut guard = self.parked.lock().unwrap();
-            guard.remove(flow_id)
+            let now = now_secs();
+            guard.retain(|_, p| p.expires_at > now);
+            let parked = guard
+                .get(flow_id)
+                .ok_or_else(|| ApiError::Other("unknown or expired auth flow".into()))?;
+            parked.flow.clone()
         };
-        let parked =
-            parked.ok_or_else(|| ApiError::Other("unknown or expired auth flow".into()))?;
-        if parked.expires_at <= now_secs() {
-            return Err(ApiError::Other("unknown or expired auth flow".into()));
+        match flow.step(input).await? {
+            AuthStepOutcome::Challenge(challenge) => Ok(FlowStep::Challenge(challenge)),
+            AuthStepOutcome::Completed(outcome) => {
+                // Single-use: evict the completed flow (and recover its parked bind) under the lock.
+                let bind = self
+                    .parked
+                    .lock()
+                    .unwrap()
+                    .remove(flow_id)
+                    .and_then(|p| p.bind);
+                Ok(FlowStep::Completed { outcome, bind })
+            }
         }
-        Ok((parked.flow, parked.bind))
     }
 
     /// Drop a parked flow (idempotent — unknown ids are a no-op).

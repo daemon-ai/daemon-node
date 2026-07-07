@@ -344,7 +344,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  enabled INTEGER NOT NULL\n\
              );",
         ),
-        // M9 (wire v31 — user feedback over OpenTelemetry, N1): the durable feedback outbox and the
+        // M9 (wire v32 — user feedback over OpenTelemetry, N1): the durable feedback outbox and the
         // node-owned global telemetry consent toggle. `feedback_outbox.payload` is the opaque CBOR
         // of the whole `FeedbackRecord` (protocol-free, mirroring `cron_jobs.spec`); `id`,
         // `created_at_ms`, and `delivered` are indexed so the exporter's pending-drain query is
@@ -2274,7 +2274,7 @@ mod tests {
     /// `user_version` (9: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
     /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, the
-    /// wire-v30 `tool_overrides` table, and the wire-v31 feedback outbox + telemetry-consent seam).
+    /// wire-v30 `tool_overrides` table, and the wire-v32 feedback outbox + telemetry-consent seam).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());

@@ -633,7 +633,20 @@ impl WireVersion {
     /// Additive (new ops/events/optional fields; `is_self` is required only inside the brand-new
     /// `MembershipChanged` variant; no renames).
     ///
-    /// v31 (user feedback over OpenTelemetry — N1 API contract half): adds the additive
+    /// v31 (multi-step interactive auth): lands alongside the v30 batch above and generalizes the
+    /// client-driven login seam from a single
+    /// begin/complete redirect into an n-step challenge/response state machine modeled on libpurple's
+    /// request-fields API (phone/OTP/token/QR prompts). Adds the `AuthStep { flow_id, input }` op ->
+    /// `AuthStepped(auth-step-result)` response, the `auth-challenge` (`Redirect`/`Form`/`Qr`/
+    /// `Message`), `auth-step-input` (`Fields`/`Callback`/`Poll`), `auth-step-result`
+    /// (`Challenge`/`Completed`) and `auth-step-request` DTOs, and extends `auth-flow-kind` with
+    /// `BotToken`/`UserToken`/`PhoneOtp`/`QrPairing`. `AuthBeginResponse` is reshaped to carry the
+    /// initial `challenge` (an `auth-challenge`) instead of the redirect-only `authorization_url`/
+    /// `redirect_uri`/`flow_kind` trio; `auth_complete` stays as a single-step compatibility wrapper
+    /// over `auth_step`. Breaking (`auth-begin-response` shape + new required op), bumped because
+    /// `is_compatible` is strict-equal.
+    ///
+    /// v32 (user feedback over OpenTelemetry — N1 API contract half): adds the additive
     /// `FeedbackSubmit { kind, target?, rating?, comment?, include_content, diagnostics?, surface }`
     /// op -> `FeedbackAck { accepted, queued }` (the ack means accepted+queued to the durable
     /// feedback outbox, never delivered — export is a separate best-effort drain), with the
@@ -645,7 +658,7 @@ impl WireVersion {
     /// when the global toggle is off; passive telemetry stays gated by the toggle. Additive (new
     /// request/response variants + DTOs), but bumped because `is_compatible` is strict-equal, so an
     /// older peer cannot decode the new ops (mirrors the additive v15–v30 bumps).
-    pub const CURRENT: Self = Self(31);
+    pub const CURRENT: Self = Self(32);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

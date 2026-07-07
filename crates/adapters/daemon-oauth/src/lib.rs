@@ -48,9 +48,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-use daemon_api::{ApiError, AuthFlowKind, AuthParamField, AuthProviderInfo};
+use daemon_api::{
+    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+};
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_host::{AuthFlowFactory, AuthOutcome, CredentialSlotKind, PendingAuthFlow};
+use daemon_host::{
+    AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
+};
 use daemon_protocol::TransportId;
 
 /// The generic operator-facing family (`auth_begin.family`).
@@ -530,15 +534,27 @@ impl DescriptorPendingFlow {
 
 #[async_trait]
 impl PendingAuthFlow for DescriptorPendingFlow {
-    fn authorization_url(&self) -> &str {
-        &self.authorization_url
+    fn initial_challenge(&self) -> AuthChallenge {
+        // An authorization-code + PKCE flow is a single browser-redirect hop: present the URL, then
+        // complete from the captured callback.
+        AuthChallenge::Redirect {
+            authorization_url: self.authorization_url.clone(),
+        }
     }
 
-    fn flow_kind(&self) -> AuthFlowKind {
-        AuthFlowKind::OAuth2Pkce
+    async fn step(&self, input: AuthStepInput) -> Result<AuthStepOutcome, ApiError> {
+        let AuthStepInput::Callback(callback) = input else {
+            return Err(ApiError::Other(
+                "oauth2 auth: this flow expects the captured redirect callback".into(),
+            ));
+        };
+        Ok(AuthStepOutcome::Completed(self.complete(&callback).await?))
     }
+}
 
-    async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError> {
+impl DescriptorPendingFlow {
+    /// Validate the callback, run the token exchange, and build the [`AuthOutcome`] the node persists.
+    async fn complete(&self, callback: &str) -> Result<AuthOutcome, ApiError> {
         let code = self.callback_code(callback)?;
         let (tokens, body) = self.exchange(&code).await?;
 
@@ -637,6 +653,14 @@ mod tests {
             .map(|(_, v)| v.into_owned())
     }
 
+    /// The authorization URL a redirect flow presents as its initial challenge.
+    fn redirect_url(flow: &dyn PendingAuthFlow) -> String {
+        match flow.initial_challenge() {
+            AuthChallenge::Redirect { authorization_url } => authorization_url,
+            other => panic!("expected a redirect challenge, got {other:?}"),
+        }
+    }
+
     #[test]
     fn verifier_and_state_have_pkce_shape() {
         let verifier = random_urlsafe(32).unwrap();
@@ -659,7 +683,8 @@ mod tests {
             .begin(&base_params(), "http://127.0.0.1:7777/cb")
             .await
             .unwrap();
-        let url = flow.authorization_url();
+        let url = redirect_url(flow.as_ref());
+        let url = url.as_str();
         assert!(url.starts_with("https://idp.example/authorize?"), "{url}");
         assert_eq!(query_param(url, "response_type").as_deref(), Some("code"));
         assert_eq!(query_param(url, "client_id").as_deref(), Some("my-client"));
@@ -678,7 +703,7 @@ mod tests {
             "S256 challenge is 43 base64url chars"
         );
         assert!(query_param(url, "state").is_some());
-        assert_eq!(flow.flow_kind(), AuthFlowKind::OAuth2Pkce);
+        assert_eq!(factory.provider_info().flow_kind, AuthFlowKind::OAuth2Pkce);
     }
 
     #[tokio::test]
@@ -704,7 +729,8 @@ mod tests {
             .begin(&BTreeMap::new(), "http://127.0.0.1:7777/cb")
             .await
             .unwrap();
-        let url = flow.authorization_url();
+        let url = redirect_url(flow.as_ref());
+        let url = url.as_str();
         assert!(url.starts_with("https://openrouter.ai/auth?"), "{url}");
         assert_eq!(
             query_param(url, "callback_url").as_deref(),
@@ -733,7 +759,8 @@ mod tests {
             .begin(&BTreeMap::new(), "http://127.0.0.1:7777/cb")
             .await
             .unwrap();
-        let url = flow.authorization_url();
+        let url = redirect_url(flow.as_ref());
+        let url = url.as_str();
         assert!(
             url.starts_with("https://huggingface.co/oauth/authorize?"),
             "{url}"

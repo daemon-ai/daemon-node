@@ -496,37 +496,41 @@ async fn bound_accounts_derive_instance_profile_binding_impl() {
 async fn interactive_auth_generic_begin_complete_binds_and_lists() {
     use async_trait::async_trait;
     use daemon_api::{
-        ApiError, AuthApi, AuthBeginRequest, AuthBindRequest, AuthCompleteRequest, AuthFlowKind,
-        AuthParamField, AuthProviderInfo, CredentialApi, ProfileSpec, ProviderSelector,
+        ApiError, AuthApi, AuthBeginRequest, AuthBindRequest, AuthChallenge, AuthCompleteRequest,
+        AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput, CredentialApi, ProfileSpec,
+        ProviderSelector,
     };
     use daemon_host::{
-        AuthFlowFactory, AuthOutcome, MemCredentialStore, MemProfileStore, PendingAuthFlow,
-        ProfileStore,
+        AuthFlowFactory, AuthOutcome, AuthStepOutcome, MemCredentialStore, MemProfileStore,
+        PendingAuthFlow, ProfileStore,
     };
     use daemon_protocol::TransportId;
     use std::collections::BTreeMap;
 
-    // A parked flow: echoes the captured callback into the blob so the test can prove it flowed
-    // through, and reports a fixed identity (a real family derives these from the IdP response).
+    // A parked flow: a single-redirect flow that echoes the captured callback into the blob so the
+    // test can prove it flowed through, and reports a fixed identity (a real family derives these
+    // from the IdP response).
     struct StubFlow {
         url: String,
     }
     #[async_trait]
     impl PendingAuthFlow for StubFlow {
-        fn authorization_url(&self) -> &str {
-            &self.url
+        fn initial_challenge(&self) -> AuthChallenge {
+            AuthChallenge::Redirect {
+                authorization_url: self.url.clone(),
+            }
         }
-        fn flow_kind(&self) -> AuthFlowKind {
-            AuthFlowKind::OAuth2Pkce
-        }
-        async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError> {
-            Ok(AuthOutcome {
+        async fn step(&self, input: AuthStepInput) -> Result<AuthStepOutcome, ApiError> {
+            let AuthStepInput::Callback(callback) = input else {
+                return Err(ApiError::Other("stub flow expects a callback".into()));
+            };
+            Ok(AuthStepOutcome::Completed(AuthOutcome {
                 credential_blob: format!("blob:{callback}"),
                 credential_ref: "stub/acct".to_string(),
                 account_label: "stub-user".to_string(),
                 transport_instance: TransportId::new("stub/stub-user"),
                 slot: daemon_host::CredentialSlotKind::Derived,
-            })
+            }))
         }
     }
 
@@ -628,19 +632,17 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
         })
         .await
         .expect("auth_begin");
+    let auth_url = match &begun.challenge {
+        AuthChallenge::Redirect { authorization_url } => authorization_url.clone(),
+        other => panic!("expected a redirect challenge, got {other:?}"),
+    };
     assert!(
-        begun
-            .authorization_url
-            .contains("https://idp.example/authorize"),
-        "authorization url from the family: {}",
-        begun.authorization_url
+        auth_url.contains("https://idp.example/authorize"),
+        "authorization url from the family: {auth_url}"
     );
     assert!(
-        begun
-            .authorization_url
-            .contains("redirect_uri=http://127.0.0.1:7777/cb"),
-        "authorization url carries our redirect: {}",
-        begun.authorization_url
+        auth_url.contains("redirect_uri=http://127.0.0.1:7777/cb"),
+        "authorization url carries our redirect: {auth_url}"
     );
 
     // (3) complete: stores the blob, binds the account, returns the identity.

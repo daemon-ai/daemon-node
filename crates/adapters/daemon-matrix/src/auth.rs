@@ -19,14 +19,17 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::utils::UrlOrQuery;
 use matrix_sdk::Client;
 
 use async_trait::async_trait;
-use daemon_api::{ApiError, AuthFlowKind, AuthParamField, AuthProviderInfo};
-use daemon_host::{AuthFlowFactory, AuthOutcome, PendingAuthFlow};
+use daemon_api::{
+    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+};
+use daemon_host::{AuthFlowFactory, AuthOutcome, AuthStepOutcome, PendingAuthFlow};
 use daemon_protocol::TransportId;
 
 use crate::account::{account_store_dir, build_client, StoredSession};
@@ -217,35 +220,54 @@ impl AuthFlowFactory for MatrixAuthFlowFactory {
         .await
         .map_err(|e| ApiError::Other(format!("matrix SSO begin: {e}")))?;
 
-        Ok(Box::new(MatrixPendingFlow { session }))
+        Ok(Box::new(MatrixPendingFlow {
+            authorization_url: session.authorization_url.clone(),
+            session: Mutex::new(Some(session)),
+        }))
     }
 }
 
-/// A parked Matrix SSO flow: holds the [`SsoSession`] across the browser hop and finishes it.
+/// A parked Matrix SSO flow: holds the [`SsoSession`] across the browser hop and finishes it on the
+/// captured callback. The session is behind a `Mutex<Option<..>>` so the single-use completion can
+/// take it out under `&self` (the flow trait steps in place), leaving the flow spent afterward.
 struct MatrixPendingFlow {
-    session: SsoSession,
+    /// The authorization URL, cloned out so [`PendingAuthFlow::initial_challenge`] needs no lock.
+    authorization_url: String,
+    /// The continuation state; `take`n on the completing step.
+    session: Mutex<Option<SsoSession>>,
 }
 
 #[async_trait]
 impl PendingAuthFlow for MatrixPendingFlow {
-    fn authorization_url(&self) -> &str {
-        &self.session.authorization_url
+    fn initial_challenge(&self) -> AuthChallenge {
+        // Matrix SSO is a single browser-redirect hop.
+        AuthChallenge::Redirect {
+            authorization_url: self.authorization_url.clone(),
+        }
     }
 
-    fn flow_kind(&self) -> AuthFlowKind {
-        AuthFlowKind::MatrixSso
-    }
-
-    async fn complete(self: Box<Self>, callback: &str) -> Result<AuthOutcome, ApiError> {
-        let login = sso_complete(self.session, callback)
+    async fn step(&self, input: AuthStepInput) -> Result<AuthStepOutcome, ApiError> {
+        let AuthStepInput::Callback(callback) = input else {
+            return Err(ApiError::Other(
+                "matrix SSO expects the captured redirect callback".into(),
+            ));
+        };
+        // Take the session out (single-use); dropping the guard before the await keeps `&self`-safe.
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| ApiError::Other("matrix SSO flow already completed".into()))?;
+        let login = sso_complete(session, &callback)
             .await
             .map_err(|e| ApiError::Other(format!("matrix SSO complete: {e}")))?;
-        Ok(AuthOutcome {
+        Ok(AuthStepOutcome::Completed(AuthOutcome {
             credential_blob: login.credential_blob,
             credential_ref: login.credential_ref,
             account_label: login.user_id,
             transport_instance: login.transport_instance,
             slot: daemon_host::CredentialSlotKind::Derived,
-        })
+        }))
     }
 }

@@ -369,6 +369,7 @@ async fn serve_curator(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
 async fn serve_auth(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
         ApiRequest::AuthBegin(req) => ok_or_err(api.auth_begin(req).await, ApiResponse::AuthBegun),
+        ApiRequest::AuthStep(req) => ok_or_err(api.auth_step(req).await, ApiResponse::AuthStepped),
         ApiRequest::AuthComplete(req) => {
             ok_or_err(api.auth_complete(req).await, ApiResponse::AuthCompleted)
         }

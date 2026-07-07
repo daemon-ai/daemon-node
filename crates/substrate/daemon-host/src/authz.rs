@@ -156,6 +156,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // -- serve_auth: interactive (OAuth) flows + credential store ---------------------------
         AuthProviders | CredentialList => C::CredentialRead,
         AuthBegin(_)
+        | AuthStep(_)
         | AuthComplete(_)
         | AuthCancel { .. }
         | CredentialSet { .. }

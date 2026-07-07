@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 31)
+wire_version = uint                 ; daemon-common WireVersion (current = 32)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -967,13 +967,35 @@ command-invocation = {
 }
 command-output = { "text": tstr, "ephemeral": bool }
 
-; ----- interactive auth (SSO / OAuth2), wire v13 (daemon-interactive-auth-spec) -----
-; the client-driven, browser-redirect login seam. The client owns the browser + the redirect_uri; the
-; daemon parks a pending flow between begin and complete and writes the credential via CredentialStore.
+; ----- interactive auth (SSO / OAuth2 / token / OTP / QR), wire v13 + multi-step v31 -----
+; the client-driven login seam, generalized (v31) into an n-step challenge/response state machine
+; modeled on libpurple's request-fields API. The daemon parks a pending flow and drives it via
+; auth_step (auth_complete is the single-callback compatibility shape); on completion it writes the
+; credential via CredentialStore (and honors any bind).
 auth-flow-kind = "MatrixSso"
                / "OAuth2Pkce"
+               / "BotToken"
+               / "UserToken"
+               / "PhoneOtp"
+               / "QrPairing"
 auth-param-field = { "key": tstr, "label": tstr, "required": bool }
 auth-provider-info = { "family": tstr, "flow_kind": auth-flow-kind, "display_name": tstr, "params_schema": [* auth-param-field] }
+; one challenge a flow presents at a step — how the client collects the next auth-step-input.
+auth-challenge-redirect = { "Redirect": { "authorization_url": tstr } }
+auth-challenge-form = { "Form": { "title": tstr, "fields": [* auth-param-field] } }
+auth-challenge-qr = { "Qr": { "payload": tstr, "image": (byte-array / null), "poll_interval_ms": uint64 } }
+auth-challenge-message = { "Message": { "text": tstr } }
+auth-challenge = auth-challenge-redirect
+               / auth-challenge-form
+               / auth-challenge-qr
+               / auth-challenge-message
+; the client's response to a challenge (externally-tagged; Poll is the bare unit variant). Each map
+; arm is its own named rule (the zcbor idiom — distinct generated decode fns).
+auth-step-input-fields = { "Fields": { * tstr => tstr } }
+auth-step-input-callback = { "Callback": tstr }
+auth-step-input = auth-step-input-fields
+                / auth-step-input-callback
+                / "Poll"
 ; optionally bind the freshly-authenticated account to a profile on success.
 auth-bind-request = { "profile": tstr, "transport_instance": (transport-id / null), "credential_ref": (tstr / null) }
 auth-begin-request = {
@@ -984,11 +1006,10 @@ auth-begin-request = {
 }
 auth-begin-response = {
   "flow_id": tstr,
-  "authorization_url": tstr,
-  "redirect_uri": tstr,
+  "challenge": auth-challenge,            ; the initial challenge (redirect / form / qr / message)
   "expires_at": uint64,                  ; flow TTL (unix seconds)
-  "flow_kind": auth-flow-kind,
 }
+auth-step-request = { "flow_id": tstr, "input": auth-step-input }
 auth-complete-request = { "flow_id": tstr, "callback": tstr }   ; callback: full redirect URL or its query
 auth-complete-response = {
   "credential_ref": tstr,
@@ -996,6 +1017,12 @@ auth-complete-response = {
   "transport_instance": transport-id,
   "bound_profile": (tstr / null),
 }
+; the result of advancing a flow one step: the next challenge, or the completed outcome. Each arm is
+; its own named rule (the zcbor idiom — distinct generated decode fns).
+auth-step-result-challenge = { "Challenge": auth-challenge }
+auth-step-result-completed = { "Completed": auth-complete-response }
+auth-step-result = auth-step-result-challenge
+                 / auth-step-result-completed
 
 ; ----- transport-adapter framework + messaging data model (wire v18) -----
 account-settings-schema = { ? "fields": [* auth-param-field] }
@@ -1173,6 +1200,7 @@ request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-provider-catalog = "ProviderCatalog"
 request-provider-models = { "ProviderModels": { "provider": tstr, ? "credential_ref": (tstr / null), ? "transient_key": (tstr / null), ? "after": (tstr / null) } }
 request-auth-begin = { "AuthBegin": auth-begin-request }
+request-auth-step = { "AuthStep": auth-step-request }
 request-auth-complete = { "AuthComplete": auth-complete-request }
 request-auth-cancel = { "AuthCancel": { "flow_id": tstr } }
 request-auth-providers = "AuthProviders"
@@ -1276,7 +1304,7 @@ request-resource-grant-create = { "ResourceGrantCreate": { "user_id": tstr, "res
 request-resource-grant-list   = { "ResourceGrantList": { ? "user_id": (tstr / null) } }
 request-resource-grant-revoke = { "ResourceGrantRevoke": { "id": tstr } }
 
-; ----- user feedback over OpenTelemetry (N1; wire v31) -----
+; ----- user feedback over OpenTelemetry (N1; wire v32) -----
 ; Explicit feedback is per-event consent (queued even when the global telemetry toggle is off);
 ; the ack means accepted+queued to the durable outbox, never delivered. Optional fields mirror
 ; serde `#[serde(default)] Option<T>` as `? "k": (T / null)`.
@@ -1366,6 +1394,7 @@ api-request = request-submit
             / request-provider-catalog
             / request-provider-models
             / request-auth-begin
+            / request-auth-step
             / request-auth-complete
             / request-auth-cancel
             / request-auth-providers
@@ -1514,6 +1543,7 @@ response-skill-bundle = { "SkillBundle": skill-bundle }
 response-curator-skills = { "CuratorSkills": [* curator-entry] }
 response-curator-run = { "CuratorRun": [* curator-change] }
 response-auth-begun = { "AuthBegun": auth-begin-response }
+response-auth-stepped = { "AuthStepped": auth-step-result }
 response-auth-completed = { "AuthCompleted": auth-complete-response }
 response-auth-providers = { "AuthProviders": [* auth-provider-info] }
 response-checkpoints = { "Checkpoints": checkpoint-page }
@@ -1565,7 +1595,7 @@ response-access-users = { "AccessUsers": [* access-user] }
 response-access-roles = { "AccessRoles": [* role-info] }
 response-who-am-i     = { "WhoAmI": principal-view }
 
-; ----- user feedback over OpenTelemetry (N1; wire v31) -----
+; ----- user feedback over OpenTelemetry (N1; wire v32) -----
 feedback-ack = { "accepted": bool, "queued": bool }
 response-feedback-ack = { "FeedbackAck": feedback-ack }
 response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
@@ -1612,6 +1642,7 @@ api-response = response-ok
              / response-curator-skills
              / response-curator-run
              / response-auth-begun
+             / response-auth-stepped
              / response-auth-completed
              / response-auth-providers
              / response-checkpoints

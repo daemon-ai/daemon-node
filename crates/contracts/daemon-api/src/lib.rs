@@ -1593,14 +1593,94 @@ pub trait CredentialApi: Send + Sync {
 // `auth_complete`. The daemon never owns a browser or a loopback; it parks a pending flow between the
 // two calls and writes the resulting credential into the same `CredentialStore` as `CredentialApi`.
 
-/// The kind of interactive auth flow (informs the client how to capture the redirect).
+/// The kind of interactive auth flow (informs the client how to render + drive it). A flow is a
+/// challenge/response state machine (see [`AuthChallenge`] / [`AuthStepInput`]); the kind is a hint
+/// for capability discovery + the first challenge the client should expect.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthFlowKind {
-    /// Matrix SSO: the redirect carries a single-use `loginToken`.
+    /// Matrix SSO: a browser-redirect flow whose redirect carries a single-use `loginToken`.
     MatrixSso,
-    /// OAuth2 / OIDC authorization-code + PKCE: the redirect carries `code` + `state`.
+    /// OAuth2 / OIDC authorization-code + PKCE: a browser-redirect flow whose redirect carries
+    /// `code` + `state`.
     OAuth2Pkce,
+    /// A bot/service token pasted into a form (no browser hop) — e.g. a Discord/Telegram bot token.
+    BotToken,
+    /// A user access token pasted into a form (no browser hop) — e.g. a personal API token.
+    UserToken,
+    /// A phone-number + one-time-code exchange (a `Form` phone prompt, then a `Form` OTP prompt).
+    PhoneOtp,
+    /// A QR-code device-link/pairing flow: the client renders a `Qr` challenge and polls until the
+    /// other device approves (e.g. WhatsApp/Signal linked-device pairing).
+    QrPairing,
+}
+
+/// A single challenge a flow presents to the client at some step — how the client should collect the
+/// next [`AuthStepInput`]. Modeled on libpurple's `PurpleRequest` request-fields (redirect / form /
+/// QR / message prompts). Serialized externally-tagged (`{ "Redirect": { .. } }`, ...).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthChallenge {
+    /// Open `authorization_url` in a browser and capture the redirect; reply with
+    /// [`AuthStepInput::Callback`] carrying the captured URL/query (the SSO / OAuth2 hop).
+    Redirect {
+        /// The URL the client opens in a browser.
+        authorization_url: String,
+    },
+    /// Collect the named fields from the user (phone number, OTP, bot/user token, homeserver, …) and
+    /// reply with [`AuthStepInput::Fields`]. `fields` reuses the discovery [`AuthParamField`] shape.
+    Form {
+        /// A human title for the form (e.g. "Enter the code we texted you").
+        title: String,
+        /// The fields to collect (keyed by [`AuthParamField::key`]).
+        fields: Vec<AuthParamField>,
+    },
+    /// Render `payload` as a QR code (and/or display the pre-rendered `image` bytes) and poll with
+    /// [`AuthStepInput::Poll`] every `poll_interval_ms` until the flow completes (device pairing).
+    Qr {
+        /// The QR payload the peer device scans (e.g. a device-link URI).
+        payload: String,
+        /// An optional pre-rendered QR image (raw bytes, e.g. PNG); `None` = the client renders
+        /// `payload` itself. Inline bytes rather than a content-addressed [`Image`] because the QR is
+        /// ephemeral per-flow and the client renders it immediately (no blob store round-trip).
+        #[serde(with = "serde_bytes")]
+        image: Option<Vec<u8>>,
+        /// How often the client should re-poll with [`AuthStepInput::Poll`] (milliseconds).
+        poll_interval_ms: u64,
+    },
+    /// A purely informational message to display (e.g. "Approve the login on your other device");
+    /// the client typically follows it with a [`AuthStepInput::Poll`] or a terminal state.
+    Message {
+        /// The message text to show the user.
+        text: String,
+    },
+}
+
+/// The client's response to an [`AuthChallenge`] — the input driving one step of the flow.
+/// Serialized externally-tagged (`{ "Fields": { .. } }`, `{ "Callback": ".." }`, `"Poll"`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthStepInput {
+    /// The filled `key -> value` pairs answering a [`AuthChallenge::Form`] (keyed by
+    /// [`AuthParamField::key`]).
+    Fields(BTreeMap<String, String>),
+    /// The captured redirect (full URL or its query string) answering a [`AuthChallenge::Redirect`].
+    Callback(String),
+    /// A no-payload poll answering a [`AuthChallenge::Qr`] / [`AuthChallenge::Message`] — "has the
+    /// pairing/approval landed yet?".
+    Poll,
+}
+
+/// The result of advancing a flow one step: either the next challenge to present, or the completed
+/// outcome. Serialized externally-tagged (`{ "Challenge": .. }` / `{ "Completed": .. }`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthStepResult {
+    /// The flow needs more input: present this challenge and call `auth_step` again.
+    Challenge(AuthChallenge),
+    /// The flow finished: the credential was persisted (and any bind honored), described by the
+    /// same [`AuthCompleteResponse`] the single-step `auth_complete` returns.
+    Completed(AuthCompleteResponse),
 }
 
 /// Optionally bind the freshly-authenticated account to a profile on success.
@@ -1630,23 +1710,30 @@ pub struct AuthBeginRequest {
     pub bind: Option<AuthBindRequest>,
 }
 
-/// The parked-flow handle returned by `auth_begin`.
+/// The parked-flow handle returned by `auth_begin`: the flow id + its initial [`AuthChallenge`].
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthBeginResponse {
-    /// The single-use flow id to pass to `auth_complete` / `auth_cancel`.
+    /// The single-use flow id to pass to `auth_step` / `auth_complete` / `auth_cancel`.
     pub flow_id: String,
-    /// The URL the client opens in a browser.
-    pub authorization_url: String,
-    /// The redirect URI the flow expects (echoed back).
-    pub redirect_uri: String,
+    /// The first challenge to present (a redirect URL to open, a form to fill, a QR to render, …).
+    pub challenge: AuthChallenge,
     /// Flow TTL (unix seconds); the flow is evicted after this.
     pub expires_at: u64,
-    /// Which flow kind this is (how to capture the redirect).
-    pub flow_kind: AuthFlowKind,
 }
 
-/// Finish a flow from the captured redirect.
+/// Advance a flow one step: feed the [`AuthStepInput`] the client collected for the current
+/// [`AuthChallenge`]. The reply is an [`AuthStepResult`] (the next challenge, or completion).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStepRequest {
+    /// The flow id from `auth_begin`.
+    pub flow_id: String,
+    /// The client's response to the current challenge.
+    pub input: AuthStepInput,
+}
+
+/// Finish a flow from the captured redirect (the single-step compatibility shape over `auth_step`).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCompleteRequest {
@@ -1701,17 +1788,39 @@ pub struct AuthProviderInfo {
 /// transport that registers no auth factory inherits the surface; the node binds the real impl.
 #[async_trait]
 pub trait AuthApi: Send + Sync {
-    /// Begin a flow: mint the authorization URL against the client-supplied `redirect_uri` and park it.
+    /// Begin a flow: park the continuation and return its id + initial [`AuthChallenge`].
     async fn auth_begin(&self, _req: AuthBeginRequest) -> Result<AuthBeginResponse, ApiError> {
         Err(ApiError::Unsupported("auth_begin".into()))
     }
 
-    /// Finish a flow from the captured redirect; persist the credential and optionally bind a profile.
+    /// Advance a parked flow one step with the client's [`AuthStepInput`]. On completion the node
+    /// persists the credential (and honors any bind) and returns the [`AuthCompleteResponse`] inside
+    /// [`AuthStepResult::Completed`]; otherwise it returns the next [`AuthChallenge`].
+    async fn auth_step(&self, _req: AuthStepRequest) -> Result<AuthStepResult, ApiError> {
+        Err(ApiError::Unsupported("auth_step".into()))
+    }
+
+    /// Finish a single-redirect flow from the captured callback — a thin compatibility wrapper that
+    /// drives [`auth_step`](AuthApi::auth_step) with an [`AuthStepInput::Callback`] and expects the
+    /// flow to complete in one step. A flow that needs further interactive steps errors here (use
+    /// `auth_step`). Kept so existing single-step callers keep working over one code path.
     async fn auth_complete(
         &self,
-        _req: AuthCompleteRequest,
+        req: AuthCompleteRequest,
     ) -> Result<AuthCompleteResponse, ApiError> {
-        Err(ApiError::Unsupported("auth_complete".into()))
+        match self
+            .auth_step(AuthStepRequest {
+                flow_id: req.flow_id,
+                input: AuthStepInput::Callback(req.callback),
+            })
+            .await?
+        {
+            AuthStepResult::Completed(resp) => Ok(resp),
+            AuthStepResult::Challenge(_) => Err(ApiError::Unsupported(
+                "auth_complete: flow needs interactive steps beyond a single callback; use auth_step"
+                    .into(),
+            )),
+        }
     }
 
     /// Drop a pending flow (user aborted / cleanup). Idempotent.

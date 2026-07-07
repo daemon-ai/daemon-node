@@ -16,6 +16,10 @@ browser = ["dep:daemon-tool-browser", "daemon-tool-browser/cdp"]
 # Compile the OpenTelemetry OTLP trace exporter + GenAI span enrichment. OFF by default; when on,
 # the daemon exports session traces to `OTEL_EXPORTER_OTLP_ENDPOINT` (see `daemon-telemetry`).
 otel = ["daemon-telemetry/otel", "daemon-core/otel", "daemon-host/otel"]
+# Compile + register the Discord chat transport (`daemon-discord`, self-bot capable). OFF by default:
+# its `serenity_self` SDK pins an old reqwest/rustls stack carrying live rustls-webpki advisories
+# (see `deny.toml`), so it is excluded from the default binary. Enable with `--features discord`.
+discord = ["dep:daemon-discord"]
 
 [dependencies]
 daemon-common = { workspace = true, features = ["governor"] }
@@ -87,6 +91,17 @@ daemon-oauth = { workspace = true }
 # The internal Rooms loopback transport, toggled on at launch by `[rooms].enabled`. The daemon binary
 # only references `serve` / `RoomsConfig`; it reuses the same `daemon-ingest`/`daemon-delivery` halves.
 daemon-rooms = { workspace = true }
+# [waveB:msg-adapters] Six additional chat transports, each toggled on at launch by its own
+# `[<p>].enabled` flag. Each crate confines its external SDK; the daemon binary only references the
+# adapter's `Adapter` / `AuthFlowFactory` / `Config` types.
+daemon-telegram = { workspace = true }
+daemon-whatsapp = { workspace = true }
+# Discord is gated behind the off-by-default `discord` feature (see `[features]`): serenity_self drags
+# in an old TLS stack with live advisories, so the default binary never compiles it.
+daemon-discord = { workspace = true, optional = true }
+daemon-wechat = { workspace = true }
+daemon-line = { workspace = true }
+daemon-slack = { workspace = true }
 daemon-credentials = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-store = { workspace = true, features = ["sqlite"] }

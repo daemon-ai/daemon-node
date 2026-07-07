@@ -1,0 +1,59 @@
+[package]
+name = "daemon-slack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Slack chat transport (Phase 1 of the multi-protocol messaging plan): an in-process
+# `NodeApi`-client adapter modelled on `daemon-matrix`. It isolates the Slack SDK deps
+# (`slack-morphism` for the app/bot Web API + Socket Mode, `slacko` for xoxc/xoxd user "stealth"
+# tokens) and drives *our* engine as a client — normalising Slack events into `Origin`s for the
+# reusable `daemon-ingest` gate (inbound, over Socket Mode), and projecting the session's outbound
+# merged log to `chat.postMessage`s via a `daemon-delivery` `Projector` (outbound). No slack-morphism
+# / slacko types leak into host/core (mirrors the matrix/genai/rmcp isolation).
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# the in-process bring-up seams (not wire): AccountProvisioning (enumerate bound slack accounts +
+# resolve/write-back credential blobs) and the interactive-auth factory surface.
+daemon-host = { workspace = true }
+# the two reusable transport-agnostic halves this adapter plugs into.
+daemon-delivery = { workspace = true }
+daemon-ingest = { workspace = true }
+# the ONE SSRF-safe outbound HTTP client — used for the bot/app OAuth `oauth.v2.access` code exchange
+# (the SDK's own OAuth surface is axum-coupled; the exchange is a plain form POST we own).
+daemon-egress = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# authorization-URL construction + callback query parsing for the bot/app OAuth flow.
+url = { workspace = true }
+# app/bot Web API + Events API + Socket Mode + Block Kit. `hyper` feature pulls the tokio/hyper
+# connector + Socket Mode WSS client (rustls native roots). All slack-morphism types stay in-crate.
+slack-morphism = { version = "2.22", features = ["hyper"] }
+# xoxc/xoxd user "stealth" token Web API client. Young crate (user-accepted risk, see lib.rs header)
+# AND it pulls `reqwest` with default features (native-tls -> openssl-sys), which the rustls-only Nix
+# devShell cannot build — so it is OPTIONAL, behind the off-by-default `stealth` feature. The bot/app
+# path (mature slack-morphism, rustls) is the default; the user-stealth conn is opt-in.
+slacko = { version = "0.2", optional = true }
+
+[features]
+# The xoxc/xoxd user "stealth" conn (pulls slacko -> openssl-sys). Off by default so the default gate
+# build stays rustls-only. The user-mode auth flow (packaging the tokens) works without this feature;
+# only the live conn used at `serve` time needs it.
+default = []
+stealth = ["dep:slacko"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+# in-process mock HTTP server for the bot OAuth code-exchange test (no live network, no real tokens).
+wiremock = "0.6"
+
+[lints]
+workspace = true
