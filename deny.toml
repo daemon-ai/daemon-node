@@ -24,6 +24,24 @@ ignore = [
   # `extract` cargo feature. Re-evaluate when pdf-extract/lopdf move off ttf-parser (upstream
   # suggests `skrifa`).
   "RUSTSEC-2026-0192",
+
+  # [waveB:msg-adapters] Discord (daemon-discord) — serenity_self 0.13.3 transitive advisories.
+  # serenity_self is the self-bot fork pinned to an OLD reqwest 0.11 / rustls 0.21+0.22 /
+  # tokio-tungstenite 0.21 TLS+HTTP stack; it is the sole path to every ID below (verified: each
+  # dep tree terminates at `serenity_self 0.13.3 -> daemon-discord -> daemon`). None can be bumped
+  # or feature-gated away without forking serenity_self, and no safe upgrade of the leaf crate is
+  # reachable while serenity_self pins these majors. The user has PRE-ACCEPTED this maturity / ToS /
+  # advisory risk in the approved plan (self-bot user-token mode carries Discord ToS/ban risk on top
+  # of these). Tracked for an upstream serenity_self TLS-stack bump; re-evaluate (or feature-gate /
+  # drop Discord) then. NOTE: the rustls-webpki name-constraint / CRL issues are reachable only
+  # after signature verification and require issuer misissuance, and Discord speaks only to Discord's
+  # own pinned endpoints — bounded exposure. See the prominent Discord flag in the integration report.
+  "RUSTSEC-2025-0057", # fxhash: unmaintained; direct dep of serenity_self 0.13.3
+  "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4: unmaintained; via reqwest 0.11 -> serenity_self
+  "RUSTSEC-2026-0049", # rustls-webpki 0.102.8: CRL distribution-point matching; via serenity_self
+  "RUSTSEC-2026-0098", # rustls-webpki 0.101.7/0.102.8: URI name constraints; via serenity_self
+  "RUSTSEC-2026-0099", # rustls-webpki 0.101.7/0.102.8: wildcard-name constraints; via serenity_self
+  "RUSTSEC-2026-0104", # rustls-webpki 0.101.7/0.102.8: reachable CRL-parse panic; via serenity_self
 ]
 
 [bans]
