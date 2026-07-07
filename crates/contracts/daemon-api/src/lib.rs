@@ -34,7 +34,7 @@ use daemon_common::{
 };
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
-    RewindAnchor, TranscriptBlock, TransportId, UserMsg,
+    RewindAnchor, ToolDetail, TranscriptBlock, TransportId, UserMsg,
 };
 pub use daemon_protocol::{Outbound, SessionLogEntry};
 use futures::stream::{self, BoxStream, StreamExt};
@@ -47,8 +47,8 @@ pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
     Distribution, EngineSelector, EngineTunables, MemoryProviderSel, ModelDescriptor, ProfileInfo,
-    ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector, SessionOverlay,
-    ToolsOverride,
+    ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn,
+    SessionOverlay, ToolsOverride,
 };
 
 /// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live
@@ -704,6 +704,21 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// Disconnect a transport instance (wire v30): stop its serve loop and mark it `Offline`,
+    /// KEEPING its credential/config/bound_profile so a later reconnect resumes it — the reversible
+    /// `purple_account_disconnect` analogue. Default: unsupported.
+    async fn transport_disconnect(&self, _transport: TransportId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("transport_disconnect".into()))
+    }
+
+    /// Remove a transport instance (wire v30): disconnect it, then perform the single node-owned
+    /// teardown — close its conversations, unbind its routing pins, and drop its credential +
+    /// config (the `purple_account_delete` analogue). The client issues one intent; the node
+    /// sequences the steps. Default: unsupported.
+    async fn transport_remove(&self, _transport: TransportId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("transport_remove".into()))
+    }
+
     // -- Rooms: the internal loopback transport CRUD (daemon-rooms-spec.md) ----------------------
     //
     // A Room is a first-class N-participant conversation backed by the internal loopback transport
@@ -929,6 +944,15 @@ pub trait ControlApi: Send + Sync {
     /// only `ProfileSpec.tool_allowlist` is dynamic).
     async fn tool_register(&self, _tool: ToolInfo) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("tool_register".into()))
+    }
+
+    /// Persist a node-wide tool enable/disable override (wire v30). The override overlays the bound
+    /// inventory served by [`Self::tool_list`] AND is consulted by per-session tool wiring, so a
+    /// disabled tool disappears from new turns. Force-disable is always honored; a force-enable can
+    /// never conjure a tool missing its build feature (it stays disabled with its `requires`
+    /// string). Default: unsupported.
+    async fn tool_set_enabled(&self, _tool: String, _enabled: bool) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("tool_set_enabled".into()))
     }
 
     /// The daemon-authoritative command catalog — every operator/user command the node exposes
@@ -1999,6 +2023,12 @@ pub struct ApprovalInfo {
     /// approve-then-swap enforcement stays snapshot-side in `daemon-core`.
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// A node-computed structured detail for the gated call (wire v30) — an fs/edit approval
+    /// attaches a unified diff as a [`ToolDetail`] with `kind == "fs.diff"` (JSON body
+    /// `{ "path", "diff" }`) a rich client renders. `None` for approvals with no computable detail
+    /// and pre-v30 rows.
+    #[serde(default)]
+    pub detail: Option<ToolDetail>,
 }
 
 /// One remembered exec-approval command fingerprint on a session's `allow_permanent` allow-list
@@ -2011,11 +2041,15 @@ pub struct RememberedFingerprint {
     /// The lowercase-hex sha256 of the resolved `(exec-surface, abs-binary, argv, env-delta, cwd)`
     /// tuple — the same value [`ApprovalInfo::fingerprint`] displays at park time.
     pub fingerprint: String,
-    /// An optional human-readable label for the remembered command. Always `None` today (the
-    /// engine stores only the hash); reserved so a future command-summary capture needs no wire
-    /// bump.
+    /// An optional human-readable label for the remembered command (wire v30; populated from the
+    /// engine's command summary at the `allow_permanent` decide path when known). `None` when only
+    /// the hash was captured.
     #[serde(default)]
     pub label: Option<String>,
+    /// Unix milliseconds when the operator remembered this command (wire v30; the `allow_permanent`
+    /// decide path stamps it). `0` for pre-v30 rows that predate provenance.
+    #[serde(default)]
+    pub remembered_at_ms: u64,
 }
 
 /// A recorded §12 tool checkpoint — the transport-stable mirror of a `daemon-core`
@@ -2730,8 +2764,34 @@ pub enum ConnectionState {
     Connecting,
     /// Connected and serving.
     Connected,
+    /// A disconnect/teardown is in flight (wire v30; transient — the account is on its way to
+    /// `Offline`). Emitted per reconnect attempt so a client can render a "reconnecting…" state.
+    Disconnecting,
     /// Failed (the adapter logs the specifics; this carries only the coarse state).
     Error,
+}
+
+/// Why a transport instance disconnected (wire v30) — a closed, Matrix-scoped set the node maps
+/// every adapter-specific failure onto (the GError-shaped analogue). **The node decides
+/// [`TransportInstanceInfo::fatal`]**; a thin client keys re-auth affordances off `fatal`/`reason`,
+/// never off adapter strings, and never re-derives whether a disconnect is terminal.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisconnectReason {
+    /// The operator/user asked to disconnect (`TransportDisconnect`, sign-out).
+    UserRequested,
+    /// A network/transport error (timeout, connection reset, homeserver unreachable).
+    NetworkError,
+    /// The stored credential was rejected (login/refresh failed).
+    AuthenticationFailed,
+    /// The server replaced this session with another client (soft-logout / device conflict).
+    ReplacedByOtherClient,
+    /// The instance config is invalid (bad homeserver URL, missing required field).
+    InvalidSettings,
+    /// A TLS/certificate validation failure.
+    CertificateError,
+    /// Any reason not captured above (the adapter's detail rides `message`).
+    Other,
 }
 
 /// A normalized presence primitive (libpurple `PurplePresencePrimitive` / Kopete `OnlineStatus`
@@ -2787,6 +2847,20 @@ pub struct AccountSettingsSchema {
     pub fields: Vec<AuthParamField>,
 }
 
+/// One display-oriented adapter policy row (wire v30; [`AdapterInfo::policies`]) — a node-labeled,
+/// node-valued setting a client renders read-only (the [`AuthParamField::label`] precedent: the
+/// node owns the label, the client never keys behavior off `key`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEntry {
+    /// The stable policy key (e.g. `"auto_accept_invites"`).
+    pub key: String,
+    /// The node-decided human label.
+    pub label: String,
+    /// The current value, rendered as text (e.g. `"true"`).
+    pub value: String,
+}
+
 /// A self-describing events-IO transport adapter (the declarative analogue of libpurple's
 /// `PurpleProtocol` / Kopete's `Kopete::Protocol` / Adium's `AIService`). Enumerated by
 /// [`ControlApi::transport_adapters`] so the GUI renders the "Add channel" picker and
@@ -2803,6 +2877,11 @@ pub struct AdapterInfo {
     /// The account-setup form for a new instance of this adapter.
     #[serde(default)]
     pub account_schema: AccountSettingsSchema,
+    /// Display-oriented adapter policies the client renders read-only (wire v30). Matrix reports
+    /// `auto_accept_invites`; the node decides the labels. Empty for adapters with no reportable
+    /// policy.
+    #[serde(default)]
+    pub policies: Vec<PolicyEntry>,
 }
 
 /// One configured transport instance (account) plus its live status — what the GUI status bar and
@@ -2826,6 +2905,17 @@ pub struct TransportInstanceInfo {
     /// The profile this instance is bound to, when one is.
     #[serde(default)]
     pub bound_profile: Option<ProfileRef>,
+    /// Why the instance is offline/disconnected, when known (wire v30). `None` while connected.
+    #[serde(default)]
+    pub reason: Option<DisconnectReason>,
+    /// A human-readable detail for the disconnect (the adapter's error text). `None` when none.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Node-decided: whether the disconnect is fatal (stop retrying; offer re-auth). Thin clients
+    /// MUST NOT re-derive this — the node owns the reconnect/backoff policy. `false` for transient
+    /// reasons the node will retry, and while connected.
+    #[serde(default)]
+    pub fatal: bool,
 }
 
 /// A self-describing events-IO transport adapter — the declarative analogue of libpurple's
@@ -3482,6 +3572,32 @@ pub struct LogPageView {
 // Node-wide event feed DTOs (L3; daemon-sync-protocol-spec.md §5)
 // ---------------------------------------------------------------------------
 
+/// A coarse conversation-set delta (wire v30; [`NodeEvent::ConversationsChanged`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConvChange {
+    /// A conversation appeared (joined / created).
+    Added,
+    /// A conversation disappeared (left / deleted).
+    Removed,
+}
+
+/// A membership transition (wire v30; [`NodeEvent::MembershipChanged`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MembershipChange {
+    /// The member joined.
+    Joined,
+    /// The member left of their own accord.
+    Left,
+    /// The member was invited.
+    Invited,
+    /// The member was kicked (removed by another).
+    Kicked,
+    /// The member was banned.
+    Banned,
+}
+
 /// One payload-free node-wide notification (L3 `EventsSince`). A pointer, not a payload: it tells a
 /// client that *something* changed out of focus so it can update a badge / mark a roster row stale /
 /// nudge a focused turn and then lazily fetch the detail; it never carries transcript/model bytes.
@@ -3553,6 +3669,49 @@ pub enum NodeEvent {
         /// The new presence (adapters without a presence source report `Unknown`).
         #[serde(default)]
         presence: PresenceState,
+        /// Why the instance disconnected, when known (wire v30). `None` on a connect transition.
+        #[serde(default)]
+        reason: Option<DisconnectReason>,
+        /// A human-readable disconnect detail (the adapter's error text), when any (wire v30).
+        #[serde(default)]
+        message: Option<String>,
+        /// Node-decided: whether the disconnect is fatal (stop retrying; offer re-auth). Thin
+        /// clients MUST NOT re-derive this (wire v30). `false` for transient reasons + connects.
+        #[serde(default)]
+        fatal: bool,
+    },
+    /// A transport's conversation set changed (wire v30): a conversation was added or removed.
+    /// Retires client `ConvList` re-polling — a pointer; the client refetches `ConvGet`/`ConvList`.
+    ConversationsChanged {
+        /// The owning transport instance.
+        transport: TransportId,
+        /// The affected conversation id.
+        conv: String,
+        /// Added or removed.
+        change: ConvChange,
+    },
+    /// A conversation's membership changed (wire v30). A granular invalidation pointer; on an
+    /// `is_self` removal (`Left`/`Kicked`/`Banned`) the node has ALREADY reconciled its own routing
+    /// registry (dropped the now-dangling `ChatRoute` pin for that origin) before emitting this.
+    MembershipChanged {
+        /// The owning transport instance.
+        transport: TransportId,
+        /// The affected conversation id.
+        conv: String,
+        /// The adapter-opaque member handle whose membership changed (e.g. a Matrix MXID). Clients
+        /// re-fetch richer detail via `ConvGet`.
+        member: String,
+        /// What happened to `member`.
+        change: MembershipChange,
+        /// Who performed the action (the inviter/kicker/banner), when known.
+        #[serde(default)]
+        actor: Option<String>,
+        /// A reason string (kick/ban reason), when the transport supplies one.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Whether `member` is THIS account. On a self `Left`/`Kicked`/`Banned` the node reconciled
+        /// its routing for the now-dangling origin before emitting.
+        is_self: bool,
     },
     /// The feed could not serve from the client's cursor (aged out / lagged); the client must
     /// re-baseline the named scope ("roster" / "all" / ...).

@@ -399,6 +399,12 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::TransportInstances => {
             ApiResponse::TransportInstances(api.transport_instances().await)
         }
+        ApiRequest::TransportDisconnect { transport } => {
+            unit_or_err(api.transport_disconnect(transport).await)
+        }
+        ApiRequest::TransportRemove { transport } => {
+            unit_or_err(api.transport_remove(transport).await)
+        }
         _ => return None,
     })
 }
@@ -488,6 +494,9 @@ async fn serve_registry(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespons
         }
         ApiRequest::ToolList => ApiResponse::Tools(api.tool_list().await),
         ApiRequest::ToolRegister { tool } => unit_or_err(api.tool_register(tool).await),
+        ApiRequest::ToolSetEnabled { tool, enabled } => {
+            unit_or_err(api.tool_set_enabled(tool, enabled).await)
+        }
         ApiRequest::CommandList => ApiResponse::Commands(api.command_list().await),
         ApiRequest::CommandInvoke { invocation } => ok_or_err(
             api.command_invoke(invocation).await,

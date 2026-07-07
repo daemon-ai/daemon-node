@@ -597,6 +597,13 @@ pub enum ApiRequest {
         /// The tool to register.
         tool: ToolInfo,
     },
+    /// [`ControlApi::tool_set_enabled`] — persist a node-wide enable/disable override (wire v30).
+    ToolSetEnabled {
+        /// The tool name (as in `tool-info.name` / `ProfileSpec.tool_allowlist`).
+        tool: String,
+        /// The override: `true` force-enable, `false` force-disable.
+        enabled: bool,
+    },
     /// [`ControlApi::command_list`] — the daemon-authoritative command catalog.
     CommandList,
     /// [`ControlApi::command_invoke`] — run a command by name.
@@ -704,6 +711,18 @@ pub enum ApiRequest {
     TransportAdapters,
     /// [`ControlApi::transport_instances`] — the configured instances + live connection/presence.
     TransportInstances,
+    /// [`ControlApi::transport_disconnect`] — stop an instance's serve loop, go
+    /// `ConnectionState::Offline`, KEEP credential/config/bound_profile (reversible; wire v30).
+    TransportDisconnect {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+    },
+    /// [`ControlApi::transport_remove`] — remove implies disconnect, then one node-side teardown:
+    /// close conversations, unbind routing, drop credential + config (wire v30).
+    TransportRemove {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+    },
     /// [`ControlApi::conv_list`] — a transport's conversations.
     ConvList {
         /// The owning transport.

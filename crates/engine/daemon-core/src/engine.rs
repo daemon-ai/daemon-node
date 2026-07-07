@@ -1232,6 +1232,7 @@ impl Engine {
             end_reason,
             final_text: Some(out.text),
             usage: turn_usage,
+            failure: None,
         };
         let emitted = summary.clone();
         events.emit(|seq| AgentEvent::TurnFinished {
@@ -1253,6 +1254,7 @@ impl Engine {
             end_reason: EndReason::Completed,
             final_text: Some(out.text),
             usage: turn_usage,
+            failure: None,
         };
         let emitted = summary.clone();
         events.emit(|seq| AgentEvent::TurnFinished {

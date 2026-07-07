@@ -390,6 +390,33 @@ pub enum EndReason {
     Failed,
 }
 
+/// Where a foreign agent failed (wire v30, C6) — the coarse stage the node attributes a foreign
+/// child's death to, so a client can render "the agent crashed mid-turn" instead of hanging on a
+/// turn that never finishes.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignStage {
+    /// Failed launching / connecting to the foreign agent process.
+    Spawn,
+    /// Failed during the initialize/handshake.
+    Handshake,
+    /// Died mid-turn (the agent's stdout closed while a turn was in flight).
+    Turn,
+    /// Stage not determinable.
+    Unknown,
+}
+
+/// A structured foreign-agent failure carried on a terminal [`TurnSummary`] (wire v30, C6).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignFailure {
+    /// The coarse failure stage.
+    pub stage: ForeignStage,
+    /// The foreign agent name (catalog id), when known.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
 /// Terminal turn outcome (§17).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +427,11 @@ pub struct TurnSummary {
     pub final_text: Option<String>,
     /// Usage accrued over the turn.
     pub usage: UsageDelta,
+    /// A structured foreign-agent failure (wire v30, C6). `Some` only on a foreign child's
+    /// synthesized `TurnFinished{Failed}` (its stdout closed mid-turn); `None` for native turns and
+    /// pre-v30 encodings.
+    #[serde(default)]
+    pub failure: Option<ForeignFailure>,
 }
 
 impl TurnSummary {
@@ -409,6 +441,17 @@ impl TurnSummary {
             end_reason,
             final_text: None,
             usage: UsageDelta::default(),
+            failure: None,
+        }
+    }
+
+    /// A terminal `Failed` summary carrying a structured foreign-agent failure (wire v30, C6).
+    pub fn foreign_failed(failure: ForeignFailure) -> Self {
+        Self {
+            end_reason: EndReason::Failed,
+            final_text: None,
+            usage: UsageDelta::default(),
+            failure: Some(failure),
         }
     }
 }

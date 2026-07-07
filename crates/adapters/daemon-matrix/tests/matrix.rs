@@ -271,6 +271,7 @@ async fn outbound_turn_finished_posts_reply() {
                 end_reason: EndReason::Completed,
                 final_text: Some("the reply".to_string()),
                 usage: UsageDelta::default(),
+                failure: None,
             },
         }),
     };
