@@ -228,6 +228,9 @@ pub struct TransportInstanceInfo {
     pub connection: ConnectionState,
     pub presence: PresenceState,
     pub bound_profile: Option<ProfileRef>,
+    // (+ v30 disconnect provenance: reason / message / fatal — omitted here for brevity)
+    pub enabled: bool,                 // v35: operator's desired state (node-overlaid from the store)
+    pub label: Option<String>,         // v35: operator rename (node-overlaid; falls back to display_name)
 }
 ```
 

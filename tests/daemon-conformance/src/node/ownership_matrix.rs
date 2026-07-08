@@ -349,7 +349,8 @@ fn classify(req: &ApiRequest) -> Coverage {
         | AuthCancel { .. }
         | CredentialSet { .. }
         | CredentialList
-        | CredentialRemove { .. } => NotSessionTouching,
+        | CredentialRemove { .. }
+        | CredentialSetLabel { .. } => NotSessionTouching,
         CronList
         | CronCreate { .. }
         | CronUpdate { .. }
@@ -371,7 +372,10 @@ fn classify(req: &ApiRequest) -> Coverage {
         | TransportAdapters
         | TransportInstances
         | TransportDisconnect { .. }
-        | TransportRemove { .. } => NotSessionTouching,
+        | TransportRemove { .. }
+        | TransportConnect { .. }
+        | TransportSetEnabled { .. }
+        | TransportSetLabel { .. } => NotSessionTouching,
         ConvList { .. }
         | ConvGet { .. }
         | ConvCreateDetails { .. }

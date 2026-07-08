@@ -686,7 +686,22 @@ impl WireVersion {
     /// `RosterList` without polling. Additive (new optional `list` field on `roster-ops` + new
     /// request/response/event variants), but bumped because `is_compatible` is strict-equal
     /// (mirrors the additive v15–v33 bumps).
-    pub const CURRENT: Self = Self(34);
+    ///
+    /// v35 (account management): makes `transport_disconnect` reversible and persists the
+    /// operator's DESIRED transport/credential state so an account survives a restart with its
+    /// enabled/disabled choice + rename intact. Adds four `ControlApi` ops (standard `Ok`/`Error`):
+    /// `transport_connect { transport }` (the reversible counterpart of `TransportDisconnect` —
+    /// re-spawns the owning adapter FAMILY's supervised serve loop, idempotent, honoring the
+    /// persisted enabled state), `transport_set_enabled { transport, enabled }` (`false`
+    /// disconnects now + skips at boot/spawn; `true` persists + reconnects), `transport_set_label
+    /// { transport, label? }`, and `credential_set_label { profile, label? }`. Because the serve
+    /// loop is per-adapter-FAMILY (the coarsest granularity), a family serves unless EVERY one of
+    /// its instances is disabled; the per-instance desire is surfaced regardless. Also adds the
+    /// additive optional fields `enabled: bool?` (default true) + `label: tstr?` on
+    /// `transport-instance-info`, and `label: tstr?` on `credential-info`, both overlaid by the
+    /// node from its durable store. Additive (new request variants + two optional info fields), but
+    /// bumped because `is_compatible` is strict-equal (mirrors the additive v15–v34 bumps).
+    pub const CURRENT: Self = Self(35);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

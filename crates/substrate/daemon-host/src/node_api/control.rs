@@ -1059,8 +1059,25 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn transport_instances(&self) -> Vec<TransportInstanceInfo> {
-        // Live per-account connection/presence, aggregated across every registered adapter.
-        self.adapters.load_full().instances().await
+        // Live per-account connection/presence, aggregated across every registered adapter, then
+        // overlaid with the node-owned desired state (wire v35): the persisted `enabled` flag and
+        // human `label`. The node is authoritative — adapters report the inert defaults
+        // (`enabled=true`, `label=None`), and the store's row (when present) wins.
+        let mut instances = self.adapters.load_full().instances().await;
+        let prefs: std::collections::HashMap<String, (bool, Option<String>)> = self
+            .store
+            .transport_prefs()
+            .await
+            .into_iter()
+            .map(|p| (p.transport, (p.enabled, p.label)))
+            .collect();
+        for info in &mut instances {
+            if let Some((enabled, label)) = prefs.get(info.transport.as_str()) {
+                info.enabled = *enabled;
+                info.label = label.clone();
+            }
+        }
+        instances
     }
 
     async fn transport_disconnect(&self, transport: TransportId) -> Result<(), ApiError> {
@@ -1090,6 +1107,99 @@ impl ControlApi for NodeApiImpl {
                 message: None,
                 fatal: false,
             });
+        }
+        Ok(())
+    }
+
+    async fn transport_connect(&self, transport: TransportId) -> Result<(), ApiError> {
+        // Reversible reconnect (wire v35, item 1): re-spawn the owning adapter FAMILY's supervised
+        // serve loop. The serve loop is per-family (the coarsest granularity), matching
+        // `transport_disconnect`'s abort granularity. Error if no adapter owns the transport.
+        let family = self
+            .adapters
+            .load_full()
+            .adapter_for_transport(&transport)
+            .map(|a| a.family().to_string())
+            .ok_or_else(|| {
+                ApiError::Other(format!("no adapter owns transport {}", transport.as_str()))
+            })?;
+        // Clear any fatal marker so the supervisor does not immediately short-circuit (defensive;
+        // `supervise_adapter` also clears it for each instance at serve start).
+        self.disconnect_fatal.remove(&transport);
+        // We need an owned `Arc<Self>` to spawn the serve loop; recover it from the weak handle
+        // captured by `spawn_adapters` at boot. Absent => adapters were never spawned on this node,
+        // so there is nothing to resume.
+        let node = self
+            .self_weak
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| ApiError::Unsupported("transport_connect".into()))?;
+        // Idempotent: `spawn_adapter_family` is a no-op when the family's serve loop is already
+        // running, or when every instance of the family is disabled in the store (honoring the
+        // persisted desired state). On a real (re)spawn the loop emits its own serve-start
+        // `TransportChanged`, so we do not emit here (avoid double-emitting).
+        node.spawn_adapter_family(&family).await;
+        Ok(())
+    }
+
+    async fn transport_set_enabled(
+        &self,
+        transport: TransportId,
+        enabled: bool,
+    ) -> Result<(), ApiError> {
+        // Persist the operator's desired state (wire v35, item 2), then reconcile the live serve
+        // loop. Family-vs-instance mismatch (documented): the serve loop is per-family, so
+        // `enabled=false` disconnects the WHOLE owning family; a sibling instance that remains
+        // enabled is restored on the next `transport_connect`/boot (the family re-serves because
+        // not all its instances are disabled). In the common one-instance-per-family case this is
+        // exactly "disconnect and stay disconnected". `enabled=true` persists then reconnects.
+        self.store
+            .set_transport_enabled(transport.as_str(), enabled)
+            .await
+            .map_err(|e| ApiError::Other(format!("set_transport_enabled: {e}")))?;
+        if enabled {
+            // Best-effort: attempt to (re)connect. A transport with no owning adapter simply has
+            // nothing to spawn — the persisted desire still stands for a future boot.
+            let _ = self.transport_connect(transport).await;
+        } else {
+            // Disconnect now (reuse the reversible v30 op; it emits the Offline `TransportChanged`).
+            self.transport_disconnect(transport).await?;
+        }
+        Ok(())
+    }
+
+    async fn transport_set_label(
+        &self,
+        transport: TransportId,
+        label: Option<String>,
+    ) -> Result<(), ApiError> {
+        // Persist the human label (wire v35, item 3); it is overlaid onto `TransportInstanceInfo`
+        // in `transport_instances()`.
+        self.store
+            .set_transport_label(transport.as_str(), label)
+            .await
+            .map_err(|e| ApiError::Other(format!("set_transport_label: {e}")))?;
+        // Nudge clients to refetch the instance list via the existing per-transport
+        // `TransportChanged` pointer, carrying the instance's CURRENT live connection/presence (so
+        // no spurious status flip — the label rides `TransportInstanceInfo`, refetched on the same
+        // event). Reuses the event the app already handles per transport instead of inventing a new
+        // one. Best-effort: skipped when the instance is not currently reported.
+        if let Some(feed) = self.node_feed() {
+            if let Some(cur) = self
+                .transport_instances()
+                .await
+                .into_iter()
+                .find(|i| i.transport == transport)
+            {
+                feed.emit(daemon_api::NodeEvent::TransportChanged {
+                    transport,
+                    connection: cur.connection,
+                    presence: cur.presence,
+                    reason: cur.reason,
+                    message: cur.message,
+                    fatal: cur.fatal,
+                });
+            }
         }
         Ok(())
     }

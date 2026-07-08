@@ -165,7 +165,8 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | AuthComplete(_)
         | AuthCancel { .. }
         | CredentialSet { .. }
-        | CredentialRemove { .. } => C::CredentialWrite,
+        | CredentialRemove { .. }
+        | CredentialSetLabel { .. } => C::CredentialWrite,
 
         // -- serve_cron: scheduled jobs ---------------------------------------------------------
         CronList | CronRuns { .. } | CronSuggestions => C::CronRead,
@@ -187,7 +188,10 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | RoutingBindChat { .. }
         | RoutingUnbindChat { .. }
         | TransportDisconnect { .. }
-        | TransportRemove { .. } => C::RoutingWrite,
+        | TransportRemove { .. }
+        | TransportConnect { .. }
+        | TransportSetEnabled { .. }
+        | TransportSetLabel { .. } => C::RoutingWrite,
 
         // -- serve_messaging: conversations, membership, contacts -------------------------------
         ConvList { .. }

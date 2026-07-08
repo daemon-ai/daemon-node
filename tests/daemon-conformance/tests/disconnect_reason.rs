@@ -51,6 +51,8 @@ fn transport_changed_and_instance_carry_reason_fatal() {
         reason: Some(DisconnectReason::NetworkError),
         message: None,
         fatal: false,
+        enabled: true,
+        label: None,
     };
     assert_eq!(
         info,

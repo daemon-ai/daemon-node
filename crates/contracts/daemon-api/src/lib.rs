@@ -803,6 +803,44 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("transport_disconnect".into()))
     }
 
+    /// Reconnect a transport instance (wire v35): the reversible counterpart of
+    /// [`transport_disconnect`](Self::transport_disconnect) — re-spawn the owning adapter family's
+    /// supervised serve loop and clear any fatal-disconnect marker, so a disconnected (or
+    /// fatally-dropped) account resumes without a node restart. Errors if no adapter owns the
+    /// transport. Idempotent: a no-op (returns `Ok`) when the family's serve loop is already
+    /// running, and — honoring the persisted desired state — when every instance of the family is
+    /// disabled. The serve loop emits its own serve-start `TransportChanged`, so this does not
+    /// double-emit. Default: unsupported.
+    async fn transport_connect(&self, _transport: TransportId) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("transport_connect".into()))
+    }
+
+    /// Persist a transport instance's desired enabled/disabled state (wire v35). `enabled = false`
+    /// disconnects it now (via [`transport_disconnect`](Self::transport_disconnect)) AND persists
+    /// the desire so it is skipped at boot/spawn; `enabled = true` persists the desire and attempts
+    /// to (re)connect (via [`transport_connect`](Self::transport_connect)). Because the serve loop
+    /// is per-adapter-FAMILY (the coarsest granularity), a family serves unless EVERY one of its
+    /// instances is disabled; the per-instance desire is always surfaced on
+    /// [`TransportInstanceInfo::enabled`] regardless. Default: unsupported.
+    async fn transport_set_enabled(
+        &self,
+        _transport: TransportId,
+        _enabled: bool,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("transport_set_enabled".into()))
+    }
+
+    /// Set (or clear, with `None`) a transport instance's human label/rename (wire v35). Persisted
+    /// by the node and overlaid onto [`TransportInstanceInfo::label`] in
+    /// [`transport_instances`](Self::transport_instances). Default: unsupported.
+    async fn transport_set_label(
+        &self,
+        _transport: TransportId,
+        _label: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("transport_set_label".into()))
+    }
+
     /// Remove a transport instance (wire v30): disconnect it, then perform the single node-owned
     /// teardown — close its conversations, unbind its routing pins, and drop its credential +
     /// config (the `purple_account_delete` analogue). The client issues one intent; the node
@@ -1641,6 +1679,18 @@ pub trait CredentialApi: Send + Sync {
     /// Remove the secret for `profile`.
     async fn credential_remove(&self, _profile: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("credential_remove".into()))
+    }
+
+    /// Set (or clear, with `None`) a credential/account's human label/rename (wire v35). Persisted
+    /// by the node and overlaid onto [`CredentialInfo::label`] in
+    /// [`credential_list`](Self::credential_list) — this backs the app's AccountsPage rename.
+    /// Default: unsupported.
+    async fn credential_set_label(
+        &self,
+        _profile: String,
+        _label: Option<String>,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("credential_set_label".into()))
     }
 }
 
@@ -3349,6 +3399,16 @@ pub struct TransportInstanceInfo {
     /// reasons the node will retry, and while connected.
     #[serde(default)]
     pub fatal: bool,
+    /// The operator's DESIRED enabled state (wire v35), overlaid by the node from its durable
+    /// store. `false` = disabled: disconnected now and skipped at boot/spawn. Surfaced per-instance
+    /// regardless of the family's live serve state (the serve loop is per-family, but the desire is
+    /// per-instance). Default `true` (an instance with no stored preference).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// An operator-set human label/rename for this instance (wire v35), overlaid by the node from
+    /// its durable store. `None` = no custom label (the client falls back to `display_name`).
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// The node-owned lifecycle sink an events-IO adapter reports coarse lifecycle signals through
@@ -4460,6 +4520,8 @@ mod tests {
                 reason: None,
                 message: None,
                 fatal: false,
+                enabled: true,
+                label: None,
             }]),
             ApiResponse::Adapters(vec![AdapterInfo {
                 family: "room".into(),

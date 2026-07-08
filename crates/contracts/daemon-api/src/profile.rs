@@ -585,6 +585,10 @@ pub struct CredentialInfo {
     pub present: bool,
     /// A masked hint (e.g. the last four characters), never the full secret.
     pub hint: String,
+    /// An operator-set human label/rename for this credential/account (wire v35), overlaid by the
+    /// node from its durable store. `None` = no custom label. Backs the app's AccountsPage rename.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 impl CredentialInfo {
@@ -605,12 +609,14 @@ impl CredentialInfo {
                     profile,
                     present: true,
                     hint: format!("…{tail}"),
+                    label: None,
                 }
             }
             _ => Self {
                 profile,
                 present: false,
                 hint: String::new(),
+                label: None,
             },
         }
     }

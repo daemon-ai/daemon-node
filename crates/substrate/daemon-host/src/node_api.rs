@@ -404,6 +404,12 @@ pub struct NodeApiImpl {
     /// in `spawn_adapters` reads it to short-circuit the backoff loop (stop, offer re-auth) instead
     /// of respawning a serve loop that will only fail again.
     disconnect_fatal: Arc<dashmap::DashMap<TransportId, bool>>,
+    /// A weak self-handle captured by `spawn_adapters` (wire v35): `transport_connect` needs an
+    /// owned `Arc<Self>` to (re)spawn a single family's supervised serve loop, but it is a `&self`
+    /// `ControlApi` method. `OnceLock`-set at the first `spawn_adapters` (boot); absent on a node
+    /// whose adapters were never spawned, where `transport_connect` has nothing to resume anyway
+    /// (and returns `Unsupported`).
+    self_weak: std::sync::OnceLock<std::sync::Weak<NodeApiImpl>>,
     /// The lazily-opened verifiable-journal writer for the `node-management` stream: management
     /// mutations (`conv_*`/`member_*`) are recorded + sealed onto it so the audit chains per op.
     /// `None` until the first mutation (and stays `None` when journaling is disabled).

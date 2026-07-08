@@ -178,6 +178,10 @@ impl TransportAdapter for MatrixAdapter {
                     reason: None,
                     message: None,
                     fatal: false,
+                    // Wire v35: the desired-state overlay (enabled/label) is applied by the node in
+                    // `transport_instances()` from its store; the adapter reports the inert default.
+                    enabled: true,
+                    label: None,
                 }
             })
             .collect()

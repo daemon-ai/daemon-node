@@ -59,6 +59,8 @@ impl TransportAdapter for MockTransport {
             reason: None,
             message: None,
             fatal: false,
+            enabled: true,
+            label: None,
         }]
     }
 }
@@ -131,7 +133,7 @@ async fn transport_transitions_push_events() {
         node.set_adapters(AdapterRegistry::new().with_adapter(Arc::new(MockTransport {
             release: release.clone(),
         })));
-        let handles = node.spawn_adapters();
+        let handles = node.spawn_adapters().await;
 
         // Serve start: the baseline push carries the instance's reported Connected state.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

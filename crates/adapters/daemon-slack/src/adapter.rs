@@ -133,6 +133,9 @@ impl TransportAdapter for SlackAdapter {
                     reason: None,
                     message: None,
                     fatal: false,
+                    // Wire v35: enabled/label are node-overlaid from the store; report inert default.
+                    enabled: true,
+                    label: None,
                 }
             })
             .collect()

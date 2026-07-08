@@ -46,7 +46,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
             None,
         ));
     node.set_adapters(registry);
-    let adapter_tasks = node.spawn_adapters();
+    let adapter_tasks = node.spawn_adapters().await;
 
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);
@@ -490,7 +490,7 @@ async fn messaging_adapter_roster_manage_over_socket() {
     let mock = RosterMockAdapter::new();
     let registry = daemon_host::AdapterRegistry::new().with_adapter(mock);
     node.set_adapters(registry);
-    let adapter_tasks = node.spawn_adapters();
+    let adapter_tasks = node.spawn_adapters().await;
 
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);
@@ -830,7 +830,7 @@ async fn conv_list_pages_beyond_the_wire_bound() {
         daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
     );
     node.set_adapters(registry);
-    let adapter_tasks = node.spawn_adapters();
+    let adapter_tasks = node.spawn_adapters().await;
 
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);

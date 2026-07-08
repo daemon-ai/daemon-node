@@ -3171,7 +3171,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         ));
     }
     node.set_adapters(adapter_registry);
-    let adapter_tasks = node.spawn_adapters();
+    let adapter_tasks = node.spawn_adapters().await;
 
     // The node-owned OpenAI-compatible gateway (`daemon-gateway`) as a RESIDENT, wire-configurable
     // managed resource (not a boot-only `tokio::spawn`): it owns its listener's lifecycle, persists

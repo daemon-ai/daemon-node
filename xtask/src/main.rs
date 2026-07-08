@@ -401,6 +401,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             reason: Some(DisconnectReason::AuthenticationFailed),
             message: Some("M_FORBIDDEN: invalid access token".into()),
             fatal: true,
+            // Wire v35: this instance carries a custom label + is enabled (the desired-state
+            // overlay), so the one fixture exercises the populated decode of both new fields.
+            enabled: true,
+            label: Some("Work bot".into()),
         }]),
     )?;
     // Item 4: adapter policies — matrix reports auto_accept_invites; a second adapter reports none.
@@ -622,6 +626,40 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             }],
             next: Some("@bob:matrix.org".into()),
         }),
+    )?;
+    // Account management (wire v35): the reversible-connect + persisted enabled/label + credential
+    // rename requests, so verify-codec proves the generated zcbor C decoder accepts all four new
+    // request variants (including the `? label` optional in both set/clear shapes).
+    write_cbor(
+        &out,
+        "request-transport-connect.cbor",
+        &ApiRequest::TransportConnect {
+            transport: TransportId::new("matrix/@bot:hs.org"),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-transport-set-enabled.cbor",
+        &ApiRequest::TransportSetEnabled {
+            transport: TransportId::new("matrix/@bot:hs.org"),
+            enabled: false,
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-transport-set-label.cbor",
+        &ApiRequest::TransportSetLabel {
+            transport: TransportId::new("matrix/@bot:hs.org"),
+            label: Some("Work bot".into()),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-credential-set-label.cbor",
+        &ApiRequest::CredentialSetLabel {
+            profile: "default".into(),
+            label: Some("Personal key".into()),
+        },
     )?;
     write_cbor(&out, "request-command-list.cbor", &ApiRequest::CommandList)?;
     write_cbor(
@@ -919,6 +957,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             profile: "default".into(),
             present: true,
             hint: "\u{2026}cret".into(),
+            // Wire v35: the node-overlaid human label (`None` on an un-labeled credential).
+            label: Some("Personal key".into()),
         }]),
     )?;
     write_cbor(

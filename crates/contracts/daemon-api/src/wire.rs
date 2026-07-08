@@ -398,6 +398,15 @@ pub enum ApiRequest {
         /// The profile / credential-ref to clear.
         profile: String,
     },
+    /// [`CredentialApi::credential_set_label`] — set/clear a credential/account's human label
+    /// (wire v35).
+    CredentialSetLabel {
+        /// The profile / credential-ref to label.
+        profile: String,
+        /// The new label (`None` clears).
+        #[serde(default)]
+        label: Option<String>,
+    },
     /// [`AuthApi::auth_begin`].
     AuthBegin(AuthBeginRequest),
     /// [`AuthApi::auth_step`].
@@ -734,6 +743,28 @@ pub enum ApiRequest {
     TransportRemove {
         /// The instance-qualified transport id.
         transport: TransportId,
+    },
+    /// [`ControlApi::transport_connect`] — resume a disconnected instance's family serve loop
+    /// (wire v35; the reversible counterpart of `TransportDisconnect`). Idempotent.
+    TransportConnect {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+    },
+    /// [`ControlApi::transport_set_enabled`] — persist the desired enabled/disabled state (wire
+    /// v35): `false` disconnects now + skips at spawn; `true` persists + attempts to reconnect.
+    TransportSetEnabled {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+        /// The desired enabled state.
+        enabled: bool,
+    },
+    /// [`ControlApi::transport_set_label`] — set/clear the instance's human label (wire v35).
+    TransportSetLabel {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+        /// The new label (`None` clears).
+        #[serde(default)]
+        label: Option<String>,
     },
     /// [`ControlApi::conv_list`] — a transport's conversations.
     ConvList {

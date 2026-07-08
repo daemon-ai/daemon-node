@@ -22,10 +22,20 @@ impl CredentialApi for NodeApiImpl {
     }
 
     async fn credential_list(&self) -> Vec<CredentialInfo> {
-        match &self.credentials {
+        let mut list = match &self.credentials {
             Some(store) => store.list_redacted(),
             None => Vec::new(),
+        };
+        // Overlay the node-owned human labels (wire v35) from the durable store onto the redacted
+        // rows — the credential store itself holds only the secret material.
+        let labels: std::collections::HashMap<String, String> =
+            self.store.credential_labels().await.into_iter().collect();
+        for info in &mut list {
+            if let Some(label) = labels.get(&info.profile) {
+                info.label = Some(label.clone());
+            }
         }
+        list
     }
 
     async fn credential_remove(&self, profile: String) -> Result<(), ApiError> {
@@ -42,6 +52,23 @@ impl CredentialApi for NodeApiImpl {
         if let Some(revoker) = &self.credential_revoker {
             revoker.revoke_profile(&profile);
         }
+        // Drop any human label for this credential too, so a later re-add starts clean (wire v35).
+        let _ = self.store.set_credential_label(&profile, None).await;
+        Ok(())
+    }
+
+    async fn credential_set_label(
+        &self,
+        profile: String,
+        label: Option<String>,
+    ) -> Result<(), ApiError> {
+        // Persist the human label (wire v35); it is overlaid onto `CredentialInfo` in
+        // `credential_list()`. Node-owned in the durable store (the credential store holds only
+        // secret material), so this is available even without a credential store bound.
+        self.store
+            .set_credential_label(&profile, label)
+            .await
+            .map_err(|e| ApiError::Other(format!("set_credential_label: {e}")))?;
         Ok(())
     }
 }

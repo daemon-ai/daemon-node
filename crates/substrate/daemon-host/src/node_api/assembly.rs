@@ -70,6 +70,7 @@ impl NodeApiImpl {
             )),
             adapter_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             disconnect_fatal: Arc::new(dashmap::DashMap::new()),
+            self_weak: std::sync::OnceLock::new(),
             mgmt_journal: Arc::new(std::sync::Mutex::new(None)),
             agents: None,
             last_agents: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -257,23 +258,87 @@ impl NodeApiImpl {
     /// clean teardown, `Error` when the loop crashes — so clients stop navigation-polling
     /// `TransportInstances`. Deliberately not a presence state machine: adapters that never
     /// transition simply never re-emit.
-    pub fn spawn_adapters(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+    pub async fn spawn_adapters(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        // Capture the weak self-handle so `transport_connect` (a `&self` op) can re-spawn a single
+        // family's serve loop later (wire v35). Idempotent — only the first boot sets it.
+        let _ = self.self_weak.set(Arc::downgrade(self));
         let registry = self.adapters.load_full();
+        let families: Vec<String> = registry
+            .adapters()
+            .iter()
+            .map(|a| a.family().to_string())
+            .collect();
+        drop(registry);
         let mut out = Vec::new();
-        for adapter in registry.adapters() {
-            let adapter = adapter.clone();
-            let node = self.clone();
-            let family = adapter.family().to_string();
-            let handle = tokio::spawn(node.clone().supervise_adapter(adapter));
-            // Record the supervised serve task so `transport_disconnect`/`transport_remove` can
-            // abort a single adapter's serve loop (wire v30, item 1). Replaces any prior handle.
-            self.adapter_handles
-                .lock()
-                .unwrap()
-                .insert(family, handle.abort_handle());
-            out.push(handle);
+        for family in families {
+            if let Some(handle) = self.spawn_adapter_family(&family).await {
+                out.push(handle);
+            }
         }
         out
+    }
+
+    /// Spawn + record the supervised serve loop for ONE adapter family — the per-family unit both
+    /// boot [`spawn_adapters`](Self::spawn_adapters) and the wire-v35 `transport_connect` reuse.
+    /// Returns the [`JoinHandle`](tokio::task::JoinHandle) when a loop is (re)spawned, or `None`
+    /// when the family is unknown, its serve loop is already running (idempotent no-op), or EVERY
+    /// one of its instances is disabled in the store (the persisted desired state — the serve loop
+    /// is per-family, so a family only skips when all its instances are disabled). Records the
+    /// abort handle keyed by family so `transport_disconnect` can stop it.
+    pub async fn spawn_adapter_family(
+        self: &Arc<Self>,
+        family: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        // Already running? (a live, un-finished handle) — idempotent no-op.
+        if self
+            .adapter_handles
+            .lock()
+            .unwrap()
+            .get(family)
+            .is_some_and(|h| !h.is_finished())
+        {
+            return None;
+        }
+        let registry = self.adapters.load_full();
+        let adapter = registry
+            .adapters()
+            .iter()
+            .find(|a| a.family() == family)
+            .cloned()?;
+        drop(registry);
+        // Honor the persisted desired state: skip a family only when ALL its instances are disabled.
+        if self.family_all_disabled(&adapter).await {
+            return None;
+        }
+        let handle = tokio::spawn(self.clone().supervise_adapter(adapter));
+        self.adapter_handles
+            .lock()
+            .unwrap()
+            .insert(family.to_string(), handle.abort_handle());
+        Some(handle)
+    }
+
+    /// Whether EVERY instance of `adapter` is explicitly disabled in the store (wire v35). A family
+    /// with no reported instances, or with at least one enabled (or unset — default enabled)
+    /// instance, is NOT all-disabled and serves. The family-vs-instance granularity mismatch is
+    /// deliberate: the serve loop is per-family (the coarsest unit), so per-instance disable only
+    /// stops the family when nothing enabled remains.
+    async fn family_all_disabled(&self, adapter: &Arc<dyn daemon_api::TransportAdapter>) -> bool {
+        let instances = adapter.clone().instances().await;
+        if instances.is_empty() {
+            return false;
+        }
+        let disabled: std::collections::HashSet<String> = self
+            .store
+            .transport_prefs()
+            .await
+            .into_iter()
+            .filter(|p| !p.enabled)
+            .map(|p| p.transport)
+            .collect();
+        instances
+            .iter()
+            .all(|i| disabled.contains(i.transport.as_str()))
     }
 
     /// The per-adapter reconnect supervisor (wire v30, item 2): run the adapter's serve loop,

@@ -382,6 +382,9 @@ async fn serve_auth(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
         ApiRequest::CredentialRemove { profile } => {
             unit_or_err(api.credential_remove(profile).await)
         }
+        ApiRequest::CredentialSetLabel { profile, label } => {
+            unit_or_err(api.credential_set_label(profile, label).await)
+        }
         _ => return None,
     })
 }
@@ -437,6 +440,15 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         }
         ApiRequest::TransportRemove { transport } => {
             unit_or_err(api.transport_remove(transport).await)
+        }
+        ApiRequest::TransportConnect { transport } => {
+            unit_or_err(api.transport_connect(transport).await)
+        }
+        ApiRequest::TransportSetEnabled { transport, enabled } => {
+            unit_or_err(api.transport_set_enabled(transport, enabled).await)
+        }
+        ApiRequest::TransportSetLabel { transport, label } => {
+            unit_or_err(api.transport_set_label(transport, label).await)
         }
         _ => return None,
     })

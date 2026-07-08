@@ -963,7 +963,7 @@ bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 ; profile-info provenance (wire v31): mirrors profile-spec's created_by/owner so a client can badge +
 ; subtree-filter the profile list. Optional (pre-provenance encodings omit both).
 profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null) }
-credential-info = { "profile": tstr, "present": bool, "hint": tstr }
+credential-info = { "profile": tstr, "present": bool, "hint": tstr, ? "label": (tstr / null) }
 provider-selector = "mock"
                   / "genai"
                   / "daemon_api"
@@ -1114,6 +1114,7 @@ transport-instance-info = {
   "transport": transport-id, "family": tstr, "display_name": tstr,
   ? "connection": connection-state, ? "presence": presence-state, ? "bound_profile": (profile-ref / null),
   ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool,
+  ? "enabled": bool, ? "label": (tstr / null),
 }
 conversation-type = "Unset"
                   / "Dm"
@@ -1235,6 +1236,7 @@ request-curator-run = { "CuratorRun": { ? "profile": (tstr / null) } }
 request-credential-set = { "CredentialSet": { "profile": tstr, "secret": tstr } }
 request-credential-list = "CredentialList"
 request-credential-remove = { "CredentialRemove": { "profile": tstr } }
+request-credential-set-label = { "CredentialSetLabel": { "profile": tstr, ? "label": (tstr / null) } }
 request-model-search = { "ModelSearch": { "query": search-query } }
 request-model-files = { "ModelFiles": { "repo": tstr, "revision": (tstr / null), "engine": model-engine, ? "after": (tstr / null) } }
 request-model-download = { "ModelDownload": { "model": model-ref } }
@@ -1306,6 +1308,9 @@ request-transport-adapters = "TransportAdapters"
 request-transport-instances = "TransportInstances"
 request-transport-disconnect = { "TransportDisconnect": { "transport": transport-id } }
 request-transport-remove = { "TransportRemove": { "transport": transport-id } }
+request-transport-connect = { "TransportConnect": { "transport": transport-id } }
+request-transport-set-enabled = { "TransportSetEnabled": { "transport": transport-id, "enabled": bool } }
+request-transport-set-label = { "TransportSetLabel": { "transport": transport-id, ? "label": (tstr / null) } }
 request-conv-list = { "ConvList": { "transport": transport-id, ? "after": (tstr / null) } }
 request-conv-get = { "ConvGet": { "transport": transport-id, "conv": tstr } }
 request-conv-create-details = { "ConvCreateDetails": { "transport": transport-id } }
@@ -1437,6 +1442,7 @@ api-request = request-submit
             / request-credential-set
             / request-credential-list
             / request-credential-remove
+            / request-credential-set-label
             / request-model-search
             / request-model-files
             / request-model-download
@@ -1506,6 +1512,9 @@ api-request = request-submit
             / request-transport-instances
             / request-transport-disconnect
             / request-transport-remove
+            / request-transport-connect
+            / request-transport-set-enabled
+            / request-transport-set-label
             / request-conv-list
             / request-conv-get
             / request-conv-create-details
