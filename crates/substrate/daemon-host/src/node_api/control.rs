@@ -1026,7 +1026,36 @@ impl ControlApi for NodeApiImpl {
         // §3.4). Empty until the assembling binary installs adapters via `with_adapters`; lifecycle
         // (`serve`) still runs from `bins/daemon` in the skeleton. `transport_instances` (live
         // per-account connection/presence) is deferred and inherits the empty `ControlApi` default.
-        self.adapters.load().infos()
+        //
+        // Wire v33: enrich each row centrally with the per-verb ops descriptors by probing the
+        // adapter's `MessagingProtocol` feature-trait accessors and calling each trait's
+        // `supported()` — the same `messaging()->feature()` path the per-op helpers
+        // (`conversations_for`/`membership_for`/… in node_api/messaging.rs) walk, but done once here
+        // so every adapter gets it for free (zero per-adapter duplication). `None` on a field means
+        // the adapter does not implement that feature trait at all.
+        self.adapters
+            .load_full()
+            .adapters()
+            .iter()
+            .map(|adapter| {
+                let mut info = adapter.info();
+                if let Some(messaging) = adapter.clone().messaging() {
+                    info.conversation_ops =
+                        messaging.clone().conversations().map(|c| c.supported());
+                    info.membership_ops = messaging.clone().membership().map(|m| m.supported());
+                    info.contacts_ops = messaging.clone().contacts().map(|c| c.supported());
+                    info.roster_ops = messaging.clone().roster().map(|r| r.supported());
+                    // Directory has no per-verb ops struct — presence of the trait AND its own
+                    // `supported()` probe collapse to a single bool (absent trait => false).
+                    info.directory = messaging
+                        .clone()
+                        .directory()
+                        .map(|d| d.supported())
+                        .unwrap_or(false);
+                }
+                info
+            })
+            .collect()
     }
 
     async fn transport_instances(&self) -> Vec<TransportInstanceInfo> {

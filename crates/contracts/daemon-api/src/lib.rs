@@ -3244,6 +3244,36 @@ pub struct AdapterInfo {
     /// policy.
     #[serde(default)]
     pub policies: Vec<PolicyEntry>,
+    /// Per-verb conversation-management capabilities (wire v33; ← libpurple's `implements_*` probes,
+    /// here reported once by the node from [`SupportsConversations::supported`]). `None` = this
+    /// adapter does not implement the conversation feature trait at all; `Some(ops)` = implemented,
+    /// with a bool per verb (create / join / leave / delete / …). A thin client capability-gates the
+    /// room affordances off these flags instead of switching on `family`.
+    #[serde(default)]
+    pub conversation_ops: Option<ConversationOps>,
+    /// Per-verb membership-administration capabilities (wire v33; from
+    /// [`SupportsMembership::supported`]). `None` = the adapter does not implement the membership
+    /// feature trait; `Some(ops)` = implemented, with a bool per verb (invite / remove / ban /
+    /// set_role) gating the member-row buttons.
+    #[serde(default)]
+    pub membership_ops: Option<MembershipOps>,
+    /// Per-verb remote-contact capabilities (wire v33; from [`SupportsContacts::supported`]).
+    /// `None` = the adapter does not implement the contacts feature trait; `Some(ops)` =
+    /// implemented, with a bool per verb (get_profile / action_menu / set_alias).
+    #[serde(default)]
+    pub contacts_ops: Option<ContactsOps>,
+    /// Per-verb server-side roster (contact-list) capabilities (wire v33; from
+    /// [`SupportsRoster::supported`]). `None` = the adapter does not implement the roster feature
+    /// trait; `Some(ops)` = implemented, with a bool per verb (add / update / remove).
+    #[serde(default)]
+    pub roster_ops: Option<RosterOps>,
+    /// Whether the adapter exposes a contact/user directory search (wire v33; ←
+    /// `purpleprotocoldirectory.h` / the libpurple roomlist successor). Unlike the other feature
+    /// traits there is no per-verb ops struct — search is the sole verb — so presence + the
+    /// adapter's own [`SupportsDirectory::supported`] probe collapse to this single flag. `false`
+    /// when the trait is absent or the adapter reports it unsupported.
+    #[serde(default)]
+    pub directory: bool,
 }
 
 /// One configured transport instance (account) plus its live status — what the GUI status bar and
@@ -4380,6 +4410,12 @@ mod tests {
                 capabilities: AdapterCapabilities::default(),
                 account_schema: AccountSettingsSchema::default(),
                 policies: Vec::new(),
+                // wire v33: an adapter that implements no feature trait leaves every ops field None.
+                conversation_ops: None,
+                membership_ops: None,
+                contacts_ops: None,
+                roster_ops: None,
+                directory: false,
             }]),
             ApiResponse::ContactProfile("display_name: Alice".into()),
             ApiResponse::Contacts(vec![info.members[0].contact.clone()]),
@@ -4721,6 +4757,105 @@ mod tests {
         let bytes = to_cbor(&resp);
         let back: ApiResponse = from_cbor(&bytes).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn adapter_info_per_verb_ops_round_trip() {
+        // wire v33: AdapterInfo with every per-verb ops descriptor populated (mixed flags) plus the
+        // directory bool, and a second row with every new field absent — both must round-trip so
+        // the additive fields agree with the CDDL under `api-response`.
+        let full = AdapterInfo {
+            family: "matrix".into(),
+            display_name: "Matrix".into(),
+            capabilities: AdapterCapabilities {
+                rooms: true,
+                direct_messages: true,
+                presence: true,
+                room_enumeration: true,
+                file_transfer: false,
+                interactive_auth: true,
+            },
+            account_schema: AccountSettingsSchema::default(),
+            policies: Vec::new(),
+            conversation_ops: Some(ConversationOps {
+                create: true,
+                join_channel: true,
+                leave: true,
+                delete: false,
+                send: true,
+                set_topic: false,
+                set_title: true,
+                set_description: false,
+            }),
+            membership_ops: Some(MembershipOps {
+                invite: true,
+                remove: false,
+                ban: false,
+                set_role: true,
+            }),
+            contacts_ops: Some(ContactsOps {
+                get_profile: true,
+                action_menu: false,
+                set_alias: true,
+            }),
+            roster_ops: Some(RosterOps {
+                add: true,
+                update: false,
+                remove: true,
+            }),
+            directory: true,
+        };
+        let bare = AdapterInfo {
+            family: "room".into(),
+            display_name: "Rooms (internal)".into(),
+            capabilities: AdapterCapabilities::default(),
+            account_schema: AccountSettingsSchema::default(),
+            policies: Vec::new(),
+            conversation_ops: None,
+            membership_ops: None,
+            contacts_ops: None,
+            roster_ops: None,
+            directory: false,
+        };
+        let resp = ApiResponse::Adapters(vec![full, bare]);
+        let bytes = to_cbor(&resp);
+        let back: ApiResponse = from_cbor(&bytes).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn adapter_info_decodes_pre_v33_payload() {
+        // Back-compat: a v32-shaped AdapterInfo map (no per-verb ops fields at all) must still decode
+        // — the new fields are `#[serde(default)]`, so an older peer's payload deserializes with the
+        // ops absent (None) and directory false. This proves the v33 bump is additive on the wire.
+        use ciborium::value::Value;
+        let legacy = Value::Map(vec![
+            (Value::Text("family".into()), Value::Text("room".into())),
+            (
+                Value::Text("display_name".into()),
+                Value::Text("Rooms (internal)".into()),
+            ),
+            (
+                Value::Text("capabilities".into()),
+                Value::Map(vec![
+                    (Value::Text("rooms".into()), Value::Bool(false)),
+                    (Value::Text("direct_messages".into()), Value::Bool(false)),
+                    (Value::Text("presence".into()), Value::Bool(false)),
+                    (Value::Text("room_enumeration".into()), Value::Bool(false)),
+                    (Value::Text("file_transfer".into()), Value::Bool(false)),
+                    (Value::Text("interactive_auth".into()), Value::Bool(false)),
+                ]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut bytes).unwrap();
+        let info: AdapterInfo = from_cbor(&bytes).unwrap();
+        assert_eq!(info.family, "room");
+        assert_eq!(info.conversation_ops, None);
+        assert_eq!(info.membership_ops, None);
+        assert_eq!(info.contacts_ops, None);
+        assert_eq!(info.roster_ops, None);
+        assert!(!info.directory);
     }
 
     fn sample_info() -> SessionInfo {

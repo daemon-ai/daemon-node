@@ -658,7 +658,22 @@ impl WireVersion {
     /// when the global toggle is off; passive telemetry stays gated by the toggle. Additive (new
     /// request/response variants + DTOs), but bumped because `is_compatible` is strict-equal, so an
     /// older peer cannot decode the new ops (mirrors the additive v15–v30 bumps).
-    pub const CURRENT: Self = Self(32);
+    ///
+    /// v33 (per-verb adapter ops): `AdapterInfo` gains per-verb capability descriptors so thin
+    /// clients capability-gate every room/contact affordance off the node's own probe instead of
+    /// switching on the transport-family string (the "node decides, apps render" invariant). Adds
+    /// the additive optional fields `conversation_ops: conversation-ops?`, `membership_ops:
+    /// membership-ops?`, `contacts_ops: contacts-ops?`, `roster_ops: roster-ops?`, and `directory:
+    /// bool?`, plus the four ops maps (bool-per-verb: `conversation-ops` = create/join_channel/
+    /// leave/delete/send/set_topic/set_title/set_description; `membership-ops` = invite/remove/ban/
+    /// set_role; `contacts-ops` = get_profile/action_menu/set_alias; `roster-ops` = add/update/
+    /// remove). `None` on an ops field = the adapter does not implement that `MessagingProtocol`
+    /// feature trait at all; `Some(ops)` = implemented, with a bool per verb. `directory` collapses
+    /// the (verb-less) `SupportsDirectory` presence + `supported()` probe to one flag. The node
+    /// populates them centrally in `transport_adapters()` from each feature trait's `supported()`.
+    /// Additive (new optional fields + new named ops rules), but bumped because `is_compatible` is
+    /// strict-equal (mirrors the additive v15–v32 bumps).
+    pub const CURRENT: Self = Self(33);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

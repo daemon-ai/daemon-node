@@ -147,6 +147,9 @@ impl TransportAdapter for DiscordAdapter {
             },
             account_schema: AccountSettingsSchema::default(),
             policies: Vec::new(),
+            // Per-verb ops (wire v33) are enriched centrally in the host `transport_adapters()` from
+            // the feature-trait `supported()` probes; the adapter leaves them at default here.
+            ..Default::default()
         }
     }
 

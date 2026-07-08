@@ -146,6 +146,9 @@ impl TransportAdapter for MatrixAdapter {
                 label: "Automatically accept room invites".to_string(),
                 value: self.cfg.auto_accept_invites.to_string(),
             }],
+            // Per-verb ops (wire v33) are enriched centrally in the host `transport_adapters()` from
+            // the feature-trait `supported()` probes; the adapter leaves them at default here.
+            ..Default::default()
         }
     }
 

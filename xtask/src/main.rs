@@ -247,11 +247,11 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
         AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiRequest, ApiResponse,
-        ApprovalInfo, CommandInvocation, CommandOutput, ConnectionState, ConvChange,
-        CredentialInfo, DisconnectReason, EventsPage, HealthReport, LogPageView, MembershipChange,
-        ModelDescriptor, NodeEvent, PolicyEntry, PresenceState, ProfileInfo, ProfileSpec,
-        ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn, ServiceHealth,
-        SessionPage, TransportInstanceInfo,
+        ApprovalInfo, CommandInvocation, CommandOutput, ConnectionState, ContactsOps, ConvChange,
+        ConversationOps, CredentialInfo, DisconnectReason, EventsPage, HealthReport, LogPageView,
+        MembershipChange, MembershipOps, ModelDescriptor, NodeEvent, PolicyEntry, PresenceState,
+        ProfileInfo, ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector,
+        ProviderSignIn, RosterOps, ServiceHealth, SessionPage, TransportInstanceInfo,
     };
     use daemon_common::{Author, ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, ToolDetail, TransportId, UserMsg};
@@ -404,6 +404,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         }]),
     )?;
     // Item 4: adapter policies — matrix reports auto_accept_invites; a second adapter reports none.
+    // Wire v33: the matrix row also carries the per-verb ops descriptors (Some(..) with mixed
+    // flags + directory=true) while the room row leaves every new field at its default (None ops +
+    // directory=false, encoded as absent) — so the one fixture proves both the populated and the
+    // back-compat "absent" decode of the v33 additive fields.
     write_cbor(
         &out,
         "response-adapters.cbor",
@@ -425,6 +429,33 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     label: "Automatically accept room invites".into(),
                     value: "true".into(),
                 }],
+                conversation_ops: Some(ConversationOps {
+                    create: true,
+                    join_channel: true,
+                    leave: true,
+                    delete: false,
+                    send: true,
+                    set_topic: true,
+                    set_title: true,
+                    set_description: true,
+                }),
+                membership_ops: Some(MembershipOps {
+                    invite: true,
+                    remove: true,
+                    ban: true,
+                    set_role: true,
+                }),
+                contacts_ops: Some(ContactsOps {
+                    get_profile: true,
+                    action_menu: false,
+                    set_alias: false,
+                }),
+                roster_ops: Some(RosterOps {
+                    add: false,
+                    update: false,
+                    remove: false,
+                }),
+                directory: true,
             },
             AdapterInfo {
                 family: "room".into(),
@@ -432,6 +463,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 capabilities: AdapterCapabilities::default(),
                 account_schema: AccountSettingsSchema::default(),
                 policies: Vec::new(),
+                conversation_ops: None,
+                membership_ops: None,
+                contacts_ops: None,
+                roster_ops: None,
+                directory: false,
             },
         ]),
     )?;

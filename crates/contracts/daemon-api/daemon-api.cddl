@@ -1079,7 +1079,16 @@ adapter-capabilities = {
 ; policy-entry (wire v30): a node-labeled, node-valued adapter policy a client renders read-only
 ; (the auth-param-field.label precedent). Matrix reports auto_accept_invites.
 policy-entry = { "key": tstr, "label": tstr, "value": tstr }
-adapter-info = { "family": tstr, "display_name": tstr, "capabilities": adapter-capabilities, ? "account_schema": account-settings-schema, ? "policies": [* policy-entry] }
+; Per-verb adapter ops (wire v33): the node reports each MessagingProtocol feature trait's
+; supported() probe once on AdapterInfo so clients capability-gate affordances per verb (← the
+; libpurple implements_* probes) instead of switching on `family`. Each map is a plain set of
+; bool flags; an absent optional field on adapter-info means the adapter does not implement that
+; feature trait at all (as opposed to implementing it with every flag false).
+conversation-ops = { "create": bool, "join_channel": bool, "leave": bool, "delete": bool, "send": bool, "set_topic": bool, "set_title": bool, "set_description": bool }
+membership-ops = { "invite": bool, "remove": bool, "ban": bool, "set_role": bool }
+contacts-ops = { "get_profile": bool, "action_menu": bool, "set_alias": bool }
+roster-ops = { "add": bool, "update": bool, "remove": bool }
+adapter-info = { "family": tstr, "display_name": tstr, "capabilities": adapter-capabilities, ? "account_schema": account-settings-schema, ? "policies": [* policy-entry], ? "conversation_ops": (conversation-ops / null), ? "membership_ops": (membership-ops / null), ? "contacts_ops": (contacts-ops / null), ? "roster_ops": (roster-ops / null), ? "directory": bool }
 connection-state = "Offline"
                  / "Connecting"
                  / "Connected"

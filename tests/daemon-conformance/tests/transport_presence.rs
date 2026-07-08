@@ -40,6 +40,7 @@ impl TransportAdapter for MockTransport {
             capabilities: AdapterCapabilities::default(),
             account_schema: AccountSettingsSchema::default(),
             policies: Vec::new(),
+            ..Default::default()
         }
     }
 

@@ -22,6 +22,7 @@ fn adapter_info_with_policies_round_trips() {
             label: "Automatically accept room invites".into(),
             value: "true".into(),
         }],
+        ..Default::default()
     };
     assert_eq!(info, from_cbor::<AdapterInfo>(&to_cbor(&info)).unwrap());
 }
