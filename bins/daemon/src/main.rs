@@ -1536,7 +1536,8 @@ async fn build_mcp_tools(cfg: &NodeConfig) -> Vec<Arc<dyn Tool>> {
 }
 
 /// Build the `browser` tool when enabled and compiled in (the `browser` feature). The supervised
-/// Chromium is launched lazily on first use.
+/// Chromium is launched lazily on first use, or eagerly (prewarmed) for a visible/attached session
+/// so the window is up front.
 #[cfg(feature = "browser")]
 fn build_browser_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
     use daemon_tool_browser::{BrowserSettings, BrowserSupervisor, BrowserTool};
@@ -1549,14 +1550,38 @@ fn build_browser_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
         .screenshot_dir
         .clone()
         .unwrap_or_else(|| cfg.profile_home().join("browser").join("screenshots"));
+    // Default to a persistent profile dir under the profile home so logins/cookies survive
+    // restarts (mirrors the screenshot_dir default). Ignored when attaching via connect_url.
+    let user_data_dir = Some(
+        cfg.browser
+            .user_data_dir
+            .clone()
+            .unwrap_or_else(|| cfg.profile_home().join("browser").join("profile")),
+    );
     let settings = BrowserSettings {
         chrome_path: cfg.browser.chrome_path.clone(),
         headless: cfg.browser.headless,
         screenshot_dir,
         launch_timeout: cfg.browser.launch_timeout,
         auto_dismiss_dialogs: cfg.browser.auto_dismiss_dialogs,
+        remote_debugging_port: cfg.browser.remote_debugging_port,
+        connect_url: cfg.browser.connect_url.clone(),
+        user_data_dir,
+        persistent: cfg.browser.persistent,
+        extra_args: cfg.browser.extra_args.clone(),
     };
     let supervisor = Arc::new(BrowserSupervisor::new(settings));
+    // A visible (non-headless) or attached (connect_url) session should appear up front rather
+    // than on the first agent op. Prewarm off-thread so a slow/failed launch never blocks daemon
+    // startup; on failure the lazy launch still runs on first use.
+    if !cfg.browser.headless || cfg.browser.connect_url.is_some() {
+        let sup = Arc::clone(&supervisor);
+        tokio::spawn(async move {
+            if let Err(e) = sup.prewarm().await {
+                tracing::warn!(error = %e, "browser prewarm failed; will launch lazily on first use");
+            }
+        });
+    }
     let mut tool = BrowserTool::new(supervisor);
     if cfg.browser.approve_navigation {
         tool = tool.with_navigation_approval();
@@ -1564,6 +1589,9 @@ fn build_browser_tool(cfg: &NodeConfig) -> Option<Arc<dyn Tool>> {
     tracing::info!(
         headless = cfg.browser.headless,
         approve_navigation = cfg.browser.approve_navigation,
+        persistent = cfg.browser.persistent,
+        remote_debugging_port = ?cfg.browser.remote_debugging_port,
+        connect = cfg.browser.connect_url.is_some(),
         "browser tool enabled"
     );
     Some(Arc::new(tool) as Arc<dyn Tool>)

@@ -41,9 +41,10 @@ pub enum ExtractFormat {
 /// Launch + behaviour settings for the supervised browser.
 #[derive(Clone, Debug)]
 pub struct BrowserSettings {
-    /// An explicit Chromium/Chrome executable path; `None` lets chromiumoxide auto-detect.
+    /// An explicit Chromium/Chrome executable path; `None` lets chromiumoxide auto-detect
+    /// (searches `$PATH` + well-known install locations). Ignored when `connect_url` is set.
     pub chrome_path: Option<PathBuf>,
-    /// Run headless (the default). `false` shows a window (local debugging only).
+    /// Run headless (the default). `false` shows a window (a human-observable session).
     pub headless: bool,
     /// Where PNG screenshots are written.
     pub screenshot_dir: PathBuf,
@@ -51,6 +52,21 @@ pub struct BrowserSettings {
     pub launch_timeout: Duration,
     /// Auto-dismiss JS dialogs (`alert`/`confirm`/`beforeunload`) so they cannot wedge the session.
     pub auto_dismiss_dialogs: bool,
+    /// Bind the CDP endpoint on a fixed port so external DevTools/viewers can attach to the same
+    /// instance; `None` lets Chromium pick an ephemeral port. Ignored when `connect_url` is set.
+    pub remote_debugging_port: Option<u16>,
+    /// Attach to an already-running browser at this CDP endpoint (`ws://`/`http://`) instead of
+    /// launching one. When set, the launch-only settings (`chrome_path`, `headless`,
+    /// `user_data_dir`, `remote_debugging_port`, `extra_args`) do not apply.
+    pub connect_url: Option<String>,
+    /// Persistent Chromium user-data (profile) directory; `None` uses a fresh temp profile per
+    /// launch. Ignored when `connect_url` is set.
+    pub user_data_dir: Option<PathBuf>,
+    /// Keep the session alive across page-op errors (only rebuild on a launch/transport fault), so
+    /// a human-observable window is not torn down by a transient CDP error.
+    pub persistent: bool,
+    /// Extra Chromium command-line arguments (e.g. `--no-sandbox`). Ignored when `connect_url` is set.
+    pub extra_args: Vec<String>,
 }
 
 impl Default for BrowserSettings {
@@ -61,6 +77,11 @@ impl Default for BrowserSettings {
             screenshot_dir: std::env::temp_dir().join("daemon_browser_screenshots"),
             launch_timeout: Duration::from_secs(20),
             auto_dismiss_dialogs: true,
+            remote_debugging_port: None,
+            connect_url: None,
+            user_data_dir: None,
+            persistent: false,
+            extra_args: Vec::new(),
         }
     }
 }
@@ -324,13 +345,30 @@ impl BrowserSupervisor {
         }
         let session = guard.as_ref().expect("session present after launch");
         let result = op(&session.page).await;
-        if result.is_err() {
-            // Tear down on fault; the next op relaunches a clean session.
-            if let Some(mut s) = guard.take() {
-                let _ = s.browser.close().await;
+        if let Err(err) = &result {
+            // Ephemeral sessions tear down on any fault so the next op relaunches clean. A
+            // persistent (human-observable) session is only rebuilt on a launch/transport fault —
+            // a transient page-op error (bad selector, blocked navigation, failed eval) must not
+            // close a window the user is watching.
+            let teardown = !self.settings.persistent || matches!(err, BrowserError::Launch(_));
+            if teardown {
+                if let Some(mut s) = guard.take() {
+                    let _ = s.browser.close().await;
+                }
             }
         }
         result
+    }
+
+    /// Eagerly launch (or attach to) the browser now, instead of lazily on the first op — used for
+    /// a visible/attached persistent session so the window is up before any agent op. Surfaces the
+    /// launch error to the caller (which may log-and-continue); the crash-loop breaker still applies.
+    pub async fn prewarm(&self) -> Result<(), BrowserError> {
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.launch().await?);
+        }
+        Ok(())
     }
 
     /// Launch a fresh browser + page, wiring the CDP-driving task and optional dialog auto-dismiss.
@@ -351,17 +389,35 @@ impl BrowserSupervisor {
     }
 
     async fn try_launch(&self) -> Result<Session, BrowserError> {
-        let mut builder = BrowserConfig::builder().launch_timeout(self.settings.launch_timeout);
-        if !self.settings.headless {
-            builder = builder.with_head();
-        }
-        if let Some(path) = &self.settings.chrome_path {
-            builder = builder.chrome_executable(path);
-        }
-        let config = builder.build().map_err(BrowserError::Launch)?;
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        let (browser, mut handler) = if let Some(url) = &self.settings.connect_url {
+            // Attach to a human-owned browser instead of launching one: the remote instance owns
+            // its window + lifecycle, and we drive the same instance over its CDP endpoint. The
+            // launch-only settings do not apply on this path.
+            Browser::connect(url.clone())
+                .await
+                .map_err(|e| BrowserError::Launch(e.to_string()))?
+        } else {
+            let mut builder = BrowserConfig::builder().launch_timeout(self.settings.launch_timeout);
+            if !self.settings.headless {
+                builder = builder.with_head();
+            }
+            if let Some(path) = &self.settings.chrome_path {
+                builder = builder.chrome_executable(path);
+            }
+            if let Some(dir) = &self.settings.user_data_dir {
+                builder = builder.user_data_dir(dir);
+            }
+            if let Some(port) = self.settings.remote_debugging_port {
+                builder = builder.port(port);
+            }
+            if !self.settings.extra_args.is_empty() {
+                builder = builder.args(self.settings.extra_args.clone());
+            }
+            let config = builder.build().map_err(BrowserError::Launch)?;
+            Browser::launch(config)
+                .await
+                .map_err(|e| BrowserError::Launch(e.to_string()))?
+        };
         let handler_task = tokio::spawn(async move {
             while let Some(ev) = handler.next().await {
                 if ev.is_err() {

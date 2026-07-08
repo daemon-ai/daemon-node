@@ -553,6 +553,27 @@ pub struct BrowserConfig {
     /// Auto-dismiss JS dialogs so a modal cannot wedge the session.
     #[serde(with = "daemon_common::flex_bool")]
     pub auto_dismiss_dialogs: bool,
+    /// Bind Chromium's CDP endpoint on a fixed port so external DevTools/viewers can attach to the
+    /// same instance (`None` => an ephemeral port chosen by Chromium). Loopback only. Ignored when
+    /// `connect_url` is set.
+    pub remote_debugging_port: Option<u16>,
+    /// Attach to an already-running browser at this CDP endpoint (`ws://`/`http://`) instead of
+    /// launching one — the human owns the window and lifecycle, the daemon drives the same
+    /// instance. When set, `chrome_path`/`headless`/`user_data_dir`/`remote_debugging_port`/
+    /// `extra_args` do not apply (they configure a launch this path skips).
+    pub connect_url: Option<String>,
+    /// Persistent Chromium user-data (profile) directory so logins/cookies survive restarts
+    /// (`None` => `<profile_home>/browser/profile`). Ignored when `connect_url` is set.
+    pub user_data_dir: Option<PathBuf>,
+    /// Keep the browser session alive across page-op errors (a persistent, human-observable
+    /// window is not torn down by a transient CDP error); the session is only rebuilt on a
+    /// launch/transport fault. Defaults to `false` (the ephemeral-scrape behaviour: tear down and
+    /// relaunch on any error).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub persistent: bool,
+    /// Extra Chromium command-line arguments (e.g. `--no-sandbox` in a container / headless node,
+    /// or window-sizing flags for a visible session). Ignored when `connect_url` is set.
+    pub extra_args: Vec<String>,
 }
 
 impl Default for BrowserConfig {
@@ -565,6 +586,11 @@ impl Default for BrowserConfig {
             approve_navigation: false,
             launch_timeout: Duration::from_secs(20),
             auto_dismiss_dialogs: true,
+            remote_debugging_port: None,
+            connect_url: None,
+            user_data_dir: None,
+            persistent: false,
+            extra_args: Vec::new(),
         }
     }
 }

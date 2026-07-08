@@ -73,6 +73,7 @@ fn unlaunchable_tool() -> BrowserTool {
         screenshot_dir: std::env::temp_dir().join("daemon_browser_test_shots"),
         launch_timeout: Duration::from_secs(2),
         auto_dismiss_dialogs: true,
+        ..BrowserSettings::default()
     };
     BrowserTool::new(Arc::new(BrowserSupervisor::new(settings)))
 }

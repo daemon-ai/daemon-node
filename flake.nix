@@ -6,10 +6,17 @@
   # Public pull key only — no secret lives here. The numtide cache serves the `llm-agents.nix`
   # coding-agent binaries (the `e2e` devShell) prebuilt, so the e2e lane never compiles them.
   nixConfig = {
-    extra-substituters = [ "https://daemon-ai.cachix.org" "https://cache.numtide.com" ];
+    # nix-community serves the `fenix` rust toolchain (github:nix-community/fenix) and many
+    # community flake outputs, so the toolchain substitutes instead of rederiving.
+    extra-substituters = [
+      "https://daemon-ai.cachix.org"
+      "https://cache.numtide.com"
+      "https://nix-community.cachix.org"
+    ];
     extra-trusted-public-keys = [
       "daemon-ai.cachix.org-1:jzeLmFDfgE5dzGT0RXF70IEU/tKsWdDV9LQ5zPGAnQs="
       "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+      "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
     ];
   };
 
@@ -244,6 +251,46 @@
 
         daemon = buildWorkspacePackage "daemon";
         daemon-cli = buildWorkspacePackage "daemon-cli";
+
+        # The browser-enabled daemon: the `daemon` binary compiled with the `browser` feature
+        # (chromiumoxide CDP). Kept a SEPARATE output so the default `daemon` + the workspace gate /
+        # `checks` never compile the heavy (~60K generated LOC) chromiumoxide bindings. No Chromium is
+        # embedded here: `chrome_path` stays unset, so at runtime chromiumoxide auto-detects a system
+        # Chromium on PATH (the `.#browser` dev shell provides `pkgs.chromium`; product bundles rely
+        # on the host's installed Chromium). The feature pulls only pure-Rust deps (chromiumoxide/futures/
+        # dom_smoothie/tokio) — no cmake/native inputs — so this reuses the standard build recipe with
+        # a feature-matched deps artifact so the CDP bindings cache across source edits.
+        daemon-browser =
+          let
+            # chromiumoxide's transitive deps flip `openssl-sys` into vendored mode (cargo feature
+            # unification across the browser closure); vendored openssl-sys compiles OpenSSL from
+            # source, which needs `perl` — absent in the crane sandbox. Adding perl lets it build
+            # statically, so the shipped daemon carries no runtime `libssl.so` dependency (keeping
+            # it as self-contained as the browser-free daemon, and letting the default checkPhase
+            # run the daemon's tests with the feature). The default `daemon` build never pulls
+            # openssl, so it stays on the bare commonArgs.
+            browserExtra = {
+              nativeBuildInputs = [ pkgs.perl ];
+            };
+          in
+          craneLib.buildPackage (
+            commonArgs
+            // browserExtra
+            // {
+              pname = "daemon-browser";
+              version = baseVersion;
+              cargoArtifacts = craneLib.buildDepsOnly (
+                commonArgs
+                // browserExtra
+                // {
+                  pname = "daemon-browser-deps";
+                  cargoExtraArgs = "-p daemon --features browser";
+                }
+              );
+              cargoExtraArgs = "-p daemon --features browser";
+              DAEMON_BUILD_ID = buildId;
+            }
+          );
 
         # Engine-lane compile checks: build the `daemon-infer` worker with an engine feature so the
         # llama-cpp-4 / mistral.rs glue is type-checked against the real native APIs. These compile
@@ -804,6 +851,7 @@
           inherit
             daemon
             daemon-cli
+            daemon-browser
             daemon-infer-llama
             daemon-infer-mistralrs
             daemon-infer-vulkan
@@ -844,6 +892,12 @@
           }) // {
             meta.description = "Run the daemon operator CLI";
           };
+          daemon-browser = (flake-utils.lib.mkApp {
+            drv = daemon-browser;
+            name = "daemon";
+          }) // {
+            meta.description = "Run the daemon host binary with the CDP `browser` tool compiled in";
+          };
           default = self.apps.${system}.daemon;
         };
 
@@ -866,8 +920,8 @@
           );
         };
 
-        devShells = {
-          default = craneLib.devShell {
+        devShells = let
+          defaultDevShell = craneLib.devShell {
             # Worker engine toolchain (clang/libclang for bindgen, cmake for the GPU lanes) is present
             # so a dev can build an engine lane locally. The default `cargo test --workspace` still
             # builds only the stub worker — no engine, no cmake step.
@@ -911,6 +965,19 @@
               ]
               ++ engineNativeInputs;
           };
+        in
+        {
+          default = defaultDevShell;
+
+          # Opt-in shell that adds Chromium for the `browser` tool (`cargo run -p daemon --features
+          # browser`; the `daemon-tool-browser` `--ignored` integration test). Kept SEPARATE from
+          # `default` because Chromium's desktop closure (avahi/cups/...) is heavy to realize on the
+          # pinned nixpkgs fork and must not slow every default `nix develop` / `just dev-run` / CI
+          # shell entry. Enter with `nix develop .#browser`.
+          browser = defaultDevShell.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.chromium ];
+            DAEMON_BROWSER__CHROME_PATH = "${pkgs.chromium}/bin/chromium";
+          });
         }
         // {
           # Interactive iteration on the windows cross lane: `cargo build -p daemon` in here
