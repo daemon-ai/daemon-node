@@ -12,6 +12,7 @@
 //! is proven by the `bindings/daemon-core-ffi` C harness, not here.
 
 mod access_control;
+mod account_management;
 mod auth_transport;
 mod bootstrap_wiring;
 mod cron;
