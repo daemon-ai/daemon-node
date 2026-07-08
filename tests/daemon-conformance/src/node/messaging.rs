@@ -611,6 +611,197 @@ async fn messaging_adapter_roster_manage_over_socket() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The wire-v34 server-side roster surface end to end over the Unix socket against the *real*
+/// [`daemon_rooms::RoomsAdapter`] `SupportsRoster` impl (not the in-test mock): the node reports the
+/// rooms family's `roster_ops` (all four verbs) in `TransportAdapters`; `RosterAdd`/`RosterUpdate`/
+/// `RosterRemove` mutate the adapter's in-memory roster and `RosterList` reflects each change (sorted
+/// + paged, contact-id order); and every successful mutation raises a `ContactsChanged` pointer for
+/// the `room` transport. Grounds the roster surface on the reference adapter, mirroring how
+/// `messaging_adapter_rooms_manage_over_socket` grounds the conv/member surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messaging_adapter_rooms_roster_manage_over_socket() {
+    use daemon_api::{ContactInfo, ContactPermission, NodeEvent, Presence};
+    use daemon_protocol::TransportId;
+
+    // The roster is in-memory, but the adapter still needs a store for its rooms/membership wiring.
+    let dir = std::env::temp_dir().join(format!("daemon-rooms-roster-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store: Arc<dyn SessionStore> =
+        Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
+    let AssembledNode {
+        node,
+        handle,
+        signer,
+        ..
+    } = assemble_over(store.clone(), 0, [0x5f; 32], fast_host_config());
+
+    let rooms_cfg = daemon_rooms::RoomsConfig {
+        enabled: true,
+        max_turns: 8,
+    };
+    let registry = daemon_host::AdapterRegistry::new().with_adapter(
+        daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+    );
+    node.set_adapters(registry);
+    let adapter_tasks = node.spawn_adapters();
+
+    let path = temp_socket();
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind api socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+    let client = ApiClient::new(path.clone());
+    let transport = TransportId::new("room");
+
+    // The node reports the rooms family's per-verb roster capabilities from `supported()`.
+    let adapters = match client.call(ApiRequest::TransportAdapters).await.unwrap() {
+        ApiResponse::Adapters(a) => a,
+        other => panic!("expected Adapters, got {other:?}"),
+    };
+    let ops = adapters
+        .iter()
+        .find(|a| a.family == "room")
+        .and_then(|a| a.roster_ops)
+        .expect("rooms adapter reports roster_ops");
+    assert!(
+        ops.list && ops.add && ops.update && ops.remove,
+        "the rooms adapter reports every roster verb"
+    );
+
+    let contact = |id: &str, name: Option<&str>| ContactInfo {
+        id: id.into(),
+        display_name: name.map(|s| s.into()),
+        presence: Presence::default(),
+        permission: ContactPermission::Allow,
+    };
+
+    // Empty to start.
+    assert!(roster_items(&client, &transport).await.is_empty());
+
+    // Add two (inserted out of id order) — the list comes back sorted by contact id (host-central).
+    for c in [
+        contact("agent-charlie", Some("Charlie")),
+        contact("agent-alice", Some("Alice")),
+    ] {
+        assert!(matches!(
+            client
+                .call(ApiRequest::RosterAdd {
+                    transport: transport.clone(),
+                    contact: c,
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+    }
+    let ids: Vec<String> = roster_items(&client, &transport)
+        .await
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["agent-alice".to_string(), "agent-charlie".to_string()]
+    );
+
+    // Adding a duplicate id is refused (the adapter errors; the id already on the roster).
+    assert!(matches!(
+        client
+            .call(ApiRequest::RosterAdd {
+                transport: transport.clone(),
+                contact: contact("agent-alice", Some("Alice II")),
+            })
+            .await
+            .unwrap(),
+        ApiResponse::Error(_)
+    ));
+
+    // Update reflects in the list.
+    assert!(matches!(
+        client
+            .call(ApiRequest::RosterUpdate {
+                transport: transport.clone(),
+                contact: contact("agent-alice", Some("Alice Cooper")),
+            })
+            .await
+            .unwrap(),
+        ApiResponse::Ok
+    ));
+    let alice = roster_items(&client, &transport)
+        .await
+        .into_iter()
+        .find(|c| c.id == "agent-alice")
+        .expect("alice present");
+    assert_eq!(alice.display_name.as_deref(), Some("Alice Cooper"));
+
+    // Updating a missing id is refused.
+    assert!(matches!(
+        client
+            .call(ApiRequest::RosterUpdate {
+                transport: transport.clone(),
+                contact: contact("agent-nobody", None),
+            })
+            .await
+            .unwrap(),
+        ApiResponse::Error(_)
+    ));
+
+    // Remove drops it; removing a missing id is refused.
+    assert!(matches!(
+        client
+            .call(ApiRequest::RosterRemove {
+                transport: transport.clone(),
+                contact: contact("agent-alice", None),
+            })
+            .await
+            .unwrap(),
+        ApiResponse::Ok
+    ));
+    assert!(matches!(
+        client
+            .call(ApiRequest::RosterRemove {
+                transport: transport.clone(),
+                contact: contact("agent-alice", None),
+            })
+            .await
+            .unwrap(),
+        ApiResponse::Error(_)
+    ));
+    let ids: Vec<String> = roster_items(&client, &transport)
+        .await
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, vec!["agent-charlie".to_string()]);
+
+    // Every successful mutation raised a ContactsChanged pointer for the `room` transport.
+    let saw_contacts_changed = match client
+        .call(ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        })
+        .await
+        .unwrap()
+    {
+        ApiResponse::EventsPage(page) => page.events.iter().any(
+            |e| matches!(e, NodeEvent::ContactsChanged { transport: t } if t.as_str() == "room"),
+        ),
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+    assert!(
+        saw_contacts_changed,
+        "a successful roster mutation must raise ContactsChanged on the node-wide feed"
+    );
+
+    server.abort();
+    for task in &adapter_tasks {
+        task.abort();
+    }
+    handle.shutdown().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wire page bound (v25): `ConvList` over a transport holding more than `WIRE_PAGE_MAX`
 /// conversations is served in cursor pages through real dispatch/CBOR — 70 rooms page as 64 + 6,
 /// the `next` cursor chains the pages, and the union is exactly the full set with no dup or gap.

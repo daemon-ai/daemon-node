@@ -32,8 +32,9 @@ use daemon_api::{
     ChannelJoinDetails, ConnectionState, ContactInfo, ContactPermission, ConvSendArgs,
     ConversationInfo, ConversationMember, ConversationOps, ConversationType,
     CreateConversationDetails, MemberInviteArgs, MemberRemoveArgs, MemberRole, MembershipOps,
-    MessagingProtocol, NodeApi, Participant, Presence, PresenceState, SupportsConversations,
-    SupportsMembership, TransportAdapter, TransportInstanceInfo, TypingState,
+    MessagingProtocol, NodeApi, Participant, Presence, PresenceState, RosterOps,
+    SupportsConversations, SupportsMembership, SupportsRoster, TransportAdapter,
+    TransportInstanceInfo, TypingState,
 };
 use daemon_common::{JournalStreamId, SessionId, UnitId};
 use daemon_host::journal::JournalSink;
@@ -349,6 +350,11 @@ pub struct RoomsAdapter {
     membership: Arc<Mutex<Membership>>,
     cmd_tx: mpsc::UnboundedSender<RoomCommand>,
     cmd_rx: Mutex<Option<mpsc::UnboundedReceiver<RoomCommand>>>,
+    /// The in-memory, per-transport server-side contact roster ([`SupportsRoster`], wire v34): a map
+    /// of `transport -> (contact id -> contact)`. The Rooms transport has no external directory, so
+    /// the roster is purely local process state (unlike rooms/membership, which persist to the store);
+    /// the host paginates + emits `ContactsChanged` centrally.
+    roster: Mutex<HashMap<TransportId, HashMap<String, ContactInfo>>>,
 }
 
 impl RoomsAdapter {
@@ -368,6 +374,7 @@ impl RoomsAdapter {
             membership: Arc::new(Mutex::new(Membership::new())),
             cmd_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
+            roster: Mutex::new(HashMap::new()),
         })
     }
 
@@ -559,6 +566,10 @@ impl MessagingProtocol for RoomsAdapter {
     }
 
     fn membership(self: Arc<Self>) -> Option<Arc<dyn SupportsMembership>> {
+        Some(self)
+    }
+
+    fn roster(self: Arc<Self>) -> Option<Arc<dyn SupportsRoster>> {
         Some(self)
     }
 }
@@ -805,5 +816,67 @@ impl SupportsMembership for RoomsAdapter {
             .unwrap()
             .remove(&RoomId::new(conv), &member);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl SupportsRoster for RoomsAdapter {
+    fn supported(&self) -> RosterOps {
+        // The Rooms transport keeps a full in-memory contact list; all four verbs are live.
+        RosterOps {
+            list: true,
+            add: true,
+            update: true,
+            remove: true,
+        }
+    }
+
+    async fn list(&self, transport: TransportId) -> Vec<ContactInfo> {
+        // Unpaged + adapter-ordered: the host sorts by contact id and pages centrally.
+        self.roster
+            .lock()
+            .unwrap()
+            .get(&transport)
+            .map(|contacts| contacts.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    async fn add(&self, transport: TransportId, contact: ContactInfo) -> Result<(), ApiError> {
+        let mut roster = self.roster.lock().unwrap();
+        let contacts = roster.entry(transport).or_default();
+        if contacts.contains_key(&contact.id) {
+            return Err(ApiError::Other(format!(
+                "contact {} already on the roster",
+                contact.id
+            )));
+        }
+        contacts.insert(contact.id.clone(), contact);
+        Ok(())
+    }
+
+    async fn update(&self, transport: TransportId, contact: ContactInfo) -> Result<(), ApiError> {
+        let mut roster = self.roster.lock().unwrap();
+        match roster
+            .get_mut(&transport)
+            .and_then(|c| c.get_mut(&contact.id))
+        {
+            Some(slot) => {
+                *slot = contact;
+                Ok(())
+            }
+            None => Err(ApiError::Other(format!("contact {} not found", contact.id))),
+        }
+    }
+
+    async fn remove(&self, transport: TransportId, contact: ContactInfo) -> Result<(), ApiError> {
+        let mut roster = self.roster.lock().unwrap();
+        let removed = roster
+            .get_mut(&transport)
+            .is_some_and(|contacts| contacts.remove(&contact.id).is_some());
+        if removed {
+            Ok(())
+        } else {
+            Err(ApiError::Other(format!("contact {} not found", contact.id)))
+        }
     }
 }
