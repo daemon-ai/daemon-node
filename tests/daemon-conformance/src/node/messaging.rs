@@ -644,7 +644,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
         daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
     );
     node.set_adapters(registry);
-    let adapter_tasks = node.spawn_adapters();
+    let adapter_tasks = node.spawn_adapters().await;
 
     let path = temp_socket();
     let _ = std::fs::remove_file(&path);
