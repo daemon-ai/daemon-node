@@ -141,6 +141,7 @@ use daemon_api::{
     SupportsConversations,
     SupportsDirectory,
     SupportsMembership,
+    SupportsRoster,
     TelemetryDump,
     TransportInstanceInfo,
     TreeReport,

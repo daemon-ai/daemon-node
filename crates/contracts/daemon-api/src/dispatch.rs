@@ -510,6 +510,18 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
             api.directory_search(transport, query).await,
             ApiResponse::Contacts,
         ),
+        ApiRequest::RosterList { transport, after } => {
+            ApiResponse::ContactPage(api.roster_list(transport, after).await)
+        }
+        ApiRequest::RosterAdd { transport, contact } => {
+            unit_or_err(api.roster_add(transport, contact).await)
+        }
+        ApiRequest::RosterUpdate { transport, contact } => {
+            unit_or_err(api.roster_update(transport, contact).await)
+        }
+        ApiRequest::RosterRemove { transport, contact } => {
+            unit_or_err(api.roster_remove(transport, contact).await)
+        }
         _ => return None,
     })
 }

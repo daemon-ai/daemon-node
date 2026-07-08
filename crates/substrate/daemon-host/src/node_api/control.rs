@@ -1435,6 +1435,83 @@ impl ControlApi for NodeApiImpl {
             .await
     }
 
+    async fn roster_list(
+        &self,
+        transport: TransportId,
+        after: Option<String>,
+    ) -> daemon_api::WirePage<ContactInfo> {
+        // The adapter returns the unbounded, adapter-ordered roster; sort + page here (once) rather
+        // than teaching every `SupportsRoster` impl the cursor. The cursor is the contact id
+        // (mirrors `conv_list`).
+        let mut contacts = match self.roster_for(&transport) {
+            Ok(r) => r.list(transport).await,
+            Err(_) => Vec::new(),
+        };
+        contacts.sort_by(|a, b| a.id.cmp(&b.id));
+        daemon_api::paginate(contacts, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
+            c.id.clone()
+        })
+    }
+
+    async fn roster_add(
+        &self,
+        transport: TransportId,
+        contact: ContactInfo,
+    ) -> Result<(), ApiError> {
+        let detail = format!("transport={} contact={}", transport.as_str(), contact.id);
+        let res = self
+            .audited(
+                "mgmt.roster.add",
+                detail,
+                self.roster_for(&transport)?.add(transport.clone(), contact),
+            )
+            .await;
+        if res.is_ok() {
+            self.emit_contacts_changed(transport);
+        }
+        res
+    }
+
+    async fn roster_update(
+        &self,
+        transport: TransportId,
+        contact: ContactInfo,
+    ) -> Result<(), ApiError> {
+        let detail = format!("transport={} contact={}", transport.as_str(), contact.id);
+        let res = self
+            .audited(
+                "mgmt.roster.update",
+                detail,
+                self.roster_for(&transport)?
+                    .update(transport.clone(), contact),
+            )
+            .await;
+        if res.is_ok() {
+            self.emit_contacts_changed(transport);
+        }
+        res
+    }
+
+    async fn roster_remove(
+        &self,
+        transport: TransportId,
+        contact: ContactInfo,
+    ) -> Result<(), ApiError> {
+        let detail = format!("transport={} contact={}", transport.as_str(), contact.id);
+        let res = self
+            .audited(
+                "mgmt.roster.remove",
+                detail,
+                self.roster_for(&transport)?
+                    .remove(transport.clone(), contact),
+            )
+            .await;
+        if res.is_ok() {
+            self.emit_contacts_changed(transport);
+        }
+        res
+    }
+
     async fn agent_discover(&self) -> Vec<AgentEntry> {
         // Probe the curated direct-binary recipe table via the injected discovery hook (the binary
         // owns the ACP runtime). Cache the results so `agent_catalog` surfaces them without

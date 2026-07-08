@@ -557,6 +557,7 @@ node-event = node-event-session-advanced
            / node-event-transport-changed
            / node-event-conversations-changed
            / node-event-membership-changed
+           / node-event-contacts-changed
            / node-event-resync-needed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
@@ -575,6 +576,7 @@ node-event-catalog-changed      = "CatalogChanged"
 node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state, ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool } }
 node-event-conversations-changed = { "ConversationsChanged": { "transport": transport-id, "conv": tstr, "change": conv-change } }
 node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool } }
+node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 events-page = {
   "events": [0*64 node-event],
@@ -1087,7 +1089,7 @@ policy-entry = { "key": tstr, "label": tstr, "value": tstr }
 conversation-ops = { "create": bool, "join_channel": bool, "leave": bool, "delete": bool, "send": bool, "set_topic": bool, "set_title": bool, "set_description": bool }
 membership-ops = { "invite": bool, "remove": bool, "ban": bool, "set_role": bool }
 contacts-ops = { "get_profile": bool, "action_menu": bool, "set_alias": bool }
-roster-ops = { "add": bool, "update": bool, "remove": bool }
+roster-ops = { "list": bool, "add": bool, "update": bool, "remove": bool }
 adapter-info = { "family": tstr, "display_name": tstr, "capabilities": adapter-capabilities, ? "account_schema": account-settings-schema, ? "policies": [* policy-entry], ? "conversation_ops": (conversation-ops / null), ? "membership_ops": (membership-ops / null), ? "contacts_ops": (contacts-ops / null), ? "roster_ops": (roster-ops / null), ? "directory": bool }
 connection-state = "Offline"
                  / "Connecting"
@@ -1331,6 +1333,10 @@ request-contact-get-profile = { "ContactGetProfile": { "transport": transport-id
 request-contact-set-alias = { "ContactSetAlias": { "transport": transport-id, "contact": contact-info, ? "alias": (tstr / null) } }
 request-contact-action-menu = { "ContactActionMenu": { "transport": transport-id, "contact": contact-info } }
 request-directory-search = { "DirectorySearch": { "transport": transport-id, ? "query": (tstr / null) } }
+request-roster-list = { "RosterList": { "transport": transport-id, ? "after": (tstr / null) } }
+request-roster-add = { "RosterAdd": { "transport": transport-id, "contact": contact-info } }
+request-roster-update = { "RosterUpdate": { "transport": transport-id, "contact": contact-info } }
+request-roster-remove = { "RosterRemove": { "transport": transport-id, "contact": contact-info } }
 request-fs-roots = "FsRoots"
 request-fs-list = { "FsList": { "root": fs-root-id-t, "dir": tstr, ? "show_ignored": bool, ? "after": (tstr / null) } }
 request-fs-stat = { "FsStat": { "root": fs-root-id-t, "path": tstr } }
@@ -1521,6 +1527,10 @@ api-request = request-submit
             / request-contact-set-alias
             / request-contact-action-menu
             / request-directory-search
+            / request-roster-list
+            / request-roster-add
+            / request-roster-update
+            / request-roster-remove
             / request-fs-roots
             / request-fs-list
             / request-fs-stat
@@ -1566,6 +1576,7 @@ revision-page = { "items": [0*64 revision], ? "next": (tstr / null) }
 chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
 room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
 conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null) }
+contact-page = { "items": [0*64 contact-info], ? "next": (tstr / null) }
 response-approvals = { "Approvals": approval-page }
 response-fingerprints = { "Fingerprints": [0*64 remembered-fingerprint] }
 response-fleet = { "Fleet": fleet-report }
@@ -1633,6 +1644,7 @@ response-conv-create-details = { "ConvCreateDetails": create-conversation-detail
 response-conv-join-details = { "ConvJoinDetails": channel-join-details }
 response-contact-profile = { "ContactProfile": tstr }
 response-contacts = { "Contacts": [* contact-info] }
+response-contact-page = { "ContactPage": contact-page }
 response-action-menu = { "ActionMenu": (action-menu / null) }
 response-error = { "Error": api-error }
 response-fs-roots = { "FsRoots": [* fs-root] }
@@ -1733,6 +1745,7 @@ api-response = response-ok
              / response-conv-join-details
              / response-contact-profile
              / response-contacts
+             / response-contact-page
              / response-action-menu
              / response-error
              / response-fs-roots

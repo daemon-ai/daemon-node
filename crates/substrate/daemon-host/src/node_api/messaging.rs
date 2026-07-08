@@ -79,6 +79,24 @@ impl NodeApiImpl {
                 ))
             })
     }
+
+    /// Resolve the server-side roster (contact-list) feature for `transport`.
+    pub(crate) fn roster_for(
+        &self,
+        transport: &TransportId,
+    ) -> Result<Arc<dyn SupportsRoster>, ApiError> {
+        self.adapters
+            .load_full()
+            .adapter_for_transport(transport)
+            .and_then(|a| a.messaging())
+            .and_then(|m| m.roster())
+            .ok_or_else(|| {
+                ApiError::Unsupported(format!(
+                    "transport {} has no roster support",
+                    transport.as_str()
+                ))
+            })
+    }
 }
 
 /// A human label for a [`Participant`] (the management-audit detail; never a secret payload).

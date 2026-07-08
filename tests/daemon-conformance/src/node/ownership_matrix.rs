@@ -392,7 +392,11 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ContactGetProfile { .. }
         | ContactSetAlias { .. }
         | ContactActionMenu { .. }
-        | DirectorySearch { .. } => NotSessionTouching,
+        | DirectorySearch { .. }
+        | RosterList { .. }
+        | RosterAdd { .. }
+        | RosterUpdate { .. }
+        | RosterRemove { .. } => NotSessionTouching,
         AgentDiscover
         | AgentCatalog
         | AgentRegister { .. }

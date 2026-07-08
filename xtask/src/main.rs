@@ -451,6 +451,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     set_alias: false,
                 }),
                 roster_ops: Some(RosterOps {
+                    list: true,
                     add: false,
                     update: false,
                     remove: false,
@@ -570,6 +571,56 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 members: Vec::new(),
             }],
             next: Some("conv-064".into()),
+        }),
+    )?;
+    // Server-side roster (wire v34): a paged list request + resume, the mutation requests carrying a
+    // ContactInfo, and a ContactPage response with a set `next` cursor — so verify-codec proves the
+    // generated zcbor C decoder accepts the contact-page shape + the four new request variants.
+    write_cbor(
+        &out,
+        "request-roster-list.cbor",
+        &ApiRequest::RosterList {
+            transport: TransportId::new("matrix/@me:hs.org"),
+            after: Some("@aaa:matrix.org".into()),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-roster-add.cbor",
+        &ApiRequest::RosterAdd {
+            transport: TransportId::new("matrix/@me:hs.org"),
+            contact: daemon_api::ContactInfo {
+                id: "@bob:matrix.org".into(),
+                display_name: Some("Bob".into()),
+                presence: daemon_api::Presence::default(),
+                permission: daemon_api::ContactPermission::Allow,
+            },
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-roster-remove.cbor",
+        &ApiRequest::RosterRemove {
+            transport: TransportId::new("matrix/@me:hs.org"),
+            contact: daemon_api::ContactInfo {
+                id: "@bob:matrix.org".into(),
+                display_name: None,
+                presence: daemon_api::Presence::default(),
+                permission: daemon_api::ContactPermission::Unset,
+            },
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-contact-page.cbor",
+        &ApiResponse::ContactPage(daemon_api::WirePage {
+            items: vec![daemon_api::ContactInfo {
+                id: "@bob:matrix.org".into(),
+                display_name: Some("Bob".into()),
+                presence: daemon_api::Presence::default(),
+                permission: daemon_api::ContactPermission::Allow,
+            }],
+            next: Some("@bob:matrix.org".into()),
         }),
     )?;
     write_cbor(&out, "request-command-list.cbor", &ApiRequest::CommandList)?;
@@ -1050,6 +1101,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     actor: Some("@admin:hs.org".into()),
                     reason: Some("cleanup".into()),
                     is_self: true,
+                },
+                // v34: the roster-changed pointer, so verify-codec proves the generated decoder
+                // accepts the new node-event arm.
+                NodeEvent::ContactsChanged {
+                    transport: TransportId::new("matrix/@bot:hs.org"),
                 },
             ],
             next_cursor: 12,

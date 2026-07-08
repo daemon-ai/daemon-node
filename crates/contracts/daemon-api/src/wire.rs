@@ -862,6 +862,35 @@ pub enum ApiRequest {
         #[serde(default)]
         query: Option<String>,
     },
+    /// [`ControlApi::roster_list`] — a transport's server-side contact roster (wire v34).
+    RosterList {
+        /// The owning transport.
+        transport: TransportId,
+        /// Resume cursor: the previous page's `next` (the last served contact `id`).
+        #[serde(default)]
+        after: Option<String>,
+    },
+    /// [`ControlApi::roster_add`] — add a contact to the server-side roster (wire v34).
+    RosterAdd {
+        /// The owning transport.
+        transport: TransportId,
+        /// The contact to add.
+        contact: ContactInfo,
+    },
+    /// [`ControlApi::roster_update`] — update a contact on the server-side roster (wire v34).
+    RosterUpdate {
+        /// The owning transport.
+        transport: TransportId,
+        /// The contact to update.
+        contact: ContactInfo,
+    },
+    /// [`ControlApi::roster_remove`] — remove a contact from the server-side roster (wire v34).
+    RosterRemove {
+        /// The owning transport.
+        transport: TransportId,
+        /// The contact to remove.
+        contact: ContactInfo,
+    },
     /// [`ControlApi::fs_roots`].
     FsRoots,
     /// [`ControlApi::fs_list`].
@@ -1185,6 +1214,8 @@ pub enum ApiResponse {
     ContactProfile(String),
     /// A list of contacts (directory_search).
     Contacts(Vec<ContactInfo>),
+    /// A page of a transport's server-side contact roster (roster_list), contact-id order (wire v34).
+    ContactPage(WirePage<ContactInfo>),
     /// A contact's action menu, if any (contact_action_menu).
     ActionMenu(Option<ActionMenu>),
     /// The typed create-conversation form (conv_create_details).

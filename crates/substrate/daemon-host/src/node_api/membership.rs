@@ -58,6 +58,15 @@ impl NodeApiImpl {
         }
     }
 
+    /// Emit a `ContactsChanged` for `transport` (wire v34) after a successful roster mutation
+    /// (`roster_add`/`roster_update`/`roster_remove`) so clients refetch `RosterList` without
+    /// polling. A payload-free-per-transport invalidation pointer, mirroring `conversations_changed`.
+    pub(crate) fn emit_contacts_changed(&self, transport: TransportId) {
+        if let Some(feed) = self.node_feed() {
+            feed.emit(NodeEvent::ContactsChanged { transport });
+        }
+    }
+
     /// Reconcile the node's own routing on a self-removal (item 3): drop the now-dangling
     /// `ChatRoute` pin for the conversation's origin (matches libpurple teardown — a re-join re-pins
     /// on next inbound), then reload the live routing table. Called BEFORE the invalidation event is

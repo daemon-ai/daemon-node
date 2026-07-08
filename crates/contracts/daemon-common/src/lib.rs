@@ -673,7 +673,20 @@ impl WireVersion {
     /// populates them centrally in `transport_adapters()` from each feature trait's `supported()`.
     /// Additive (new optional fields + new named ops rules), but bumped because `is_compatible` is
     /// strict-equal (mirrors the additive v15–v32 bumps).
-    pub const CURRENT: Self = Self(33);
+    ///
+    /// v34 (roster surface): plumbs the server-side contact roster (`SupportsRoster`) end to end so
+    /// a thin client renders + mutates an account's contact list. `RosterOps` gains a `list` bool
+    /// (the Contacts-section gate) alongside the existing `add`/`update`/`remove`. Adds four
+    /// `ControlApi` ops — `roster_list` (paged `ContactPage(WirePage<ContactInfo>)`, contact-id
+    /// order, mirroring `conv_list`) and the `roster_add`/`roster_update`/`roster_remove` mutations
+    /// (standard `Ok`/`Error`) — with the wire requests `RosterList { transport, after? }` and
+    /// `RosterAdd`/`RosterUpdate`/`RosterRemove { transport, contact }`, plus the `contact-page`
+    /// rule. A successful roster mutation emits the new node event `ContactsChanged { transport }`
+    /// (named to avoid colliding with the session-`RosterChanged` event) so clients refetch
+    /// `RosterList` without polling. Additive (new optional `list` field on `roster-ops` + new
+    /// request/response/event variants), but bumped because `is_compatible` is strict-equal
+    /// (mirrors the additive v15–v33 bumps).
+    pub const CURRENT: Self = Self(34);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

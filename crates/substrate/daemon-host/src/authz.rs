@@ -197,7 +197,8 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ConvHistory(_)
         | ContactGetProfile { .. }
         | ContactActionMenu { .. }
-        | DirectorySearch { .. } => C::MessagingRead,
+        | DirectorySearch { .. }
+        | RosterList { .. } => C::MessagingRead,
         ConvCreate { .. }
         | ConvJoin { .. }
         | ConvLeave { .. }
@@ -210,7 +211,10 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | MemberRemove(_)
         | MemberBan(_)
         | MemberSetRole(_)
-        | ContactSetAlias { .. } => C::MessagingWrite,
+        | ContactSetAlias { .. }
+        | RosterAdd { .. }
+        | RosterUpdate { .. }
+        | RosterRemove { .. } => C::MessagingWrite,
 
         // -- serve_registry: extension/agent/provider registry + node config --------------------
         // AgentDiscover only probes recipes and caches in memory (no persistence) -> a read.

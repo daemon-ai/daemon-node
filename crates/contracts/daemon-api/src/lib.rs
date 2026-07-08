@@ -976,6 +976,47 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("directory_search".into()))
     }
 
+    /// List a transport's server-side contact roster (`SupportsRoster::list`), paged at
+    /// [`WIRE_PAGE_MAX`] in contact-id order (mirrors [`ControlApi::conv_list`]; the adapter
+    /// returns the unbounded roster, the host sorts + pages it once). Default: empty.
+    async fn roster_list(
+        &self,
+        _transport: TransportId,
+        _after: Option<String>,
+    ) -> WirePage<ContactInfo> {
+        WirePage::default()
+    }
+
+    /// Add a contact to a transport's server-side roster (`SupportsRoster::add`). Default:
+    /// unsupported.
+    async fn roster_add(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("roster_add".into()))
+    }
+
+    /// Update a contact already on a transport's server-side roster (`SupportsRoster::update`).
+    /// Default: unsupported.
+    async fn roster_update(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("roster_update".into()))
+    }
+
+    /// Remove a contact from a transport's server-side roster (`SupportsRoster::remove`). Default:
+    /// unsupported.
+    async fn roster_remove(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("roster_remove".into()))
+    }
+
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
     /// Trigger a server-side foreign-agent discovery scan (PATH + well-known locations + the
@@ -3539,6 +3580,9 @@ pub trait SupportsMembership: Send + Sync {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterOps {
+    /// Enumerate the account's server-side contact list (wire v34; ← `purple_protocol_roster_*`
+    /// listing). Gates the client's Contacts section.
+    pub list: bool,
     pub add: bool,
     pub update: bool,
     pub remove: bool,
@@ -3548,6 +3592,11 @@ pub struct RosterOps {
 #[async_trait]
 pub trait SupportsRoster: Send + Sync {
     fn supported(&self) -> RosterOps;
+    /// List the account's server-side contact roster (wire v34). Adapter-ordered + unbounded; the
+    /// host sorts + pages it centrally (mirrors [`SupportsConversations::list`]). Default: empty.
+    async fn list(&self, _transport: TransportId) -> Vec<ContactInfo> {
+        Vec::new()
+    }
     async fn add(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("roster_add".into()))
     }
@@ -4149,6 +4198,14 @@ pub enum NodeEvent {
         /// Whether `member` is THIS account. On a self `Left`/`Kicked`/`Banned` the node reconciled
         /// its routing for the now-dangling origin before emitting.
         is_self: bool,
+    },
+    /// A transport's server-side contact roster changed (wire v34): a contact was added, updated, or
+    /// removed. A payload-free-per-transport invalidation pointer (named `ContactsChanged` to avoid
+    /// colliding with the session-roster [`NodeEvent::RosterChanged`]); the client refetches the
+    /// roster (`RosterList`). Retires client roster re-polling.
+    ContactsChanged {
+        /// The owning transport instance whose roster changed.
+        transport: TransportId,
     },
     /// The feed could not serve from the client's cursor (aged out / lagged); the client must
     /// re-baseline the named scope ("roster" / "all" / ...).
@@ -4799,6 +4856,7 @@ mod tests {
                 set_alias: true,
             }),
             roster_ops: Some(RosterOps {
+                list: true,
                 add: true,
                 update: false,
                 remove: true,
@@ -4856,6 +4914,68 @@ mod tests {
         assert_eq!(info.contacts_ops, None);
         assert_eq!(info.roster_ops, None);
         assert!(!info.directory);
+    }
+
+    #[test]
+    fn messaging_roster_requests_responses_and_event_round_trip() {
+        // wire v34: the server-side roster surface — the four RosterList/Add/Update/Remove requests,
+        // the paged ContactPage response, and the ContactsChanged node event — must all CBOR
+        // round-trip so they agree with the CDDL under `api-request` / `api-response`.
+        let contact = ContactInfo {
+            id: "@bob:matrix.org".into(),
+            display_name: Some("Bob".into()),
+            presence: Presence::default(),
+            permission: ContactPermission::Allow,
+        };
+        let transport = TransportId::new("matrix/@me:hs.org");
+        let reqs = vec![
+            ApiRequest::RosterList {
+                transport: transport.clone(),
+                after: Some("@aaa:matrix.org".into()),
+            },
+            ApiRequest::RosterList {
+                transport: transport.clone(),
+                after: None,
+            },
+            ApiRequest::RosterAdd {
+                transport: transport.clone(),
+                contact: contact.clone(),
+            },
+            ApiRequest::RosterUpdate {
+                transport: transport.clone(),
+                contact: contact.clone(),
+            },
+            ApiRequest::RosterRemove {
+                transport: transport.clone(),
+                contact: contact.clone(),
+            },
+        ];
+        for req in reqs {
+            assert_eq!(req, from_cbor::<ApiRequest>(&to_cbor(&req)).unwrap());
+        }
+
+        let resps = vec![
+            ApiResponse::ContactPage(WirePage {
+                items: vec![contact.clone()],
+                next: Some("@bob:matrix.org".into()),
+            }),
+            ApiResponse::ContactPage(WirePage::default()),
+            ApiResponse::Ok,
+        ];
+        for resp in resps {
+            assert_eq!(resp, from_cbor::<ApiResponse>(&to_cbor(&resp)).unwrap());
+        }
+
+        // The ContactsChanged event round-trips inside an EventsPage (its wire carrier).
+        let wrapped = EventsPage {
+            events: vec![NodeEvent::ContactsChanged { transport }],
+            next_cursor: 1,
+            head_cursor: 1,
+        };
+        assert_eq!(
+            wrapped,
+            from_cbor::<EventsPage>(&to_cbor(&wrapped)).unwrap()
+        );
     }
 
     fn sample_info() -> SessionInfo {
