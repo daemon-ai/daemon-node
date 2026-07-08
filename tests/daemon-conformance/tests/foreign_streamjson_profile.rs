@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemon_api::{
-    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, EngineSelector, Outbound,
-    ProfileApi, ProfileSpec, ProviderSelector, SessionApi,
+    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, AgentVerification, ControlApi,
+    EngineSelector, Outbound, ProfileApi, ProfileSpec, ProviderSelector, SessionApi,
 };
 use daemon_common::{ProfileRef, ReqId};
 use daemon_core::{MockProvider, Provider, ProviderBuilder, ProviderRegistry};
@@ -151,6 +151,7 @@ async fn streamjson_profile_spawns_and_completes_a_turn_impl() {
         installed: false, // the probe fills this in; a caller-supplied value is not trusted
         version: None,
         capabilities: Vec::new(),
+        verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
     })
     .await
     .expect("register the mock stream-json agent");

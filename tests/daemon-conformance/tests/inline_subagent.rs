@@ -20,7 +20,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use daemon_api::{AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, ProfileSpec};
+use daemon_api::{
+    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, AgentVerification, ControlApi, ProfileSpec,
+};
 use daemon_common::{JournalStreamId, PartitionId, ProfileRef, SessionId};
 use daemon_core::{
     Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderBuilder, ProviderRegistry,
@@ -179,6 +181,7 @@ async fn register_mock_agent(node: &Arc<NodeApiImpl>, name: &str) {
         installed: false,
         version: None,
         capabilities: Vec::new(),
+        verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
     })
     .await
     .expect("register the mock ACP agent");

@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use daemon_api::{
-    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, EngineSelector, ProfileApi,
-    ProfileSpec, ProviderSelector,
+    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, AgentVerification, ControlApi,
+    EngineSelector, ProfileApi, ProfileSpec, ProviderSelector,
 };
 use daemon_common::{PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::{MockProvider, Provider, ProviderBuilder, ProviderRegistry, Snapshot};
@@ -117,6 +117,7 @@ async fn tree_nodes_carry_lifetime_and_engine_impl() {
         installed: false,
         version: None,
         capabilities: Vec::new(),
+        verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
     })
     .await
     .expect("register the mock stream-json agent");

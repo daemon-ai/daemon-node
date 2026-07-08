@@ -1429,7 +1429,11 @@ impl ControlApi for NodeApiImpl {
             by_name.insert(entry.name.clone(), entry.clone());
         }
         for stored in self.store.acp_list().await {
-            if let Ok(entry) = from_cbor::<AgentEntry>(&stored.entry) {
+            if let Ok(mut entry) = from_cbor::<AgentEntry>(&stored.entry) {
+                // Re-derive the trust status from the durable installed/protocol/version so a
+                // legacy row stored before the wire carried `verification` (decodes as the default)
+                // surfaces the node's current verdict — the single node-side derivation.
+                entry.refresh_verification();
                 by_name.insert(entry.name.clone(), entry);
             }
         }
@@ -1445,6 +1449,10 @@ impl ControlApi for NodeApiImpl {
             entry = agents.probe(entry).await;
             entry.source = AgentSource::Manual;
         }
+        // Re-derive the trust status from the (probed, if a hook is wired) installed/protocol/version
+        // — never trust the caller-supplied value, and cover the no-hook path where `probe` did not
+        // run. The single node-side derivation.
+        entry.refresh_verification();
         self.store
             .acp_set(daemon_store::AcpEntry {
                 name: entry.name.clone(),

@@ -757,6 +757,15 @@ agent-source = "Builtin"
 agent-protocol = "Acp"
                / "StreamJson"
 
+; The node-derived trust status (wire v32): computed once from installed/protocol/version so every
+; client renders the same verdict. "Verified" = installed ACP agent that reported a version at
+; `initialize`; "Unverified" = installed but unconfirmed (stream-json, or ACP without a handshake
+; version); "NotInstalled" = no candidate found (the serde default — a pre-v32 entry omitting the
+; field decodes as "NotInstalled" until the node re-derives).
+agent-verification = "Verified"
+                   / "Unverified"
+                   / "NotInstalled"
+
 agent-recipe = {
   ? "program": (tstr / null),
   ? "args": [* tstr],
@@ -772,6 +781,7 @@ agent-entry = {
   ? "installed": bool,
   ? "version": (tstr / null),
   ? "capabilities": [* kv-pair],
+  ? "verification": agent-verification,
 }
 
 ; ----- long-tail surface stub DTOs (wire v14; tool-info enriched in v29) -----

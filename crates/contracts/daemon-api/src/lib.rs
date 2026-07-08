@@ -2526,6 +2526,24 @@ pub struct AgentRecipe {
     pub endpoint: Option<String>,
 }
 
+/// The node-derived trust status of a cataloged agent (wire v32) — computed once at catalog
+/// assembly from `installed` / `protocol` / `version` so every client renders the same verdict
+/// instead of re-deriving it. Build it only via [`AgentEntry::derive_verification`] (never hand-roll
+/// the rule at a call site).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentVerification {
+    /// Installed and confirmed via the ACP `initialize` handshake (protocol version reported).
+    Verified,
+    /// Installed but unconfirmed: a stream-json agent (no handshake), or an ACP agent whose
+    /// `initialize` probe has not reported a protocol version.
+    Unverified,
+    /// No candidate binary/endpoint was found on PATH/well-known/endpoint probe (the serde default,
+    /// so a pre-v32 encoding without the field decodes as `NotInstalled` until the node re-derives).
+    #[default]
+    NotInstalled,
+}
+
 /// One entry in the foreign-agent catalog ([`ControlApi::agent_catalog`] /
 /// [`ControlApi::agent_discover`]): a known/registered agent, the protocol it speaks, whether it is
 /// installed, and (for ACP) the `initialize`-verified metadata.
@@ -2552,6 +2570,36 @@ pub struct AgentEntry {
     /// stream-json agents).
     #[serde(default)]
     pub capabilities: Vec<(String, String)>,
+    /// The node-derived trust status (wire v32): the single authoritative verdict a client renders
+    /// verbatim. Always recomputed by the node from `installed`/`protocol`/`version` at catalog
+    /// assembly (see [`AgentEntry::derive_verification`] / [`AgentEntry::refresh_verification`]); a
+    /// caller-supplied value on a registration is not trusted.
+    #[serde(default)]
+    pub verification: AgentVerification,
+}
+
+impl AgentEntry {
+    /// The single derivation rule for [`AgentVerification`] — the ONE place `installed` / `protocol`
+    /// / `version` are folded into a verdict, so no client (or node) call site re-implements it:
+    /// not installed ⇒ `NotInstalled`; an installed ACP agent that reported a version at
+    /// `initialize` ⇒ `Verified`; anything else installed (stream-json, or ACP without a handshake
+    /// version) ⇒ `Unverified`.
+    pub fn derive_verification(&self) -> AgentVerification {
+        if !self.installed {
+            AgentVerification::NotInstalled
+        } else if matches!(self.protocol, AgentProtocol::Acp) && self.version.is_some() {
+            AgentVerification::Verified
+        } else {
+            AgentVerification::Unverified
+        }
+    }
+
+    /// Recompute [`Self::verification`] from the current `installed`/`protocol`/`version`. Call this
+    /// after any mutation of those fields (probe/enrich) and before serving/persisting an entry, so
+    /// the wire status stays in lockstep with the raw fields the node derives it from.
+    pub fn refresh_verification(&mut self) {
+        self.verification = self.derive_verification();
+    }
 }
 
 /// A push stream of [`LogLine`]s ([`ControlApi::logs`]). Streaming is a transport capability, like
@@ -4734,6 +4782,7 @@ mod tests {
                     installed: true,
                     version: Some("0.1".into()),
                     capabilities: vec![("fs".into(), "true".into())],
+                    verification: AgentVerification::Verified,
                 },
             },
             ApiRequest::AgentRegister {
@@ -4750,6 +4799,7 @@ mod tests {
                     installed: true,
                     version: None,
                     capabilities: Vec::new(),
+                    verification: AgentVerification::Unverified,
                 },
             },
         ];

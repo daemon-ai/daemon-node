@@ -346,7 +346,7 @@ fn curated_entry(row: &Curated) -> daemon_api::AgentEntry {
         env: Vec::new(),
         endpoint: None,
     };
-    daemon_api::AgentEntry {
+    let mut entry = daemon_api::AgentEntry {
         name: row.name.to_string(),
         installed: recipe_installed(&recipe),
         recipe,
@@ -354,7 +354,12 @@ fn curated_entry(row: &Curated) -> daemon_api::AgentEntry {
         protocol: row.protocol,
         version: None,
         capabilities: Vec::new(),
-    }
+        verification: daemon_api::AgentVerification::NotInstalled,
+    };
+    // Derive the trust status from the freshly-computed installed/protocol/version (the node's ONE
+    // rule). `discover`/`probe` recompute it after the `initialize` enrich.
+    entry.refresh_verification();
+    entry
 }
 
 /// The server-side ACP discoverer (I7): probes the curated direct-binary recipe table on `$PATH` via
@@ -413,6 +418,9 @@ impl daemon_host::AgentDiscovery for AcpDiscoverer {
                     }
                 }
             }
+            // Re-derive the trust status now that the `initialize` handshake (if any) has settled
+            // `version` — the single node-side derivation, so no client re-implements it.
+            entry.refresh_verification();
             out.push(entry);
         }
         out
@@ -425,15 +433,17 @@ impl daemon_host::AgentDiscovery for AcpDiscoverer {
         if let Some(program) = entry.recipe.program.as_deref() {
             entry.installed = which(program).is_some();
         }
-        if entry.protocol != daemon_api::AgentProtocol::Acp {
-            return entry;
-        }
-        if let Some(launch) = launch_from_recipe(&entry.recipe) {
-            if let Some(p) = probe(launch).await {
-                entry.version = Some(p.protocol_version);
-                entry.capabilities = p.capabilities;
+        if entry.protocol == daemon_api::AgentProtocol::Acp {
+            if let Some(launch) = launch_from_recipe(&entry.recipe) {
+                if let Some(p) = probe(launch).await {
+                    entry.version = Some(p.protocol_version);
+                    entry.capabilities = p.capabilities;
+                }
             }
         }
+        // Derive the trust status from the now-settled installed/protocol/version (the node's ONE
+        // rule) before handing the enriched entry back to the host.
+        entry.refresh_verification();
         entry
     }
 

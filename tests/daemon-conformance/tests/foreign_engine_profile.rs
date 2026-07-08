@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemon_api::{
-    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, ControlApi, EngineSelector,
-    ForeignBackend, Outbound, ProfileApi, ProfileSpec, ProviderSelector, SessionApi, SessionQuery,
+    AgentEntry, AgentProtocol, AgentRecipe, AgentSource, AgentVerification, ControlApi,
+    EngineSelector, ForeignBackend, Outbound, ProfileApi, ProfileSpec, ProviderSelector,
+    SessionApi, SessionQuery,
 };
 use daemon_common::{ProfileRef, ReqId};
 use daemon_core::{MockProvider, Provider, ProviderBuilder, ProviderRegistry};
@@ -129,6 +130,7 @@ async fn register_mock_agent(node: &Arc<NodeApiImpl>, name: &str) {
         installed: false, // the probe fills this in; a caller-supplied value is not trusted
         version: None,
         capabilities: Vec::new(),
+        verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
     })
     .await
     .expect("register the mock ACP agent");
@@ -398,6 +400,7 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
         installed: false,
         version: None,
         capabilities: Vec::new(),
+        verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
     })
     .await
     .expect("register the ghost agent");

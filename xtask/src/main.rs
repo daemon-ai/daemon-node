@@ -796,6 +796,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 installed: true,
                 version: Some("1".into()),
                 capabilities: vec![("fs".into(), "true".into())],
+                verification: daemon_api::AgentVerification::Verified,
             },
             daemon_api::AgentEntry {
                 name: "claude".into(),
@@ -810,6 +811,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 installed: true,
                 version: None,
                 capabilities: Vec::new(),
+                verification: daemon_api::AgentVerification::Unverified,
             },
         ]),
     )?;
