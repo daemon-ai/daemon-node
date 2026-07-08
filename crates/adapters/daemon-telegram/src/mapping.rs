@@ -8,7 +8,7 @@
 //! the wire DTOs. Keeping the projection here (rather than against grammers types) makes it unit
 //! testable without a live client — the same split `daemon-matrix` uses for its `mapping` module.
 
-use daemon_api::{ConversationInfo, ConversationMember, ConversationType};
+use daemon_api::{ContactInfo, ConversationInfo, ConversationMember, ConversationType};
 use daemon_protocol::TransportId;
 
 /// The daemon-opaque conversation id for a Telegram chat: the peer id rendered as a base-10 string.
@@ -48,6 +48,18 @@ pub(crate) fn conversation_from(
     }
 }
 
+/// Project a Telegram roster user into the wire [`ContactInfo`]. `user_id` is the user's Bot-API
+/// peer id; it is rendered base-10 with the same convention [`chat_conv_id`] uses and
+/// [`parse_chat_id`] round-trips, so a roster contact id resolves back to the cached peer for
+/// `get_profile` / `add` / `remove`. `display_name` is the user's rendered name, when known.
+pub(crate) fn contact_from(user_id: i64, display_name: Option<String>) -> ContactInfo {
+    ContactInfo {
+        id: chat_conv_id(user_id),
+        display_name,
+        ..ContactInfo::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +81,14 @@ mod tests {
         assert_eq!(dm.title.as_deref(), Some("Alice"));
         let chan = conversation_from(&t, -100, false, None, Vec::new());
         assert_eq!(chan.kind, ConversationType::Channel);
+    }
+
+    #[test]
+    fn contact_id_shares_the_conv_id_convention() {
+        let c = contact_from(4242, Some("Alice".into()));
+        assert_eq!(c.id, "4242");
+        assert_eq!(parse_chat_id(&c.id), Some(4242));
+        assert_eq!(c.display_name.as_deref(), Some("Alice"));
+        assert_eq!(contact_from(7, None).display_name, None);
     }
 }

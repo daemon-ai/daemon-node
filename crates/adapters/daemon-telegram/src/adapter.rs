@@ -25,8 +25,8 @@ use daemon_api::{
     AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiError, ChannelJoinDetails,
     ConnectionState, ContactInfo, ContactsOps, ConvSendArgs, ConversationInfo, ConversationOps,
     MemberBanArgs, MemberRemoveArgs, MembershipOps, MessagingProtocol, NodeApi, Participant,
-    PresenceState, SupportsContacts, SupportsConversations, SupportsDirectory, SupportsMembership,
-    TransportAdapter, TransportInstanceInfo,
+    PresenceState, RosterOps, SupportsContacts, SupportsConversations, SupportsDirectory,
+    SupportsMembership, SupportsRoster, TransportAdapter, TransportInstanceInfo,
 };
 use daemon_host::AccountProvisioning;
 use daemon_protocol::TransportId;
@@ -67,6 +67,13 @@ pub trait TelegramClient: Send + Sync {
     async fn get_profile(&self, user_id: i64) -> Result<String, ApiError>;
     /// Resolve a `@username` search `query` into matching contacts (0 or 1 for a username lookup).
     async fn search_contacts(&self, query: &str) -> Result<Vec<ContactInfo>, ApiError>;
+    /// The account's server-side contact roster (`contacts.getContacts`), projected to wire DTOs.
+    async fn roster_list(&self, transport: &TransportId) -> Result<Vec<ContactInfo>, ApiError>;
+    /// Add/upsert `user_id` to the roster with `first_name` (`contacts.addContact`; the same call
+    /// backs both add and update, since addContact refreshes the name of an existing contact).
+    async fn roster_add(&self, user_id: i64, first_name: &str) -> Result<(), ApiError>;
+    /// Remove `user_id` from the roster (`contacts.deleteContacts`).
+    async fn roster_remove(&self, user_id: i64) -> Result<(), ApiError>;
 }
 
 /// The Telegram transport adapter: holds the in-process provisioning seam + resolved config so its
@@ -122,6 +129,13 @@ impl TelegramAdapter {
 /// Parse a daemon-opaque conversation id into the numeric chat id grammers indexes on.
 fn conv_chat_id(conv: &str) -> Result<i64, ApiError> {
     parse_chat_id(conv).ok_or_else(|| ApiError::Other(format!("invalid telegram chat id {conv}")))
+}
+
+/// Parse a roster `ContactInfo`'s opaque id into the numeric Telegram user id (same convention as
+/// [`SupportsContacts::get_profile`]).
+fn roster_user_id(contact: &ContactInfo) -> Result<i64, ApiError> {
+    parse_chat_id(&contact.id)
+        .ok_or_else(|| ApiError::Other(format!("invalid telegram user id {}", contact.id)))
 }
 
 /// Extract the target Telegram user id from a membership `Participant`. Telegram membership targets a
@@ -215,6 +229,10 @@ impl MessagingProtocol for TelegramAdapter {
     }
 
     fn membership(self: Arc<Self>) -> Option<Arc<dyn SupportsMembership>> {
+        Some(self)
+    }
+
+    fn roster(self: Arc<Self>) -> Option<Arc<dyn SupportsRoster>> {
         Some(self)
     }
 
@@ -341,6 +359,59 @@ impl SupportsMembership for TelegramAdapter {
 }
 
 #[async_trait]
+impl SupportsRoster for TelegramAdapter {
+    fn supported(&self) -> RosterOps {
+        // The full server-side contact roster is wired against the raw Telegram TL API
+        // (`contacts.getContacts` / `addContact` / `deleteContacts`). `update` maps to the same
+        // `addContact` upsert as `add` (it refreshes an existing contact's name), so it is honestly
+        // supported. These ops are user-account-only; a bot session gets a clean `Unsupported` at
+        // call time (`supported()` is per-adapter, so it advertises the user-account capability).
+        RosterOps {
+            list: true,
+            add: true,
+            update: true,
+            remove: true,
+        }
+    }
+
+    async fn list(&self, transport: TransportId) -> Vec<ContactInfo> {
+        // Mirrors `SupportsConversations::list`: an unconnected account (or a bot, which has no
+        // roster) yields an empty list; the host sorts + pages it centrally.
+        match self.client_for(&transport).await {
+            Ok(client) => client.roster_list(&transport).await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn add(&self, transport: TransportId, contact: ContactInfo) -> Result<(), ApiError> {
+        let client = self.client_for(&transport).await?;
+        client
+            .roster_add(
+                roster_user_id(&contact)?,
+                contact.display_name.as_deref().unwrap_or_default(),
+            )
+            .await
+    }
+
+    async fn update(&self, transport: TransportId, contact: ContactInfo) -> Result<(), ApiError> {
+        // Telegram's `contacts.addContact` upserts, so an update is the same call as an add: it
+        // refreshes the contact's stored first name.
+        let client = self.client_for(&transport).await?;
+        client
+            .roster_add(
+                roster_user_id(&contact)?,
+                contact.display_name.as_deref().unwrap_or_default(),
+            )
+            .await
+    }
+
+    async fn remove(&self, transport: TransportId, contact: ContactInfo) -> Result<(), ApiError> {
+        let client = self.client_for(&transport).await?;
+        client.roster_remove(roster_user_id(&contact)?).await
+    }
+}
+
+#[async_trait]
 impl SupportsContacts for TelegramAdapter {
     fn supported(&self) -> ContactsOps {
         // A remote profile fetch is wired; per-contact alias / action menu have no counterpart.
@@ -409,6 +480,7 @@ mod tests {
     struct MockClient {
         sent: Mutex<Vec<(i64, String)>>,
         banned: Mutex<Vec<(i64, i64)>>,
+        roster: Mutex<Vec<ContactInfo>>,
     }
 
     #[async_trait]
@@ -446,6 +518,30 @@ mod tests {
         async fn search_contacts(&self, _query: &str) -> Result<Vec<ContactInfo>, ApiError> {
             Ok(Vec::new())
         }
+        async fn roster_list(&self, _t: &TransportId) -> Result<Vec<ContactInfo>, ApiError> {
+            Ok(self.roster.lock().unwrap().clone())
+        }
+        async fn roster_add(&self, user_id: i64, first_name: &str) -> Result<(), ApiError> {
+            let mut roster = self.roster.lock().unwrap();
+            let id = user_id.to_string();
+            let contact = ContactInfo {
+                id: id.clone(),
+                display_name: Some(first_name.to_string()),
+                ..ContactInfo::default()
+            };
+            match roster.iter_mut().find(|c| c.id == id) {
+                Some(slot) => *slot = contact,
+                None => roster.push(contact),
+            }
+            Ok(())
+        }
+        async fn roster_remove(&self, user_id: i64) -> Result<(), ApiError> {
+            self.roster
+                .lock()
+                .unwrap()
+                .retain(|c| c.id != user_id.to_string());
+            Ok(())
+        }
     }
 
     async fn adapter_with(
@@ -476,6 +572,8 @@ mod tests {
         assert!(!mem.invite && !mem.set_role);
         let contacts = SupportsContacts::supported(&*adapter);
         assert!(contacts.get_profile && !contacts.action_menu && !contacts.set_alias);
+        let roster = SupportsRoster::supported(&*adapter);
+        assert!(roster.list && roster.add && roster.update && roster.remove);
         assert!(SupportsDirectory::supported(&*adapter));
     }
 
@@ -566,6 +664,83 @@ mod tests {
         )
         .await
         .expect_err("an agent is not a membership target");
+        assert!(matches!(err, ApiError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn roster_add_update_list_remove_round_trip() {
+        let transport = TransportId::new("telegram/555");
+        let client = Arc::new(MockClient::default());
+        let adapter = adapter_with(&transport, client.clone()).await;
+
+        let contact = ContactInfo {
+            id: "42".to_string(),
+            display_name: Some("Alice".to_string()),
+            ..ContactInfo::default()
+        };
+        SupportsRoster::add(&*adapter, transport.clone(), contact.clone())
+            .await
+            .expect("add routes to the client");
+        let listed = SupportsRoster::list(&*adapter, transport.clone()).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "42");
+        assert_eq!(listed[0].display_name.as_deref(), Some("Alice"));
+
+        // update maps to the same addContact upsert (refreshes the name in place, no duplicate).
+        let renamed = ContactInfo {
+            display_name: Some("Alice B.".to_string()),
+            ..contact.clone()
+        };
+        SupportsRoster::update(&*adapter, transport.clone(), renamed)
+            .await
+            .expect("update routes to the client");
+        let listed = SupportsRoster::list(&*adapter, transport.clone()).await;
+        assert_eq!(listed.len(), 1, "update upserts in place");
+        assert_eq!(listed[0].display_name.as_deref(), Some("Alice B."));
+
+        SupportsRoster::remove(&*adapter, transport.clone(), contact)
+            .await
+            .expect("remove routes to the client");
+        assert!(SupportsRoster::list(&*adapter, transport).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn roster_add_rejects_a_non_numeric_id() {
+        let transport = TransportId::new("telegram/555");
+        let client = Arc::new(MockClient::default());
+        let adapter = adapter_with(&transport, client).await;
+        let err = SupportsRoster::add(
+            &*adapter,
+            transport,
+            ContactInfo {
+                id: "@notnumeric".to_string(),
+                ..ContactInfo::default()
+            },
+        )
+        .await
+        .expect_err("a non-numeric contact id is rejected");
+        assert!(matches!(err, ApiError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn roster_ops_on_unconnected_account_are_unsupported() {
+        let adapter = TelegramAdapter::new(Arc::new(MockProvisioning), TelegramConfig::default());
+        let transport = TransportId::new("telegram/999");
+        // list is lenient (empty), matching conversation list.
+        assert!(SupportsRoster::list(&*adapter, transport.clone())
+            .await
+            .is_empty());
+        // mutations on an unconnected account surface Unsupported.
+        let err = SupportsRoster::remove(
+            &*adapter,
+            transport,
+            ContactInfo {
+                id: "1".to_string(),
+                ..ContactInfo::default()
+            },
+        )
+        .await
+        .expect_err("an unconnected account cannot mutate its roster");
         assert!(matches!(err, ApiError::Unsupported(_)));
     }
 

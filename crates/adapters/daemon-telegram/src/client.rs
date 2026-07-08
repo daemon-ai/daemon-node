@@ -30,7 +30,8 @@ use daemon_host::AccountProvisioning;
 use daemon_protocol::TransportId;
 
 use grammers_client::client::UpdatesConfiguration;
-use grammers_client::peer::Peer;
+use grammers_client::peer::{Peer, User};
+use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
 use grammers_session::storages::SqliteSession;
@@ -46,7 +47,7 @@ use crate::adapter::TelegramClient;
 use crate::auth::{CodeStep, LoginBackend, LoginIdentity};
 use crate::config::TelegramConfig;
 use crate::inbound::{self, InboundCtx, InboundEvent};
-use crate::mapping::conversation_from;
+use crate::mapping::{contact_from, conversation_from};
 use crate::outbound::{DeliveryManager, TelegramProjector};
 use crate::{LiveClients, FAMILY};
 
@@ -224,16 +225,31 @@ impl LoginBackend for GrammersLogin {
 pub(crate) struct GrammersTelegramClient {
     client: Client,
     transport: TransportId,
+    /// Whether this account is a user or a bot. Contacts/roster MTProto calls are user-only, so the
+    /// roster verbs reject a bot session with a clean `Unsupported` rather than surfacing the raw
+    /// `BOT_METHOD_INVALID` RPC error.
+    mode: AccountMode,
     peers: Mutex<HashMap<i64, Peer>>,
 }
 
 impl GrammersTelegramClient {
-    fn new(client: Client, transport: TransportId) -> Arc<Self> {
+    fn new(client: Client, transport: TransportId, mode: AccountMode) -> Arc<Self> {
         Arc::new(Self {
             client,
             transport,
+            mode,
             peers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Guard the user-only contact roster: a bot account has no server-side contact list.
+    fn ensure_user_roster(&self) -> Result<(), ApiError> {
+        match self.mode {
+            AccountMode::User => Ok(()),
+            AccountMode::Bot => Err(ApiError::Unsupported(
+                "telegram bot accounts have no server-side contact roster".into(),
+            )),
+        }
     }
 
     /// Cache a seen `peer` (chat or sender) so later verbs can resolve its ocap reference.
@@ -378,13 +394,73 @@ impl TelegramClient for GrammersTelegramClient {
             .await
             .map_err(|e| ApiError::Other(format!("telegram directory search: {e}")))?
         {
-            Some(peer) => Ok(vec![ContactInfo {
-                id: peer_i64(&peer).to_string(),
-                display_name: peer.name().map(str::to_string),
-                ..ContactInfo::default()
-            }]),
+            Some(peer) => {
+                // Cache the resolved peer so a follow-up `roster_add` can build its ocap `InputUser`
+                // from the found contact (the resolve→add flow, mirroring the inbound peer cache).
+                self.cache_peer(&peer);
+                Ok(vec![contact_from(
+                    peer_i64(&peer),
+                    peer.name().map(str::to_string),
+                )])
+            }
             None => Ok(Vec::new()),
         }
+    }
+
+    async fn roster_list(&self, _transport: &TransportId) -> Result<Vec<ContactInfo>, ApiError> {
+        self.ensure_user_roster()?;
+        let contacts = self
+            .client
+            .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
+            .await
+            .map_err(|e| ApiError::Other(format!("telegram getContacts: {e}")))?;
+        let users = match contacts {
+            tl::enums::contacts::Contacts::Contacts(c) => c.users,
+            tl::enums::contacts::Contacts::NotModified => Vec::new(),
+        };
+        let mut out = Vec::with_capacity(users.len());
+        for user in users {
+            // Cache each roster user so a follow-up add/update/remove resolves its ocap `InputUser`.
+            let peer = Peer::User(User::from_raw(&self.client, user));
+            self.cache_peer(&peer);
+            out.push(contact_from(
+                peer_i64(&peer),
+                peer.name().map(str::to_string),
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn roster_add(&self, user_id: i64, first_name: &str) -> Result<(), ApiError> {
+        self.ensure_user_roster()?;
+        // `contacts.addContact` upserts: it also refreshes the first/last name for an existing
+        // contact, so the same call backs both `roster.add` and `roster.update`. It needs an ocap
+        // `InputUser` (id + access hash), resolved from the cached peer for `user_id`.
+        let peer_ref = self.peer_ref(user_id).await?;
+        let id: tl::enums::InputUser = (&peer_ref).into();
+        self.client
+            .invoke(&tl::functions::contacts::AddContact {
+                add_phone_privacy_exception: false,
+                id,
+                first_name: first_name.to_string(),
+                last_name: String::new(),
+                phone: String::new(),
+                note: None,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| ApiError::Other(format!("telegram addContact: {e}")))
+    }
+
+    async fn roster_remove(&self, user_id: i64) -> Result<(), ApiError> {
+        self.ensure_user_roster()?;
+        let peer_ref = self.peer_ref(user_id).await?;
+        let id: tl::enums::InputUser = (&peer_ref).into();
+        self.client
+            .invoke(&tl::functions::contacts::DeleteContacts { id: vec![id] })
+            .await
+            .map(|_| ())
+            .map_err(|e| ApiError::Other(format!("telegram deleteContacts: {e}")))
     }
 }
 
@@ -482,7 +558,11 @@ pub async fn serve(
             }
         }
 
-        let gclient = GrammersTelegramClient::new(client.clone(), acct.transport_instance.clone());
+        let gclient = GrammersTelegramClient::new(
+            client.clone(),
+            acct.transport_instance.clone(),
+            stored.mode,
+        );
         brought.push(BroughtUp {
             transport: acct.transport_instance.clone(),
             bare: bare_account(&acct.transport_instance).to_string(),
