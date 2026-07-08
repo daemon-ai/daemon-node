@@ -30,10 +30,15 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `browser.approve_navigation` | `DAEMON_BROWSER__APPROVE_NAVIGATION` | bool | `false` |
 | `browser.auto_dismiss_dialogs` | `DAEMON_BROWSER__AUTO_DISMISS_DIALOGS` | bool | `true` |
 | `browser.chrome_path` | `DAEMON_BROWSER__CHROME_PATH` | optional | _(unset)_ |
+| `browser.connect_url` | `DAEMON_BROWSER__CONNECT_URL` | optional | _(unset)_ |
 | `browser.enable` | `DAEMON_BROWSER__ENABLE` | bool | `false` |
+| `browser.extra_args` | `DAEMON_BROWSER__EXTRA_ARGS` | array | `[]` |
 | `browser.headless` | `DAEMON_BROWSER__HEADLESS` | bool | `true` |
 | `browser.launch_timeout_ms` | `DAEMON_BROWSER__LAUNCH_TIMEOUT_MS` | number | `20000` |
+| `browser.persistent` | `DAEMON_BROWSER__PERSISTENT` | bool | `false` |
+| `browser.remote_debugging_port` | `DAEMON_BROWSER__REMOTE_DEBUGGING_PORT` | optional | _(unset)_ |
 | `browser.screenshot_dir` | `DAEMON_BROWSER__SCREENSHOT_DIR` | optional | _(unset)_ |
+| `browser.user_data_dir` | `DAEMON_BROWSER__USER_DATA_DIR` | optional | _(unset)_ |
 | `context_engine` | `DAEMON_CONTEXT_ENGINE` | string | `lcm` |
 | `credential_key` | `DAEMON_CREDENTIAL_KEY` | string | `""` |
 | `data_dir` | `DAEMON_DATA_DIR` | string | `$XDG_DATA_HOME/daemon` |
