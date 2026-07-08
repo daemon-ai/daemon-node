@@ -41,6 +41,10 @@ child          TEXT PRIMARY KEY,
 parent_session TEXT NOT NULL,
 notified       INTEGER NOT NULL DEFAULT 0
 , call_id TEXT);
+CREATE TABLE credential_labels (
+profile TEXT PRIMARY KEY,
+label   TEXT NOT NULL
+);
 CREATE TABLE cron_jobs (
     id             TEXT PRIMARY KEY,
     schedule       TEXT NOT NULL,
@@ -210,6 +214,11 @@ enabled INTEGER NOT NULL
 CREATE TABLE tool_overrides (
 tool    TEXT PRIMARY KEY,
 enabled INTEGER NOT NULL
+);
+CREATE TABLE transport_prefs (
+transport TEXT PRIMARY KEY,
+enabled   INTEGER NOT NULL DEFAULT 1,
+label     TEXT
 );
 CREATE TABLE wake_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,

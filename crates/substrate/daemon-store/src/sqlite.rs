@@ -19,7 +19,7 @@ use crate::{
     FaultPoint, FeedbackRecord, JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal,
     ParkedApproval, Room, RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus,
     SessionStore, StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion,
-    TraceEntry, TraceSegment, CRON_RUN_RETENTION,
+    TraceEntry, TraceSegment, TransportPref, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -379,6 +379,23 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // `overlay` is treated — protocol-free bytes). NULL on legacy rows and every non-inline
         // (bound-profile / default) session.
         M::up("ALTER TABLE session_meta ADD COLUMN inline_profile BLOB;"),
+        // M12 (wire v35 — account management): the operator's DESIRED per-transport-instance state
+        // (`transport_prefs`) and per-credential human labels (`credential_labels`).
+        // `transport_prefs.enabled` defaults 1 (a fresh instance is enabled); the node skips a
+        // family at boot/spawn only when EVERY one of its instances is explicitly disabled, and
+        // overlays `label`/`enabled` onto `transport_instances()`. `credential_labels` mirrors the
+        // AccountsPage rename; a row exists only for a credential with a custom label.
+        M::up(
+            "CREATE TABLE transport_prefs (\n\
+                 transport TEXT PRIMARY KEY,\n\
+                 enabled   INTEGER NOT NULL DEFAULT 1,\n\
+                 label     TEXT\n\
+             );\n\
+             CREATE TABLE credential_labels (\n\
+                 profile TEXT PRIMARY KEY,\n\
+                 label   TEXT NOT NULL\n\
+             );",
+        ),
     ])
 });
 
@@ -1636,6 +1653,97 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn transport_prefs(&self) -> Vec<TransportPref> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT transport, enabled, label FROM transport_prefs ORDER BY transport")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(TransportPref {
+                transport: row.get::<_, String>(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                label: row.get::<_, Option<String>>(2)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn set_transport_enabled(
+        &self,
+        transport: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        // Upsert the enabled flag, preserving any existing label (a fresh row has a NULL label).
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transport_prefs (transport, enabled) VALUES (?1, ?2) \
+             ON CONFLICT(transport) DO UPDATE SET enabled = ?2",
+            params![transport, enabled as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn set_transport_label(
+        &self,
+        transport: &str,
+        label: Option<String>,
+    ) -> Result<(), StoreError> {
+        // Upsert the label, preserving `enabled` (a fresh row defaults to enabled = 1). `None`
+        // clears the label but keeps the row (its enabled state may still matter).
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transport_prefs (transport, label) VALUES (?1, ?2) \
+             ON CONFLICT(transport) DO UPDATE SET label = ?2",
+            params![transport, label],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn credential_labels(&self) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            match conn.prepare("SELECT profile, label FROM credential_labels ORDER BY profile") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn set_credential_label(
+        &self,
+        profile: &str,
+        label: Option<String>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        match label {
+            Some(l) => conn.execute(
+                "INSERT INTO credential_labels (profile, label) VALUES (?1, ?2) \
+                 ON CONFLICT(profile) DO UPDATE SET label = ?2",
+                params![profile, l],
+            ),
+            None => conn.execute(
+                "DELETE FROM credential_labels WHERE profile = ?1",
+                params![profile],
+            ),
+        }
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn feedback_enqueue(&self, record: FeedbackRecord) -> Result<(), StoreError> {
         // The whole record is persisted as an opaque CBOR blob; id/created_at_ms/delivered are
         // mirrored into indexed columns for the exporter's pending-drain query. Idempotent by id.
@@ -2320,12 +2428,13 @@ mod tests {
     use super::*;
 
     /// The migration ladder is internally consistent, and a fresh store is stamped to the latest
-    /// `user_version` (11: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
+    /// `user_version` (12: `M1 = SCHEMA`, the Auth 4 ownership ALTERs, the pending-input table, the
     /// terminal clock, the detached-delegation completion-notice seam, the wire-v28
     /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, the
     /// wire-v30 `tool_overrides` table, the wire-v32 feedback outbox + telemetry-consent seam, the
-    /// gateway runtime-override `gateway_config` single-row setting, and the Phase 1 inline
-    /// sub-agent `session_meta.inline_profile` column).
+    /// gateway runtime-override `gateway_config` single-row setting, the Phase 1 inline
+    /// sub-agent `session_meta.inline_profile` column, and the wire-v35 `transport_prefs` +
+    /// `credential_labels` account-management tables).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2336,7 +2445,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 12, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {

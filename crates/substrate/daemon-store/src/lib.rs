@@ -265,6 +265,22 @@ pub struct RoomMember {
     pub session_id: SessionId,
 }
 
+/// A durable per-transport-instance preference row (wire v35): the operator's desired
+/// enabled/disabled state plus an optional human label (rename) for a transport instance
+/// (account), keyed by the instance-qualified transport id string (e.g. `"matrix/@bot:hs.org"`,
+/// `"room"`). The node consults `enabled` at boot/spawn and reconnect, and overlays `label` onto
+/// the adapter-reported `TransportInstanceInfo` in `transport_instances()` — so the store stays
+/// protocol-free (plain strings, no wire types) exactly like [`ChatRoute`]/[`Room`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportPref {
+    /// The instance-qualified transport id (primary key for upsert/lookup).
+    pub transport: String,
+    /// The operator's desired enabled state (`false` = disconnected now + skipped at spawn).
+    pub enabled: bool,
+    /// The operator-set human label/rename (`None` = no custom label).
+    pub label: Option<String>,
+}
+
 /// A durable manually-registered foreign-agent catalog entry (I7): the operator-persisted half of
 /// the agent discovery catalog (auto-discovered builtins are re-probed each scan and need no
 /// persistence). `entry` is the opaque host-encoded CBOR of the wire `AgentEntry`; the store stays
@@ -1134,6 +1150,52 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// List every persisted per-transport-instance preference (wire v35): the desired
+    /// enabled/disabled state + optional human label, keyed by transport id. The node consults
+    /// these at boot/spawn (skip a fully-disabled family) and overlays `label` +
+    /// `enabled` onto `transport_instances()`. Default: none (a store without the prefs table —
+    /// every instance is then enabled with no custom label).
+    async fn transport_prefs(&self) -> Vec<TransportPref> {
+        Vec::new()
+    }
+
+    /// Upsert a transport instance's desired enabled state (wire v35), preserving any existing
+    /// label. Default: no-op.
+    async fn set_transport_enabled(
+        &self,
+        _transport: &str,
+        _enabled: bool,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) a transport instance's human label (wire v35), preserving its
+    /// enabled state (a new row defaults to enabled). Default: no-op.
+    async fn set_transport_label(
+        &self,
+        _transport: &str,
+        _label: Option<String>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// List every persisted credential/account human label (wire v35) as `(profile, label)` pairs.
+    /// The node overlays these onto `credential_list()`. Default: none (a store without the labels
+    /// table — every credential then renders with no custom label). Backs the app's AccountsPage
+    /// rename.
+    async fn credential_labels(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Set (or clear, with `None`) a credential/account's human label (wire v35). Default: no-op.
+    async fn set_credential_label(
+        &self,
+        _profile: &str,
+        _label: Option<String>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Enqueue a user-feedback record onto the durable feedback outbox (N1). Idempotent by `id`
     /// (a re-enqueue of the same id is a no-op). Default: no-op (a store without the outbox).
     async fn feedback_enqueue(&self, _record: FeedbackRecord) -> Result<(), StoreError> {
@@ -1443,6 +1505,12 @@ struct Inner {
     /// Node-wide tool enable/disable overrides (wire v30), keyed by tool name (the in-memory
     /// analogue of the SQLite `tool_overrides` table).
     tool_overrides: HashMap<String, bool>,
+    /// Per-transport-instance preferences (wire v35): desired enabled state + optional label,
+    /// keyed by transport id (the in-memory analogue of the SQLite `transport_prefs` table).
+    transport_prefs: HashMap<String, (bool, Option<String>)>,
+    /// Per-credential/account human labels (wire v35), keyed by profile (the in-memory analogue of
+    /// the SQLite `credential_labels` table).
+    credential_labels: HashMap<String, String>,
     /// Durable user-feedback outbox (N1), in enqueue order (the in-memory analogue of the SQLite
     /// `feedback_outbox` table). Keyed-dedup by `id`.
     feedback_outbox: Vec<FeedbackRecord>,
@@ -2076,6 +2144,75 @@ impl SessionStore for InMemoryStore {
             .unwrap()
             .tool_overrides
             .insert(tool.to_string(), enabled);
+        Ok(())
+    }
+
+    async fn transport_prefs(&self) -> Vec<TransportPref> {
+        self.inner
+            .lock()
+            .unwrap()
+            .transport_prefs
+            .iter()
+            .map(|(transport, (enabled, label))| TransportPref {
+                transport: transport.clone(),
+                enabled: *enabled,
+                label: label.clone(),
+            })
+            .collect()
+    }
+
+    async fn set_transport_enabled(
+        &self,
+        transport: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner
+            .transport_prefs
+            .entry(transport.to_string())
+            .or_insert((true, None));
+        entry.0 = enabled;
+        Ok(())
+    }
+
+    async fn set_transport_label(
+        &self,
+        transport: &str,
+        label: Option<String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner
+            .transport_prefs
+            .entry(transport.to_string())
+            .or_insert((true, None));
+        entry.1 = label;
+        Ok(())
+    }
+
+    async fn credential_labels(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .credential_labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    async fn set_credential_label(
+        &self,
+        profile: &str,
+        label: Option<String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        match label {
+            Some(l) => {
+                inner.credential_labels.insert(profile.to_string(), l);
+            }
+            None => {
+                inner.credential_labels.remove(profile);
+            }
+        }
         Ok(())
     }
 
