@@ -30,5 +30,9 @@ anyhow = { workspace = true }
 # match the rest of the tree (no second TLS stack). All serenity types stay inside this crate.
 serenity_self = { version = "0.13", default-features = false, features = ["client", "gateway", "cache", "model", "http", "builder", "utils", "rustls_backend"] }
 
+[dev-dependencies]
+# W1-A conformance: run the ops<->behavior invariant against the real adapter.
+daemon-api-testkit = { workspace = true }
+
 [lints]
 workspace = true

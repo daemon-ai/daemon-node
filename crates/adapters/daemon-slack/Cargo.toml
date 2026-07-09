@@ -51,6 +51,8 @@ default = []
 stealth = ["dep:slacko"]
 
 [dev-dependencies]
+# W1-A conformance: run the ops<->behavior invariant against the real adapter.
+daemon-api-testkit = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 # in-process mock HTTP server for the bot OAuth code-exchange test (no live network, no real tokens).
 wiremock = "0.6"
