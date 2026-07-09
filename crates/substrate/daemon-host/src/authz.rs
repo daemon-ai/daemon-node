@@ -131,14 +131,17 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | Models { .. }
         | ModelCurrent { .. }
         | ProviderCatalog
-        | ProviderModels { .. } => C::ModelsRead,
+        | ProviderModels { .. }
+        | CustomProviderList => C::ModelsRead,
         ModelDownload { .. }
         | ModelCancel { .. }
         | ModelPause { .. }
         | ModelResume { .. }
         | ModelDelete { .. }
         | ModelActivate { .. }
-        | ModelQuantize(_) => C::ModelsWrite,
+        | ModelQuantize(_)
+        | CustomProviderSet { .. }
+        | CustomProviderRemove { .. } => C::ModelsWrite,
 
         // -- serve_profile: profiles + skills (versioned) + personas (wire v36) -----------------
         ProfileList

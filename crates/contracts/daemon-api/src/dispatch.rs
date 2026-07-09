@@ -304,6 +304,15 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
             api.provider_models(provider, credential_ref, transient_key, after)
                 .await,
         ),
+        ApiRequest::CustomProviderList => {
+            ApiResponse::CustomProviders(api.custom_provider_list().await)
+        }
+        ApiRequest::CustomProviderSet { provider } => {
+            unit_or_err(api.custom_provider_set(provider).await)
+        }
+        ApiRequest::CustomProviderRemove { id } => {
+            unit_or_err(api.custom_provider_remove(id).await)
+        }
         _ => return None,
     })
 }

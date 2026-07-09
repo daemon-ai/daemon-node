@@ -1124,6 +1124,48 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next: None,
         }),
     )?;
+    // Custom providers (generalized Daemon Cloud): the write-model CRUD ops + the list response, so
+    // a non-Rust client and verify-codec exercise the `custom-provider` shape end-to-end.
+    write_cbor(
+        &out,
+        "request-custom-provider-list.cbor",
+        &ApiRequest::CustomProviderList,
+    )?;
+    write_cbor(
+        &out,
+        "request-custom-provider-set.cbor",
+        &ApiRequest::CustomProviderSet {
+            provider: daemon_api::CustomProvider {
+                id: "custom/my-gateway".into(),
+                display_name: "My Gateway".into(),
+                base_url: "https://my-gateway.example/v1/".into(),
+                wire_selector: ProviderSelector::DaemonApi,
+                requires_key: true,
+                credential_ref: Some("custom/my-gateway".into()),
+                source: daemon_api::CustomProviderSource::User,
+            },
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-custom-provider-remove.cbor",
+        &ApiRequest::CustomProviderRemove {
+            id: "custom/my-gateway".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-custom-providers.cbor",
+        &ApiResponse::CustomProviders(vec![daemon_api::CustomProvider {
+            id: "custom/my-gateway".into(),
+            display_name: "My Gateway".into(),
+            base_url: "https://my-gateway.example/v1/".into(),
+            wire_selector: ProviderSelector::DaemonApi,
+            requires_key: true,
+            credential_ref: None,
+            source: daemon_api::CustomProviderSource::Config,
+        }]),
+    )?;
     write_cbor(&out, "response-ok.cbor", &ApiResponse::Ok)?;
     write_cbor(
         &out,

@@ -16,10 +16,11 @@
 
 use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, CompletionNotice,
-    FaultPoint, FeedbackRecord, JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal,
-    ParkedApproval, Room, RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus,
-    SessionStore, StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion,
-    StoredSavedPresence, TraceEntry, TraceSegment, TransportPref, CRON_RUN_RETENTION,
+    CustomProviderRecord, FaultPoint, FeedbackRecord, JobCommand, JobCompletion, JournalEntry,
+    JournalPage, JournalSeal, ParkedApproval, Room, RoomMember, SessionMeta, SessionRole,
+    SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, StoredCronJob,
+    StoredCronRun, StoredCronSuggestion, StoredSavedPresence, TraceEntry, TraceSegment,
+    TransportPref, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -411,6 +412,15 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              CREATE TABLE saved_presence_active (\n\
                  id     INTEGER PRIMARY KEY CHECK (id = 0),\n\
                  active TEXT NOT NULL\n\
+             );",
+        ),
+        // M14 (custom providers — generalized Daemon Cloud): the durable half of the provider
+        // catalog. `entry` is the opaque CBOR of the wire `CustomProvider` (protocol-free, mirroring
+        // `acp_catalog.entry`); a row exists per user-defined or config-seeded custom provider.
+        M::up(
+            "CREATE TABLE custom_providers (\n\
+                 id    TEXT PRIMARY KEY,\n\
+                 entry BLOB NOT NULL\n\
              );",
         ),
     ])
@@ -2012,6 +2022,42 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn custom_provider_list(&self) -> Vec<CustomProviderRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT id, entry FROM custom_providers ORDER BY id") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(CustomProviderRecord {
+                id: row.get::<_, String>(0)?,
+                entry: row.get::<_, Vec<u8>>(1)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn custom_provider_set(&self, entry: CustomProviderRecord) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO custom_providers (id, entry) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET entry = ?2",
+            params![entry.id, entry.entry],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn custom_provider_remove(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM custom_providers WHERE id = ?1", params![id])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn cron_list(&self) -> Vec<StoredCronJob> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
@@ -2511,8 +2557,9 @@ mod tests {
     /// pending-approval fingerprint column, the wire-v29 completion-notice call_id columns, the
     /// wire-v30 `tool_overrides` table, the wire-v32 feedback outbox + telemetry-consent seam, the
     /// gateway runtime-override `gateway_config` single-row setting, the Phase 1 inline
-    /// sub-agent `session_meta.inline_profile` column, and the wire-v35 `transport_prefs` +
-    /// `credential_labels` account-management tables).
+    /// sub-agent `session_meta.inline_profile` column, the wire-v35 `transport_prefs` +
+    /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
+    /// `saved_presence_active` tables, and the `custom_providers` table).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2523,7 +2570,47 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 14, "fresh DB is stamped to the latest migration");
+    }
+
+    /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory
+    /// backends: set is an upsert keyed by id, list is id-ordered, remove is idempotent.
+    #[tokio::test]
+    async fn custom_provider_round_trips_mem_and_sqlite() {
+        // The trait does not promise listing order (the in-memory backend is a HashMap), so compare
+        // by id-sorted vectors.
+        async fn sorted(store: &dyn SessionStore) -> Vec<CustomProviderRecord> {
+            let mut v = store.custom_provider_list().await;
+            v.sort_by(|x, y| x.id.cmp(&y.id));
+            v
+        }
+        async fn check(store: &dyn SessionStore) {
+            assert!(store.custom_provider_list().await.is_empty());
+            let a = CustomProviderRecord {
+                id: "custom/a".into(),
+                entry: vec![1, 2, 3],
+            };
+            let b = CustomProviderRecord {
+                id: "custom/b".into(),
+                entry: vec![4],
+            };
+            store.custom_provider_set(a.clone()).await.unwrap();
+            store.custom_provider_set(b.clone()).await.unwrap();
+            assert_eq!(sorted(store).await, vec![a.clone(), b.clone()]);
+            // Upsert replaces the entry blob for an existing id.
+            let a2 = CustomProviderRecord {
+                id: "custom/a".into(),
+                entry: vec![9, 9],
+            };
+            store.custom_provider_set(a2.clone()).await.unwrap();
+            assert_eq!(sorted(store).await, vec![a2, b.clone()]);
+            // Remove is idempotent.
+            store.custom_provider_remove("custom/a").await.unwrap();
+            store.custom_provider_remove("custom/a").await.unwrap();
+            assert_eq!(sorted(store).await, vec![b]);
+        }
+        check(&crate::InMemoryStore::new()).await;
+        check(&SqliteStore::open_in_memory().expect("open")).await;
     }
 
     fn dump_schema(conn: &Connection) -> String {

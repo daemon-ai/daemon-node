@@ -314,15 +314,18 @@ struct GatewayModel {
     context_length: Option<u32>,
 }
 
-/// Fetch Daemon Cloud gateway models keyless via `GET {base}/models` (unauth MVP). Tolerates both the
-/// OpenAI `{ "data": [..] }` envelope and a bare array; a non-200 (incl. the 500 "Registry not
-/// published") or a transport error yields an empty list (never an error to the picker). Ids stay
-/// `author/slug` so they feed `ProfileSpec.model` verbatim.
-async fn daemon_cloud_gateway_models(base: &str) -> Vec<ModelDescriptor> {
+/// Fetch OpenAI-compatible gateway models via `GET {base}/models`, credential-aware: when `key` is
+/// `Some` it rides as `Authorization: Bearer` (dropped on any cross-origin redirect by the egress
+/// client); when `None` the probe is keyless (the Daemon Cloud MVP path). Tolerates both the OpenAI
+/// `{ "data": [..] }` envelope and a bare array; a non-200 (incl. the 500 "Registry not published")
+/// or a transport error yields an empty list (never an error to the picker). Ids stay `author/slug`
+/// (or whatever the gateway returns) so they feed `ProfileSpec.model` verbatim. Shared by the
+/// hardcoded Daemon Cloud row and every user-defined custom provider.
+async fn daemon_cloud_gateway_models(base: &str, key: Option<&str>) -> Vec<ModelDescriptor> {
     let url = format!("{}models", NodeConfig::ensure_trailing_slash(base));
-    // Route through the SSRF-safe egress client. `base` is the operator-configured Daemon Cloud
-    // gateway (config-influenced), so `Redirects::None` is used: it may legitimately be a private/
-    // self-hosted host, and a `/models` probe never needs to follow a redirect.
+    // Route through the SSRF-safe egress client. `base` is operator/user-configured (config-
+    // influenced), so `Redirects::None` is used: it may legitimately be a private/self-hosted host,
+    // and a `/models` probe never needs to follow a redirect.
     let client = match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
         Ok(c) => c,
         Err(e) => {
@@ -330,7 +333,11 @@ async fn daemon_cloud_gateway_models(base: &str) -> Vec<ModelDescriptor> {
             return Vec::new();
         }
     };
-    let resp = match client.get(&url, daemon_egress::Redirects::None).await {
+    let mut req = daemon_egress::EgressRequest::get(&url);
+    if let Some(key) = key {
+        req = req.bearer_auth(key);
+    }
+    let resp = match client.execute(req, daemon_egress::Redirects::None).await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::debug!(status = %r.status(), "daemon cloud gateway /models non-success");
@@ -451,7 +458,7 @@ impl CloudCatalog for GenAiCloudCatalog {
             // Local engines are served by the host from the ModelManager catalog, not here.
             "llama_cpp" | "mistral_rs" => Vec::new(),
             // Daemon Cloud: keyless gateway listing (author/slug).
-            "daemon_cloud" => daemon_cloud_gateway_models(DAEMON_CLOUD_BASE).await,
+            "daemon_cloud" => daemon_cloud_gateway_models(DAEMON_CLOUD_BASE, None).await,
             // A genai cloud vendor: credential-aware live listing, overlaid with static pricing.
             vendor => genai_models_for_id(vendor, key.as_deref())
                 .await
@@ -459,6 +466,16 @@ impl CloudCatalog for GenAiCloudCatalog {
                 .map(genai_model_descriptor)
                 .collect(),
         }
+    }
+
+    async fn openai_compat_models(
+        &self,
+        base_url: &str,
+        key: Option<String>,
+    ) -> Vec<ModelDescriptor> {
+        // A user-defined custom provider is a Daemon-Cloud-style OpenAI gateway at an arbitrary base;
+        // the same `GET {base}/models` probe serves it, credential-aware.
+        daemon_cloud_gateway_models(base_url, key.as_deref()).await
     }
 }
 
@@ -2273,6 +2290,25 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     ensure_data_dir(&cfg.data_dir)?;
     let store = build_store(&cfg.store_backend())?;
 
+    // Seed config-defined custom providers (`[[custom_providers]]`) into the durable provider store
+    // (`source = Config`, idempotent upsert): config is authoritative for its ids on every boot,
+    // while user-created (`source = User`) entries persist independently. They then surface in
+    // `provider_catalog` exactly like the hardcoded Daemon Cloud row.
+    for spec in &cfg.custom_providers {
+        if spec.id.trim().is_empty() {
+            tracing::warn!("skipping [[custom_providers]] entry with empty id");
+            continue;
+        }
+        let wire = spec.to_wire();
+        store
+            .custom_provider_set(daemon_store::CustomProviderRecord {
+                id: wire.id.clone(),
+                entry: daemon_api::to_cbor(&wire),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("seeding custom provider {:?}: {e}", wire.id))?;
+    }
+
     // The persisted credential store backing the `CredentialApi` surface and the owner authority.
     // Durable nodes persist secrets under the data root; the ephemeral default keeps them in memory.
     let credential_store: Arc<dyn CredentialStore> = if cfg.persist_providers() {
@@ -4000,7 +4036,7 @@ mod tests {
         });
 
         let base = format!("http://{addr}/");
-        let models = daemon_cloud_gateway_models(&base).await;
+        let models = daemon_cloud_gateway_models(&base, None).await;
         server.await.unwrap();
 
         assert_eq!(models.len(), 1, "one gateway model: {models:?}");
@@ -4016,8 +4052,46 @@ mod tests {
     #[tokio::test]
     async fn daemon_cloud_models_empty_on_gateway_error() {
         // An unroutable/closed port: the GET fails and the picker sees an empty list.
-        let models = daemon_cloud_gateway_models("http://127.0.0.1:1/").await;
+        let models = daemon_cloud_gateway_models("http://127.0.0.1:1/", None).await;
         assert!(models.is_empty(), "gateway error => empty list: {models:?}");
+    }
+
+    /// A custom provider's `GET {base}/models` probe forwards the resolved key as
+    /// `Authorization: Bearer` (the credential-aware listing path shared by `openai_compat_models`).
+    #[tokio::test]
+    async fn openai_compat_models_forwards_the_bearer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen_srv = seen.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            *seen_srv.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"data":[{"id":"gw/model-1"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let base = format!("http://{addr}/");
+        let models = daemon_cloud_gateway_models(&base, Some("sk-gw-secret")).await;
+        server.await.unwrap();
+
+        assert_eq!(models.len(), 1, "one model: {models:?}");
+        assert_eq!(models[0].provider, ProviderSelector::DaemonApi);
+        let req = seen.lock().await.clone();
+        assert!(
+            req.to_ascii_lowercase()
+                .contains("authorization: bearer sk-gw-secret"),
+            "the request must carry the bearer, got:\n{req}"
+        );
     }
 
     /// The `tool_list` inventory (wire v29) mirrors the build gates: a default config registers the
