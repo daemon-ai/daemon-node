@@ -55,47 +55,86 @@ pub struct SavedPresence {
 impl SavedPresence {
     /// A new saved presence with `primitive` and a freshly-minted id
     /// (← `purple_saved_presence_new`, whose `constructed` mints a random id).
-    pub fn new(_primitive: PresencePrimitive) -> Self {
-        // TDD red stub: does not set the primitive or mint an id yet.
-        Self::default()
+    pub fn new(primitive: PresencePrimitive) -> Self {
+        Self {
+            id: Self::gen_id(),
+            primitive,
+            ..Self::default()
+        }
     }
 
     /// Ensure the id is set, minting a fresh one if it is empty
-    /// (← `purple_saved_presence_constructed`).
+    /// (← `purple_saved_presence_constructed`: mint only when `birb_str_is_empty(id)`).
     pub fn ensure_id(&mut self) {
-        // TDD red stub: no-op.
+        if self.id.is_empty() {
+            self.id = Self::gen_id();
+        }
     }
 
-    /// Mint a fresh unique id (time + process counter; UUID-shaped, no external `uuid` dep).
+    /// Mint a fresh unique id (nanosecond clock + process-unique counter, formatted UUID-shaped so
+    /// it reads like `purple_saved_presence`'s `g_uuid_string_random()` — no external `uuid` dep).
     fn gen_id() -> String {
-        // TDD red stub: empty id.
-        let _ = (
-            SystemTime::now().duration_since(UNIX_EPOCH),
-            ID_SALT.load(Ordering::Relaxed),
-        );
-        String::new()
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let salt = ID_SALT.fetch_add(1, Ordering::Relaxed);
+        // 128 bits of (time || counter), rendered in the 8-4-4-4-12 hex UUID grouping.
+        let hi = (nanos as u64) ^ (salt << 1);
+        let lo = ((nanos >> 64) as u64).wrapping_add(salt);
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            hi & 0xffff_ffff,
+            (hi >> 32) & 0xffff,
+            (hi >> 48) & 0xffff,
+            lo & 0xffff,
+            (lo >> 16) & 0xffff_ffff_ffff,
+        )
     }
 
     /// Domain equality (← `purple_saved_presence_equal`), which **ignores `id`**: compares
-    /// `last_used`, `use_count`, `name`, `primitive`, `message`, `emoji`.
-    pub fn equal(&self, _other: &SavedPresence) -> bool {
-        // TDD red stub.
-        false
+    /// `last_used`, `use_count`, `name`, `primitive`, `message`, `emoji`. `Option` equality
+    /// reproduces the birb NULL rules exactly (both-`None` equal; one-`None` unequal).
+    pub fn equal(&self, other: &SavedPresence) -> bool {
+        self.last_used == other.last_used
+            && self.use_count == other.use_count
+            && self.name == other.name
+            && self.primitive == other.primitive
+            && self.message == other.message
+            && self.emoji == other.emoji
     }
 
     /// Filter (← `purple_saved_presence_matches`): an empty/`None` needle matches; else a caseless
-    /// subsequence match against `name` then `message`, then an exact match against `emoji`.
-    pub fn matches(&self, _needle: Option<&str>) -> bool {
-        // TDD red stub.
-        false
+    /// subsequence match (birb `str_matches`) against `name` then `message`, then an **exact** match
+    /// against `emoji` (`birb_str_equal`).
+    pub fn matches(&self, needle: Option<&str>) -> bool {
+        let needle = match needle {
+            None | Some("") => return true,
+            Some(needle) => needle,
+        };
+        if let Some(name) = self.name.as_deref() {
+            if crate::matching::str_matches(needle, name) {
+                return true;
+            }
+        }
+        if let Some(message) = self.message.as_deref() {
+            if crate::matching::str_matches(needle, message) {
+                return true;
+            }
+        }
+        // Emoji is compared for exact equality (not a subsequence), matching `birb_str_equal`.
+        self.emoji.as_deref() == Some(needle)
     }
 }
 
 /// NULL-aware domain equality (← `purple_saved_presence_equal`, full): `None`/`None` → true; one
 /// `None` → false; both `Some` → [`SavedPresence::equal`].
-pub fn saved_presence_equal(_a: Option<&SavedPresence>, _b: Option<&SavedPresence>) -> bool {
-    // TDD red stub.
-    false
+pub fn saved_presence_equal(a: Option<&SavedPresence>, b: Option<&SavedPresence>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.equal(b),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -109,7 +148,6 @@ mod tests {
     // -- properties + id ----------------------------------------------------
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_properties_roundtrip() {
         // ← /saved-presence/properties: every property set via the constructor round-trips.
         let p = SavedPresence {
@@ -134,7 +172,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_generates_id() {
         // ← /saved-presence/generates-id: a constructed presence has a non-empty id.
         let p = SavedPresence::new(PresencePrimitive::Available);
@@ -154,14 +191,12 @@ mod tests {
     // -- equal --------------------------------------------------------------
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_null_null() {
         // ← /saved-presence/equal/null_null.
         assert!(saved_presence_equal(None, None));
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_null_a() {
         // ← /saved-presence/equal/null_a: NULL vs a presence → false.
         let b = default_presence();
@@ -169,7 +204,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_null_b() {
         // ← /saved-presence/equal/null_b: a presence vs NULL → false.
         let a = default_presence();
@@ -177,7 +211,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_default() {
         // ← /saved-presence/equal/default: two defaults are equal DESPITE different ids.
         let a = default_presence();
@@ -188,7 +221,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_last_used() {
         // ← /saved-presence/equal/last-used.
         let mut a = default_presence();
@@ -209,7 +241,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_use_count() {
         // ← /saved-presence/equal/use-count.
         let mut a = default_presence();
@@ -223,7 +254,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_name() {
         // ← /saved-presence/equal/name.
         let mut a = default_presence();
@@ -239,7 +269,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_primitive() {
         // ← /saved-presence/equal/primitive.
         let mut a = default_presence();
@@ -253,7 +282,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_message() {
         // ← /saved-presence/equal/message.
         let mut a = default_presence();
@@ -267,7 +295,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_equal_emoji() {
         // ← /saved-presence/equal/emoji.
         let mut a = default_presence();
@@ -283,21 +310,18 @@ mod tests {
     // -- matches ------------------------------------------------------------
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_matches_accepts_null() {
         // ← /saved-presence/matches/accepts_null.
         assert!(default_presence().matches(None));
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_matches_empty_string() {
         // ← /saved-presence/matches/empty_string.
         assert!(default_presence().matches(Some("")));
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_matches_name() {
         // ← /saved-presence/matches/name: caseless subsequence over the name.
         let mut p = default_presence();
@@ -306,7 +330,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_matches_message() {
         // ← /saved-presence/matches/message: caseless subsequence over the message.
         let mut p = default_presence();
@@ -315,7 +338,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_matches_emoji() {
         // ← /saved-presence/matches/emoji: EXACT match over the emoji.
         let mut p = default_presence();
@@ -326,7 +348,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD red: pending impl"]
     fn sp_matches_none() {
         // ← /saved-presence/matches/none: a default presence (no name/message/emoji) matches nothing.
         assert!(!default_presence().matches(Some("away")));
