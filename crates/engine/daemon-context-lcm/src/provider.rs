@@ -1564,6 +1564,143 @@ fn rotate_apply_text(engine: &LcmContextEngine) -> String {
     lines.join("\n")
 }
 
+/// `/lcm doctor source` — read-only scan for legacy blank-`source` rows (`_doctor_source_text`,
+/// `LCM:command.py:766`). Reports the source-bucket breakdown and how many rows a normalize would
+/// touch, without changing anything.
+fn doctor_source_text(engine: &LcmContextEngine) -> String {
+    match engine.store.source_normalization_plan() {
+        Ok((would_update, affected_sessions, stats)) => {
+            let mut lines = vec![
+                "LCM doctor source".to_string(),
+                format!(
+                    "status: {}",
+                    if would_update > 0 {
+                        "normalization-needed"
+                    } else {
+                        "ok"
+                    }
+                ),
+                format!("messages_total: {}", stats.messages_total),
+                format!("attributed_messages: {}", stats.attributed_messages),
+                format!("unknown_messages: {}", stats.normalized_unknown_messages),
+                format!(
+                    "legacy_blank_messages: {}",
+                    stats.legacy_blank_source_messages
+                ),
+                format!(
+                    "effective_unknown_messages: {}",
+                    stats.effective_unknown_messages
+                ),
+                "target_source: unknown".to_string(),
+                format!("would_update_messages: {would_update}"),
+                format!("affected_sessions: {affected_sessions}"),
+                "note: read-only scan only — no source rows were updated".to_string(),
+            ];
+            if would_update > 0 {
+                lines.push(
+                    "note: use `/lcm doctor source apply` to create a backup and normalize legacy \
+                     blank-source rows"
+                        .to_string(),
+                );
+            } else {
+                lines.push("note: no legacy blank-source rows need normalization".to_string());
+            }
+            lines.join("\n")
+        }
+        Err(e) => [
+            "LCM doctor source".to_string(),
+            "status: error".to_string(),
+            format!("error: source-lineage scan failed: {e}"),
+            "note: read-only scan only — no source rows were updated".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+/// `/lcm doctor source apply` — backup-first normalization of legacy blank-`source` rows to
+/// `unknown` (`_doctor_source_apply_text`, `LCM:command.py:801`). A no-op batch skips the backup;
+/// otherwise a timestamped backup is written before the scoped `UPDATE`.
+fn doctor_source_apply_text(engine: &LcmContextEngine) -> String {
+    let (would_update, _affected, stats_before) = match engine.store.source_normalization_plan() {
+        Ok(plan) => plan,
+        Err(e) => {
+            return [
+                "LCM doctor source apply".to_string(),
+                "status: error".to_string(),
+                format!("error: source-lineage scan failed: {e}"),
+                "note: source normalization apply aborted before any rows were updated".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    if would_update == 0 {
+        return [
+            "LCM doctor source apply".to_string(),
+            "status: ok".to_string(),
+            "target_source: unknown".to_string(),
+            "updated_messages: 0".to_string(),
+            format!(
+                "legacy_blank_before: {}",
+                stats_before.legacy_blank_source_messages
+            ),
+            format!(
+                "legacy_blank_after: {}",
+                stats_before.legacy_blank_source_messages
+            ),
+            "note: no legacy blank-source rows needed normalization".to_string(),
+        ]
+        .join("\n");
+    }
+    let db = engine
+        .config
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let backup = match engine.backup_database() {
+        Ok(b) => b,
+        Err(e) => {
+            return [
+                "LCM doctor source apply".to_string(),
+                "status: error".to_string(),
+                format!("database_path: {db}"),
+                format!("error: backup failed: {e}"),
+                "note: source normalization apply aborted before any rows were updated".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    match engine.store.normalize_legacy_blank_sources() {
+        Ok((updated, before, after)) => [
+            "LCM doctor source apply".to_string(),
+            "status: ok".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            "target_source: unknown".to_string(),
+            format!("updated_messages: {updated}"),
+            format!(
+                "legacy_blank_before: {}",
+                before.legacy_blank_source_messages
+            ),
+            format!("legacy_blank_after: {}", after.legacy_blank_source_messages),
+            format!("unknown_before: {}", before.normalized_unknown_messages),
+            format!("unknown_after: {}", after.normalized_unknown_messages),
+            "note: backup created before source normalization apply".to_string(),
+        ]
+        .join("\n"),
+        Err(e) => [
+            "LCM doctor source apply".to_string(),
+            "status: error".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            format!("error: source normalization failed: {e}"),
+            "note: backup was created before source normalization apply".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
 /// `/lcm doctor repair` — the read-only FTS repair scan (`_doctor_repair_text`,
 /// `LCM:command.py:704-721`).
 fn doctor_repair_text(engine: &LcmContextEngine) -> String {
@@ -1711,8 +1848,13 @@ impl CommandProvider for LcmContextEngine {
                 (Some("repair"), Some("apply")) => {
                     Ok(CommandOutput::text(doctor_repair_apply_text(self)))
                 }
+                (Some("source"), None) => Ok(CommandOutput::text(doctor_source_text(self))),
+                (Some("source"), Some("apply")) => {
+                    Ok(CommandOutput::text(doctor_source_apply_text(self)))
+                }
                 _ => Err(CommandError::BadArgs(
-                    "unknown /lcm doctor subcommand (try `doctor` or `doctor repair [apply]`)"
+                    "unknown /lcm doctor subcommand (try `doctor`, `doctor repair [apply]`, or \
+                     `doctor source [apply]`)"
                         .to_string(),
                 )),
             },
@@ -1750,7 +1892,7 @@ pub fn command_specs() -> Vec<CommandSpec> {
     vec![CommandSpec::new("lcm")
         .summary("Lossless context management: status, health, preset, backup, rotate")
         .category("Context")
-        .args_hint("<status|doctor [repair [apply]]|preset|backup|rotate [apply]>")
+        .args_hint("<status|doctor [repair|source [apply]]|preset|backup|rotate [apply]>")
         .subcommands(["status", "doctor", "preset", "backup", "rotate"])]
 }
 
@@ -3114,7 +3256,7 @@ mod tests {
 
     // parity: command.py::test_doctor_source_reports_legacy_blank_rows (tests/test_lcm_command.py:440)
     #[tokio::test]
-    async fn parity_gap_doctor_source_scans_legacy_blank_rows() {
+    async fn doctor_source_scans_legacy_blank_rows() {
         let (lcm, dir) = durable_engine("doctor-source-scan", 32);
         let mut c = convo(2); // 4 attributed rows via the normal write path
         lcm.before_turn(&mut c, None);
@@ -3143,7 +3285,7 @@ mod tests {
 
     // parity: command.py::test_doctor_source_apply_normalizes_legacy_blank_rows (tests/test_lcm_command.py:451)
     #[tokio::test]
-    async fn parity_gap_doctor_source_apply_normalizes_legacy_blank_rows() {
+    async fn doctor_source_apply_normalizes_legacy_blank_rows() {
         let (lcm, dir) = durable_engine("doctor-source-apply", 32);
         let mut c = convo(2);
         lcm.before_turn(&mut c, None);

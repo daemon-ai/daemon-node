@@ -73,7 +73,10 @@ Reconcile gap-open rows (not attempted this pass) are grouped in the backlog sec
 
 ### Area 4 — doctor/maintenance commands (`tests/test_lcm_command.py` L440–1091)
 
-(pending)
+| Python test | status | Rust test | note |
+|---|---|---|---|
+| `/lcm doctor source` scan (L440) | gap-closed | `doctor_source_scans_legacy_blank_rows` | red `053b890`, green `<doctor-source green commit>`; new `Store::source_normalization_plan` |
+| `/lcm doctor source apply` (L451) | gap-closed | `doctor_source_apply_normalizes_legacy_blank_rows` | same pair; backup-first `Store::normalize_legacy_blank_sources`, no-op batch skips the backup |
 
 ## Out of scope (recorded per task brief)
 

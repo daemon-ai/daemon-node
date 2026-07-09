@@ -1680,6 +1680,37 @@ impl Store {
         })
     }
 
+    /// A dry-run plan for normalizing legacy NULL/blank `source` rows to the explicit `unknown`
+    /// bucket (`get_source_normalization_plan`, `LCM:store.py`). Returns
+    /// `(would_update_messages, affected_sessions, stats_before)`.
+    pub fn source_normalization_plan(&self) -> Result<(i64, i64, SourceStats)> {
+        let stats_before = self.source_stats(None)?;
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let blank = legacy_blank_source_clause("source");
+        let sql =
+            format!("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM messages WHERE {blank}");
+        let (would_update, affected_sessions) =
+            conn.query_row(&sql, [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok((would_update, affected_sessions, stats_before))
+    }
+
+    /// Normalize legacy NULL/blank `source` rows to the explicit `unknown` bucket
+    /// (`normalize_legacy_blank_sources`, `LCM:store.py`). Returns
+    /// `(updated_messages, stats_before, stats_after)`.
+    pub fn normalize_legacy_blank_sources(&self) -> Result<(i64, SourceStats, SourceStats)> {
+        let stats_before = self.source_stats(None)?;
+        let blank = legacy_blank_source_clause("source");
+        let updated = {
+            let conn = self.conn.lock().expect("lcm store poisoned");
+            conn.execute(
+                &format!("UPDATE messages SET source = 'unknown' WHERE {blank}"),
+                [],
+            )? as i64
+        };
+        let stats_after = self.source_stats(None)?;
+        Ok((updated, stats_before, stats_after))
+    }
+
     /// Lifecycle/session fragmentation diagnostics — `lcm_doctor`'s `lifecycle_fragmentation` check
     /// (§10.6), the in-database portion of `get_fragmentation_stats` (`LCM:lifecycle_state.py:337`).
     pub fn lifecycle_fragmentation_stats(&self) -> Result<LifecycleFragmentation> {
