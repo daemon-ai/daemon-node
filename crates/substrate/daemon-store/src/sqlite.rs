@@ -19,7 +19,7 @@ use crate::{
     FaultPoint, FeedbackRecord, JobCommand, JobCompletion, JournalEntry, JournalPage, JournalSeal,
     ParkedApproval, Room, RoomMember, SessionMeta, SessionRole, SessionSearchHit, SessionStatus,
     SessionStore, StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion,
-    TraceEntry, TraceSegment, TransportPref, CRON_RUN_RETENTION,
+    StoredSavedPresence, TraceEntry, TraceSegment, TransportPref, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -394,6 +394,23 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              CREATE TABLE credential_labels (\n\
                  profile TEXT PRIMARY KEY,\n\
                  label   TEXT NOT NULL\n\
+             );",
+        ),
+        // M13 (W2-F — saved presences): the durable backing for the host `PresenceManager`.
+        // `saved_presences.payload` is the opaque CBOR of the whole wire `SavedPresence`
+        // (protocol-free, mirroring `cron_jobs.spec`); the `rowseq` AUTOINCREMENT primary key gives
+        // stable insertion ordering (the manager's active index depends on list order), with `id`
+        // UNIQUE for upsert/lookup/delete. `saved_presence_active` is a single-row (`id = 0`)
+        // setting holding the active presence id (mirroring `telemetry_consent`); absence = none.
+        M::up(
+            "CREATE TABLE saved_presences (\n\
+                 rowseq  INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 id      TEXT NOT NULL UNIQUE,\n\
+                 payload BLOB NOT NULL\n\
+             );\n\
+             CREATE TABLE saved_presence_active (\n\
+                 id     INTEGER PRIMARY KEY CHECK (id = 0),\n\
+                 active TEXT NOT NULL\n\
              );",
         ),
     ])
@@ -2175,6 +2192,67 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn saved_presence_list(&self) -> Vec<StoredSavedPresence> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT id, payload FROM saved_presences ORDER BY rowseq")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredSavedPresence {
+                id: row.get::<_, String>(0)?,
+                payload: row.get::<_, Vec<u8>>(1)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn saved_presence_set(&self, presence: StoredSavedPresence) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Upsert keyed by the UNIQUE `id`; an existing row keeps its `rowseq` (hence its position).
+        conn.execute(
+            "INSERT INTO saved_presences (id, payload) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET payload = ?2",
+            params![presence.id, presence.payload],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn saved_presence_remove(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM saved_presences WHERE id = ?1", params![id])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn saved_presence_active_get(&self) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT active FROM saved_presence_active WHERE id = 0",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    async fn saved_presence_active_set(&self, id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO saved_presence_active (id, active) VALUES (0, ?1) \
+             ON CONFLICT(id) DO UPDATE SET active = ?1",
+            params![id],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn status(&self, id: &SessionId) -> Option<SessionStatus> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -2445,7 +2523,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 13, "fresh DB is stamped to the latest migration");
     }
 
     fn dump_schema(conn: &Connection) -> String {
@@ -2541,6 +2619,71 @@ mod tests {
         assert_eq!(total.cache_write_tokens, 40);
         assert_eq!(total.reasoning_tokens, 20);
         assert_eq!(total.cost_micros, 2468);
+    }
+
+    /// Saved presences (W2-F): list/set/remove round-trip, upsert preserves insertion order, and
+    /// the single-row active id persists (the durable backing for the host `PresenceManager`).
+    #[tokio::test]
+    async fn saved_presence_store_round_trips() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.saved_presence_list().await.is_empty());
+        assert!(store.saved_presence_active_get().await.is_none());
+
+        // Insertion order is preserved.
+        for id in ["a", "b", "c"] {
+            store
+                .saved_presence_set(StoredSavedPresence {
+                    id: id.into(),
+                    payload: vec![id.as_bytes()[0]],
+                })
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = store
+            .saved_presence_list()
+            .await
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+
+        // Upsert of an existing id keeps its position and replaces the payload.
+        store
+            .saved_presence_set(StoredSavedPresence {
+                id: "b".into(),
+                payload: vec![0xff],
+            })
+            .await
+            .unwrap();
+        let list = store.saved_presence_list().await;
+        assert_eq!(
+            list.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(list[1].payload, vec![0xff]);
+
+        // Active id persists (single-row setting).
+        store.saved_presence_active_set("b").await.unwrap();
+        assert_eq!(
+            store.saved_presence_active_get().await.as_deref(),
+            Some("b")
+        );
+        store.saved_presence_active_set("c").await.unwrap();
+        assert_eq!(
+            store.saved_presence_active_get().await.as_deref(),
+            Some("c")
+        );
+
+        // Remove is idempotent.
+        store.saved_presence_remove("b").await.unwrap();
+        store.saved_presence_remove("b").await.unwrap();
+        let ids: Vec<String> = store
+            .saved_presence_list()
+            .await
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec!["a", "c"]);
     }
 
     /// Conversation-rewind seals are append-only; the latest seal for a stream is the active one.
