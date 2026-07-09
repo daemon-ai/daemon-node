@@ -25,6 +25,9 @@
 //! - [`user_profile`] — [`UserProfileStore`] (per-profile `USER.md`: §-delimited entries,
 //!   dedup, scan-on-write, external-drift guard, load-time snapshot sanitization), the
 //!   `user_profile` tool schema/rubric, and the pure [`NudgeCounter`].
+//! - [`context_files`] — the workspace context-file loader (`DAEMON.md` > `AGENTS.md` >
+//!   `CLAUDE.md` > `.cursorrules` chain) and the mid-session [`SubdirHintTracker`], both
+//!   driven exclusively through an `ExecutionEnvironment`.
 //!
 //! Cache discipline: every producer here is deterministic from its inputs (no clocks, no env
 //! vars, no ambient config), so a caller that snapshots the outputs once per session gets a
@@ -32,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod context_files;
 pub mod guidance;
 pub mod persona;
 mod revlog;
@@ -39,6 +43,7 @@ pub mod scan;
 pub mod truncate;
 pub mod user_profile;
 
+pub use context_files::{ContextFilesLoader, SubdirHintTracker};
 pub use guidance::{
     core_agentic_guidance, date_stamp, environment_hints, model_family_guidance, tool_use_guidance,
     transport_hints, EnvironmentInput, ToolUseMode, TransportOrigin,
