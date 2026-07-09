@@ -1514,6 +1514,61 @@ mod tests {
         );
     }
 
+    // ---- Session-end drain (`tests/test_hermes_memory_provider.py::on_session_end`) ----
+
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider.py::test_on_session_end_completes_when_sleep_is_fast
+    // A terminal session switch drains pending working memory into the episodic tiers (a forced
+    // sleep), while a non-terminal switch (Start) leaves the buffer intact.
+    #[tokio::test]
+    async fn session_end_drains_pending_working_memory() {
+        let conv = Conversation::new(SystemPrompt::new(""));
+
+        // End drains: after a forced sleep, nothing remains pending for consolidation, and the
+        // content survives (now recallable from the episodic tier).
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let ended = MnemosyneProvider::new(engine.clone());
+        ended
+            .after_turn(
+                &Turn::User(UserMsg::new("the deployment uses a blue-green rollout")),
+                &conv,
+            )
+            .await;
+        ended
+            .after_turn(
+                &Turn::User(UserMsg::new("the database runs postgres sixteen daily")),
+                &conv,
+            )
+            .await;
+        ended.on_session_switch(SwitchReason::End).await;
+        assert_eq!(
+            engine.consolidate().unwrap(),
+            0,
+            "End must have already drained working memory"
+        );
+        assert!(
+            !engine
+                .recall("deployment blue-green", 5)
+                .unwrap()
+                .is_empty(),
+            "drained content must survive in the episodic tier"
+        );
+
+        // A non-terminal switch (Start) must NOT drain: rows stay pending.
+        let engine2 = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let started = MnemosyneProvider::new(engine2.clone());
+        started
+            .after_turn(
+                &Turn::User(UserMsg::new("the deployment uses a blue-green rollout")),
+                &conv,
+            )
+            .await;
+        started.on_session_switch(SwitchReason::Start).await;
+        assert!(
+            engine2.consolidate().unwrap() >= 1,
+            "Start must leave the working-memory buffer un-drained"
+        );
+    }
+
     // ---- Identity always-inject / capture (`tests/test_prefetch_identity_always_inject.py`) ----
 
     fn insert_identity(engine: &Engine, content: &str, session_id: &str) {
