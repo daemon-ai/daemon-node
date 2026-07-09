@@ -47,62 +47,132 @@ impl PresenceManager {
             .unwrap_or(0)
     }
 
+    /// Map a store error onto the wire [`ApiError`].
+    fn store_err(e: daemon_store::StoreError) -> ApiError {
+        ApiError::Other(format!("presence store: {e}"))
+    }
+
+    /// Decode a stored row into its wire [`SavedPresence`] (skipping undecodable rows).
+    fn decode(stored: &StoredSavedPresence) -> Option<SavedPresence> {
+        from_cbor::<SavedPresence>(&stored.payload).ok()
+    }
+
+    /// Persist `presence` (upsert) into the store as opaque CBOR.
+    async fn persist(&self, presence: &SavedPresence) -> Result<(), ApiError> {
+        self.store
+            .saved_presence_set(StoredSavedPresence {
+                id: presence.id.clone(),
+                payload: to_cbor(presence),
+            })
+            .await
+            .map_err(Self::store_err)
+    }
+
     /// Load from the backend, seeding the default Offline + Available presences when absent
     /// (← the manager's backend-load callback + `add_default_{offline,available}`). Idempotent.
     pub async fn load(&self) {
-        // TDD red stub: no seeding.
+        let have_offline = self.find_with_id(DEFAULT_OFFLINE_ID).await.is_some();
+        if !have_offline {
+            let offline = SavedPresence {
+                id: DEFAULT_OFFLINE_ID.to_string(),
+                name: Some("Offline".to_string()),
+                primitive: PresencePrimitive::Offline,
+                ..SavedPresence::default()
+            };
+            let _ = self.persist(&offline).await;
+        }
+        let have_available = self.find_with_id(DEFAULT_AVAILABLE_ID).await.is_some();
+        if !have_available {
+            let available = SavedPresence {
+                id: DEFAULT_AVAILABLE_ID.to_string(),
+                name: Some("Available".to_string()),
+                primitive: PresencePrimitive::Available,
+                ..SavedPresence::default()
+            };
+            let _ = self.persist(&available).await;
+        }
     }
 
     /// Every saved presence, in insertion order (← the `GListModel`).
     pub async fn list(&self) -> Vec<SavedPresence> {
-        // TDD red stub.
-        Vec::new()
+        self.store
+            .saved_presence_list()
+            .await
+            .iter()
+            .filter_map(Self::decode)
+            .collect()
     }
 
     /// Add a saved presence (← `purple_presence_manager_add`): mints an id when unset, rejects a
     /// duplicate id (returns `Ok(false)`), else persists it and returns `Ok(true)`.
-    pub async fn add(&self, _presence: SavedPresence) -> Result<bool, ApiError> {
-        // TDD red stub.
-        Ok(false)
+    pub async fn add(&self, mut presence: SavedPresence) -> Result<bool, ApiError> {
+        presence.ensure_id();
+        if self.find_with_id(&presence.id).await.is_some() {
+            return Ok(false);
+        }
+        self.persist(&presence).await?;
+        Ok(true)
     }
 
     /// Upsert a saved presence (the wire `PresenceSave` seam): mints an id when unset, then
     /// persists — creating a new presence or replacing an existing one by id.
-    pub async fn save(&self, _presence: SavedPresence) -> Result<(), ApiError> {
-        // TDD red stub.
-        Err(ApiError::Unsupported("presence_save".into()))
+    pub async fn save(&self, mut presence: SavedPresence) -> Result<(), ApiError> {
+        presence.ensure_id();
+        self.persist(&presence).await
     }
 
     /// Remove a saved presence by id (← `purple_presence_manager_remove`); returns whether one was
     /// removed.
-    pub async fn remove(&self, _id: &str) -> Result<bool, ApiError> {
-        // TDD red stub.
-        Ok(false)
+    pub async fn remove(&self, id: &str) -> Result<bool, ApiError> {
+        if self.find_with_id(id).await.is_none() {
+            return Ok(false);
+        }
+        self.store
+            .saved_presence_remove(id)
+            .await
+            .map_err(Self::store_err)?;
+        Ok(true)
     }
 
     /// Find a saved presence by id (← `purple_presence_manager_find_with_id`).
-    pub async fn find_with_id(&self, _id: &str) -> Option<SavedPresence> {
-        // TDD red stub.
-        None
+    pub async fn find_with_id(&self, id: &str) -> Option<SavedPresence> {
+        self.store
+            .saved_presence_list()
+            .await
+            .iter()
+            .filter_map(Self::decode)
+            .find(|p| p.id == id)
     }
 
     /// Find the first saved presence whose name equals `name` (daemon-native lookup-by-name).
-    pub async fn find_with_name(&self, _name: &str) -> Option<SavedPresence> {
-        // TDD red stub.
-        None
+    pub async fn find_with_name(&self, name: &str) -> Option<SavedPresence> {
+        self.store
+            .saved_presence_list()
+            .await
+            .iter()
+            .filter_map(Self::decode)
+            .find(|p| p.name.as_deref() == Some(name))
     }
 
     /// Set the active saved presence by id (← `purple_presence_manager_set_active_from_id`), bumping
     /// its use-count and stamping its last-used time (daemon-native activation bookkeeping).
-    pub async fn set_active(&self, _id: &str) -> Result<(), ApiError> {
-        // TDD red stub.
-        Err(ApiError::Unsupported("presence_set_active".into()))
+    pub async fn set_active(&self, id: &str) -> Result<(), ApiError> {
+        let Some(mut presence) = self.find_with_id(id).await else {
+            return Err(ApiError::Other(format!("unknown saved presence: {id}")));
+        };
+        presence.use_count = presence.use_count.saturating_add(1);
+        presence.last_used = Some(Self::now_unix());
+        self.persist(&presence).await?;
+        self.store
+            .saved_presence_active_set(id)
+            .await
+            .map_err(Self::store_err)
     }
 
     /// The active saved presence, if one has been set (← `purple_presence_manager_get_active`).
     pub async fn active(&self) -> Option<SavedPresence> {
-        // TDD red stub.
-        None
+        let id = self.store.saved_presence_active_get().await?;
+        self.find_with_id(&id).await
     }
 }
 
@@ -121,7 +191,6 @@ mod tests {
     // -- /presence-manager/new ---------------------------------------------
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_new_has_two_defaults() {
         // ← /presence-manager/new: a fresh manager has exactly the 2 default presences.
         let m = manager().await;
@@ -139,7 +208,6 @@ mod tests {
     // -- /presence-manager/add-remove --------------------------------------
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_add_remove() {
         // ← /presence-manager/add-remove.
         let m = manager().await;
@@ -162,7 +230,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_add_rejects_duplicate() {
         // ← purple_presence_manager_add returning FALSE on a duplicate id.
         let m = manager().await;
@@ -177,7 +244,6 @@ mod tests {
     // -- backend-normal ports (the store persistence seam) -----------------
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_add_persists_to_store() {
         // ← /presence-manager-backend-normal/save-saved-presence: add persists to the store backend.
         let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
@@ -193,7 +259,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_remove_deletes_from_store() {
         // ← /presence-manager-backend-normal/delete-saved-presence: remove deletes from the backend.
         let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
@@ -210,7 +275,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_new_loads_from_store() {
         // ← /presence-manager-backend-normal/load-saved-presences: a new manager loads persisted
         // presences from the backend (plus seeds the two defaults).
@@ -235,7 +299,6 @@ mod tests {
     // -- derived: lookup-by-name + activation bookkeeping ------------------
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_find_by_name() {
         let m = manager().await;
         let mut p = SavedPresence::new(PresencePrimitive::Away);
@@ -246,7 +309,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_set_active_bumps_use_count_and_last_used() {
         let m = manager().await;
         // Unknown id errors.
@@ -264,7 +326,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "TDD red: pending impl"]
     async fn mgr_active_persists_across_reload() {
         let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
         let m = PresenceManager::new(store.clone());
