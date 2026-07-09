@@ -1678,6 +1678,180 @@ fn forget_cascade_failure_rolls_back_row_delete() {
     );
 }
 
+/// Recall with per-call weight overrides through the public filter surface (`beam.py`
+/// `recall(vec_weight=..., fts_weight=..., importance_weight=...)`).
+fn recall_weighted(
+    e: &Engine,
+    query: &str,
+    weights: (Option<f64>, Option<f64>, Option<f64>),
+) -> Vec<MemoryRow> {
+    let scope = RecallScope::default();
+    e.recall_with_scope(&RecallReq {
+        query,
+        top_k: 5,
+        query_vector: None,
+        scope: &scope,
+        filters: crate::config::RecallFilters {
+            vec_weight: weights.0,
+            fts_weight: weights.1,
+            importance_weight: weights.2,
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
+
+// parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_high_importance_weight_boosts_high_importance_memories (tests/test_configurable_scoring.py:147)
+// parity: test_configurable_scoring.py::TestPublicRecallConfigurableWeights::test_mnemosyne_recall_accepts_weight_params (tests/test_configurable_scoring.py:241)
+#[test]
+fn recall_importance_weight_override_reorders_results() {
+    let e = engine();
+    // A: strong lexical match, low importance. B: weaker lexical match, high importance.
+    e.remember(
+        "critical alert generic text",
+        &RememberArgs {
+            importance: 0.1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    e.remember(
+        "critical system status",
+        &RememberArgs {
+            importance: 0.9,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Keyword-dominated weights: the exact lexical match ranks first.
+    let low_iw = recall_weighted(&e, "critical alert", (Some(0.5), Some(0.45), Some(0.05)));
+    assert_eq!(low_iw.len(), 2, "both rows pass the gate: {low_iw:?}");
+    assert!(
+        low_iw[0].content.contains("generic"),
+        "keyword-dominant weights must rank the lexical match first, got {low_iw:?}"
+    );
+
+    // Importance-dominated weights: the high-importance row overtakes it end-to-end.
+    let high_iw = recall_weighted(&e, "critical alert", (Some(0.1), Some(0.1), Some(0.8)));
+    assert!(
+        high_iw[0].content.contains("system status"),
+        "importance-dominant weights must reorder the ranking, got {high_iw:?}"
+    );
+}
+
+// parity: test_configurable_scoring.py::TestNormalizeWeights::test_env_var_override (tests/test_configurable_scoring.py:83) — env vars map to the injected config in Rust
+// parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_env_vars_affect_scoring (tests/test_configurable_scoring.py:185)
+#[test]
+fn configured_recall_weights_change_ranking_end_to_end() {
+    // The Rust analog of `MNEMOSYNE_{VEC,FTS,IMPORTANCE}_WEIGHT`: the host injects
+    // `recall_weights` through MnemosyneConfig, and recall uses them as its defaults.
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        recall_weights: (0.1, 0.1, 0.8),
+        ..MnemosyneConfig::default()
+    })
+    .unwrap();
+    e.remember(
+        "critical alert generic text",
+        &RememberArgs {
+            importance: 0.1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    e.remember(
+        "critical system status",
+        &RememberArgs {
+            importance: 0.9,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let hits = e.recall("critical alert", 5).unwrap();
+    assert!(
+        hits[0].content.contains("system status"),
+        "configured importance-heavy defaults must drive the ranking, got {hits:?}"
+    );
+    assert!(hits[0].importance >= 0.5, "top hit is the important row");
+}
+
+// parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_zero_all_weights_uses_defaults_in_recall (tests/test_configurable_scoring.py:227)
+// parity: test_configurable_scoring.py::TestEdgeCases::test_invalid_negative_param_clamped (tests/test_configurable_scoring.py:307)
+// parity: test_configurable_scoring.py::TestEdgeCases::test_very_high_fts_weight (tests/test_configurable_scoring.py:298)
+#[test]
+fn recall_weight_override_edge_cases_never_break_recall() {
+    let e = engine();
+    e.remember(
+        "exact text match phrase",
+        &RememberArgs {
+            importance: 0.5,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // All-zero overrides fall back to the defaults instead of zeroing every score.
+    let zeros = recall_weighted(&e, "exact text match", (Some(0.0), Some(0.0), Some(0.0)));
+    assert!(
+        !zeros.is_empty(),
+        "all-zero weights must fall back to defaults"
+    );
+
+    // Negative components are clamped, not propagated.
+    let negative = recall_weighted(&e, "exact text", (Some(-0.5), Some(1.0), Some(0.5)));
+    assert!(!negative.is_empty(), "negative weights must be clamped");
+
+    // A pure-FTS weighting still surfaces the text match.
+    let fts_only = recall_weighted(&e, "exact text match", (Some(0.0), Some(1.0), Some(0.0)));
+    assert!(
+        !fts_only.is_empty() && fts_only[0].content.contains("exact"),
+        "fts-only weighting surfaces the text match, got {fts_only:?}"
+    );
+}
+
+// parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_results_include_score_breakdown (tests/test_configurable_scoring.py:171)
+// parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_weight_params_dont_break_temporal_scoring (tests/test_configurable_scoring.py:217)
+#[test]
+fn recall_weight_overrides_report_breakdown_and_compose_with_temporal() {
+    let e = engine();
+    e.remember(
+        "Test content for scoring breakdown",
+        &RememberArgs::default(),
+    )
+    .unwrap();
+
+    let hits = recall_weighted(&e, "test content", (Some(0.4), Some(0.4), Some(0.2)));
+    assert_eq!(hits.len(), 1);
+    // The row carries the per-signal breakdown fields (`dense_score`/`fts_score`/`score`).
+    assert!(hits[0].score > 0.0);
+    assert!(hits[0].fts_score > 0.0, "fts signal populated: {hits:?}");
+    assert_eq!(hits[0].dense_score, 0.0, "no vector supplied");
+
+    // Weight overrides coexist with the Phase-3 temporal boost knobs.
+    let scope = RecallScope::default();
+    let temporal = e
+        .recall_with_scope(&RecallReq {
+            query: "test content",
+            top_k: 5,
+            query_vector: None,
+            scope: &scope,
+            filters: crate::config::RecallFilters {
+                vec_weight: Some(0.4),
+                fts_weight: Some(0.3),
+                importance_weight: Some(0.3),
+                temporal_weight: 0.5,
+                query_time: Some("2099-01-01".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    assert!(
+        !temporal.is_empty(),
+        "temporal boost + weight overrides must compose"
+    );
+}
+
 #[test]
 fn polyphonic_recall_fuses_voices() {
     let cfg = MnemosyneConfig {
