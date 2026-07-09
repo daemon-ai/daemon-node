@@ -2342,6 +2342,146 @@ fn temporal_halflife_override_changes_boost_end_to_end() {
     );
 }
 
+// ---- Proactive content-similarity / entity linking (`tests/test_proactive_linking.py`) ----
+
+fn linking_engine(proactive_linking: bool) -> Engine {
+    Engine::open_in_memory(MnemosyneConfig {
+        proactive_linking,
+        ..MnemosyneConfig::default()
+    })
+    .unwrap()
+}
+
+fn imp08(extract_entities: bool) -> RememberArgs {
+    RememberArgs {
+        importance: 0.8,
+        extract_entities,
+        ..RememberArgs::default()
+    }
+}
+
+fn related_edge_count(e: &Engine, source: &str, target: &str, edge_type: &str) -> i64 {
+    e.with_conn(|c| {
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE source = ?1 AND target = ?2 AND edge_type = ?3",
+            params![source, target, edge_type],
+            |r| r.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+// PARITY: Mnemosyne tests/test_proactive_linking.py::TestProactiveContentLinking::test_similar_content_creates_edges
+// PARITY: Mnemosyne tests/test_proactive_linking.py::TestProactiveContentLinking::test_self_not_linked
+#[test]
+fn proactive_linking_links_similar_content_and_never_itself() {
+    let e = linking_engine(true);
+    let a = e
+        .remember(
+            "Alice set up the CI/CD pipeline for the backend deployment",
+            &imp08(false),
+        )
+        .unwrap();
+    let b = e
+        .remember(
+            "Alice configured the deployment pipeline for continuous integration",
+            &imp08(false),
+        )
+        .unwrap();
+
+    let related = e.graph_query(&b, 1).unwrap();
+    assert!(
+        related.iter().any(|r| r.memory_id == a),
+        "the similar prior memory must be proactively linked: {related:?}"
+    );
+    assert!(
+        !related.iter().any(|r| r.memory_id == b),
+        "a memory must never link to itself"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_proactive_linking.py::TestProactiveContentLinking::test_unrelated_content_no_edges
+#[test]
+fn proactive_linking_skips_unrelated_content() {
+    let e = linking_engine(true);
+    e.remember(
+        "Quantum entanglement in particle physics experiments",
+        &imp08(false),
+    )
+    .unwrap();
+    let b = e
+        .remember(
+            "The cat sat on the mat and purred contentedly",
+            &imp08(false),
+        )
+        .unwrap();
+    let related = e.graph_query(&b, 1).unwrap();
+    assert!(
+        related.iter().all(|r| r.edge_type != "related_to"),
+        "unrelated content must not get related_to edges: {related:?}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_proactive_linking.py::TestProactiveLinkingGating::test_disabled_by_default
+#[test]
+fn proactive_linking_disabled_by_default_creates_no_cross_memory_edges() {
+    let e = linking_engine(false);
+    let a = e
+        .remember(
+            "The server infrastructure runs on Kubernetes with auto-scaling",
+            &imp08(false),
+        )
+        .unwrap();
+    let b = e
+        .remember(
+            "Kubernetes orchestration manages container deployment and scaling",
+            &imp08(false),
+        )
+        .unwrap();
+    let related = e.graph_query(&b, 1).unwrap();
+    assert!(
+        !related.iter().any(|r| r.memory_id == a),
+        "proactive linking is off by default: {related:?}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_proactive_linking.py::TestEdgeDeduplication::test_repeat_remember_doesnt_duplicate_edges
+#[test]
+fn proactive_linking_dedups_edges_on_repeat_remember() {
+    let e = linking_engine(true);
+    let content_a = "Database indexing improves query performance significantly";
+    let content_b = "Database indexing optimizes query speed and efficiency";
+    let a = e.remember(content_a, &imp08(false)).unwrap();
+    let b = e.remember(content_b, &imp08(false)).unwrap();
+    let before = related_edge_count(&e, &b, &a, "related_to");
+    // Re-remember B (the dedup path) — the edge must not be duplicated.
+    e.remember(content_b, &imp08(false)).unwrap();
+    let after = related_edge_count(&e, &b, &a, "related_to");
+    assert_eq!(after, before, "repeat remember must not duplicate edges");
+}
+
+// PARITY: Mnemosyne tests/test_proactive_linking.py::TestEdgeTypesAndWeights::test_entity_edge_type
+#[test]
+fn proactive_linking_creates_references_edge_on_shared_entity() {
+    let e = linking_engine(true);
+    let a = e
+        .remember(
+            "Jane is a talented architect. Jane uses AutoCAD daily.",
+            &imp08(true),
+        )
+        .unwrap();
+    let b = e
+        .remember(
+            "Jane is designing the new office building. Jane reviews blueprints.",
+            &imp08(true),
+        )
+        .unwrap();
+    assert!(
+        related_edge_count(&e, &b, &a, "references") >= 1,
+        "a shared extracted entity must create a references edge"
+    );
+}
+
 // ---- A/B scoring toggles (`tests/test_ab_toggles.py`) ----
 
 /// Seed one episodic row plus the graph edges + fact that let a recall claim the bonuses.
