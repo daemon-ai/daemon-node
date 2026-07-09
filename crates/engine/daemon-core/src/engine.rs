@@ -526,6 +526,14 @@ impl Engine {
         let mut attempt = 0u32;
         let mut compacted = false;
         loop {
+            // A cancellation observed between attempts (e.g. a `/stop` that landed while a transient
+            // stream error was being handled) aborts the recovery loop immediately — before any fresh
+            // credential acquire or provider re-invocation — rather than opening a doomed new attempt.
+            // Mirrors hermes' `_interruptible_streaming_api_call` checking `_interrupt_requested` at
+            // the top of its retry loop (test_stream_interrupt_retry.py).
+            if cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
             tracing::debug!(
                 attempt,
                 offer_tools,
@@ -575,7 +583,13 @@ impl Engine {
                             },
                         });
                     }
-                    tokio::time::sleep(after).await;
+                    // The backoff is interruptible: a `/stop` during the wait aborts immediately
+                    // instead of serving out a (possibly long, `Retry-After`-sized) sleep.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(Failure::Cancelled),
+                        _ = tokio::time::sleep(after) => {}
+                    }
                     attempt += 1;
                 }
                 RecoveryStep::Rotate => {

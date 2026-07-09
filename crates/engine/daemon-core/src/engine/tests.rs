@@ -1751,7 +1751,7 @@ impl Provider for CancelThenTransient {
 // the engine's §8 recovery loop (`call_model`): a cancellation observed between attempts aborts the
 // loop before it acquires a fresh credential or re-invokes the provider.
 #[tokio::test]
-async fn parity_gap_interrupt_aborts_model_retry_loop() {
+async fn interrupt_aborts_model_retry_loop() {
     use crate::credentials::CredentialProvider;
     let control = TurnControl::new();
     let creds = Arc::new(TwoProfileCreds {
