@@ -247,11 +247,13 @@ fn cddl_rule_mentions_variant(cddl: &str, rule_name: &str, variant: &str) -> boo
 fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
         AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiRequest, ApiResponse,
-        ApprovalInfo, CommandInvocation, CommandOutput, ConnectionState, ContactsOps, ConvChange,
-        ConversationOps, CredentialInfo, DisconnectReason, EventsPage, HealthReport, LogPageView,
-        MembershipChange, MembershipOps, ModelDescriptor, NodeEvent, PolicyEntry, PresenceState,
-        ProfileInfo, ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector,
-        ProviderSignIn, RosterOps, ServiceHealth, SessionPage, TransportInstanceInfo,
+        ApprovalInfo, ChatMessage, CommandInvocation, CommandOutput, ConnectionState, ContactInfo,
+        ContactsOps, ConvChange, ConversationOps, CredentialInfo, DisconnectReason, EventsPage,
+        HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView,
+        MembershipChange, MembershipOps, MessageAttachment, ModelDescriptor, NodeEvent,
+        Participant, PolicyEntry, PresenceState, ProfileInfo, ProfileSpec, ProviderDescriptor,
+        ProviderKindWire, ProviderSelector, ProviderSignIn, RosterOps, ServiceHealth, SessionPage,
+        TransportInstanceInfo,
     };
     use daemon_common::{Author, ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, ToolDetail, TransportId, UserMsg};
@@ -1102,6 +1104,59 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next_seq: 0,
             head_seq: 0,
             epoch: 0,
+        }),
+    )?;
+    // wire vNEXT (W2-E): the richer ChatMessage on the conversation-history surface, so conformance
+    // + verify-codec prove the CDDL↔Rust agreement on the new `JournalRecordPayload::Chat` arm and
+    // the `chat-message` / `message-attachment` shapes on a real ciborium payload.
+    write_cbor(
+        &out,
+        "response-journal.cbor",
+        &ApiResponse::Journal(JournalPageView {
+            entries: vec![JournalRecord {
+                cursor: 3,
+                segment: 1,
+                seq: 3,
+                epoch: 0,
+                trace: 0,
+                kind: "block.message".into(),
+                timestamp_ms: 911_347_200_000,
+                verified: true,
+                payload: JournalRecordPayload::Chat {
+                    message: Box::new(ChatMessage {
+                        id: Some("$evt:hs.org".into()),
+                        author: Some(Participant::Contact(ContactInfo {
+                            id: "@alice:hs.org".into(),
+                            display_name: Some("Alice Smith".into()),
+                            ..Default::default()
+                        })),
+                        replying_to: Some("$prev:hs.org".into()),
+                        text: "Now that is a big door".into(),
+                        attachments: vec![MessageAttachment {
+                            id: "att-1".into(),
+                            content_type: Some("image/png".into()),
+                            is_inline: true,
+                            local_uri: None,
+                            remote_uri: Some("mxc://hs.org/abc".into()),
+                            size: 4096,
+                        }],
+                        timestamp: Some(911_347_200),
+                        delivered_at: Some(911_347_201),
+                        edited_at: None,
+                        error: None,
+                        title: Some("Titled".into()),
+                        highlight_color: Some("#FF00FF".into()),
+                        action: false,
+                        event: false,
+                        notice: false,
+                        system: false,
+                        highlighted: true,
+                    }),
+                },
+            }],
+            next_cursor: 3,
+            head_cursor: 3,
+            sealed_after: None,
         }),
     )?;
     write_cbor(

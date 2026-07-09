@@ -465,8 +465,37 @@ transcript-block = transcript-block-message
 
 journal-record-payload-management = { "Management": { "detail": tstr } }
 journal-record-payload-block = { "Block": { "block": transcript-block } }
+; wire vNEXT: the richer ChatMessage representation on the conversation-history surface (W2-E).
+message-attachment = {
+  "id": tstr,
+  ? "content_type": (tstr / null),
+  ? "is_inline": bool,
+  ? "local_uri": (tstr / null),
+  ? "remote_uri": (tstr / null),
+  ? "size": uint64,
+}
+chat-message = {
+  ? "id": (tstr / null),
+  ? "author": (participant / null),
+  ? "replying_to": (tstr / null),
+  "text": tstr,
+  ? "attachments": [* message-attachment],
+  ? "timestamp": (uint64 / null),
+  ? "delivered_at": (uint64 / null),
+  ? "edited_at": (uint64 / null),
+  ? "error": (tstr / null),
+  ? "title": (tstr / null),
+  ? "highlight_color": (tstr / null),
+  ? "action": bool,
+  ? "event": bool,
+  ? "notice": bool,
+  ? "system": bool,
+  ? "highlighted": bool,
+}
+journal-record-payload-chat = { "Chat": { "message": chat-message } }
 journal-record-payload-t = journal-record-payload-management
                          / journal-record-payload-block
+                         / journal-record-payload-chat
 
 journal-record = {
   "cursor": uint64,

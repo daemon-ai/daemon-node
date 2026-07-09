@@ -4076,6 +4076,15 @@ pub enum JournalRecordPayload {
         /// The decoded transcript block.
         block: TranscriptBlock,
     },
+    /// A rich chat message (wire vNEXT): the [`ChatMessage`] representation of a conversation-history
+    /// entry, carrying delivery/edit state, author, and attachments the coarser `Block` shape omits.
+    /// Additive — clients that only know `Management`/`Block` ignore it. Boxed to keep the enum small
+    /// (`ChatMessage` is the largest variant); `Box<T>` serializes identically, so the wire shape is
+    /// unchanged.
+    Chat {
+        /// The decoded chat message.
+        message: Box<ChatMessage>,
+    },
 }
 
 /// One decoded + verified journal entry, as returned by a history read.
@@ -5337,3 +5346,9 @@ mod details;
 pub use details::*;
 mod saved_presence;
 pub use saved_presence::*;
+
+mod message;
+pub use message::*;
+
+mod tags;
+pub use tags::*;

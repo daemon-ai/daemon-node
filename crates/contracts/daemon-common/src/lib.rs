@@ -42,6 +42,11 @@ pub mod ingress;
 pub use ingress::{ConnectionPermit, IngressGovernor};
 pub use ingress::{IngressLimits, IngressReject, PeerKey, RateSpec};
 
+/// HTML-markup stripping (`markup::strip_html`) ported from libpurple `purple_markup_strip_html`:
+/// node-authoritative reduction of message HTML to plain text (tags dropped, entities decoded,
+/// links collapsed). Pure + sync.
+pub mod markup;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
