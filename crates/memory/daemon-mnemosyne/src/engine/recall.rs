@@ -1262,11 +1262,29 @@ impl Engine {
         let now = util::now_iso();
 
         // ---- The four voices (over-fetch top_k*2, `beam.py` L6599) ----
+        // Each voice is independently ablatable (`polyphonic_recall.py` `MNEMOSYNE_VOICE_*`
+        // toggles): a disabled voice contributes an empty hit list to the RRF fusion.
         let voices = [
-            poly_vector_voice(&conn, req.query_vector, &now),
-            poly_graph_voice(&conn, req.query)?,
-            poly_fact_voice(&conn, req.query)?,
-            poly_temporal_voice(&conn, req.query)?,
+            if self.config.voice_vector {
+                poly_vector_voice(&conn, req.query_vector, &now)
+            } else {
+                Vec::new()
+            },
+            if self.config.voice_graph {
+                poly_graph_voice(&conn, req.query)?
+            } else {
+                Vec::new()
+            },
+            if self.config.voice_fact {
+                poly_fact_voice(&conn, req.query)?
+            } else {
+                Vec::new()
+            },
+            if self.config.voice_temporal {
+                poly_temporal_voice(&conn, req.query)?
+            } else {
+                Vec::new()
+            },
         ];
         let fused = polyphonic::combine_voices(&voices);
         let reranked = polyphonic::diversity_rerank(fused, req.top_k * 2);
