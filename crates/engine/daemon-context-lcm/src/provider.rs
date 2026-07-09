@@ -509,15 +509,50 @@ impl LcmContextEngine {
             return;
         }
         let session = effective_session(&state.session_id);
+        let tok = state.tokenizer.clone();
         if !state.reconciled {
-            let frontier = self.store.get_frontier(&session).unwrap_or(0);
-            let _ = self.store.delete_messages_after(&session, frontier);
-            state.cursor = 0;
-            state.turn_store_ids.clear();
             state.reconciled = true;
+            let session_count = self.store.message_count(&session).unwrap_or(0);
+            if session_count <= 0 {
+                // Fresh session — nothing durable yet, ingest from the top.
+                state.cursor = 0;
+                state.turn_store_ids.clear();
+            } else if leading_scaffold_count(&conv.turns) > 0 {
+                // A genuine LCM-compacted replay leads with a summary scaffold turn: the volatile
+                // tail (`store_id > frontier`) is re-supplied by the replay, so delete it and
+                // rebuild the turn→row index by re-ingesting from the top (the summarized head
+                // stays behind the frontier). This is the original reconcile path, retained for
+                // the compaction-restart case.
+                let frontier = self.store.get_frontier(&session).unwrap_or(0);
+                let _ = self.store.delete_messages_after(&session, frontier);
+                state.cursor = 0;
+                state.turn_store_ids.clear();
+            } else {
+                // Non-scaffold restart: match the replayed prefix against the durable store tail
+                // and advance the cursor past it WITHOUT deleting durable rows (a core port of
+                // `_reconcile_ingest_cursor_from_store`, `LCM:engine.py:3125`). A delta, a stale
+                // short snapshot, or a scaffold+new-rows replay must not wipe or duplicate the
+                // durable transcript.
+                // A plain system prompt (no LCM note) is the Rust anchor for Python's
+                // system-message stale-snapshot guard.
+                let system_is_plain = !conv
+                    .system
+                    .text
+                    .contains("Lossless Context Management (LCM)");
+                let (cursor, kind) = self.reconcile_turn_cursor(
+                    &session,
+                    &conv.turns,
+                    &tok,
+                    session_count,
+                    system_is_plain,
+                );
+                let cursor = cursor.min(conv.turns.len());
+                state.turn_store_ids =
+                    self.rebuild_turn_store_ids(&session, &conv.turns, cursor, &tok, kind);
+                state.cursor = cursor;
+            }
         }
         let scaffold = leading_scaffold_count(&conv.turns);
-        let tok = state.tokenizer.clone();
         let ext_dir = self.config.externalization_dir();
         while state.cursor < conv.turns.len() {
             let idx = state.cursor;
@@ -552,6 +587,284 @@ impl LcmContextEngine {
             state.cursor += 1;
         }
     }
+
+    /// Restart reconcile for a non-scaffold replay: return `(turn_cursor, kind)` — how many leading
+    /// turns of `turns` are a replay of the durable store, and why. A core port of
+    /// `_reconcile_ingest_cursor_from_store` + `_find_reconciled_cursor_for_store_tail`
+    /// (`LCM:engine.py:2910-3222`), operating at turn granularity (each turn flattens to one or
+    /// more message identities). Never deletes durable rows.
+    ///
+    /// Adaptation (see PARITY.md): the Python system-message anchor for the stale-snapshot guard is
+    /// mapped to "the conversation carries a plain system prompt (no LCM note)", because the Rust
+    /// `Conversation` keeps the system prompt out of the turn/row stream. Externalized-payload and
+    /// quarantine-identity restoration and the sanitized-active-cleanup equivalence flags are not
+    /// modeled here (documented gaps).
+    /// Whether a durable store row matches the active `ignore_message_patterns` (so it is excluded
+    /// from tail reconciliation, mirroring Python's `stored_row=True` filtering).
+    fn row_is_ignored(&self, row: &crate::store::MessageRow) -> bool {
+        !self.message_patterns.is_empty()
+            && self
+                .message_patterns
+                .is_match(row.content.as_deref().unwrap_or(""))
+    }
+
+    /// Whether a live turn matches the active `ignore_message_patterns` (§12.3).
+    fn turn_is_ignored(&self, turn: &Turn) -> bool {
+        !self.message_patterns.is_empty() && self.message_patterns.is_match(&turn_match_text(turn))
+    }
+
+    fn reconcile_turn_cursor(
+        &self,
+        session: &str,
+        turns: &[Turn],
+        tok: &Tokenizer,
+        session_count: i64,
+        system_is_plain: bool,
+    ) -> (usize, ReconcileKind) {
+        let all_rows = self.store.session_messages(session).unwrap_or_default();
+        // Durable identities (ignore-filtered), oldest→newest. `stored_head` is the full prefix
+        // from row 0; `stored_tail` is the last `tail_limit` of them.
+        let stored_all: Vec<ReplayId> = all_rows
+            .iter()
+            .filter(|r| !self.row_is_ignored(r))
+            .map(row_replay_id)
+            .collect();
+        if stored_all.is_empty() {
+            return (0, ReconcileKind::AmbiguousDelta);
+        }
+        let flat_incoming: usize = turns
+            .iter()
+            .map(|t| flatten_turns(std::slice::from_ref(t), tok).len())
+            .sum();
+        let tail_limit = (flat_incoming.saturating_mul(4).max(64)).min(stored_all.len());
+        let stored_tail = &stored_all[stored_all.len() - tail_limit..];
+
+        // Precompute per-turn flags/identities once.
+        let per_turn: Vec<(bool, bool, Vec<ReplayId>)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    is_scaffold_turn(t),
+                    self.turn_is_ignored(t),
+                    turn_replay_ids(t, tok),
+                )
+            })
+            .collect();
+        let visible_prefix = |upto: usize| -> Vec<ReplayId> {
+            let mut out = Vec::new();
+            for (scaffold, ignored, ids) in per_turn.iter().take(upto) {
+                if !*scaffold && !*ignored {
+                    out.extend(ids.iter().cloned());
+                }
+            }
+            out
+        };
+
+        let n = turns.len();
+        let effective_session_count = stored_tail.len();
+        // Search high→low for the largest turn cursor proving a durable-tail replay.
+        for t in (0..=n).rev() {
+            let candidate_prefix = visible_prefix(t);
+            if candidate_prefix.is_empty() {
+                // A leading run of scaffold/ignored-only turns; skip it (allow-empty-prefix).
+                let kind = if t == 0 {
+                    ReconcileKind::AmbiguousDelta
+                } else {
+                    ReconcileKind::ScaffoldOnly
+                };
+                if t > 0 {
+                    return (t, kind);
+                }
+                break;
+            }
+            if !matches_store_tail_suffix(stored_tail, &candidate_prefix) {
+                continue;
+            }
+            let has_scaffold_evidence = per_turn.iter().take(t).any(|(s, _, _)| *s);
+            let has_effective_full_replay =
+                candidate_prefix.len() >= effective_session_count && effective_session_count > 1;
+            let has_raw_full_replay = !has_scaffold_evidence
+                && candidate_prefix.len() >= session_count as usize
+                && session_count > 1;
+            if has_effective_full_replay || has_raw_full_replay {
+                return (t, ReconcileKind::TailReplay);
+            }
+        }
+
+        // No qualifying replay cursor. A stale short snapshot that exactly re-supplies the durable
+        // head with no tail overlap must be skipped, not appended (a duplicate guard). Otherwise the
+        // batch is an ambiguous delta and is persisted from the top.
+        let incoming = visible_prefix(n);
+        if is_suspicious_stale_no_overlap(&incoming, stored_tail, &stored_all, system_is_plain) {
+            return (n, ReconcileKind::StaleSkip);
+        }
+        (0, ReconcileKind::AmbiguousDelta)
+    }
+
+    /// Rebuild `turn_store_ids` for the reconciled replay prefix `turns[0..cursor]` from the durable
+    /// store rows (so a later compaction still maps replayed turns to their real `store_id`s). The
+    /// visible replayed turns correspond to the last `M` durable rows; scaffold/ignored/skip turns
+    /// get an empty slot. The result length is exactly `cursor`.
+    fn rebuild_turn_store_ids(
+        &self,
+        session: &str,
+        turns: &[Turn],
+        cursor: usize,
+        tok: &Tokenizer,
+        kind: ReconcileKind,
+    ) -> Vec<Vec<i64>> {
+        if cursor == 0 {
+            return Vec::new();
+        }
+        // For a stale skip the incoming prefix matches the durable head, not the tail — there is no
+        // sound tail mapping, so leave the slots empty (a skipped snapshot is never compacted).
+        if matches!(kind, ReconcileKind::StaleSkip) {
+            return vec![Vec::new(); cursor];
+        }
+        let all_rows = self.store.session_messages(session).unwrap_or_default();
+        let store_ids: Vec<i64> = all_rows.iter().map(|r| r.store_id).collect();
+        let flat_count = |t: &Turn| flatten_turns(std::slice::from_ref(t), tok).len();
+        let covered: usize = turns
+            .iter()
+            .take(cursor)
+            .filter(|t| !is_scaffold_turn(t) && !self.turn_is_ignored(t))
+            .map(flat_count)
+            .sum();
+        let start = store_ids.len().saturating_sub(covered);
+        let tail_ids = &store_ids[start..];
+        let mut ptr = 0usize;
+        let mut out = Vec::with_capacity(cursor);
+        for t in turns.iter().take(cursor) {
+            if is_scaffold_turn(t) || self.turn_is_ignored(t) {
+                out.push(Vec::new());
+                continue;
+            }
+            let f = flat_count(t);
+            let slice: Vec<i64> = tail_ids.iter().skip(ptr).take(f).copied().collect();
+            ptr += f;
+            out.push(slice);
+        }
+        out
+    }
+}
+
+/// Why a non-scaffold restart reconcile advanced (or held) the ingest cursor
+/// (`_record_ingest_reconciliation` reasons, `LCM:engine.py:3065`).
+#[derive(Clone, Copy)]
+enum ReconcileKind {
+    /// The prefix replays the durable tail — advance past it.
+    TailReplay,
+    /// A leading scaffold-only prefix — skip it.
+    ScaffoldOnly,
+    /// A stale short snapshot re-supplying the durable head with no tail overlap — skip the batch.
+    StaleSkip,
+    /// No replay proof — persist the batch from the top.
+    AmbiguousDelta,
+}
+
+/// A message-level replay identity for restart reconciliation (a core port of
+/// `_message_replay_identity`, `LCM:engine.py:2754`): `(role, content, tool_call_id, tool_calls)`.
+/// Externalized-payload / quarantine restoration is not modeled (adaptation — see PARITY.md).
+#[derive(Clone, PartialEq, Eq)]
+struct ReplayId {
+    role: String,
+    content: String,
+    tool_call_id: String,
+    tool_calls: String,
+}
+
+fn row_replay_id(row: &crate::store::MessageRow) -> ReplayId {
+    ReplayId {
+        role: row.role.clone(),
+        content: row.content.clone().unwrap_or_default(),
+        tool_call_id: row.tool_call_id.clone().unwrap_or_default(),
+        tool_calls: row.tool_calls.clone().unwrap_or_default(),
+    }
+}
+
+/// Flatten one turn into its message-level replay identities (mirrors [`flatten_turns`]).
+fn turn_replay_ids(turn: &Turn, tok: &Tokenizer) -> Vec<ReplayId> {
+    flatten_turns(std::slice::from_ref(turn), tok)
+        .into_iter()
+        .map(|m| ReplayId {
+            role: m.role,
+            content: m.content.unwrap_or_default(),
+            tool_call_id: m.tool_call_id.unwrap_or_default(),
+            tool_calls: m.tool_calls.unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Whether a turn is replayed active-context scaffolding that must not be re-ingested (a port of
+/// `_is_replayed_context_scaffold_message`, `LCM:engine.py:2644`, at turn granularity — the
+/// system-prompt branch is handled out-of-band since Rust keeps the system prompt off the turn
+/// stream).
+fn is_scaffold_turn(turn: &Turn) -> bool {
+    let text = match turn {
+        Turn::User(u) => u.text.as_str(),
+        Turn::Assistant(a) => a.text.as_str(),
+        Turn::Tool(t) => t.assistant.text.as_str(),
+    };
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(crate::compaction::SUMMARY_SENTINEL)
+        || trimmed.starts_with(crate::compaction::PRESERVED_OBJECTIVE_PREFIX)
+    {
+        return true;
+    }
+    if !text.contains("[Expand for details:") {
+        return false;
+    }
+    summary_header_regex().is_match(text)
+}
+
+/// The synthetic-summary header pattern (`LCM:engine.py:2658`).
+fn summary_header_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]",
+        )
+        .expect("summary header regex is valid")
+    })
+}
+
+/// `stored_tail[-len(prefix):] == prefix` (a port of `_matches_store_tail_suffix`,
+/// `LCM:engine.py:2782`).
+fn matches_store_tail_suffix(stored_tail: &[ReplayId], candidate_prefix: &[ReplayId]) -> bool {
+    if candidate_prefix.is_empty() {
+        return true;
+    }
+    if candidate_prefix.len() > stored_tail.len() {
+        return false;
+    }
+    &stored_tail[stored_tail.len() - candidate_prefix.len()..] == candidate_prefix
+}
+
+/// A short stale snapshot that exactly re-supplies the durable head with no tail overlap (a port of
+/// `_is_suspicious_stale_no_overlap_snapshot`, `LCM:engine.py:3098`). The Python system-role anchor
+/// is adapted to `system_is_plain` — the incoming carries a plain (non-LCM) system prompt.
+fn is_suspicious_stale_no_overlap(
+    incoming: &[ReplayId],
+    stored_tail: &[ReplayId],
+    stored_head: &[ReplayId],
+    system_is_plain: bool,
+) -> bool {
+    if incoming.len() <= 1 {
+        return false;
+    }
+    if !system_is_plain {
+        return false;
+    }
+    if stored_tail.is_empty() || incoming.len() >= stored_tail.len() {
+        return false;
+    }
+    if incoming.iter().any(|m| stored_tail.contains(m)) {
+        return false;
+    }
+    if incoming.len() > stored_head.len() {
+        return false;
+    }
+    &stored_head[..incoming.len()] == incoming
 }
 
 /// The matchable text of a turn for the `ignore_message_patterns` filter (§12.3): user/assistant
@@ -1764,7 +2077,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_persists_delta_message_matching_store_tail (tests/test_lcm_engine.py:1688)
     #[tokio::test]
-    async fn parity_gap_restart_delta_matching_store_tail_is_preserved() {
+    async fn restart_delta_matching_store_tail_is_preserved() {
         let dir = reconcile_dir("delta-matching-tail");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -1798,7 +2111,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_persists_single_delta_message_matching_store_tail_with_followup (tests/test_lcm_engine.py:1762)
     #[tokio::test]
-    async fn parity_gap_restart_single_delta_matching_tail_with_followup_is_preserved() {
+    async fn restart_single_delta_matching_tail_with_followup_is_preserved() {
         let dir = reconcile_dir("single-delta-followup");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -1825,7 +2138,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_does_not_skip_repeated_non_tail_messages (tests/test_lcm_engine.py:1553)
     #[tokio::test]
-    async fn parity_gap_restart_does_not_skip_repeated_non_tail_messages() {
+    async fn restart_does_not_skip_repeated_non_tail_messages() {
         let dir = reconcile_dir("repeated-non-tail");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -1871,7 +2184,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_skips_stale_short_no_overlap_snapshot (tests/test_lcm_engine.py:2133)
     #[tokio::test]
-    async fn parity_gap_restart_skips_stale_short_no_overlap_snapshot() {
+    async fn restart_skips_stale_short_no_overlap_snapshot() {
         let dir = reconcile_dir("stale-short-no-overlap");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -1908,7 +2221,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_persists_one_message_no_overlap_delta (tests/test_lcm_engine.py:2240)
     #[tokio::test]
-    async fn parity_gap_restart_persists_one_message_no_overlap_delta() {
+    async fn restart_persists_one_message_no_overlap_delta() {
         let dir = reconcile_dir("one-message-no-overlap");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -1942,7 +2255,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_scaffold_prefix_does_not_skip_unrelated_new_rows (tests/test_lcm_engine.py:2282)
     #[tokio::test]
-    async fn parity_gap_restart_scaffold_prefix_does_not_skip_unrelated_new_rows() {
+    async fn restart_scaffold_prefix_does_not_skip_unrelated_new_rows() {
         let dir = reconcile_dir("scaffold-prefix-unrelated");
         let cfg = LcmConfig {
             data_dir: dir.clone(),

@@ -41,11 +41,27 @@ green) · `gap-open` (documented red backlog) · `out-of-scope`.
 
 ### Area 1 — restart-reconciliation matrix (`tests/test_lcm_engine.py` L1264–2542)
 
+Reconcile gap-closed cluster: red `3f0a48a`, green `<this commit>`.
+
 | Python test | status | Rust test | note |
 |---|---|---|---|
 | `test_existing_session_restart_reconciles_cursor_before_ingest` (L1264) | ported-pass | `restart_full_transcript_replay_persists_only_new_tail` | frontier=0 delete-all + re-ingest of the full replay yields the same observable rows |
+| `test_existing_session_restart_persists_delta_message_matching_store_tail` (L1688) | gap-closed | `restart_delta_matching_store_tail_is_preserved` | an ambiguous delta repeating the tail now appends instead of wiping the durable transcript |
+| `test_existing_session_restart_persists_single_delta_message_matching_store_tail_with_followup` (L1762) | gap-closed | `restart_single_delta_matching_tail_with_followup_is_preserved` | ambiguous delta + follow-up appended |
+| `test_existing_session_restart_does_not_skip_repeated_non_tail_messages` (L1553) | gap-closed | `restart_does_not_skip_repeated_non_tail_messages` | short LCM-scaffolded replay repeating an early pair is appended, not treated as replay/stale |
+| `test_existing_session_restart_skips_stale_short_no_overlap_snapshot` (L2133) | gap-closed | `restart_skips_stale_short_no_overlap_snapshot` | stale head-prefix snapshot with a plain system prompt is skipped (system-anchor adaptation) |
+| `test_existing_session_restart_persists_one_message_no_overlap_delta` (L2240) | gap-closed | `restart_persists_one_message_no_overlap_delta` | singleton no-overlap delta stays ambiguous and is appended |
+| `test_existing_session_restart_scaffold_prefix_does_not_skip_unrelated_new_rows` (L2282) | gap-closed | `restart_scaffold_prefix_does_not_skip_unrelated_new_rows` | scaffold-only prefix skipped, new rows appended |
 
-(more rows appended as work proceeds)
+**Reconcile implementation** (`src/provider.rs`): `ingest_current` now routes the once-per-incarnation
+reconcile three ways — fresh session (`session_count==0`, ingest from top); LCM-summary-scaffold-led
+replay (`leading_scaffold_count>0`, the original delete-volatile-tail + re-ingest path, retained for
+compaction restart); and any other restart, which runs `reconcile_turn_cursor` (a core turn-level
+port of `_reconcile_ingest_cursor_from_store` / `_find_reconciled_cursor_for_store_tail`) and advances
+the cursor past the proven replay prefix **without deleting durable rows**, then rebuilds
+`turn_store_ids` from the durable tail so a later compaction still maps replayed turns to real rows.
+
+Reconcile gap-open rows (not attempted this pass) are grouped in the backlog section below.
 
 ### Area 2 — engine-level compaction behaviors
 
