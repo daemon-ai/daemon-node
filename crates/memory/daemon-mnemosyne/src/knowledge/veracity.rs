@@ -123,6 +123,26 @@ pub fn bayesian_update(current_confidence: f64, veracity: &str) -> f64 {
     (current_confidence + increment).min(1.0)
 }
 
+/// Run `f` inside a `BEGIN IMMEDIATE` transaction, or inside the caller's transaction when one
+/// is already open (`veracity_consolidation.py` `_serialized_write`, E2.a.5/E2.a.6). SELECT-then-
+/// write sequences on `consolidated_facts` are path-dependent; without writer serialization two
+/// connections both pass the no-match SELECT and race the INSERT (silent data loss via the
+/// deterministic PRIMARY KEY), and concurrent Bayesian updates overwrite instead of compounding.
+/// On error the owned transaction rolls back (drop); a caller-owned transaction is left untouched.
+pub fn serialized_write<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    if !conn.is_autocommit() {
+        // Nested call: the caller owns the transaction lifecycle (`conn.in_transaction` check).
+        return f(conn);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
 /// A consolidated fact and the effect of [`consolidate_fact`] on it.
 #[derive(Clone, Debug)]
 pub struct ConsolidatedFact {
@@ -143,8 +163,24 @@ pub struct ConsolidatedFact {
 /// Upsert a fact into `consolidated_facts` (`veracity_consolidation.py` `consolidate_fact`
 /// L460-L568). An existing SPO has its confidence Bayesian-updated and mention count bumped; a new
 /// SPO is inserted at the initial confidence and any same-`(subject, predicate)` rows with a
-/// different object are recorded as `contradiction` rows in `conflicts`.
+/// different object are recorded as `contradiction` rows in `conflicts`. The whole SELECT-then-
+/// write sequence runs under [`serialized_write`] so concurrent same-SPO callers serialize
+/// instead of racing (E2.a.5); conflict rows commit atomically with the fact insert.
 pub fn consolidate_fact(
+    conn: &Connection,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    veracity: &str,
+    source: &str,
+) -> Result<ConsolidatedFact> {
+    serialized_write(conn, |conn| {
+        consolidate_fact_locked(conn, subject, predicate, object, veracity, source)
+    })
+}
+
+/// The [`consolidate_fact`] body, running inside the serialized-write scope.
+fn consolidate_fact_locked(
     conn: &Connection,
     subject: &str,
     predicate: &str,
@@ -313,9 +349,15 @@ pub fn conflict_count(conn: &Connection) -> Result<usize> {
 
 /// Background consolidation pass (`veracity_consolidation.py` `run_consolidation_pass` L520+): for
 /// each well-attested fact (`mention_count > 2`), any conflicting `(subject, predicate)` row with a
-/// strictly lower confidence is auto-resolved by marking it `superseded_by` the winner. Returns the
-/// number of facts superseded.
+/// strictly lower confidence is auto-resolved by marking it `superseded_by` the winner. Runs under
+/// [`serialized_write`] (E2.a.6) so interleaved writers can't mutate the pass's read-decide-resolve
+/// loop mid-flight. Returns the number of facts superseded.
 pub fn run_consolidation_pass(conn: &Connection) -> Result<usize> {
+    serialized_write(conn, run_consolidation_pass_locked)
+}
+
+/// The [`run_consolidation_pass`] body, running inside the serialized-write scope.
+fn run_consolidation_pass_locked(conn: &Connection) -> Result<usize> {
     let primary: Vec<(String, String, String, String, f64)> = {
         let mut stmt = conn.prepare(
             "SELECT id, subject, predicate, object, confidence FROM consolidated_facts \
@@ -584,7 +626,7 @@ mod tests {
     // parity: test_consolidate_fact_concurrency.py::test_eight_threads_same_spo_produce_one_row_count_8 (tests/test_consolidate_fact_concurrency.py:123)
     // parity: test_consolidate_fact_concurrency.py::test_two_threads_same_spo_produce_one_row_count_2 (tests/test_consolidate_fact_concurrency.py:85)
     #[test]
-    fn parity_gap_concurrent_same_spo_yields_one_row_with_all_mentions() {
+    fn concurrent_same_spo_yields_one_row_with_all_mentions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("concurrency.db");
         drop(Store::open(&path).unwrap()); // initialize the schema once (WAL persists)
@@ -638,7 +680,7 @@ mod tests {
 
     // parity: test_consolidate_fact_concurrency.py::test_concurrent_updates_compound_confidence_correctly (tests/test_consolidate_fact_concurrency.py:261)
     #[test]
-    fn parity_gap_concurrent_updates_compound_confidence_and_count() {
+    fn concurrent_updates_compound_confidence_and_count() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("compound.db");
         drop(Store::open(&path).unwrap());
@@ -690,6 +732,92 @@ mod tests {
             confidence > seed_confidence,
             "confidence {confidence} did not compound above the seed {seed_confidence}"
         );
+    }
+
+    // parity: test_consolidate_fact_concurrency.py::test_consolidate_fact_nested_in_outer_transaction (tests/test_consolidate_fact_concurrency.py:192)
+    // parity: test_consolidate_fact_sibling_races.py::test_serialized_write_participates_in_outer_transaction (tests/test_consolidate_fact_sibling_races.py:299)
+    #[test]
+    fn consolidate_fact_participates_in_outer_transaction() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        c.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        assert!(!c.is_autocommit(), "test setup: outer transaction open");
+
+        // Must NOT raise "cannot start a transaction within a transaction" and must NOT commit
+        // the caller's transaction.
+        let fact = consolidate_fact(&c, "Dan", "is", "designer", "stated", "src_x").unwrap();
+        assert_eq!(fact.subject, "Dan");
+        assert!(
+            !c.is_autocommit(),
+            "the nested call must leave the outer transaction open"
+        );
+
+        c.execute_batch("COMMIT;").unwrap();
+        let count: i64 = c
+            .query_row(
+                "SELECT mention_count FROM consolidated_facts WHERE subject = 'Dan'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the row persists once the caller commits");
+    }
+
+    // parity: test_consolidate_fact_sibling_races.py::test_serialized_write_begins_immediate_when_not_in_tx (tests/test_consolidate_fact_sibling_races.py:246)
+    // parity: test_consolidate_fact_sibling_races.py::test_serialized_write_rolls_back_on_exception (tests/test_consolidate_fact_sibling_races.py:272)
+    #[test]
+    fn serialized_write_owns_commit_and_rolls_back_on_error() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+
+        // Happy path: the helper opens its own transaction and commits it.
+        serialized_write(&c, |conn| {
+            assert!(!conn.is_autocommit(), "helper must open a transaction");
+            conn.execute(
+                "INSERT INTO consolidated_facts \
+                 (id, subject, predicate, object, confidence, mention_count, first_seen, \
+                  last_seen, sources_json, veracity) \
+                 VALUES ('cf_test', 's', 'p', 'o', 0.5, 1, datetime('now'), datetime('now'), \
+                         '[]', 'stated')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(c.is_autocommit(), "helper must close its transaction");
+        let stored: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM consolidated_facts WHERE id = 'cf_test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+
+        // Error path: the body's writes roll back.
+        let res: Result<()> = serialized_write(&c, |conn| {
+            conn.execute(
+                "INSERT INTO consolidated_facts \
+                 (id, subject, predicate, object, confidence, mention_count, first_seen, \
+                  last_seen, sources_json, veracity) \
+                 VALUES ('cf_doomed', 's', 'p', 'o', 0.5, 1, datetime('now'), datetime('now'), \
+                         '[]', 'stated')",
+                [],
+            )?;
+            Err(crate::error::Error::Invalid(
+                "simulated mid-write failure".to_string(),
+            ))
+        });
+        assert!(res.is_err());
+        assert!(c.is_autocommit(), "transaction closed after rollback");
+        let leaked: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM consolidated_facts WHERE id = 'cf_doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "rollback didn't undo the insert");
     }
 
     // parity: test_consolidate_fact_concurrency.py::test_eight_threads_distinct_spos_produce_eight_rows (tests/test_consolidate_fact_concurrency.py:157)

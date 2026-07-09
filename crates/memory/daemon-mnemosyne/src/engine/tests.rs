@@ -1377,7 +1377,7 @@ fn base_recall_unchanged_when_flags_off() {
 // parity: test_consolidate_fact_sibling_races.py::test_concurrent_resolve_conflict_different_winners_deterministic (tests/test_consolidate_fact_sibling_races.py:56)
 // parity: test_consolidate_fact_sibling_races.py::TestReviewHardening::test_first_writer_wins_logs_warning (tests/test_consolidate_fact_sibling_races.py:436)
 #[test]
-fn parity_gap_resolve_conflict_first_writer_wins() {
+fn resolve_conflict_first_writer_wins() {
     use crate::knowledge::veracity::consolidate_fact;
     let e = engine();
     {
@@ -1436,7 +1436,7 @@ fn parity_gap_resolve_conflict_first_writer_wins() {
 
 // parity: test_consolidate_fact_id_collision.py::TestReviewHardening::test_resolve_conflict_rejects_ambiguous_winning_id (tests/test_consolidate_fact_id_collision.py:389)
 #[test]
-fn parity_gap_resolve_conflict_rejects_foreign_fact_ids() {
+fn resolve_conflict_rejects_foreign_fact_ids() {
     use crate::knowledge::veracity::consolidate_fact;
     let e = engine();
     {
