@@ -84,7 +84,7 @@ and daemon: `crates/contracts/daemon-api/src/lib.rs`, `crates/contracts/daemon-p
 | **Account** (configured instance + conn state) | `PurpleAccount` / `PurpleConnection` | `Kopete::Account` | `AIAccount` | `TransportId` + `bound_accounts` + `credential_ref` |
 | **Capability descriptor** | `implements_*()` + `PurpleTags` | `Capability` flags | service bool flags + optional protocols | `AdapterCapabilities` (coarse) + feature-trait `*Ops` probes (fine) |
 | **Conversation** (DM/Group/Channel) | `PurpleConversation` + `PurpleConversationType` | `ChatSession` | `AIChat` | session + `OriginScope{Dm,Group,Api,Internal}` |
-| **Person / MetaContact** | `PurplePerson` → `PurpleContact` | `MetaContact` → `Contact` | `AIMetaContact` → `AIListContact` | — (deferred, §6) |
+| **Person / MetaContact** | `PurplePerson` → `PurpleContact` | `MetaContact` → `Contact` | `AIMetaContact` → `AIListContact` | `Person` → `PersonEndpoint` (`daemon_api::person` + host `PersonManager`; §6) |
 | **Presence** (normalized + per-proto map) | `PurplePresencePrimitive` | `OnlineStatus` + manager | `AIStatusSummary` | `PresenceState` / `ConnectionState` on `TransportInstanceInfo` |
 | **Adapter registry** | `PurpleProtocolManager` | `PluginManager` | `AdiumServices` | `AdapterRegistry` (`daemon-host`) |
 
@@ -309,7 +309,7 @@ parallel descriptor concept is needed. Build deferred.
 
 ---
 
-## 6. Person / MetaContact (DEFERRED — designed, not built)
+## 6. Person / MetaContact (IMPLEMENTED — W3-J `port-person`)
 
 The messengers' highest-value pattern: one **Person** (libpurple `PurplePerson`, Kopete
 `MetaContact`, Adium `AIMetaContact`) unifies many per-account **endpoints** (`PurpleContact` /
@@ -326,9 +326,15 @@ For daemon this maps to:
 - Two concrete uses: unify *one human* across their Matrix + future Slack accounts; unify *one agent*
   exposed via an internal Room + an A2A endpoint.
 
-This is **deferred**: no DTO, store, or skeleton lands now. It is recorded here so the roster/routing
-design (`05-routing-manager.md`, the daemon-app client-surface spec) can account for it as a future
-layer rather than be reshaped later.
+**Status: implemented** (was deferred). The model now exists, ported from `purpleperson.c` under
+TDD (see `docs/port-ledger/person.md` in the repo root): the `Person` wire DTO with
+`endpoints: Vec<PersonEndpoint>` (`(TransportId, ContactInfo)` bindings) and `preferred_endpoint()`
+live in `crates/contracts/daemon-api/src/person.rs`; the person-aware display layering
+(`person-alias → display_name → id`) in `crates/contracts/daemon-api/src/matching.rs`; the host
+registry (create/remove/associate/dissociate/lookup) in `crates/substrate/daemon-host/src/person.rs`;
+and the read surface (`PersonList` → `Persons`, `NodeEvent::PersonsChanged`) in the wire contract
+(wire vNEXT). `preferred_endpoint()` is the presence-comparator algorithm the libpurple tests
+assert; the open-conversation / account-priority tiers remain future layers (ledger-recorded).
 
 ---
 
@@ -345,7 +351,8 @@ layer rather than be reshaped later.
   defines the typed feature-trait family these adapters implement. `daemon-http` is not yet retrofitted.)*
 - **P2 — presence + live room enumeration (partial).** Per-account `ConnectionState` reported (Matrix);
   richer `PresenceState` and generalising `transport_rooms` to live enumeration (EIO-8) remain open.
-- **P3 — Person/MetaContact (§6).** Endpoint unification + preferred-endpoint routing.
+- **P3 — Person/MetaContact (§6, landed).** Endpoint unification + preferred-endpoint model
+  (`daemon_api::person`, host `PersonManager`, `PersonList` wire op — W3-J `port-person`).
 - **P4 — `daemon-a2a`.** Server + client roles; `AgentCard` ↔ `AdapterInfo` (§5).
 - **Deferred (optional) — server-side `daemonnet()` projection.** A read-only, additive, **stateless**
   aggregation surface (`daemonnet(scope)` over a node neighbourhood + an optional `daemonnet_subscribe`

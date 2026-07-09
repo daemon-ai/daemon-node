@@ -476,7 +476,9 @@ Reuse / reconcile with existing `daemon-api` types:
 - `Image`, `ActionMenu`, `FileTransfer` — minimal carriers introduced for the deferred-impl
   interfaces (avatars, contact action menus, transfers); shapes ported from
   `purpleimage.h`/`birb` action menu/`purplefiletransfer.h` when those interfaces are implemented.
-- `Person` (← `purpleperson.h`, the MetaContact) — defined but **deferred** (§10/§12).
+- `Person` (← `purpleperson.h`, the MetaContact) — **implemented** (W3-J `port-person`):
+  `crates/contracts/daemon-api/src/person.rs` (+ host `PersonManager` in
+  `crates/substrate/daemon-host/src/person.rs`, `PersonList` wire op; see §10/§12).
 
 ---
 
@@ -670,7 +672,9 @@ Data model:
 - `purplemessage.h` — **Now** via reuse of `UserMsg`/the merged log (no new type).
 - `MemberRole` (observed per-member role; ← `purplebadges.h` / Adium `AIGroupChatFlags` / XMPP
   affiliations) — **Now** (observed field on `ConversationMember`); `set_role` outbound optional per-adapter.
-- `purpleperson.h` (MetaContact), `purplebadges.h`, `purpleimage.h`, `purplefiletransfer.h`,
+- `purpleperson.h` (MetaContact) — **Now** (W3-J `port-person`: `daemon_api::person` +
+  the host `PersonManager`, `PersonList` wire op).
+- `purplebadges.h`, `purpleimage.h`, `purplefiletransfer.h`,
   `purpleauthorizationrequest.h`, `purpleaddcontactrequest.h`, `purpletags.h`, `purplecontact.h`
   (the roster-side contact wrapper) — **Defer** (ported as the dependent interfaces land).
 - `purpleaccount.h`/account manager — partially **Now** via the existing `TransportInstanceInfo` +
@@ -694,8 +698,9 @@ reading the source at implementation time.
   management audit; CLI; conformance test. `SupportsMembership` `ban`/`set_role` implemented by Matrix
   (power levels) and off in Rooms.
 - **Deferred:** real `SupportsRoster`/`SupportsFileTransfer` (defined but no implementor); Matrix admin
-  beyond the landed `send`/`set_topic`/membership; `Person`/MetaContact unification; the daemon-app GUI
-  client.
+  beyond the landed `send`/`set_topic`/membership; the daemon-app GUI client. (`Person`/MetaContact
+  unification is no longer deferred — implemented by W3-J `port-person`: `daemon_api::person` +
+  host `PersonManager`.)
 
 ### 12.2 Acceptance criteria (for the implementation)
 
