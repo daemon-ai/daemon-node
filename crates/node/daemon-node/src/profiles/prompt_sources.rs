@@ -191,27 +191,6 @@ impl ToolCallObserver for SubdirHints {
     }
 }
 
-/// The per-surface transport hint for a ROUTED session's origin transport (`[prompt]`-gated):
-/// only surfaces daemon-prompt knows formatting rules for are mapped — today the Matrix chat
-/// transport. Socket clients get none (GUI/TUI are indistinguishable at wire v36 — a client-kind
-/// Hello signal is a wire-level follow-up), and no ACP *server* surface exists yet.
-pub(crate) fn transport_hint_source(
-    origin: Option<&daemon_protocol::TransportId>,
-    policy: &PromptPolicy,
-) -> Option<Arc<dyn StablePromptSource>> {
-    if !policy.transport_hints {
-        return None;
-    }
-    // Transport ids are instance-qualified (`matrix/@bot:hs`); the FAMILY segment keys the hint.
-    let family = origin?.as_str().split('/').next().unwrap_or_default();
-    let mapped = match family {
-        "matrix" => daemon_prompt::TransportOrigin::Matrix,
-        _ => return None,
-    };
-    daemon_prompt::transport_hints(mapped)
-        .map(|text| Arc::new(StaticGuidance(text)) as Arc<dyn StablePromptSource>)
-}
-
 /// Attach the full prompt-architecture source set to a full-capability engine profile: guidance
 /// blocks (core / tool-use / model-family / environment), the workspace context files + the
 /// subdirectory hint observer, the USER.md snapshot + save nudge (scoped to `profile_id`), and
@@ -336,31 +315,6 @@ mod tests {
             mode: ToolUseMode::Auto,
         };
         assert!(no_tools.block("gpt-5.5").is_none(), "no tools, no block");
-    }
-
-    #[test]
-    fn transport_hint_maps_matrix_only_and_respects_the_gate() {
-        let policy = PromptPolicy::default();
-        // Instance-qualified ids (`matrix/<mxid>`, the adapter's stamp) map by family.
-        for id in ["matrix", "matrix/@bot:hs.org"] {
-            let origin = daemon_protocol::TransportId::new(id);
-            let hint = transport_hint_source(Some(&origin), &policy)
-                .expect("the matrix surface maps to a hint")
-                .block()
-                .unwrap();
-            assert!(hint.contains("Matrix room"), "{id}");
-        }
-        // Unmapped surfaces and origin-less (socket) activations compose nothing.
-        let telegram = daemon_protocol::TransportId::new("telegram/bot-1");
-        assert!(transport_hint_source(Some(&telegram), &policy).is_none());
-        assert!(transport_hint_source(None, &policy).is_none());
-        // The [prompt].transport_hints gate wins.
-        let off = PromptPolicy {
-            transport_hints: false,
-            ..PromptPolicy::default()
-        };
-        let matrix = daemon_protocol::TransportId::new("matrix/@bot:hs.org");
-        assert!(transport_hint_source(Some(&matrix), &off).is_none());
     }
 
     #[test]

@@ -186,20 +186,8 @@ use tokio_stream::wrappers::BroadcastStream;
 /// freedom); `None` resolves the node's active default. The [`SessionOverlay`] is the session's
 /// persisted per-session override (model/provider/tools/approval), applied on top of the bound
 /// profile at build time, so a live override is **restored** when the actor is (re)spawned.
-/// The optional [`TransportId`](daemon_protocol::TransportId) is the origin transport of the
-/// submit that activated the session (a routed chat surface like `matrix`), letting the node
-/// compose a per-surface formatting hint into the engine's prompt; `None` for socket clients
-/// (GUI/TUI are indistinguishable at wire v36) and non-origin activations.
-pub type SessionEngineBuilder = Arc<
-    dyn Fn(
-            SessionId,
-            Option<ProfileRef>,
-            &SessionOverlay,
-            Option<&daemon_protocol::TransportId>,
-        ) -> SessionBackend
-        + Send
-        + Sync,
->;
+pub type SessionEngineBuilder =
+    Arc<dyn Fn(SessionId, Option<ProfileRef>, &SessionOverlay) -> SessionBackend + Send + Sync>;
 
 /// Constructs a foreign live session (e.g. an ACP agent) once the host hands it the session's
 /// [`HostRequestHandler`] (the parking handler that answers the agent's blocking §17 requests —

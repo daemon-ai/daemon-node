@@ -257,7 +257,6 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         session_profile,
         a.store.clone(),
         a.foreign_gateway.clone(),
-        a.prompt.policy,
     );
 
     let mut node_api = NodeApiImpl::new(NodeApiParts {
@@ -767,27 +766,20 @@ fn build_session_profile(
 /// (provider/model resolution as before); `Foreign { agent }` returns a deferred foreign factory
 /// that resolves the agent's catalog recipe + protocol node-side at spawn (`fleet::foreign_live`)
 /// — the genai provider/model path is bypassed entirely for foreign engines. `session_store`
-/// supplies the durable agent registrations that resolution reads. A Core backend additionally
-/// composes the per-surface transport hint when the activating submit carried a routed origin the
-/// node knows formatting rules for (`origin` — e.g. a Matrix room).
+/// supplies the durable agent registrations that resolution reads.
 fn build_session_builder(
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     session_profile: EngineProfile,
     session_store: Arc<dyn daemon_store::SessionStore>,
     foreign_gateway: Option<crate::GatewayCoords>,
-    prompt_policy: crate::types::PromptPolicy,
 ) -> SessionEngineBuilder {
-    use crate::profiles::prompt_sources::transport_hint_source;
     match session_ctx {
         Some((store, ctx)) => {
             let store = store.clone();
             let ctx = ctx.clone();
             let fallback = session_profile;
             Arc::new(
-                move |id: SessionId,
-                      requested: Option<ProfileRef>,
-                      overlay: &SessionOverlay,
-                      origin: Option<&daemon_protocol::TransportId>| {
+                move |id: SessionId, requested: Option<ProfileRef>, overlay: &SessionOverlay| {
                     // Routing's agent-selection seam: build from the explicitly-requested profile when
                     // one is supplied, else the node's active default (the legacy single-profile path).
                     let spec = match requested {
@@ -800,19 +792,14 @@ fn build_session_builder(
                     };
                     match spec {
                         Some(spec) => match &spec.engine {
-                            daemon_api::EngineSelector::Core => {
-                                let mut profile = ctx.resolve_effective(
+                            daemon_api::EngineSelector::Core => SessionBackend::Core(
+                                ctx.resolve_effective(
                                     &spec,
                                     overlay,
                                     PersonaSource::Profile(&spec.id),
-                                );
-                                if let Some(hint) =
-                                    transport_hint_source(origin, &ctx.prompt.policy)
-                                {
-                                    profile = profile.with_prompt_block(hint);
-                                }
-                                SessionBackend::Core(profile.fresh(id))
-                            }
+                                )
+                                .fresh(id),
+                            ),
                             daemon_api::EngineSelector::Foreign { agent } => {
                                 // A persisted per-session model override still steers a foreign
                                 // session at open (Phase 3 makes `SetSessionModel` fully
@@ -842,13 +829,7 @@ fn build_session_builder(
                                 }))
                             }
                         },
-                        None => {
-                            let mut profile = fallback.clone();
-                            if let Some(hint) = transport_hint_source(origin, &ctx.prompt.policy) {
-                                profile = profile.with_prompt_block(hint);
-                            }
-                            SessionBackend::Core(profile.fresh(id))
-                        }
+                        None => SessionBackend::Core(fallback.fresh(id)),
                     }
                 },
             )
@@ -856,14 +837,7 @@ fn build_session_builder(
         None => {
             let profile = session_profile;
             Arc::new(
-                move |id: SessionId,
-                      _requested: Option<ProfileRef>,
-                      _overlay: &SessionOverlay,
-                      origin: Option<&daemon_protocol::TransportId>| {
-                    let mut profile = profile.clone();
-                    if let Some(hint) = transport_hint_source(origin, &prompt_policy) {
-                        profile = profile.with_prompt_block(hint);
-                    }
+                move |id: SessionId, _requested: Option<ProfileRef>, _overlay: &SessionOverlay| {
                     SessionBackend::Core(profile.fresh(id))
                 },
             )

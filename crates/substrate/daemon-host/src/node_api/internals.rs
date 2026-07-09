@@ -680,7 +680,6 @@ impl LiveSessions {
         &self,
         session: &SessionId,
         profile: Option<ProfileRef>,
-        origin_transport: Option<&daemon_protocol::TransportId>,
     ) -> Result<LiveHandle, ApiError> {
         if let Some(s) = self.sessions.get(session) {
             return Ok(s.handle.clone());
@@ -712,12 +711,7 @@ impl LiveSessions {
             feed.emit(NodeEvent::RosterChanged { rev });
         }
         let overlay = decode_overlay(&meta.overlay);
-        let backend = (self.builder)(
-            session.clone(),
-            effective_profile,
-            &overlay,
-            origin_transport,
-        );
+        let backend = (self.builder)(session.clone(), effective_profile, &overlay);
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let log: Merged = Arc::new(Mutex::new(MergedLog::new(
@@ -916,7 +910,7 @@ impl LiveSessions {
             AgentCommand::StartTurn { input, request_id } => {
                 // Opening command: spawn-if-absent, then run the turn in the background so events
                 // (including the terminal `TurnFinished`) flow to the drain queue for `poll`.
-                let handle = self.ensure(&session, None, Some(&origin.transport)).await?;
+                let handle = self.ensure(&session, None).await?;
                 // Seed the session's Primary reply sink from the opening origin (where replies post by
                 // default), unless one is already in force. Handover re-points it later.
                 self.seed_primary(&session, &origin);
@@ -994,7 +988,7 @@ impl LiveSessions {
             AgentCommand::Steer { text, request_id } => {
                 // Steer-when-idle opens a fresh turn; mid-turn it is drained at a phase boundary.
                 // Either way the ack + any turn events flow to the drain queue via the pump.
-                let handle = self.ensure(&session, None, Some(&origin.transport)).await?;
+                let handle = self.ensure(&session, None).await?;
                 self.record_inbound(
                     &session,
                     LogEntryParts {
@@ -1020,7 +1014,7 @@ impl LiveSessions {
                 // Context-only append (no turn): spawn-if-absent so the chatter has a conversation to
                 // land in, record it as context, then hand it to the actor — which folds it in when
                 // idle or queues it for the following turn when busy (event-io §5.9). No turn starts.
-                let handle = self.ensure(&session, None, Some(&origin.transport)).await?;
+                let handle = self.ensure(&session, None).await?;
                 self.record_inbound(
                     &session,
                     LogEntryParts {
