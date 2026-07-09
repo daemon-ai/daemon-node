@@ -1513,4 +1513,144 @@ mod tests {
             "len<=4: {res}"
         );
     }
+
+    // ---- Identity always-inject / capture (`tests/test_prefetch_identity_always_inject.py`) ----
+
+    fn insert_identity(engine: &Engine, content: &str, session_id: &str) {
+        engine
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) \
+                     VALUES (?1, ?2, 'identity', '2026-05-14T12:00:00Z', ?3, 0.95)",
+                    rusqlite::params![
+                        format!("id-{session_id}-{}", content.len()),
+                        content,
+                        session_id
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // PARITY: Mnemosyne tests/test_prefetch_identity_always_inject.py::test_identity_surfaces_on_non_matching_generic_query
+    #[tokio::test]
+    async fn identity_always_injects_on_non_matching_generic_query() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let session = engine.config().session_id.clone();
+        let identity = "Contact A is the lead engineer on the payments team.";
+        insert_identity(&engine, identity, &session);
+        let provider = MnemosyneProvider::new(engine);
+
+        // "Hi" has zero lexical/semantic overlap with the identity row, yet it must surface.
+        let block = provider
+            .recall(&RecallQuery {
+                text: "Hi".to_string(),
+                top_k: 5,
+            })
+            .await
+            .expect("identity block injected");
+        assert!(block.text.contains("[IDENTITY]"), "block: {}", block.text);
+        assert!(block.text.contains(identity), "block: {}", block.text);
+    }
+
+    // PARITY: Mnemosyne tests/test_prefetch_identity_always_inject.py::test_identity_does_not_leak_across_sessions
+    #[tokio::test]
+    async fn identity_does_not_leak_across_sessions() {
+        let dir =
+            std::env::temp_dir().join(format!("mnemosyne-identity-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let make = |sid: &str| {
+            Arc::new(
+                Engine::open(MnemosyneConfig {
+                    data_dir: dir.clone(),
+                    session_id: sid.to_string(),
+                    ..MnemosyneConfig::default()
+                })
+                .unwrap(),
+            )
+        };
+        let identity = "Contact A is the lead engineer on the payments team.";
+        let engine_a = make("session-A");
+        insert_identity(&engine_a, identity, "session-A");
+        let prov_a = MnemosyneProvider::new(engine_a);
+        let prov_b = MnemosyneProvider::new(make("session-B"));
+
+        // Session B must not see session A's identity.
+        let block_b = prov_b
+            .recall(&RecallQuery {
+                text: "Hi".to_string(),
+                top_k: 5,
+            })
+            .await;
+        assert!(
+            block_b.is_none() || !block_b.unwrap().text.contains("Contact A"),
+            "session B must not see session A's identity"
+        );
+        // Session A still sees its own identity.
+        let block_a = prov_a
+            .recall(&RecallQuery {
+                text: "Hi".to_string(),
+                top_k: 5,
+            })
+            .await
+            .expect("session A sees its own identity");
+        assert!(block_a.text.contains(identity), "block: {}", block_a.text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: Mnemosyne tests/test_prefetch_identity_always_inject.py::test_no_identity_rows_is_a_noop
+    #[tokio::test]
+    async fn no_identity_rows_yields_no_identity_block() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let block = provider
+            .recall(&RecallQuery {
+                text: "Hi".to_string(),
+                top_k: 5,
+            })
+            .await;
+        assert!(
+            block.is_none() || !block.unwrap().text.contains("[IDENTITY]"),
+            "no identity rows must not emit an [IDENTITY] block"
+        );
+    }
+
+    // PARITY: Mnemosyne tests/test_identity_memory.py (capture: an identity-signal user turn persists
+    // a source='identity' memory that then always-injects)
+    #[tokio::test]
+    async fn identity_signal_capture_persists_and_injects() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine.clone());
+        let conv = Conversation::new(SystemPrompt::new(""));
+        // "i feel like a" is an identity signal → captured as a source='identity' memory.
+        provider
+            .after_turn(
+                &Turn::User(UserMsg::new("Honestly I feel like a fraud on this team")),
+                &conv,
+            )
+            .await;
+
+        let identity_count: i64 = engine
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM working_memory WHERE source = 'identity'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(identity_count, 1, "an identity memory must be captured");
+
+        // The captured identity always-injects on a generic query.
+        let block = provider
+            .recall(&RecallQuery {
+                text: "Hi".to_string(),
+                top_k: 5,
+            })
+            .await
+            .expect("identity injected after capture");
+        assert!(block.text.contains("[IDENTITY]"), "block: {}", block.text);
+    }
 }
