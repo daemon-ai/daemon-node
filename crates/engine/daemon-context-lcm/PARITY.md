@@ -85,7 +85,15 @@ Reconcile gap-open rows (not attempted this pass) are grouped in the backlog sec
 
 ### Area 2 — engine-level compaction behaviors
 
-(pending)
+| Python test | status | Rust test | note |
+|---|---|---|---|
+| `test_dynamic_leaf_chunk_sizing_compacts_only_oldest_bounded_raw_chunk` (L4029) | ported-pass | `dynamic_leaf_chunk_compacts_only_oldest_bounded_chunk` | 1 node covering only the bounded oldest chunk; remainder kept raw; store intact |
+| `test_adaptive_leaf_rescue_retries_with_smaller_oldest_chunk` (L4085) | ported-pass | `adaptive_leaf_rescue_retries_with_smaller_oldest_chunk` | retry-worthy aux failure shrinks to the oldest single turn (breaker threshold raised in-test — the Python mock has no breaker) |
+| `test_unlimited_depth_condenses_beyond_ten` (L9029) | ported-pass | `unlimited_condensation_depth_reaches_d12` | `incremental_max_depth = -1` builds d12 from seeded d11 nodes through `compact` |
+| `test_dynamic_leaf_chunk_sizing_runs_bounded_catchup_passes_when_pressure_remains_high` (L4144) | already-covered | `compaction.rs` multi-pass unit tests | the bounded catch-up loop is unit-covered; the single-pass engine path is exercised by the L4029 port |
+| `test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group` (L4306) | gap-closed | `cache_friendly_gating_suppresses_single_fanin_group` | red `<area2 red>`, green `<area2 green>`; node-level gating worked, the `condensation_suppressed_reason` status surface was missing |
+| `test_critical_budget_pressure_bypasses_cache_friendly_single_group_suppression` (L4359) | gap-closed | `critical_pressure_bypasses_cache_friendly_suppression` | same pair |
+| `test_cache_friendly_gating_allows_condensation_when_debt_reaches_two_groups` (L4411) | gap-closed | `cache_friendly_gating_allows_two_debt_groups` | same pair |
 
 ### Area 3 — deferred maintenance debt lifecycle
 

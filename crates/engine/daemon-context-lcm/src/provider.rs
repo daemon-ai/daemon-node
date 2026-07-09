@@ -4024,6 +4024,217 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An engine-level compaction fixture: 6 alternating user/assistant turns of ~43 tokens each
+    /// (the Python `"Message {i}: " + "chunk " * 35` shape), so with `fresh_tail_count = 2` the
+    /// eligible region is turns 0..4.
+    fn chunky_convo(words_per_turn: usize) -> Conversation {
+        let mut c = Conversation::new(SystemPrompt::new("You are a helpful assistant."));
+        for i in 0..6 {
+            let body = format!("Message {i}: {}", "chunk ".repeat(words_per_turn));
+            if i % 2 == 0 {
+                c.push_user(UserMsg::new(body));
+            } else {
+                c.push_assistant(AssistantMsg::text(body));
+            }
+        }
+        c
+    }
+
+    /// Seed a pre-existing summary node (the Python `engine._dag.add_node(SummaryNode(...))`
+    /// fixture) at `depth`.
+    fn seed_node(lcm: &LcmContextEngine, session: &str, depth: i64, summary: &str, age: f64) {
+        lcm.store()
+            .add_node(&crate::store::NewNode {
+                session_id: session.to_string(),
+                depth,
+                summary: summary.to_string(),
+                token_count: 40,
+                source_token_count: 80,
+                source_ids: Vec::new(),
+                source_type: if depth == 0 {
+                    crate::store::SourceType::Messages
+                } else {
+                    crate::store::SourceType::Nodes
+                },
+                created_at: 1_000.0 - age,
+                earliest_at: None,
+                latest_at: None,
+                expand_hint: format!("Expand for details about: {summary}"),
+            })
+            .unwrap();
+    }
+
+    // parity: engine.py::test_dynamic_leaf_chunk_sizing_compacts_only_oldest_bounded_raw_chunk (tests/test_lcm_engine.py:4029)
+    #[tokio::test]
+    async fn dynamic_leaf_chunk_compacts_only_oldest_bounded_chunk() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Dynamic leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let c = chunky_convo(35);
+        let region_texts: Vec<String> = c.turns[..4]
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.clone(),
+                Turn::Assistant(a) => a.text.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let compacted = lcm.compact(c, 100_000).await;
+        // Exactly one D0 node, covering ONLY the oldest two region rows (the bounded chunk).
+        assert_eq!(lcm.store().summary_count("s1").unwrap(), 1);
+        let nodes = lcm.store().get_session_nodes("s1", Some(0), 10).unwrap();
+        assert_eq!(nodes[0].source_ids, vec![1, 2], "oldest bounded chunk only");
+        // The un-summarized region remainder and the tail stay in the compacted context.
+        let texts: Vec<String> = compacted
+            .turns
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.clone(),
+                Turn::Assistant(a) => a.text.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert!(texts.contains(&region_texts[2]), "Message 2 kept raw");
+        assert!(texts.contains(&region_texts[3]), "Message 3 kept raw");
+        assert!(
+            !texts.iter().any(|t| t == &region_texts[0]),
+            "Message 0 summarized"
+        );
+        // The durable transcript is intact (all 6 rows).
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 6);
+    }
+
+    /// An aux provider that fails retry-worthily whenever the prompt covers the second turn
+    /// (`"Message 1:"`), succeeding on smaller chunks — the engine-level analog of the Python
+    /// `flaky_summary` that raises "context length exceeded" for large sources.
+    struct MarkerFailAux {
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Provider for MarkerFailAux {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: false,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(200_000),
+            }
+        }
+
+        async fn chat(&self, req: Request) -> std::result::Result<ModelOutput, Failure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let prompt = req
+                .messages
+                .first()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            if prompt.contains("Message 1:") {
+                return Err(Failure::ContextOverflow("context length exceeded".into()));
+            }
+            Ok(ModelOutput {
+                text: "Recovered smaller leaf summary.\nExpand for details about: oldest raw chunk"
+                    .into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    // parity: engine.py::test_adaptive_leaf_rescue_retries_with_smaller_oldest_chunk (tests/test_lcm_engine.py:4085)
+    #[tokio::test]
+    async fn adaptive_leaf_rescue_retries_with_smaller_oldest_chunk() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            // The Python mock has no circuit breaker in the loop; keep the single route closed
+            // across the two failed levels of attempt 1 so attempt 2 can succeed.
+            summary_circuit_breaker_failure_threshold: 10,
+            ..LcmConfig::in_memory()
+        };
+        let aux = Arc::new(MarkerFailAux {
+            calls: AtomicU64::new(0),
+        });
+        let lcm = LcmContextEngine::open(cfg, aux.clone()).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let compacted = lcm.compact(chunky_convo(35), 100_000).await;
+        // Attempt 1 (2-turn chunk) fails L1+L2 retry-worthily; the rescue shrinks to the oldest
+        // single turn and attempt 2's L1 succeeds: 3 aux calls in total.
+        assert_eq!(
+            aux.calls.load(Ordering::Relaxed),
+            3,
+            "L1+L2 failed, retry L1 succeeded"
+        );
+        assert_eq!(lcm.store().summary_count("s1").unwrap(), 1);
+        let nodes = lcm.store().get_session_nodes("s1", Some(0), 10).unwrap();
+        assert_eq!(
+            nodes[0].source_ids,
+            vec![1],
+            "only the rescued single-turn chunk"
+        );
+        let texts: Vec<&str> = compacted
+            .turns
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.as_str(),
+                Turn::Assistant(a) => a.text.as_str(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("Message 1:")),
+            "Message 1 kept raw"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with("Message 2:")),
+            "Message 2 kept raw"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with("Message 3:")),
+            "Message 3 kept raw"
+        );
+    }
+
+    // parity: engine.py::test_unlimited_depth_condenses_beyond_ten (tests/test_lcm_engine.py:9029)
+    #[tokio::test]
+    async fn unlimited_condensation_depth_reaches_d12() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 1,
+            condensation_fanin: 2,
+            incremental_max_depth: -1,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Condensed.\nExpand for details about: deep nodes"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        for i in 0..3 {
+            seed_node(&lcm, "s1", 11, &format!("Deep node {i}"), 10.0 + i as f64);
+        }
+        lcm.compact(chunky_convo(35), 100_000).await;
+        assert!(
+            lcm.store().count_at_depth("s1", 12).unwrap() >= 1,
+            "max_depth=-1 condenses beyond depth 10"
+        );
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
