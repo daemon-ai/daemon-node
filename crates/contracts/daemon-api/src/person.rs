@@ -75,14 +75,19 @@ pub struct Person {
 impl Person {
     /// A new person with a supplied or auto-minted non-empty `id` (← `purple_person_new` +
     /// `constructed`, which mints a random id when none was given).
-    pub fn new(_id: Option<String>) -> Self {
-        // TDD red stub.
-        Self::default()
+    pub fn new(id: Option<String>) -> Self {
+        Self {
+            id: id.filter(|s| !s.is_empty()).unwrap_or_else(Self::gen_id),
+            ..Self::default()
+        }
     }
 
-    /// Ensure the id is set, minting a fresh one if it is empty (← `purple_person_constructed`).
+    /// Ensure the id is set, minting a fresh one if it is empty (← `purple_person_constructed`,
+    /// which mints only when `birb_str_is_empty(id)`).
     pub fn ensure_id(&mut self) {
-        // TDD red stub.
+        if self.id.is_empty() {
+            self.id = Self::gen_id();
+        }
     }
 
     /// Mint a fresh unique id (nanosecond clock + process-unique counter, UUID-shaped — no external
@@ -106,57 +111,90 @@ impl Person {
     }
 
     /// Add a contact endpoint (← `purple_person_add_contact_info`, which appends).
-    pub fn add_endpoint(&mut self, _endpoint: PersonEndpoint) {
-        // TDD red stub.
+    pub fn add_endpoint(&mut self, endpoint: PersonEndpoint) {
+        self.endpoints.push(endpoint);
     }
 
     /// Remove the endpoint addressing `(transport, contact_id)`
     /// (← `purple_person_remove_contact_info`); returns whether one was removed (a second remove is
     /// a no-op — `g_ptr_array_find` misses).
-    pub fn remove_endpoint(&mut self, _transport: &TransportId, _contact_id: &str) -> bool {
-        // TDD red stub.
-        false
+    pub fn remove_endpoint(&mut self, transport: &TransportId, contact_id: &str) -> bool {
+        let Some(position) = self
+            .endpoints
+            .iter()
+            .position(|e| e.addresses(transport, contact_id))
+        else {
+            return false;
+        };
+        self.endpoints.remove(position);
+        true
     }
 
     /// Remove every endpoint (← `purple_person_remove_all_contact_infos`).
     pub fn remove_all_endpoints(&mut self) {
-        // TDD red stub.
+        self.endpoints.clear();
     }
 
     /// Whether the person has any endpoints (← `purple_person_has_contacts`).
     pub fn has_contacts(&self) -> bool {
-        // TDD red stub.
-        false
+        !self.endpoints.is_empty()
     }
 
     /// The priority (preferred) contact endpoint (← `purple_person_get_priority_contact_info`): the
-    /// endpoint whose contact presence is best under [`Presence::compare`](crate::Presence::compare),
-    /// ties resolved to the first (insertion order). `None` when the person has no endpoints.
+    /// endpoint whose contact presence is best under [`Presence::compare`](crate::Presence::compare)
+    /// (the exact comparator of `purple_person_contact_compare`), ties resolved to the first in
+    /// insertion order (the C sort + index-0). `None` when the person has no endpoints.
     pub fn preferred_endpoint(&self) -> Option<&PersonEndpoint> {
-        // TDD red stub.
-        None
+        self.endpoints.iter().reduce(|best, candidate| {
+            // Replace only on a STRICT win so ties keep the earlier endpoint (stable, index-0).
+            if candidate
+                .contact
+                .presence
+                .compare(&best.contact.presence)
+                .is_lt()
+            {
+                candidate
+            } else {
+                best
+            }
+        })
     }
 
     /// The name to display for this person (← `purple_person_get_name_for_display`): the alias when
-    /// set, else the preferred endpoint's contact name-for-display, else `None`.
+    /// non-empty, else the preferred endpoint's contact name-for-display, else `None`.
     pub fn name_for_display(&self) -> Option<&str> {
-        // TDD red stub.
-        None
+        if let Some(alias) = self.alias.as_deref() {
+            if !alias.is_empty() {
+                return Some(alias);
+            }
+        }
+        self.preferred_endpoint()
+            .map(|endpoint| endpoint.contact.name_for_display())
     }
 
     /// The avatar to display for this person (← `purple_person_get_avatar_for_display`): the person's
     /// own avatar when set. (The daemon `ContactInfo` has no avatar, so there is no contact-level
     /// fallback — see the ledger.)
     pub fn avatar_for_display(&self) -> Option<&Image> {
-        // TDD red stub.
-        None
+        self.avatar.as_ref()
     }
 
     /// Whether the person matches `needle` (← `purple_person_matches`): an empty/`None` needle
-    /// matches; else a caseless subsequence match against the alias, then any endpoint's contact.
-    pub fn matches(&self, _needle: Option<&str>) -> bool {
-        // TDD red stub.
-        false
+    /// matches; else a caseless subsequence match against the alias
+    /// (`birb_str_matches`), then any endpoint's contact ([`ContactInfo::matches`]).
+    pub fn matches(&self, needle: Option<&str>) -> bool {
+        let needle = match needle {
+            None | Some("") => return true,
+            Some(needle) => needle,
+        };
+        if let Some(alias) = self.alias.as_deref() {
+            if !alias.is_empty() && str_matches(needle, alias) {
+                return true;
+            }
+        }
+        self.endpoints
+            .iter()
+            .any(|endpoint| endpoint.contact.matches(Some(needle)))
     }
 }
 

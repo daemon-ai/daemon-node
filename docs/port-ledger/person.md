@@ -119,6 +119,7 @@ annotated as re-activated.
 | D5 | `PersonManager::{add_person double-add, remove_person double-remove}` | `manager_person_double_add`, `manager_person_double_remove` | D/P |
 | D6 | `PersonManager::{associate/dissociate}` double edges | `manager_associate_dissociate_edges` | D/P |
 | D7 | `PersonManager::{find_person, find_by_endpoint}` lookups | `manager_lookup_by_id_and_endpoint` | D/P |
+| D8 | `PersonManager::add_person` mints a missing id (`ensure_id` discipline) | `manager_add_mints_missing_id` | D/P |
 
 ---
 
@@ -131,8 +132,8 @@ annotated as re-activated.
 - Skipped (S): **4 full skips** (`avatar-for-display/contact`, both `color-for-display`, plus the
   `contact_with_alias` name row already S in `matching.md`) + the GObject signal/back-ref halves of
   rows 2/3/9/10/17.
-- Derived (D): **7** daemon-native rows (id mint, empty-priority, endpoint edges, CBOR round-trip,
-  manager double add/remove, associate/dissociate edges, lookups).
+- Derived (D): **8** daemon-native rows (id mint, empty-priority, endpoint edges, CBOR round-trip,
+  manager double add/remove, associate/dissociate edges, lookups, add-mints-id).
 
 ## Wire additions (wire vNEXT — integration bumps `WireVersion`)
 

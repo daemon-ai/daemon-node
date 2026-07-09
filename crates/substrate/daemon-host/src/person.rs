@@ -64,11 +64,15 @@ impl PersonManager {
     }
 
     /// Add a person (← `purple_contact_manager_add_person`): mints an id when empty
-    /// ([`Person::ensure_id`]), rejects a double-add by id, else appends.
-    pub fn add_person(&mut self, person: Person) -> AddOutcome {
-        // TDD red stub.
-        let _ = person;
-        AddOutcome::DuplicateRejected
+    /// ([`Person::ensure_id`]), rejects a double-add by id, else appends. A person arriving with
+    /// endpoints carries its edges in (the C "contact already has a person" auto-add path).
+    pub fn add_person(&mut self, mut person: Person) -> AddOutcome {
+        person.ensure_id();
+        if self.persons.iter().any(|p| p.id == person.id) {
+            return AddOutcome::DuplicateRejected;
+        }
+        self.persons.push(person);
+        AddOutcome::Added
     }
 
     /// Remove a person by id (← `purple_contact_manager_remove_person`). With
@@ -76,18 +80,32 @@ impl PersonManager {
     /// C `remove_contacts=TRUE` path, which also removes the person's contacts from the manager).
     /// Returns whether one was removed (a second remove is a no-op).
     pub fn remove_person(&mut self, id: &str, remove_endpoints: bool) -> bool {
-        // TDD red stub.
-        let _ = (id, remove_endpoints);
-        false
+        let Some(position) = self.persons.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        let mut removed = self.persons.remove(position);
+        if remove_endpoints {
+            removed.remove_all_endpoints();
+        }
+        true
     }
 
     /// Associate a contact endpoint with an existing person (the person ↔ contact edge;
     /// ← `purple_person_add_contact_info` under the manager). Rejected (`false`) when the person id
     /// is unknown or the `(transport, contact-id)` edge already exists on it.
     pub fn associate(&mut self, person_id: &str, endpoint: PersonEndpoint) -> bool {
-        // TDD red stub.
-        let _ = (person_id, endpoint);
-        false
+        let Some(person) = self.persons.iter_mut().find(|p| p.id == person_id) else {
+            return false;
+        };
+        if person
+            .endpoints
+            .iter()
+            .any(|e| e.addresses(&endpoint.transport, &endpoint.contact.id))
+        {
+            return false;
+        }
+        person.add_endpoint(endpoint);
+        true
     }
 
     /// Dissociate a contact endpoint from a person (← `purple_person_remove_contact_info` under the
@@ -98,24 +116,25 @@ impl PersonManager {
         transport: &TransportId,
         contact_id: &str,
     ) -> bool {
-        // TDD red stub.
-        let _ = (person_id, transport, contact_id);
-        false
+        let Some(person) = self.persons.iter_mut().find(|p| p.id == person_id) else {
+            return false;
+        };
+        person.remove_endpoint(transport, contact_id)
     }
 
     /// Find a person by id.
     pub fn find_person(&self, id: &str) -> Option<&Person> {
-        // TDD red stub.
-        let _ = id;
-        None
+        self.persons.iter().find(|p| p.id == id)
     }
 
     /// Find the person holding the `(transport, contact-id)` endpoint, if any (the reverse edge —
     /// ← `purple_contact_info_get_person` from the contact side).
     pub fn find_by_endpoint(&self, transport: &TransportId, contact_id: &str) -> Option<&Person> {
-        // TDD red stub.
-        let _ = (transport, contact_id);
-        None
+        self.persons.iter().find(|p| {
+            p.endpoints
+                .iter()
+                .any(|e| e.addresses(transport, contact_id))
+        })
     }
 }
 
