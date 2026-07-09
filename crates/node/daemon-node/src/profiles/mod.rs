@@ -10,11 +10,13 @@
 //!   by the live session surface and the durable rehydration resolver.
 //! - [`persona`] resolves every engine's Identity slot (`PersonaStore` SOUL.md / inline persona /
 //!   built-in role library).
+//! - [`persona_ops`] backs the wire `SoulGet`/`SoulSet` ops with the same `PersonaStore`.
 //! - [`prompt_sources`] binds `daemon-prompt`'s guidance / context-file / USER.md builders into
 //!   the engine's composed-prompt slots.
 
 pub(crate) mod dress;
 pub(crate) mod persona;
+pub mod persona_ops;
 pub(crate) mod prompt_sources;
 pub(crate) mod registry;
 pub(crate) mod resolve;

@@ -308,6 +308,14 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     if let Some(stack) = &profile_stack {
         node_api = node_api.with_profile_ops(stack.profile_ops.clone());
     }
+    // Bind the persona (SOUL.md) backend behind the wire SoulGet/SoulSet ops — the SAME store the
+    // engine Identity slots and the `profile_manage` persona argument use. Absent (ephemeral
+    // nodes), both persona ops resolve to Unsupported (mirroring the versioning gating).
+    if let Some(personas) = a.prompt.personas.clone() {
+        node_api = node_api.with_persona_ops(Arc::new(
+            crate::profiles::persona_ops::PersonaStoreOps::new(personas),
+        ));
+    }
 
     let node = Arc::new(node_api);
     // Late-bind the profile-ops validator now that the node exists: the node IS the engine/inference

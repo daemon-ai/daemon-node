@@ -37,6 +37,7 @@ pub use fleet::{
     AgentBackend, EphemeralReaper, FleetJobWorker, FleetViewImpl, ForeignProtocol, LaunchProfile,
     ProfileChildSpawner, ReaperConfig,
 };
+pub use profiles::persona_ops::PersonaStoreOps;
 pub use types::{
     AssembledNode, GatewayBinding, GatewayCoords, GatewayLease, GatewayTokenMinter, NodeAssembly,
     OrchestrateCaps, PromptAssembly, PromptPolicy, ProviderResolver, ResolvedSkills,

@@ -53,7 +53,7 @@ impl Provider for AuthorThenSpawnProvider {
                 tool_calls: vec![ToolCall {
                     call_id: "author".into(),
                     name: "profile_manage".into(),
-                    args: r#"{"action":"create","name":"helper","model":"m","system_prompt":"a focused helper"}"#.into(),
+                    args: r#"{"action":"create","name":"helper","model":"m","persona":"a focused helper"}"#.into(),
                 }],
                 ..Default::default()
             }),
@@ -84,7 +84,7 @@ impl Provider for AuthorThenSpawnProvider {
 /// the authored profile.
 fn assemble_authoring_node(
     authored_id: &str,
-    revisions_dir: std::path::PathBuf,
+    data_dir: &std::path::Path,
 ) -> (Arc<NodeApiImpl>, Arc<dyn SessionStore>, SupervisorHandle) {
     let orchestrator: ProviderBuilder = {
         let authored_id = authored_id.to_string();
@@ -107,7 +107,16 @@ fn assemble_authoring_node(
     });
 
     let revisions: Arc<dyn daemon_common::RevisionLog> =
-        Arc::new(FileRevisionLog::open(revisions_dir).unwrap());
+        Arc::new(FileRevisionLog::open(data_dir.join("revisions")).unwrap());
+    // The persona store: the tool's `persona` argument routes through it, and the wire SoulGet
+    // serves the same doc back.
+    let personas = Arc::new(
+        daemon_prompt::PersonaStore::open(
+            data_dir.join("profiles"),
+            daemon_prompt::DEFAULT_PERSONA_CAP,
+        )
+        .unwrap(),
+    );
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
     let AssembledNode { node, handle, .. } = assemble(NodeAssembly {
         store: store.clone(),
@@ -144,7 +153,10 @@ fn assemble_authoring_node(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
-        prompt: Default::default(),
+        prompt: daemon_node::PromptAssembly {
+            personas: Some(personas),
+            ..Default::default()
+        },
     });
     (node, store, handle)
 }
@@ -185,7 +197,7 @@ async fn agent_authored_profile_is_recorded_and_spawned_impl() {
     let authored_id = format!("agent/{}/helper", parent.as_str());
     // A self-cleaning temp dir (dropped at test end) backs the file revision log.
     let dir = tempfile::tempdir().unwrap();
-    let (node, store, handle) = assemble_authoring_node(&authored_id, dir.path().join("revisions"));
+    let (node, store, handle) = assemble_authoring_node(&authored_id, dir.path());
 
     // Drive the durable orchestrator: it authors the profile, then delegates to a child bound to it.
     node.assign(parent.clone())
@@ -218,9 +230,14 @@ async fn agent_authored_profile_is_recorded_and_spawned_impl() {
         .expect("profile_get")
         .expect("the agent-authored profile is persisted");
     assert!(authored_id.starts_with("agent/author-parent/"));
-    // TODO(prompt-arch Lane E): assert the authored persona landed via PersonaStore (SoulGet)
-    // once `profile_manage` routes it there (`system_prompt` left `ProfileSpec` at wire v36).
     assert_eq!(spec.id, authored_id);
+    // The authored persona landed via the persona store: the wire SoulGet serves it back.
+    assert_eq!(
+        node.soul_get(authored_id.clone())
+            .await
+            .expect("soul_get the authored persona"),
+        "a focused helper",
+    );
 
     // ...and it is recorded as `Author::Agent("profile_manage")` on the shared revision log.
     let hist = node
@@ -252,7 +269,7 @@ async fn operator_create_records_operator_and_shares_validation() {
 async fn operator_create_records_operator_and_shares_validation_impl() {
     let authored_id = "agent/unused/x";
     let dir = tempfile::tempdir().unwrap();
-    let (node, _store, handle) = assemble_authoring_node(authored_id, dir.path().join("revisions"));
+    let (node, _store, handle) = assemble_authoring_node(authored_id, dir.path());
 
     // Operator create of a valid Core profile: persisted + recorded as `Author::Operator`.
     node.profile_create(ProfileSpec::new(

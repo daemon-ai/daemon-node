@@ -52,7 +52,7 @@ impl Provider for ComposeProvider {
                     call_id: format!("author-{n}"),
                     name: "profile_manage".into(),
                     args: format!(
-                        r#"{{"action":"create","name":"p{n}","model":"m","system_prompt":"helper {n}"}}"#
+                        r#"{{"action":"create","name":"p{n}","model":"m","persona":"helper {n}"}}"#
                     ),
                 }],
                 ..Default::default()
