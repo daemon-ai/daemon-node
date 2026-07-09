@@ -1374,6 +1374,201 @@ fn base_recall_unchanged_when_flags_off() {
     );
 }
 
+// parity: test_e6a_followup_gaps.py::TestForgetCascadeToAnnotations::test_forget_deletes_annotations_for_memory_id (tests/test_e6a_followup_gaps.py:47)
+#[test]
+fn forget_cascades_annotations_and_embeddings() {
+    let e = engine();
+    let id = e
+        .remember_with_vector(
+            "Alice met Bob in San Francisco.",
+            &RememberArgs {
+                extract_entities: true,
+                ..Default::default()
+            },
+            Some(&[0.5, 0.5, 0.0]),
+            "mock",
+        )
+        .unwrap();
+    {
+        let c = e.store.conn.lock().unwrap();
+        let pre: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(pre > 0, "setup failure: no annotations to forget");
+        let emb: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(emb, 1, "setup failure: no embedding to forget");
+    }
+
+    assert!(e.forget(&id).unwrap(), "forget() found no memory");
+
+    let c = e.store.conn.lock().unwrap();
+    let post: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(post, 0, "annotations for forgotten memory still present");
+    let emb: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(emb, 0, "embedding for forgotten memory still present");
+}
+
+// parity: test_e6a_followup_gaps.py::TestForgetCascadeToAnnotations::test_forget_doesnt_touch_other_memories_annotations (tests/test_e6a_followup_gaps.py:66)
+#[test]
+fn forget_leaves_other_memories_annotations_intact() {
+    let e = engine();
+    let args = RememberArgs {
+        extract_entities: true,
+        ..Default::default()
+    };
+    let id_to_forget = e.remember("Alice met Bob.", &args).unwrap();
+    let id_to_keep = e.remember("Charlie met Dana.", &args).unwrap();
+
+    let count = |id: &str| -> i64 {
+        e.store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let keep_before = count(&id_to_keep);
+    assert!(
+        keep_before > 0,
+        "setup failure: no annotations on the kept row"
+    );
+
+    assert!(e.forget(&id_to_forget).unwrap());
+
+    assert_eq!(count(&id_to_forget), 0);
+    assert_eq!(
+        count(&id_to_keep),
+        keep_before,
+        "forget destroyed another memory's annotations"
+    );
+}
+
+// parity: test_e6a_followup_gaps.py::TestForgetCrossSessionDoesNotLeakAnnotations::test_wrong_session_forget_does_not_touch_annotations (tests/test_e6a_followup_gaps.py:131)
+// parity: test_e6a_followup_gaps.py::TestForgetCrossSessionDoesNotLeakAnnotations::test_correct_session_forget_still_works (tests/test_e6a_followup_gaps.py:148)
+#[test]
+fn cross_session_forget_is_denied_and_preserves_annotations() {
+    let dir = std::env::temp_dir().join(format!("mnemosyne-xforget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = |sid: &str| MnemosyneConfig {
+        data_dir: dir.clone(),
+        session_id: sid.to_string(),
+        ..MnemosyneConfig::default()
+    };
+    let s_a = Engine::open(cfg("session-a")).expect("open session-a");
+    let id = s_a
+        .remember(
+            "Alice met Bob in Paris.",
+            &RememberArgs {
+                extract_entities: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let count = |e: &Engine| -> i64 {
+        e.store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let pre = count(&s_a);
+    assert!(pre > 0, "setup failure: no annotations");
+
+    // The session-scoped DELETE is the authorization boundary: a cross-session forget matches
+    // no row, so the cascade must not fire (`beam.py` `forget_working` L3913).
+    let s_b = Engine::open(cfg("session-b")).expect("open session-b");
+    assert!(
+        !s_b.forget(&id).unwrap(),
+        "cross-session forget should report nothing deleted"
+    );
+    assert_eq!(
+        count(&s_b),
+        pre,
+        "cross-session forget destroyed annotations"
+    );
+
+    // The owning session still forgets normally.
+    assert!(s_a.forget(&id).unwrap());
+    assert_eq!(count(&s_a), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// parity: test_e6a_followup_gaps.py::TestForgetCascadeIsAtomic::test_failed_cascade_rolls_back_working_memory_delete (tests/test_e6a_followup_gaps.py:178)
+#[test]
+fn parity_gap_forget_cascade_failure_rolls_back_row_delete() {
+    let e = engine();
+    let id = e
+        .remember(
+            "Atomic cascade test.",
+            &RememberArgs {
+                extract_entities: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Break the cascade mid-way: the annotations DELETE will fail after the working_memory
+    // DELETE succeeded. Python wraps the cascade in one transaction and rolls back.
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute("DROP TABLE annotations", [])
+        .unwrap();
+
+    assert!(
+        e.forget(&id).is_err(),
+        "a broken cascade must surface the error"
+    );
+
+    let survives: i64 = e
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM working_memory WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        survives, 1,
+        "working_memory row not rolled back after cascade failure"
+    );
+}
+
 #[test]
 fn polyphonic_recall_fuses_voices() {
     let cfg = MnemosyneConfig {
