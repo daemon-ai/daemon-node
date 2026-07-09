@@ -1,0 +1,33 @@
+[package]
+name = "daemon-prompt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The §13 ExecutionEnvironment seam: ALL workspace context-file IO goes through it (never raw
+# std::fs), so the loader works identically on local, remote, and sandboxed backends. This is the
+# ONLY daemon-core surface this crate consumes — binding the produced blocks into the engine's
+# prompt slots is deliberately deferred to the node integration lane.
+daemon-core = { workspace = true }
+# Threat-pattern scanning (the hermes `tools/threat_patterns.py` port).
+regex = { workspace = true }
+serde = { workspace = true }
+# JSONL revision-log lines + the `user_profile` tool schema constant.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Content hashing for revision-log entries (mirrors daemon-host's FileRevisionLog idiom).
+sha2 = { workspace = true }
+# Load-time scan diagnostics: blocked context files / sanitized entries are warn-logged.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Async tests against the LocalEnvironment ExecutionEnvironment backend.
+tokio = { workspace = true }
+# Implementing the (async-trait) ExecutionEnvironment in test doubles (permission-error injection).
+async-trait = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true
