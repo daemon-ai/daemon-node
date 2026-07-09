@@ -1293,6 +1293,38 @@ async fn multi_round_loop_runs_tools_then_completes() {
     assert_eq!(tool_turns, 2);
 }
 
+// parity: test_agent_guardrails.py::TestDeduplicateToolCalls::test_duplicate_pair_deduplicated (tests/run_agent/test_agent_guardrails.py:177)
+//
+// Ports hermes' `_deduplicate_tool_calls` (run_agent.py:3395), applied at the decode/dispatch
+// boundary (agent/conversation_loop.py:3866): duplicate (name, args) tool calls within one
+// assistant message collapse to the first occurrence, so an identical parallel call runs once.
+/// Two identical (name, args) tool calls in one assistant message are deduplicated — the tool runs
+/// exactly once, not once per duplicate.
+#[tokio::test]
+async fn parity_gap_deduplicates_identical_parallel_tool_calls() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = Arc::new(ScriptedProvider::new(
+        vec![ScriptStep::Calls(vec![
+            ("counter".into(), "{}".into()),
+            ("counter".into(), "{}".into()),
+        ])],
+        "done",
+    ));
+    let mut engine = looping_engine(provider, runs.clone(), 8);
+    engine.push_user(UserMsg::new("go"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed(_)));
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        1,
+        "identical parallel tool calls should be deduplicated to a single execution"
+    );
+}
+
 /// A batch of two `Parallel` tool calls runs concurrently: the peak observed in-flight count is 2.
 #[tokio::test]
 async fn parallel_tool_batch_runs_concurrently() {
