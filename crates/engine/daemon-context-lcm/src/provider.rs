@@ -99,6 +99,14 @@ struct State {
     /// Provider-reported usage from the most recent model response (`update_from_response`,
     /// `LCM:engine.py:614-629`) — surfaced by `lcm_status`.
     usage: UsageMetrics,
+    /// The last restart-reconciliation record (`_record_ingest_reconciliation`,
+    /// `LCM:engine.py:3065-3085`) — surfaced by `lcm_status` as `ingest_reconciliation`.
+    /// `Null` renders as the Python "not run" default. Counts are turn-based (adaptation).
+    last_ingest_reconciliation: Value,
+    /// The cache-friendly condensation suppression reason of the last compaction
+    /// (`_last_condensation_suppressed_reason`, `LCM:engine.py:380`) — surfaced by `lcm_status`;
+    /// empty when condensation ran, was not gated, or has not been reached yet.
+    last_condensation_suppressed_reason: &'static str,
 }
 
 /// The provider-reported usage snapshot recorded by [`ContextEngine::after_response`]
@@ -270,6 +278,9 @@ impl LcmContextEngine {
         state.reconciled = false;
         state.last_compression_status = "idle".to_string();
         state.last_compression_noop_reason.clear();
+        // Back to the "not run" default (`LCM:engine.py:1732`).
+        state.last_ingest_reconciliation = Value::Null;
+        state.last_condensation_suppressed_reason = "";
     }
 
     /// The `/new`-style session reset (`on_session_reset`, `LCM:engine.py:2202-2219`): arm the
@@ -401,6 +412,8 @@ impl LcmContextEngine {
             context_length_source: String,
             last_compression_status: String,
             last_compression_noop_reason: String,
+            ingest_reconciliation: Value,
+            condensation_suppressed_reason: &'static str,
         }
         let snap = {
             let state = self.state.lock().expect("lcm state poisoned");
@@ -422,6 +435,8 @@ impl LcmContextEngine {
                     state.last_compression_status.clone()
                 },
                 last_compression_noop_reason: state.last_compression_noop_reason.clone(),
+                ingest_reconciliation: state.last_ingest_reconciliation.clone(),
+                condensation_suppressed_reason: state.last_condensation_suppressed_reason,
             }
         };
         let cx = ToolCx {
@@ -442,6 +457,8 @@ impl LcmContextEngine {
             context_length_source: &snap.context_length_source,
             last_compression_status: &snap.last_compression_status,
             last_compression_noop_reason: &snap.last_compression_noop_reason,
+            ingest_reconciliation: &snap.ingest_reconciliation,
+            condensation_suppressed_reason: snap.condensation_suppressed_reason,
         };
         crate::tools::dispatch(&cx, name, args).await
     }
@@ -509,15 +526,53 @@ impl LcmContextEngine {
             return;
         }
         let session = effective_session(&state.session_id);
+        let tok = state.tokenizer.clone();
         if !state.reconciled {
-            let frontier = self.store.get_frontier(&session).unwrap_or(0);
-            let _ = self.store.delete_messages_after(&session, frontier);
-            state.cursor = 0;
-            state.turn_store_ids.clear();
             state.reconciled = true;
+            let session_count = self.store.message_count(&session).unwrap_or(0);
+            if session_count <= 0 {
+                // Fresh session — nothing durable yet, ingest from the top.
+                state.cursor = 0;
+                state.turn_store_ids.clear();
+            } else if leading_scaffold_count(&conv.turns) > 0 {
+                // A genuine LCM-compacted replay leads with a summary scaffold turn: the volatile
+                // tail (`store_id > frontier`) is re-supplied by the replay, so delete it and
+                // rebuild the turn→row index by re-ingesting from the top (the summarized head
+                // stays behind the frontier). This is the original reconcile path, retained for
+                // the compaction-restart case.
+                let frontier = self.store.get_frontier(&session).unwrap_or(0);
+                let _ = self.store.delete_messages_after(&session, frontier);
+                state.cursor = 0;
+                state.turn_store_ids.clear();
+            } else {
+                // Non-scaffold restart: match the replayed prefix against the durable store tail
+                // and advance the cursor past it WITHOUT deleting durable rows (a core port of
+                // `_reconcile_ingest_cursor_from_store`, `LCM:engine.py:3125`). A delta, a stale
+                // short snapshot, or a scaffold+new-rows replay must not wipe or duplicate the
+                // durable transcript.
+                // A plain system prompt (no LCM note) is the Rust anchor for Python's
+                // system-message stale-snapshot guard.
+                let system_is_plain = !conv
+                    .system
+                    .text
+                    .contains("Lossless Context Management (LCM)");
+                let (cursor, kind, record) = self.reconcile_turn_cursor(
+                    &session,
+                    &conv.turns,
+                    &tok,
+                    session_count,
+                    system_is_plain,
+                );
+                let cursor = cursor.min(conv.turns.len());
+                state.turn_store_ids =
+                    self.rebuild_turn_store_ids(&session, &conv.turns, cursor, &tok, kind);
+                state.cursor = cursor;
+                if let Some(record) = record {
+                    state.last_ingest_reconciliation = record;
+                }
+            }
         }
         let scaffold = leading_scaffold_count(&conv.turns);
-        let tok = state.tokenizer.clone();
         let ext_dir = self.config.externalization_dir();
         while state.cursor < conv.turns.len() {
             let idx = state.cursor;
@@ -552,6 +607,350 @@ impl LcmContextEngine {
             state.cursor += 1;
         }
     }
+
+    /// Whether a durable store row matches the active `ignore_message_patterns` (so it is excluded
+    /// from tail reconciliation, mirroring Python's `stored_row=True` filtering).
+    fn row_is_ignored(&self, row: &crate::store::MessageRow) -> bool {
+        !self.message_patterns.is_empty()
+            && self
+                .message_patterns
+                .is_match(row.content.as_deref().unwrap_or(""))
+    }
+
+    /// Whether a live turn matches the active `ignore_message_patterns` (§12.3).
+    fn turn_is_ignored(&self, turn: &Turn) -> bool {
+        !self.message_patterns.is_empty() && self.message_patterns.is_match(&turn_match_text(turn))
+    }
+
+    /// The actively-bound session id — the identity the doctor cleanup/retention surfaces protect
+    /// (`engine._session_id` in `command.py`; the row receiving live writes).
+    fn bound_session_id(&self) -> String {
+        let state = self.state.lock().expect("lcm state poisoned");
+        effective_session(&state.session_id)
+    }
+
+    /// Restart reconcile for a non-scaffold replay: return `(turn_cursor, kind)` — how many leading
+    /// turns of `turns` are a replay of the durable store, and why. A core port of
+    /// `_reconcile_ingest_cursor_from_store` + `_find_reconciled_cursor_for_store_tail`
+    /// (`LCM:engine.py:2910-3222`), operating at turn granularity (each turn flattens to one or
+    /// more message identities). Never deletes durable rows.
+    ///
+    /// Stored-row identities restore externalized ingest payloads before matching (the
+    /// `stored_row=True` restoration in `_message_replay_identity`), so a replay carrying the raw
+    /// inline payload still matches the placeholder row the write boundary persisted. The
+    /// stale-snapshot proof compares against the RAW durable prefix (ignore filters may suppress
+    /// noisy rows for tail reconciliation, but filtered history must not create replay evidence
+    /// for skipping a batch — `LCM:engine.py:3186-3192`).
+    ///
+    /// Adaptation (see PARITY.md): the Python system-message anchor for the stale-snapshot guard is
+    /// mapped to "the conversation carries a plain system prompt (no LCM note)", because the Rust
+    /// `Conversation` keeps the system prompt out of the turn/row stream. Quarantine-identity
+    /// restoration and the sanitized-active-cleanup equivalence flags are not modeled here
+    /// (documented gaps).
+    fn reconcile_turn_cursor(
+        &self,
+        session: &str,
+        turns: &[Turn],
+        tok: &Tokenizer,
+        session_count: i64,
+        system_is_plain: bool,
+    ) -> (usize, ReconcileKind, Option<Value>) {
+        let all_rows = self.store.session_messages(session).unwrap_or_default();
+        let ext_dir = self.config.externalization_dir();
+        // Durable identities oldest→newest: `stored_raw_all` keeps every row (the stale-proof
+        // view); `stored_all` is the ignore-filtered view used for tail matching.
+        let stored_raw_all: Vec<ReplayId> = all_rows
+            .iter()
+            .map(|r| row_replay_id(r, ext_dir.as_deref()))
+            .collect();
+        let stored_all: Vec<ReplayId> = all_rows
+            .iter()
+            .zip(stored_raw_all.iter())
+            .filter(|(r, _)| !self.row_is_ignored(r))
+            .map(|(_, id)| id.clone())
+            .collect();
+        if stored_all.is_empty() {
+            return (0, ReconcileKind::AmbiguousDelta, None);
+        }
+        let flat_incoming: usize = turns
+            .iter()
+            .map(|t| flatten_turns(std::slice::from_ref(t), tok).len())
+            .sum();
+        let tail_limit = (flat_incoming.saturating_mul(4).max(64)).min(stored_all.len());
+        let stored_tail = &stored_all[stored_all.len() - tail_limit..];
+
+        // Precompute per-turn flags/identities once.
+        let per_turn: Vec<(bool, bool, Vec<ReplayId>)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    is_scaffold_turn(t),
+                    self.turn_is_ignored(t),
+                    turn_replay_ids(t, tok),
+                )
+            })
+            .collect();
+        let visible_prefix = |upto: usize| -> Vec<ReplayId> {
+            let mut out = Vec::new();
+            for (scaffold, ignored, ids) in per_turn.iter().take(upto) {
+                if !*scaffold && !*ignored {
+                    out.extend(ids.iter().cloned());
+                }
+            }
+            out
+        };
+
+        let n = turns.len();
+        let effective_session_count = stored_tail.len();
+        // The `_record_ingest_reconciliation` analog (`LCM:engine.py:3065-3085`); counts are
+        // turn-based where Python counts messages (adaptation).
+        let record = |action: &str, reason: &str, cursor: usize, effective_incoming: usize| {
+            serde_json::json!({
+                "action": action,
+                "reason": reason,
+                "cursor": cursor,
+                "incoming": n,
+                "session_count": session_count,
+                "stored_tail_count": stored_tail.len(),
+                "effective_incoming": effective_incoming,
+            })
+        };
+        // Search high→low for the largest turn cursor proving a durable-tail replay.
+        for t in (0..=n).rev() {
+            let candidate_prefix = visible_prefix(t);
+            if candidate_prefix.is_empty() {
+                // A leading run of scaffold/ignored-only turns; skip it (allow-empty-prefix).
+                if t > 0 {
+                    let rec = record(
+                        "advanced cursor",
+                        "skipped scaffold-only prefix",
+                        t,
+                        visible_prefix(n).len(),
+                    );
+                    return (t, ReconcileKind::ScaffoldOnly, Some(rec));
+                }
+                break;
+            }
+            if !matches_store_tail_suffix(stored_tail, &candidate_prefix) {
+                continue;
+            }
+            let has_scaffold_evidence = per_turn.iter().take(t).any(|(s, _, _)| *s);
+            let has_effective_full_replay =
+                candidate_prefix.len() >= effective_session_count && effective_session_count > 1;
+            let has_raw_full_replay = !has_scaffold_evidence
+                && candidate_prefix.len() >= session_count as usize
+                && session_count > 1;
+            if has_effective_full_replay || has_raw_full_replay {
+                let rec = record(
+                    "advanced cursor",
+                    "replayed durable tail",
+                    t,
+                    visible_prefix(n).len(),
+                );
+                return (t, ReconcileKind::TailReplay, Some(rec));
+            }
+        }
+
+        // No qualifying replay cursor. A stale short snapshot that exactly re-supplies the durable
+        // head with no tail overlap must be skipped, not appended (a duplicate guard). The proof
+        // uses the RAW durable prefix — filtered rows must not manufacture stale evidence.
+        // Otherwise the batch is an ambiguous delta and is persisted from the top.
+        let incoming = visible_prefix(n);
+        if is_suspicious_stale_no_overlap(&incoming, stored_tail, &stored_raw_all, system_is_plain)
+        {
+            let rec = record(
+                "skipped batch",
+                "skipped stale no-overlap snapshot",
+                n,
+                incoming.len(),
+            );
+            return (n, ReconcileKind::StaleSkip, Some(rec));
+        }
+        let rec = record(
+            "persisted batch",
+            "persisted ambiguous delta",
+            0,
+            incoming.len(),
+        );
+        (0, ReconcileKind::AmbiguousDelta, Some(rec))
+    }
+
+    /// Rebuild `turn_store_ids` for the reconciled replay prefix `turns[0..cursor]` from the durable
+    /// store rows (so a later compaction still maps replayed turns to their real `store_id`s). The
+    /// visible replayed turns correspond to the last `M` durable rows; scaffold/ignored/skip turns
+    /// get an empty slot. The result length is exactly `cursor`.
+    fn rebuild_turn_store_ids(
+        &self,
+        session: &str,
+        turns: &[Turn],
+        cursor: usize,
+        tok: &Tokenizer,
+        kind: ReconcileKind,
+    ) -> Vec<Vec<i64>> {
+        if cursor == 0 {
+            return Vec::new();
+        }
+        // For a stale skip the incoming prefix matches the durable head, not the tail — there is no
+        // sound tail mapping, so leave the slots empty (a skipped snapshot is never compacted).
+        if matches!(kind, ReconcileKind::StaleSkip) {
+            return vec![Vec::new(); cursor];
+        }
+        let all_rows = self.store.session_messages(session).unwrap_or_default();
+        let store_ids: Vec<i64> = all_rows.iter().map(|r| r.store_id).collect();
+        let flat_count = |t: &Turn| flatten_turns(std::slice::from_ref(t), tok).len();
+        let covered: usize = turns
+            .iter()
+            .take(cursor)
+            .filter(|t| !is_scaffold_turn(t) && !self.turn_is_ignored(t))
+            .map(flat_count)
+            .sum();
+        let start = store_ids.len().saturating_sub(covered);
+        let tail_ids = &store_ids[start..];
+        let mut ptr = 0usize;
+        let mut out = Vec::with_capacity(cursor);
+        for t in turns.iter().take(cursor) {
+            if is_scaffold_turn(t) || self.turn_is_ignored(t) {
+                out.push(Vec::new());
+                continue;
+            }
+            let f = flat_count(t);
+            let slice: Vec<i64> = tail_ids.iter().skip(ptr).take(f).copied().collect();
+            ptr += f;
+            out.push(slice);
+        }
+        out
+    }
+}
+
+/// Why a non-scaffold restart reconcile advanced (or held) the ingest cursor
+/// (`_record_ingest_reconciliation` reasons, `LCM:engine.py:3065`).
+#[derive(Clone, Copy)]
+enum ReconcileKind {
+    /// The prefix replays the durable tail — advance past it.
+    TailReplay,
+    /// A leading scaffold-only prefix — skip it.
+    ScaffoldOnly,
+    /// A stale short snapshot re-supplying the durable head with no tail overlap — skip the batch.
+    StaleSkip,
+    /// No replay proof — persist the batch from the top.
+    AmbiguousDelta,
+}
+
+/// A message-level replay identity for restart reconciliation (a core port of
+/// `_message_replay_identity`, `LCM:engine.py:2754`): `(role, content, tool_call_id, tool_calls)`.
+/// Stored rows restore externalized ingest payloads (`stored_row=True`); quarantine restoration is
+/// not modeled (adaptation — see PARITY.md).
+#[derive(Clone, PartialEq, Eq)]
+struct ReplayId {
+    role: String,
+    content: String,
+    tool_call_id: String,
+    tool_calls: String,
+}
+
+/// The replay identity of a durable store row. Externalized ingest-payload placeholders are
+/// restored to their original inline content (the `stored_row=True` branch of
+/// `_message_replay_identity`) so a restart replay carrying the raw payload matches the row the
+/// write boundary persisted; quarantined-assistant spills keep their placeholder (kind mismatch).
+fn row_replay_id(row: &crate::store::MessageRow, ext_dir: Option<&std::path::Path>) -> ReplayId {
+    let mut content = row.content.clone().unwrap_or_default();
+    if let Some(dir) = ext_dir {
+        if content.contains("[Externalized LCM ingest payload:") {
+            content =
+                crate::externalize::restore_ingest_placeholders(dir, &content, &row.session_id);
+        }
+    }
+    ReplayId {
+        role: row.role.clone(),
+        content,
+        tool_call_id: row.tool_call_id.clone().unwrap_or_default(),
+        tool_calls: row.tool_calls.clone().unwrap_or_default(),
+    }
+}
+
+/// Flatten one turn into its message-level replay identities (mirrors [`flatten_turns`]).
+fn turn_replay_ids(turn: &Turn, tok: &Tokenizer) -> Vec<ReplayId> {
+    flatten_turns(std::slice::from_ref(turn), tok)
+        .into_iter()
+        .map(|m| ReplayId {
+            role: m.role,
+            content: m.content.unwrap_or_default(),
+            tool_call_id: m.tool_call_id.unwrap_or_default(),
+            tool_calls: m.tool_calls.unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Whether a turn is replayed active-context scaffolding that must not be re-ingested (a port of
+/// `_is_replayed_context_scaffold_message`, `LCM:engine.py:2644`, at turn granularity — the
+/// system-prompt branch is handled out-of-band since Rust keeps the system prompt off the turn
+/// stream).
+fn is_scaffold_turn(turn: &Turn) -> bool {
+    let text = match turn {
+        Turn::User(u) => u.text.as_str(),
+        Turn::Assistant(a) => a.text.as_str(),
+        Turn::Tool(t) => t.assistant.text.as_str(),
+    };
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(crate::compaction::SUMMARY_SENTINEL)
+        || trimmed.starts_with(crate::compaction::PRESERVED_OBJECTIVE_PREFIX)
+    {
+        return true;
+    }
+    if !text.contains("[Expand for details:") {
+        return false;
+    }
+    summary_header_regex().is_match(text)
+}
+
+/// The synthetic-summary header pattern (`LCM:engine.py:2658`).
+fn summary_header_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]",
+        )
+        .expect("summary header regex is valid")
+    })
+}
+
+/// `stored_tail[-len(prefix):] == prefix` (a port of `_matches_store_tail_suffix`,
+/// `LCM:engine.py:2782`).
+fn matches_store_tail_suffix(stored_tail: &[ReplayId], candidate_prefix: &[ReplayId]) -> bool {
+    if candidate_prefix.is_empty() {
+        return true;
+    }
+    if candidate_prefix.len() > stored_tail.len() {
+        return false;
+    }
+    &stored_tail[stored_tail.len() - candidate_prefix.len()..] == candidate_prefix
+}
+
+/// A short stale snapshot that exactly re-supplies the durable head with no tail overlap (a port of
+/// `_is_suspicious_stale_no_overlap_snapshot`, `LCM:engine.py:3098`). The Python system-role anchor
+/// is adapted to `system_is_plain` — the incoming carries a plain (non-LCM) system prompt.
+fn is_suspicious_stale_no_overlap(
+    incoming: &[ReplayId],
+    stored_tail: &[ReplayId],
+    stored_head: &[ReplayId],
+    system_is_plain: bool,
+) -> bool {
+    if incoming.len() <= 1 {
+        return false;
+    }
+    if !system_is_plain {
+        return false;
+    }
+    if stored_tail.is_empty() || incoming.len() >= stored_tail.len() {
+        return false;
+    }
+    if incoming.iter().any(|m| stored_tail.contains(m)) {
+        return false;
+    }
+    if incoming.len() > stored_head.len() {
+        return false;
+    }
+    &stored_head[..incoming.len()] == incoming
 }
 
 /// The matchable text of a turn for the `ignore_message_patterns` filter (§12.3): user/assistant
@@ -760,6 +1159,7 @@ impl ContextEngine for LcmContextEngine {
         state.breakers = breakers;
         state.cursor = outcome.index.len();
         state.turn_store_ids = outcome.index;
+        state.last_condensation_suppressed_reason = outcome.condensation_suppressed;
         match outcome.status {
             crate::compaction::CompressionStatus::Compacted => {
                 state.compaction_count += 1;
@@ -1251,6 +1651,624 @@ fn rotate_apply_text(engine: &LcmContextEngine) -> String {
     lines.join("\n")
 }
 
+/// A `/lcm doctor clean` candidate (`_scan_clean_candidates`, `LCM:command.py:200`).
+struct CleanCandidate {
+    session_id: String,
+    classes: Vec<&'static str>,
+    message_count: i64,
+    node_count: i64,
+    token_total: i64,
+}
+
+/// The `/lcm doctor clean` scan result.
+struct CleanScan {
+    candidates: Vec<CleanCandidate>,
+    ignored_count: usize,
+    stateless_count: usize,
+    protected_count: usize,
+}
+
+/// Scan stored sessions for pattern-matched junk/noise candidates (`_scan_clean_candidates`,
+/// `LCM:command.py:200-283`): every stored session is classified against the compiled
+/// `ignore_session_patterns` first (ignored wins over stateless); the actively-bound session is
+/// protected from cleanup.
+fn scan_clean_candidates(engine: &LcmContextEngine) -> crate::error::Result<CleanScan> {
+    let bound = engine.bound_session_id();
+    let rows = engine.store.session_footprints(None)?;
+    let mut scan = CleanScan {
+        candidates: Vec::new(),
+        ignored_count: 0,
+        stateless_count: 0,
+        protected_count: 0,
+    };
+    for row in rows {
+        let keys = build_session_match_keys("", &row.session_id);
+        let mut classes: Vec<&'static str> = Vec::new();
+        if engine.ignore_session_globs.matches(&keys) {
+            classes.push("ignored-pattern");
+            scan.ignored_count += 1;
+        } else if engine.stateless_session_globs.matches(&keys) {
+            classes.push("stateless-pattern");
+            scan.stateless_count += 1;
+        }
+        if classes.is_empty() {
+            continue;
+        }
+        if row.session_id == bound {
+            scan.protected_count += 1;
+            continue;
+        }
+        scan.candidates.push(CleanCandidate {
+            session_id: row.session_id,
+            classes,
+            message_count: row.message_count,
+            node_count: row.node_count,
+            token_total: row.token_total,
+        });
+    }
+    Ok(scan)
+}
+
+/// `/lcm doctor clean` — best-effort read-only scan for obvious junk/noise session candidates
+/// (`_doctor_clean_text`, `LCM:command.py:1207`).
+fn doctor_clean_text(engine: &LcmContextEngine) -> String {
+    let scan = match scan_clean_candidates(engine) {
+        Ok(scan) => scan,
+        Err(e) => {
+            return [
+                "LCM doctor clean".to_string(),
+                "status: error".to_string(),
+                format!("error: {e}"),
+                "note: read-only scan only — no rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    let mut lines = vec![
+        "LCM doctor clean".to_string(),
+        format!(
+            "status: {}",
+            if scan.candidates.is_empty() {
+                "ok"
+            } else {
+                "candidates-found"
+            }
+        ),
+        format!("candidate_sessions: {}", scan.candidates.len()),
+        format!("ignored_pattern_matches: {}", scan.ignored_count),
+        format!("stateless_pattern_matches: {}", scan.stateless_count),
+    ];
+    if scan.protected_count > 0 {
+        lines.push(format!(
+            "protected_sessions_skipped: {}",
+            scan.protected_count
+        ));
+    }
+    if scan.candidates.is_empty() {
+        lines.push("result: no obvious junk/noise session candidates detected".to_string());
+        return lines.join("\n");
+    }
+    lines.push("candidates:".to_string());
+    for item in scan.candidates.iter().take(20) {
+        lines.push(format!(
+            "- {} | class={} | messages={} | nodes={} | tokens={}",
+            item.session_id,
+            item.classes.join(", "),
+            item.message_count,
+            item.node_count,
+            item.token_total,
+        ));
+    }
+    if scan.candidates.len() > 20 {
+        lines.push(format!(
+            "... {} more candidate session(s) omitted",
+            scan.candidates.len() - 20
+        ));
+    }
+    lines.push(
+        "note: best-effort stored-session scan only — platform-only matches may not be \
+         reconstructable from the SQLite state"
+            .to_string(),
+    );
+    lines.push("note: read-only scan only — no rows were deleted".to_string());
+    lines.push(
+        "note: use `/lcm doctor clean apply` only after a backup-first review of these safe \
+         candidates"
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+/// `/lcm doctor clean apply` — backup-first atomic deletion of the safe pattern-matched cleanup
+/// candidates (`_doctor_clean_apply_text`, `LCM:command.py:1367`). Denied unless
+/// `doctor_clean_apply_enabled` is set.
+fn doctor_clean_apply_text(engine: &LcmContextEngine) -> String {
+    if !engine.config.doctor_clean_apply_enabled {
+        return [
+            "LCM doctor clean apply".to_string(),
+            "status: denied".to_string(),
+            "error: destructive cleanup is disabled by default".to_string(),
+            "note: enable `doctor_clean_apply_enabled` only in trusted operator environments"
+                .to_string(),
+            "note: no rows were deleted".to_string(),
+        ]
+        .join("\n");
+    }
+    let scan = match scan_clean_candidates(engine) {
+        Ok(scan) => scan,
+        Err(e) => {
+            return [
+                "LCM doctor clean apply".to_string(),
+                "status: error".to_string(),
+                format!("error: {e}"),
+                "note: cleanup apply aborted before any rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    if scan.candidates.is_empty() {
+        return [
+            "LCM doctor clean apply".to_string(),
+            "status: ok".to_string(),
+            "candidate_sessions: 0".to_string(),
+            "result: no safe cleanup candidates detected".to_string(),
+            "note: nothing was deleted".to_string(),
+        ]
+        .join("\n");
+    }
+    let db = engine
+        .config
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let backup = match engine.backup_database() {
+        Ok(b) => b,
+        Err(e) => {
+            return [
+                "LCM doctor clean apply".to_string(),
+                "status: error".to_string(),
+                format!("database_path: {db}"),
+                format!("error: backup failed: {e}"),
+                "note: cleanup apply aborted before any rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    let session_ids: Vec<String> = scan
+        .candidates
+        .iter()
+        .map(|c| c.session_id.clone())
+        .collect();
+    let protected = vec![engine.bound_session_id()];
+    match engine
+        .store
+        .delete_sessions_atomically(&session_ids, &protected)
+    {
+        Ok((messages_deleted, nodes_deleted, lifecycle_deleted, lifecycle_skipped)) => [
+            "LCM doctor clean apply".to_string(),
+            "status: ok".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            format!("candidate_sessions: {}", scan.candidates.len()),
+            format!("messages_deleted: {messages_deleted}"),
+            format!("nodes_deleted: {nodes_deleted}"),
+            format!("lifecycle_rows_deleted: {lifecycle_deleted}"),
+            format!("lifecycle_rows_skipped: {lifecycle_skipped}"),
+            "note: backup created before cleanup apply".to_string(),
+        ]
+        .join("\n"),
+        Err(e) => [
+            "LCM doctor clean apply".to_string(),
+            "status: error".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            format!("error: cleanup apply failed: {e}"),
+            "note: cleanup apply rolled back; restore from the backup if you need to inspect \
+             pre-apply state"
+                .to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+/// `/lcm doctor retention` — read-only retention analysis scoped to the active session
+/// (`_doctor_retention_text` + `_scan_retention_candidates`, `LCM:command.py:285/1248`).
+fn doctor_retention_text(engine: &LcmContextEngine) -> String {
+    let session = engine.bound_session_id();
+    let rows = if session.is_empty() {
+        Vec::new()
+    } else {
+        match engine.store.session_footprints(Some(&session)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return [
+                    "LCM doctor retention".to_string(),
+                    "status: error".to_string(),
+                    format!("error: {e}"),
+                    "note: read-only analysis only — no rows were deleted".to_string(),
+                ]
+                .join("\n");
+            }
+        }
+    };
+    struct RetentionRow {
+        session_id: String,
+        protected: bool,
+        message_count: i64,
+        node_count: i64,
+        token_total: i64,
+        last_activity_at: f64,
+        age_days: f64,
+    }
+    let now = LcmContextEngine::now();
+    let mut sessions: Vec<RetentionRow> = Vec::new();
+    let (mut stale_30, mut stale_90, mut tokens_30, mut tokens_90, mut protected_count) =
+        (0i64, 0i64, 0i64, 0i64, 0i64);
+    for row in rows {
+        let timestamps: Vec<f64> = [
+            row.first_message_at,
+            row.last_message_at,
+            row.first_node_at,
+            row.last_node_at,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if timestamps.is_empty() {
+            continue;
+        }
+        let last_activity_at = timestamps.iter().copied().fold(f64::MIN, f64::max);
+        let age_days = ((now - last_activity_at) / 86_400.0).max(0.0);
+        let protected = row.session_id == session;
+        let token_total = row.token_total + row.node_token_total;
+        if protected {
+            protected_count += 1;
+        }
+        if age_days >= 30.0 {
+            stale_30 += 1;
+            tokens_30 += token_total;
+        }
+        if age_days >= 90.0 {
+            stale_90 += 1;
+            tokens_90 += token_total;
+        }
+        sessions.push(RetentionRow {
+            session_id: row.session_id,
+            protected,
+            message_count: row.message_count,
+            node_count: row.node_count,
+            token_total,
+            last_activity_at,
+            age_days,
+        });
+    }
+    // Python's sort key: protected last, stale bucket first, then footprint descending
+    // (`LCM:command.py:416-426`).
+    sessions.sort_by(|a, b| {
+        (a.protected as u8)
+            .cmp(&(b.protected as u8))
+            .then_with(|| {
+                let a_fresh = u8::from(a.age_days < 30.0);
+                let b_fresh = u8::from(b.age_days < 30.0);
+                a_fresh.cmp(&b_fresh)
+            })
+            .then_with(|| b.token_total.cmp(&a.token_total))
+            .then_with(|| b.node_count.cmp(&a.node_count))
+            .then_with(|| b.message_count.cmp(&a.message_count))
+            .then_with(|| {
+                a.last_activity_at
+                    .partial_cmp(&b.last_activity_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    let mut lines = vec![
+        "LCM doctor retention".to_string(),
+        format!(
+            "status: {}",
+            if sessions.is_empty() {
+                "ok"
+            } else {
+                "analysis-ready"
+            }
+        ),
+        format!("sessions_analyzed: {}", sessions.len()),
+        format!("stale_sessions_30d: {stale_30}"),
+        format!("stale_sessions_90d: {stale_90}"),
+        format!("retained_tokens_30d: {tokens_30}"),
+        format!("retained_tokens_90d: {tokens_90}"),
+    ];
+    if protected_count > 0 {
+        lines.push(format!("protected_sessions: {protected_count}"));
+    }
+    if sessions.is_empty() {
+        lines.push("result: no stored sessions found for retention analysis".to_string());
+        lines.push("note: read-only analysis only — no rows were deleted".to_string());
+        return lines.join("\n");
+    }
+    lines.push("retention_candidates:".to_string());
+    for item in sessions.iter().take(20) {
+        lines.push(format!(
+            "- {} | protected={} | messages={} | nodes={} | tokens={} | age_days={:.1}",
+            item.session_id,
+            if item.protected { "yes" } else { "no" },
+            item.message_count,
+            item.node_count,
+            item.token_total,
+            item.age_days,
+        ));
+    }
+    if sessions.len() > 20 {
+        lines.push(format!(
+            "... {} more session(s) omitted",
+            sessions.len() - 20
+        ));
+    }
+    lines.push("note: retention analysis is scoped to the active session only".to_string());
+    lines.push(
+        "note: stale sessions are listed before fresh ones; within each bucket, candidates are \
+         sorted by footprint (tokens/nodes/messages), with protected current-session entries \
+         listed after non-protected ones"
+            .to_string(),
+    );
+    lines.push("note: read-only analysis only — no rows were deleted".to_string());
+    lines.push(
+        "note: if you prune later, create a safety snapshot first with `/lcm backup`".to_string(),
+    );
+    lines.join("\n")
+}
+
+/// `/lcm doctor clean lifecycle` — read-only scan for lifecycle rows with zero stored data
+/// (`_doctor_clean_lifecycle_text`, `LCM:command.py:1435`).
+fn doctor_clean_lifecycle_text(engine: &LcmContextEngine) -> String {
+    let count = engine.store.lifecycle_row_count().unwrap_or(0);
+    let protected = vec![engine.bound_session_id()];
+    let (empty_current, empty_finalized, empty_protected) =
+        match engine.store.empty_lifecycle_stats(&protected) {
+            Ok(stats) => stats,
+            Err(e) => {
+                return [
+                    "LCM doctor clean lifecycle".to_string(),
+                    "status: error".to_string(),
+                    format!("error: {e}"),
+                    "note: read-only scan — no rows were deleted".to_string(),
+                ]
+                .join("\n");
+            }
+        };
+    let total_empty = empty_current + empty_finalized;
+    if total_empty == 0 {
+        return [
+            "LCM doctor clean lifecycle".to_string(),
+            "status: ok".to_string(),
+            format!("lifecycle_rows: {count}"),
+            "empty_rows: 0".to_string(),
+            "note: no empty lifecycle rows to prune".to_string(),
+        ]
+        .join("\n");
+    }
+    [
+        "LCM doctor clean lifecycle".to_string(),
+        "status: candidates-found".to_string(),
+        format!("lifecycle_rows: {count}"),
+        format!("empty_rows: {total_empty}"),
+        format!("  empty_current: {empty_current}"),
+        format!("  empty_finalized: {empty_finalized}"),
+        format!("  empty_protected: {empty_protected}"),
+        "note: read-only scan — no rows were deleted".to_string(),
+        "note: empty rows reference sessions with zero messages and zero nodes".to_string(),
+        "note: use `/lcm doctor clean lifecycle apply` to delete empty rows".to_string(),
+    ]
+    .join("\n")
+}
+
+/// `/lcm doctor clean lifecycle apply` — backup-first pruning of empty lifecycle rows
+/// (`_doctor_clean_lifecycle_apply_text`, `LCM:command.py:1490`). Denied unless
+/// `doctor_clean_apply_enabled` is set; the operator apply prunes regardless of row age (the
+/// automatic session-bind GC keeps its age guard).
+fn doctor_clean_lifecycle_apply_text(engine: &LcmContextEngine) -> String {
+    if !engine.config.doctor_clean_apply_enabled {
+        return [
+            "LCM doctor clean lifecycle apply".to_string(),
+            "status: denied".to_string(),
+            "error: destructive cleanup is disabled by default".to_string(),
+            "note: enable `doctor_clean_apply_enabled` only in trusted operator environments"
+                .to_string(),
+            "note: no rows were deleted".to_string(),
+        ]
+        .join("\n");
+    }
+    let db = engine
+        .config
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let backup = match engine.backup_database() {
+        Ok(b) => b,
+        Err(e) => {
+            return [
+                "LCM doctor clean lifecycle apply".to_string(),
+                "status: error".to_string(),
+                "error: failed to create backup before destructive cleanup".to_string(),
+                format!("database_path: {db}"),
+                format!("backup_error: {e}"),
+                "note: no rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    let before = engine.store.lifecycle_row_count().unwrap_or(0);
+    let protected = vec![engine.bound_session_id()];
+    match engine
+        .store
+        .prune_empty_sessions(&protected, None, LcmContextEngine::now())
+    {
+        Ok(deleted) => {
+            let after = engine.store.lifecycle_row_count().unwrap_or(0);
+            [
+                "LCM doctor clean lifecycle apply".to_string(),
+                "status: ok".to_string(),
+                format!("lifecycle_rows_before: {before}"),
+                format!("lifecycle_rows_deleted: {deleted}"),
+                format!("lifecycle_rows_remaining: {after}"),
+                format!("backup_path: {}", backup.path.display()),
+                format!("backup_size_bytes: {}", backup.size),
+                "note: only empty lifecycle rows were deleted — messages and nodes untouched"
+                    .to_string(),
+            ]
+            .join("\n")
+        }
+        Err(e) => [
+            "LCM doctor clean lifecycle apply".to_string(),
+            "status: error".to_string(),
+            "error: failed to prune empty sessions".to_string(),
+            format!("backup_path: {}", backup.path.display()),
+            format!("prune_error: {e}"),
+            "note: no rows were deleted".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+/// `/lcm doctor source` — read-only scan for legacy blank-`source` rows (`_doctor_source_text`,
+/// `LCM:command.py:766`). Reports the source-bucket breakdown and how many rows a normalize would
+/// touch, without changing anything.
+fn doctor_source_text(engine: &LcmContextEngine) -> String {
+    match engine.store.source_normalization_plan() {
+        Ok((would_update, affected_sessions, stats)) => {
+            let mut lines = vec![
+                "LCM doctor source".to_string(),
+                format!(
+                    "status: {}",
+                    if would_update > 0 {
+                        "normalization-needed"
+                    } else {
+                        "ok"
+                    }
+                ),
+                format!("messages_total: {}", stats.messages_total),
+                format!("attributed_messages: {}", stats.attributed_messages),
+                format!("unknown_messages: {}", stats.normalized_unknown_messages),
+                format!(
+                    "legacy_blank_messages: {}",
+                    stats.legacy_blank_source_messages
+                ),
+                format!(
+                    "effective_unknown_messages: {}",
+                    stats.effective_unknown_messages
+                ),
+                "target_source: unknown".to_string(),
+                format!("would_update_messages: {would_update}"),
+                format!("affected_sessions: {affected_sessions}"),
+                "note: read-only scan only — no source rows were updated".to_string(),
+            ];
+            if would_update > 0 {
+                lines.push(
+                    "note: use `/lcm doctor source apply` to create a backup and normalize legacy \
+                     blank-source rows"
+                        .to_string(),
+                );
+            } else {
+                lines.push("note: no legacy blank-source rows need normalization".to_string());
+            }
+            lines.join("\n")
+        }
+        Err(e) => [
+            "LCM doctor source".to_string(),
+            "status: error".to_string(),
+            format!("error: source-lineage scan failed: {e}"),
+            "note: read-only scan only — no source rows were updated".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+/// `/lcm doctor source apply` — backup-first normalization of legacy blank-`source` rows to
+/// `unknown` (`_doctor_source_apply_text`, `LCM:command.py:801`). A no-op batch skips the backup;
+/// otherwise a timestamped backup is written before the scoped `UPDATE`.
+fn doctor_source_apply_text(engine: &LcmContextEngine) -> String {
+    let (would_update, _affected, stats_before) = match engine.store.source_normalization_plan() {
+        Ok(plan) => plan,
+        Err(e) => {
+            return [
+                "LCM doctor source apply".to_string(),
+                "status: error".to_string(),
+                format!("error: source-lineage scan failed: {e}"),
+                "note: source normalization apply aborted before any rows were updated".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    if would_update == 0 {
+        return [
+            "LCM doctor source apply".to_string(),
+            "status: ok".to_string(),
+            "target_source: unknown".to_string(),
+            "updated_messages: 0".to_string(),
+            format!(
+                "legacy_blank_before: {}",
+                stats_before.legacy_blank_source_messages
+            ),
+            format!(
+                "legacy_blank_after: {}",
+                stats_before.legacy_blank_source_messages
+            ),
+            "note: no legacy blank-source rows needed normalization".to_string(),
+        ]
+        .join("\n");
+    }
+    let db = engine
+        .config
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let backup = match engine.backup_database() {
+        Ok(b) => b,
+        Err(e) => {
+            return [
+                "LCM doctor source apply".to_string(),
+                "status: error".to_string(),
+                format!("database_path: {db}"),
+                format!("error: backup failed: {e}"),
+                "note: source normalization apply aborted before any rows were updated".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    match engine.store.normalize_legacy_blank_sources() {
+        Ok((updated, before, after)) => [
+            "LCM doctor source apply".to_string(),
+            "status: ok".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            "target_source: unknown".to_string(),
+            format!("updated_messages: {updated}"),
+            format!(
+                "legacy_blank_before: {}",
+                before.legacy_blank_source_messages
+            ),
+            format!("legacy_blank_after: {}", after.legacy_blank_source_messages),
+            format!("unknown_before: {}", before.normalized_unknown_messages),
+            format!("unknown_after: {}", after.normalized_unknown_messages),
+            "note: backup created before source normalization apply".to_string(),
+        ]
+        .join("\n"),
+        Err(e) => [
+            "LCM doctor source apply".to_string(),
+            "status: error".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            format!("error: source normalization failed: {e}"),
+            "note: backup was created before source normalization apply".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
 /// `/lcm doctor repair` — the read-only FTS repair scan (`_doctor_repair_text`,
 /// `LCM:command.py:704-721`).
 fn doctor_repair_text(engine: &LcmContextEngine) -> String {
@@ -1389,17 +2407,36 @@ impl CommandProvider for LcmContextEngine {
                 let json = self.call_tool("lcm_status", Value::Null).await;
                 Ok(CommandOutput::text(pretty_json(&json)))
             }
-            "doctor" => match (arg(1), arg(2)) {
-                (None, _) => {
+            "doctor" => match (arg(1), arg(2), arg(3)) {
+                (None, _, _) => {
                     let json = self.call_tool("lcm_doctor", Value::Null).await;
                     Ok(CommandOutput::text(pretty_json(&json)))
                 }
-                (Some("repair"), None) => Ok(CommandOutput::text(doctor_repair_text(self))),
-                (Some("repair"), Some("apply")) => {
+                (Some("repair"), None, _) => Ok(CommandOutput::text(doctor_repair_text(self))),
+                (Some("repair"), Some("apply"), _) => {
                     Ok(CommandOutput::text(doctor_repair_apply_text(self)))
                 }
+                (Some("source"), None, _) => Ok(CommandOutput::text(doctor_source_text(self))),
+                (Some("source"), Some("apply"), _) => {
+                    Ok(CommandOutput::text(doctor_source_apply_text(self)))
+                }
+                (Some("retention"), None, _) => {
+                    Ok(CommandOutput::text(doctor_retention_text(self)))
+                }
+                (Some("clean"), None, _) => Ok(CommandOutput::text(doctor_clean_text(self))),
+                (Some("clean"), Some("apply"), _) => {
+                    Ok(CommandOutput::text(doctor_clean_apply_text(self)))
+                }
+                (Some("clean"), Some("lifecycle"), None) => {
+                    Ok(CommandOutput::text(doctor_clean_lifecycle_text(self)))
+                }
+                (Some("clean"), Some("lifecycle"), Some("apply")) => {
+                    Ok(CommandOutput::text(doctor_clean_lifecycle_apply_text(self)))
+                }
                 _ => Err(CommandError::BadArgs(
-                    "unknown /lcm doctor subcommand (try `doctor` or `doctor repair [apply]`)"
+                    "unknown /lcm doctor subcommand (try `doctor`, `doctor repair [apply]`, \
+                     `doctor source [apply]`, `doctor retention`, `doctor clean [apply]`, or \
+                     `doctor clean lifecycle [apply]`)"
                         .to_string(),
                 )),
             },
@@ -1437,7 +2474,10 @@ pub fn command_specs() -> Vec<CommandSpec> {
     vec![CommandSpec::new("lcm")
         .summary("Lossless context management: status, health, preset, backup, rotate")
         .category("Context")
-        .args_hint("<status|doctor [repair [apply]]|preset|backup|rotate [apply]>")
+        .args_hint(
+            "<status|doctor [repair|source|clean [lifecycle]|retention [apply]]|preset|backup|\
+             rotate [apply]>",
+        )
         .subcommands(["status", "doctor", "preset", "backup", "rotate"])]
 }
 
@@ -1665,6 +2705,728 @@ mod tests {
             count2, count1,
             "reconcile rebuilt the tail without duplication"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a fresh, unique data dir for a restart-reconcile test.
+    fn reconcile_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lcm-reconcile-{}-{}-{name}",
+            std::process::id(),
+            RECONCILE_DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    static RECONCILE_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // parity: engine.py::test_existing_session_restart_reconciles_cursor_before_ingest (tests/test_lcm_engine.py:1264)
+    #[tokio::test]
+    async fn restart_full_transcript_replay_persists_only_new_tail() {
+        let dir = reconcile_dir("full-transcript");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1: persist a short transcript (no compaction).
+        {
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("s"),
+            )
+            .unwrap();
+            lcm.on_model(&model());
+            let mut c = Conversation::new(SystemPrompt::new("You are concise."));
+            c.push_user(UserMsg::new("question before restart"));
+            c.push_assistant(AssistantMsg::text("answer before restart"));
+            lcm.before_turn(&mut c, None);
+        }
+        // Incarnation 2: replay the full transcript plus a genuinely-new tool turn.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("question before restart"));
+        replay.push_assistant(AssistantMsg::text("answer before restart"));
+        replay.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("calling terminal"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_1".into(),
+                    name: "terminal".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_1".into(),
+                    ok: true,
+                    content: "terminal output after restart".into(),
+                },
+            )],
+        });
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "assistant", "tool"],
+            "replay of the durable transcript must not duplicate persisted rows"
+        );
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("terminal output after restart")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Persist `turns` into a fresh incarnation of `session` under `cfg`, then drop it (closing the
+    /// store). No compaction runs (`before_turn` only ingests). Returns nothing; the durable rows
+    /// remain for the next incarnation.
+    async fn persist_durable_turns(
+        cfg: &LcmConfig,
+        session: &str,
+        build: impl FnOnce(&mut Conversation),
+    ) {
+        let lcm = LcmContextEngine::open_for_session(
+            cfg.clone(),
+            &SessionId::new(session),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        let mut c = Conversation::new(SystemPrompt::new("You are concise."));
+        build(&mut c);
+        lcm.before_turn(&mut c, None);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_delta_message_matching_store_tail (tests/test_lcm_engine.py:1688)
+    #[tokio::test]
+    async fn restart_delta_matching_store_tail_is_preserved() {
+        let dir = reconcile_dir("delta-matching-tail");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("initial question"));
+            c.push_assistant(AssistantMsg::text("initial answer"));
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        // Restart: the gateway hands only the newly-arrived delta, which happens to repeat the
+        // durable tail ("retry"). It must be preserved as a genuinely-new row, not treated as replay.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("retry"));
+        lcm2.before_turn(&mut delta, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec!["initial question", "initial answer", "retry", "retry"],
+            "an ambiguous delta repeating the tail must append, not wipe the durable transcript"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_single_delta_message_matching_store_tail_with_followup (tests/test_lcm_engine.py:1762)
+    #[tokio::test]
+    async fn restart_single_delta_matching_tail_with_followup_is_preserved() {
+        let dir = reconcile_dir("single-delta-followup");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("retry"));
+        delta.push_assistant(AssistantMsg::text("next answer"));
+        lcm2.before_turn(&mut delta, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(contents, vec!["retry", "retry", "next answer"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_does_not_skip_repeated_non_tail_messages (tests/test_lcm_engine.py:1553)
+    #[tokio::test]
+    async fn restart_does_not_skip_repeated_non_tail_messages() {
+        let dir = reconcile_dir("repeated-non-tail");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("repeatable request"));
+            c.push_assistant(AssistantMsg::text("repeatable answer"));
+            for i in 0..120 {
+                c.push_user(UserMsg::new(format!("tail message before restart {i}")));
+            }
+        })
+        .await;
+        let durable = 122;
+        // Restart with a short stale replay that repeats an EARLY (non-tail) pair.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("repeatable request"));
+        replay.push_assistant(AssistantMsg::text("repeatable answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            durable + 2,
+            "repeated non-tail pair appended without wiping the durable transcript"
+        );
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("repeatable request")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("repeatable answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_skips_stale_short_no_overlap_snapshot (tests/test_lcm_engine.py:2133)
+    #[tokio::test]
+    async fn restart_skips_stale_short_no_overlap_snapshot() {
+        let dir = reconcile_dir("stale-short-no-overlap");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("old startup question"));
+            c.push_assistant(AssistantMsg::text("old startup answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail message {i}")));
+            }
+        })
+        .await;
+        let durable = 82;
+        // A restarted gateway hands a stale, short snapshot from the START of the session with no
+        // overlap with the durable tail. Appending it would duplicate; it must be skipped.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut stale = Conversation::new(SystemPrompt::new("You are concise."));
+        stale.push_user(UserMsg::new("old startup question"));
+        stale.push_assistant(AssistantMsg::text("old startup answer"));
+        lcm2.before_turn(&mut stale, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            durable,
+            "a stale short no-overlap snapshot is skipped, not appended or wiped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_one_message_no_overlap_delta (tests/test_lcm_engine.py:2240)
+    #[tokio::test]
+    async fn restart_persists_one_message_no_overlap_delta() {
+        let dir = reconcile_dir("one-message-no-overlap");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable message {i}")));
+            }
+        })
+        .await;
+        let durable = 80;
+        // A single, genuinely-new standalone delta with no overlap must be appended (ambiguous
+        // singletons are preserved, not skipped).
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("legitimate standalone delta"));
+        lcm2.before_turn(&mut delta, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, durable + 1);
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("legitimate standalone delta")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_scaffold_prefix_does_not_skip_unrelated_new_rows (tests/test_lcm_engine.py:2282)
+    #[tokio::test]
+    async fn restart_scaffold_prefix_does_not_skip_unrelated_new_rows() {
+        let dir = reconcile_dir("scaffold-prefix-unrelated");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable message {i}")));
+            }
+        })
+        .await;
+        let durable = 80;
+        // Replay begins with a scaffold summary turn, then unrelated NEW rows. The scaffold prefix
+        // is skipped, but the new rows must be appended to the durable transcript.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_assistant(AssistantMsg::text(
+            "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+        ));
+        replay.push_user(UserMsg::new("unrelated new request"));
+        replay.push_assistant(AssistantMsg::text("unrelated new answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, durable + 2);
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("unrelated new request")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("unrelated new answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool (tests/test_lcm_engine.py:1315)
+    #[tokio::test]
+    async fn compacted_restart_skips_synthetic_context_but_persists_new_tool() {
+        let dir = reconcile_dir("compacted-new-tool");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1: compact a long conversation (produces the synthetic summary scaffold).
+        let compacted = {
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("s"),
+            )
+            .unwrap();
+            lcm.on_model(&model());
+            lcm.compact(convo(50), 100).await
+        };
+        let count1 = {
+            let probe = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
+            probe.store().message_count("s1").unwrap()
+        };
+        // Incarnation 2: replay the compacted snapshot plus a genuinely-new tool turn.
+        let mut replay = compacted;
+        replay.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("calling terminal"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_2".into(),
+                    name: "terminal".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_2".into(),
+                    ok: true,
+                    content: "tool output after compacted restart".into(),
+                },
+            )],
+        });
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            count1 + 2,
+            "the synthetic summary context is skipped; only the new tool turn is persisted"
+        );
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("tool output after compacted restart")
+        );
+        assert_eq!(rows.last().unwrap().tool_call_id.as_deref(), Some("call_2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_reconciles_full_replay_without_system_prompt (tests/test_lcm_engine.py:1606)
+    #[tokio::test]
+    async fn restart_full_replay_without_system_anchor_appends_only_new_row() {
+        let dir = reconcile_dir("full-replay-no-anchor");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("first question"));
+            c.push_assistant(AssistantMsg::text("first answer"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("first question"));
+        replay.push_assistant(AssistantMsg::text("first answer"));
+        replay.push_user(UserMsg::new("new question after restart"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "first question",
+                "first answer",
+                "new question after restart"
+            ],
+            "a multi-row full replay is proof enough without a system anchor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_reconciles_complete_replay_without_system_prompt (tests/test_lcm_engine.py:1651)
+    #[tokio::test]
+    async fn restart_complete_replay_without_new_rows_is_noop() {
+        let dir = reconcile_dir("complete-replay-noop");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("first question"));
+            c.push_assistant(AssistantMsg::text("first answer"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("first question"));
+        replay.push_assistant(AssistantMsg::text("first answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(contents, vec!["first question", "first answer"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail (tests/test_lcm_engine.py:1800)
+    #[tokio::test]
+    async fn restart_scaffolded_delta_matching_tail_is_preserved() {
+        let dir = reconcile_dir("scaffolded-delta");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("initial question"));
+            c.push_assistant(AssistantMsg::text("initial answer"));
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        // Restart with the LCM system note and a delta repeating only the durable tail row.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("retry"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec!["initial question", "initial answer", "retry", "retry"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail_with_followup (tests/test_lcm_engine.py:1845)
+    #[tokio::test]
+    async fn restart_scaffolded_delta_with_followup_is_preserved() {
+        let dir = reconcile_dir("scaffolded-delta-followup");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("initial question"));
+            c.push_assistant(AssistantMsg::text("initial answer"));
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("retry"));
+        replay.push_assistant(AssistantMsg::text("next answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "initial question",
+                "initial answer",
+                "retry",
+                "retry",
+                "next answer"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_restart_reconciliation_filtered_singleton_tail_stays_ambiguous (tests/test_lcm_engine.py:2397)
+    #[tokio::test]
+    async fn restart_filtered_singleton_tail_stays_ambiguous() {
+        let dir = reconcile_dir("filtered-singleton");
+        let base = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1 has no ignore filter: both rows are persisted.
+        persist_durable_turns(&base, "s1", |c| {
+            c.push_user(UserMsg::new("Cronjob Response: heartbeat"));
+            c.push_user(UserMsg::new("real singleton tail"));
+        })
+        .await;
+        // Incarnation 2 enables the ignore filter; the singleton delta repeats the visible tail
+        // but stays ambiguous and must be preserved.
+        let cfg2 = LcmConfig {
+            ignore_message_patterns: vec!["^Cronjob Response:".to_string()],
+            ..base.clone()
+        };
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg2, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("real singleton tail"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "Cronjob Response: heartbeat",
+                "real singleton tail",
+                "real singleton tail"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_large_session_restart_reconciles_beyond_short_tail_window (tests/test_lcm_engine.py:1510)
+    #[tokio::test]
+    async fn restart_large_session_reconciles_beyond_short_tail_window() {
+        let dir = reconcile_dir("large-session");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..5000 {
+                c.push_user(UserMsg::new(format!("message before restart {i}")));
+            }
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        for i in 0..5000 {
+            replay.push_user(UserMsg::new(format!("message before restart {i}")));
+        }
+        replay.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("calling terminal"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_large".into(),
+                    name: "terminal".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_large".into(),
+                    ok: true,
+                    content: "large-session tool output after restart".into(),
+                },
+            )],
+        });
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len(), 5002, "5000 replayed rows + assistant + tool");
+        assert_eq!(rows.last().unwrap().role, "tool");
+        assert_eq!(
+            rows.last().unwrap().tool_call_id.as_deref(),
+            Some("call_large")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_repeated_prefix_after_scaffold_only_prefix (tests/test_lcm_engine.py:2338)
+    #[tokio::test]
+    async fn restart_repeated_head_after_scaffold_only_prefix_is_preserved() {
+        let dir = reconcile_dir("scaffold-repeated-head");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("old first question"));
+            c.push_assistant(AssistantMsg::text("old first answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail after scaffold {i}")));
+            }
+        })
+        .await;
+        let durable = 82;
+        // A stale replay: scaffold summary turn, then the durable HEAD pair (not the tail). The
+        // scaffold-only prefix is skipped; the repeated pair must be appended (no stale proof —
+        // the LCM-note system prompt is not a plain anchor).
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_assistant(AssistantMsg::text(
+            "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+        ));
+        replay.push_user(UserMsg::new("old first question"));
+        replay.push_assistant(AssistantMsg::text("old first answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, durable + 2);
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("old first question")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("old first answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail (tests/test_lcm_engine.py:1891)
+    #[tokio::test]
+    async fn restart_literal_json_assistant_tail_delta_is_preserved() {
+        let dir = reconcile_dir("literal-json-tail");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        let literal_json = r#"[{"text": "visible literal JSON payload", "type": "thinking"}]"#;
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("older question"));
+            c.push_assistant(AssistantMsg::text("older answer"));
+            c.push_user(UserMsg::new("retry"));
+            c.push_assistant(AssistantMsg::text(literal_json));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("retry"));
+        replay.push_assistant(AssistantMsg::text(literal_json));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len(), 6);
+        let tail: Vec<&str> = rows[2..]
+            .iter()
+            .filter_map(|r| r.content.as_deref())
+            .collect();
+        assert_eq!(tail, vec!["retry", literal_json, "retry", literal_json]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_skips_exact_lcm_system_scaffold (tests/test_lcm_engine.py:2095)
+    #[tokio::test]
+    async fn restart_system_only_replay_leaves_store_untouched() {
+        let dir = reconcile_dir("system-only");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("tail before restart"));
+        })
+        .await;
+        // Rust keeps the system prompt off the turn stream, so an "exact LCM system scaffold"
+        // replay is a conversation with zero turns; nothing must be ingested or deleted.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content.as_deref(), Some("tail before restart"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2483,6 +4245,758 @@ mod tests {
             .text
     }
 
+    // parity: command.py::test_doctor_source_reports_legacy_blank_rows (tests/test_lcm_command.py:440)
+    #[tokio::test]
+    async fn doctor_source_scans_legacy_blank_rows() {
+        let (lcm, dir) = durable_engine("doctor-source-scan", 32);
+        let mut c = convo(2); // 4 attributed rows via the normal write path
+        lcm.before_turn(&mut c, None);
+        lcm.store()
+            .insert_legacy_blank_source_row("s1", "user", "legacy blank row")
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor source").await;
+        assert!(text.contains("status: normalization-needed"), "{text}");
+        assert!(text.contains("legacy_blank_messages: 1"), "{text}");
+        assert!(text.contains("would_update_messages: 1"), "{text}");
+        assert!(text.contains("target_source: unknown"), "{text}");
+        assert!(
+            text.contains("no source rows were updated"),
+            "read-only: {text}"
+        );
+        // Read-only scan did not mutate the blank row.
+        assert_eq!(
+            lcm.store()
+                .source_stats(None)
+                .unwrap()
+                .legacy_blank_source_messages,
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: command.py::test_doctor_source_apply_normalizes_legacy_blank_rows (tests/test_lcm_command.py:451)
+    #[tokio::test]
+    async fn doctor_source_apply_normalizes_legacy_blank_rows() {
+        let (lcm, dir) = durable_engine("doctor-source-apply", 32);
+        let mut c = convo(2);
+        lcm.before_turn(&mut c, None);
+        lcm.store()
+            .insert_legacy_blank_source_row("s1", "user", "legacy blank row")
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor source apply").await;
+        assert!(text.contains("status: ok"), "{text}");
+        assert!(text.contains("updated_messages: 1"), "{text}");
+        assert!(text.contains("legacy_blank_before: 1"), "{text}");
+        assert!(text.contains("legacy_blank_after: 0"), "{text}");
+        assert!(text.contains("backup_path: "), "backup-first: {text}");
+        // The blank row is now attributed to the explicit unknown bucket.
+        let stats = lcm.store().source_stats(None).unwrap();
+        assert_eq!(stats.legacy_blank_source_messages, 0);
+        // A second scan reports nothing to do.
+        let rescan = run_lcm(&lcm, "doctor source").await;
+        assert!(rescan.contains("status: ok"), "{rescan}");
+        assert!(rescan.contains("would_update_messages: 0"), "{rescan}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload (tests/test_lcm_engine.py:2185)
+    #[tokio::test]
+    async fn restart_stale_snapshot_with_externalized_head_payload_is_skipped() {
+        let dir = reconcile_dir("stale-externalized-head");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            large_output_externalization_enabled: true,
+            ..LcmConfig::default()
+        };
+        let data_uri = format!("data:image/png;base64,{}", "QUJDREVGRw==".repeat(500));
+        let head_user = format!("old startup image {data_uri}");
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new(head_user.clone()));
+            c.push_assistant(AssistantMsg::text("old startup answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail message {i}")));
+            }
+        })
+        .await;
+        // The head row was externalized at the write boundary.
+        {
+            let probe = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
+            let rows = probe.store().session_messages("s1").unwrap();
+            assert_eq!(rows.len(), 82);
+            let head = rows[0].content.as_deref().unwrap();
+            assert!(
+                head.contains("[Externalized LCM ingest payload:"),
+                "head externalized: {head}"
+            );
+            assert!(!head.contains(&data_uri));
+        }
+        // Restart with a stale short snapshot re-supplying the raw head (inline payload intact).
+        // Identity restoration must recognize it as the externalized durable head and skip it.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut stale = Conversation::new(SystemPrompt::new("You are concise."));
+        stale.push_user(UserMsg::new(head_user.clone()));
+        stale.push_assistant(AssistantMsg::text("old startup answer"));
+        lcm2.before_turn(&mut stale, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len(),
+            82,
+            "the stale externalized-head snapshot is skipped, not duplicated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof (tests/test_lcm_engine.py:2487)
+    #[tokio::test]
+    async fn restart_filtered_prefix_does_not_create_stale_proof() {
+        let dir = reconcile_dir("filtered-prefix-stale");
+        let base = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&base, "s1", |c| {
+            c.push_user(UserMsg::new("Cronjob Response: heartbeat"));
+            c.push_user(UserMsg::new("real prefix question"));
+            c.push_assistant(AssistantMsg::text("real prefix answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail after filter {i}")));
+            }
+        })
+        .await;
+        let durable = 83;
+        // Incarnation 2 enables the ignore filter. The delta repeats what is now the *visible*
+        // durable head — but the stale-snapshot proof must use the RAW durable prefix (the cron
+        // row included), so this batch stays ambiguous and is preserved.
+        let cfg2 = LcmConfig {
+            ignore_message_patterns: vec!["^Cronjob Response:".to_string()],
+            ..base.clone()
+        };
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg2, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("real prefix question"));
+        replay.push_assistant(AssistantMsg::text("real prefix answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            durable + 2,
+            "filtered history must not create stale-replay proof"
+        );
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("real prefix question")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("real prefix answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_compacted_session_restart_ignores_preserved_objective_anchor (tests/test_lcm_engine.py:1375)
+    #[tokio::test]
+    async fn restart_ignores_preserved_objective_anchor() {
+        let dir = reconcile_dir("preserved-objective");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            fresh_tail_count: 2,
+            ..LcmConfig::default()
+        };
+        let latest_request = "increase kanban autonomy";
+        // Incarnation 1: the newest real user turn is followed by two tool turns, so with a
+        // 2-turn fresh tail the compaction preserves it as an objective anchor inside the
+        // synthetic summary scaffold.
+        let compacted = {
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("Older board cleanup summary."),
+            )
+            .unwrap();
+            lcm.on_model(&model());
+            let mut c = Conversation::new(SystemPrompt::new("You are concise."));
+            for i in 0..20 {
+                c.push_user(UserMsg::new(format!("clean up boards {i} ").repeat(20)));
+                c.push_assistant(AssistantMsg::text(format!("inspecting {i} ").repeat(20)));
+            }
+            c.push_user(UserMsg::new(latest_request));
+            for call in ["call_1", "call_2"] {
+                c.push_tool(ToolTurn {
+                    assistant: AssistantMsg::text(format!("inspect via {call}")),
+                    calls: vec![(
+                        ToolCall {
+                            call_id: call.into(),
+                            name: "inspect".into(),
+                            args: "{}".into(),
+                        },
+                        ToolResult {
+                            call_id: call.into(),
+                            ok: true,
+                            content: format!("{call} output"),
+                        },
+                    )],
+                });
+            }
+            lcm.compact(c, 100).await
+        };
+        // The compacted scaffold carries the preserved-objective anchor.
+        let scaffold_text = match &compacted.turns[0] {
+            Turn::Assistant(a) => a.text.clone(),
+            other => panic!("expected scaffold, got {other:?}"),
+        };
+        assert!(
+            scaffold_text.contains("Current user objective preserved"),
+            "anchor emitted: {scaffold_text}"
+        );
+        let count1 = {
+            let probe = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
+            probe.store().message_count("s1").unwrap()
+        };
+        // Incarnation 2: replay the compacted snapshot plus one new user message.
+        let mut replay = compacted;
+        replay.push_user(UserMsg::new("follow-up after restart"));
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, count1 + 1, "only the follow-up is new");
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("follow-up after restart")
+        );
+        let objective_repeats = rows
+            .iter()
+            .filter(|r| r.content.as_deref() == Some(latest_request))
+            .count();
+        assert_eq!(
+            objective_repeats, 1,
+            "the anchored objective is not re-ingested"
+        );
+        assert!(
+            rows.iter().all(|r| !r
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Current user objective preserved")),
+            "the scaffold anchor never lands in the store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_lcm_status_reports_ingest_reconciliation_diagnostics (tests/test_lcm_engine.py:2542)
+    #[tokio::test]
+    async fn status_reports_ingest_reconciliation_diagnostics() {
+        let dir = reconcile_dir("status-reconcile");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable message {i}")));
+            }
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("status delta"));
+        lcm2.before_turn(&mut delta, None);
+        let payload: Value =
+            serde_json::from_str(&lcm2.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            payload["ingest_reconciliation"]["reason"], "persisted ambiguous delta",
+            "status: {payload}"
+        );
+        assert_eq!(
+            payload["ingest_reconciliation"]["action"],
+            "persisted batch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An engine-level compaction fixture: 6 alternating user/assistant turns of ~43 tokens each
+    /// (the Python `"Message {i}: " + "chunk " * 35` shape), so with `fresh_tail_count = 2` the
+    /// eligible region is turns 0..4.
+    fn chunky_convo(words_per_turn: usize) -> Conversation {
+        let mut c = Conversation::new(SystemPrompt::new("You are a helpful assistant."));
+        for i in 0..6 {
+            let body = format!("Message {i}: {}", "chunk ".repeat(words_per_turn));
+            if i % 2 == 0 {
+                c.push_user(UserMsg::new(body));
+            } else {
+                c.push_assistant(AssistantMsg::text(body));
+            }
+        }
+        c
+    }
+
+    /// Seed a pre-existing summary node (the Python `engine._dag.add_node(SummaryNode(...))`
+    /// fixture) at `depth`.
+    fn seed_node(lcm: &LcmContextEngine, session: &str, depth: i64, summary: &str, age: f64) {
+        lcm.store()
+            .add_node(&crate::store::NewNode {
+                session_id: session.to_string(),
+                depth,
+                summary: summary.to_string(),
+                token_count: 40,
+                source_token_count: 80,
+                source_ids: Vec::new(),
+                source_type: if depth == 0 {
+                    crate::store::SourceType::Messages
+                } else {
+                    crate::store::SourceType::Nodes
+                },
+                created_at: 1_000.0 - age,
+                earliest_at: None,
+                latest_at: None,
+                expand_hint: format!("Expand for details about: {summary}"),
+            })
+            .unwrap();
+    }
+
+    // parity: engine.py::test_dynamic_leaf_chunk_sizing_compacts_only_oldest_bounded_raw_chunk (tests/test_lcm_engine.py:4029)
+    #[tokio::test]
+    async fn dynamic_leaf_chunk_compacts_only_oldest_bounded_chunk() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Dynamic leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let c = chunky_convo(35);
+        let region_texts: Vec<String> = c.turns[..4]
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.clone(),
+                Turn::Assistant(a) => a.text.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let compacted = lcm.compact(c, 100_000).await;
+        // Exactly one D0 node, covering ONLY the oldest two region rows (the bounded chunk).
+        assert_eq!(lcm.store().summary_count("s1").unwrap(), 1);
+        let nodes = lcm.store().get_session_nodes("s1", Some(0), 10).unwrap();
+        assert_eq!(nodes[0].source_ids, vec![1, 2], "oldest bounded chunk only");
+        // The un-summarized region remainder and the tail stay in the compacted context.
+        let texts: Vec<String> = compacted
+            .turns
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.clone(),
+                Turn::Assistant(a) => a.text.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert!(texts.contains(&region_texts[2]), "Message 2 kept raw");
+        assert!(texts.contains(&region_texts[3]), "Message 3 kept raw");
+        assert!(
+            !texts.iter().any(|t| t == &region_texts[0]),
+            "Message 0 summarized"
+        );
+        // The durable transcript is intact (all 6 rows).
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 6);
+    }
+
+    /// An aux provider that fails retry-worthily whenever the prompt covers the second turn
+    /// (`"Message 1:"`), succeeding on smaller chunks — the engine-level analog of the Python
+    /// `flaky_summary` that raises "context length exceeded" for large sources.
+    struct MarkerFailAux {
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Provider for MarkerFailAux {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: false,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(200_000),
+            }
+        }
+
+        async fn chat(&self, req: Request) -> std::result::Result<ModelOutput, Failure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let prompt = req
+                .messages
+                .first()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            if prompt.contains("Message 1:") {
+                return Err(Failure::ContextOverflow("context length exceeded".into()));
+            }
+            Ok(ModelOutput {
+                text: "Recovered smaller leaf summary.\nExpand for details about: oldest raw chunk"
+                    .into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    // parity: engine.py::test_adaptive_leaf_rescue_retries_with_smaller_oldest_chunk (tests/test_lcm_engine.py:4085)
+    #[tokio::test]
+    async fn adaptive_leaf_rescue_retries_with_smaller_oldest_chunk() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            // The Python mock has no circuit breaker in the loop; keep the single route closed
+            // across the two failed levels of attempt 1 so attempt 2 can succeed.
+            summary_circuit_breaker_failure_threshold: 10,
+            ..LcmConfig::in_memory()
+        };
+        let aux = Arc::new(MarkerFailAux {
+            calls: AtomicU64::new(0),
+        });
+        let lcm = LcmContextEngine::open(cfg, aux.clone()).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let compacted = lcm.compact(chunky_convo(35), 100_000).await;
+        // Attempt 1 (2-turn chunk) fails L1+L2 retry-worthily; the rescue shrinks to the oldest
+        // single turn and attempt 2's L1 succeeds: 3 aux calls in total.
+        assert_eq!(
+            aux.calls.load(Ordering::Relaxed),
+            3,
+            "L1+L2 failed, retry L1 succeeded"
+        );
+        assert_eq!(lcm.store().summary_count("s1").unwrap(), 1);
+        let nodes = lcm.store().get_session_nodes("s1", Some(0), 10).unwrap();
+        assert_eq!(
+            nodes[0].source_ids,
+            vec![1],
+            "only the rescued single-turn chunk"
+        );
+        let texts: Vec<&str> = compacted
+            .turns
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.as_str(),
+                Turn::Assistant(a) => a.text.as_str(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("Message 1:")),
+            "Message 1 kept raw"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with("Message 2:")),
+            "Message 2 kept raw"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with("Message 3:")),
+            "Message 3 kept raw"
+        );
+    }
+
+    // parity: engine.py::test_unlimited_depth_condenses_beyond_ten (tests/test_lcm_engine.py:9029)
+    #[tokio::test]
+    async fn unlimited_condensation_depth_reaches_d12() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 1,
+            condensation_fanin: 2,
+            incremental_max_depth: -1,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Condensed.\nExpand for details about: deep nodes"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        for i in 0..3 {
+            seed_node(&lcm, "s1", 11, &format!("Deep node {i}"), 10.0 + i as f64);
+        }
+        lcm.compact(chunky_convo(35), 100_000).await;
+        assert!(
+            lcm.store().count_at_depth("s1", 12).unwrap() >= 1,
+            "max_depth=-1 condenses beyond depth 10"
+        );
+    }
+
+    // parity: engine.py::test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group (tests/test_lcm_engine.py:4306)
+    #[tokio::test]
+    async fn cache_friendly_gating_suppresses_single_fanin_group() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            condensation_fanin: 2,
+            cache_friendly_condensation_enabled: true,
+            cache_friendly_min_debt_groups: 2,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        seed_node(&lcm, "s1", 0, "Earlier leaf", 10.0);
+        lcm.compact(chunky_convo(35), 100_000).await;
+        // The fresh leaf makes exactly one fanin group (2 uncondensed d0) — a follow-on
+        // condensation right after the leaf pass is suppressed for cache stability.
+        assert_eq!(lcm.store().count_at_depth("s1", 0).unwrap(), 2);
+        assert_eq!(
+            lcm.store().count_at_depth("s1", 1).unwrap(),
+            0,
+            "no follow-on d1"
+        );
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            status["condensation_suppressed_reason"], "cache_friendly_single_group",
+            "status: {status}"
+        );
+    }
+
+    // parity: engine.py::test_critical_budget_pressure_bypasses_cache_friendly_single_group_suppression (tests/test_lcm_engine.py:4359)
+    #[tokio::test]
+    async fn critical_pressure_bypasses_cache_friendly_suppression() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            condensation_fanin: 2,
+            cache_friendly_condensation_enabled: true,
+            cache_friendly_min_debt_groups: 2,
+            critical_budget_pressure_ratio: 0.90,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        // A 1000-token window with ~43-token-per-turn content puts the conversation over the
+        // 90% critical ratio (the Python `current_tokens=900` analog).
+        lcm.on_model(&ModelInfo {
+            model: "gpt-4o-mini".into(),
+            max_context: Some(300),
+        });
+        lcm.on_session_start(&SessionId::new("s1"));
+        seed_node(&lcm, "s1", 0, "Earlier leaf", 10.0);
+        lcm.compact(chunky_convo(35), 100_000).await;
+        assert_eq!(
+            lcm.store().count_at_depth("s1", 1).unwrap(),
+            1,
+            "critical pressure bypasses the cache-friendly gate"
+        );
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            status["condensation_suppressed_reason"], "",
+            "status: {status}"
+        );
+    }
+
+    // parity: engine.py::test_cache_friendly_gating_allows_condensation_when_debt_reaches_two_groups (tests/test_lcm_engine.py:4411)
+    #[tokio::test]
+    async fn cache_friendly_gating_allows_two_debt_groups() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            condensation_fanin: 2,
+            cache_friendly_condensation_enabled: true,
+            cache_friendly_min_debt_groups: 2,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        for i in 0..3 {
+            seed_node(&lcm, "s1", 0, &format!("Earlier leaf {i}"), 10.0 + i as f64);
+        }
+        lcm.compact(chunky_convo(35), 100_000).await;
+        // 3 seeded + 1 fresh = 4 uncondensed = fanin * min_debt_groups — condensation proceeds
+        // (one group per call in cache-friendly mode).
+        assert_eq!(lcm.store().count_at_depth("s1", 1).unwrap(), 1);
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            status["condensation_suppressed_reason"], "",
+            "status: {status}"
+        );
+    }
+
+    /// A conversation with `region` heavy (~220-token) turns plus a 2-turn fresh tail — the
+    /// Python `_make_backlog_messages` shape for the deferred-maintenance debt tests.
+    fn debt_backlog_convo(region: usize) -> Conversation {
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..region + 2 {
+            let body = format!("chunk-{i} ").repeat(220);
+            if i % 2 == 0 {
+                c.push_user(UserMsg::new(body));
+            } else {
+                c.push_assistant(AssistantMsg::text(body));
+            }
+        }
+        c
+    }
+
+    fn debt_engine(max_passes: usize) -> LcmContextEngine {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 100,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 100,
+            deferred_maintenance_enabled: true,
+            deferred_maintenance_max_passes: max_passes,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(cfg, aux_with("debt summary")).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        lcm
+    }
+
+    // parity: engine.py::test_debt_persists_when_bounded_leaf_passes_leave_raw_backlog (tests/test_lcm_engine.py:8849)
+    #[tokio::test]
+    async fn debt_persists_when_bounded_passes_leave_backlog() {
+        let lcm = debt_engine(1);
+        lcm.compact(debt_backlog_convo(4), 100_000).await;
+        let row = lcm
+            .store()
+            .get_lifecycle("s1")
+            .unwrap()
+            .expect("lifecycle row");
+        assert_eq!(row.debt_kind.as_deref(), Some("raw_backlog"));
+        assert!(
+            row.debt_size_estimate > 0,
+            "debt: {}",
+            row.debt_size_estimate
+        );
+    }
+
+    // parity: engine.py::test_bounded_catchup_reduces_then_clears_debt_only_after_backlog_shrinks (tests/test_lcm_engine.py:8877)
+    #[tokio::test]
+    async fn bounded_catchup_reduces_then_clears_debt() {
+        let lcm = debt_engine(2);
+        // Pass 1 (no debt yet): the polite dynamic loop stops after one bounded pass, leaving a
+        // three-turn backlog recorded as debt.
+        let out1 = lcm.compact(debt_backlog_convo(4), 100_000).await;
+        let debt1 = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(debt1.debt_kind.as_deref(), Some("raw_backlog"));
+        assert!(debt1.debt_size_estimate > 0);
+        // Pass 2 (debt-carrying): up to two bounded catch-up passes reduce but do not clear.
+        let out2 = lcm.compact(out1, 100_000).await;
+        let debt2 = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(debt2.debt_kind.as_deref(), Some("raw_backlog"));
+        assert!(
+            debt2.debt_size_estimate < debt1.debt_size_estimate,
+            "debt reduced: {} -> {}",
+            debt1.debt_size_estimate,
+            debt2.debt_size_estimate
+        );
+        assert!(debt2.last_maintenance_attempt_at.is_some());
+        // Pass 3 drains the remaining backlog; the debt clears only once it is gone.
+        let out3 = lcm.compact(out2, 100_000).await;
+        let debt3 = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(debt3.debt_kind, None, "cleared after the backlog shrank");
+        assert_eq!(debt3.debt_size_estimate, 0);
+        assert!(!out3.turns.is_empty());
+    }
+
+    // parity: engine.py::test_status_and_lcm_status_surface_debt_state (tests/test_lcm_engine.py:8912)
+    #[tokio::test]
+    async fn status_surfaces_debt_state() {
+        let lcm = debt_engine(1);
+        lcm.compact(debt_backlog_convo(4), 100_000).await;
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(status["lifecycle"]["debt_kind"], "raw_backlog", "{status}");
+        assert!(status["lifecycle"]["debt_size_estimate"].as_i64().unwrap() > 0);
+        assert_eq!(status["config"]["deferred_maintenance_enabled"], true);
+        assert_eq!(status["config"]["critical_budget_pressure_ratio"], 0.0);
+    }
+
+    // parity: engine.py::test_critical_budget_pressure_drains_under_threshold_deferred_debt (tests/test_lcm_engine.py:8938)
+    #[tokio::test]
+    async fn critical_pressure_drains_under_threshold_debt() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 1,
+            leaf_chunk_tokens: 10_000,
+            deferred_maintenance_enabled: true,
+            critical_budget_pressure_ratio: 0.90,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(cfg, aux_with("critical debt summary")).unwrap();
+        // A 100-token window puts this small conversation over the 90% critical ratio.
+        lcm.on_model(&ModelInfo {
+            model: "gpt-4o-mini".into(),
+            max_context: Some(100),
+        });
+        lcm.on_session_start(&SessionId::new("s1"));
+        lcm.store()
+            .record_debt("s1", "raw_backlog", 500, 1.0)
+            .unwrap();
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        c.push_user(UserMsg::new(format!(
+            "small raw backlog {}",
+            "pad ".repeat(30)
+        )));
+        c.push_assistant(AssistantMsg::text(format!(
+            "small raw answer {}",
+            "pad ".repeat(30)
+        )));
+        c.push_user(UserMsg::new("fresh tail"));
+        let compacted = lcm.compact(c, 100_000).await;
+        // The under-threshold backlog would normally defer at the leaf floor; critical pressure
+        // drains it and the drained debt clears.
+        let row = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(row.debt_kind, None, "debt drained under critical pressure");
+        assert_eq!(row.debt_size_estimate, 0);
+        assert_eq!(lcm.store().count_at_depth("s1", 0).unwrap(), 1);
+        match compacted.turns.last().expect("tail kept") {
+            Turn::User(u) => assert_eq!(u.text, "fresh tail"),
+            other => panic!("expected the fresh tail last, got {other:?}"),
+        }
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2496,6 +5010,271 @@ mod tests {
         lcm.on_model(&model());
         lcm.on_session_start(&SessionId::new("s1"));
         (lcm, dir)
+    }
+
+    /// Seed one direct store row for `session` at `timestamp` (the Python
+    /// `engine._store.append(...)` + timestamp-UPDATE fixture).
+    fn seed_row(lcm: &LcmContextEngine, session: &str, content: &str, tokens: i64, ts: f64) {
+        lcm.store()
+            .append_batch(
+                session,
+                &[crate::store::NewMessage {
+                    role: "user".into(),
+                    content: Some(content.into()),
+                    token_estimate: tokens,
+                    ..Default::default()
+                }],
+                ts,
+            )
+            .unwrap();
+    }
+
+    fn now_secs() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    // parity: command.py::test_lcm_doctor_retention_reports_old_heavy_sessions (tests/test_lcm_command.py:744)
+    #[tokio::test]
+    async fn doctor_retention_scopes_analysis_to_the_active_session() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "s1", "fresh chat", 8, now_secs());
+        seed_row(&lcm, "old-heavy", "archived chunk", 240, 1.0);
+        seed_node(&lcm, "old-heavy", 0, "old heavy summary", 10.0);
+        let text = run_lcm(&lcm, "doctor retention").await;
+        assert!(text.contains("LCM doctor retention"), "{text}");
+        assert!(text.contains("status: analysis-ready"), "{text}");
+        assert!(text.contains("sessions_analyzed: 1"), "{text}");
+        assert!(text.contains("stale_sessions_30d: 0"), "{text}");
+        assert!(text.contains("stale_sessions_90d: 0"), "{text}");
+        assert!(text.contains("retained_tokens_30d: 0"), "{text}");
+        assert!(text.contains("retained_tokens_90d: 0"), "{text}");
+        assert!(text.contains("retention_candidates:"), "{text}");
+        assert!(text.contains("s1 | protected=yes"), "{text}");
+        assert!(
+            !text.contains("old-heavy"),
+            "scoped to the active session: {text}"
+        );
+        assert!(
+            text.contains("note: retention analysis is scoped to the active session only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("note: read-only analysis only — no rows were deleted"),
+            "{text}"
+        );
+    }
+
+    // parity: command.py::test_lcm_doctor_retention_counts_summary_only_sessions (tests/test_lcm_command.py:786)
+    #[tokio::test]
+    async fn doctor_retention_reports_nothing_without_active_session_rows() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        seed_node(&lcm, "summary-only", 0, "summary only node", 10.0);
+        let text = run_lcm(&lcm, "doctor retention").await;
+        assert!(text.contains("sessions_analyzed: 0"), "{text}");
+        assert!(text.contains("stale_sessions_30d: 0"), "{text}");
+        assert!(text.contains("retained_tokens_30d: 0"), "{text}");
+        assert!(!text.contains("summary-only"), "{text}");
+        assert!(
+            text.contains("result: no stored sessions found for retention analysis"),
+            "{text}"
+        );
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_reports_pattern_matched_junk_candidates (tests/test_lcm_command.py:840)
+    #[tokio::test]
+    async fn doctor_clean_reports_pattern_matched_junk_candidates() {
+        let cfg = LcmConfig {
+            ignore_session_patterns: vec!["cron*".to_string()],
+            ..LcmConfig::in_memory()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        seed_row(&lcm, "normal_session", "real conversation", 20, 1.0);
+        let text = run_lcm(&lcm, "doctor clean").await;
+        assert!(text.contains("LCM doctor clean"), "{text}");
+        assert!(text.contains("status: candidates-found"), "{text}");
+        assert!(text.contains("ignored_pattern_matches: 1"), "{text}");
+        assert!(text.contains("cron_20260414"), "{text}");
+        assert!(!text.contains("normal_session"), "{text}");
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_prefers_ignore_over_stateless_when_both_match (tests/test_lcm_command.py:859)
+    #[tokio::test]
+    async fn doctor_clean_prefers_ignored_class_over_stateless() {
+        let cfg = LcmConfig {
+            ignore_session_patterns: vec!["cron*".to_string()],
+            stateless_session_patterns: vec!["cron*".to_string()],
+            ..LcmConfig::in_memory()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        let text = run_lcm(&lcm, "doctor clean").await;
+        assert!(text.contains("ignored_pattern_matches: 1"), "{text}");
+        assert!(text.contains("stateless_pattern_matches: 0"), "{text}");
+        assert!(text.contains("class=ignored-pattern"), "{text}");
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_apply_denied_by_default (tests/test_lcm_command.py:1026)
+    #[tokio::test]
+    async fn doctor_clean_apply_denied_by_default() {
+        let cfg = LcmConfig {
+            ignore_session_patterns: vec!["cron*".to_string()],
+            ..LcmConfig::in_memory()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        let text = run_lcm(&lcm, "doctor clean apply").await;
+        assert!(text.contains("LCM doctor clean apply"), "{text}");
+        assert!(text.contains("status: denied"), "{text}");
+        assert!(text.contains("disabled by default"), "{text}");
+        assert_eq!(lcm.store().message_count("cron_20260414").unwrap(), 1);
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates (tests/test_lcm_command.py:910)
+    #[tokio::test]
+    async fn doctor_clean_apply_backup_first_deletes_safe_candidates() {
+        let dir = reconcile_dir("clean-apply");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ignore_session_patterns: vec!["cron*".to_string()],
+            doctor_clean_apply_enabled: true,
+            ..LcmConfig::default()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        seed_row(&lcm, "normal_session", "real conversation", 20, 1.0);
+        seed_node(&lcm, "cron_20260414", 0, "scheduled report summary", 10.0);
+        lcm.store()
+            .bind_session("cron_20260414", "cron_20260414", 1.0)
+            .unwrap();
+        lcm.store()
+            .finalize_session("cron_20260414", "cron_20260414", 1, 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean apply").await;
+        assert!(text.contains("LCM doctor clean apply"), "{text}");
+        assert!(text.contains("status: ok"), "{text}");
+        let backup_line = text
+            .lines()
+            .find(|l| l.starts_with("backup_path: "))
+            .unwrap_or_else(|| panic!("backup-first: {text}"));
+        assert!(std::path::Path::new(&backup_line["backup_path: ".len()..]).exists());
+        assert_eq!(lcm.store().message_count("cron_20260414").unwrap(), 0);
+        assert_eq!(lcm.store().summary_count("cron_20260414").unwrap(), 0);
+        assert!(lcm
+            .store()
+            .get_lifecycle("cron_20260414")
+            .unwrap()
+            .is_none());
+        assert_eq!(lcm.store().message_count("normal_session").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_lifecycle_reports_empty_candidates (tests/test_lcm_command.py:1042)
+    #[tokio::test]
+    async fn doctor_clean_lifecycle_reports_empty_rows() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        // The bound session has data (so its own lifecycle row is not an empty candidate).
+        seed_row(&lcm, "s1", "live data", 5, 1.0);
+        lcm.store()
+            .bind_session("orphan-1", "orphan-1", 1.0)
+            .unwrap();
+        lcm.store()
+            .bind_session("orphan-2", "orphan-2", 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean lifecycle").await;
+        assert!(text.contains("LCM doctor clean lifecycle"), "{text}");
+        assert!(text.contains("status: candidates-found"), "{text}");
+        assert!(text.contains("empty_rows: 2"), "{text}");
+        assert!(text.contains("empty_current: 2"), "{text}");
+        assert!(text.contains("empty_finalized: 0"), "{text}");
+        assert!(text.contains("empty_protected: 0"), "{text}");
+        assert!(text.contains("no rows were deleted"), "{text}");
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_lifecycle_apply_is_backup_first_and_deletes_safe_candidates (tests/test_lcm_command.py:1063)
+    #[tokio::test]
+    async fn doctor_clean_lifecycle_apply_deletes_empty_rows() {
+        let dir = reconcile_dir("clean-lifecycle-apply");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            doctor_clean_apply_enabled: true,
+            ..LcmConfig::default()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "s1", "live data", 5, 1.0);
+        lcm.store()
+            .bind_session("orphan-1", "orphan-1", 1.0)
+            .unwrap();
+        lcm.store()
+            .bind_session("orphan-2", "orphan-2", 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean lifecycle apply").await;
+        assert!(text.contains("LCM doctor clean lifecycle apply"), "{text}");
+        assert!(text.contains("status: ok"), "{text}");
+        assert!(text.contains("lifecycle_rows_deleted: 2"), "{text}");
+        assert!(text.contains("lifecycle_rows_remaining: 1"), "{text}");
+        assert!(text.contains("backup_path:"), "{text}");
+        assert!(text.contains("backup_size_bytes:"), "{text}");
+        let remaining = lcm
+            .store()
+            .get_lifecycle("s1")
+            .unwrap()
+            .expect("live row kept");
+        assert_eq!(remaining.current_session_id.as_deref(), Some("s1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_lifecycle_apply_denied_by_default (tests/test_lcm_command.py:1091)
+    #[tokio::test]
+    async fn doctor_clean_lifecycle_apply_denied_by_default() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.store()
+            .bind_session("orphan-1", "orphan-1", 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean lifecycle apply").await;
+        assert!(text.contains("LCM doctor clean lifecycle apply"), "{text}");
+        assert!(text.contains("status: denied"), "{text}");
+        assert!(text.contains("disabled by default"), "{text}");
+        assert!(lcm.store().get_lifecycle("orphan-1").unwrap().is_some());
     }
 
     #[test]
@@ -2585,6 +5364,92 @@ mod tests {
         let text = run_lcm(&lcm, "rotate apply").await;
         assert!(text.contains("status: refused"), "{text}");
         assert!(text.contains("no backup was created"), "{text}");
+    }
+
+    // ---- Wave 2 theme 3: rotate edge cases (empty segments, boundaries, repeated rotation) -----
+
+    // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_preview_reports_noop_when_total_messages_within_tail
+    #[tokio::test]
+    async fn rotate_preview_noop_when_total_within_tail() {
+        let (lcm, dir) = durable_engine("rotate-within-tail", 5);
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..3 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 3);
+
+        let text = run_lcm(&lcm, "rotate").await;
+        assert!(text.contains("status: noop"), "{text}");
+        assert!(text.contains("reason: no_pre_tail_content"), "{text}");
+        assert!(text.contains("total_message_count: 3"), "{text}");
+        // No mutation on a preview.
+        assert_eq!(lcm.store().get_frontier("s1").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_handles_session_with_exactly_fresh_tail_count_messages
+    #[tokio::test]
+    async fn rotate_noop_when_exactly_fresh_tail_count_messages() {
+        let (lcm, dir) = durable_engine("rotate-boundary", 3);
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..3 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 3);
+
+        let text = run_lcm(&lcm, "rotate").await;
+        assert!(text.contains("status: noop"), "{text}");
+        assert!(text.contains("reason: no_pre_tail_content"), "{text}");
+        assert!(text.contains("total_message_count: 3"), "{text}");
+        assert!(text.contains("pre_tail_message_count: 0"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_apply_rolling_backup_overwrites_prior_slot_on_actual_rotate
+    #[tokio::test]
+    async fn rotate_apply_reuses_rolling_slot_on_repeated_rotate() {
+        let (lcm, dir) = durable_engine("rotate-reroll", 3);
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..10 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+
+        let first = run_lcm(&lcm, "rotate apply").await;
+        assert!(first.contains("status: ok"), "{first}");
+        let slot = lcm.config.rotate_backup_path().unwrap();
+        assert!(slot.exists(), "rolling slot written");
+        let frontier_after_first = lcm.store().get_frontier("s1").unwrap();
+        assert!(frontier_after_first > 0);
+
+        // Add more content so the second apply has fresh pre-tail rows to rotate past
+        // (an actual rotate, not a frontier_already_ahead noop).
+        for i in 10..15 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+
+        let second = run_lcm(&lcm, "rotate apply").await;
+        assert!(second.contains("status: ok"), "{second}");
+        // The frontier advanced again past the new pre-tail rows.
+        assert!(lcm.store().get_frontier("s1").unwrap() > frontier_after_first);
+
+        // Only one rolling rotate-latest file exists — disk usage stays bounded.
+        let slot_dir = slot.parent().unwrap();
+        let rotate_latest: Vec<_> = std::fs::read_dir(slot_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("-rotate-latest.sqlite3")
+            })
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(rotate_latest, vec![slot.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

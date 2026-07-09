@@ -94,6 +94,8 @@ impl Fixture {
             context_length_source: "model_info",
             last_compression_status: "idle",
             last_compression_noop_reason: "",
+            ingest_reconciliation: &Value::Null,
+            condensation_suppressed_reason: "",
         }
     }
 }
@@ -209,6 +211,43 @@ async fn grep_clamps_oversized_limits_and_reports_the_original() {
     let out = call(&fx, "lcm_grep", json!({"query": "blue", "limit": 500})).await;
     assert_eq!(out["limit"], 200);
     assert_eq!(out["limit_clamped_from"], 500);
+}
+
+// ---- Wave 2 theme 8: grep/expand tool edges ------------------------------------------------------
+
+// PARITY: hermes-lcm tests/test_lcm_engine.py::test_limit_zero_returns_error
+#[tokio::test]
+async fn grep_limit_zero_returns_error() {
+    let fx = Fixture::new("");
+    let out = call(&fx, "lcm_grep", json!({"query": "blue", "limit": 0})).await;
+    let error = out["error"].as_str().expect("error field");
+    assert!(error.contains("limit"), "{error}");
+}
+
+// PARITY: hermes-lcm tests/test_lcm_engine.py::test_limit_negative_returns_error
+#[tokio::test]
+async fn grep_limit_negative_returns_error() {
+    let fx = Fixture::new("");
+    let out = call(&fx, "lcm_grep", json!({"query": "blue", "limit": -5})).await;
+    assert!(out["error"].is_string(), "expected an error: {out}");
+}
+
+// PARITY: hermes-lcm tests/test_lcm_engine.py::test_store_id_not_found_returns_error
+#[tokio::test]
+async fn expand_store_id_not_found_returns_error() {
+    let fx = Fixture::new("");
+    let out = call(&fx, "lcm_expand", json!({"store_id": 999_999_999})).await;
+    let error = out["error"].as_str().expect("error field");
+    assert!(error.contains("store_id"), "{error}");
+}
+
+// PARITY: hermes-lcm tests/test_lcm_engine.py::test_store_id_not_an_integer_returns_error
+#[tokio::test]
+async fn expand_store_id_not_an_integer_returns_error() {
+    let fx = Fixture::new("");
+    let out = call(&fx, "lcm_expand", json!({"store_id": "not-an-int"})).await;
+    let error = out["error"].as_str().expect("error field");
+    assert!(error.contains("integer"), "{error}");
 }
 
 #[tokio::test]
