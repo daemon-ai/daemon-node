@@ -1678,6 +1678,313 @@ fn forget_cascade_failure_rolls_back_row_delete() {
     );
 }
 
+/// A [`BatchItem`] with just content (+ optional source/veracity), the common test shape.
+fn batch_item(content: &str, source: Option<&str>, veracity: Option<&str>) -> BatchItem {
+    BatchItem {
+        content: content.to_string(),
+        source: source.map(String::from),
+        veracity: veracity.map(String::from),
+        ..Default::default()
+    }
+}
+
+/// Annotation kinds for one memory id, sorted (the `_annotation_rows` fixture,
+/// tests/test_e2_remember_batch_enrichment.py:46).
+fn annotation_kinds(e: &Engine, id: &str) -> Vec<String> {
+    let c = e.store.conn.lock().unwrap();
+    let mut stmt = c
+        .prepare("SELECT DISTINCT kind FROM annotations WHERE memory_id = ?1 ORDER BY kind")
+        .unwrap();
+    let rows = stmt.query_map(params![id], |r| r.get(0)).unwrap();
+    rows.collect::<std::result::Result<Vec<String>, _>>()
+        .unwrap()
+}
+
+fn gist_count(e: &Engine, id: &str) -> i64 {
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM gists WHERE memory_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+// parity: test_e2_remember_batch_enrichment.py::test_remember_batch_writes_temporal_annotations_for_every_row (tests/test_e2_remember_batch_enrichment.py:82)
+// parity: test_e2_remember_batch_enrichment.py::test_remember_batch_extracts_gists_and_consolidated_facts (tests/test_e2_remember_batch_enrichment.py:122)
+#[test]
+fn remember_batch_enriches_every_row_with_annotations_gists_and_facts() {
+    let e = engine();
+    let ids = e
+        .remember_batch(
+            &[
+                batch_item("Alice is the lead engineer", Some("convo"), None),
+                batch_item("Bob is a contractor", Some("convo"), None),
+            ],
+            &RememberBatchArgs::default(),
+        )
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+    for id in &ids {
+        assert!(
+            annotation_kinds(&e, id).contains(&"occurred_on".to_string()),
+            "{id}: missing occurred_on — the temporal enrichment didn't fire"
+        );
+        assert!(
+            gist_count(&e, id) >= 1,
+            "{id}: missing gist — graph ingestion didn't fire"
+        );
+    }
+    let facts: i64 = e
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM consolidated_facts", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        facts > 0,
+        "consolidated_facts empty — the veracity consolidator wasn't consulted by the batch path"
+    );
+}
+
+// parity: test_e2_remember_batch_enrichment.py::test_per_row_source_flows_to_has_source_annotation (tests/test_e2_remember_batch_enrichment.py:188)
+// parity: test_e2_remember_batch_enrichment.py::TestReviewHardening::test_meta_by_id_dict_survives_python_o (tests/test_e2_remember_batch_enrichment.py:531)
+// parity: test_e2_remember_batch_enrichment.py::test_per_row_veracity_threads_into_consolidated_facts (tests/test_e2_remember_batch_enrichment.py:151)
+#[test]
+fn remember_batch_threads_per_row_source_and_veracity() {
+    let e = engine();
+    let ids = e
+        .remember_batch(
+            &[
+                batch_item("First from wiki", Some("wiki"), Some("stated")),
+                batch_item("Second from email", Some("email"), Some("inferred")),
+                batch_item("Third from doc", Some("doc"), None),
+            ],
+            &RememberBatchArgs::default(),
+        )
+        .unwrap();
+    // Each row's has_source annotation carries its OWN source value, regardless of order.
+    let c = e.store.conn.lock().unwrap();
+    for (id, expected) in ids.iter().zip(["wiki", "email", "doc"]) {
+        let value: String = c
+            .query_row(
+                "SELECT value FROM annotations WHERE memory_id = ?1 AND kind = 'has_source'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, expected, "{id}: has_source mismatch");
+    }
+    // Per-row veracity landed on the rows themselves (stated / inferred / the unknown default).
+    let veracities: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            c.query_row(
+                "SELECT veracity FROM working_memory WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(veracities, vec!["stated", "inferred", "unknown"]);
+}
+
+// parity: test_e2_remember_batch_enrichment.py::test_extract_entities_off_by_default (tests/test_e2_remember_batch_enrichment.py:213)
+// parity: test_e2_remember_batch_enrichment.py::test_extract_entities_true_populates_mentions (tests/test_e2_remember_batch_enrichment.py:227)
+#[test]
+fn remember_batch_entity_extraction_is_opt_in() {
+    let e = engine();
+    let items = [batch_item(
+        "Alice and Bob worked on the auth refactor",
+        None,
+        None,
+    )];
+    let off = e
+        .remember_batch(&items, &RememberBatchArgs::default())
+        .unwrap();
+    assert!(
+        !annotation_kinds(&e, &off[0]).contains(&"mentions".to_string()),
+        "default-off entity extraction leaked a mentions annotation"
+    );
+
+    let on = e
+        .remember_batch(
+            &items,
+            &RememberBatchArgs {
+                extract_entities: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        annotation_kinds(&e, &on[0]).contains(&"mentions".to_string()),
+        "extract_entities=true should produce mentions annotations"
+    );
+}
+
+// parity: test_e2_remember_batch_enrichment.py::test_remember_batch_parity_with_remember_for_annotations (tests/test_e2_remember_batch_enrichment.py:284)
+// parity: test_e2_remember_batch_enrichment.py::test_remember_batch_parity_with_remember_for_gists (tests/test_e2_remember_batch_enrichment.py:314)
+#[test]
+fn remember_batch_matches_single_remember_enrichment() {
+    let content = "Frank is a database administrator";
+    let single = engine();
+    let single_id = single
+        .remember(
+            content,
+            &RememberArgs {
+                source: "wiki".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let batched = engine();
+    let batch_ids = batched
+        .remember_batch(
+            &[batch_item(content, Some("wiki"), None)],
+            &RememberBatchArgs::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        annotation_kinds(&single, &single_id),
+        annotation_kinds(&batched, &batch_ids[0]),
+        "annotation kinds diverge between remember() and remember_batch()"
+    );
+    assert_eq!(
+        gist_count(&single, &single_id),
+        gist_count(&batched, &batch_ids[0]),
+        "gist counts diverge between remember() and remember_batch()"
+    );
+}
+
+// parity: test_e2_remember_batch_enrichment.py::test_enrichment_exception_does_not_break_batch (tests/test_e2_remember_batch_enrichment.py:339)
+#[test]
+fn remember_batch_survives_per_row_enrichment_failure() {
+    let e = engine();
+    // Break the graph half of the enrichment pipeline for every row; inserts and the temporal
+    // annotations must still land for the whole batch.
+    e.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute("DROP TABLE gists", [])
+        .unwrap();
+
+    let ids = e
+        .remember_batch(
+            &[
+                batch_item("ok row 1", None, None),
+                batch_item("row with boom inside", None, None),
+                batch_item("ok row 3", None, None),
+            ],
+            &RememberBatchArgs::default(),
+        )
+        .expect("a broken enrichment helper must not fail the batch");
+    assert_eq!(ids.len(), 3);
+
+    let wm: i64 = e
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM working_memory", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(wm, 3, "enrichment failure tore down working_memory inserts");
+    for id in &ids {
+        assert!(
+            annotation_kinds(&e, id).contains(&"occurred_on".to_string()),
+            "{id}: enrichment loop short-circuited — later rows lost their temporal annotation"
+        );
+    }
+}
+
+// parity: test_e2_remember_batch_enrichment.py::TestReviewHardening::test_remember_batch_emits_memory_added_event_per_row (tests/test_e2_remember_batch_enrichment.py:493)
+#[test]
+fn remember_batch_emits_memory_added_event_per_row() {
+    let e = engine();
+    let stream = e.enable_streaming();
+    let ids = e
+        .remember_batch(
+            &[
+                batch_item("Event row A", None, None),
+                batch_item("Event row B", None, None),
+                batch_item("Event row C", None, None),
+            ],
+            &RememberBatchArgs::default(),
+        )
+        .unwrap();
+
+    let buffer = stream.get_buffer(None, None);
+    let added: Vec<&crate::streaming::MemoryEvent> = buffer
+        .iter()
+        .filter(|ev| ev.event_type == crate::streaming::EventType::MemoryAdded)
+        .collect();
+    assert_eq!(added.len(), 3, "one MEMORY_ADDED per batch row: {buffer:?}");
+    let event_ids: std::collections::HashSet<&str> =
+        added.iter().map(|ev| ev.memory_id.as_str()).collect();
+    assert_eq!(
+        event_ids,
+        ids.iter().map(String::as_str).collect(),
+        "event memory_ids must match the returned batch ids"
+    );
+    // The always-on event log saw them too.
+    let creates: i64 = e
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE operation = 'CREATE'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(creates, 3);
+}
+
+// parity: test_e2_remember_batch_enrichment.py (`force_veracity` + `trust_tier` kwargs, beam.py:3047-3080)
+#[test]
+fn remember_batch_force_veracity_and_imported_trust_tier() {
+    let e = engine();
+    let ids = e
+        .remember_batch(
+            &[
+                batch_item("row that self-elevates", None, Some("stated")),
+                batch_item("row without a label", None, None),
+            ],
+            &RememberBatchArgs {
+                veracity: Some("tool".to_string()),
+                force_veracity: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = e.store.conn.lock().unwrap();
+    for id in &ids {
+        let (veracity, tier): (String, String) = c
+            .query_row(
+                "SELECT veracity, trust_tier FROM working_memory WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            veracity, "tool",
+            "force_veracity must override per-item labels uniformly"
+        );
+        assert_eq!(
+            tier, "IMPORTED",
+            "batch ingest defaults to the IMPORTED tier"
+        );
+    }
+}
+
 /// Recall with per-call weight overrides through the public filter surface (`beam.py`
 /// `recall(vec_weight=..., fts_weight=..., importance_weight=...)`).
 fn recall_weighted(

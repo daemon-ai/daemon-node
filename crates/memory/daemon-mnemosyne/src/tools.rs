@@ -14,8 +14,8 @@
 
 use crate::embeddings::Embedder;
 use crate::engine::{
-    CanonicalRemember, Engine, GraphLink, GroupSummary, RecallReq, RememberArgs, SleepGroup,
-    TripleAdd, TripleEnd, TripleQuery,
+    BatchItem, CanonicalRemember, Engine, GraphLink, GroupSummary, RecallReq, RememberArgs,
+    RememberBatchArgs, SleepGroup, TripleAdd, TripleEnd, TripleQuery,
 };
 use crate::extract::Extractor;
 use daemon_core::tools::ToolDef;
@@ -37,6 +37,10 @@ pub fn defs() -> Vec<ToolDef> {
         def(
             "mnemosyne_remember",
             r#"{"type":"object","properties":{"content":{"type":"string"},"importance":{"type":"number"},"source":{"type":"string"},"scope":{"type":"string"},"valid_until":{"type":"string"},"extract_entities":{"type":"boolean"},"extract":{"type":"boolean"},"metadata":{"type":"object"},"veracity":{"type":"string"}},"required":["content"]}"#,
+        ),
+        def(
+            "mnemosyne_remember_batch",
+            r#"{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"source":{"type":"string"},"importance":{"type":"number"},"metadata":{"type":"object"},"veracity":{"type":"string"}},"required":["content"]}},"veracity":{"type":"string"},"force_veracity":{"type":"boolean"},"trust_tier":{"type":"string"},"extract_entities":{"type":"boolean"},"extract":{"type":"boolean"}},"required":["items"]}"#,
         ),
         def(
             "mnemosyne_recall",
@@ -383,6 +387,68 @@ pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
                 "veracity": veracity,
             })
             .to_string()
+        }
+        "mnemosyne_remember_batch" => {
+            // High-throughput batch ingest (`beam.py` `remember_batch` L3047). Python exposes it
+            // as a library call on `BeamMemory`; the Rust node reaches it through this dispatch.
+            // Embedding happens per item at this async seam (Python's inline `_embeddings.embed`
+            // block), as does the opt-in per-row LLM fact extraction.
+            let Some(items_json) = args.get("items").and_then(|v| v.as_array()) else {
+                return json!({"error": "items is required"}).to_string();
+            };
+            let mut items: Vec<BatchItem> = Vec::with_capacity(items_json.len());
+            for item in items_json {
+                let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    return json!({"error": "each item requires content"}).to_string();
+                }
+                items.push(BatchItem {
+                    content: content.to_string(),
+                    source: item.get("source").and_then(|v| v.as_str()).map(String::from),
+                    importance: item.get("importance").and_then(|v| v.as_f64()),
+                    metadata: item.get("metadata").filter(|m| m.is_object()).cloned(),
+                    veracity: item
+                        .get("veracity")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    vector: embedder.embed_query(content).await,
+                    ..Default::default()
+                });
+            }
+            let batch_args = RememberBatchArgs {
+                veracity: s(&args, "veracity").map(String::from),
+                force_veracity: args
+                    .get("force_veracity")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                trust_tier: s(&args, "trust_tier").unwrap_or("IMPORTED").to_string(),
+                extract_entities: args
+                    .get("extract_entities")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                model: embedder.model().unwrap_or("").to_string(),
+            };
+            let extract = args.get("extract").and_then(|v| v.as_bool()).unwrap_or(false);
+            match engine.remember_batch(&items, &batch_args) {
+                Ok(ids) => {
+                    // Opt-in LLM fact extraction fires once per row (`beam.py` L3287-L3289),
+                    // at this async seam like the single-remember path.
+                    if extract && extractor.available() {
+                        for (item, id) in items.iter().zip(&ids) {
+                            if let Some(extracted) = extractor.extract(&item.content).await {
+                                let _ = engine.ingest_extracted(id, &extracted);
+                            }
+                        }
+                    }
+                    json!({
+                        "status": "stored_batch",
+                        "count": ids.len(),
+                        "memory_ids": ids,
+                    })
+                    .to_string()
+                }
+                Err(e) => err(e),
+            }
         }
         "mnemosyne_recall" => {
             let query = s(&args, "query").unwrap_or("");

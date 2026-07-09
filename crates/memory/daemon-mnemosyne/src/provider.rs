@@ -1035,7 +1035,7 @@ mod tests {
     // parity: test_e2_remember_batch_enrichment.py::test_per_row_veracity_threads_into_consolidated_facts (tests/test_e2_remember_batch_enrichment.py:151)
     // parity: test_e2_remember_batch_enrichment.py::test_remember_batch_writes_has_source_when_source_is_non_default (tests/test_e2_remember_batch_enrichment.py:101)
     #[tokio::test]
-    async fn parity_gap_tool_remember_batch_enriches_every_row() {
+    async fn tool_remember_batch_enriches_every_row() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
 
@@ -1107,6 +1107,63 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    // parity: test_e2_remember_batch_enrichment.py::test_extract_false_does_not_call_llm (tests/test_e2_remember_batch_enrichment.py:244)
+    // parity: test_e2_remember_batch_enrichment.py::test_extract_true_calls_llm_fact_extractor_per_row (tests/test_e2_remember_batch_enrichment.py:258)
+    #[tokio::test]
+    async fn tool_remember_batch_extract_flag_gates_llm_enrichment() {
+        use daemon_core::MockProvider;
+        let llm_json = r#"{"entities":["Atlas"],"triples":[{"subject":"Denis","predicate":"manages","object":"Atlas","confidence":0.95}],"facts":[]}"#;
+        let make = || {
+            let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+            MnemosyneProvider::with_backends(
+                engine,
+                None,
+                Some(Arc::new(MockProvider::completing(llm_json))),
+            )
+        };
+        let llm_fact_count = |p: &MnemosyneProvider| -> i64 {
+            p.engine
+                .with_conn(|c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*) FROM consolidated_facts \
+                         WHERE subject = 'Denis' AND predicate = 'manages' AND object = 'Atlas'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+
+        // Default `extract=false`: the LLM extractor must not fire.
+        let provider = make();
+        provider
+            .call_tool(
+                "mnemosyne_remember_batch",
+                json!({"items": [{"content": "a note about the team"}]}),
+            )
+            .await;
+        assert_eq!(
+            llm_fact_count(&provider),
+            0,
+            "extract=false but LLM fact extraction fired anyway"
+        );
+
+        // `extract=true`: the LLM triple lands per row (the regex baseline can't produce it).
+        let provider = make();
+        let res = provider
+            .call_tool(
+                "mnemosyne_remember_batch",
+                json!({"items": [{"content": "a note about the team"}], "extract": true}),
+            )
+            .await;
+        assert!(res.contains("stored_batch"), "got: {res}");
+        assert_eq!(
+            llm_fact_count(&provider),
+            1,
+            "extract=true must run LLM extraction per batch row"
+        );
     }
 
     #[tokio::test]

@@ -295,6 +295,64 @@ impl Default for RememberArgs {
     }
 }
 
+/// One item of an [`Engine::remember_batch`] ingest (`beam.py` `remember_batch` item dicts,
+/// L3055-L3057: `content`, `source`, `importance`, `metadata`, `veracity` + the per-item
+/// multi-agent identity overrides).
+#[derive(Clone, Debug, Default)]
+pub struct BatchItem {
+    /// The memory content (required).
+    pub content: String,
+    /// Ingestion source (`None` -> `conversation`).
+    pub source: Option<String>,
+    /// Importance `[0, 1]` (`None` -> 0.5).
+    pub importance: Option<f64>,
+    /// Caller-supplied metadata object persisted to `metadata_json`.
+    pub metadata: Option<serde_json::Value>,
+    /// Per-item veracity label; overrides the batch default unless
+    /// [`RememberBatchArgs::force_veracity`] is set.
+    pub veracity: Option<String>,
+    /// Per-item author override (`item.get("author_id", self.author_id)`).
+    pub author_id: Option<String>,
+    /// Per-item author type override.
+    pub author_type: Option<String>,
+    /// Per-item channel override.
+    pub channel_id: Option<String>,
+    /// Precomputed dense embedding for this item — the async seam's analog of Python's inline
+    /// `_embeddings.embed(contents)` block (L3213-L3252).
+    pub vector: Option<Vec<f32>>,
+}
+
+/// Batch-level arguments for [`Engine::remember_batch`] (`beam.py` `remember_batch` kwargs
+/// L3047-L3053).
+#[derive(Clone, Debug)]
+pub struct RememberBatchArgs {
+    /// Default veracity applied to items without their own label (`None`/empty clamps to
+    /// `unknown`; clamped once for the whole batch).
+    pub veracity: Option<String>,
+    /// Security knob: apply the batch default to EVERY row, ignoring per-item labels (the
+    /// caller is the trust authority — e.g. an importer ingesting LLM-generated content that
+    /// must not self-elevate).
+    pub force_veracity: bool,
+    /// Trust tier stamped on every row (batch ingest defaults to `IMPORTED`).
+    pub trust_tier: String,
+    /// Opt-in regex entity scan per row (`mentions` annotations).
+    pub extract_entities: bool,
+    /// The embedding model tag for stored item vectors.
+    pub model: String,
+}
+
+impl Default for RememberBatchArgs {
+    fn default() -> Self {
+        Self {
+            veracity: None,
+            force_veracity: false,
+            trust_tier: "IMPORTED".to_string(),
+            extract_entities: false,
+            model: String::new(),
+        }
+    }
+}
+
 // ── Parameter bundles (W-MNEMO: clear the pervasive Excess-Number-of-Function-Arguments smell) ──
 
 /// Shared per-recall request parameters threaded through the recall pipeline.
