@@ -1668,6 +1668,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Build a fresh, unique data dir for a restart-reconcile test.
+    fn reconcile_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lcm-reconcile-{}-{}-{name}",
+            std::process::id(),
+            RECONCILE_DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    static RECONCILE_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // parity: engine.py::test_existing_session_restart_reconciles_cursor_before_ingest (tests/test_lcm_engine.py:1264)
+    #[tokio::test]
+    async fn restart_full_transcript_replay_persists_only_new_tail() {
+        let dir = reconcile_dir("full-transcript");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1: persist a short transcript (no compaction).
+        {
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("s"),
+            )
+            .unwrap();
+            lcm.on_model(&model());
+            let mut c = Conversation::new(SystemPrompt::new("You are concise."));
+            c.push_user(UserMsg::new("question before restart"));
+            c.push_assistant(AssistantMsg::text("answer before restart"));
+            lcm.before_turn(&mut c, None);
+        }
+        // Incarnation 2: replay the full transcript plus a genuinely-new tool turn.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("question before restart"));
+        replay.push_assistant(AssistantMsg::text("answer before restart"));
+        replay.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("calling terminal"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_1".into(),
+                    name: "terminal".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_1".into(),
+                    ok: true,
+                    content: "terminal output after restart".into(),
+                },
+            )],
+        });
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "assistant", "tool"],
+            "replay of the durable transcript must not duplicate persisted rows"
+        );
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("terminal output after restart")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn ingest_redacts_sensitive_content_when_enabled() {
         let cfg = LcmConfig {
