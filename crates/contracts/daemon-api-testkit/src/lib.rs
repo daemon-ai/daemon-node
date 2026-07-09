@@ -27,7 +27,6 @@ use daemon_api::{
     MemberBanArgs, MemberInviteArgs, MemberRemoveArgs, MemberSetRoleArgs, MembershipOps,
     MessagingProtocol, NodeApi, RosterOps, SupportsContacts, SupportsConversations,
     SupportsDirectory, SupportsFileTransfer, SupportsMembership, SupportsRoster, TransportAdapter,
-    TransportInstanceInfo,
 };
 use daemon_protocol::TransportId;
 
@@ -290,10 +289,16 @@ impl FakeProtocol {
 
     /// Resolve a unit-returning verb keyed by its sentinel: `Ok(())` unless switched to fail.
     fn unit(&self, key: &'static str) -> Result<(), ApiError> {
+        self.value(key, ())
+    }
+
+    /// Resolve a value-returning verb keyed by its sentinel: `Ok(ok)` unless switched to fail (then
+    /// `Err(Other)` — never the capability sentinel).
+    fn value<T>(&self, key: &'static str, ok: T) -> Result<T, ApiError> {
         if self.fail.fails(key) {
             Err(ApiError::Other(format!("fake:{key} error")))
         } else {
-            Ok(())
+            Ok(ok)
         }
     }
 }
@@ -358,42 +363,215 @@ impl MessagingProtocol for FakeProtocol {
     }
 }
 
-// TDD RED: the FakeProtocol feature-trait bodies are still stubs — `supported()` reports nothing
-// and every verb keeps its trait default (→ Unsupported). The GREEN commit fills these in.
+/// A reference conversation the Fake's `create`/`join_channel` return.
+fn fake_conversation(transport: TransportId, kind: ConversationType) -> ConversationInfo {
+    ConversationInfo {
+        transport,
+        id: "fake-conv".to_string(),
+        kind,
+        title: None,
+        topic: None,
+        description: None,
+        members: Vec::new(),
+    }
+}
+
 #[async_trait]
 impl SupportsConversations for FakeProtocol {
     fn supported(&self) -> ConversationOps {
-        ConversationOps::default()
+        ConversationOps {
+            create: true,
+            join_channel: true,
+            leave: true,
+            delete: true,
+            send: true,
+            set_topic: true,
+            set_title: true,
+            set_description: true,
+        }
+    }
+
+    async fn create_details(&self, _transport: TransportId) -> CreateConversationDetails {
+        // Mirrors libpurple's fixture `purple_create_conversation_details_new(10)`.
+        CreateConversationDetails {
+            max_participants: 10,
+            ..Default::default()
+        }
+    }
+
+    async fn create(
+        &self,
+        transport: TransportId,
+        _details: CreateConversationDetails,
+    ) -> Result<ConversationInfo, ApiError> {
+        // libpurple's fixture returns a PURPLE_CONVERSATION_TYPE_UNSET conversation.
+        self.value(
+            sentinels::CONV_CREATE,
+            fake_conversation(transport, ConversationType::Unset),
+        )
+    }
+
+    async fn channel_join_details(&self, _transport: TransportId) -> ChannelJoinDetails {
+        // Mirrors `purple_channel_join_details_new(16, TRUE, 16, TRUE, 0)`.
+        ChannelJoinDetails {
+            name_max_length: 16,
+            nickname_supported: true,
+            nickname_max_length: 16,
+            password_supported: true,
+            password_max_length: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn join_channel(
+        &self,
+        transport: TransportId,
+        _details: ChannelJoinDetails,
+    ) -> Result<ConversationInfo, ApiError> {
+        self.value(
+            sentinels::CONV_JOIN,
+            fake_conversation(transport, ConversationType::Channel),
+        )
+    }
+
+    async fn leave(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
+        self.unit(sentinels::CONV_LEAVE)
+    }
+    async fn delete(&self, _transport: TransportId, _conv: String) -> Result<(), ApiError> {
+        self.unit(sentinels::CONV_DELETE)
+    }
+    async fn send(&self, _args: ConvSendArgs) -> Result<(), ApiError> {
+        self.unit(sentinels::CONV_SEND)
+    }
+    async fn set_topic(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _topic: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.unit(sentinels::CONV_SET_TOPIC)
+    }
+    async fn set_title(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _title: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.unit(sentinels::CONV_SET_TITLE)
+    }
+    async fn set_description(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _description: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.unit(sentinels::CONV_SET_DESCRIPTION)
     }
 }
+
 #[async_trait]
 impl SupportsMembership for FakeProtocol {
     fn supported(&self) -> MembershipOps {
-        MembershipOps::default()
+        MembershipOps {
+            invite: true,
+            remove: true,
+            ban: true,
+            set_role: true,
+        }
+    }
+    async fn invite(&self, _args: MemberInviteArgs) -> Result<(), ApiError> {
+        self.unit(sentinels::MEMBER_INVITE)
+    }
+    async fn remove(&self, _args: MemberRemoveArgs) -> Result<(), ApiError> {
+        self.unit(sentinels::MEMBER_REMOVE)
+    }
+    async fn ban(&self, _args: MemberBanArgs) -> Result<(), ApiError> {
+        self.unit(sentinels::MEMBER_BAN)
+    }
+    async fn set_role(&self, _args: MemberSetRoleArgs) -> Result<(), ApiError> {
+        self.unit(sentinels::MEMBER_SET_ROLE)
     }
 }
+
 #[async_trait]
 impl SupportsRoster for FakeProtocol {
     fn supported(&self) -> RosterOps {
-        RosterOps::default()
+        RosterOps {
+            list: true,
+            add: true,
+            update: true,
+            remove: true,
+        }
+    }
+    async fn add(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
+        self.unit(sentinels::ROSTER_ADD)
+    }
+    async fn update(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
+        self.unit(sentinels::ROSTER_UPDATE)
+    }
+    async fn remove(&self, _transport: TransportId, _contact: ContactInfo) -> Result<(), ApiError> {
+        self.unit(sentinels::ROSTER_REMOVE)
     }
 }
+
 #[async_trait]
 impl SupportsContacts for FakeProtocol {
     fn supported(&self) -> ContactsOps {
-        ContactsOps::default()
+        ContactsOps {
+            get_profile: true,
+            action_menu: true,
+            set_alias: true,
+        }
+    }
+    async fn get_profile(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+    ) -> Result<String, ApiError> {
+        // Mirrors the libpurple fixture returning `"profile data"`.
+        self.value(sentinels::CONTACT_GET_PROFILE, "profile data".to_string())
+    }
+    fn action_menu(&self, _transport: TransportId, _contact: ContactInfo) -> Option<ActionMenu> {
+        Some(ActionMenu::default())
+    }
+    async fn set_alias(
+        &self,
+        _transport: TransportId,
+        _contact: ContactInfo,
+        _alias: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.unit(sentinels::CONTACT_SET_ALIAS)
     }
 }
+
 #[async_trait]
 impl SupportsDirectory for FakeProtocol {
     fn supported(&self) -> bool {
-        false
+        true
+    }
+    async fn search_contacts(
+        &self,
+        _transport: TransportId,
+        _query: Option<String>,
+    ) -> Result<Vec<ContactInfo>, ApiError> {
+        // Mirrors the libpurple fixture returning an (empty) PurpleContacts container.
+        self.value(sentinels::DIRECTORY_SEARCH, Vec::new())
     }
 }
+
 #[async_trait]
 impl SupportsFileTransfer for FakeProtocol {
     fn supported(&self) -> FileTransferOps {
-        FileTransferOps::default()
+        FileTransferOps {
+            send: true,
+            receive: true,
+        }
+    }
+    async fn send(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
+        self.unit(sentinels::FILE_TRANSFER_SEND)
+    }
+    async fn receive(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
+        self.unit(sentinels::FILE_TRANSFER_RECEIVE)
     }
 }
 
