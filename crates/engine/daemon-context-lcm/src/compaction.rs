@@ -1564,6 +1564,67 @@ mod tests {
         assert_eq!(out, tail);
     }
 
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_assembly_skips_oversized_assistant_turn_to_preserve_user_prompt
+    // The newest user objective is preserved into the summary turn (never re-emitted as a raw user
+    // row), an oversized assistant turn is dropped, and the latest compact status survives — the
+    // assembled context degrades gracefully under the cap instead of overflowing.
+    #[test]
+    fn capped_assembly_preserves_objective_and_drops_oversized_assistant() {
+        let store = Store::open_in_memory().unwrap();
+        let tok = Tokenizer::heuristic();
+        let system = daemon_core::SystemPrompt::new("");
+        let objective = "KEEP_USER_DECISION: continue with prompt-aware assembly.".to_string();
+        let oversized = assistant(&"oversized assistant tool chatter ".repeat(400));
+        let status = assistant("Latest compact status.");
+
+        // A cap that fits the preserved-objective summary turn plus the tiny status tail, but not
+        // the oversized assistant chatter.
+        let obj_summary_tokens = tok
+            .count_text(&summary_turn_body(std::slice::from_ref(&objective)))
+            + crate::tokens::PER_MESSAGE_OVERHEAD;
+        let cap = obj_summary_tokens + tok.count_turn(&status) + 4;
+
+        let (out, index) = assemble_capped(
+            &store,
+            &tok,
+            "s1",
+            &system,
+            Some(objective.clone()),
+            vec![oversized, status.clone()],
+            vec![Vec::new(); 2],
+            Some(cap),
+        );
+
+        // The oversized chatter never appears; the newest status survives.
+        let contents: String = out
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.clone(),
+                Turn::Assistant(a) => a.text.clone(),
+                Turn::Tool(tt) => tt.assistant.text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            contents.contains("KEEP_USER_DECISION"),
+            "objective preserved"
+        );
+        assert!(
+            contents.contains("Latest compact status"),
+            "latest status kept"
+        );
+        assert!(
+            !contents.contains("oversized assistant tool chatter"),
+            "oversized turn dropped"
+        );
+        // The objective is folded into the summary turn — not re-emitted as a raw user row.
+        assert!(
+            !out.iter().any(|t| matches!(t, Turn::User(_))),
+            "objective is not a raw user turn"
+        );
+        assert_eq!(out.len(), index.len());
+    }
+
     #[test]
     fn budget_droppable_tail_turns_exclude_user_and_preserved_scaffolds() {
         assert!(!is_budget_droppable_tail_turn(&user("a prompt")));
