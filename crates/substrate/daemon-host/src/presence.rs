@@ -93,8 +93,12 @@ impl PresenceManager {
         }
     }
 
-    /// Every saved presence, in insertion order (← the `GListModel`).
+    /// Every saved presence, in insertion order (← the `GListModel`). Seeds the default presences
+    /// first (idempotent), so a freshly-wired node surfaces the Offline/Available defaults on the
+    /// first read without an explicit startup `load` — mirroring `CronOps::suggestions`'
+    /// seed-on-read.
     pub async fn list(&self) -> Vec<SavedPresence> {
+        self.load().await;
         self.store
             .saved_presence_list()
             .await

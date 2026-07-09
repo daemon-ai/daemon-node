@@ -460,6 +460,10 @@ pub struct NodeApiImpl {
     /// every cron op resolves to its defaulted [`ApiError::Unsupported`] / empty list (a node built
     /// without the cron backing). Shared with the agent `cron` tool, so both create through one path.
     cron: Option<Arc<crate::cron::CronOps>>,
+    /// The saved-presence manager (W2-F; wire vNEXT) backing the `presence_*` control ops. `None`
+    /// => every presence op resolves to its defaulted empty list / [`ApiError::Unsupported`] (a node
+    /// built without saved-presence management).
+    presences: Option<Arc<crate::presence::PresenceManager>>,
     /// The daemon-authoritative command catalog backing `command_list`/`command_invoke`: built-in
     /// node-op commands unified with the engine profile's [`CommandProvider`](daemon_core::CommandProvider)
     /// contributions (`/lcm`, `/memory`, …). Empty => the command surface resolves to its defaulted

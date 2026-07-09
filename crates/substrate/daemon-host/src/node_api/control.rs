@@ -1759,6 +1759,36 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
+    // -- Saved presences (W2-F; wire vNEXT): every op delegates to the shared `PresenceManager`;
+    //    absent it, the trait defaults (empty list / `Unsupported`) apply.
+    async fn presence_list(&self) -> Vec<daemon_api::SavedPresence> {
+        match &self.presences {
+            Some(presences) => presences.list().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn presence_save(&self, presence: daemon_api::SavedPresence) -> Result<(), ApiError> {
+        match &self.presences {
+            Some(presences) => presences.save(presence).await,
+            None => Err(ApiError::Unsupported("presence_save".into())),
+        }
+    }
+
+    async fn presence_delete(&self, id: String) -> Result<(), ApiError> {
+        match &self.presences {
+            Some(presences) => presences.remove(&id).await.map(|_| ()),
+            None => Err(ApiError::Unsupported("presence_delete".into())),
+        }
+    }
+
+    async fn presence_set_active(&self, id: String) -> Result<(), ApiError> {
+        match &self.presences {
+            Some(presences) => presences.set_active(&id).await,
+            None => Err(ApiError::Unsupported("presence_set_active".into())),
+        }
+    }
+
     async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
         // Auth 4 (F3): a non-owner must not read another owner's unit management events (deny ->
         // empty; own units only unless SessionSeeAll).

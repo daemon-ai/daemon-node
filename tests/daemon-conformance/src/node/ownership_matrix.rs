@@ -440,6 +440,12 @@ fn classify(req: &ApiRequest) -> Coverage {
         // The node-owned gateway is a node-wide resident service (not per-owner session state): the
         // coarse capability gate governs (GatewayGet -> ControlRead, GatewaySet -> ControlWrite).
         GatewayGet | GatewaySet { .. } => NotSessionTouching,
+        // Saved presences (W2-F) are node-wide shared config, not per-owner session state: the
+        // coarse capability gate governs (PresenceList -> ControlRead, the mutations -> ControlWrite).
+        PresenceList
+        | PresenceSave { .. }
+        | PresenceDelete { .. }
+        | PresenceSetActive { .. } => NotSessionTouching,
     }
 }
 

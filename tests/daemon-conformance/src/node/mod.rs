@@ -36,6 +36,7 @@ mod ownership;
 mod ownership_matrix;
 mod ownership_transport;
 mod positive_e2e;
+mod presence;
 mod process_notify;
 mod profiles_skills;
 mod provider_discovery;

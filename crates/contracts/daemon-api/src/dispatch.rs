@@ -211,6 +211,11 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
                 ApiResponse::TelemetryConsent { enabled }
             })
         }
+        // -- saved presences (W2-F; wire vNEXT) -------------------------------------------------
+        ApiRequest::PresenceList => ApiResponse::SavedPresences(api.presence_list().await),
+        ApiRequest::PresenceSave { presence } => unit_or_err(api.presence_save(presence).await),
+        ApiRequest::PresenceDelete { id } => unit_or_err(api.presence_delete(id).await),
+        ApiRequest::PresenceSetActive { id } => unit_or_err(api.presence_set_active(id).await),
         _ => return None,
     })
 }
