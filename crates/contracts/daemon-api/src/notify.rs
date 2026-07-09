@@ -61,22 +61,27 @@ impl AuthorizationRequest {
     /// A fresh request for `contact` (`purple_authorization_request_new`): no message, `add` false,
     /// not yet handled.
     pub fn new(contact: ContactInfo) -> Self {
-        // RED stub.
-        let _ = contact;
-        Self::default()
+        Self {
+            contact,
+            message: None,
+            add: false,
+            handled: false,
+        }
     }
 
     /// Whether the request has already been accepted or denied.
     pub fn is_handled(&self) -> bool {
-        // RED stub.
-        false
+        self.handled
     }
 
     /// Accept the request (`purple_authorization_request_accept`). The first `accept`/`deny` wins:
     /// returns `Ok(())` and marks it handled; a subsequent call is `Err(RequestError::AlreadyHandled)`.
     pub fn accept(&mut self) -> Result<(), RequestError> {
-        // RED stub.
-        Err(RequestError::AlreadyHandled)
+        if self.handled {
+            return Err(RequestError::AlreadyHandled);
+        }
+        self.handled = true;
+        Ok(())
     }
 
     /// Deny the request with an optional message (`purple_authorization_request_deny`). The first
@@ -84,9 +89,11 @@ impl AuthorizationRequest {
     /// signal's `message` parameter) and marks it handled; a subsequent call is
     /// `Err(RequestError::AlreadyHandled)`.
     pub fn deny(&mut self, message: Option<String>) -> Result<Option<String>, RequestError> {
-        // RED stub.
-        let _ = message;
-        Err(RequestError::AlreadyHandled)
+        if self.handled {
+            return Err(RequestError::AlreadyHandled);
+        }
+        self.handled = true;
+        Ok(message)
     }
 }
 
@@ -112,23 +119,27 @@ pub struct AddContactRequest {
 impl AddContactRequest {
     /// A fresh request for `contact` (`purple_add_contact_request_new`).
     pub fn new(contact: ContactInfo) -> Self {
-        // RED stub.
-        let _ = contact;
-        Self::default()
+        Self {
+            contact,
+            message: None,
+            handled: false,
+        }
     }
 
     /// Whether `add` has already been called.
     pub fn is_handled(&self) -> bool {
-        // RED stub.
-        false
+        self.handled
     }
 
     /// Tell the UI to add the contact (`purple_add_contact_request_add`). Single-shot: the first
     /// call returns `Ok(())` and marks it handled; a subsequent call is
     /// `Err(RequestError::AlreadyHandled)`.
     pub fn add(&mut self) -> Result<(), RequestError> {
-        // RED stub.
-        Err(RequestError::AlreadyHandled)
+        if self.handled {
+            return Err(RequestError::AlreadyHandled);
+        }
+        self.handled = true;
+        Ok(())
     }
 }
 
@@ -199,44 +210,84 @@ pub struct NotificationInfo {
     deleted: bool,
 }
 
+/// A process-unique, non-empty notification id (the daemon analog of `g_uuid_string_random`): a
+/// monotonic sequence combined with a nanosecond timestamp. Uniqueness within a process is what the
+/// manager's identity-keyed add/remove relies on; no `uuid` dependency is pulled in for it.
+fn generate_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("notif-{nanos:032x}-{seq:x}")
+}
+
+/// Unix-millis now (the DTO analog of `g_date_time_new_now_local` for the created timestamp).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Compute the title for an add-contact notification (`purple_notification_add_contact_update`):
 /// includes the remote contact's display name.
 pub fn add_contact_title(request: &AddContactRequest) -> String {
-    // RED stub.
-    let _ = request;
-    String::new()
+    format!(
+        "{} added you to their contact list",
+        request.contact.name_for_display()
+    )
 }
 
 /// Compute the title for an authorization-request notification
 /// (`purple_notification_authorization_request_update`): includes the remote contact's display name.
 pub fn authorization_title(request: &AuthorizationRequest) -> String {
-    // RED stub.
-    let _ = request;
-    String::new()
+    format!(
+        "{} would like to add you to their contact list",
+        request.contact.name_for_display()
+    )
 }
 
 impl NotificationInfo {
+    /// The base of every constructor: a supplied or auto-generated non-empty `id`, `created_ms`
+    /// stamped to now, everything else defaulted, and the given `kind`.
+    fn base(id: Option<String>, kind: NotificationKind) -> Self {
+        Self {
+            id: id.filter(|s| !s.is_empty()).unwrap_or_else(generate_id),
+            created_ms: now_ms(),
+            kind,
+            ..Default::default()
+        }
+    }
+
     /// A generic notification (`purple_notification_new`): a supplied or auto-generated non-empty
     /// `id`, `created_ms` stamped to now, and [`NotificationKind::Generic`].
     pub fn new(id: Option<String>, title: Option<String>) -> Self {
-        // RED stub.
-        let _ = (id, title);
-        Self::default()
+        let mut n = Self::base(id, NotificationKind::Generic);
+        n.title = title;
+        n
     }
 
     /// An add-contact notification (`purple_notification_add_contact_new`): the title is derived
     /// from the request's contact and the icon is `contact-new-symbolic`.
     pub fn new_add_contact(id: Option<String>, request: AddContactRequest) -> Self {
-        // RED stub.
-        let _ = (id, request);
-        Self::default()
+        let title = add_contact_title(&request);
+        let mut n = Self::base(id, NotificationKind::AddContact(request));
+        n.title = Some(title);
+        n.icon_name = Some("contact-new-symbolic".to_string());
+        n
     }
 
-    /// An authorization-request notification (`purple_notification_authorization_request_new`).
+    /// An authorization-request notification (`purple_notification_authorization_request_new`): the
+    /// title is derived from the request's contact and the icon is `address-book-new-symbolic`.
     pub fn new_authorization(id: Option<String>, request: AuthorizationRequest) -> Self {
-        // RED stub.
-        let _ = (id, request);
-        Self::default()
+        let title = authorization_title(&request);
+        let mut n = Self::base(id, NotificationKind::Authorization(request));
+        n.title = Some(title);
+        n.icon_name = Some("address-book-new-symbolic".to_string());
+        n
     }
 
     /// A link notification (`purple_notification_link_new`).
@@ -246,44 +297,62 @@ impl NotificationInfo {
         link_text: Option<String>,
         link_uri: impl Into<String>,
     ) -> Self {
-        // RED stub.
-        let _ = (id, title.into(), link_text, link_uri.into());
-        Self::default()
+        let mut n = Self::base(
+            id,
+            NotificationKind::Link {
+                link_text,
+                link_uri: link_uri.into(),
+            },
+        );
+        n.title = Some(title.into());
+        n
     }
 
-    /// A connection-error notification (`purple_notification_connection_error_new`): account-bound.
+    /// A connection-error notification (`purple_notification_connection_error_new`): account-bound,
+    /// with the `network-error-symbolic` icon.
     pub fn new_connection_error(id: Option<String>, account: TransportId) -> Self {
-        // RED stub.
-        let _ = (id, account);
-        Self::default()
+        let mut n = Self::base(id, NotificationKind::ConnectionError);
+        n.account = Some(account);
+        n.icon_name = Some("network-error-symbolic".to_string());
+        n
     }
 
     /// The link text of a [`NotificationKind::Link`] with null-text fallback
     /// (`purple_notification_link_get_link_text`): `link_text` when non-empty, else `link_uri`.
     /// `None` for a non-link notification.
     pub fn link_text(&self) -> Option<&str> {
-        // RED stub.
-        None
+        match &self.kind {
+            NotificationKind::Link {
+                link_text,
+                link_uri,
+            } => Some(
+                link_text
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(link_uri),
+            ),
+            _ => None,
+        }
     }
 
     /// Sort order by creation time (`purple_notification_compare`).
     pub fn compare(&self, other: &NotificationInfo) -> Ordering {
-        // RED stub.
-        let _ = other;
-        Ordering::Equal
+        self.created_ms.cmp(&other.created_ms)
     }
 
     /// Whether `delete` has been called.
     pub fn is_deleted(&self) -> bool {
-        // RED stub.
-        false
+        self.deleted
     }
 
     /// Mark the notification deleted (`purple_notification_delete`). Single-shot: the first call
     /// returns `Ok(())`; a subsequent call is `Err(RequestError::AlreadyHandled)`.
     pub fn delete(&mut self) -> Result<(), RequestError> {
-        // RED stub.
-        Err(RequestError::AlreadyHandled)
+        if self.deleted {
+            return Err(RequestError::AlreadyHandled);
+        }
+        self.deleted = true;
+        Ok(())
     }
 }
 
