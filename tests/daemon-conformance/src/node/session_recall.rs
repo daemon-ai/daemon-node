@@ -292,6 +292,7 @@ fn assemble_with_store_for_recall(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, handle, store)
 }

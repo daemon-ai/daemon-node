@@ -105,6 +105,7 @@ fn assemble_min() -> AssembledNode {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     })
 }
 

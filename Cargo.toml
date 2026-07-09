@@ -336,6 +336,7 @@ daemon-tool-execute-code = { version = "0", path = "tools/daemon-tool-execute-co
 daemon-tool-session-search = { version = "0", path = "tools/daemon-tool-session-search" }
 daemon-tool-semantic-search = { version = "0", path = "tools/daemon-tool-semantic-search" }
 daemon-skills = { version = "0", path = "crates/skills/daemon-skills" }
+daemon-prompt = { version = "0", path = "crates/prompt/daemon-prompt" }
 daemon-tool-skill = { version = "0", path = "tools/daemon-tool-skill" }
 daemon-tool-profile = { version = "0", path = "tools/daemon-tool-profile" }
 

@@ -42,6 +42,9 @@ daemon-models = { workspace = true }
 # the skills store: the node threads it (with its revision log) into the api surface for skill
 # versioning + the skill payload of a profile distribution.
 daemon-skills = { workspace = true }
+# The prompt content + stores (hermes parity): PersonaStore (SOUL.md) / UserProfileStore (USER.md),
+# the role persona library, and the gated guidance builders the node composes into engine prompts.
+daemon-prompt = { workspace = true }
 async-trait = { workspace = true }
 # The host fleet event bus (I4/I8) is a `tokio::sync::broadcast` channel threaded through the
 # assembled producers (FleetRuntime/FleetJobWorker) into the tree-push surface.
@@ -53,6 +56,8 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 daemon-context-lcm = { workspace = true }
 daemon-mnemosyne = { workspace = true }
+# Persona-resolution tests run a real PersonaStore over a scratch dir.
+tempfile = "3"
 
 [lints]
 workspace = true

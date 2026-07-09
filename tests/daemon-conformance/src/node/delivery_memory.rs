@@ -104,6 +104,7 @@ async fn delivery_sink_push_honors_handover_impl() {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
 
     // Register two in-process sinks: the matrix account and a GUI surface.
@@ -316,6 +317,7 @@ async fn delivery_sessions_discovery_and_pull_subscriber_impl() {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
 
     async fn drive_turn(node: &Arc<NodeApiImpl>, origin: Origin, req: u64) -> SessionId {
@@ -584,6 +586,7 @@ async fn routed_profiles_get_isolated_memory_banks_impl() {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
 
     async fn route(node: &Arc<NodeApiImpl>, origin: Origin) {

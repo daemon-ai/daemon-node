@@ -163,6 +163,7 @@ fn assemble_inline_node(
         },
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, store, handle, captured)
 }

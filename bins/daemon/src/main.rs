@@ -2786,6 +2786,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             max_ephemeral_per_session: cfg.orchestrate.max_ephemeral_per_session,
         },
         foreign_gateway: gateway_coords,
+        // Prompt-architecture stores + policy are wired by the `[prompt]` config workstream
+        // (WI-10); until then engines run on the built-in role personas.
+        prompt: Default::default(),
     });
     // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
     // conversations are readable through the tool (the node did not exist when the tool was built).

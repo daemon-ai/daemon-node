@@ -45,6 +45,38 @@ pub struct ResolvedSkills {
 /// so `daemon-node` stays free of the concrete tool crate (mirrors [`ProviderResolver`]).
 pub type SkillsResolver = Arc<dyn Fn(&ProfileRef) -> ResolvedSkills + Send + Sync>;
 
+/// The prompt-architecture inputs (hermes parity, Phase 3): the persona / user-profile stores and
+/// the composition policy every engine's system prompt is built from. Grouped so the assembly
+/// seam stays one field on [`NodeAssembly`]; the default (no stores, default policy) builds a node
+/// whose engines run on the built-in role personas with no USER.md surface — the ephemeral /
+/// test shape.
+#[derive(Clone, Default)]
+pub struct PromptAssembly {
+    /// The per-profile persona store (`<data_dir>/<profile>/SOUL.md`). `None` (ephemeral nodes,
+    /// tests) falls back to the built-in role persona library and resolves the wire persona ops
+    /// (`SoulGet`/`SoulSet`) to `Unsupported` — mirroring how versioning is gated on `revisions`.
+    pub personas: Option<Arc<daemon_prompt::PersonaStore>>,
+    /// The composition policy (guidance toggles, caps, nudge cadence) from the binary's
+    /// `[prompt]` config section.
+    pub policy: PromptPolicy,
+}
+
+/// The `[prompt]`-section composition policy: which guidance blocks compose, the content caps,
+/// and the USER.md nudge cadence. Defaults mirror hermes (everything on, hermes caps).
+#[derive(Clone, Copy, Debug)]
+pub struct PromptPolicy {
+    /// The persona (SOUL.md / inline persona) character cap.
+    pub persona_cap: usize,
+}
+
+impl Default for PromptPolicy {
+    fn default() -> Self {
+        Self {
+            persona_cap: daemon_prompt::DEFAULT_PERSONA_CAP,
+        }
+    }
+}
+
 /// The policy inputs for [`assemble`](crate::assemble): everything that varies between a production
 /// node and a test node. The standard plumbing (role profiles, fleet, factory, host, session
 /// surface) is derived.
@@ -183,6 +215,10 @@ pub struct NodeAssembly {
     /// leaves foreign agents on their own backend; the binary sets it when the gateway has a bind
     /// address.
     pub foreign_gateway: Option<GatewayCoords>,
+    /// The prompt-architecture inputs (hermes parity): persona / user-profile stores + the
+    /// `[prompt]` composition policy. The default builds a node on the built-in role personas with
+    /// no SOUL.md/USER.md stores (tests / ephemeral nodes).
+    pub prompt: PromptAssembly,
 }
 
 /// The loopback coordinates of the node's OpenAI-compatible gateway (`daemon-gateway`), threaded

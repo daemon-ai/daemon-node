@@ -98,6 +98,7 @@ fn assemble_semantic(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     })
 }
 

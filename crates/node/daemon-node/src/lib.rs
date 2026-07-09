@@ -39,5 +39,6 @@ pub use fleet::{
 };
 pub use types::{
     AssembledNode, GatewayBinding, GatewayCoords, GatewayLease, GatewayTokenMinter, NodeAssembly,
-    OrchestrateCaps, ProviderResolver, ResolvedSkills, SkillsResolver,
+    OrchestrateCaps, PromptAssembly, PromptPolicy, ProviderResolver, ResolvedSkills,
+    SkillsResolver,
 };

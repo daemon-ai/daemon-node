@@ -9,6 +9,7 @@ use std::sync::Arc;
 use daemon_api::EngineTunables;
 use daemon_core::{ApprovalPolicy, Config, EngineProfile, SystemPrompt, Tool, ToolRegistry};
 use daemon_host::{BackgroundProfile, BackgroundProfileRegistry};
+use daemon_prompt::{role_persona, RolePersona};
 
 use crate::profiles::dress::{provider_for, ORCHESTRATOR_PROFILE};
 use crate::types::NodeAssembly;
@@ -90,12 +91,12 @@ pub(crate) fn background_registry(
     let base = |pool: &[Arc<dyn Tool>],
                 names: &[&str],
                 prefix: Option<&str>,
-                persona: &str|
+                role: RolePersona|
      -> EngineProfile {
         let profile = EngineProfile::new(
             provider_for(&a.providers, ORCHESTRATOR_PROFILE),
             Arc::new(constrained_registry(pool, names, prefix)),
-            SystemPrompt::new(persona),
+            SystemPrompt::new(role_persona(role)),
         )
         .with_config(bg_config);
         match &a.credentials {
@@ -111,7 +112,12 @@ pub(crate) fn background_registry(
         registry = registry.with(
             "skill_review",
             BackgroundProfile::new(
-                base(&skill_pool, &SKILL_TOOL_NAMES, None, "skill curator"),
+                base(
+                    &skill_pool,
+                    &SKILL_TOOL_NAMES,
+                    None,
+                    RolePersona::SkillCurator,
+                ),
                 SKILL_REVIEW_PROMPT,
             ),
         );
@@ -127,7 +133,7 @@ pub(crate) fn background_registry(
                     &a.extra_tools,
                     &[],
                     Some(MEMORY_TOOL_PREFIX),
-                    "memory curator",
+                    RolePersona::MemoryCurator,
                 ),
                 MEMORY_REVIEW_PROMPT,
             ),

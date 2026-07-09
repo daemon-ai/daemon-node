@@ -135,6 +135,7 @@ fn assemble_foreign_delegation_node(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, store, handle)
 }

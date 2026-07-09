@@ -13,8 +13,10 @@ use daemon_api::{
 use daemon_common::{PartitionId, ProfileRef, SessionId, UnitId};
 use daemon_core::EngineProfile;
 use daemon_host::{BlobStore, JobWorker, ProfileStore, ServiceError, WorkspaceRoots};
+use daemon_prompt::RolePersona;
 use daemon_protocol::ChildSource;
 
+use crate::profiles::persona::PersonaSource;
 use crate::profiles::resolve::SessionFactoryCtx;
 
 /// Drives the durable job outbox by materializing each delegation as a *durable child session*:
@@ -268,9 +270,19 @@ impl JobWorker for FleetJobWorker {
                         .map_err(ServiceError::new)?
                 } else {
                     let mut engine = match (&inline_spec, &self.session_ctx) {
-                        (Some(spec), Some(ctx)) => ctx
-                            .resolve_effective(spec, &SessionOverlay::default())
-                            .fresh(child.clone()),
+                        (Some(spec), Some(ctx)) => {
+                            // The seed path still holds the raw ChildSource, so the inline
+                            // persona rides straight into the Identity slot (never the persona
+                            // store — the synthetic child id must not seed an orphan SOUL doc).
+                            let persona = match &input.source {
+                                ChildSource::Inline(inline) => {
+                                    PersonaSource::Inline(&inline.system_prompt)
+                                }
+                                _ => PersonaSource::Role(RolePersona::FleetChild),
+                            };
+                            ctx.resolve_effective(spec, &SessionOverlay::default(), persona)
+                                .fresh(child.clone())
+                        }
                         _ => self.profile.fresh(child.clone()),
                     };
                     engine.push_user(daemon_protocol::UserMsg::new(input.task.clone()));

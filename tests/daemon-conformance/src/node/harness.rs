@@ -88,6 +88,7 @@ pub fn assemble_over(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     })
 }
 
@@ -171,6 +172,7 @@ pub fn assemble_demo() -> (Arc<NodeApiImpl>, daemon_host::SupervisorHandle) {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, handle)
 }
@@ -309,6 +311,7 @@ fn assemble_daemon_api_gateway_inner(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, cred_store, handle)
 }

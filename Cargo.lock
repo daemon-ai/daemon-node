@@ -2818,6 +2818,7 @@ dependencies = [
  "daemon-models",
  "daemon-orchestration",
  "daemon-processes",
+ "daemon-prompt",
  "daemon-protocol",
  "daemon-provision",
  "daemon-schedule",
@@ -2832,6 +2833,7 @@ dependencies = [
  "daemon-tool-profile",
  "daemon-tool-shell",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

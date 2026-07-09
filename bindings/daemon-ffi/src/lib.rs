@@ -229,6 +229,7 @@ fn build_node(cfg: &HostFfiConfig) -> Result<AssembledNode, String> {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     }))
 }
 

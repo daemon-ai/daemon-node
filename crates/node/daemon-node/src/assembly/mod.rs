@@ -39,9 +39,11 @@ use crate::profiles::dress::{
     core_tool_registry_with_skills, dress, provider_for, root_profile, ProcessToolkit,
     CHILD_PROFILE, ORCHESTRATOR_PROFILE,
 };
+use crate::profiles::persona::PersonaSource;
 use crate::profiles::registry::background_registry;
 use crate::profiles::resolve::SessionFactoryCtx;
 use crate::types::{AssembledNode, NodeAssembly};
+use daemon_prompt::{role_persona, RolePersona};
 
 /// The node-wide single-instance handles every phase shares. Threading one [`Shared`] keeps the
 /// capture lists identical across the phase helpers: the SAME `fleet_events` broadcast sender flows
@@ -410,7 +412,7 @@ fn build_child_profile(
                     &a.fs,
                     procs,
                 )),
-                SystemPrompt::new("fleet child"),
+                SystemPrompt::new(role_persona(RolePersona::FleetChild)),
             ),
             a,
             launch_index,
@@ -467,7 +469,7 @@ fn build_orchestrator_profile(
             EngineProfile::new(
                 provider_for(&a.providers, ORCHESTRATOR_PROFILE),
                 Arc::new(registry),
-                SystemPrompt::new("daemon host node"),
+                SystemPrompt::new(role_persona(RolePersona::Host)),
             ),
             a,
             launch_index,
@@ -595,6 +597,7 @@ fn build_session_ctx(
                 workspace_roots: shared.workspace_roots.clone(),
                 fs_config: a.fs.clone(),
                 procs: procs.clone(),
+                prompt: a.prompt.clone(),
             });
             Some((store, ctx))
         }
@@ -641,13 +644,22 @@ fn build_factory(
                 if !inline.is_empty() {
                     let spec = from_cbor::<ProfileSpec>(inline).ok()?;
                     return match spec.engine {
-                        EngineSelector::Core => Some(ctx.resolve_effective(&spec, overlay)),
+                        // The synthetic inline id must never touch the persona store (a load
+                        // would seed an orphan SOUL doc): until the persisted payload carries
+                        // the inline persona (prompt-arch WI-9), a rehydrated inline child runs
+                        // the fleet-child role persona.
+                        EngineSelector::Core => Some(ctx.resolve_effective(
+                            &spec,
+                            overlay,
+                            PersonaSource::Role(RolePersona::FleetChild),
+                        )),
                         EngineSelector::Foreign { .. } => None,
                     };
                 }
                 let bound = bound?;
                 let spec = store.get(bound.as_str()).ok().flatten()?;
-                Some(ctx.resolve_effective(&spec, overlay))
+                let persona = PersonaSource::Profile(&spec.id);
+                Some(ctx.resolve_effective(&spec, overlay, persona))
             },
         );
         factory = factory.with_session_resolver(resolver);
@@ -719,7 +731,7 @@ fn build_session_profile(
             EngineProfile::new(
                 provider_for(&a.providers, a.profile.as_str()),
                 Arc::new(session_registry),
-                SystemPrompt::new("interactive session"),
+                SystemPrompt::new(role_persona(RolePersona::InteractiveSession)),
             ),
             a,
             launch_index,
@@ -764,7 +776,12 @@ fn build_session_builder(
                     match spec {
                         Some(spec) => match &spec.engine {
                             daemon_api::EngineSelector::Core => SessionBackend::Core(
-                                ctx.resolve_effective(&spec, overlay).fresh(id),
+                                ctx.resolve_effective(
+                                    &spec,
+                                    overlay,
+                                    PersonaSource::Profile(&spec.id),
+                                )
+                                .fresh(id),
                             ),
                             daemon_api::EngineSelector::Foreign { agent } => {
                                 // A persisted per-session model override still steers a foreign

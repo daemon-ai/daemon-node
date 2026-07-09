@@ -23,8 +23,9 @@ use daemon_core::{
 };
 use daemon_host::WorkspaceRoots;
 
+use crate::profiles::persona::{resolve_persona, PersonaSource};
 use crate::profiles::registry::{merged_config, session_tool_registry};
-use crate::types::{ProviderResolver, SkillsResolver};
+use crate::types::{PromptAssembly, ProviderResolver, SkillsResolver};
 
 /// The captured node context a profile-aware session builder needs to materialize a per-session
 /// [`EngineProfile`] from the active [`ProfileSpec`] (provider + persona + tools + budget +
@@ -47,6 +48,9 @@ pub(crate) struct SessionFactoryCtx {
     pub(crate) fs_config: daemon_tool_fs::FsConfig,
     /// The resident process-service handles (background shell + process tool), shared node-wide.
     pub(crate) procs: crate::profiles::dress::ProcessToolkit,
+    /// The prompt-architecture inputs: the persona store (SOUL.md-backed Identity slots) and the
+    /// `[prompt]` composition policy.
+    pub(crate) prompt: PromptAssembly,
 }
 
 impl SessionFactoryCtx {
@@ -54,11 +58,15 @@ impl SessionFactoryCtx {
     /// session's **overlay** — the one resolution path shared by the live surface and the durable
     /// rehydration path. The overlay's model/provider/tool-allowlist are applied to the spec; its
     /// approval-mode override is baked into the engine config. Unset overlay fields fall through to
-    /// the profile, so an empty overlay resolves straight from the profile bundle.
+    /// the profile, so an empty overlay resolves straight from the profile bundle. `persona` names
+    /// where the engine's Identity slot comes from: `Profile(id)` reads the profile's SOUL.md via
+    /// the persona store (seeded on first load), `Inline(text)` carries an ad-hoc sub-agent's
+    /// persona, `Role(kind)` uses the built-in library.
     pub(crate) fn resolve_effective(
         &self,
         base: &ProfileSpec,
         overlay: &SessionOverlay,
+        persona: PersonaSource<'_>,
     ) -> EngineProfile {
         let mut spec = base.clone();
         overlay.apply_to(&mut spec);
@@ -71,10 +79,11 @@ impl SessionFactoryCtx {
             &self.procs,
         );
         let skills_index = self.resolve_skills_into_registry(spec, &mut registry);
-        // TODO(prompt-arch Lane E): persona resolution moves node-side (PersonaSource ->
-        // PersonaStore SOUL.md); `ProfileSpec.system_prompt` left the wire at v36. This
-        // placeholder keeps the pre-existing empty-persona fallback until Lane E lands.
-        let persona = "interactive session".to_string();
+        let persona = resolve_persona(
+            self.prompt.personas.as_deref(),
+            persona,
+            self.prompt.policy.persona_cap,
+        );
         // The §20 tunables config, with the overlay's edit-approval override (if any) baked in so a
         // per-session mode switch is honored by both the live actor and a rehydrated durable engine.
         let mut config = merged_config(self.engine_config, &spec.tunables);
@@ -383,6 +392,7 @@ mod tests {
                 )),
                 shell: daemon_processes::ShellConfig::default(),
             },
+            prompt: Default::default(),
         };
 
         let base = ProfileSpec::new("p", ProviderSelector::GenAi, "base-model");
@@ -393,7 +403,11 @@ mod tests {
             approval_mode: Some(ApprovalMode::AutoAllow),
             workspace: None,
         };
-        let _profile = ctx.resolve_effective(&base, &overlay);
+        let _profile = ctx.resolve_effective(
+            &base,
+            &overlay,
+            crate::profiles::persona::PersonaSource::Profile(&base.id),
+        );
 
         let (model, allow) = seen.lock().unwrap().clone().expect("resolver ran");
         assert_eq!(model, "override-model", "overlay model override is applied");
@@ -404,7 +418,11 @@ mod tests {
         );
 
         // An empty overlay is a pure inherit: the resolver sees the profile's own model untouched.
-        let _ = ctx.resolve_effective(&base, &SessionOverlay::default());
+        let _ = ctx.resolve_effective(
+            &base,
+            &SessionOverlay::default(),
+            crate::profiles::persona::PersonaSource::Profile(&base.id),
+        );
         assert_eq!(seen.lock().unwrap().clone().unwrap().0, "base-model");
     }
 

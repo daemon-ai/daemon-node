@@ -8,7 +8,10 @@
 //! - [`registry`] builds the session/background tool registries and the §20 tunables overlay.
 //! - [`resolve`] is the one [`SessionFactoryCtx`](resolve::SessionFactoryCtx) resolution path shared
 //!   by the live session surface and the durable rehydration resolver.
+//! - [`persona`] resolves every engine's Identity slot (`PersonaStore` SOUL.md / inline persona /
+//!   built-in role library).
 
 pub(crate) mod dress;
+pub(crate) mod persona;
 pub(crate) mod registry;
 pub(crate) mod resolve;

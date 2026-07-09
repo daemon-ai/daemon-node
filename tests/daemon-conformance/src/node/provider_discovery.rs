@@ -116,6 +116,7 @@ fn assemble_with_catalog(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     node
 }
@@ -299,6 +300,7 @@ async fn projector_records_are_excluded_and_activate_rejects() {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
 
     // The local chat offer carries the text model but never the projector.
@@ -379,6 +381,7 @@ async fn unconfigured_node_still_lists_providers() {
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     let providers = node.provider_catalog().await;
     let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();

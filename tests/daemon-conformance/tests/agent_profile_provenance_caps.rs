@@ -127,6 +127,7 @@ fn assemble_compose_node(
             ..Default::default()
         },
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, store, handle)
 }

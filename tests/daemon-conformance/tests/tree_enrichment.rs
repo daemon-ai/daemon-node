@@ -67,6 +67,7 @@ fn assemble_with_profiles(
         reaper: Default::default(),
         orchestrate: Default::default(),
         foreign_gateway: None,
+        prompt: Default::default(),
     });
     (node, handle)
 }
