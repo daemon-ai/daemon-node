@@ -1716,6 +1716,93 @@ async fn rate_limit_retries_with_backoff_then_completes() {
     );
 }
 
+/// A provider that, on its first call, cancels the shared turn token (simulating a `/stop` that
+/// arrives while a transient stream error is being handled) and returns a retryable transport
+/// failure; any later call would succeed — but must never be reached once interrupted.
+struct CancelThenTransient {
+    cancel: CancellationToken,
+    calls: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl Provider for CancelThenTransient {
+    fn capabilities(&self) -> Capabilities {
+        test_caps()
+    }
+    async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // /stop arrives while the transient error is being handled.
+            self.cancel.cancel();
+            Err(Failure::TransientTransport(
+                "connection reset by /stop".into(),
+            ))
+        } else {
+            Ok(ok_output("should never retry after an interrupt"))
+        }
+    }
+}
+
+// parity: test_stream_interrupt_retry.py::TestStreamInterruptBeforeRetry::test_interrupt_prevents_stream_retry (tests/run_agent/test_stream_interrupt_retry.py:45)
+//
+// Hermes' `_interruptible_streaming_api_call` checks `_interrupt_requested` at the TOP of its retry
+// loop, so a `/stop` that lands while a transient stream error is being handled aborts immediately
+// instead of opening a fresh connection (and burning retry-cycle × read-timeout latency). Ported to
+// the engine's §8 recovery loop (`call_model`): a cancellation observed between attempts aborts the
+// loop before it acquires a fresh credential or re-invokes the provider.
+#[tokio::test]
+async fn parity_gap_interrupt_aborts_model_retry_loop() {
+    use crate::credentials::CredentialProvider;
+    let control = TurnControl::new();
+    let creds = Arc::new(TwoProfileCreds {
+        acquired: std::sync::Mutex::new(Vec::new()),
+    });
+    let provider = Arc::new(CancelThenTransient {
+        cancel: control.cancel_token(),
+        calls: AtomicU64::new(0),
+    });
+    let mut engine = Engine::fresh(
+        SessionId::new("stream-int"),
+        SystemPrompt::new("test"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_credentials(
+        creds.clone() as Arc<dyn CredentialProvider>,
+        ProfileRef::new("primary"),
+    )
+    .with_config(Config {
+        // Tiny backoff so, without the fix, the doomed retry is reached fast (not a 2min sleep).
+        model_backoff_base_ms: 1,
+        model_backoff_max_ms: 2,
+        model_max_retries: 3,
+        ..Config::default()
+    });
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &control)
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
+        _ => panic!("an interrupt during a transient error must abort the retry loop"),
+    }
+    // The retry after the interrupt must do NO work: it must not acquire a fresh credential (the
+    // primary was acquired exactly once, for the first, failed attempt) …
+    assert_eq!(
+        creds.acquired.lock().unwrap().clone(),
+        vec!["primary".to_string()],
+        "the interrupted retry must not acquire a fresh credential"
+    );
+    // … and the provider is not re-invoked for a doomed fresh attempt.
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "the interrupted retry must not re-invoke the provider"
+    );
+}
+
 /// A `ContextOverflow` compacts the conversation once (the §8 -> §10 tie-in) then retries and
 /// completes; the conversation is shorter afterwards.
 #[tokio::test]
