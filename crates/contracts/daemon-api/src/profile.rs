@@ -4,9 +4,11 @@
 //! Profile contract types: the serializable bundle a GUI creates/edits to configure an agent.
 //!
 //! A [`ProfileSpec`] is the full configuration bundle for an agent (the analogue of a hermes
-//! `HERMES_HOME` `config.yaml`): which provider + model it talks to, its persona, the tools it may
-//! use, its budget/engine tunables, its context/memory backends, and the credential it acquires
-//! capabilities from. The host resolves a `ProfileSpec` into an engine-construction `EngineProfile`
+//! `HERMES_HOME` `config.yaml`): which provider + model it talks to, the tools it may use, its
+//! budget/engine tunables, its context/memory backends, and the credential it acquires
+//! capabilities from. The persona is NOT a spec field: it lives node-side (per-profile SOUL.md)
+//! and is read/edited over the wire only through `SoulGet`/`SoulSet` (wire v36) — the composed
+//! system prompt itself is never wire-visible. The host resolves a `ProfileSpec` into an engine-construction `EngineProfile`
 //! at session open (`daemon-host`), so a GUI can create/select/edit a profile without restarting
 //! the node. There is no separate runtime-config surface: a profile is edited in full via
 //! `ProfileUpdate`, and a live session is adjusted via a `SessionOverlay`.
@@ -108,9 +110,10 @@ impl BoundAccount {
 
 /// The full agent configuration bundle a GUI creates/edits and a session binds to.
 ///
-/// One profile is the unit a GUI manages: it names a provider + model, the persona system prompt,
-/// the tool allowlist, the engine budget/tunables, the context/memory backends, and the credential
-/// it acquires from. The host resolves it into an `EngineProfile` per session.
+/// One profile is the unit a GUI manages: it names a provider + model, the tool allowlist, the
+/// engine budget/tunables, the context/memory backends, and the credential it acquires from. The
+/// host resolves it into an `EngineProfile` per session. The persona (SOUL.md) is node-owned and
+/// edited via `SoulGet`/`SoulSet`, never as a spec field (wire v36).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileSpec {
@@ -125,9 +128,6 @@ pub struct ProfileSpec {
     /// Optional provider API base-URL override (`None` = the provider default endpoint).
     #[serde(default)]
     pub base_url: Option<String>,
-    /// The persona / system prompt this profile's engine runs under.
-    #[serde(default)]
-    pub system_prompt: String,
     /// The tools this profile's engine may use. `None` = the full node toolset; `Some(list)` =
     /// only those tool names (an allowlist).
     #[serde(default)]
@@ -184,7 +184,7 @@ pub struct ProfileSpec {
 }
 
 impl ProfileSpec {
-    /// A minimal profile over a provider + model, with empty persona and full toolset.
+    /// A minimal profile over a provider + model, with the full toolset.
     pub fn new(
         id: impl Into<String>,
         provider: ProviderSelector,
@@ -195,7 +195,6 @@ impl ProfileSpec {
             provider,
             model: model.into(),
             base_url: None,
-            system_prompt: String::new(),
             tool_allowlist: None,
             budget: BudgetSpec::default(),
             tunables: EngineTunables::default(),
@@ -213,14 +212,16 @@ impl ProfileSpec {
 
     /// Materialize a full [`ProfileSpec`] from an ad-hoc [`InlineProfileSpec`](daemon_protocol::InlineProfileSpec)
     /// under a synthetic `id` — the Phase 1 inline-sub-agent seam. The inline spec carries only the
-    /// security-relevant subset (persona + tool allowlist + engine + foreign backend + model); every
-    /// other field takes the `ProfileSpec::new` default (provider `Mock`, no credential/budget), so a
+    /// security-relevant subset (tool allowlist + engine + foreign backend + model); every other
+    /// field takes the `ProfileSpec::new` default (provider `Mock`, no credential/budget), so a
     /// Core inline sub-agent resolves through the ordinary `resolve_effective` path and a Foreign one
     /// routes to the foreign incarnation. It is never persisted in the profile store (the child binds
     /// `bound_profile = None`); the id is only its transient engine identity.
+    // TODO(prompt-arch Lane E): the inline spec's persona (`InlineProfileSpec.system_prompt`,
+    // renamed `persona`) resolves node-side via PersonaSource::Inline — it left `ProfileSpec` at
+    // wire v36 and no longer maps through this constructor.
     pub fn from_inline(id: impl Into<String>, inline: &daemon_protocol::InlineProfileSpec) -> Self {
         Self {
-            system_prompt: inline.system_prompt.clone(),
             tool_allowlist: inline.tool_allowlist.clone(),
             model: inline.model.clone(),
             engine: inline.engine.clone(),
@@ -267,6 +268,11 @@ pub struct Distribution {
     /// Optional free-form origin label (who/where it came from).
     #[serde(default)]
     pub source: Option<String>,
+    /// The profile's persona (SOUL.md) text at export time (wire v36). `None` when the exporting
+    /// node hosts no persona management or the profile runs a Foreign engine (its agent owns its
+    /// prompt — there is no persona). USER.md is personal data and NEVER travels in a distribution.
+    #[serde(default)]
+    pub soul: Option<String>,
 }
 
 /// One row of a profile's curator listing ([`crate::ProfileApi::curator_list`]): a discovered or

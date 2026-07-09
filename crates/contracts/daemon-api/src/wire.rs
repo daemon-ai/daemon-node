@@ -318,6 +318,20 @@ pub enum ApiRequest {
         /// The revision sequence to revert to.
         seq: u64,
     },
+    /// [`ProfileApi::soul_get`] — read a profile's persona (SOUL.md) text (wire v36).
+    SoulGet {
+        /// The profile id whose persona to read.
+        id: String,
+    },
+    /// [`ProfileApi::soul_set`] — replace a profile's persona (SOUL.md) text (wire v36). The node
+    /// validates/scans/caps + revision-logs; rejected for a Foreign-engine profile (its agent owns
+    /// its own prompt — there is no persona to set).
+    SoulSet {
+        /// The profile id whose persona to set.
+        id: String,
+        /// The new persona text.
+        text: String,
+    },
     /// [`ProfileApi::skill_history`].
     SkillHistory {
         /// The skill (bundle) name whose history to list.
@@ -1167,6 +1181,8 @@ pub enum ApiResponse {
     Profiles(Vec<ProfileInfo>),
     /// One profile's full spec, or `None` if unknown / no active default (profile_get).
     Profile(Option<ProfileSpec>),
+    /// A profile's persona (SOUL.md) text (soul_get; wire v36).
+    SoulText(String),
     /// A redacted credential listing.
     Credentials(Vec<CredentialInfo>),
     /// A begun interactive-auth flow handle (`auth_begin`).
