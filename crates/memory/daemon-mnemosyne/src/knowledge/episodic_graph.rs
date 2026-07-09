@@ -519,4 +519,23 @@ mod tests {
         let facts = extract_facts(content, "m1");
         assert!(facts.len() <= MAX_FACTS_PER_MEMORY, "{}", facts.len());
     }
+
+    // parity: test_e2_remember_batch_enrichment.py::TestReviewHardening::test_extract_facts_caps_long_content (tests/test_e2_remember_batch_enrichment.py:469)
+    #[test]
+    fn extract_facts_truncates_pathological_long_content() {
+        // ~12KB of pattern-rich content: the input is truncated to the 4096-char window and the
+        // result stays capped, so adversarial long inputs can't drive regex backtracking over
+        // the full text (the batch-ingest hardening).
+        let long_content = "Anna is a developer. ".repeat(600);
+        assert!(
+            long_content.len() > EXTRACT_FACTS_MAX_CONTENT_LEN,
+            "test setup: content must exceed the truncation window"
+        );
+        let facts = extract_facts(&long_content, "m1");
+        assert!(
+            !facts.is_empty(),
+            "the pattern still extracts within the window"
+        );
+        assert!(facts.len() <= MAX_FACTS_PER_MEMORY, "{}", facts.len());
+    }
 }

@@ -234,4 +234,27 @@ mod tests {
         assert_eq!(s4, Status::Created);
         assert_eq!(r4.version, 3);
     }
+
+    // PARITY: Mnemosyne tests/test_canonical.py::TestOwnerIsolation::test_same_slot_different_owners_coexist
+    // PARITY: Mnemosyne tests/test_canonical.py::TestOwnerIsolation::test_list_is_owner_scoped
+    #[test]
+    fn canonical_slots_are_owner_isolated() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        // The same (category, name) slot under two owners coexists without collision.
+        remember(&c, "jessi", "identity", "name", "I am Jessi.", "", 1.0).unwrap();
+        remember(&c, "atlas", "identity", "name", "I am Atlas.", "", 1.0).unwrap();
+        assert_eq!(
+            current(&c, "jessi", Some("identity"), Some("name")).unwrap()[0].body,
+            "I am Jessi."
+        );
+        assert_eq!(
+            current(&c, "atlas", Some("identity"), Some("name")).unwrap()[0].body,
+            "I am Atlas."
+        );
+        // Listing an owner never leaks another owner's slots.
+        let jessi_all = current(&c, "jessi", None, None).unwrap();
+        assert_eq!(jessi_all.len(), 1);
+        assert!(jessi_all.iter().all(|r| r.owner_id == "jessi"));
+    }
 }

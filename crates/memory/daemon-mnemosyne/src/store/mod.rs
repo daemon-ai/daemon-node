@@ -382,6 +382,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // parity: test_consolidate_fact_concurrency.py::TestReviewHardening::test_consolidator_sets_wal_and_busy_timeout (tests/test_consolidate_fact_concurrency.py:399)
+    // parity: test_consolidate_fact_sibling_races.py::TestReviewHardening::test_consolidator_sets_wal_and_busy_timeout (tests/test_consolidate_fact_sibling_races.py:342)
+    #[test]
+    fn store_sets_wal_and_busy_timeout() {
+        // Both pragmas are the contention contract for BEGIN IMMEDIATE writers: without WAL the
+        // write lock blocks readers too; without busy_timeout a second writer fails instantly.
+        let dir = std::env::temp_dir().join(format!("mnemosyne-pragma-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("pragma_check.db")).expect("open");
+        let conn = store.conn.lock().unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
+        let timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+            .unwrap();
+        assert!(timeout > 0, "busy_timeout must be set, got {timeout}");
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn schema_applies_cleanly() {
         let store = Store::open_in_memory().expect("open");

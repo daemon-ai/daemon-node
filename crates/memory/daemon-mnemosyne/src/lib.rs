@@ -54,6 +54,6 @@ pub mod tools;
 pub mod util;
 
 pub use config::{MnemosyneConfig, RecallMode};
-pub use engine::{Engine, MemoryRow, RememberArgs, Tier};
+pub use engine::{BatchItem, Engine, MemoryRow, RememberArgs, RememberBatchArgs, Tier};
 pub use error::{Error, Result};
 pub use provider::{command_specs, MnemosyneProvider};

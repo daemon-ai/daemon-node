@@ -113,6 +113,15 @@ pub struct MnemosyneConfig {
     pub binary_bonus: bool,
     /// Cross-tier summary dedup in recall finalize (`MNEMOSYNE_CROSS_TIER_DEDUP=0` disables).
     pub cross_tier_dedup: bool,
+    /// Polyphonic vector voice (`MNEMOSYNE_VOICE_VECTOR=0` disables; default on,
+    /// `polyphonic_recall.py` `_vector_voice`).
+    pub voice_vector: bool,
+    /// Polyphonic graph voice (`MNEMOSYNE_VOICE_GRAPH=0` disables; default on).
+    pub voice_graph: bool,
+    /// Polyphonic fact voice (`MNEMOSYNE_VOICE_FACT=0` disables; default on).
+    pub voice_fact: bool,
+    /// Polyphonic temporal voice (`MNEMOSYNE_VOICE_TEMPORAL=0` disables; default on).
+    pub voice_temporal: bool,
     /// Merge structured `fact_recall` hits into recall output (`MNEMOSYNE_FACT_RECALL_ENABLED=1`
     /// enables; default off, `beam.py` L6152).
     pub fact_recall_enabled: bool,
@@ -249,6 +258,10 @@ impl Default for MnemosyneConfig {
             fact_bonus: true,
             binary_bonus: true,
             cross_tier_dedup: true,
+            voice_vector: true,
+            voice_graph: true,
+            voice_fact: true,
+            voice_temporal: true,
             fact_recall_enabled: false,
             lenient_fact_match: false,
             temporal_halflife_hours: 24.0,

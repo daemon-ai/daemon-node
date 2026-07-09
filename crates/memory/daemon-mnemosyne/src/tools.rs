@@ -14,8 +14,8 @@
 
 use crate::embeddings::Embedder;
 use crate::engine::{
-    CanonicalRemember, Engine, GraphLink, GroupSummary, RecallReq, RememberArgs, SleepGroup,
-    TripleAdd, TripleEnd, TripleQuery, ValidateArgs,
+    BatchItem, CanonicalRemember, Engine, GraphLink, GroupSummary, RecallReq, RememberArgs,
+    RememberBatchArgs, SleepGroup, TripleAdd, TripleEnd, TripleQuery,
 };
 use crate::extract::Extractor;
 use daemon_core::tools::ToolDef;
@@ -39,6 +39,10 @@ pub fn defs() -> Vec<ToolDef> {
             r#"{"type":"object","properties":{"content":{"type":"string"},"importance":{"type":"number"},"source":{"type":"string"},"scope":{"type":"string"},"valid_until":{"type":"string"},"extract_entities":{"type":"boolean"},"extract":{"type":"boolean"},"metadata":{"type":"object"},"veracity":{"type":"string"}},"required":["content"]}"#,
         ),
         def(
+            "mnemosyne_remember_batch",
+            r#"{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"source":{"type":"string"},"importance":{"type":"number"},"metadata":{"type":"object"},"veracity":{"type":"string"}},"required":["content"]}},"veracity":{"type":"string"},"force_veracity":{"type":"boolean"},"trust_tier":{"type":"string"},"extract_entities":{"type":"boolean"},"extract":{"type":"boolean"}},"required":["items"]}"#,
+        ),
+        def(
             "mnemosyne_recall",
             r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"temporal_weight":{"type":"number"},"query_time":{"type":"string"},"temporal_halflife":{"type":"number"},"vec_weight":{"type":"number"},"fts_weight":{"type":"number"},"importance_weight":{"type":"number"},"from_date":{"type":"string"},"to_date":{"type":"string"},"source":{"type":"string"},"topic":{"type":"string"},"veracity":{"type":"string"},"memory_type":{"type":"string"},"author_id":{"type":"string"},"author_type":{"type":"string"},"channel_id":{"type":"string"}},"required":["query"]}"#,
         ),
@@ -60,7 +64,7 @@ pub fn defs() -> Vec<ToolDef> {
         ),
         def(
             "mnemosyne_validate",
-            r#"{"type":"object","properties":{"id":{"type":"string"},"action":{"type":"string"},"validator":{"type":"string"},"new_content":{"type":"string"},"note":{"type":"string"}},"required":["id","action"]}"#,
+            r#"{"type":"object","properties":{"memory_id":{"type":"string"},"action":{"type":"string","enum":["attest","update","invalidate","delete"]},"validator":{"type":"string"},"new_content":{"type":"string"},"note":{"type":"string"},"bank":{"type":"string","enum":["private","surface"]}},"required":["memory_id","action"]}"#,
         ),
         def(
             "mnemosyne_sleep",
@@ -384,6 +388,68 @@ pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
             })
             .to_string()
         }
+        "mnemosyne_remember_batch" => {
+            // High-throughput batch ingest (`beam.py` `remember_batch` L3047). Python exposes it
+            // as a library call on `BeamMemory`; the Rust node reaches it through this dispatch.
+            // Embedding happens per item at this async seam (Python's inline `_embeddings.embed`
+            // block), as does the opt-in per-row LLM fact extraction.
+            let Some(items_json) = args.get("items").and_then(|v| v.as_array()) else {
+                return json!({"error": "items is required"}).to_string();
+            };
+            let mut items: Vec<BatchItem> = Vec::with_capacity(items_json.len());
+            for item in items_json {
+                let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    return json!({"error": "each item requires content"}).to_string();
+                }
+                items.push(BatchItem {
+                    content: content.to_string(),
+                    source: item.get("source").and_then(|v| v.as_str()).map(String::from),
+                    importance: item.get("importance").and_then(|v| v.as_f64()),
+                    metadata: item.get("metadata").filter(|m| m.is_object()).cloned(),
+                    veracity: item
+                        .get("veracity")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    vector: embedder.embed_query(content).await,
+                    ..Default::default()
+                });
+            }
+            let batch_args = RememberBatchArgs {
+                veracity: s(&args, "veracity").map(String::from),
+                force_veracity: args
+                    .get("force_veracity")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                trust_tier: s(&args, "trust_tier").unwrap_or("IMPORTED").to_string(),
+                extract_entities: args
+                    .get("extract_entities")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                model: embedder.model().unwrap_or("").to_string(),
+            };
+            let extract = args.get("extract").and_then(|v| v.as_bool()).unwrap_or(false);
+            match engine.remember_batch(&items, &batch_args) {
+                Ok(ids) => {
+                    // Opt-in LLM fact extraction fires once per row (`beam.py` L3287-L3289),
+                    // at this async seam like the single-remember path.
+                    if extract && extractor.available() {
+                        for (item, id) in items.iter().zip(&ids) {
+                            if let Some(extracted) = extractor.extract(&item.content).await {
+                                let _ = engine.ingest_extracted(id, &extracted);
+                            }
+                        }
+                    }
+                    json!({
+                        "status": "stored_batch",
+                        "count": ids.len(),
+                        "memory_ids": ids,
+                    })
+                    .to_string()
+                }
+                Err(e) => err(e),
+            }
+        }
         "mnemosyne_recall" => {
             let query = s(&args, "query").unwrap_or("");
             if query.is_empty() {
@@ -642,15 +708,73 @@ pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
             }
         }
         "mnemosyne_validate" => {
-            match engine.validate(&ValidateArgs {
-                id: s(&args, "id").unwrap_or(""),
-                action: s(&args, "action").unwrap_or("confirm"),
-                validator: s(&args, "validator"),
-                new_content: s(&args, "new_content"),
-                note: s(&args, "note"),
-            }) {
-                Ok(found) => json!({"status": "ok", "found": found}).to_string(),
-                Err(e) => err(e),
+            // Collaborative attestation over either bank (`_handle_validate`, `__init__.py`
+            // L2091-L2207): any agent can attest/update/invalidate/delete any memory; the
+            // original author_id is preserved and the ring buffer keeps the last 3 validations.
+            let memory_id = s(&args, "memory_id").or_else(|| s(&args, "id")).unwrap_or("");
+            let action = s(&args, "action").unwrap_or("");
+            let bank = s(&args, "bank").unwrap_or("private");
+            let new_content = s(&args, "new_content").filter(|c| !c.is_empty());
+            let note = s(&args, "note").filter(|n| !n.is_empty());
+            if memory_id.is_empty() {
+                return json!({"error": "memory_id is required"}).to_string();
+            }
+            if !matches!(action, "attest" | "update" | "invalidate" | "delete") {
+                return json!({"error": format!("unknown action: {action}")}).to_string();
+            }
+            if !matches!(bank, "private" | "surface") {
+                return json!({"error": format!("unknown bank: {bank}")}).to_string();
+            }
+            if action == "update" && new_content.is_none() {
+                return json!({"error": "new_content is required for action='update'"}).to_string();
+            }
+            // Validator identity: explicit arg, else the configured author identity — the Rust
+            // analog of Python's `self._agent_identity` — else "unknown".
+            let validator = s(&args, "validator")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .or_else(|| engine.config().author_id.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let target = if bank == "surface" {
+                match cx.surface() {
+                    Ok(sf) => sf,
+                    Err(e) => return e,
+                }
+            } else {
+                engine
+            };
+            match target.validate_action(memory_id, action, &validator, new_content, note) {
+                Ok(Some(outcome)) => {
+                    // Tool-level audit into the private provider log, bank-stamped (`_audit_event`).
+                    engine.audit_tool(
+                        &format!("validate_{action}"),
+                        Some(memory_id),
+                        bank,
+                        "mnemosyne_validate",
+                        None,
+                    );
+                    json!({
+                        "status": format!("validation_{action}"),
+                        "memory_id": memory_id,
+                        "bank": bank,
+                        "validator": validator,
+                        "author_id": outcome.author_id,
+                        "previous_content": outcome.previous_content.chars().take(200).collect::<String>(),
+                    })
+                    .to_string()
+                }
+                Ok(None) => json!({
+                    "error": "memory_not_found",
+                    "memory_id": memory_id,
+                    "bank": bank,
+                })
+                .to_string(),
+                Err(e) => json!({
+                    "error": "validation_failed",
+                    "reason": e.to_string(),
+                    "memory_id": memory_id,
+                })
+                .to_string(),
             }
         }
         "mnemosyne_sleep" => {
