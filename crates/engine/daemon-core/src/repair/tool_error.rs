@@ -110,3 +110,146 @@ mod tests {
         assert!(out.len() < 5_000);
     }
 }
+
+/// Parity tests ported from hermes' `_sanitize_tool_error` (`model_tools.py:599`) and its test
+/// matrix (`tests/test_sanitize_tool_error.py`). The Python helper strips structural framing tokens
+/// (XML role tags, CDATA, markdown fences) from a tool error string as prompt-injection defense.
+/// The Rust port already strips ANSI/control bytes and bounds length; these tests document the
+/// missing role-tag/CDATA/fence stripping.
+///
+/// Adaptation: hermes wraps the result in a `[TOOL_ERROR] ` envelope and caps at 2000 chars. The
+/// Rust port keeps its own envelope (no prefix, 4096-byte cap, separate `wrap_untrusted_tool_result`
+/// fence), so parity here is on the *stripping* behavior, not the Python envelope — the envelope
+/// tests are recorded `out-of-scope` in PARITY.md.
+///
+/// `parity_gap_*` tests assert the desired Python behavior and are expected to FAIL until the
+/// strippers are ported; plain-named tests port behavior the Rust port already has and MUST PASS.
+#[cfg(test)]
+mod parity {
+    use super::*;
+
+    // ── Role/XML tag stripping (gaps) ─────────────────────────────────────
+
+    // parity: test_sanitize_tool_error.py::TestRoleTagStripping::test_strips_tool_call_tags (tests/test_sanitize_tool_error.py:16)
+    #[test]
+    fn parity_gap_strips_tool_call_tags() {
+        let out = sanitize_tool_error("bad <tool_call>injected</tool_call> happened");
+        assert!(!out.contains("<tool_call>"));
+        assert!(!out.contains("</tool_call>"));
+        assert!(out.contains("bad injected happened"));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestRoleTagStripping::test_strips_function_call_tags (tests/test_sanitize_tool_error.py:22)
+    #[test]
+    fn parity_gap_strips_function_call_tags() {
+        let out = sanitize_tool_error("<function_call>x</function_call>");
+        assert!(!out.contains("<function_call>"));
+        assert!(!out.contains("</function_call>"));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestRoleTagStripping::test_strips_role_tags (tests/test_sanitize_tool_error.py:27)
+    #[test]
+    fn parity_gap_strips_role_tags() {
+        for tag in [
+            "system",
+            "assistant",
+            "user",
+            "result",
+            "response",
+            "output",
+            "input",
+        ] {
+            let raw = format!("prefix <{tag}>hi</{tag}> suffix");
+            let out = sanitize_tool_error(&raw);
+            assert!(
+                !out.contains(&format!("<{tag}>")),
+                "failed to strip <{tag}>"
+            );
+            assert!(
+                !out.contains(&format!("</{tag}>")),
+                "failed to strip </{tag}>"
+            );
+        }
+    }
+
+    // parity: test_sanitize_tool_error.py::TestRoleTagStripping::test_role_tag_strip_is_case_insensitive (tests/test_sanitize_tool_error.py:35)
+    #[test]
+    fn parity_gap_role_tag_strip_is_case_insensitive() {
+        let out = sanitize_tool_error("<TOOL_CALL>x</Tool_Call>");
+        assert!(!out.contains('<'));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestRoleTagStripping::test_unrelated_xml_kept (tests/test_sanitize_tool_error.py:39)
+    #[test]
+    fn unrelated_xml_kept() {
+        // Only the role-like tag whitelist is stripped, not all XML.
+        let out = sanitize_tool_error("Error parsing <ParseError>line 5</ParseError>");
+        assert!(out.contains("<ParseError>"));
+    }
+
+    // ── CDATA stripping (gaps) ────────────────────────────────────────────
+
+    // parity: test_sanitize_tool_error.py::TestCDATAStripping::test_strips_cdata (tests/test_sanitize_tool_error.py:46)
+    #[test]
+    fn parity_gap_strips_cdata() {
+        let out = sanitize_tool_error("error: <![CDATA[malicious]]> here");
+        assert!(!out.contains("<![CDATA["));
+        assert!(!out.contains("]]>"));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestCDATAStripping::test_strips_multiline_cdata (tests/test_sanitize_tool_error.py:51)
+    #[test]
+    fn parity_gap_strips_multiline_cdata() {
+        let out = sanitize_tool_error("a\n<![CDATA[line1\nline2]]>\nb");
+        assert!(!out.contains("CDATA"));
+        assert!(out.contains('a') && out.contains('b'));
+    }
+
+    // ── Markdown code-fence stripping (gaps) ──────────────────────────────
+
+    // parity: test_sanitize_tool_error.py::TestCodeFenceStripping::test_strips_leading_fence_with_lang (tests/test_sanitize_tool_error.py:58)
+    #[test]
+    fn parity_gap_strips_leading_fence_with_lang() {
+        let out = sanitize_tool_error("```json\n{\"x\": 1}");
+        assert!(!out.starts_with("```"));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestCodeFenceStripping::test_strips_trailing_fence (tests/test_sanitize_tool_error.py:62)
+    #[test]
+    fn parity_gap_strips_trailing_fence() {
+        let out = sanitize_tool_error("payload\n```");
+        assert!(!out.trim_end().ends_with("```"));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestCodeFenceStripping::test_strips_bare_fence (tests/test_sanitize_tool_error.py:66)
+    #[test]
+    fn parity_gap_strips_bare_fence() {
+        let out = sanitize_tool_error("```\nstuff");
+        assert!(!out.split('\n').next().unwrap().contains("```"));
+    }
+
+    // ── Truncation / passthrough (already handled — port for coverage) ────
+
+    // parity: test_sanitize_tool_error.py::TestTruncation::test_does_not_truncate_short_input (tests/test_sanitize_tool_error.py:80)
+    #[test]
+    fn does_not_truncate_short_input() {
+        let out = sanitize_tool_error("short error");
+        assert!(!out.contains("..."));
+        assert!(out.contains("short error"));
+    }
+
+    // parity: test_sanitize_tool_error.py::TestEnvelope::test_empty_input (tests/test_sanitize_tool_error.py:92)
+    #[test]
+    fn empty_input_returns_empty() {
+        // Adaptation: hermes returns the `[TOOL_ERROR] ` envelope; the Rust port has no prefix, so
+        // an empty error sanitizes to an empty string.
+        assert_eq!(sanitize_tool_error(""), "");
+    }
+
+    // parity: test_sanitize_tool_error.py::TestEnvelope::test_preserves_normal_error_text (tests/test_sanitize_tool_error.py:96)
+    #[test]
+    fn preserves_normal_error_text() {
+        let msg = "Error executing read_file: FileNotFoundError: /tmp/missing";
+        assert!(sanitize_tool_error(msg).contains(msg));
+    }
+}
