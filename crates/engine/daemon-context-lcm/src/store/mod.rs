@@ -4075,6 +4075,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- Wave 2 theme 9: concurrent append serialization -------------------------------------
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_write_lock_serializes_concurrent_appends
+    // The Rust `Store` serializes every write behind `conn: Mutex<Connection>` (the analog of
+    // Python's `_write_lock` RLock). Heavy concurrent single + batch appends from many `std::thread`
+    // workers must complete without errors and produce the exact expected row count — no lost or
+    // duplicated rows from interleaving.
+    #[test]
+    fn concurrent_appends_serialize_without_losing_rows() {
+        use std::sync::Arc;
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        const N_THREADS: usize = 8;
+        const PER_THREAD_SINGLES: usize = 25;
+        const PER_THREAD_BATCH_SIZE: usize = 5;
+        const PER_THREAD_BATCHES: usize = 5;
+
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|thread_id| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || -> Result<()> {
+                    let session = format!("sess-t{thread_id}");
+                    for i in 0..PER_THREAD_SINGLES {
+                        store.append_batch(
+                            &session,
+                            &[NewMessage {
+                                role: "user".into(),
+                                content: Some(format!("single-{thread_id}-{i}")),
+                                token_estimate: 1,
+                                ..NewMessage::default()
+                            }],
+                            1.0,
+                        )?;
+                    }
+                    for b in 0..PER_THREAD_BATCHES {
+                        let msgs: Vec<NewMessage> = (0..PER_THREAD_BATCH_SIZE)
+                            .map(|j| NewMessage {
+                                role: "user".into(),
+                                content: Some(format!("batch-{thread_id}-{b}-{j}")),
+                                token_estimate: 1,
+                                ..NewMessage::default()
+                            })
+                            .collect();
+                        store.append_batch(&session, &msgs, 1.0)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join()
+                .expect("worker thread panicked")
+                .expect("append failed");
+        }
+
+        let expected =
+            N_THREADS * (PER_THREAD_SINGLES + PER_THREAD_BATCHES * PER_THREAD_BATCH_SIZE);
+        let actual: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual as usize, expected,
+            "concurrent appends lost or duplicated rows — broken serialization"
+        );
+    }
+
     /// `scan_fts_repair` (`_scan_fts_repair`, `LCM:command.py:665-701`) reports a desynced index
     /// without touching it; a forced `repair_fts` then heals it.
     #[test]
