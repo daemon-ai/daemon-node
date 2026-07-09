@@ -16,6 +16,9 @@
 //!   `all` ⊂ `context` ⊂ `strict`, invisible-unicode detection, and the whole-content
 //!   `[BLOCKED: ...]` replacement applied wherever untrusted text enters the system prompt.
 //! - [`truncate`] — the 20k-char head/tail cap (`agent/prompt_builder.py::_truncate_content`).
+//! - [`guidance`] — gated `Option<String>` block builders: core task-completion guidance,
+//!   tool-use enforcement, model-family operational guidance, environment hints, transport
+//!   hints, and the date-only stamp.
 //!
 //! Cache discipline: every producer here is deterministic from its inputs (no clocks, no env
 //! vars, no ambient config), so a caller that snapshots the outputs once per session gets a
@@ -23,9 +26,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod guidance;
 pub mod scan;
 pub mod truncate;
 
+pub use guidance::{
+    core_agentic_guidance, date_stamp, environment_hints, model_family_guidance, tool_use_guidance,
+    transport_hints, EnvironmentInput, ToolUseMode, TransportOrigin,
+    GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, TASK_COMPLETION_GUIDANCE,
+    TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS,
+};
 pub use scan::{
     first_threat_message, scan_context_content, scan_for_threats, Scope, INVISIBLE_CHARS,
 };
