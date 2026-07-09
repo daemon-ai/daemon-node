@@ -1129,6 +1129,24 @@ pub enum ApiRequest {
     /// read-only snapshot (newest first); the client re-lists on a
     /// [`NodeEvent::NotificationsChanged`] pointer. Answered by [`ApiResponse::Notifications`].
     NotificationList,
+
+    // -- file transfer (W2-H; wire vNEXT) --------------------------------------------------------
+    /// [`ControlApi::ft_send`] — send a file out over a transport (`SupportsFileTransfer::send`).
+    /// Answered by [`ApiResponse::Ok`]. wire vNEXT.
+    FtSend {
+        /// The owning transport instance.
+        transport: TransportId,
+        /// The transfer to send.
+        transfer: FileTransfer,
+    },
+    /// [`ControlApi::ft_receive`] — receive a file over a transport
+    /// (`SupportsFileTransfer::receive`). Answered by [`ApiResponse::Ok`]. wire vNEXT.
+    FtReceive {
+        /// The owning transport instance.
+        transport: TransportId,
+        /// The transfer to receive.
+        transfer: FileTransfer,
+    },
 }
 
 /// The serializable reflection of an interface result.

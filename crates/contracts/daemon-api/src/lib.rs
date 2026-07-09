@@ -1063,6 +1063,26 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// Send a file out over a transport (`SupportsFileTransfer::send`; wire vNEXT). Default:
+    /// unsupported.
+    async fn ft_send(
+        &self,
+        _transport: TransportId,
+        _transfer: FileTransfer,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("ft_send".into()))
+    }
+
+    /// Receive a file over a transport (`SupportsFileTransfer::receive`; wire vNEXT). Default:
+    /// unsupported.
+    async fn ft_receive(
+        &self,
+        _transport: TransportId,
+        _transfer: FileTransfer,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("ft_receive".into()))
+    }
+
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
     /// Trigger a server-side foreign-agent discovery scan (PATH + well-known locations + the
@@ -3771,14 +3791,23 @@ pub struct FileTransferOps {
     pub receive: bool,
 }
 
-/// File transfer (← `purpleprotocolfiletransfer.h`). Defined; no adapter yet.
+/// File transfer (← `purpleprotocolfiletransfer.h`). The verbs carry `transport` (mirroring every
+/// other feature trait, e.g. [`ConvSendArgs::transport`]) so an adapter can resolve its per-account
+/// client; the [`FileTransfer`] stays a pure domain object.
 #[async_trait]
 pub trait SupportsFileTransfer: Send + Sync {
+    /// The per-verb capability probe (← `implements_send`/`implements_receive`).
     fn supported(&self) -> FileTransferOps;
-    async fn send(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
+    /// Send a file out (← `send_async`/`send_finish`). Default: unsupported.
+    async fn send(&self, _transport: TransportId, _transfer: FileTransfer) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("file_transfer_send".into()))
     }
-    async fn receive(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
+    /// Receive a file (← `receive_async`/`receive_finish`). Default: unsupported.
+    async fn receive(
+        &self,
+        _transport: TransportId,
+        _transfer: FileTransfer,
+    ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("file_transfer_receive".into()))
     }
 }
@@ -4053,14 +4082,83 @@ pub struct ActionMenu {
     pub items: Vec<String>,
 }
 
-/// Minimal file-transfer carrier (← `PurpleFileTransfer`; deferred).
+/// The direction of a [`FileTransfer`] (wire vNEXT). Daemon-native framing of libpurple's
+/// initiator-vs-remote asymmetry (`purple_file_transfer_new_send` sets `initiator = account`;
+/// `purple_file_transfer_new_receive` sets `initiator = remote`).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTransferDirection {
+    /// The node is sending a local file out (`new_send`).
+    #[default]
+    Send,
+    /// The node is receiving a remote file (`new_receive`).
+    Receive,
+}
+
+/// The state of a [`FileTransfer`] (← `PurpleFileTransferState`, `purplefiletransfer.h`; wire
+/// vNEXT). There is no explicit accepted/cancelled state in libpurple — cancellation is a
+/// `GCancellable` + error, modeled here as [`FileTransferState::Failed`] plus an `error` message.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTransferState {
+    /// The transfer is in an unknown state (`*_STATE_UNKNOWN`, the default).
+    #[default]
+    Unknown,
+    /// The transfer is still being negotiated (`*_STATE_NEGOTIATING`).
+    Negotiating,
+    /// The transfer is in progress (`*_STATE_STARTED`).
+    Started,
+    /// The transfer completed successfully (`*_STATE_FINISHED`).
+    Finished,
+    /// The transfer failed (`*_STATE_FAILED`); `error` should carry the reason.
+    Failed,
+}
+
+/// A file transfer (← `PurpleFileTransfer`, `purplefiletransfer.c`). The `name` + content-addressed
+/// `blob` are the original (Wave-1) wire shape; every field below is appended additively with a
+/// serde default (wire vNEXT), so pre-existing payloads decode unchanged. The behavior logic
+/// (constructors, state machine, predicates) lives in [`crate::file_transfer`].
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTransfer {
-    /// The file name.
+    /// The file name (← `filename`; for `new_send`, the local file's base name).
     pub name: String,
-    /// The content-addressed blob.
+    /// The content-addressed blob. For a `Send` this is the local file's content; for a `Receive`
+    /// it is the destination handle (a placeholder hash until the bytes are stored).
     pub blob: BlobRef,
+    /// Send vs. receive (wire vNEXT).
+    #[serde(default)]
+    pub direction: FileTransferDirection,
+    /// The lifecycle state (wire vNEXT).
+    #[serde(default)]
+    pub state: FileTransferState,
+    /// The remote participant (← `remote`; wire vNEXT).
+    #[serde(default)]
+    pub remote: Option<ContactInfo>,
+    /// Who initiated the transfer (← `initiator`; wire vNEXT).
+    #[serde(default)]
+    pub initiator: Option<ContactInfo>,
+    /// The advertised file size in bytes (← `file-size`; kept independent of `blob.size`, as in C;
+    /// wire vNEXT).
+    #[serde(default)]
+    pub file_size: u64,
+    /// Bytes transferred so far — the node-owned progress a thin client renders (wire vNEXT).
+    #[serde(default)]
+    pub transferred: u64,
+    /// The content/media type hint (← `content-type`; wire vNEXT).
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// An optional message sent with the transfer (← `message`; wire vNEXT).
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The failure reason when `state == Failed` (← the `error` `GError`, rendered as text; wire
+    /// vNEXT).
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The remote content locator a `receive` fetches from (e.g. a Matrix `mxc://` URI);
+    /// protocol-opaque, daemon-native (wire vNEXT).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5371,3 +5469,6 @@ pub use notify::*;
 
 mod request;
 pub use request::*;
+
+mod file_transfer;
+pub use file_transfer::*;

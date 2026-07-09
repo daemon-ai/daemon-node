@@ -31,14 +31,14 @@ use daemon_api::{
     from_cbor, to_cbor, AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiError,
     ChannelJoinDetails, ConnectionState, ContactInfo, ContactPermission, ConvSendArgs,
     ConversationInfo, ConversationMember, ConversationOps, ConversationType,
-    CreateConversationDetails, MemberInviteArgs, MemberRemoveArgs, MemberRole, MembershipOps,
-    MessagingProtocol, NodeApi, Participant, Presence, PresenceState, RosterOps,
-    SupportsConversations, SupportsMembership, SupportsRoster, TransportAdapter,
-    TransportInstanceInfo, TypingState,
+    CreateConversationDetails, FileTransfer, FileTransferOps, MemberInviteArgs, MemberRemoveArgs,
+    MemberRole, MembershipOps, MessagingProtocol, NodeApi, Participant, Presence, PresenceState,
+    RosterOps, SupportsConversations, SupportsFileTransfer, SupportsMembership, SupportsRoster,
+    TransportAdapter, TransportInstanceInfo, TypingState,
 };
 use daemon_common::{JournalStreamId, SessionId, UnitId};
 use daemon_host::journal::JournalSink;
-use daemon_host::{with_request_context, RequestContext};
+use daemon_host::{with_request_context, BlobStore, RequestContext};
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
     AgentEvent, RoomId, RoomMember, RoomPolicy, SenderId, SessionPayload, TranscriptBlock,
@@ -355,6 +355,11 @@ pub struct RoomsAdapter {
     /// the roster is purely local process state (unlike rooms/membership, which persist to the store);
     /// the host paginates + emits `ContactsChanged` centrally.
     roster: Mutex<HashMap<TransportId, HashMap<String, ContactInfo>>>,
+    /// The node content store, for the loopback [`SupportsFileTransfer`] (W2-H). When present, file
+    /// transfer round-trips bytes through the content-addressed blob store (send verifies the blob
+    /// resolves; receive fetches it — a same-node loopback). `None` ⟹ the feature is absent
+    /// (`file_transfer()` returns `None`), keeping `assert_ops_match_behavior` honest.
+    blobs: Option<Arc<dyn BlobStore>>,
 }
 
 impl RoomsAdapter {
@@ -366,6 +371,26 @@ impl RoomsAdapter {
         signer: Arc<TraceSigner>,
         cfg: RoomsConfig,
     ) -> Arc<Self> {
+        Self::build(store, signer, cfg, None)
+    }
+
+    /// Like [`new`](Self::new), but wires the node content store so the loopback
+    /// [`SupportsFileTransfer`] (W2-H) is advertised + operable.
+    pub fn with_blobs(
+        store: Arc<dyn SessionStore>,
+        signer: Arc<TraceSigner>,
+        cfg: RoomsConfig,
+        blobs: Arc<dyn BlobStore>,
+    ) -> Arc<Self> {
+        Self::build(store, signer, cfg, Some(blobs))
+    }
+
+    fn build(
+        store: Arc<dyn SessionStore>,
+        signer: Arc<TraceSigner>,
+        cfg: RoomsConfig,
+        blobs: Option<Arc<dyn BlobStore>>,
+    ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             store,
@@ -375,6 +400,7 @@ impl RoomsAdapter {
             cmd_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
             roster: Mutex::new(HashMap::new()),
+            blobs,
         })
     }
 
@@ -574,6 +600,16 @@ impl MessagingProtocol for RoomsAdapter {
 
     fn roster(self: Arc<Self>) -> Option<Arc<dyn SupportsRoster>> {
         Some(self)
+    }
+
+    fn file_transfer(self: Arc<Self>) -> Option<Arc<dyn SupportsFileTransfer>> {
+        // The feature exists only when the node content store is wired (W2-H). Absent ⟹ `None`, so
+        // the ops-vs-behavior invariant sees no advertised (yet unimplemented) file-transfer verbs.
+        if self.blobs.is_some() {
+            Some(self)
+        } else {
+            None
+        }
     }
 }
 
@@ -819,6 +855,48 @@ impl SupportsMembership for RoomsAdapter {
             .unwrap()
             .remove(&RoomId::new(conv), &member);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl SupportsFileTransfer for RoomsAdapter {
+    fn supported(&self) -> FileTransferOps {
+        // Reachable only when `blobs` is wired (see `file_transfer()`); both verbs are then live.
+        FileTransferOps {
+            send: self.blobs.is_some(),
+            receive: self.blobs.is_some(),
+        }
+    }
+
+    async fn send(&self, _transport: TransportId, transfer: FileTransfer) -> Result<(), ApiError> {
+        // Loopback send: the content is content-addressed and already resident in the node store, so
+        // "sending" verifies the blob resolves (a full, integrity-checked read).
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("file_transfer_send".into()))?;
+        blobs
+            .get(&transfer.blob.hash, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| ApiError::Other(format!("rooms file transfer send: {e}")))
+    }
+
+    async fn receive(
+        &self,
+        _transport: TransportId,
+        transfer: FileTransfer,
+    ) -> Result<(), ApiError> {
+        // Loopback receive: fetch the sender's blob from the same node store (a same-node transfer).
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("file_transfer_receive".into()))?;
+        blobs
+            .get(&transfer.blob.hash, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| ApiError::Other(format!("rooms file transfer receive: {e}")))
     }
 }
 

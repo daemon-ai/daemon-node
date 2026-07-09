@@ -543,6 +543,14 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
         ApiRequest::RosterRemove { transport, contact } => {
             unit_or_err(api.roster_remove(transport, contact).await)
         }
+        ApiRequest::FtSend {
+            transport,
+            transfer,
+        } => unit_or_err(api.ft_send(transport, transfer).await),
+        ApiRequest::FtReceive {
+            transport,
+            transfer,
+        } => unit_or_err(api.ft_receive(transport, transfer).await),
         _ => return None,
     })
 }

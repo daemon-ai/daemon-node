@@ -1629,6 +1629,36 @@ impl ControlApi for NodeApiImpl {
         res
     }
 
+    async fn ft_send(
+        &self,
+        transport: TransportId,
+        transfer: daemon_api::FileTransfer,
+    ) -> Result<(), ApiError> {
+        let detail = format!("transport={} name={}", transport.as_str(), transfer.name);
+        self.audited(
+            "mgmt.ft.send",
+            detail,
+            self.file_transfer_for(&transport)?
+                .send(transport.clone(), transfer),
+        )
+        .await
+    }
+
+    async fn ft_receive(
+        &self,
+        transport: TransportId,
+        transfer: daemon_api::FileTransfer,
+    ) -> Result<(), ApiError> {
+        let detail = format!("transport={} name={}", transport.as_str(), transfer.name);
+        self.audited(
+            "mgmt.ft.receive",
+            detail,
+            self.file_transfer_for(&transport)?
+                .receive(transport.clone(), transfer),
+        )
+        .await
+    }
+
     async fn agent_discover(&self) -> Vec<AgentEntry> {
         // Probe the curated direct-binary recipe table via the injected discovery hook (the binary
         // owns the ACP runtime). Cache the results so `agent_catalog` surfaces them without

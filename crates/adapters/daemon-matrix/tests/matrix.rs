@@ -31,10 +31,43 @@ use daemon_protocol::{
     TransportId, TurnSummary,
 };
 
-use matrix_sdk::ruma::{device_id, event_id, room_id, user_id};
+use matrix_sdk::ruma::{device_id, event_id, mxc_uri, room_id, user_id};
 use matrix_sdk::test_utils::mocks::{LoginResponseTemplate200, MatrixMockServer};
 use matrix_sdk_test::event_factory::EventFactory;
 use matrix_sdk_test::JoinedRoomBuilder;
+
+use daemon_api::{FileTransfer, TransportAdapter};
+use daemon_host::{AccountProvisioning, BlobStore, FileBlobStore, ProvisionedAccount};
+use daemon_matrix::MatrixAdapter;
+
+/// A no-op provisioning seam: the file-transfer tests resolve the live client from the seeded
+/// registry (via `register_live_client`), never from provisioning.
+struct MockProvisioning;
+
+impl AccountProvisioning for MockProvisioning {
+    fn bound_accounts(&self, _family: &str) -> Vec<ProvisionedAccount> {
+        Vec::new()
+    }
+    fn account_credential(&self, _credential_ref: &str) -> Option<String> {
+        None
+    }
+    fn store_account_credential(&self, _credential_ref: &str, _blob: &str) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+fn blob_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "daemon-matrix-ft-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    root
+}
 
 /// A recording mock node: captures every submitted command and answers the two delivery primitives
 /// with a single `Primary` target on `transport`/`route`. `pending_subscribe` makes `subscribe`
@@ -338,6 +371,105 @@ async fn sso_begin_mints_url_then_complete_persists_session() {
     assert_eq!(back.session.meta.user_id.as_str(), "@bot:localhost");
 
     let _ = std::fs::remove_dir_all(&store_root);
+}
+
+/// W2-H: `SupportsFileTransfer::send` reads the blob's bytes from the node store and uploads them to
+/// the Matrix content repository (`POST /_matrix/media/v3/upload`, mocked).
+#[tokio::test]
+async fn file_transfer_send_uploads_media() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server
+        .mock_upload()
+        .ok(mxc_uri!("mxc://localhost/uploaded"))
+        .expect(1)
+        .mount()
+        .await;
+
+    let root = blob_root("send");
+    let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(&root).unwrap());
+    let blob = blobs.put(b"the outbound file").await.unwrap();
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    let adapter =
+        MatrixAdapter::with_blobs(Arc::new(MockProvisioning), Default::default(), None, blobs);
+    adapter
+        .register_live_client(transport.clone(), client)
+        .await;
+
+    assert!(TransportAdapter::info(&*adapter).capabilities.file_transfer);
+    let ft = adapter
+        .messaging()
+        .unwrap()
+        .file_transfer()
+        .expect("blobs wired ⟹ file transfer present");
+    assert!(ft.supported().send && ft.supported().receive);
+
+    let transfer = FileTransfer {
+        name: "cat.png".into(),
+        blob,
+        content_type: Some("image/png".into()),
+        ..Default::default()
+    };
+    ft.send(transport, transfer)
+        .await
+        .expect("media upload succeeds against the mock");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// W2-H: `SupportsFileTransfer::receive` downloads the `source` `mxc://` content
+/// (`GET /_matrix/client/v1/media/download/...`, mocked) and stores it back into the node store.
+#[tokio::test]
+async fn file_transfer_receive_downloads_media() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server
+        .mock_authed_media_download()
+        .ok_bytes(b"the inbound file".to_vec())
+        .expect(1)
+        .mount()
+        .await;
+
+    let root = blob_root("recv");
+    let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(&root).unwrap());
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    let adapter = MatrixAdapter::with_blobs(
+        Arc::new(MockProvisioning),
+        Default::default(),
+        None,
+        blobs.clone(),
+    );
+    adapter
+        .register_live_client(transport.clone(), client)
+        .await;
+    let ft = adapter
+        .messaging()
+        .unwrap()
+        .file_transfer()
+        .expect("file transfer present");
+
+    let transfer = FileTransfer {
+        name: "in.png".into(),
+        source: Some("mxc://localhost/inbound".into()),
+        ..Default::default()
+    };
+    ft.receive(transport, transfer)
+        .await
+        .expect("media download succeeds against the mock");
+
+    // The downloaded bytes are now resident in the node blob store.
+    let expected_root = blob_root("recv-expected");
+    let expected: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(&expected_root).unwrap());
+    let expected_ref = expected.put(b"the inbound file").await.unwrap();
+    assert!(
+        blobs.has(&expected_ref.hash).await,
+        "receive stored the downloaded content in the node store"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&expected_root);
 }
 
 #[tokio::test]
