@@ -149,16 +149,52 @@ pub struct AnnotationExport {
 }
 
 /// Export every annotation row, id-carrying, insertion-ordered (`annotations.py` `export_all`).
-pub fn export_all(_conn: &Connection) -> Result<Vec<AnnotationExport>> {
-    // Stub: real implementation lands in the green commit.
-    Ok(Vec::new())
+pub fn export_all(conn: &Connection) -> Result<Vec<AnnotationExport>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, memory_id, kind, value, source, confidence FROM annotations ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AnnotationExport {
+                id: r.get(0)?,
+                memory_id: r.get(1)?,
+                kind: r.get(2)?,
+                value: r.get(3)?,
+                source: r.get(4)?,
+                confidence: r.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Import annotation rows preserving their ids, deduping by id (`annotations.py` `import_all`).
 /// Returns `(inserted, skipped)`.
-pub fn import_all(_conn: &Connection, _rows: &[AnnotationExport]) -> Result<(usize, usize)> {
-    // Stub: real implementation lands in the green commit.
-    Ok((0, 0))
+pub fn import_all(conn: &Connection, rows: &[AnnotationExport]) -> Result<(usize, usize)> {
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    for row in rows {
+        // `INSERT OR IGNORE` on the explicit primary-key id makes re-importing the same export a
+        // no-op (id already present), matching the Python idempotent-reimport contract.
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO annotations (id, memory_id, kind, value, source, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.id,
+                row.memory_id,
+                row.kind,
+                row.value,
+                row.source,
+                row.confidence
+            ],
+        )?;
+        if changed > 0 {
+            inserted += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    Ok((inserted, skipped))
 }
 
 /// All annotations of a kind, optionally filtered by value (`annotations.py` `query_by_kind`). When
