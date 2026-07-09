@@ -5366,6 +5366,92 @@ mod tests {
         assert!(text.contains("no backup was created"), "{text}");
     }
 
+    // ---- Wave 2 theme 3: rotate edge cases (empty segments, boundaries, repeated rotation) -----
+
+    // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_preview_reports_noop_when_total_messages_within_tail
+    #[tokio::test]
+    async fn rotate_preview_noop_when_total_within_tail() {
+        let (lcm, dir) = durable_engine("rotate-within-tail", 5);
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..3 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 3);
+
+        let text = run_lcm(&lcm, "rotate").await;
+        assert!(text.contains("status: noop"), "{text}");
+        assert!(text.contains("reason: no_pre_tail_content"), "{text}");
+        assert!(text.contains("total_message_count: 3"), "{text}");
+        // No mutation on a preview.
+        assert_eq!(lcm.store().get_frontier("s1").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_handles_session_with_exactly_fresh_tail_count_messages
+    #[tokio::test]
+    async fn rotate_noop_when_exactly_fresh_tail_count_messages() {
+        let (lcm, dir) = durable_engine("rotate-boundary", 3);
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..3 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+        assert_eq!(lcm.store().message_count("s1").unwrap(), 3);
+
+        let text = run_lcm(&lcm, "rotate").await;
+        assert!(text.contains("status: noop"), "{text}");
+        assert!(text.contains("reason: no_pre_tail_content"), "{text}");
+        assert!(text.contains("total_message_count: 3"), "{text}");
+        assert!(text.contains("pre_tail_message_count: 0"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_apply_rolling_backup_overwrites_prior_slot_on_actual_rotate
+    #[tokio::test]
+    async fn rotate_apply_reuses_rolling_slot_on_repeated_rotate() {
+        let (lcm, dir) = durable_engine("rotate-reroll", 3);
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..10 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+
+        let first = run_lcm(&lcm, "rotate apply").await;
+        assert!(first.contains("status: ok"), "{first}");
+        let slot = lcm.config.rotate_backup_path().unwrap();
+        assert!(slot.exists(), "rolling slot written");
+        let frontier_after_first = lcm.store().get_frontier("s1").unwrap();
+        assert!(frontier_after_first > 0);
+
+        // Add more content so the second apply has fresh pre-tail rows to rotate past
+        // (an actual rotate, not a frontier_already_ahead noop).
+        for i in 10..15 {
+            c.push_user(UserMsg::new(format!("turn number {i}")));
+        }
+        lcm.before_turn(&mut c, None);
+
+        let second = run_lcm(&lcm, "rotate apply").await;
+        assert!(second.contains("status: ok"), "{second}");
+        // The frontier advanced again past the new pre-tail rows.
+        assert!(lcm.store().get_frontier("s1").unwrap() > frontier_after_first);
+
+        // Only one rolling rotate-latest file exists — disk usage stays bounded.
+        let slot_dir = slot.parent().unwrap();
+        let rotate_latest: Vec<_> = std::fs::read_dir(slot_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("-rotate-latest.sqlite3")
+            })
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(rotate_latest, vec![slot.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn doctor_repair_scans_read_only_and_apply_backs_up_first() {
         let (lcm, dir) = durable_engine("repair", 32);
