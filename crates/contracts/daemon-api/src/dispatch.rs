@@ -325,6 +325,8 @@ async fn serve_profile(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             ApiResponse::Profile(Some(spec))
         }),
         ApiRequest::ProfileRevert { id, seq } => unit_or_err(api.profile_revert(id, seq).await),
+        ApiRequest::SoulGet { id } => ok_or_err(api.soul_get(id).await, ApiResponse::SoulText),
+        ApiRequest::SoulSet { id, text } => unit_or_err(api.soul_set(id, text).await),
         ApiRequest::SkillHistory { name, after } => {
             ok_or_err(api.skill_history(name, after).await, ApiResponse::Revisions)
         }
