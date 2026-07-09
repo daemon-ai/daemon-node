@@ -1031,6 +1031,84 @@ mod tests {
         );
     }
 
+    // parity: test_e2_remember_batch_enrichment.py::test_remember_batch_writes_temporal_annotations_for_every_row (tests/test_e2_remember_batch_enrichment.py:82)
+    // parity: test_e2_remember_batch_enrichment.py::test_per_row_veracity_threads_into_consolidated_facts (tests/test_e2_remember_batch_enrichment.py:151)
+    // parity: test_e2_remember_batch_enrichment.py::test_remember_batch_writes_has_source_when_source_is_non_default (tests/test_e2_remember_batch_enrichment.py:101)
+    #[tokio::test]
+    async fn parity_gap_tool_remember_batch_enriches_every_row() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_remember_batch",
+                json!({"items": [
+                    {"content": "Dana is a developer", "veracity": "stated"},
+                    {"content": "Eric is a tester", "veracity": "inferred"},
+                    {"content": "From a wiki page", "source": "wiki"},
+                ]}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "stored_batch", "got: {res}");
+        let ids: Vec<String> = parsed["memory_ids"]
+            .as_array()
+            .unwrap_or_else(|| panic!("memory_ids missing: {res}"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 3, "one id per batch item");
+
+        provider
+            .engine
+            .with_conn(|c| {
+                // Always-on temporal enrichment: every row gets `occurred_on`.
+                for id in &ids {
+                    let occurred: i64 = c.query_row(
+                        "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1 \
+                         AND kind = 'occurred_on'",
+                        rusqlite::params![id],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(occurred, 1, "{id}: missing occurred_on annotation");
+                }
+                // `has_source` only for the non-conversational source, with the row's OWN value.
+                let wiki_sources: Vec<String> = {
+                    let mut stmt = c.prepare(
+                        "SELECT value FROM annotations WHERE memory_id = ?1 \
+                         AND kind = 'has_source'",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![ids[2]], |r| r.get(0))?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                assert_eq!(wiki_sources, vec!["wiki".to_string()]);
+                let convo_has_source: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM annotations WHERE memory_id = ?1 \
+                     AND kind = 'has_source'",
+                    rusqlite::params![ids[0]],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(convo_has_source, 0, "conversational rows get no has_source");
+                // Per-row veracity threads into consolidated-fact confidence: stated (Dana)
+                // must weigh above inferred (Eric).
+                let confidence = |subject: &str| -> crate::Result<f64> {
+                    Ok(c.query_row(
+                        "SELECT confidence FROM consolidated_facts WHERE subject = ?1",
+                        rusqlite::params![subject],
+                        |r| r.get(0),
+                    )?)
+                };
+                let dana = confidence("Dana")?;
+                let eric = confidence("Eric")?;
+                assert!(
+                    dana > eric,
+                    "stated ({dana}) must outweigh inferred ({eric}) — per-row veracity collapsed"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn shared_tools_write_to_separate_surface_bank() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
