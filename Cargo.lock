@@ -3365,6 +3365,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-tool-user-profile"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-common",
+ "daemon-core",
+ "daemon-prompt",
+ "daemon-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "daemon-tool-vision"
 version = "0.0.1"
 dependencies = [

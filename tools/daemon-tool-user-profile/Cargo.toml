@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-tool-user-profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The agent veneer over daemon-prompt's UserProfileStore (USER.md): add/replace/remove/read with
+# the hermes WHEN-TO-SAVE rubric in the schema. Scoped per profile via TurnCx::profile.
+[dependencies]
+daemon-core = { workspace = true }
+daemon-prompt = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = "3"
+daemon-common = { workspace = true }
+daemon-protocol = { workspace = true }
+
+[lints]
+workspace = true
