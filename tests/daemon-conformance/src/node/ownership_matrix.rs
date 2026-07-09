@@ -440,10 +440,10 @@ fn classify(req: &ApiRequest) -> Coverage {
             NotSessionTouching
         }
         // The notification list is node-wide (not per-owner session state): the coarse ControlRead
-        // capability gate governs it (wire vNEXT).
+        // capability gate governs it (wire v37).
         NotificationList => NotSessionTouching,
         // The person/metacontact registry is node-wide (not per-owner session state): the coarse
-        // ControlRead capability gate governs it (wire vNEXT).
+        // ControlRead capability gate governs it (wire v37).
         PersonList => NotSessionTouching,
         // The node-owned gateway is a node-wide resident service (not per-owner session state): the
         // coarse capability gate governs (GatewayGet -> ControlRead, GatewaySet -> ControlWrite).

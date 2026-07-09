@@ -715,7 +715,18 @@ impl WireVersion {
     /// rejected typed — an ACP agent owns its own prompt, there is no persona to set). The profile
     /// `distribution` gains an optional `soul` doc (SOUL.md travels with an exported profile;
     /// USER.md is personal data and never travels).
-    pub const CURRENT: Self = Self(36);
+    ///
+    /// v37 (libpurple parity surface): the one-time bump owning the full-parity libpurple port.
+    /// Adds the node-authoritative saved-presence surface (`PresenceList`/`PresenceSave`/
+    /// `PresenceDelete`/`PresenceSetActive` -> `SavedPresences`), the live notification list
+    /// (`NotificationList` -> `Notifications`, with the payload-free `NodeEvent::NotificationsChanged`
+    /// pointer), file transfer (`FtSend`/`FtReceive` + the `FileTransfer`/`FileTransferDirection`/
+    /// `FileTransferState` types), the person/metacontact registry (`PersonList` -> `Persons`, with
+    /// `NodeEvent::PersonsChanged` and the `Person`/`PersonEndpoint` DTOs), and the richer
+    /// conversation-history representation (`JournalRecordPayload::Chat` + `ChatMessage`/
+    /// `MessageAttachment`). All additive, but bumped because `is_compatible` is strict-equal
+    /// (mirrors the additive v15–v36 bumps).
+    pub const CURRENT: Self = Self(37);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

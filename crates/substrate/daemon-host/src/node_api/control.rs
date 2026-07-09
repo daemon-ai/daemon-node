@@ -1564,14 +1564,14 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn notification_list(&self) -> Vec<daemon_api::NotificationInfo> {
-        // The node-authoritative notification list (wire vNEXT), newest first — a snapshot of the
+        // The node-authoritative notification list (wire v37), newest first — a snapshot of the
         // node's `NotificationManager` (ported from libpurple's `PurpleNotificationManager`).
         // Clients re-list on a `NotificationsChanged` pointer.
         self.notifications_snapshot()
     }
 
     async fn person_list(&self) -> Vec<daemon_api::Person> {
-        // The node-authoritative person/metacontact registry (wire vNEXT), insertion order — a
+        // The node-authoritative person/metacontact registry (wire v37), insertion order — a
         // snapshot of the node's `PersonManager` (ported from the person half of libpurple's
         // `PurpleContactManager`). Clients re-list on a `PersonsChanged` pointer.
         self.persons_snapshot()
@@ -1803,7 +1803,7 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
-    // -- Saved presences (W2-F; wire vNEXT): every op delegates to the shared `PresenceManager`;
+    // -- Saved presences (W2-F; wire v37): every op delegates to the shared `PresenceManager`;
     //    absent it, the trait defaults (empty list / `Unsupported`) apply.
     async fn presence_list(&self) -> Vec<daemon_api::SavedPresence> {
         match &self.presences {

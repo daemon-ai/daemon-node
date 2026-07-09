@@ -111,7 +111,7 @@ libpurple-specific `GObject`/`GSettings` plumbing variants. The daemon has one b
 | set-active persists across a reload | `mgr_active_persists_across_reload` | DERIVED |
 | store round-trip (list/set/remove) | `saved_presence_store_round_trips` (daemon-store) | DERIVED |
 
-## Wire additions (all tagged `wire vNEXT`; `WireVersion::CURRENT` NOT bumped — integration owns it)
+## Wire additions (tagged `wire v37`; `WireVersion::CURRENT` bumped to 37 by integration)
 
 - **Types:** `SavedPresence` (new serde wire DTO; `Arbitrary` feature-gated).
 - **Requests:** `PresenceList`, `PresenceSave { presence }`, `PresenceDelete { id }`,

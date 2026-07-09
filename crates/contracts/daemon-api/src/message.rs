@@ -17,7 +17,7 @@ use crate::Participant;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-/// One message attachment (← `PurpleAttachment`). `wire vNEXT`.
+/// One message attachment (← `PurpleAttachment`). `wire v37`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageAttachment {
@@ -41,7 +41,7 @@ pub struct MessageAttachment {
 }
 
 /// A chat message (← `PurpleMessage`). `delivered`/`edited` are derived from
-/// `delivered_at`/`edited_at`. `wire vNEXT`.
+/// `delivered_at`/`edited_at`. `wire v37`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {

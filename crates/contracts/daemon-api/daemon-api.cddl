@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 36)
+wire_version = uint                 ; daemon-common WireVersion (current = 37)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -465,7 +465,7 @@ transcript-block = transcript-block-message
 
 journal-record-payload-management = { "Management": { "detail": tstr } }
 journal-record-payload-block = { "Block": { "block": transcript-block } }
-; wire vNEXT: the richer ChatMessage representation on the conversation-history surface (W2-E).
+; wire v37: the richer ChatMessage representation on the conversation-history surface (W2-E).
 message-attachment = {
   "id": tstr,
   ? "content_type": (tstr / null),
@@ -609,9 +609,9 @@ node-event-conversations-changed = { "ConversationsChanged": { "transport": tran
 node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool } }
 node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
-; wire vNEXT: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
+; wire v37: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
 node-event-notifications-changed = "NotificationsChanged"
-; wire vNEXT: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
+; wire v37: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
 node-event-persons-changed      = "PersonsChanged"
 events-page = {
   "events": [0*64 node-event],
@@ -1175,7 +1175,7 @@ presence-primitive-t = "Offline"
                      / "Streaming"
                      / "OutOfOffice"
 presence = { "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "mobile": bool, ? "idle_since": (uint64 / null) }
-; saved-presence (W2-F; wire vNEXT): a named, reusable presence. `id`+`primitive` are required; the
+; saved-presence (W2-F; wire v37): a named, reusable presence. `id`+`primitive` are required; the
 ; rest mirror serde `#[serde(default)]` (present-null / present / absent all accepted).
 saved-presence = { "id": tstr, ? "name": (tstr / null), "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "last_used": (uint64 / null), ? "use_count": uint64 }
 contact-permission = "Unset"
@@ -1196,7 +1196,7 @@ conversation-info = {
   ? "title": (tstr / null), ? "topic": (tstr / null), ? "description": (tstr / null),
   ? "members": [* conversation-member],
 }
-; ----- notifications (wire vNEXT; port-notify) -----
+; ----- notifications (wire v37; port-notify) -----
 authorization-request = { "contact": contact-info, ? "message": (tstr / null), ? "add": bool, ? "handled": bool }
 add-contact-request = { "contact": contact-info, ? "message": (tstr / null), ? "handled": bool }
 notification-kind = notification-kind-generic
@@ -1222,7 +1222,7 @@ notification-info = {
   "kind": notification-kind,
   ? "deleted": bool,
 }
-; ----- persons / metacontacts (wire vNEXT; port-person) -----
+; ----- persons / metacontacts (wire v37; port-person) -----
 ; The avatar carrier (first wire-reachable via person.avatar): a content-addressed image blob.
 image = { "blob": blob-ref }
 ; One transport-scoped contact endpoint of a person (transport + the contact reachable there).
@@ -1465,19 +1465,19 @@ feedback-diagnostics = { ? "app_version": (tstr / null), ? "os": (tstr / null) }
 request-feedback-submit = { "FeedbackSubmit": { "kind": feedback-kind, ? "target": (feedback-target / null), ? "rating": (feedback-rating / null), ? "comment": (tstr / null), "include_content": bool, ? "diagnostics": (feedback-diagnostics / null), "surface": tstr } }
 request-telemetry-consent-get = "TelemetryConsentGet"
 request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
-; wire vNEXT: the node's live notification list (read-only; re-listed on NotificationsChanged).
+; wire v37: the node's live notification list (read-only; re-listed on NotificationsChanged).
 request-notification-list = "NotificationList"
 
-; wire vNEXT: the node's person/metacontact registry (read-only; re-listed on PersonsChanged).
+; wire v37: the node's person/metacontact registry (read-only; re-listed on PersonsChanged).
 request-person-list = "PersonList"
 
-; ----- saved presences (W2-F; wire vNEXT) -----
+; ----- saved presences (W2-F; wire v37) -----
 request-presence-list = "PresenceList"
 request-presence-save = { "PresenceSave": { "presence": saved-presence } }
 request-presence-delete = { "PresenceDelete": { "id": tstr } }
 request-presence-set-active = { "PresenceSetActive": { "id": tstr } }
 
-; ----- file transfer (W2-H; wire vNEXT) -----
+; ----- file transfer (W2-H; wire v37) -----
 ; FileTransfer (<- PurpleFileTransfer). "name"+"blob" are the Wave-1 shape; the rest are additive
 ; #[serde(default)] fields (present-and-typed by serde; optional here). direction/state are
 ; serde-external unit-variant strings.
@@ -1809,13 +1809,13 @@ response-who-am-i     = { "WhoAmI": principal-view }
 feedback-ack = { "accepted": bool, "queued": bool }
 response-feedback-ack = { "FeedbackAck": feedback-ack }
 response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
-; ----- saved presences (W2-F; wire vNEXT) -----
+; ----- saved presences (W2-F; wire v37) -----
 response-saved-presences = { "SavedPresences": [* saved-presence] }
 
-; wire vNEXT: the node's live notification list, newest first.
+; wire v37: the node's live notification list, newest first.
 response-notifications = { "Notifications": [* notification-info] }
 
-; wire vNEXT: the node's person/metacontact registry, insertion order.
+; wire v37: the node's person/metacontact registry, insertion order.
 response-persons = { "Persons": [* person] }
 api-response = response-ok
              / response-routed

@@ -71,9 +71,9 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ApprovalsPending { .. }
         | CheckpointList { .. }
         | EventsSince { .. }
-        // The notification list is a node-wide control-plane read (wire vNEXT).
+        // The notification list is a node-wide control-plane read (wire v37).
         | NotificationList
-        // The person/metacontact registry is a node-wide control-plane read (wire vNEXT).
+        // The person/metacontact registry is a node-wide control-plane read (wire v37).
         | PersonList => C::ControlRead,
         // Durable control-plane lifecycle is operator-level (Assign wakes a durable session).
         Assign { .. } => C::ControlWrite,

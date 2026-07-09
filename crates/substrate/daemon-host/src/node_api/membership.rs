@@ -67,7 +67,7 @@ impl NodeApiImpl {
         }
     }
 
-    /// Emit a payload-free `NotificationsChanged` pointer (wire vNEXT) after a notification-manager
+    /// Emit a payload-free `NotificationsChanged` pointer (wire v37) after a notification-manager
     /// mutation so clients re-list via `NotificationList`. Mirrors `emit_contacts_changed` /
     /// `CatalogChanged`: the whole list is cheap to refetch, so the event carries no detail.
     pub(crate) fn emit_notifications_changed(&self) {
@@ -117,7 +117,7 @@ impl NodeApiImpl {
         removed
     }
 
-    /// Emit a payload-free `PersonsChanged` pointer (wire vNEXT) after a person-registry mutation
+    /// Emit a payload-free `PersonsChanged` pointer (wire v37) after a person-registry mutation
     /// so clients re-list via `PersonList`. Mirrors `emit_notifications_changed`: the whole list is
     /// cheap to refetch, so the event carries no detail.
     pub(crate) fn emit_persons_changed(&self) {

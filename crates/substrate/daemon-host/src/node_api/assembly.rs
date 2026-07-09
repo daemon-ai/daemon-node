@@ -196,7 +196,7 @@ impl NodeApiImpl {
         self
     }
 
-    /// Bind the saved-presence manager (W2-F; wire vNEXT) backing the `presence_*` control ops.
+    /// Bind the saved-presence manager (W2-F; wire v37) backing the `presence_*` control ops.
     /// The manager is shared over the same durable [`SessionStore`] as the rest of the node.
     /// Absent, the presence ops keep their defaulted empty-list / `Unsupported` behavior.
     pub fn with_presence_manager(

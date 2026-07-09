@@ -333,7 +333,7 @@ live in `crates/contracts/daemon-api/src/person.rs`; the person-aware display la
 (`person-alias → display_name → id`) in `crates/contracts/daemon-api/src/matching.rs`; the host
 registry (create/remove/associate/dissociate/lookup) in `crates/substrate/daemon-host/src/person.rs`;
 and the read surface (`PersonList` → `Persons`, `NodeEvent::PersonsChanged`) in the wire contract
-(wire vNEXT). `preferred_endpoint()` is the presence-comparator algorithm the libpurple tests
+(wire v37). `preferred_endpoint()` is the presence-comparator algorithm the libpurple tests
 assert; the open-conversation / account-priority tiers remain future layers (ledger-recorded).
 
 ---

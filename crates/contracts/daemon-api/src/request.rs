@@ -17,15 +17,15 @@
 //! `AuthParamField` deliberately omits. `AuthParamField` is, in effect, the on-the-wire projection
 //! of a [`RequestField::string`]-shaped field; this module is the authority that computes validity.
 //!
-//! # Wire exposure — node-internal (wire vNEXT candidate)
+//! # Wire exposure — node-internal (candidate for a future wire version)
 //!
 //! These types are **not** on the wire (no serde, no `Arbitrary`, no CDDL, no ops, no `WireVersion`
 //! bump). The wire carries data, not validators, and there is no consuming surface today that should
 //! carry a full [`RequestPage`]. When a client eventually needs to render an interactive request form
 //! (e.g. an `AuthChallenge::Form` upgrade or a protocol-driven prompt), lift the *data* projection of
 //! these types onto the wire then — append-only, feature-gated `Arbitrary`, CDDL in lockstep — while
-//! the validators stay node-side per the "node decides, apps render" invariant. **Tagged: wire
-//! vNEXT candidate.**
+//! the validators stay node-side per the "node decides, apps render" invariant. **Tagged: a
+//! candidate for a future wire version (beyond the v37 libpurple-parity bump).**
 
 use crate::LocalizedString;
 use daemon_protocol::TransportId;

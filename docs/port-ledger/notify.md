@@ -10,7 +10,7 @@ wire**: `NotificationInfo`/`NotificationKind`/`AuthorizationRequest`/
 `AddContactRequest` cross the wire (reachable from `ApiResponse::Notifications`),
 so they are mirrored in `daemon-api.cddl`, derive `Arbitrary`, and gain CBOR
 fixtures; a `NotificationList` op and a payload-free `NodeEvent::NotificationsChanged`
-pointer are appended (wire vNEXT; the integration branch bumps `WireVersion`).
+pointer are appended (wire v37; the integration branch bumps `WireVersion` to 37).
 
 "Done" = every row below is green or explicitly skipped-with-reason.
 
@@ -199,7 +199,7 @@ the raw signal-emission-count mechanics are **S** (GObject artifacts).
 - Skipped (S): the signal-emission-count mechanics folded into #17/#20 and the
   manager transitions (GObject artifacts; no signals in the DTO/manager).
 
-## Wire additions (wire vNEXT — integration bumps `WireVersion`)
+## Wire additions (wire v37 — integration bumps `WireVersion` to 37)
 
 - Types: `NotificationInfo`, `NotificationKind` (`Generic`/`AddContact`/
   `Authorization`/`Link`/`ConnectionError`), `AuthorizationRequest`,

@@ -211,14 +211,14 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
                 ApiResponse::TelemetryConsent { enabled }
             })
         }
-        // -- saved presences (W2-F; wire vNEXT) -------------------------------------------------
+        // -- saved presences (W2-F; wire v37) -------------------------------------------------
         ApiRequest::PresenceList => ApiResponse::SavedPresences(api.presence_list().await),
         ApiRequest::PresenceSave { presence } => unit_or_err(api.presence_save(presence).await),
         ApiRequest::PresenceDelete { id } => unit_or_err(api.presence_delete(id).await),
         ApiRequest::PresenceSetActive { id } => unit_or_err(api.presence_set_active(id).await),
-        // -- notifications (W2-G; wire vNEXT) ---------------------------------------------------
+        // -- notifications (W2-G; wire v37) ---------------------------------------------------
         ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
-        // -- persons / metacontacts (W3-J; wire vNEXT) ------------------------------------------
+        // -- persons / metacontacts (W3-J; wire v37) ------------------------------------------
         ApiRequest::PersonList => ApiResponse::Persons(api.person_list().await),
         _ => return None,
     })

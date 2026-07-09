@@ -20,7 +20,7 @@ display layering seam left in `matching.rs`, a host `PersonManager`, and a minim
 This package **touches the wire**: `Person`/`PersonEndpoint` cross the wire (reachable from
 `ApiResponse::Persons`), so they are serde types mirrored in `daemon-api.cddl`, derive feature-gated
 `Arbitrary`, and gain CBOR fixtures; a `PersonList` op + a payload-free `NodeEvent::PersonsChanged`
-pointer are appended (wire vNEXT — the integration branch bumps `WireVersion`, not this one).
+pointer are appended (wire v37 — the integration branch bumps `WireVersion` to 37, not this one).
 
 "Done" = every row below is green or explicitly skipped-with-reason.
 
@@ -135,7 +135,7 @@ annotated as re-activated.
 - Derived (D): **8** daemon-native rows (id mint, empty-priority, endpoint edges, CBOR round-trip,
   manager double add/remove, associate/dissociate edges, lookups, add-mints-id).
 
-## Wire additions (wire vNEXT — integration bumps `WireVersion`)
+## Wire additions (wire v37 — integration bumps `WireVersion` to 37)
 
 - Types: `Person`, `PersonEndpoint` — `Serialize`/`Deserialize` + feature-gated `Arbitrary`. `Image`
   becomes wire-reachable (via `Person::avatar`) and gains its first CDDL rule.

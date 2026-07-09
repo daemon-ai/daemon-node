@@ -1104,35 +1104,35 @@ pub enum ApiRequest {
         enabled: bool,
     },
 
-    // -- saved presences (W2-F; wire vNEXT) ------------------------------------------------------
-    /// [`ControlApi::presence_list`] — list the saved presences (wire vNEXT). Answered by
+    // -- saved presences (W2-F; wire v37) ------------------------------------------------------
+    /// [`ControlApi::presence_list`] — list the saved presences (wire v37). Answered by
     /// [`ApiResponse::SavedPresences`].
     PresenceList,
-    /// [`ControlApi::presence_save`] — create or update a saved presence (wire vNEXT).
+    /// [`ControlApi::presence_save`] — create or update a saved presence (wire v37).
     PresenceSave {
         /// The saved presence to persist (an empty `id` mints a fresh one).
         presence: SavedPresence,
     },
-    /// [`ControlApi::presence_delete`] — delete a saved presence by id (wire vNEXT; idempotent).
+    /// [`ControlApi::presence_delete`] — delete a saved presence by id (wire v37; idempotent).
     PresenceDelete {
         /// The saved-presence id to remove.
         id: String,
     },
-    /// [`ControlApi::presence_set_active`] — set the active saved presence by id (wire vNEXT).
+    /// [`ControlApi::presence_set_active`] — set the active saved presence by id (wire v37).
     PresenceSetActive {
         /// The saved-presence id to activate.
         id: String,
     },
 
-    // -- notifications (W2-G; wire vNEXT) --------------------------------------------------------
-    /// [`ControlApi::notification_list`] — the node's live notification list (wire vNEXT). A
+    // -- notifications (W2-G; wire v37) --------------------------------------------------------
+    /// [`ControlApi::notification_list`] — the node's live notification list (wire v37). A
     /// read-only snapshot (newest first); the client re-lists on a
     /// [`NodeEvent::NotificationsChanged`] pointer. Answered by [`ApiResponse::Notifications`].
     NotificationList,
 
-    // -- file transfer (W2-H; wire vNEXT) --------------------------------------------------------
+    // -- file transfer (W2-H; wire v37) --------------------------------------------------------
     /// [`ControlApi::ft_send`] — send a file out over a transport (`SupportsFileTransfer::send`).
-    /// Answered by [`ApiResponse::Ok`]. wire vNEXT.
+    /// Answered by [`ApiResponse::Ok`]. wire v37.
     FtSend {
         /// The owning transport instance.
         transport: TransportId,
@@ -1140,7 +1140,7 @@ pub enum ApiRequest {
         transfer: FileTransfer,
     },
     /// [`ControlApi::ft_receive`] — receive a file over a transport
-    /// (`SupportsFileTransfer::receive`). Answered by [`ApiResponse::Ok`]. wire vNEXT.
+    /// (`SupportsFileTransfer::receive`). Answered by [`ApiResponse::Ok`]. wire v37.
     FtReceive {
         /// The owning transport instance.
         transport: TransportId,
@@ -1148,8 +1148,8 @@ pub enum ApiRequest {
         transfer: FileTransfer,
     },
 
-    // -- persons / metacontacts (W3-J; wire vNEXT) -----------------------------------------------
-    /// [`ControlApi::person_list`] — the node's person/metacontact registry (wire vNEXT). A
+    // -- persons / metacontacts (W3-J; wire v37) -----------------------------------------------
+    /// [`ControlApi::person_list`] — the node's person/metacontact registry (wire v37). A
     /// read-only snapshot (insertion order); the client re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
     PersonList,
@@ -1367,12 +1367,12 @@ pub enum ApiResponse {
         enabled: bool,
     },
 
-    // -- saved presences (W2-F; wire vNEXT) ------------------------------------------------------
+    // -- saved presences (W2-F; wire v37) ------------------------------------------------------
     /// The saved-presence listing (the reply to `PresenceList`), in the manager's insertion order.
     SavedPresences(Vec<SavedPresence>),
-    /// The node's live notification list (`notification_list`; wire vNEXT), newest first.
+    /// The node's live notification list (`notification_list`; wire v37), newest first.
     Notifications(Vec<NotificationInfo>),
-    /// The node's person/metacontact registry (`person_list`; wire vNEXT), insertion order.
+    /// The node's person/metacontact registry (`person_list`; wire v37), insertion order.
     Persons(Vec<Person>),
 }
 

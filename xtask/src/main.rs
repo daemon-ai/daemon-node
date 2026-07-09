@@ -629,7 +629,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next: Some("@bob:matrix.org".into()),
         }),
     )?;
-    // Notifications (wire vNEXT; port-notify): the read-only list op + a response carrying an
+    // Notifications (wire v37; port-notify): the read-only list op + a response carrying an
     // authorization-request and a connection-error notification, so verify-codec proves the
     // generated zcbor C decoder accepts the notification-info shape + its typed kinds.
     write_cbor(
@@ -656,7 +656,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             ),
         ]),
     )?;
-    // Persons / metacontacts (wire vNEXT; port-person): the read-only list op + a response carrying
+    // Persons / metacontacts (wire v37; port-person): the read-only list op + a response carrying
     // an aliased, avatared, multi-endpoint person, so verify-codec proves the generated zcbor C
     // decoder accepts the person shape (incl. the first wire-reachable `image` rule).
     write_cbor(&out, "request-person-list.cbor", &ApiRequest::PersonList)?;
@@ -1168,7 +1168,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             epoch: 0,
         }),
     )?;
-    // wire vNEXT (W2-E): the richer ChatMessage on the conversation-history surface, so conformance
+    // wire v37 (W2-E): the richer ChatMessage on the conversation-history surface, so conformance
     // + verify-codec prove the CDDL↔Rust agreement on the new `JournalRecordPayload::Chat` arm and
     // the `chat-message` / `message-attachment` shapes on a real ciborium payload.
     write_cbor(
@@ -1284,9 +1284,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 NodeEvent::ContactsChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
                 },
-                // wire vNEXT: the payload-free notifications-changed pointer (port-notify).
+                // wire v37: the payload-free notifications-changed pointer (port-notify).
                 NodeEvent::NotificationsChanged,
-                // wire vNEXT: the payload-free persons-changed pointer (port-person).
+                // wire v37: the payload-free persons-changed pointer (port-person).
                 NodeEvent::PersonsChanged,
             ],
             next_cursor: 12,
@@ -1712,7 +1712,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-telemetry-consent.cbor",
         &ApiResponse::TelemetryConsent { enabled: true },
     )?;
-    // Saved presences (W2-F; wire vNEXT): the list/save/delete/set-active ops + the listing reply.
+    // Saved presences (W2-F; wire v37): the list/save/delete/set-active ops + the listing reply.
     {
         use daemon_api::{PresencePrimitive, SavedPresence};
         write_cbor(
@@ -1757,7 +1757,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         )?;
     }
 
-    // -- file transfer (W2-H; wire vNEXT) --------------------------------------------------------
+    // -- file transfer (W2-H; wire v37) --------------------------------------------------------
     {
         use daemon_api::{FileTransfer, FileTransferDirection, FileTransferState};
         use daemon_common::{BlobRef, ContentHash};

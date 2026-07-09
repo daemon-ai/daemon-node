@@ -857,7 +857,7 @@ fn bind_node_api_surfaces(
 ) -> NodeApiImpl {
     spawn_fleet_change_bridge(shared);
     let node_api = bind_storage_surfaces(node_api, cron_ops, shared);
-    // Saved presences (W2-F; wire vNEXT): the host `PresenceManager` over the SAME durable store the
+    // Saved presences (W2-F; wire v37): the host `PresenceManager` over the SAME durable store the
     // rest of the node uses. Its default Offline/Available presences seed lazily on the first
     // `presence_list` (seed-on-read, like the cron catalog), so no async startup load is needed here.
     let node_api = node_api

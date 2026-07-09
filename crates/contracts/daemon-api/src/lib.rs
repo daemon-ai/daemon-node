@@ -1055,7 +1055,7 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("roster_remove".into()))
     }
 
-    /// The node's live notification list (wire vNEXT), newest first — the node-authoritative
+    /// The node's live notification list (wire v37), newest first — the node-authoritative
     /// [`NotificationInfo`] collection a client renders and re-lists on a
     /// [`NodeEvent::NotificationsChanged`] pointer (ported from libpurple's `PurpleNotificationManager`).
     /// Default: empty (a node assembled without a notification manager).
@@ -1063,7 +1063,7 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
-    /// Send a file out over a transport (`SupportsFileTransfer::send`; wire vNEXT). Default:
+    /// Send a file out over a transport (`SupportsFileTransfer::send`; wire v37). Default:
     /// unsupported.
     async fn ft_send(
         &self,
@@ -1073,7 +1073,7 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("ft_send".into()))
     }
 
-    /// Receive a file over a transport (`SupportsFileTransfer::receive`; wire vNEXT). Default:
+    /// Receive a file over a transport (`SupportsFileTransfer::receive`; wire v37). Default:
     /// unsupported.
     async fn ft_receive(
         &self,
@@ -1083,7 +1083,7 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("ft_receive".into()))
     }
 
-    /// The node's person/metacontact registry (wire vNEXT), insertion order — the
+    /// The node's person/metacontact registry (wire v37), insertion order — the
     /// node-authoritative [`Person`] collection a client renders and re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer (ported from the person half of libpurple's
     /// `PurpleContactManager`). Default: empty (a node assembled without a person registry).
@@ -1294,27 +1294,27 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("cron_dismiss_suggestion".into()))
     }
 
-    // -- Saved presences (W2-F; wire vNEXT): the node-authoritative list of named, reusable
+    // -- Saved presences (W2-F; wire v37): the node-authoritative list of named, reusable
     //    presences the app renders + drives. Backed by the host `PresenceManager` over the durable
     //    store; a node built without it inherits the defaulted empty list / `Unsupported`. --
 
-    /// List every saved presence (wire vNEXT), in the manager's insertion order. Default: empty.
+    /// List every saved presence (wire v37), in the manager's insertion order. Default: empty.
     async fn presence_list(&self) -> Vec<SavedPresence> {
         Vec::new()
     }
 
-    /// Create or update a saved presence (wire vNEXT): mints an id when unset, else replaces the
+    /// Create or update a saved presence (wire v37): mints an id when unset, else replaces the
     /// existing presence by id. Default: unsupported.
     async fn presence_save(&self, _presence: SavedPresence) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("presence_save".into()))
     }
 
-    /// Delete a saved presence by id (wire vNEXT; idempotent). Default: unsupported.
+    /// Delete a saved presence by id (wire v37; idempotent). Default: unsupported.
     async fn presence_delete(&self, _id: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("presence_delete".into()))
     }
 
-    /// Set the active saved presence by id (wire vNEXT), bumping its use-count + last-used.
+    /// Set the active saved presence by id (wire v37), bumping its use-count + last-used.
     /// Default: unsupported.
     async fn presence_set_active(&self, _id: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("presence_set_active".into()))
@@ -4090,7 +4090,7 @@ pub struct ActionMenu {
     pub items: Vec<String>,
 }
 
-/// The direction of a [`FileTransfer`] (wire vNEXT). Daemon-native framing of libpurple's
+/// The direction of a [`FileTransfer`] (wire v37). Daemon-native framing of libpurple's
 /// initiator-vs-remote asymmetry (`purple_file_transfer_new_send` sets `initiator = account`;
 /// `purple_file_transfer_new_receive` sets `initiator = remote`).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -4104,7 +4104,7 @@ pub enum FileTransferDirection {
 }
 
 /// The state of a [`FileTransfer`] (← `PurpleFileTransferState`, `purplefiletransfer.h`; wire
-/// vNEXT). There is no explicit accepted/cancelled state in libpurple — cancellation is a
+/// v37). There is no explicit accepted/cancelled state in libpurple — cancellation is a
 /// `GCancellable` + error, modeled here as [`FileTransferState::Failed`] plus an `error` message.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4124,7 +4124,7 @@ pub enum FileTransferState {
 
 /// A file transfer (← `PurpleFileTransfer`, `purplefiletransfer.c`). The `name` + content-addressed
 /// `blob` are the original (Wave-1) wire shape; every field below is appended additively with a
-/// serde default (wire vNEXT), so pre-existing payloads decode unchanged. The behavior logic
+/// serde default (wire v37), so pre-existing payloads decode unchanged. The behavior logic
 /// (constructors, state machine, predicates) lives in [`crate::file_transfer`].
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -4134,37 +4134,37 @@ pub struct FileTransfer {
     /// The content-addressed blob. For a `Send` this is the local file's content; for a `Receive`
     /// it is the destination handle (a placeholder hash until the bytes are stored).
     pub blob: BlobRef,
-    /// Send vs. receive (wire vNEXT).
+    /// Send vs. receive (wire v37).
     #[serde(default)]
     pub direction: FileTransferDirection,
-    /// The lifecycle state (wire vNEXT).
+    /// The lifecycle state (wire v37).
     #[serde(default)]
     pub state: FileTransferState,
-    /// The remote participant (← `remote`; wire vNEXT).
+    /// The remote participant (← `remote`; wire v37).
     #[serde(default)]
     pub remote: Option<ContactInfo>,
-    /// Who initiated the transfer (← `initiator`; wire vNEXT).
+    /// Who initiated the transfer (← `initiator`; wire v37).
     #[serde(default)]
     pub initiator: Option<ContactInfo>,
     /// The advertised file size in bytes (← `file-size`; kept independent of `blob.size`, as in C;
-    /// wire vNEXT).
+    /// wire v37).
     #[serde(default)]
     pub file_size: u64,
-    /// Bytes transferred so far — the node-owned progress a thin client renders (wire vNEXT).
+    /// Bytes transferred so far — the node-owned progress a thin client renders (wire v37).
     #[serde(default)]
     pub transferred: u64,
-    /// The content/media type hint (← `content-type`; wire vNEXT).
+    /// The content/media type hint (← `content-type`; wire v37).
     #[serde(default)]
     pub content_type: Option<String>,
-    /// An optional message sent with the transfer (← `message`; wire vNEXT).
+    /// An optional message sent with the transfer (← `message`; wire v37).
     #[serde(default)]
     pub message: Option<String>,
     /// The failure reason when `state == Failed` (← the `error` `GError`, rendered as text; wire
-    /// vNEXT).
+    /// v37).
     #[serde(default)]
     pub error: Option<String>,
     /// The remote content locator a `receive` fetches from (e.g. a Matrix `mxc://` URI);
-    /// protocol-opaque, daemon-native (wire vNEXT).
+    /// protocol-opaque, daemon-native (wire v37).
     #[serde(default)]
     pub source: Option<String>,
 }
@@ -4190,7 +4190,7 @@ pub enum JournalRecordPayload {
         /// The decoded transcript block.
         block: TranscriptBlock,
     },
-    /// A rich chat message (wire vNEXT): the [`ChatMessage`] representation of a conversation-history
+    /// A rich chat message (wire v37): the [`ChatMessage`] representation of a conversation-history
     /// entry, carrying delivery/edit state, author, and attachments the coarser `Block` shape omits.
     /// Additive — clients that only know `Management`/`Block` ignore it. Boxed to keep the enum small
     /// (`ChatMessage` is the largest variant); `Box<T>` serializes identically, so the wire shape is
@@ -4436,12 +4436,12 @@ pub enum NodeEvent {
         /// The scope to refetch.
         scope: String,
     },
-    /// The node's notification set changed (wire vNEXT): a notification was added, removed, read, or
+    /// The node's notification set changed (wire v37): a notification was added, removed, read, or
     /// deleted. A payload-free node-wide invalidation pointer (clients re-list via `NotificationList`),
     /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch, so it carries
     /// no per-notification detail.
     NotificationsChanged,
-    /// The node's person/metacontact registry changed (wire vNEXT): a person was created or removed,
+    /// The node's person/metacontact registry changed (wire v37): a person was created or removed,
     /// or a contact endpoint was associated/dissociated. A payload-free node-wide invalidation
     /// pointer (clients re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`].
     PersonsChanged,

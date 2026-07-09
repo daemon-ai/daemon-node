@@ -60,7 +60,7 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                         "  - [{}] cur={} seg={} seq={} {} block: {:?}",
                         mark, r.cursor, r.segment, r.seq, r.kind, block
                     ),
-                    // wire vNEXT (W2-E): the richer chat-message history entry.
+                    // wire v37 (W2-E): the richer chat-message history entry.
                     JournalRecordPayload::Chat { message } => {
                         let author = match &message.author {
                             Some(daemon_api::Participant::Contact(c)) => {

@@ -55,8 +55,8 @@ Wire ops added (additive, appended at the END of `ApiRequest`): `FtSend` /
 (mirroring every other feature trait, e.g. `ConvSendArgs.transport`), so an
 adapter can resolve its per-account client.
 
-`WireVersion::CURRENT` is **not** bumped (integration bumps once); new wire items
-are tagged "wire vNEXT".
+`WireVersion::CURRENT` is bumped once by integration (to 37); new wire items
+are tagged "wire v37".
 
 ---
 

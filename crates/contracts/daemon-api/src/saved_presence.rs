@@ -8,7 +8,7 @@
 //! last-used timestamp, and a use-count. Unlike [`crate::details`] (pure behavior over existing
 //! DTOs), this **is** a new wire DTO — it crosses the wire as `ApiResponse::SavedPresences` and
 //! inside the `Presence{Save}` request — so it derives serde + feature-gated `Arbitrary` and is
-//! mirrored in `daemon-api.cddl` (tagged `wire vNEXT`).
+//! mirrored in `daemon-api.cddl` (tagged `wire v37`).
 //!
 //! It reuses the existing [`PresencePrimitive`] (do not duplicate the `src/details.rs` predicates)
 //! and the birb subsequence matcher from `src/matching.rs` for [`SavedPresence::matches`].

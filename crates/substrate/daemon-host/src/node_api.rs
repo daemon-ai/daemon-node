@@ -460,7 +460,7 @@ pub struct NodeApiImpl {
     /// every cron op resolves to its defaulted [`ApiError::Unsupported`] / empty list (a node built
     /// without the cron backing). Shared with the agent `cron` tool, so both create through one path.
     cron: Option<Arc<crate::cron::CronOps>>,
-    /// The saved-presence manager (W2-F; wire vNEXT) backing the `presence_*` control ops. `None`
+    /// The saved-presence manager (W2-F; wire v37) backing the `presence_*` control ops. `None`
     /// => every presence op resolves to its defaulted empty list / [`ApiError::Unsupported`] (a node
     /// built without saved-presence management).
     presences: Option<Arc<crate::presence::PresenceManager>>,
@@ -529,12 +529,12 @@ pub struct NodeApiImpl {
     /// [`ApiError::Unsupported`]). The real `PersonaStore` adapter is bound at node assembly via
     /// [`with_persona_ops`](Self::with_persona_ops).
     persona_ops: Option<Arc<dyn crate::persona_ops::PersonaOps>>,
-    /// The node's live notification manager (wire vNEXT), ported from libpurple's
+    /// The node's live notification manager (wire v37), ported from libpurple's
     /// `PurpleNotificationManager`. Backs [`ControlApi::notification_list`](daemon_api::ControlApi::notification_list);
     /// mutations emit [`NodeEvent::NotificationsChanged`](daemon_api::NodeEvent) via
     /// [`emit_notifications_changed`](Self::emit_notifications_changed) so clients re-list.
     notifications: Arc<std::sync::Mutex<crate::notifications::NotificationManager>>,
-    /// The node's person/metacontact registry (wire vNEXT), ported from the person half of
+    /// The node's person/metacontact registry (wire v37), ported from the person half of
     /// libpurple's `PurpleContactManager`. Backs
     /// [`ControlApi::person_list`](daemon_api::ControlApi::person_list); mutations emit
     /// [`NodeEvent::PersonsChanged`](daemon_api::NodeEvent) via

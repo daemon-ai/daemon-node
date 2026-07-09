@@ -84,15 +84,16 @@ account/label) plus filled/valid semantics that `AuthParamField` deliberately om
   *filled* toggled; group/page expose `revalidate()` returning whether validity *flipped*. Test
   counters accumulate these booleans, reproducing the C `called` counts exactly.
 
-## Wire exposure decision — KEEP NODE-INTERNAL (wire vNEXT candidate)
+## Wire exposure decision — KEEP NODE-INTERNAL (candidate for a future wire version)
 
 **No wire change in this package.** The wire carries *data*, not *validators*, and there is no
 concrete consuming surface today that should carry a full `RequestPage`: the auth-discovery surface is
 already served by the untouched `AuthParamField`/`AuthProviderInfo` shapes, and no adapter action
 surface currently upgrades to a request-form. So `RequestField`/`RequestGroup`/`RequestPage` are
 node-internal (NO serde, NO `Arbitrary`, NO CDDL rules, NO new ops, NO `WireVersion` bump), exactly as
-`details.rs`/`matching.rs` are. The module doc-comment tags the future request-UI surface as a **wire
-vNEXT candidate**: when a client needs to render an interactive request form (e.g. an
+`details.rs`/`matching.rs` are. The module doc-comment tags the future request-UI surface as a
+**candidate for a future wire version** (beyond the v37 libpurple-parity bump): when a client needs
+to render an interactive request form (e.g. an
 `AuthChallenge::Form` upgrade or a protocol-driven prompt), lift the *data* projection of these types
 onto the wire then (append-only, feature-gated `Arbitrary`, CDDL lockstep in the same commit) — the
 validators stay node-side by the "node decides, apps render" invariant.
