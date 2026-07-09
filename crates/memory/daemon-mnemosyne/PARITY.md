@@ -209,3 +209,184 @@ None. Every wave-1 gap was closed red→green in this pass.
   the provider contract) but kept as public API.
 - The typos pre-commit hook rejects the literal `café` NFC fixture; the NFC/NFD test uses
   `protégé` instead.
+
+---
+
+# Mnemosyne parity ledger — wave 2 (P1)
+
+Port of the P1 themes. Same TDD-hybrid protocol as wave 1. Baseline at wave-1 tip `df65fd1`:
+281 lib + 4 integration tests, green. End state: **320 lib + 1 (`multilingual_recall.rs`) + 4
+(`recall_modes.rs`) integration tests, 0 failed**; clippy (`--all-targets -- -D warnings`) clean;
+no `gap-open` red tests remain.
+
+Statuses as in wave 1 (`ported-pass` / `already-covered` / `gap-closed` / `gap-open` /
+`out-of-scope`).
+
+## Gap-closed summary (wave 2)
+
+| Gap | Red | Green |
+|---|---|---|
+| Polyphonic voice A/B toggles (`MNEMOSYNE_VOICE_{VECTOR,GRAPH,FACT,TEMPORAL}`) had no effect — voices ran unconditionally | `8b2e8d0` | `a499059` |
+| Annotation store `export_all` / `import_all` round-trip (id-carrying, idempotent reimport) was missing | `855d067` | `9ca2543` |
+
+## Per-theme ledger
+
+### 1. Cyrillic / non-Latin recall E2E (`tests/test_cyrillic_fts.py`, `tests/test_multilingual_local_recall.py`)
+
+The pure Cyrillic layer (`has_cyrillic`, `_ngrams`, `cyrillic_score`) and the engine's FTS→LIKE
+fallback routing were already ported. Added the missing DB-routing + public-surface E2E coverage.
+Note: single-token *inflection-only* recall does NOT surface through `recall()` in either Python or
+Rust — the 1-token lexical gate (`min_relevance = 0.15`) drops it unless a dense vector carries it;
+the Cyrillic fallback is a `_fts_search*` routing feature. The E2E test therefore uses exact-token
+Cyrillic overlap; inflection routing is asserted at the `fts_search_working`/`_episodic` layer.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `TestFtsSearchRoutesCyrillic::test_working_memory_fallback` | `engine::recall::tests::cyrillic_fts_working_routes_inflected_query_to_fallback` | ported-pass | `8b38eb5` |
+| `TestFtsSearchRoutesCyrillic::test_episodic_fallback` | `engine::recall::tests::cyrillic_fts_episodic_routes_inflected_query_to_fallback` | ported-pass | |
+| `TestCyrillicLikeSearchWorking::test_returns_empty_for_latin_query` | `engine::recall::tests::latin_query_does_not_engage_cyrillic_fallback` | ported-pass | |
+| `test_cyrillic_fts.py` (E2E adaptation) | `tests/multilingual_recall.rs::cyrillic_query_recalls_matching_memory_end_to_end` | ported-pass | exact-token Cyrillic through the public `remember`/`recall` surface |
+| `TestHasCyrillic`, `TestNgrams`, `TestCyrillicScore` | `recall::lexical::tests::cyrillic_trigram_scoring_matches_inflections` | already-covered | pure functions covered pre-wave-2 |
+
+### 2. Cross-tier dedup / polyphonic (`tests/test_e3a3_cross_tier_dedup.py`)
+
+`dedup_cross_tier_summary_links` + its wiring into base & polyphonic recall pre-existed. Ported the
+helper's unit matrix (tie→episodic, per-cluster, order-preservation, empty summary_of). All pass.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `TestDedupHelperUnit::test_no_episodic_rows_returns_input_unchanged` | `engine::recall::tests::dedup_no_episodic_rows_returns_input_unchanged` | ported-pass | `85c3e8c` |
+| `::test_wm_wins_drops_episodic` | `::dedup_wm_wins_drops_episodic` | ported-pass | |
+| `::test_episodic_wins_drops_wm` | `::dedup_episodic_wins_drops_wm` | ported-pass | |
+| `::test_ties_keep_episodic` | `::dedup_ties_keep_episodic` | ported-pass | tie policy = keep episodic |
+| `::test_summary_covers_multiple_wms_partial_overlap_per_cluster` | `::dedup_per_cluster_keeps_all_sources_when_summary_loses` | ported-pass | |
+| `::test_summary_covers_multiple_wms_all_in_results` | `::dedup_summary_beats_all_sources_drops_them` | ported-pass | |
+| `::test_preserves_order_on_retained_rows` | `::dedup_preserves_input_order_on_retained_rows` | ported-pass | |
+| `::test_empty_summary_of_string_handled` | `::dedup_empty_summary_of_string_is_a_noop` | ported-pass | |
+| `::test_only_one_side_in_results_keeps_it` | `::dedup_only_one_side_in_results_keeps_it` | ported-pass | |
+| `TestLinearRecallPathIntegration::*` | `engine::tests::episodic_recall_after_consolidation_dedups_cross_tier` | already-covered | E2E dedup pre-existed |
+
+### 3. Temporal boost E2E (`tests/test_temporal_recall.py`)
+
+`temporal_boost`/`parse_query_time` + the recall `t_boost` plumbing pre-existed (tested only for
+"composes/doesn't crash"). Added the missing E2E ranking assertions.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `TestTemporalRecallEndToEnd::test_temporal_boost_recent_vs_old` | `engine::tests::temporal_boost_ranks_recent_over_old_end_to_end` | ported-pass | `d256981` |
+| `TestTemporalRecallEndToEnd::test_temporal_halflife_override` | `engine::tests::temporal_halflife_override_changes_boost_end_to_end` | ported-pass | isolates the halflife knob |
+| `TestTemporalBoostFunction::*`, `TestParseQueryTime::*` | (recall.rs `temporal_boost`/`parse_query_time` internal tests) | already-covered | pure helpers |
+
+### 4. A/B toggle matrix (`tests/test_ab_toggles.py`)
+
+Five scoring toggles (`veracity_multiplier`, `graph_bonus`, `fact_bonus`, `binary_bonus`,
+`cross_tier_dedup`) were wired as `MnemosyneConfig` bools — ported behavioral tests, all pass. The
+four polyphonic **voice** toggles were absent (voices ran unconditionally) — gap-closed by adding
+`voice_{vector,graph,fact,temporal}` config flags + gating the voice calls in `recall_polyphonic`.
+Env-var parsing (`_env_disabled`) is the node's figment layer, out of this crate.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `TestLinearBonusToggles::test_graph_bonus_disabled_does_not_apply` | `engine::tests::graph_bonus_toggle_alters_episodic_recall_score` | ported-pass | `8ef116e` |
+| `TestLinearBonusToggles::test_fact_bonus_disabled_does_not_apply` | `engine::tests::fact_bonus_toggle_alters_episodic_recall_score` | ported-pass | |
+| `TestVeracityMultiplierToggle::test_disabled_*` + `test_enabled_*` | `engine::tests::veracity_multiplier_toggle_controls_stated_vs_unknown_ranking` | ported-pass | |
+| `TestCrossTierDedupToggle::*` | `engine::tests::cross_tier_dedup_toggle_controls_summary_source_collapse` | ported-pass | |
+| `TestPolyphonicVoiceToggles::test_vector_voice_disabled_returns_empty` | `engine::tests::voice_vector_toggle_gates_the_vector_voice` | gap-closed (`8b2e8d0`→`a499059`) | added `voice_vector` flag + gate |
+| `TestPolyphonicVoiceToggles::test_temporal_voice_disabled_returns_empty` | `engine::tests::voice_temporal_toggle_gates_the_temporal_voice` | gap-closed (`8b2e8d0`→`a499059`) | `voice_graph`/`voice_fact` gated symmetrically |
+| `TestLinearBonusToggles::test_binary_bonus_toggle_structural` | — | already-covered | `binary_bonus` gate consulted at `recall.rs:594` |
+| `TestEnvDisabledHelper::*`, `TestToggleCoverageMap::*` | — | out-of-scope | env-var parsing lives in the node figment config, not this crate |
+
+### 5. Unified private + surface recall (`tests/test_hermes_memory_provider_unified_recall.py`)
+
+`mnemosyne_recall`'s surface merge (`shared_surface_read`, `bank` tags, top-k truncation, private
+fallback) pre-existed in `tools.rs`. Ported the behavioral tests. All pass.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `test_recall_default_returns_private_only` + `test_recall_default_tags_results_as_private` | `provider::tests::recall_default_returns_private_only_and_tags_private` | ported-pass | `34cfea2` |
+| `test_recall_merges_results_from_both_banks` + `test_recall_tags_surface_results_with_bank_surface` | `provider::tests::recall_with_surface_read_merges_both_banks` | ported-pass | |
+| `test_recall_truncates_to_top_k_after_merge` | `provider::tests::recall_truncates_to_top_k_after_merge` | ported-pass | |
+| `test_recall_surface_init_failure_falls_back_to_private` | — | already-covered | the `if let Some(surface)` guard structurally guarantees the private fallback; the in-memory surface cannot be forced to fail as Python monkeypatches |
+| `test_shared_surface_read_in_config_schema` / `_reads_from_config_yaml` / `_kwarg_overrides_config` | — | out-of-scope | provider `__init__.py` config-schema/YAML wiring is the node layer |
+
+### 6. Session isolation, recall-side (`tests/test_hermes_memory_provider_thread_isolation.py`)
+
+Engine-level isolation was covered by `session_scoping_over_shared_bank`; added the provider-tool
+recall-surface variant (two providers over one on-disk bank, distinct session ids).
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `test_gateway_session_key_isolates_session_memories` | `provider::tests::recall_isolates_session_memories_across_providers` | ported-pass | `905818d` |
+| `test_no_gateway_session_key_falls_back_to_session_id`, `_sanitized_*`, `_empty_*` | — | out-of-scope | `gateway_session_key`→`session_id` derivation is the node composition layer (`MnemosyneBanks`) |
+| `test_prefetch_scopes_to_thread` | `engine::tests::session_scoping_over_shared_bank` | already-covered | same `(session_id = ? OR scope = 'global')` scope branch drives prefetch |
+
+### 7. Identity inject / capture (`tests/test_prefetch_identity_always_inject.py`, `tests/test_identity_memory.py`)
+
+Always-inject identity prefetch (`identity_rows` + `render_identity_block` dedup) and signal capture
+(`capture_identity_signals`) pre-existed. Ported the E2E behaviors.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `test_identity_surfaces_on_non_matching_generic_query` | `provider::tests::identity_always_injects_on_non_matching_generic_query` | ported-pass | `0f38a42` |
+| `test_identity_does_not_leak_across_sessions` | `provider::tests::identity_does_not_leak_across_sessions` | ported-pass | |
+| `test_no_identity_rows_is_a_noop` | `provider::tests::no_identity_rows_yields_no_identity_block` | ported-pass | |
+| `test_identity_memory.py` (capture) | `provider::tests::identity_signal_capture_persists_and_injects` | ported-pass | signal-phrase capture → source='identity' → always-inject |
+| `test_no_duplicate_when_query_matches_identity` | `recall::prefetch::tests` (render_identity_block dedup) | already-covered | dedup against the bank block is unit-tested |
+
+### 8. Session-end drain (`tests/test_hermes_memory_provider.py::on_session_end`)
+
+`on_session_switch(End|Handoff)` runs a forced sleep (drain WM→episodic). Added the drain-vs-no-drain
+contrast test. The Python bounded-daemon-thread / join-timeout / shutdown-drain mechanics are
+Python-threading specifics (the Rust engine is synchronous) — out-of-scope.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `test_on_session_end_completes_when_sleep_is_fast` | `provider::tests::session_end_drains_pending_working_memory` | ported-pass | `e53ed18` (also asserts Start does NOT drain) |
+| `session_end_promotes_working_memory_to_episodic` | (pre-existing) | already-covered | |
+| `test_on_session_end_returns_within_timeout_*`, `_logs_warning_on_timeout`, `test_shutdown_drains_*` | — | out-of-scope | bounded daemon-thread / join-cap is Python threading; Rust `run_sleep` is synchronous |
+
+### 9. Proactive content-similarity linking (`tests/test_proactive_linking.py`)
+
+Fully implemented in `ingest.rs::proactively_link` (gated by `config.proactive_linking`): FTS content
+similarity → `related_to`, entity co-occurrence → `references`, edge dedup. Ported the behavioral
+matrix; all pass.
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `TestProactiveContentLinking::test_similar_content_creates_edges` + `test_self_not_linked` | `engine::tests::proactive_linking_links_similar_content_and_never_itself` | ported-pass | `9b63cd2` |
+| `TestProactiveContentLinking::test_unrelated_content_no_edges` | `engine::tests::proactive_linking_skips_unrelated_content` | ported-pass | |
+| `TestProactiveLinkingGating::test_disabled_by_default` | `engine::tests::proactive_linking_disabled_by_default_creates_no_cross_memory_edges` | ported-pass | |
+| `TestEdgeDeduplication::test_repeat_remember_doesnt_duplicate_edges` | `engine::tests::proactive_linking_dedups_edges_on_repeat_remember` | ported-pass | |
+| `TestEdgeTypesAndWeights::test_entity_edge_type` / `TestProactiveEntityLinking::test_shared_subject_creates_edge` | `engine::tests::proactive_linking_creates_references_edge_on_shared_entity` | ported-pass | |
+| `TestNonBlocking::*` | — | already-covered | linking failures are `tracing::debug!`-swallowed (non-fatal) by construction |
+
+### 10. Annotations export / canonical isolation (`tests/test_annotations.py`, `tests/test_canonical.py`)
+
+Canonical **owner isolation** + upsert/supersede/forget pre-existed; annotation **multi-value
+preservation** (append-only E6) pre-existed. The annotation store's **`export_all`/`import_all`** was
+absent — gap-closed. The canonical store's `export_all`/`import_all`/`history`/`search`/`list` remain
+out-of-scope (see below).
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `TestOwnerIsolation::test_same_slot_different_owners_coexist` + `test_list_is_owner_scoped` | `knowledge::canonical::tests::canonical_slots_are_owner_isolated` | ported-pass | `4c6a99c` |
+| `TestUpsertSemantics::*` + `TestForget::*` | `knowledge::canonical::tests::versioned_remember_and_forget` | already-covered | created/unchanged/updated + version + forget + reborn |
+| `TestAnnotationStoreMultiValuePreservation::test_multiple_mentions_for_one_memory_preserved` | `knowledge::annotations::tests::multiple_values_for_one_memory_kind_are_preserved` | ported-pass | |
+| `::test_add_returns_row_id` | `knowledge::annotations::tests::add_returns_distinct_row_ids` | ported-pass | |
+| `TestAnnotationStoreQueries::test_query_by_memory_with_kind_filter` | `knowledge::annotations::tests::query_by_memory_filters_by_kind` | ported-pass | |
+| `TestAnnotationStoreExportImport::test_export_import_round_trip` + `test_import_idempotent_on_existing_ids` | `knowledge::annotations::tests::annotation_export_import_round_trips_and_is_idempotent` | gap-closed (`855d067`→`9ca2543`) | added `AnnotationExport` + `export_all`/`import_all` (id-carrying, `INSERT OR IGNORE` idempotent reimport) |
+| `test_canonical.py` `CanonicalStore.export_all`/`import_all`/`history`/`search`/`list`; `TestProviderTools` search/history modes | — | out-of-scope | the Rust canonical port is deliberately the current-recall subset the provider tools use (`remember`/`forget`/`current`). Full history/search/list/export is a larger unbuilt subsystem; cross-store transfer in this crate flows through the event-based `src/sync/` layer, not per-store export. Recorded for a future wave. |
+
+## Gap-open items (wave 2)
+
+None. Both wave-2 gaps were closed red→green.
+
+## Out-of-scope notes (wave 2)
+
+- Env-var toggle parsing (`_env_disabled`, `TestToggleCoverageMap`), provider `config.yaml`/schema
+  wiring, `gateway_session_key`→`session_id` derivation, and the bounded-daemon-thread
+  session-end/shutdown mechanics all live in the node/figment/threading layers above this
+  synchronous crate.
+- Canonical store `history`/`search`/`list`/`export_all`/`import_all` (and the provider tool's
+  search/history recall modes) are unbuilt in the Rust port — flagged above for a future wave rather
+  than forced in as an oversized addition.
