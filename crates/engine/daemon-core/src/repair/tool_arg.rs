@@ -269,3 +269,159 @@ mod tests {
         assert!(looks_truncated(r#"{"a": "open"#));
     }
 }
+
+/// Parity tests ported from hermes' `_repair_tool_call_arguments`
+/// (`agent/message_sanitization.py:185`) and its test matrix
+/// (`tests/run_agent/test_repair_tool_call_arguments.py`).
+///
+/// `parity_gap_*` tests assert the DESIRED behavior per the Python source and are
+/// expected to FAIL against the current Rust port — each documents a missing repair
+/// stage. Plain-named tests port already-correct behavior and MUST PASS.
+#[cfg(test)]
+mod parity {
+    use super::*;
+
+    /// Helper: does the repaired output parse as valid JSON? (Python asserts
+    /// `json.loads(result)` succeeds for the "valid JSON at minimum" cases.)
+    fn parses(raw: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(&repair_tool_args(raw).args).is_ok()
+    }
+
+    // ── Stage 1: empty / whitespace-only → {} ──────────────────────────────
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_empty_string_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:13)
+    #[test]
+    fn parity_gap_empty_string_returns_empty_object() {
+        assert_eq!(repair_tool_args("").args, "{}");
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_whitespace_only_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:16)
+    #[test]
+    fn parity_gap_whitespace_only_returns_empty_object() {
+        assert_eq!(repair_tool_args("   \n\t  ").args, "{}");
+    }
+
+    // ── Stage 2: Python `None` literal → {} ────────────────────────────────
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_python_none_literal (tests/run_agent/test_repair_tool_call_arguments.py:25)
+    #[test]
+    fn parity_gap_python_none_literal_returns_empty_object() {
+        assert_eq!(repair_tool_args("None").args, "{}");
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_python_none_with_whitespace (tests/run_agent/test_repair_tool_call_arguments.py:28)
+    #[test]
+    fn parity_gap_python_none_with_whitespace_returns_empty_object() {
+        assert_eq!(repair_tool_args("  None  ").args, "{}");
+    }
+
+    // ── Stage 3: trailing-comma repair (already handled — port for coverage) ─
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_trailing_comma_in_array (tests/run_agent/test_repair_tool_call_arguments.py:37)
+    #[test]
+    fn trailing_comma_in_array() {
+        let r = repair_tool_args(r#"{"a": [1, 2,]}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
+            serde_json::json!({"a": [1, 2]})
+        );
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_multiple_trailing_commas (tests/run_agent/test_repair_tool_call_arguments.py:42)
+    #[test]
+    fn multiple_trailing_commas() {
+        let r = repair_tool_args(r#"{"a": 1, "b": 2,}"#);
+        let v: serde_json::Value = serde_json::from_str(&r.args).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+    }
+
+    // ── Stage 4: unclosed brackets (already handled — port for coverage) ────
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_unclosed_bracket_and_brace (tests/run_agent/test_repair_tool_call_arguments.py:55)
+    #[test]
+    fn unclosed_bracket_and_brace_yields_valid_json() {
+        assert!(parses(r#"{"a": [1, 2"#));
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_trailing_comma_plus_unclosed_brace (tests/run_agent/test_repair_tool_call_arguments.py:95)
+    #[test]
+    fn trailing_comma_plus_unclosed_brace_yields_valid_json() {
+        assert!(parses(r#"{"a": 1, "b": 2,"#));
+    }
+
+    // ── Stage 5: excess closing delimiters (NOT handled → gap) ─────────────
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_extra_closing_brace (tests/run_agent/test_repair_tool_call_arguments.py:64)
+    #[test]
+    fn parity_gap_extra_closing_brace_is_trimmed() {
+        let r = repair_tool_args(r#"{"key": "value"}}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
+            serde_json::json!({"key": "value"})
+        );
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_extra_closing_bracket (tests/run_agent/test_repair_tool_call_arguments.py:69)
+    #[test]
+    fn parity_gap_extra_closing_bracket_yields_valid_json() {
+        assert!(parses(r#"{"a": [1]]}"#));
+    }
+
+    // ── Stage 6: unrepairable → {} fallback (NOT handled → gap) ────────────
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_unrepairable_garbage_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:76)
+    #[test]
+    fn parity_gap_unrepairable_garbage_returns_empty_object() {
+        assert_eq!(repair_tool_args("totally not json").args, "{}");
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_unrepairable_partial_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:79)
+    #[test]
+    fn parity_gap_unrepairable_partial_returns_empty_object() {
+        // A value truncated mid-string is unrepairable in hermes (brace-count
+        // alone cannot recover it) → {}.
+        assert_eq!(repair_tool_args(r#"{"truncated": "val"#).args, "{}");
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_real_world_glm_truncation (tests/run_agent/test_repair_tool_call_arguments.py:101)
+    #[test]
+    fn parity_gap_glm_truncation_yields_valid_json() {
+        // Truncated after a key's colon (`"background":`) → hermes falls back to {}.
+        assert!(parses(
+            r#"{"command": "ls -la /tmp", "timeout": 30, "background":"#
+        ));
+    }
+
+    // ── Stage 0: lenient parse of literal control chars in strings (gap) ───
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_literal_newline_inside_string_value (tests/run_agent/test_repair_tool_call_arguments.py:113)
+    #[test]
+    fn parity_gap_literal_newline_inside_string_value() {
+        let r = repair_tool_args("{\"summary\": \"line one\nline two\"}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
+            serde_json::json!({"summary": "line one\nline two"})
+        );
+    }
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_literal_tab_inside_string_value (tests/run_agent/test_repair_tool_call_arguments.py:119)
+    #[test]
+    fn parity_gap_literal_tab_inside_string_value() {
+        let r = repair_tool_args("{\"summary\": \"col1\tcol2\"}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
+            serde_json::json!({"summary": "col1\tcol2"})
+        );
+    }
+
+    // ── Stage 4: control-char escape fallback with trailing comma (gap) ────
+
+    // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_control_chars_with_trailing_comma (tests/run_agent/test_repair_tool_call_arguments.py:135)
+    #[test]
+    fn parity_gap_control_chars_with_trailing_comma() {
+        let r = repair_tool_args("{\"msg\": \"line\none\",}");
+        let v: serde_json::Value = serde_json::from_str(&r.args).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("line"));
+    }
+}
