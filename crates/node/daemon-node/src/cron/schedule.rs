@@ -90,3 +90,116 @@ impl CronWorker {
         job
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_api::CatchUpPolicy;
+    use daemon_store::StoredCronJob;
+
+    fn spec(schedule: &str, catch_up: CatchUpPolicy) -> CronSpec {
+        CronSpec {
+            name: "job".into(),
+            schedule: schedule.into(),
+            catch_up,
+            ..CronSpec::default()
+        }
+    }
+
+    fn job(schedule: &str, next_fire_unix: Option<u64>) -> StoredCronJob {
+        StoredCronJob {
+            id: "cron-1".into(),
+            schedule: schedule.into(),
+            spec: Vec::new(),
+            next_fire_unix,
+            paused: false,
+            last_run_unix: None,
+            last_ok: None,
+            last_detail: None,
+            fire_count: 0,
+            created_unix: 0,
+            owner: None,
+        }
+    }
+
+    /// `test_scheduled_task.c` `/schedule/normal` catch-up analogue: a fire scheduled just in the
+    /// recent past still runs (within the grace window), i.e. it "fires promptly".
+    #[test]
+    fn should_fire_recent_past_due_within_grace() {
+        let now = 1_000_000;
+        let sched = CronWorker::schedule_of(&spec("@every 1h", CatchUpPolicy::Grace)).unwrap();
+        // 10s late — well inside the 120s grace floor.
+        assert!(CronWorker::should_fire(
+            &spec("@every 1h", CatchUpPolicy::Grace),
+            &sched,
+            now - 10,
+            now
+        ));
+    }
+
+    /// A stale miss beyond the Skip tolerance is not run (the schedule fast-forwards instead).
+    #[test]
+    fn should_fire_skips_stale_beyond_tolerance() {
+        let now = 1_000_000;
+        let sched = CronWorker::schedule_of(&spec("@every 1h", CatchUpPolicy::Skip)).unwrap();
+        // 1000s late — far past CRON_SKIP_TOLERANCE_SECS (60s).
+        assert!(!CronWorker::should_fire(
+            &spec("@every 1h", CatchUpPolicy::Skip),
+            &sched,
+            now - 1000,
+            now
+        ));
+        // Always ignores lateness entirely.
+        assert!(CronWorker::should_fire(
+            &spec("@every 1h", CatchUpPolicy::Always),
+            &sched,
+            now - 1_000_000,
+            now
+        ));
+    }
+
+    /// `/scheduled-task/schedule/reuse` (re-schedule after execution fires again): advancing a
+    /// recurring job past `now` re-arms it with a single future fire.
+    #[test]
+    fn advanced_recurring_rearms_future() {
+        let now = 1_000_000;
+        let sched = CronWorker::schedule_of(&spec("@every 1h", CatchUpPolicy::Grace)).unwrap();
+        let advanced = CronWorker::advanced(&job("@every 1h", Some(now - 10)), &sched, now);
+        let next = advanced.next_fire_unix.expect("recurring job re-arms");
+        assert!(next > now, "the re-armed fire is strictly in the future");
+        assert!(next <= now + 3600, "and within one period");
+    }
+
+    /// Multi-period downtime collapses to a single next occurrence (no thundering-herd backlog):
+    /// a very stale `next_fire` still advances to just the next future fire.
+    #[test]
+    fn advanced_fast_forwards_stale_downtime() {
+        let now = 1_600_000_000;
+        // Hourly cron; the job's armed fire is ~28h stale.
+        let sched = CronWorker::schedule_of(&spec("0 * * * *", CatchUpPolicy::Grace)).unwrap();
+        let advanced = CronWorker::advanced(&job("0 * * * *", Some(now - 100_000)), &sched, now);
+        let next = advanced.next_fire_unix.expect("recurring advances");
+        assert!(next > now, "collapses stale backlog to one future fire");
+        assert!(
+            next <= now + 3600,
+            "a single next hourly occurrence, not a backlog replay"
+        );
+    }
+
+    /// `/scheduled-task/schedule/past` — **divergence**: libpurple refuses a past execute-at with an
+    /// error; the daemon instead yields `next_fire None` for a past one-shot, so the tick auto-deletes
+    /// it (it can never fire again). No error path.
+    #[test]
+    fn advanced_one_shot_past_exhausts() {
+        let now = 1_600_000_000; // well after the year-2000 timestamp below
+        let sched =
+            CronWorker::schedule_of(&spec("2000-01-01T00:00:00Z", CatchUpPolicy::Grace)).unwrap();
+        assert!(sched.is_one_shot());
+        let advanced =
+            CronWorker::advanced(&job("2000-01-01T00:00:00Z", Some(946_684_800)), &sched, now);
+        assert!(
+            advanced.next_fire_unix.is_none(),
+            "a past one-shot is exhausted (no fire), not an error"
+        );
+    }
+}
