@@ -4003,6 +4003,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- Wave 2 theme 5: WAL crash-safety (durability PRAGMAs + graceful close checkpoint) -----
+
+    // PARITY: hermes-lcm tests/test_crash_safe_wal.py::TestConfigureConnectionPragmas
+    #[test]
+    fn wal_durability_pragmas_are_configured_on_a_durable_store() {
+        let dir = std::env::temp_dir().join(format!("lcm-wal-pragma-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("test.db")).expect("open");
+        {
+            let conn = store.conn.lock().unwrap();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(journal_mode, "wal");
+            let synchronous: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(synchronous, 2, "synchronous=FULL");
+            let busy_timeout: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(busy_timeout, 30_000);
+            let wal_autocheckpoint: i64 = conn
+                .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(wal_autocheckpoint, 500);
+            let journal_size_limit: i64 = conn
+                .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(journal_size_limit, 67_108_864);
+            let mmap_size: i64 = conn
+                .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mmap_size, 268_435_456);
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: hermes-lcm tests/test_crash_safe_wal.py::TestGracefulClose::test_message_store_close_runs_checkpoint
+    #[test]
+    fn graceful_close_checkpoints_the_wal() {
+        let dir = std::env::temp_dir().join(format!("lcm-wal-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.db");
+        let store = Store::open(&db).expect("open");
+        store
+            .append_batch(
+                "sess",
+                &[NewMessage {
+                    role: "user".into(),
+                    content: Some("hello".into()),
+                    ..NewMessage::default()
+                }],
+                1.0,
+            )
+            .unwrap();
+        assert!(db.exists());
+        // Dropping the store runs the passive checkpoint and closes the last connection, so SQLite
+        // flushes committed WAL frames back into the main database file.
+        drop(store);
+        let wal = std::path::PathBuf::from(format!("{}-wal", db.display()));
+        let wal_size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_size < 4096,
+            "WAL still {wal_size} bytes after graceful close; checkpoint may not have run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `scan_fts_repair` (`_scan_fts_repair`, `LCM:command.py:665-701`) reports a desynced index
     /// without touching it; a forced `repair_fts` then heals it.
     #[test]
