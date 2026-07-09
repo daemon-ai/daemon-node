@@ -2341,3 +2341,192 @@ fn temporal_halflife_override_changes_boost_end_to_end() {
         "a longer temporal halflife must boost a 2-day-old memory more: long={score_long} short={score_short}"
     );
 }
+
+// ---- A/B scoring toggles (`tests/test_ab_toggles.py`) ----
+
+/// Seed one episodic row plus the graph edges + fact that let a recall claim the bonuses.
+fn seed_episodic_with_graph_and_fact(e: &Engine) {
+    let conn = e.store.conn.lock().unwrap();
+    let ts = crate::util::now_iso();
+    conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance) \
+         VALUES ('ep-bonus', 'deploy production rollout plan', 'consolidation', ?1, 'default', 0.5)",
+        params![ts],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO graph_edges (source, target, edge_type) VALUES ('ep-bonus', 'ep-other', 'related')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO graph_edges (source, target, edge_type) VALUES ('ep-other', 'ep-bonus', 'related')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO facts (fact_id, session_id, source_msg_id, subject, predicate, object) \
+         VALUES ('fact-1', 'default', 'ep-bonus', 'team', 'deploys', 'production')",
+        [],
+    )
+    .unwrap();
+}
+
+fn ep_score(e: &Engine, query: &str) -> Option<f64> {
+    e.recall(query, 5)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == "ep-bonus")
+        .map(|r| r.score)
+}
+
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestLinearBonusToggles::test_graph_bonus_disabled_does_not_apply
+#[test]
+fn graph_bonus_toggle_alters_episodic_recall_score() {
+    // veracity multiplier defanged so only the graph bonus differs, matching the Python fixture.
+    let on = Engine::open_in_memory(MnemosyneConfig {
+        veracity_multiplier: false,
+        ..MnemosyneConfig::default()
+    })
+    .unwrap();
+    seed_episodic_with_graph_and_fact(&on);
+    let off = Engine::open_in_memory(MnemosyneConfig {
+        veracity_multiplier: false,
+        graph_bonus: false,
+        ..MnemosyneConfig::default()
+    })
+    .unwrap();
+    seed_episodic_with_graph_and_fact(&off);
+
+    let on_score = ep_score(&on, "deploy production rollout").expect("on hit");
+    let off_score = ep_score(&off, "deploy production rollout").expect("off hit");
+    assert!(
+        on_score > off_score,
+        "graph_bonus toggle must lift the score: on={on_score} off={off_score}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestLinearBonusToggles::test_fact_bonus_disabled_does_not_apply
+#[test]
+fn fact_bonus_toggle_alters_episodic_recall_score() {
+    let base = |fact_bonus: bool| MnemosyneConfig {
+        veracity_multiplier: false,
+        graph_bonus: false,
+        fact_bonus,
+        ..MnemosyneConfig::default()
+    };
+    let on = Engine::open_in_memory(base(true)).unwrap();
+    seed_episodic_with_graph_and_fact(&on);
+    let off = Engine::open_in_memory(base(false)).unwrap();
+    seed_episodic_with_graph_and_fact(&off);
+
+    let on_score = ep_score(&on, "deploys production").expect("on hit");
+    let off_score = ep_score(&off, "deploys production").expect("off hit");
+    assert!(
+        on_score > off_score,
+        "fact_bonus toggle must lift the score: on={on_score} off={off_score}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestVeracityMultiplierToggle::test_disabled_makes_stated_unknown_score_equal
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestVeracityMultiplierToggle::test_enabled_makes_stated_outrank_unknown
+#[test]
+fn veracity_multiplier_toggle_controls_stated_vs_unknown_ranking() {
+    let seed = |e: &Engine| {
+        let conn = e.store.conn.lock().unwrap();
+        let ts = crate::util::now_iso();
+        conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, veracity) \
+             VALUES ('ep-stated', 'the user prefers dark mode', 'consolidation', ?1, 'default', 0.5, 'stated')",
+            params![ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, veracity) \
+             VALUES ('ep-unknown', 'the user prefers dark mode', 'consolidation', ?1, 'default', 0.5, 'unknown')",
+            params![ts],
+        )
+        .unwrap();
+    };
+    let score_of = |e: &Engine, id: &str| {
+        e.recall("dark mode", 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .map(|r| r.score)
+    };
+    // Defang graph/fact/binary bonuses so only the veracity multiplier differs.
+    let cfg = |veracity_multiplier: bool| MnemosyneConfig {
+        veracity_multiplier,
+        graph_bonus: false,
+        fact_bonus: false,
+        binary_bonus: false,
+        ..MnemosyneConfig::default()
+    };
+
+    let off = Engine::open_in_memory(cfg(false)).unwrap();
+    seed(&off);
+    let s_stated = score_of(&off, "ep-stated").expect("stated off");
+    let s_unknown = score_of(&off, "ep-unknown").expect("unknown off");
+    assert!(
+        (s_stated - s_unknown).abs() < 1e-9,
+        "multiplier OFF: stated/unknown must score identically: {s_stated} vs {s_unknown}"
+    );
+
+    let on = Engine::open_in_memory(cfg(true)).unwrap();
+    seed(&on);
+    let s_stated_on = score_of(&on, "ep-stated").expect("stated on");
+    let s_unknown_on = score_of(&on, "ep-unknown").expect("unknown on");
+    assert!(
+        s_stated_on > s_unknown_on,
+        "multiplier ON: stated (1.0) must outrank unknown (0.8): {s_stated_on} vs {s_unknown_on}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestCrossTierDedupToggle (disabled_returns_input_unchanged + enabled_dedups_normally)
+#[test]
+fn cross_tier_dedup_toggle_controls_summary_source_collapse() {
+    let seed = |e: &Engine| {
+        let conn = e.store.conn.lock().unwrap();
+        let ts = crate::util::now_iso();
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) \
+             VALUES ('wm-src', 'deployment script for prod release', 'conversation', ?1, 'default', 0.5)",
+            params![ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, summary_of) \
+             VALUES ('ep-sum', 'Summary deployment script for prod release', 'consolidation', ?1, 'default', 0.5, 'wm-src')",
+            params![ts],
+        )
+        .unwrap();
+    };
+    let pair_count = |e: &Engine| {
+        e.recall("deployment", 10)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == "wm-src" || r.id == "ep-sum")
+            .count()
+    };
+
+    let on = Engine::open_in_memory(MnemosyneConfig::default()).unwrap();
+    seed(&on);
+    assert_eq!(
+        pair_count(&on),
+        1,
+        "cross-tier dedup ON collapses the summary<->source pair to one"
+    );
+
+    let off = Engine::open_in_memory(MnemosyneConfig {
+        cross_tier_dedup: false,
+        ..MnemosyneConfig::default()
+    })
+    .unwrap();
+    seed(&off);
+    assert_eq!(
+        pair_count(&off),
+        2,
+        "cross-tier dedup OFF leaves both the summary and its source"
+    );
+}
