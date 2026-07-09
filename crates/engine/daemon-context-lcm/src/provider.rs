@@ -3112,6 +3112,60 @@ mod tests {
             .text
     }
 
+    // parity: command.py::test_doctor_source_reports_legacy_blank_rows (tests/test_lcm_command.py:440)
+    #[tokio::test]
+    async fn parity_gap_doctor_source_scans_legacy_blank_rows() {
+        let (lcm, dir) = durable_engine("doctor-source-scan", 32);
+        let mut c = convo(2); // 4 attributed rows via the normal write path
+        lcm.before_turn(&mut c, None);
+        lcm.store()
+            .insert_legacy_blank_source_row("s1", "user", "legacy blank row")
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor source").await;
+        assert!(text.contains("status: normalization-needed"), "{text}");
+        assert!(text.contains("legacy_blank_messages: 1"), "{text}");
+        assert!(text.contains("would_update_messages: 1"), "{text}");
+        assert!(text.contains("target_source: unknown"), "{text}");
+        assert!(
+            text.contains("no source rows were updated"),
+            "read-only: {text}"
+        );
+        // Read-only scan did not mutate the blank row.
+        assert_eq!(
+            lcm.store()
+                .source_stats(None)
+                .unwrap()
+                .legacy_blank_source_messages,
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: command.py::test_doctor_source_apply_normalizes_legacy_blank_rows (tests/test_lcm_command.py:451)
+    #[tokio::test]
+    async fn parity_gap_doctor_source_apply_normalizes_legacy_blank_rows() {
+        let (lcm, dir) = durable_engine("doctor-source-apply", 32);
+        let mut c = convo(2);
+        lcm.before_turn(&mut c, None);
+        lcm.store()
+            .insert_legacy_blank_source_row("s1", "user", "legacy blank row")
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor source apply").await;
+        assert!(text.contains("status: ok"), "{text}");
+        assert!(text.contains("updated_messages: 1"), "{text}");
+        assert!(text.contains("legacy_blank_before: 1"), "{text}");
+        assert!(text.contains("legacy_blank_after: 0"), "{text}");
+        assert!(text.contains("backup_path: "), "backup-first: {text}");
+        // The blank row is now attributed to the explicit unknown bucket.
+        let stats = lcm.store().source_stats(None).unwrap();
+        assert_eq!(stats.legacy_blank_source_messages, 0);
+        // A second scan reports nothing to do.
+        let rescan = run_lcm(&lcm, "doctor source").await;
+        assert!(rescan.contains("status: ok"), "{rescan}");
+        assert!(rescan.contains("would_update_messages: 0"), "{rescan}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

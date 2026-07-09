@@ -558,6 +558,25 @@ impl Store {
         Ok(ids)
     }
 
+    /// Test-only: insert a raw row with a legacy blank (`''`) `source`, bypassing the write-time
+    /// normalization in [`append_batch`], so the source-normalization doctor can be exercised.
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_blank_source_row(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, source, role, content, timestamp, token_estimate) \
+             VALUES (?1, '', ?2, ?3, 1.0, 1)",
+            params![session_id, role, content],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// Fetch a single message by `store_id`.
     pub fn get_message(&self, store_id: i64) -> Result<Option<MessageRow>> {
         let conn = self.conn.lock().expect("lcm store poisoned");
