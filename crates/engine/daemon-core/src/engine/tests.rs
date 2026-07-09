@@ -1301,7 +1301,7 @@ async fn multi_round_loop_runs_tools_then_completes() {
 /// Two identical (name, args) tool calls in one assistant message are deduplicated — the tool runs
 /// exactly once, not once per duplicate.
 #[tokio::test]
-async fn parity_gap_deduplicates_identical_parallel_tool_calls() {
+async fn deduplicates_identical_parallel_tool_calls() {
     let runs = Arc::new(AtomicU64::new(0));
     let provider = Arc::new(ScriptedProvider::new(
         vec![ScriptStep::Calls(vec![
@@ -1330,10 +1330,12 @@ async fn parity_gap_deduplicates_identical_parallel_tool_calls() {
 async fn parallel_tool_batch_runs_concurrently() {
     let active = Arc::new(AtomicU64::new(0));
     let max_seen = Arc::new(AtomicU64::new(0));
+    // Distinct args so the §9 tool-call dedup does not collapse the pair — we are probing
+    // concurrency here, not deduplication.
     let provider = Arc::new(ScriptedProvider::new(
         vec![ScriptStep::Calls(vec![
-            ("para".into(), "{}".into()),
-            ("para".into(), "{}".into()),
+            ("para".into(), "{\"i\":0}".into()),
+            ("para".into(), "{\"i\":1}".into()),
         ])],
         "done",
     ));

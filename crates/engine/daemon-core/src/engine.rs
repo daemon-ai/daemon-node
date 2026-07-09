@@ -39,6 +39,16 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+/// Drop duplicate `(name, args)` tool calls within a single assistant message, keeping the first
+/// occurrence (a faithful port of hermes' `_deduplicate_tool_calls`, run_agent.py:3395). A model
+/// that emits the same call twice in one round would otherwise run the tool twice; deduping at the
+/// decode/dispatch boundary makes an identical parallel call idempotent. The `args` compared are the
+/// raw model arguments (pre-repair), matching the Python key `(function.name, function.arguments)`.
+fn deduplicate_tool_calls(calls: &mut Vec<crate::conversation::ToolCall>) {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    calls.retain(|c| seen.insert((c.name.clone(), c.args.clone())));
+}
+
 /// A background-job completion handed back to the engine on rehydration (the core-local form of the
 /// durable `JobCompletion`; the host adapter converts between them).
 #[derive(Clone, Debug)]
@@ -1177,7 +1187,7 @@ impl Engine {
                     epoch = model_epoch,
                     offer_tools = true
                 );
-                let out = match self
+                let mut out = match self
                     .call_model(events, true, &cancel)
                     .instrument(model_span)
                     .await
@@ -1191,6 +1201,12 @@ impl Engine {
                 if self.boundary(control, events) {
                     return Ok(self.finish_interrupted(events));
                 }
+
+                // §9 dedup: at the decode/dispatch boundary, collapse duplicate (name, args) tool
+                // calls the model emitted within this one assistant message to their first
+                // occurrence (mirrors hermes' `_deduplicate_tool_calls`), so an identical parallel
+                // call is executed once rather than once per duplicate.
+                deduplicate_tool_calls(&mut out.tool_calls);
 
                 if out.tool_calls.is_empty() {
                     // §11 -> §10 post-turn hooks (spec order): record the assistant turn, then
