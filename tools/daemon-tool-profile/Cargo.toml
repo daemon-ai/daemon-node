@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The persona (SOUL.md) store: the tool's `persona` argument routes through PersonaStore::set
+# (validated, scanned, capped, revision-logged) - the spec field left the wire at v36.
+daemon-prompt = { workspace = true }
 daemon-core = { workspace = true }
 # The shared profile create/validate/persist/version surface; the tool is a thin agent veneer over it
 # (the exact validation + store + revision path the operator `profile_create` op uses).
@@ -27,6 +30,8 @@ tokio = { workspace = true }
 # Build a minimal `TurnCx` to drive `Tool::run` (the composed-profiles guardrail path).
 tokio-util = { workspace = true }
 daemon-protocol = { workspace = true }
+# Persona-routing tests run a real PersonaStore over a scratch dir.
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -556,12 +556,17 @@ fn build_profile_stack(a: &NodeAssembly, node_events: &Arc<NodeEventFeed>) -> Op
     // refetches the profile list. The feed IS the sink (`impl ProfileEvents for NodeEventFeed`).
     ops = ops.with_events(node_events.clone() as Arc<dyn daemon_host::ProfileEvents>);
     let profile_ops = Arc::new(ops);
-    let profile_tool = Arc::new(
+    let mut profile_tool =
         daemon_tool_profile::ProfileManageTool::new(profile_ops.clone(), a.store.clone())
             // The composed-profiles cap — the agent-created-agents guardrail; the same
             // `[orchestrate].max_composed_profiles` policy surfaced read-only via `Caps`.
-            .with_max_composed(a.orchestrate.max_composed_profiles),
-    ) as Arc<dyn Tool>;
+            .with_max_composed(a.orchestrate.max_composed_profiles);
+    // The tool's `persona` argument routes through the SAME persona store the operator SoulSet
+    // path uses (one validation + revision path; `PersonaStore::set` is the single revlog writer).
+    if let Some(personas) = a.prompt.personas.clone() {
+        profile_tool = profile_tool.with_personas(personas);
+    }
+    let profile_tool = Arc::new(profile_tool) as Arc<dyn Tool>;
     Some(ProfileStack {
         profile_ops,
         profile_tool,

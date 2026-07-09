@@ -3271,10 +3271,12 @@ dependencies = [
  "daemon-common",
  "daemon-core",
  "daemon-host",
+ "daemon-prompt",
  "daemon-protocol",
  "daemon-store",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

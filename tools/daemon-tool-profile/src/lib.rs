@@ -70,6 +70,10 @@ pub struct ProfileManageTool {
     /// The composed-profiles cap (the agent-created-agents guardrail): a `create` past this many
     /// profiles in the caller's `agent/{session}/` namespace is declined with a `guardrail` detail.
     max_composed: usize,
+    /// The persona (SOUL.md) store the tool's `persona` argument routes through
+    /// ([`PersonaStore::set`] — THE single revision-log writer; the tool never appends its own
+    /// entry). `None` (ephemeral nodes): the argument is acknowledged as ignored.
+    personas: Option<Arc<daemon_prompt::PersonaStore>>,
 }
 
 /// The `profile_manage` tool-call arguments (a `ProfileSpec` shape + the action verb). Optional spec
@@ -90,8 +94,10 @@ struct ManageArgs {
     model: Option<String>,
     #[serde(default)]
     base_url: Option<String>,
+    /// The profile's persona (SOUL.md text) — routed through the node's persona store on
+    /// create/edit, never a spec field (it left the wire at v36).
     #[serde(default)]
-    system_prompt: Option<String>,
+    persona: Option<String>,
     #[serde(default)]
     tool_allowlist: Option<Vec<String>>,
     #[serde(default)]
@@ -152,10 +158,6 @@ fn apply_fields(spec: &mut ProfileSpec, args: &ManageArgs) {
     if let Some(base_url) = &args.base_url {
         spec.base_url = Some(base_url.clone());
     }
-    // TODO(prompt-arch Lane E): route `system_prompt` (renamed `persona`) through the node's
-    // PersonaStore (the SoulSet path) — the spec field left the wire at v36. The arg is accepted
-    // and ignored until then, so existing agent calls don't hard-fail deserialization.
-    let _ = &args.system_prompt;
     if let Some(tool_allowlist) = &args.tool_allowlist {
         spec.tool_allowlist = Some(tool_allowlist.clone());
     }
@@ -178,6 +180,7 @@ impl ProfileManageTool {
             ops,
             store,
             max_composed: DEFAULT_MAX_COMPOSED,
+            personas: None,
         }
     }
 
@@ -187,6 +190,47 @@ impl ProfileManageTool {
     pub fn with_max_composed(mut self, max_composed: usize) -> Self {
         self.max_composed = max_composed;
         self
+    }
+
+    /// Attach the persona (SOUL.md) store the tool's `persona` argument routes through — the
+    /// agent-authoring analogue of the operator SoulSet path (same store, same validation, same
+    /// revision log; [`daemon_prompt::PersonaStore::set`] is the single revision writer).
+    pub fn with_personas(mut self, personas: Arc<daemon_prompt::PersonaStore>) -> Self {
+        self.personas = Some(personas);
+        self
+    }
+
+    /// Route a create/edit's `persona` argument through the persona store, returning the suffix
+    /// for the action's result message. `reason` is the revision-log reason (`create`/`edit`);
+    /// `applied` the past-tense verb for the error text. A store rejection (empty /
+    /// threat-scanned / over-cap) is a hard error naming what already succeeded, so the agent can
+    /// retry the persona alone with an `edit`; a node without a persona store acknowledges the
+    /// argument as ignored.
+    fn apply_persona(
+        &self,
+        id: &str,
+        persona: Option<&str>,
+        reason: &str,
+        applied: &str,
+    ) -> Result<String, String> {
+        let Some(text) = persona else {
+            return Ok(String::new());
+        };
+        match &self.personas {
+            Some(store) => match store.set(
+                id,
+                text,
+                daemon_prompt::Author::Agent(PROFILE_TOOL_NAME.to_string()),
+                reason,
+            ) {
+                Ok(_) => Ok(" (persona recorded)".to_string()),
+                Err(e) => Err(format!(
+                    "profile `{id}` was {applied}, but the persona was rejected: {e}; \
+                     retry with `edit` and a revised persona"
+                )),
+            },
+            None => Ok(" (persona ignored: this node hosts no persona store)".to_string()),
+        }
     }
 
     /// The count of profiles in the caller's `agent/{session}/` namespace (the composed-profiles
@@ -234,7 +278,9 @@ impl ProfileManageTool {
                     .create(spec, Self::author())
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(format!("created profile `{id}`"))
+                let persona_note =
+                    self.apply_persona(&id, args.persona.as_deref(), "create", "created")?;
+                Ok(format!("created profile `{id}`{persona_note}"))
             }
             "edit" => {
                 let id = args
@@ -256,7 +302,9 @@ impl ProfileManageTool {
                     .update(spec, Self::author())
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(format!("edited profile `{id}`"))
+                let persona_note =
+                    self.apply_persona(id, args.persona.as_deref(), "edit", "edited")?;
+                Ok(format!("edited profile `{id}`{persona_note}"))
             }
             "delete" => {
                 let id = args
@@ -303,7 +351,7 @@ impl Tool for ProfileManageTool {
     }
 
     fn schema(&self) -> &str {
-        r#"{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["create","edit","delete","list"],"description":"author a reusable profile from existing building blocks, or list the profiles authored in this session's subtree"},"name":{"type":"string","description":"create: the short profile name (keys the agent/{session}/{name} id)"},"id":{"type":"string","description":"edit/delete: the full profile id (agent/{session}/{name}); only profiles authored within this session's subtree may be managed"},"provider":{"type":"string","description":"the model provider selector (Core engine)"},"model":{"type":"string","description":"the model id (Core engine)"},"base_url":{"type":"string","description":"optional provider API base-URL override"},"system_prompt":{"type":"string","description":"the profile's persona / system prompt"},"tool_allowlist":{"type":"array","items":{"type":"string"},"description":"the tools this profile's engine may use (an allowlist; omit for the full node toolset)"},"engine":{"description":"\"Core\" (default) or {\"Foreign\":{\"agent\":\"name\"}} referencing a registered agent"},"foreign_backend":{"description":"for a Foreign engine: how it sources its model backend (AgentNative or NodeProvider)"},"credential_ref":{"type":"string","description":"the credential profile this engine acquires from (defaults to the id)"}}}"#
+        r#"{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["create","edit","delete","list"],"description":"author a reusable profile from existing building blocks, or list the profiles authored in this session's subtree"},"name":{"type":"string","description":"create: the short profile name (keys the agent/{session}/{name} id)"},"id":{"type":"string","description":"edit/delete: the full profile id (agent/{session}/{name}); only profiles authored within this session's subtree may be managed"},"provider":{"type":"string","description":"the model provider selector (Core engine)"},"model":{"type":"string","description":"the model id (Core engine)"},"base_url":{"type":"string","description":"optional provider API base-URL override"},"persona":{"type":"string","description":"the profile's persona (SOUL.md text) - validated, threat-scanned, and revision-logged through the node's persona store"},"tool_allowlist":{"type":"array","items":{"type":"string"},"description":"the tools this profile's engine may use (an allowlist; omit for the full node toolset)"},"engine":{"description":"\"Core\" (default) or {\"Foreign\":{\"agent\":\"name\"}} referencing a registered agent"},"foreign_backend":{"description":"for a Foreign engine: how it sources its model backend (AgentNative or NodeProvider)"},"credential_ref":{"type":"string","description":"the credential profile this engine acquires from (defaults to the id)"}}}"#
     }
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
