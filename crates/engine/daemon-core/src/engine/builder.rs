@@ -39,6 +39,9 @@ impl Engine {
             turn_injection: TurnInjection::default(),
             memory: Vec::new(),
             prompt_sources: Vec::new(),
+            async_sources: Vec::new(),
+            nudge_sources: Vec::new(),
+            tool_observers: Vec::new(),
             next_trigger: None,
             lifecycle_started: false,
         }
@@ -103,6 +106,34 @@ impl Engine {
     pub fn with_prompt_sources(mut self, sources: Vec<Arc<dyn StablePromptSource>>) -> Self {
         self.prompt_sources = sources;
         self
+    }
+
+    /// Register async prompt sources (§10) gathered over the session's execution environment at
+    /// the same composition boundaries (e.g. the workspace context files, the environment hints).
+    pub fn with_async_sources(mut self, sources: Vec<Arc<dyn AsyncPromptSource>>) -> Self {
+        self.async_sources = sources;
+        self
+    }
+
+    /// Register per-turn nudge sources (§10/§11): consulted when a user-triggered turn opens;
+    /// contributions ride that turn's [`TurnInjection`] (e.g. the USER.md save nudge).
+    pub fn with_nudge_sources(mut self, sources: Vec<Arc<dyn NudgeSource>>) -> Self {
+        self.nudge_sources = sources;
+        self
+    }
+
+    /// Register per-tool-call observers (§10/§12): each executed call's result may gain appended
+    /// hint text (e.g. the subdirectory context-file hints).
+    pub fn with_tool_observers(mut self, observers: Vec<Arc<dyn ToolCallObserver>>) -> Self {
+        self.tool_observers = observers;
+        self
+    }
+
+    /// The contained execution environment (§13) this engine's tools run in — exposed so the
+    /// profile layer can construct per-session helpers (e.g. tool observers) over the same root
+    /// the engine operates in.
+    pub fn exec(&self) -> &Arc<dyn ExecutionEnvironment> {
+        &self.exec
     }
 
     /// Inject the credential provider + profile this engine acquires capabilities from (the host

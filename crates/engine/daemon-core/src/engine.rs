@@ -11,7 +11,8 @@
 
 use crate::config::Config;
 use crate::context::{
-    BudgetedContextEngine, ComposedPrompt, ContextEngine, StablePromptSource, TurnInjection,
+    AsyncPromptSource, BudgetedContextEngine, ComposedPrompt, ContextEngine, NudgeSource,
+    StablePromptSource, ToolCallObserver, TurnInjection,
 };
 use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
@@ -152,6 +153,16 @@ pub struct Engine {
     /// once at composition time into their [`SlotKind`](crate::context::SlotKind) slots; expected to
     /// be cache-stable across a conversation.
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
+    /// Async prompt sources (§10) gathered over the session's [`ExecutionEnvironment`] at the same
+    /// composition boundaries as [`Self::prompt_sources`] — e.g. the workspace context files and
+    /// the environment hints.
+    async_sources: Vec<Arc<dyn AsyncPromptSource>>,
+    /// Per-turn nudge sources (§10/§11): consulted when a user-triggered turn opens; contributions
+    /// ride the [`TurnInjection`] (e.g. the USER.md save nudge). Empty by default.
+    nudge_sources: Vec<Arc<dyn NudgeSource>>,
+    /// Per-tool-call observers (§10/§12): each executed call's result may gain appended hint text
+    /// (e.g. the subdirectory context-file hints). Empty by default.
+    tool_observers: Vec<Arc<dyn ToolCallObserver>>,
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
     next_trigger: Option<TurnTrigger>,
@@ -560,15 +571,20 @@ impl Engine {
     /// Build the session's [`ComposedPrompt`] from the current sources (§10) — called only at
     /// composition boundaries (session start, model switch at a turn boundary), never per turn:
     ///
-    /// - `Identity`: the conversation's persona/system text (the profile's system prompt today;
-    ///   the persona store's SOUL.md once it lands).
+    /// - `Identity`: the conversation's persona/system text (the profile's SOUL.md / role persona,
+    ///   resolved by the node at engine construction).
     /// - `Guidance`: the context engine's [`guidance_block`](ContextEngine::guidance_block) plus
-    ///   every [`StablePromptSource`] routed by its `slot_kind()` (Guidance by default).
+    ///   every [`StablePromptSource`] then every [`AsyncPromptSource`] routed by its `slot_kind()`
+    ///   (Guidance by default) — registration order within a slot, so the composition is
+    ///   deterministic and byte-stable.
     /// - `SkillsIndex`/`ContextFiles`/`UserProfile`/`Stamp`: prompt sources that override
     ///   `slot_kind()` (wired by the node integration layer).
     /// - `MemoryBlock`: each memory provider's persistent `prompt_block`, captured **here** — not
     ///   per turn — so the system prompt stays byte-stable for the whole session.
-    fn compose(&self) -> ComposedPrompt {
+    ///
+    /// Async because the async sources gather over the session's [`ExecutionEnvironment`]
+    /// (workspace context files, environment hints).
+    async fn compose(&self) -> ComposedPrompt {
         let mut builder = ComposedPrompt::builder();
         builder.push(
             crate::context::SlotKind::Identity,
@@ -579,6 +595,11 @@ impl Engine {
         }
         for source in &self.prompt_sources {
             if let Some(block) = source.block() {
+                builder.push(source.slot_kind(), block);
+            }
+        }
+        for source in &self.async_sources {
+            if let Some(block) = source.block(&*self.exec).await {
                 builder.push(source.slot_kind(), block);
             }
         }
@@ -595,7 +616,7 @@ impl Engine {
     /// change here would invalidate the provider prefix cache), else compose fresh and persist it
     /// on the snapshot. A stored composition under a *different* model is stale runtime identity:
     /// recompose (the live `/model` switch analog).
-    fn restore_or_compose(&mut self) {
+    async fn restore_or_compose(&mut self) {
         let model = self.model_info().model;
         match self.snapshot.composed_prompt.as_ref() {
             Some(stored) if self.snapshot.composed_model == model => {
@@ -608,16 +629,16 @@ impl Engine {
                     model = %model,
                     "stored composed prompt has stale runtime identity; recomposing"
                 );
-                self.recompose(model);
+                self.recompose(model).await;
             }
-            None => self.recompose(model),
+            None => self.recompose(model).await,
         }
         self.composed_dirty = false;
     }
 
     /// Compose fresh under `model` and persist the result on the durable snapshot.
-    fn recompose(&mut self, model: String) {
-        let composed = self.compose();
+    async fn recompose(&mut self, model: String) {
+        let composed = self.compose().await;
         self.snapshot.composed_prompt = Some(composed.clone());
         self.snapshot.composed_model = model;
         self.composed = Some(composed);
@@ -726,7 +747,7 @@ impl Engine {
             SwitchReason::Start
         };
         self.notify_session_switch(reason).await;
-        self.restore_or_compose();
+        self.restore_or_compose().await;
     }
 
     /// End the session: notify the §10 context engine and §11 memory providers so they can flush /
@@ -749,20 +770,39 @@ impl Engine {
 
     /// §10/§11 pre-turn hooks (run once before the ReAct loop): recompose the system prompt if a
     /// model switch marked it dirty (the turn-boundary recomposition), gather per-turn memory
-    /// recall into the [`TurnInjection`], then measure budget [`Pressure`](crate::context::Pressure)
-    /// and proactively compact when over the configured budget (`memory.before_compact` ->
-    /// `ctx.compact`). Recall is a no-op until a [`MemoryProvider`](crate::memory::MemoryProvider)
-    /// is registered.
-    async fn prepare_turn_context(&mut self, events: &EventSink) {
+    /// recall + nudges into the [`TurnInjection`], then measure budget
+    /// [`Pressure`](crate::context::Pressure) and proactively compact when over the configured
+    /// budget (`memory.before_compact` -> `ctx.compact`). Recall is a no-op until a
+    /// [`MemoryProvider`](crate::memory::MemoryProvider) is registered; nudges fire only on
+    /// **user-triggered** turns (`user_turn`), so background completions and scheduled wakes never
+    /// advance or repeat a cadence.
+    async fn prepare_turn_context(&mut self, events: &EventSink, user_turn: bool) {
         if self.composed_dirty {
             // A model switch invalidated the composition: rebuild it at this turn boundary (never
             // mid-turn) under the new model identity.
-            self.recompose(self.model_info().model);
+            self.recompose(self.model_info().model).await;
             self.composed_dirty = false;
         }
+        let nudges = if user_turn && !self.nudge_sources.is_empty() {
+            // The cadence position is the conversation's own user-turn count (this turn's opener
+            // included): self-hydrating on restore, unmoved by assistant-only turns.
+            let user_turns = self
+                .snapshot
+                .conversation
+                .turns
+                .iter()
+                .filter(|t| matches!(t, Turn::User(_)))
+                .count() as u64;
+            self.nudge_sources
+                .iter()
+                .filter_map(|s| s.nudge(user_turns))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.turn_injection = TurnInjection {
             recalled: self.gather_recall().await,
-            nudges: Vec::new(),
+            nudges,
         };
         let budget = self.config.context_budget_tokens.map(|b| b as usize);
         // `before_turn` may sanitize the provider-facing conversation in place (LCM active-replay
@@ -944,6 +984,9 @@ impl Engine {
             } else {
                 TurnTrigger::User
             });
+            // Whether a user opened this turn (a plain message or a steer) — the nudge-cadence
+            // gate: background completions and scheduled wakes never fire a nudge.
+            let user_turn = matches!(trigger, TurnTrigger::User | TurnTrigger::Steer);
             tracing::info!(
                 session = %self.snapshot.session_id,
                 epoch = self.snapshot.epoch.0,
@@ -1019,7 +1062,7 @@ impl Engine {
                 session = %context_session,
                 epoch = context_epoch
             );
-            self.prepare_turn_context(events)
+            self.prepare_turn_context(events, user_turn)
                 .instrument(context_span)
                 .await;
 
@@ -1548,6 +1591,7 @@ impl Engine {
                     guardrail.after_call(&call.name, &call.args, &outcome.result, idempotent[i]);
                 let content = std::mem::take(&mut outcome.result.content);
                 outcome.result.content = append_guidance(content, &decision);
+                self.observe_tool_call(call, &mut outcome.result, cx).await;
                 let result_view = tool_result_view(&outcome);
                 events.emit(|seq| AgentEvent::ToolFinished {
                     seq,
@@ -1586,6 +1630,7 @@ impl Engine {
                     );
                     let content = std::mem::take(&mut outcome.result.content);
                     outcome.result.content = append_guidance(content, &decision);
+                    self.observe_tool_call(call, &mut outcome.result, cx).await;
                     let result_view = tool_result_view(&outcome);
                     events.emit(|seq| AgentEvent::ToolFinished {
                         seq,
@@ -1603,6 +1648,26 @@ impl Engine {
         }
 
         (calls, effects, interrupted)
+    }
+
+    /// Run every [`ToolCallObserver`] over one executed call, appending any returned hint text to
+    /// the call's result content — the model reads it next round, it persists in the durable
+    /// conversation with the result, and (appending at the tail) it never rewrites the cached
+    /// prefix. Guardrail-blocked calls never reach here (the tool did not run).
+    async fn observe_tool_call(
+        &self,
+        call: &crate::conversation::ToolCall,
+        result: &mut crate::conversation::ToolResult,
+        cx: &TurnCx<'_>,
+    ) {
+        for observer in &self.tool_observers {
+            if let Some(hint) = observer.on_tool_call(cx.exec, &call.name, &call.args).await {
+                if !result.content.is_empty() {
+                    result.content.push_str("\n\n");
+                }
+                result.content.push_str(&hint);
+            }
+        }
     }
 
     /// Resolve parked §12 approval decisions on resume: for each unapplied completion whose `job_id`

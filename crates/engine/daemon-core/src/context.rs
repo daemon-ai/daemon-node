@@ -300,6 +300,63 @@ pub trait StablePromptSource: Send + Sync {
     }
 }
 
+/// A [`StablePromptSource`] analogue whose block is produced **asynchronously over the session's
+/// [`ExecutionEnvironment`]** (§10/§13) — the seam for content that lives in the workspace, like
+/// the project context files (`DAEMON.md` > `AGENTS.md` > `CLAUDE.md` > `.cursorrules`) and the
+/// environment hints (which name the workspace cwd).
+///
+/// Same composition contract as [`StablePromptSource`]: gathered **once per composition boundary**
+/// (session start, model switch — never per turn), so the produced block must be cache-stable for
+/// the life of a session. Workspace edits take effect at the next composition boundary.
+#[async_trait]
+pub trait AsyncPromptSource: Send + Sync {
+    /// The block to compose (`None` = nothing). Called once per composition, with the engine's
+    /// contained execution environment for workspace IO.
+    async fn block(&self, exec: &dyn crate::exec::ExecutionEnvironment) -> Option<String>;
+
+    /// The [`ComposedPrompt`] slot this source contributes to (see
+    /// [`StablePromptSource::slot_kind`]).
+    fn slot_kind(&self) -> SlotKind {
+        SlotKind::Guidance
+    }
+}
+
+/// A per-turn nudge source (§10/§11): consulted when a **user-triggered** turn opens, with the
+/// count of user turns in the durable conversation, and contributing ephemeral text to that turn's
+/// [`TurnInjection`] (the outgoing request's last user message — never the cached system prefix,
+/// never the durable conversation).
+///
+/// The seam for cadence reminders like the USER.md save nudge (hermes `memory.nudge_interval`):
+/// deriving the position from the conversation's user-turn count makes the cadence self-hydrating
+/// on restore (N prior user turns resume the cycle at `N % interval`) and means assistant-only
+/// turns (background completions, scheduled wakes) never advance it.
+pub trait NudgeSource: Send + Sync {
+    /// The nudge to inject this turn (`None` = nothing). `user_turns` counts the user turns in the
+    /// conversation *including* the one opening this turn.
+    fn nudge(&self, user_turns: u64) -> Option<String>;
+}
+
+/// A per-tool-call observer (§10/§12): sees every **executed** tool call and may return hint text
+/// the engine appends to that call's result content — the text the model reads next round, durable
+/// in the conversation, and cache-friendly (appending at the tail never rewrites the cached
+/// prefix). The seam for mid-session workspace discovery like the subdirectory context-file hints
+/// (hermes `subdirectory_hints.py`): when a tool call touches a newly-visited workspace
+/// subdirectory, its `AGENTS.md`/`CLAUDE.md`/`.cursorrules` is delivered as a hint exactly once.
+///
+/// Never invoked for a call the guardrail blocked (the tool did not run). Implementations own
+/// their per-session state via interior mutability (`&self`).
+#[async_trait]
+pub trait ToolCallObserver: Send + Sync {
+    /// Observe one executed call (`args_json` is the call's raw argument JSON); the returned text
+    /// is appended to the call's result content.
+    async fn on_tool_call(
+        &self,
+        exec: &dyn crate::exec::ExecutionEnvironment,
+        name: &str,
+        args_json: &str,
+    ) -> Option<String>;
+}
+
 /// A lightweight description of the active model, handed to a [`ContextEngine`] via
 /// [`ContextEngine::on_model`] so a stateful engine can size its token budgets/thresholds from the
 /// real context window (e.g. LCM's compaction threshold). Best-effort: `max_context` is `None` when

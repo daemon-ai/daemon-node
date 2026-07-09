@@ -18,7 +18,7 @@
 
 use crate::command::CommandProviderHandle;
 use crate::config::Config;
-use crate::context::{ContextEngine, StablePromptSource};
+use crate::context::{AsyncPromptSource, ContextEngine, StablePromptSource, ToolCallObserver};
 use crate::conversation::SystemPrompt;
 use crate::credentials::CredentialProvider;
 use crate::engine::Engine;
@@ -60,6 +60,17 @@ pub type ContextEngineBuilder =
 pub type MemoryBuilder =
     Arc<dyn Fn(Option<&ProfileRef>, &SessionId) -> Vec<Arc<dyn MemoryProvider>> + Send + Sync>;
 
+/// Builds the per-session [`ToolCallObserver`] set (§10/§12) for one engine, keyed by its
+/// [`SessionId`] and the engine's **resolved** [`ExecutionEnvironment`] (so an observer like the
+/// subdirectory hint tracker roots its containment at the same workspace the engine's tools
+/// operate in). A fresh set per engine: observers carry per-session state (e.g. which directories
+/// already yielded a hint).
+pub type ToolObserverBuilder = Arc<
+    dyn Fn(&SessionId, &Arc<dyn ExecutionEnvironment>) -> Vec<Arc<dyn ToolCallObserver>>
+        + Send
+        + Sync,
+>;
+
 /// The engine's construction environment, shared by every construction site (durable factory, live
 /// session builder, fleet child spawner).
 #[derive(Clone)]
@@ -86,6 +97,15 @@ pub struct EngineProfile {
     /// Generic stable prompt sources (§10), e.g. the skills index — independent of memory;
     /// composed into the system prompt once per session.
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
+    /// Async prompt sources (§10) gathered over each engine's execution environment at the same
+    /// composition boundaries (e.g. the workspace context files, the environment hints).
+    async_sources: Vec<Arc<dyn AsyncPromptSource>>,
+    /// Per-turn nudge sources (§10/§11), consulted when a user-triggered turn opens (e.g. the
+    /// USER.md save nudge).
+    nudge_sources: Vec<Arc<dyn crate::context::NudgeSource>>,
+    /// The per-session tool-call observer builder (§10/§12), run against each engine's resolved
+    /// execution environment (e.g. the subdirectory hint tracker). `None` => no observers.
+    tool_observers: Option<ToolObserverBuilder>,
     /// The §12 tool-checkpoint store every engine this profile builds records pre-mutation
     /// checkpoints into (shared across sessions; rewound via the control surface). `None` => off.
     checkpoints: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
@@ -120,6 +140,9 @@ impl EngineProfile {
             memory: Vec::new(),
             memory_builder: None,
             prompt_sources: Vec::new(),
+            async_sources: Vec::new(),
+            nudge_sources: Vec::new(),
+            tool_observers: None,
             checkpoints: None,
             command_providers: Vec::new(),
         }
@@ -218,6 +241,28 @@ impl EngineProfile {
         self
     }
 
+    /// Register an async prompt source (§10) gathered over each engine's execution environment at
+    /// the same composition boundaries — the seam the workspace context files and environment
+    /// hints use.
+    pub fn with_async_prompt_block(mut self, source: Arc<dyn AsyncPromptSource>) -> Self {
+        self.async_sources.push(source);
+        self
+    }
+
+    /// Register a per-turn nudge source (§10/§11) consulted when a user-triggered turn opens —
+    /// the seam the USER.md save nudge uses.
+    pub fn with_nudge_source(mut self, source: Arc<dyn crate::context::NudgeSource>) -> Self {
+        self.nudge_sources.push(source);
+        self
+    }
+
+    /// Install the per-session tool-call observer builder (§10/§12), run against each engine's
+    /// resolved execution environment — the seam the subdirectory hint tracker uses.
+    pub fn with_tool_observers(mut self, build: ToolObserverBuilder) -> Self {
+        self.tool_observers = Some(build);
+        self
+    }
+
     /// Replace the tool registry every engine this profile builds is constructed with (e.g. to
     /// constrain a background-review child to a skills-only / memory-only toolset).
     pub fn with_registry(mut self, registry: Arc<ToolRegistry>) -> Self {
@@ -308,6 +353,21 @@ impl EngineProfile {
         }
         if !self.prompt_sources.is_empty() {
             engine = engine.with_prompt_sources(self.prompt_sources.clone());
+        }
+        if !self.async_sources.is_empty() {
+            engine = engine.with_async_sources(self.async_sources.clone());
+        }
+        if !self.nudge_sources.is_empty() {
+            engine = engine.with_nudge_sources(self.nudge_sources.clone());
+        }
+        // Observers are built LAST, against the engine's final execution environment (the per
+        // session workspace root when an exec builder is installed above), so a containment-scoped
+        // observer roots exactly where the engine's tools operate.
+        if let Some(build) = &self.tool_observers {
+            let observers = build(&engine.snapshot().session_id, engine.exec());
+            if !observers.is_empty() {
+                engine = engine.with_tool_observers(observers);
+            }
         }
         engine.with_budget(self.budget).with_config(self.config)
     }

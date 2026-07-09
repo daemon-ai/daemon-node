@@ -460,6 +460,309 @@ async fn internal_role_session_stays_byte_stable() {
     assert_eq!(systems[0], "reviewer persona");
 }
 
+/// An async prompt source composing over the session's execution environment: its block lands in
+/// its declared slot (after the sync sources), is gathered once per composition, and stays
+/// byte-stable across turns like every other slot.
+#[tokio::test]
+async fn async_prompt_source_composes_into_its_slot() {
+    struct CwdBlock;
+    #[async_trait::async_trait]
+    impl crate::context::AsyncPromptSource for CwdBlock {
+        async fn block(&self, exec: &dyn crate::exec::ExecutionEnvironment) -> Option<String> {
+            Some(format!("# Project Context\ncwd={}", exec.cwd().display()))
+        }
+        fn slot_kind(&self) -> crate::context::SlotKind {
+            crate::context::SlotKind::ContextFiles
+        }
+    }
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("async-src"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_prompt_sources(vec![Arc::new(FixedBlock("SYNC-GUIDANCE"))])
+    .with_async_sources(vec![Arc::new(CwdBlock)]);
+
+    for i in 0..2 {
+        engine.push_user(UserMsg::new(format!("turn {i}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+    }
+    let systems = provider.systems();
+    assert!(systems[0].contains("# Project Context\ncwd="));
+    // Slot order: Guidance before ContextFiles.
+    let guidance_at = systems[0].find("SYNC-GUIDANCE").unwrap();
+    let ctx_at = systems[0].find("# Project Context").unwrap();
+    assert!(guidance_at < ctx_at, "Guidance slot precedes ContextFiles");
+    assert_eq!(
+        systems[0].as_bytes(),
+        systems[1].as_bytes(),
+        "async blocks are gathered at the composition boundary, not per turn"
+    );
+}
+
+/// A nudge source firing on a user-turn cadence reaches the outgoing request's last user message
+/// via the [`TurnInjection`] — never the system prompt, never the durable conversation — and its
+/// position derives from the conversation's user-turn count.
+#[tokio::test]
+async fn nudge_source_fires_at_interval_via_turn_injection() {
+    /// Fires every 3rd user turn (the NudgeCounter cadence, stateless over the count).
+    struct EveryThird;
+    impl crate::context::NudgeSource for EveryThird {
+        fn nudge(&self, user_turns: u64) -> Option<String> {
+            user_turns
+                .is_multiple_of(3)
+                .then(|| "NUDGE-SAVE-PROFILE".to_string())
+        }
+    }
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("nudge"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_nudge_sources(vec![Arc::new(EveryThird)]);
+
+    for i in 0..4 {
+        engine.push_user(UserMsg::new(format!("turn {i}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+    }
+    let last_user_of = |req: &Request| {
+        req.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .unwrap()
+            .content
+            .clone()
+    };
+    let seen = provider.seen.lock().unwrap();
+    assert!(
+        !last_user_of(&seen[0]).contains("NUDGE"),
+        "turn 1: no nudge"
+    );
+    assert!(
+        !last_user_of(&seen[1]).contains("NUDGE"),
+        "turn 2: no nudge"
+    );
+    assert_eq!(
+        last_user_of(&seen[2]),
+        "turn 2\n\nNUDGE-SAVE-PROFILE",
+        "turn 3 fires the nudge on the request only"
+    );
+    assert!(
+        !last_user_of(&seen[3]).contains("NUDGE"),
+        "turn 4: cadence reset"
+    );
+    assert!(!seen[2].system.contains("NUDGE"), "never the system prompt");
+    drop(seen);
+    // The durable conversation never carries the nudge text.
+    for turn in &engine.snapshot().conversation.turns {
+        if let Turn::User(u) = turn {
+            assert!(
+                !u.text.contains("NUDGE"),
+                "durable text stays clean: {}",
+                u.text
+            );
+        }
+    }
+}
+
+/// The nudge cadence hydrates from restored history: an engine rebuilt over a snapshot with N
+/// prior user turns resumes the cycle at `N % interval` instead of restarting from zero (the
+/// hermes `test_memory_nudge_counter_hydration` behavior).
+#[tokio::test]
+async fn nudge_cadence_hydrates_from_restored_history() {
+    struct EveryThird;
+    impl crate::context::NudgeSource for EveryThird {
+        fn nudge(&self, user_turns: u64) -> Option<String> {
+            user_turns.is_multiple_of(3).then(|| "NUDGE".to_string())
+        }
+    }
+    // First incarnation: two user turns, no nudge yet.
+    let mut engine = Engine::fresh(
+        SessionId::new("nudge-hydrate"),
+        SystemPrompt::new("persona"),
+        Arc::new(TextProvider),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_nudge_sources(vec![Arc::new(EveryThird)]);
+    for i in 0..2 {
+        engine.push_user(UserMsg::new(format!("turn {i}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+    }
+    let snapshot = engine.snapshot().clone();
+
+    // Second incarnation over the restored snapshot: the NEXT user turn is the 3rd — it fires.
+    let provider = RequestRecordingProvider::new();
+    let mut restored =
+        Engine::from_snapshot(snapshot, provider.clone(), Arc::new(ToolRegistry::new()))
+            .with_nudge_sources(vec![Arc::new(EveryThird)]);
+    restored.push_user(UserMsg::new("after restore"));
+    restored
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    let req = provider.seen.lock().unwrap().pop().unwrap();
+    let last_user = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .unwrap()
+        .content
+        .clone();
+    assert_eq!(
+        last_user, "after restore\n\nNUDGE",
+        "cadence resumed modulo interval"
+    );
+}
+
+/// Non-user turns (scheduled wakes, background completions) never consult the nudge sources: the
+/// cadence neither advances nor fires off a user turn.
+#[tokio::test]
+async fn non_user_turns_do_not_consult_nudge_sources() {
+    struct Recording(Arc<AtomicU64>);
+    impl crate::context::NudgeSource for Recording {
+        fn nudge(&self, _user_turns: u64) -> Option<String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+    let consulted = Arc::new(AtomicU64::new(0));
+    let mut engine = Engine::fresh(
+        SessionId::new("nudge-gate"),
+        SystemPrompt::new("persona"),
+        Arc::new(TextProvider),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_nudge_sources(vec![Arc::new(Recording(consulted.clone()))]);
+
+    // A scheduled (cron-fired) turn: the trigger is not a user turn — sources stay unconsulted.
+    engine.push_user(UserMsg::new("scheduled work"));
+    engine.set_next_trigger(daemon_protocol::TurnTrigger::Scheduled {
+        job: daemon_common::JobId::from("cron-1"),
+    });
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        consulted.load(Ordering::Relaxed),
+        0,
+        "scheduled turn: not consulted"
+    );
+
+    // A plain user turn consults them.
+    engine.push_user(UserMsg::new("hello"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        consulted.load(Ordering::Relaxed),
+        1,
+        "user turn: consulted once"
+    );
+}
+
+/// A tool-call observer's hint is appended to the executed call's RESULT content: the model reads
+/// it next round, it persists in the durable conversation (hermes subdirectory-hint parity), and
+/// the system prompt / user messages stay untouched.
+#[tokio::test]
+async fn tool_observer_hint_appends_to_the_tool_result() {
+    /// Hints exactly once (the load-once tracker shape), recording what it saw.
+    struct OnceHint {
+        fired: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::ToolCallObserver for OnceHint {
+        async fn on_tool_call(
+            &self,
+            _exec: &dyn crate::exec::ExecutionEnvironment,
+            name: &str,
+            _args_json: &str,
+        ) -> Option<String> {
+            if self.fired.swap(true, Ordering::SeqCst) {
+                return None;
+            }
+            Some(format!("[HINT] context for `{name}` directory"))
+        }
+    }
+    let provider = Arc::new(ScriptedProvider::new(
+        vec![
+            ScriptStep::Call {
+                name: "counter".into(),
+                args: "{}".into(),
+            },
+            ScriptStep::Call {
+                name: "counter".into(),
+                args: "{}".into(),
+            },
+        ],
+        "done",
+    ));
+    let runs = Arc::new(AtomicU64::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CounterTool { runs }));
+    let mut engine =
+        test_engine("observer", provider, registry).with_tool_observers(vec![Arc::new(OnceHint {
+            fired: std::sync::atomic::AtomicBool::new(false),
+        })]);
+
+    engine.push_user(UserMsg::new("work in a subdir"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    let tool_results: Vec<String> = engine
+        .snapshot()
+        .conversation
+        .turns
+        .iter()
+        .filter_map(|t| match t {
+            Turn::Tool(t) => Some(
+                t.calls
+                    .iter()
+                    .map(|(_, r)| r.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_results.len(), 2, "two tool rounds recorded");
+    assert_eq!(
+        tool_results[0], "counter:0\n\n[HINT] context for `counter` directory",
+        "the hint is appended to the FIRST executed call's durable result"
+    );
+    assert_eq!(tool_results[1], "counter:1", "load-once: no repeat hint");
+    // Never the system prompt or the user text.
+    assert!(!engine
+        .snapshot()
+        .conversation
+        .system
+        .text
+        .contains("[HINT]"));
+    for turn in &engine.snapshot().conversation.turns {
+        if let Turn::User(u) = turn {
+            assert!(!u.text.contains("[HINT]"));
+        }
+    }
+}
+
 /// The engine marks `system_and_3` breakpoints on the outgoing request after the composed system
 /// is folded: `cache_system` reflects the FINAL system string and the trailing messages carry the
 /// message-level markers with the configured TTL.

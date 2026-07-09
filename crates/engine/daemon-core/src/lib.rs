@@ -60,9 +60,9 @@ pub use command::{
 };
 pub use config::Config;
 pub use context::{
-    estimate_tokens, BudgetedContextEngine, ComposedPrompt, ComposedPromptBuilder, ContextEngine,
-    ContextStrategy, ModelInfo, Pressure, Slot, SlotKind, SlotReport, StablePromptSource,
-    TurnInjection,
+    estimate_tokens, AsyncPromptSource, BudgetedContextEngine, ComposedPrompt,
+    ComposedPromptBuilder, ContextEngine, ContextStrategy, ModelInfo, NudgeSource, Pressure, Slot,
+    SlotKind, SlotReport, StablePromptSource, ToolCallObserver, TurnInjection,
 };
 pub use control::{SteerReq, TurnControl};
 pub use conversation::{
@@ -86,7 +86,7 @@ pub use memory::{
 };
 pub use profile::{
     ContextEngineBuilder, CredentialBuilder, EngineProfile, ExecEnvBuilder, MemoryBuilder,
-    ProviderBuilder,
+    ProviderBuilder, ToolObserverBuilder,
 };
 pub use provider::{
     build_context, mark_cache_breakpoints, CacheTtl, Capabilities, Failure, MockProvider,
